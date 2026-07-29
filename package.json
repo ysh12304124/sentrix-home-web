@@ -1,0 +1,12 @@
+{
+  "name": "sentrix-home-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sentrix local-first family memory web portal",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "test": "node --test test/*.test.js",
+    "backend:test": "PYTHONPATH=. python3 -m unittest discover -s backend/tests -v"
+  }
+}
