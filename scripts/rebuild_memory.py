@@ -14,10 +14,16 @@ from backend.model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaC
 from backend.pipeline import IngestionPipeline
 
 
-SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".wav", ".mp3", ".m4a", ".flac", ".txt", ".md", ".json"}
+SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".wav", ".mp3", ".m4a", ".flac", ".txt", ".md"}
 
 
 def rebuild(root, source):
+    face = FaceAdapter()
+    if face.enabled and face.identity_model in {"adaface", "magface"} and not face.identity_configured:
+        raise RuntimeError(
+            f"{face.identity_model} identity embedding is not configured: "
+            f"{face.identity_error or 'missing model configuration'}"
+        )
     data_dir = root / "data"
     db_path = data_dir / "sentrix.db"
     media_dir = data_dir / "media"
@@ -28,7 +34,8 @@ def rebuild(root, source):
     media_dir.mkdir(parents=True, exist_ok=True)
 
     store = MemoryStore(str(db_path))
-    pipeline = IngestionPipeline(store, gamma=GammaClient(), asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
+    run = store.start_rebuild("sentrix-rebuild-v1", str(source))
+    pipeline = IngestionPipeline(store, gamma=GammaClient(), asr=FunASRClient(), face=face, clip=ClipAdapter())
     metadata_path = source / "sentrix_metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
     files = sorted(path for path in source.rglob("*") if path.is_file() and path != metadata_path and path.suffix.lower() in SUPPORTED)
@@ -45,7 +52,9 @@ def rebuild(root, source):
             print(f"OK {processed}/{len(files)} {path}")
     event_summaries = pipeline.summarize_events()
     recluster = store.recluster_faces()
-    print({"files": len(files), "processed": processed, "failed": failed, "assets": store.count("assets"), "observations": store.count("observations"), "events": store.count("events"), "event_summaries": len(event_summaries), "entities": store.count("entities"), "clusters": store.count("face_clusters"), "facts": store.count("facts"), "recluster": recluster})
+    stats = {"files": len(files), "processed": processed, "failed": failed, "assets": store.count("assets"), "observations": store.count("observations"), "events": store.count("events"), "event_summaries": len(event_summaries), "entities": store.count("entities"), "clusters": store.count("face_clusters"), "facts": store.count("facts"), "recluster": recluster}
+    store.finish_rebuild(run["id"], "completed" if failed == 0 else "completed_with_failures", stats)
+    print(stats)
     store.close()
 
 

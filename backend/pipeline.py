@@ -1,4 +1,5 @@
 import json
+import hashlib
 import mimetypes
 import os
 from datetime import datetime, timezone
@@ -6,6 +7,13 @@ from pathlib import Path
 
 from .db import MemoryStore, make_id
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, ModelError, normalize_confidence
+
+
+IMPORT_METADATA_KEYS = {
+    "content_sha256", "sha256", "exif", "captured_at", "captured_location",
+    "source_owner_id", "source_owner_label", "source_device_id", "source_album_id",
+    "source_confidence",
+}
 
 
 def file_time(path):
@@ -30,7 +38,57 @@ class IngestionPipeline:
         path = Path(path)
         asset_id = make_id("asset")
         media_type = media_type or self._media_type(path)
+        # Import metadata is provenance only. Model hints and benchmark labels
+        # must never enter the memory graph through the asset boundary.
+        metadata = {key: value for key, value in (metadata or {}).items() if key in IMPORT_METADATA_KEYS}
+        metadata.setdefault("content_sha256", self._sha256(path))
+        metadata.setdefault("exif", self._extract_exif(path) if media_type == "image" else {})
+        existing = self.store.find_asset_by_hash(metadata["content_sha256"])
+        if existing:
+            return existing
+        for key in ("captured_at", "captured_location", "source_device_id"):
+            if metadata.get(key) is None and metadata["exif"].get(key):
+                metadata[key] = metadata["exif"][key]
         return self.store.create_asset(asset_id, file_name or path.name, media_type, str(path), mime_type or mimetypes.guess_type(path.name)[0], path.stat().st_size, metadata)
+
+    @staticmethod
+    def _sha256(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _extract_exif(path):
+        try:
+            from PIL import Image, ExifTags
+            with Image.open(path) as image:
+                raw = image.getexif()
+                tags = {ExifTags.TAGS.get(key, str(key)): value for key, value in raw.items()}
+            result = {"device": tags.get("Model") or tags.get("Make")}
+            if tags.get("DateTimeOriginal"):
+                result["captured_at"] = tags["DateTimeOriginal"].replace(":", "-", 2) + "+00:00"
+            gps = tags.get("GPSInfo") or {}
+            def gps_value(value):
+                try:
+                    return float(value[0]) / float(value[1])
+                except (TypeError, ValueError, ZeroDivisionError, IndexError):
+                    return float(value)
+            if gps:
+                latitude = gps.get(2)
+                longitude = gps.get(4)
+                if latitude and longitude:
+                    lat = sum(gps_value(item) / (60 ** index) for index, item in enumerate(latitude))
+                    lon = sum(gps_value(item) / (60 ** index) for index, item in enumerate(longitude))
+                    if str(gps.get(1, "N")).upper() == "S":
+                        lat *= -1
+                    if str(gps.get(3, "E")).upper() == "W":
+                        lon *= -1
+                    result["gps"] = {"latitude": lat, "longitude": lon}
+            return {key: value for key, value in result.items() if value}
+        except Exception:
+            return {}
 
     def _media_type(self, path):
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -40,6 +98,9 @@ class IngestionPipeline:
         asset = self.store.get_asset(asset_id)
         if not asset:
             raise KeyError(asset_id)
+        if asset.get("status") == "processed":
+            metadata = asset.get("metadata_json") or {}
+            return asset
         if asset["media_type"] == "video":
             result = self.video_memory_adapter.reserve(asset)
             return self.store.update_asset(asset_id, result["status"], result)
@@ -68,7 +129,8 @@ class IngestionPipeline:
             cluster_ids = []
             for index, face in enumerate(result.get("face_candidates", [])):
                 face_instance = self.store.add_face_instance(asset_id, observation["id"], face)
-                cluster_ids.append(face_instance["cluster_id"])
+                if face_instance:
+                    cluster_ids.append(face_instance["cluster_id"])
             metadata = {"observation_id": observation["id"], "event_id": event["id"], "fact_ids": fact_ids, "cluster_ids": cluster_ids, "model": result.get("model"), "faces": [{key: value for key, value in face.items() if key != "embedding"} for face in result.get("face_candidates", [])]}
             saved_asset = self.store.update_asset(asset_id, "processed", metadata)
             if asset.get("source_owner_id"):
@@ -77,6 +139,7 @@ class IngestionPipeline:
                 self.summarize_event(event["id"])
             return saved_asset
         except Exception as error:
+            self.store.cleanup_asset_derivatives(asset_id)
             return self.store.update_asset(asset_id, "failed", {"error": str(error)})
 
     def summarize_event(self, event_id):
@@ -123,7 +186,7 @@ class IngestionPipeline:
         }
         analysis["source_type"] = "image"
         analysis["face_candidates"] = faces
-        analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates"}}, "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face": "buffalo_l", "image_embedding": self.clip.model_name}}
+        analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates"}}, "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face_detector": "buffalo_l", "face_embedding": sorted({face.get("embedding_model", "unknown") for face in faces}), "image_embedding": self.clip.model_name}}
         return analysis
 
     def _audio_observation(self, asset):

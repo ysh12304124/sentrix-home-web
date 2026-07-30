@@ -1,5 +1,7 @@
 import os
 import shutil
+import hashlib
+import tempfile
 from io import BytesIO
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from .agent import MemoryAgent
 from .db import MemoryStore, make_id
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, parse_json_response
 from .pipeline import IngestionPipeline
+from .person_appearance import expanded_person_crop
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +54,16 @@ def health():
         "models": {
             "gamma4_12B": {"name": gamma.model, "endpoint": gamma.base_url},
             "asr": {"name": pipeline.asr.model_name, "vad": pipeline.asr.vad_model, "punc": pipeline.asr.punc_model, "ready": pipeline.asr.error is None, "error": pipeline.asr.error},
-            "face": {"enabled": pipeline.face.enabled, "ready": pipeline.face.error is None, "error": pipeline.face.error},
+            "face": {
+                "enabled": pipeline.face.enabled,
+                "ready": pipeline.face.ready,
+                "detectionReady": pipeline.face.error is None,
+                "identityModel": pipeline.face.identity_model,
+                "identityConfigured": pipeline.face.identity_configured,
+                "identityReady": pipeline.face.identity_ready,
+                "error": pipeline.face.error,
+                "identityError": pipeline.face.identity_runtime_error or pipeline.face.identity_error,
+            },
             "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.error is None, "error": pipeline.clip.error},
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
@@ -186,6 +198,7 @@ def confirm_face_cluster(cluster_id: str, payload: dict):
     value = store.confirm_face_cluster(cluster_id, name, str(payload.get("family_role") or "").strip() or None)
     if not value:
         raise HTTPException(status_code=404, detail="face cluster not found")
+    _analyze_confirmed_person_appearance(value["entity"]["id"])
     for event_id in store.entity_event_ids(value["entity"]["id"]):
         pipeline.summarize_event(event_id)
     refreshed = store.get_entity_detail(value["entity"]["id"])
@@ -194,11 +207,76 @@ def confirm_face_cluster(cluster_id: str, payload: dict):
     return refreshed
 
 
+def _analyze_confirmed_person_appearance(person_id: str):
+    """Analyze at most one high-quality confirmed face per event for clothing."""
+    selected = []
+    for event_id in store.entity_event_ids(person_id):
+        candidates = store._rows(
+            """SELECT fi.id FROM face_instances fi JOIN entity_mentions em ON em.face_instance_id = fi.id
+            JOIN event_observations eo ON eo.observation_id = fi.observation_id
+            WHERE em.entity_id = ? AND eo.event_id = ? ORDER BY fi.quality DESC, fi.detection_confidence DESC LIMIT 1""",
+            (person_id, event_id),
+        )
+        selected.extend(candidates)
+    for candidate in selected:
+        instance = store.get_face_instance(candidate["id"])
+        if not instance or not Path(instance["asset_path"]).is_file():
+            continue
+        try:
+            from PIL import Image
+
+            image = Image.open(instance["asset_path"]).convert("RGB")
+            crop, crop_bbox = expanded_person_crop(image, instance.get("bbox_json") or [])
+            with tempfile.NamedTemporaryFile(suffix=".jpg", dir=DATA_DIR, delete=False) as temporary:
+                crop.save(temporary, format="JPEG", quality=90)
+                temp_path = Path(temporary.name)
+            try:
+                result = gamma.analyze_person_appearance(str(temp_path), {
+                    "face_instance_id": instance["id"], "target_face_bbox": instance.get("bbox_json"),
+                    "capture_time": (store.get_observation(instance["observation_id"]) or {}).get("captured_at"),
+                })
+            finally:
+                temp_path.unlink(missing_ok=True)
+            store.record_person_appearance_evidence(
+                person_id, instance["id"], crop_bbox, result.get("clothing", []),
+                result.get("confidence", 0.0), result.get("model") or gamma.model,
+            )
+        except (OSError, ValueError, RuntimeError):
+            continue
+    store.rebuild_person_memory(person_id)
+
+
 @app.post("/api/face-clusters/{cluster_id}/reject")
 def reject_face_cluster(cluster_id: str):
     value = store.reject_face_cluster(cluster_id)
     if not value:
         raise HTTPException(status_code=404, detail="face cluster not found")
+    return value
+
+
+@app.post("/api/face-clusters/merge")
+def merge_face_clusters(payload: dict):
+    target = str(payload.get("target_cluster_id") or "")
+    source = str(payload.get("source_cluster_id") or "")
+    if not target or not source:
+        raise HTTPException(status_code=400, detail="target_cluster_id and source_cluster_id are required")
+    try:
+        value = store.merge_face_clusters(target, source, "user_merge")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if not value:
+        raise HTTPException(status_code=404, detail="face cluster not found")
+    return value
+
+
+@app.post("/api/face-clusters/{cluster_id}/split")
+def split_face_cluster(cluster_id: str, payload: dict):
+    face_instance_id = str(payload.get("face_instance_id") or "")
+    if not face_instance_id:
+        raise HTTPException(status_code=400, detail="face_instance_id is required")
+    value = store.split_face_instance(cluster_id, face_instance_id, "user_split")
+    if not value:
+        raise HTTPException(status_code=404, detail="face instance not found in cluster")
     return value
 
 
@@ -387,6 +465,22 @@ async def ingest(
     media_type = (file.content_type or "application/octet-stream").split("/", 1)[0]
     if media_type not in {"image", "audio", "video", "text"}:
         media_type = "text"
+    metadata = {
+        "source_owner_id": sourceOwnerId,
+        "source_device_id": sourceDeviceId,
+        "source_album_id": sourceAlbumId,
+        "source_confidence": 1.0 if sourceOwnerId else 0.0,
+        "captured_at": capturedAt,
+        "captured_location": capturedLocation,
+        "content_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        "exif": pipeline._extract_exif(destination) if media_type == "image" else {},
+    }
+    metadata["captured_at"] = metadata["captured_at"] or metadata["exif"].get("captured_at")
+    metadata["source_device_id"] = metadata["source_device_id"] or metadata["exif"].get("device")
+    existing = store.find_asset_by_hash(metadata["content_sha256"])
+    if existing:
+        destination.unlink(missing_ok=True)
+        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "deduplicated": True}
     created = store.create_asset(
         asset_id,
         safe_name,
@@ -394,14 +488,7 @@ async def ingest(
         str(destination),
         file.content_type,
         destination.stat().st_size,
-        {
-            "source_owner_id": sourceOwnerId,
-            "source_device_id": sourceDeviceId,
-            "source_album_id": sourceAlbumId,
-            "source_confidence": 1.0 if sourceOwnerId else 0.0,
-            "captured_at": capturedAt,
-            "captured_location": capturedLocation,
-        },
+        metadata,
     )
     background_tasks.add_task(process_asset, asset_id)
     return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type}

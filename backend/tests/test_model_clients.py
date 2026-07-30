@@ -1,6 +1,9 @@
 import unittest
+from unittest.mock import patch
+from pathlib import Path
+import tempfile
 
-from backend.model_clients import as_text, normalize_confidence, parse_json_response
+from backend.model_clients import GammaClient, as_text, normalize_confidence, parse_json_response
 
 
 class ModelClientTests(unittest.TestCase):
@@ -20,6 +23,38 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(normalize_confidence("中等", 0.5), 0.6)
         self.assertEqual(normalize_confidence("80%", 0.5), 0.8)
         self.assertEqual(normalize_confidence("无效值", 0.65), 0.65)
+
+    @patch("backend.model_clients.httpx.post")
+    def test_gamma_request_uses_configured_model_keep_alive(self, post):
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {"message": {"content": "{}"}}
+
+        GammaClient(base_url="http://sentrix-ollama", model="gemma4:12b").chat("测试")
+
+        self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], "0")
+
+    def test_clip_uses_project_checkpoint_when_environment_is_unset(self):
+        checkpoint = Path(__file__).resolve().parents[2] / "data" / "models" / "clip" / "ViT-B-32.bin"
+        with patch.dict("os.environ", {"CLIP_CHECKPOINT": ""}, clear=False), patch.object(Path, "is_file", autospec=True) as is_file:
+            is_file.side_effect = lambda path: path == checkpoint
+            adapter = __import__("backend.model_clients", fromlist=["ClipAdapter"]).ClipAdapter()
+
+        self.assertEqual(adapter.checkpoint, str(checkpoint))
+
+    def test_person_appearance_analysis_returns_only_target_clothing(self):
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
+            image.write(b"synthetic-crop")
+            image.flush()
+            client = GammaClient()
+            with patch.object(client, "chat", return_value='{"clothing":["红色针织衫"],"confidence":0.88}') as chat:
+                result = client.analyze_person_appearance(
+                    image.name,
+                    {"target_face_bbox": [20, 10, 60, 50], "face_instance_id": "face_1"},
+                )
+
+        self.assertEqual(result["clothing"], ["红色针织衫"])
+        self.assertEqual(result["confidence"], 0.88)
+        self.assertIn("目标人物", chat.call_args.args[0])
 
 
 if __name__ == "__main__":

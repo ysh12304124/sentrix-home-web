@@ -32,6 +32,8 @@
     faceClusters: (status = "") => request(`/api/face-clusters${status ? `?status=${encodeURIComponent(status)}` : ""}`),
     confirmFaceCluster: (id, payload) => request(`/api/face-clusters/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify(payload) }),
     rejectFaceCluster: (id) => request(`/api/face-clusters/${encodeURIComponent(id)}/reject`, { method: "POST" }),
+    mergeFaceClusters: (targetClusterId, sourceClusterId) => request("/api/face-clusters/merge", { method: "POST", body: JSON.stringify({ target_cluster_id: targetClusterId, source_cluster_id: sourceClusterId }) }),
+    splitFaceCluster: (clusterId, faceInstanceId) => request(`/api/face-clusters/${encodeURIComponent(clusterId)}/split`, { method: "POST", body: JSON.stringify({ face_instance_id: faceInstanceId }) }),
     relationships: () => request("/api/relationships"),
     createRelationship: (payload) => request("/api/relationships", { method: "POST", body: JSON.stringify(payload) }),
     confirmRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/confirm`, { method: "POST" }),

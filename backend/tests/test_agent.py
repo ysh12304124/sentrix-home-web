@@ -20,6 +20,15 @@ class RefusingGamma(FakeGamma):
         return {"answer": "证据不足", "confidence": 0.1, "evidence": [], "insufficient_evidence": True}
 
 
+class RecordingGamma(FakeGamma):
+    def __init__(self):
+        self.focus_calls = 0
+
+    def analyze_image_focus(self, path, dimension, metadata=None):
+        self.focus_calls += 1
+        return {"objects": ["补全物体"], "confidence": 0.8}
+
+
 class AgentEvidenceTests(unittest.TestCase):
     def test_search_terms_do_not_match_every_filename_by_one_common_token(self):
         self.assertTrue(contains("SR_AWS_N_0016.jpg", "SR_AWS_N_0016.jpg"))
@@ -52,6 +61,185 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertFalse(result["insufficient_evidence"])
             self.assertIn("家人在客厅聚会", result["answer"])
             self.assertEqual(result["evidence"][1]["asset_id"], "asset_1")
+
+    def test_answer_returns_structured_trace_and_evidence_layers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "家人在客厅聚会", "place": "客厅"})
+            store.merge_observation_into_event(observation)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("客厅")
+
+            self.assertTrue(result["retrieval_trace"])
+            self.assertEqual(result["retrieval_trace"][0]["stage"], "lexical")
+            self.assertIn("observations", result["evidence_layers"])
+            self.assertIn("assets", result["evidence_layers"])
+
+    def test_retrieve_ranks_exact_lexical_match_before_unrelated_vector_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            first = store.create_asset("asset_1", "kitchen.jpg", "image", "/tmp/kitchen.jpg")
+            second = store.create_asset("asset_2", "garden.jpg", "image", "/tmp/garden.jpg")
+            first_observation = store.add_observation(first["id"], {"caption": "厨房里的冰箱", "place": "厨房"})
+            second_observation = store.add_observation(second["id"], {"caption": "花园散步", "place": "花园"})
+            store.merge_observation_into_event(first_observation)
+            store.merge_observation_into_event(second_observation)
+
+            result = MemoryAgent(store, gamma=FakeGamma()).retrieve("冰箱")
+
+            self.assertEqual(result["observations"][0]["id"], first_observation["id"])
+
+    def test_person_activity_query_uses_event_level_semantic_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            entity = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "家人在餐桌旁", "activity": "家庭聚餐", "place": "餐厅"})
+            event = store.create_event({
+                "id": "event_1", "title": "家庭聚餐", "event_type": "聚餐", "activity": "家庭聚餐",
+                "place": "餐厅", "summary": "妈妈在餐厅参与家庭聚餐", "time_start": "2025-01-01T12:00:00+00:00",
+                "time_end": "2025-01-01T13:00:00+00:00", "participants": [{"entity_id": entity["id"], "name": "妈妈"}],
+            })
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            store.upsert_event_participant(event["id"], entity["id"], "visible_subject", [observation["id"]], 0.9)
+            store.maintain_semantic_claim(entity["id"], "activity", "参与", "家庭聚餐", [observation["id"]], [event["id"]], 0.9)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("妈妈参与过哪些活动？")
+
+            self.assertIn("家庭聚餐", result["answer"])
+            claim_evidence = [item for item in result["evidence"] if item["kind"] == "semantic_claim"]
+            self.assertTrue(claim_evidence)
+            self.assertIn(event["id"], claim_evidence[0]["supporting_event_ids"])
+
+    def test_person_activity_query_keeps_all_activity_claims_ahead_of_clothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            entity = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "家庭记录"})
+            event = store.create_event({"id": "event_1", "title": "家庭聚餐", "activity": "家庭聚餐"})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            store.maintain_semantic_claim(entity["id"], "clothing", "穿着", "红色外套", [observation["id"]], [event["id"]], 0.8)
+            store.maintain_semantic_claim(entity["id"], "activity", "参与", "家庭聚餐", [observation["id"]], [event["id"]], 0.9)
+            store.maintain_semantic_claim(entity["id"], "activity", "参与", "公园散步", [observation["id"]], ["event_2"], 0.9)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("妈妈参与过哪些活动？")
+
+            self.assertIn("家庭聚餐", result["answer"])
+            self.assertIn("公园散步", result["answer"])
+            activity_evidence = [item for item in result["evidence"] if item["kind"] == "semantic_claim" and item["dimension"] == "activity"]
+            self.assertEqual({item["value_text"] for item in activity_evidence}, {"家庭聚餐", "公园散步"})
+
+    def test_place_and_date_queries_filter_to_matching_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            restaurant_asset = store.create_asset("asset_1", "restaurant.jpg", "image", "/tmp/restaurant.jpg")
+            park_asset = store.create_asset("asset_2", "park.jpg", "image", "/tmp/park.jpg")
+            restaurant_observation = store.add_observation(restaurant_asset["id"], {"caption": "餐厅聚餐"})
+            park_observation = store.add_observation(park_asset["id"], {"caption": "公园散步"})
+            restaurant_event = store.create_event({
+                "id": "event_restaurant", "title": "餐厅聚餐", "place": "家中餐厅",
+                "time_start": "2025-05-10T18:00:00+00:00", "summary": "家中餐厅聚餐",
+            })
+            park_event = store.create_event({
+                "id": "event_park", "title": "公园散步", "place": "城市公园",
+                "time_start": "2025-05-11T10:00:00+00:00", "summary": "城市公园散步",
+            })
+            store.connection.executemany(
+                "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+                [(restaurant_event["id"], restaurant_observation["id"]), (park_event["id"], park_observation["id"])],
+            )
+            store.connection.commit()
+
+            place = MemoryAgent(store, gamma=FakeGamma()).answer("家中餐厅发生了什么？")
+            date = MemoryAgent(store, gamma=FakeGamma()).answer("2025-05-10发生了什么？")
+
+            for result in (place, date):
+                event_ids = [item["event_id"] for item in result["evidence"] if item["kind"] == "event"]
+                self.assertEqual(event_ids, [restaurant_event["id"]])
+                self.assertIn("家中餐厅聚餐", result["answer"])
+
+    def test_person_clothing_and_object_queries_use_specific_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            entity = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            microphone_asset = store.create_asset("asset_1", "microphone.jpg", "image", "/tmp/microphone.jpg")
+            book_asset = store.create_asset("asset_2", "book.jpg", "image", "/tmp/book.jpg")
+            microphone_observation = store.add_observation(microphone_asset["id"], {"caption": "妈妈在麦克风前讲话", "objects": ["麦克风"]})
+            book_observation = store.add_observation(book_asset["id"], {"caption": "桌上的书", "objects": ["书"]})
+            event = store.create_event({"id": "event_1", "title": "演讲", "summary": "妈妈讲话"})
+            store.connection.executemany(
+                "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+                [(event["id"], microphone_observation["id"]), (event["id"], book_observation["id"])],
+            )
+            store.connection.commit()
+            store.upsert_event_participant(event["id"], entity["id"], "visible_subject", [microphone_observation["id"]], 0.9)
+            store.maintain_semantic_claim(entity["id"], "clothing", "穿着", "红色外套", [microphone_observation["id"]], [event["id"]], 0.9, confidence_source="user")
+
+            clothing = MemoryAgent(store, gamma=FakeGamma()).answer("妈妈穿过什么衣服？")
+            object_result = MemoryAgent(store, gamma=FakeGamma()).answer("有哪些麦克风相关证据？")
+
+            self.assertIn("红色外套", clothing["answer"])
+            self.assertIn("麦克风", object_result["answer"])
+            observation_ids = [item["observation_id"] for item in object_result["evidence"] if item["kind"] == "observation"]
+            self.assertEqual(observation_ids, [microphone_observation["id"]])
+
+    def test_person_clothing_query_does_not_turn_scene_clothing_into_a_person_fact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            entity = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            asset = store.create_asset("asset_1", "scene.jpg", "image", "/tmp/scene.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "两人站在一起", "clothing": ["红色外套", "蓝色制服"]})
+            event = store.create_event({"id": "event_1", "title": "合影"})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            store.upsert_event_participant(event["id"], entity["id"], "visible_subject", [observation["id"]], 0.9)
+
+            result = MemoryAgent(store, gamma=FakeGamma()).answer("妈妈穿过什么衣服？")
+
+            self.assertIn("没有可归属到该人物", result["answer"])
+            self.assertNotIn("红色外套", result["answer"])
+
+    def test_person_clothing_query_returns_face_scoped_evidence_and_asset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "portrait.jpg", "image", "/tmp/portrait.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "人物肖像", "clothing": ["场景级蓝色外套"]})
+            event = store.merge_observation_into_event(observation)
+            face = store.add_face_instance(
+                asset["id"], observation["id"],
+                {"bbox": [10, 20, 40, 60], "confidence": 0.95, "embedding": [1, 0, 0]},
+            )
+            person = store.confirm_face_cluster(face["cluster_id"], "妈妈", "母亲")["entity"]
+            appearance = store.record_person_appearance_evidence(
+                person["id"], face["id"], [0, 0, 120, 200], ["红色针织衫"], 0.9, "test-vision",
+            )
+            store.rebuild_person_memory(person["id"])
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("妈妈穿过什么衣服？")
+
+            self.assertIn("红色针织衫", result["answer"])
+            appearance_evidence = next(item for item in result["evidence"] if item["kind"] == "person_appearance")
+            self.assertEqual(appearance_evidence["id"], appearance["id"])
+            self.assertEqual(appearance_evidence["asset_id"], asset["id"])
+            claim = next(item for item in result["evidence"] if item["kind"] == "semantic_claim" and item["dimension"] == "clothing")
+            self.assertEqual(claim["supporting_event_ids"], [event["id"]])
+
+    def test_object_query_with_existing_observation_evidence_does_not_trigger_visual_refinement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "microphone.jpg", "image", "/tmp/microphone.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "演讲", "objects": ["麦克风"]})
+            store.merge_observation_into_event(observation)
+            gamma = RecordingGamma()
+
+            result = MemoryAgent(store, gamma=gamma).answer("有哪些麦克风相关证据？")
+
+            self.assertIn("麦克风", result["answer"])
+            self.assertEqual(gamma.focus_calls, 0)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,60 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(detail["semantic_profile"]["person_id"], cluster["entity_id"])
         self.assertTrue(any(claim["dimension"] == "identity" for claim in detail["semantic_claims"]))
 
+    def test_person_memory_does_not_inherit_scene_clothing_as_person_attribute(self):
+        self.store.connection.execute(
+            "UPDATE observations SET clothing_json = ? WHERE id = ?",
+            ('["红色外套"]', self.obs1["id"]),
+        )
+        self.store.connection.execute(
+            "UPDATE observations SET clothing_json = ? WHERE id = ?",
+            ('["蓝色制服"]', self.obs2["id"]),
+        )
+        self.store.connection.commit()
+        event = self.store.merge_observation_into_event(self.obs1)
+        self.store.connection.execute(
+            "INSERT OR IGNORE INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+            (event["id"], self.obs2["id"]),
+        )
+        self.store.connection.commit()
+        face = self.store.add_face_instance("a1", self.obs1["id"], {"bbox": [1, 2, 30, 40], "confidence": 0.95, "embedding": [1, 0, 0]})
+
+        detail = self.store.confirm_face_cluster(face["cluster_id"], "妈妈", "母亲")
+
+        clothing = [claim["value_text"] for claim in detail["semantic_claims"] if claim["dimension"] == "clothing"]
+        self.assertEqual(clothing, [])
+
+    def test_face_scoped_appearance_evidence_becomes_person_clothing_claim(self):
+        event = self.store.merge_observation_into_event(self.obs1)
+        face = self.store.add_face_instance(
+            "a1", self.obs1["id"],
+            {"bbox": [10, 20, 40, 60], "confidence": 0.95, "embedding": [1, 0, 0]},
+        )
+        detail = self.store.confirm_face_cluster(face["cluster_id"], "妈妈", "母亲")
+
+        appearance = self.store.record_person_appearance_evidence(
+            detail["entity"]["id"], face["id"], [0, 0, 100, 180], ["红色针织衫"], 0.88, "test-vision",
+        )
+        memory = self.store.rebuild_person_memory(detail["entity"]["id"])
+
+        clothing_claims = [claim for claim in memory["claims"] if claim["dimension"] == "clothing"]
+        self.assertEqual([claim["value_text"] for claim in clothing_claims], ["红色针织衫"])
+        self.assertEqual(clothing_claims[0]["evidence_ids_json"], [appearance["id"]])
+        self.assertEqual(clothing_claims[0]["supporting_event_ids_json"], [event["id"]])
+        evidence = self.store.list_person_appearance_evidence(detail["entity"]["id"])
+        self.assertEqual(evidence[0]["face_instance_id"], face["id"])
+        self.assertEqual(evidence[0]["asset_id"], "a1")
+
+    def test_legacy_person_confirmation_updates_native_entity(self):
+        person = self.store.upsert_person("旧人物", confidence=0.7)
+
+        updated = self.store.update_person(person["id"], "妈妈", "confirmed")
+        entity = self.store.get_entity(f"entity_{person['id']}")
+
+        self.assertEqual(updated["name"], "妈妈")
+        self.assertEqual(entity["canonical_name"], "妈妈")
+        self.assertEqual(entity["status"], "confirmed")
+
 
 if __name__ == "__main__":
     unittest.main()

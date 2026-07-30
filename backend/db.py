@@ -69,6 +69,7 @@ class MemoryStore:
                 source_device_id TEXT,
                 source_album_id TEXT,
                 source_confidence REAL NOT NULL DEFAULT 0,
+                content_sha256 TEXT,
                 captured_at TEXT,
                 captured_location TEXT,
                 created_at TEXT NOT NULL,
@@ -109,6 +110,8 @@ class MemoryStore:
                 participants_json TEXT NOT NULL DEFAULT '[]',
                 confidence REAL NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'active',
+                aggregation_score REAL NOT NULL DEFAULT 0,
+                aggregation_breakdown_json TEXT NOT NULL DEFAULT '{}',
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -175,11 +178,47 @@ class MemoryStore:
                 id TEXT PRIMARY KEY,
                 asset_id TEXT NOT NULL REFERENCES assets(id),
                 observation_id TEXT NOT NULL REFERENCES observations(id),
-                cluster_id TEXT NOT NULL REFERENCES face_clusters(id),
+                cluster_id TEXT REFERENCES face_clusters(id),
                 bbox_json TEXT NOT NULL DEFAULT '[]',
                 embedding_json TEXT NOT NULL DEFAULT '[]',
                 detection_confidence REAL NOT NULL DEFAULT 0,
+                quality REAL NOT NULL DEFAULT 0,
+                pose_json TEXT NOT NULL DEFAULT '[]',
+                area_ratio REAL NOT NULL DEFAULT 0,
+                sharpness REAL NOT NULL DEFAULT 0,
+                pose_bucket TEXT NOT NULL DEFAULT 'unknown',
+                embedding_model TEXT NOT NULL DEFAULT 'unknown',
+                embedding_version TEXT NOT NULL DEFAULT 'unknown',
+                embedding_quality_signal REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS face_prototypes (
+                id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL REFERENCES face_clusters(id),
+                face_instance_id TEXT NOT NULL REFERENCES face_instances(id),
+                pose_bucket TEXT NOT NULL DEFAULT 'unknown',
+                embedding_json TEXT NOT NULL DEFAULT '[]',
+                quality REAL NOT NULL DEFAULT 0,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                model_version TEXT NOT NULL DEFAULT 'unknown',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(cluster_id, pose_bucket)
+            );
+            CREATE TABLE IF NOT EXISTS person_appearance_evidence (
+                id TEXT PRIMARY KEY,
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                face_instance_id TEXT NOT NULL REFERENCES face_instances(id),
+                observation_id TEXT NOT NULL REFERENCES observations(id),
+                asset_id TEXT NOT NULL REFERENCES assets(id),
+                crop_bbox_json TEXT NOT NULL DEFAULT '[]',
+                clothing_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(person_id, face_instance_id, model_name)
             );
             CREATE TABLE IF NOT EXISTS entity_mentions (
                 id TEXT PRIMARY KEY,
@@ -256,6 +295,7 @@ class MemoryStore:
                 evidence_ids_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'active',
                 confidence REAL NOT NULL DEFAULT 0,
+                confidence_source TEXT NOT NULL DEFAULT 'derived',
                 supersedes_claim_id TEXT REFERENCES semantic_claims(id),
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
@@ -281,6 +321,16 @@ class MemoryStore:
                 target_claim_id TEXT REFERENCES semantic_claims(id),
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS rebuild_runs (
+                id TEXT PRIMARY KEY,
+                run_version TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS stories (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -299,10 +349,49 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 expires_at TEXT
             );
+            """
+        )
+        self._migrate_face_instances_cluster_nullable()
+        self._ensure_columns("assets", {
+            "source_owner_id": "TEXT", "source_owner_label": "TEXT", "source_device_id": "TEXT", "source_album_id": "TEXT",
+            "source_confidence": "REAL NOT NULL DEFAULT 0", "content_sha256": "TEXT", "captured_at": "TEXT", "captured_location": "TEXT",
+        })
+        self._ensure_columns("observations", {
+            "canonical_json": "TEXT NOT NULL DEFAULT '{}'", "source_owner_id": "TEXT",
+            "inferred_captured_by": "TEXT", "clothing_json": "TEXT NOT NULL DEFAULT '[]'",
+            "spatial_relations_json": "TEXT NOT NULL DEFAULT '[]'", "revision": "INTEGER NOT NULL DEFAULT 1",
+        })
+        self._ensure_columns("face_instances", {
+            "asset_id": "TEXT", "observation_id": "TEXT", "cluster_id": "TEXT",
+            "bbox_json": "TEXT NOT NULL DEFAULT '[]'", "embedding_json": "TEXT NOT NULL DEFAULT '[]'",
+            "detection_confidence": "REAL NOT NULL DEFAULT 0",
+            "quality": "REAL NOT NULL DEFAULT 0", "pose_json": "TEXT NOT NULL DEFAULT '[]'",
+            "area_ratio": "REAL NOT NULL DEFAULT 0", "sharpness": "REAL NOT NULL DEFAULT 0",
+            "pose_bucket": "TEXT NOT NULL DEFAULT 'unknown'", "embedding_model": "TEXT NOT NULL DEFAULT 'unknown'",
+            "embedding_version": "TEXT NOT NULL DEFAULT 'unknown'", "embedding_quality_signal": "REAL NOT NULL DEFAULT 0",
+        })
+        self._ensure_columns("events", {
+            "title": "TEXT NOT NULL DEFAULT '未命名事件'", "event_type": "TEXT",
+            "time_start": "TEXT", "time_end": "TEXT", "place": "TEXT", "activity": "TEXT",
+            "summary": "TEXT", "participants_json": "TEXT NOT NULL DEFAULT '[]'",
+            "confidence": "REAL NOT NULL DEFAULT 0", "status": "TEXT NOT NULL DEFAULT 'active'",
+            "aggregation_score": "REAL NOT NULL DEFAULT 0",
+            "aggregation_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
+            "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
+        })
+        self._ensure_columns("semantic_claims", {
+            "confidence_source": "TEXT NOT NULL DEFAULT 'derived'",
+        })
+        self.connection.executescript(
+            """
             CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(asset_id);
+            CREATE INDEX IF NOT EXISTS idx_assets_content_sha256 ON assets(content_sha256);
             CREATE INDEX IF NOT EXISTS idx_events_time ON events(time_start);
             CREATE INDEX IF NOT EXISTS idx_facts_subject_predicate ON facts(subject, predicate);
             CREATE INDEX IF NOT EXISTS idx_face_instances_cluster ON face_instances(cluster_id);
+            CREATE INDEX IF NOT EXISTS idx_face_prototypes_cluster ON face_prototypes(cluster_id);
+            CREATE INDEX IF NOT EXISTS idx_person_appearance_person ON person_appearance_evidence(person_id);
+            CREATE INDEX IF NOT EXISTS idx_person_appearance_face ON person_appearance_evidence(face_instance_id);
             CREATE INDEX IF NOT EXISTS idx_entity_mentions_observation ON entity_mentions(observation_id);
             CREATE INDEX IF NOT EXISTS idx_relationship_subject_object ON relationships(subject_entity_id, object_entity_id);
             CREATE INDEX IF NOT EXISTS idx_memory_vectors_space ON memory_vectors(space);
@@ -312,15 +401,6 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_query_gaps_status ON query_gaps(status);
             """
         )
-        self._ensure_columns("assets", {
-            "source_owner_id": "TEXT", "source_owner_label": "TEXT", "source_device_id": "TEXT", "source_album_id": "TEXT",
-            "source_confidence": "REAL NOT NULL DEFAULT 0", "captured_at": "TEXT", "captured_location": "TEXT",
-        })
-        self._ensure_columns("observations", {
-            "canonical_json": "TEXT NOT NULL DEFAULT '{}'", "source_owner_id": "TEXT",
-            "inferred_captured_by": "TEXT", "clothing_json": "TEXT NOT NULL DEFAULT '[]'",
-            "spatial_relations_json": "TEXT NOT NULL DEFAULT '[]'", "revision": "INTEGER NOT NULL DEFAULT 1",
-        })
         self.connection.commit()
         self._migrate_legacy_persons()
 
@@ -329,6 +409,62 @@ class MemoryStore:
         for name, definition in columns.items():
             if name not in existing:
                 self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    def _migrate_face_instances_cluster_nullable(self):
+        """Allow low-confidence face evidence without inventing a person cluster.
+
+        SQLite cannot drop a NOT NULL constraint in place. Older databases used
+        a required `cluster_id`; rebuild the small derived table once while
+        preserving its rows and child references.
+        """
+        columns = self.connection.execute("PRAGMA table_info(face_instances)").fetchall()
+        cluster_column = next((row for row in columns if row["name"] == "cluster_id"), None)
+        if not cluster_column or not cluster_column["notnull"]:
+            return
+        self.connection.commit()
+        self.connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.connection.executescript(
+                """
+                CREATE TABLE face_instances_migrated (
+                    id TEXT PRIMARY KEY,
+                    asset_id TEXT NOT NULL REFERENCES assets(id),
+                    observation_id TEXT NOT NULL REFERENCES observations(id),
+                    cluster_id TEXT REFERENCES face_clusters(id),
+                    bbox_json TEXT NOT NULL DEFAULT '[]',
+                    embedding_json TEXT NOT NULL DEFAULT '[]',
+                    detection_confidence REAL NOT NULL DEFAULT 0,
+                    quality REAL NOT NULL DEFAULT 0,
+                    pose_json TEXT NOT NULL DEFAULT '[]',
+                    area_ratio REAL NOT NULL DEFAULT 0,
+                    sharpness REAL NOT NULL DEFAULT 0,
+                    pose_bucket TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_model TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_version TEXT NOT NULL DEFAULT 'unknown',
+                    embedding_quality_signal REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO face_instances_migrated(
+                    id, asset_id, observation_id, cluster_id, bbox_json,
+                    embedding_json, detection_confidence, quality, pose_json,
+                    area_ratio, sharpness, pose_bucket, embedding_model,
+                    embedding_version, embedding_quality_signal, created_at
+                ) SELECT
+                    id, asset_id, observation_id, cluster_id, bbox_json,
+                    embedding_json, detection_confidence, quality, pose_json,
+                    area_ratio, sharpness, pose_bucket, embedding_model,
+                    embedding_version, embedding_quality_signal, created_at
+                FROM face_instances;
+                DROP TABLE face_instances;
+                ALTER TABLE face_instances_migrated RENAME TO face_instances;
+                """
+            )
+            self.connection.commit()
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
+        violations = self.connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("face instance migration produced foreign-key violations")
 
     def _migrate_legacy_persons(self):
         """Keep the first prototype's person candidates visible in the native entity view."""
@@ -345,7 +481,7 @@ class MemoryStore:
         self.connection.commit()
 
     def count(self, table):
-        if table not in {"assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "query_gaps", "memory_feedback", "stories", "invites"}:
+        if table not in {"assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites"}:
             raise ValueError("unsupported table")
         return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
@@ -374,12 +510,12 @@ class MemoryStore:
             """INSERT INTO assets(
                 id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
                 source_owner_id, source_owner_label, source_device_id, source_album_id, source_confidence,
-                captured_at, captured_location, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                content_sha256, captured_at, captured_location, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 asset_id, file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
                 metadata.get("source_owner_id"), metadata.get("source_owner_label"), metadata.get("source_device_id"), metadata.get("source_album_id"),
-                float(metadata.get("source_confidence", 0) or 0), metadata.get("captured_at"), metadata.get("captured_location"),
+                float(metadata.get("source_confidence", 0) or 0), metadata.get("content_sha256") or metadata.get("sha256"), metadata.get("captured_at"), metadata.get("captured_location"),
                 timestamp, timestamp,
             ),
         )
@@ -388,6 +524,12 @@ class MemoryStore:
 
     def get_asset(self, asset_id):
         return self._decode(self._row("SELECT * FROM assets WHERE id = ?", (asset_id,)), ["metadata_json"])
+
+    def find_asset_by_hash(self, content_sha256):
+        if not content_sha256:
+            return None
+        row = self._row("SELECT id FROM assets WHERE content_sha256 = ? ORDER BY created_at LIMIT 1", (content_sha256,))
+        return self.get_asset(row["id"]) if row else None
 
     def list_assets(self, media_type=None, status=None, limit=200):
         clauses = []
@@ -409,17 +551,54 @@ class MemoryStore:
         merged_metadata = {**(current.get("metadata_json") or {}), **metadata}
         self.connection.execute(
             """UPDATE assets SET status = ?, metadata_json = ?, source_owner_id = ?, source_owner_label = ?, source_device_id = ?,
-                source_album_id = ?, source_confidence = ?, captured_at = ?, captured_location = ?, updated_at = ? WHERE id = ?""",
+                source_album_id = ?, source_confidence = ?, content_sha256 = ?, captured_at = ?, captured_location = ?, updated_at = ? WHERE id = ?""",
             (
                 status, json_value(merged_metadata, {}), metadata.get("source_owner_id", current.get("source_owner_id")),
                 metadata.get("source_owner_label", current.get("source_owner_label")), metadata.get("source_device_id", current.get("source_device_id")), metadata.get("source_album_id", current.get("source_album_id")),
                 float(metadata.get("source_confidence", current.get("source_confidence", 0)) or 0),
+                metadata.get("content_sha256", metadata.get("sha256", current.get("content_sha256"))),
                 metadata.get("captured_at", current.get("captured_at")), metadata.get("captured_location", current.get("captured_location")),
                 now_iso(), asset_id,
             ),
         )
         self.connection.commit()
         return self.get_asset(asset_id)
+
+    def cleanup_asset_derivatives(self, asset_id):
+        """Remove only derived records owned by one failed asset."""
+        observation_rows = self._rows("SELECT id FROM observations WHERE asset_id = ?", (asset_id,))
+        observation_ids = [row["id"] for row in observation_rows]
+        if not observation_ids:
+            return
+        placeholders = ",".join("?" for _ in observation_ids)
+        event_rows = self._rows(
+            f"SELECT event_id FROM event_observations WHERE observation_id IN ({placeholders})",
+            observation_ids,
+        )
+        event_ids = list(dict.fromkeys(row["event_id"] for row in event_rows))
+        face_rows = self._rows(
+            f"SELECT id FROM face_instances WHERE observation_id IN ({placeholders})",
+            observation_ids,
+        )
+        face_ids = [row["id"] for row in face_rows]
+        if face_ids:
+            face_placeholders = ",".join("?" for _ in face_ids)
+            self.connection.execute(f"DELETE FROM face_prototypes WHERE face_instance_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM memory_vectors WHERE source_type = 'face_instance' AND source_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM face_instances WHERE id IN ({face_placeholders})", face_ids)
+        self.connection.execute(
+            "DELETE FROM memory_vectors WHERE (source_type = 'asset' AND source_id = ?) OR metadata_json LIKE ?",
+            (asset_id, f'%"asset_id": "{asset_id}"%'),
+        )
+        for observation_id in observation_ids:
+            self.connection.execute("DELETE FROM facts WHERE evidence_ids_json LIKE ?", (f'%{observation_id}%',))
+        self.connection.execute(f"DELETE FROM event_observations WHERE observation_id IN ({placeholders})", observation_ids)
+        self.connection.execute(f"DELETE FROM entity_mentions WHERE observation_id IN ({placeholders})", observation_ids)
+        self.connection.execute(f"DELETE FROM observations WHERE id IN ({placeholders})", observation_ids)
+        for event_id in event_ids:
+            if self.connection.execute("SELECT COUNT(*) FROM event_observations WHERE event_id = ?", (event_id,)).fetchone()[0] == 0:
+                self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        self.connection.commit()
 
     def add_observation(self, asset_id, data):
         observation_id = data.get("id") or make_id("obs")
@@ -516,22 +695,83 @@ class MemoryStore:
             if captured and event_time and abs((captured - event_time).total_seconds()) > 6 * 3600:
                 continue
             event_anchors = [self._event_anchor(self.get_observation(item["observation_id"])) for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (row["id"],))]
-            locations = {item["location"] for item in event_anchors if item["location"]}
-            albums = {item["album"] for item in event_anchors if item["album"]}
-            visual_places = {item["visual_place"] for item in event_anchors if item["visual_place"]}
-            if anchor["location"] and locations and anchor["location"] not in locations:
-                continue
-            if anchor["album"] and anchor["album"] in albums:
-                candidates.append(row)
-                continue
-            if anchor["location"] and anchor["location"] in locations:
-                candidates.append(row)
-                continue
-            if not anchor["location"] and not anchor["album"] and (
-                not anchor["visual_place"] or not visual_places or anchor["visual_place"] in visual_places
-            ):
-                candidates.append(row)
+            score = self._event_candidate_score(observation, row, event_anchors)
+            if score["total"] >= 0.50:
+                candidate = dict(row)
+                candidate["aggregation_score"] = score["total"]
+                candidate["aggregation_breakdown"] = score
+                candidates.append(candidate)
+        candidates.sort(key=lambda item: (-item["aggregation_score"], item.get("time_start") or "", item["id"]))
         return candidates
+
+    def _event_candidate_diagnostics(self, observation):
+        rows = self._rows("SELECT * FROM events WHERE status = 'active' ORDER BY time_start DESC")
+        anchor = self._event_anchor(observation)
+        captured = parse_time(anchor["captured_at"])
+        diagnostics = []
+        for row in rows:
+            event_time = parse_time(row.get("time_start"))
+            if captured and event_time and abs((captured - event_time).total_seconds()) > 6 * 3600:
+                continue
+            event_anchors = [self._event_anchor(self.get_observation(item["observation_id"])) for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (row["id"],))]
+            score = self._event_candidate_score(observation, row, event_anchors)
+            diagnostics.append({"event_id": row["id"], "score": score["total"], "breakdown": score})
+        return sorted(diagnostics, key=lambda item: (-item["score"], item["event_id"]))
+
+    @staticmethod
+    def _tokens(value):
+        if isinstance(value, (list, tuple, set)):
+            values = value
+        else:
+            values = str(value or "").lower().replace("、", " ").replace("，", " ").split()
+        return {str(item).strip().lower() for item in values if str(item).strip()}
+
+    def _event_candidate_score(self, observation, event, event_anchors):
+        anchor = self._event_anchor(observation)
+        captured = parse_time(anchor["captured_at"])
+        event_time = parse_time(event.get("time_start"))
+        if captured and event_time:
+            minutes = abs((captured - event_time).total_seconds()) / 60.0
+            time_score = max(0.0, 1.0 - min(minutes, 360.0) / 360.0)
+        else:
+            time_score = 0.25
+        locations = {item["location"] for item in event_anchors if item["location"]}
+        albums = {item["album"] for item in event_anchors if item["album"]}
+        visual_places = {item["visual_place"] for item in event_anchors if item["visual_place"]}
+        location_score = 1.0 if anchor["location"] and anchor["location"] in locations else 0.0
+        album_score = 1.0 if anchor["album"] and anchor["album"] in albums else 0.0
+        visual_place_score = 1.0 if anchor["visual_place"] and anchor["visual_place"] in visual_places else 0.0
+        event_type = anchor["visual_event_type"]
+        event_types = {item["visual_event_type"] for item in event_anchors if item["visual_event_type"]}
+        event_type_score = 0.8 if event_type and event_type in event_types else 0.0
+        activity = str(observation.get("activity") or "").lower()
+        existing_activity = str(event.get("activity") or "").lower()
+        activity_score = 0.9 if activity and existing_activity and (activity == existing_activity or activity in existing_activity or existing_activity in activity) else 0.0
+        album_matches = bool(anchor["album"] and anchor["album"] in albums)
+        if activity and existing_activity and not activity_score and event_type and event_type not in event_types and not album_matches:
+            activity_score = -0.8
+        object_sets = [self._tokens(self.get_observation(item["observation_id"]).get("objects")) for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (event["id"],))]
+        objects = self._tokens(observation.get("objects"))
+        object_score = 0.8 if objects and any(objects.intersection(values) for values in object_sets) else 0.0
+        people = {str(item.get("entity_id") if isinstance(item, dict) else item) for item in observation.get("people") or []}
+        raw_people = event.get("participants_json") or []
+        if isinstance(raw_people, str):
+            try:
+                raw_people = json.loads(raw_people)
+            except json.JSONDecodeError:
+                raw_people = []
+        existing_people = {str(item.get("entity_id") if isinstance(item, dict) else item) for item in raw_people}
+        person_score = 0.8 if people and existing_people and people.intersection(existing_people) else 0.0
+        total = (
+            0.25 * time_score + 0.25 * location_score + 0.10 * album_score
+            + 0.15 * visual_place_score + 0.05 * event_type_score + 0.20 * activity_score
+            + 0.05 * object_score + 0.05 * person_score
+        )
+        return {
+            "total": max(0.0, min(1.0, total)), "time": time_score, "location": location_score,
+            "album": album_score, "visual_place": visual_place_score, "event_type": event_type_score,
+            "activity": activity_score, "objects": object_score, "people": person_score,
+        }
 
     def _event_anchor(self, observation):
         observation = observation or {}
@@ -549,6 +789,7 @@ class MemoryStore:
     def merge_observation_into_event(self, observation):
         candidates = self._event_candidates(observation)
         event = candidates[0] if candidates else None
+        diagnostics = self._event_candidate_diagnostics(observation)
         anchor = self._event_anchor(observation)
         people = dedupe_json_values((json.loads(event["participants_json"]) if event else []) + (observation.get("people") or []))
         captured_at = anchor["captured_at"]
@@ -571,18 +812,24 @@ class MemoryStore:
             title = "待总结事件"
             self.connection.execute(
                 """INSERT INTO events(id, title, event_type, time_start, time_end, place, activity, summary,
-                participants_json, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (event_id, title, event_type, captured_at, captured_at, event_place, observation.get("activity"), observation.get("caption") or title, json_value(people, []), float(observation.get("confidence", 0) or 0), now_iso(), now_iso()),
+                participants_json, confidence, aggregation_breakdown_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (event_id, title, event_type, captured_at, captured_at, event_place, observation.get("activity"), observation.get("caption") or title, json_value(people, []), float(observation.get("confidence", 0) or 0), json_value({"selected": False, "ambiguity": len(diagnostics) > 1, "candidates": diagnostics[:5]}, {}), now_iso(), now_iso()),
             )
         self.connection.execute("INSERT OR IGNORE INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event_id, observation["id"]))
+        if event:
+            self.connection.execute(
+                "UPDATE events SET aggregation_score = ?, aggregation_breakdown_json = ? WHERE id = ?",
+                (float(event.get("aggregation_score", 0) or 0), json_value(event.get("aggregation_breakdown", {}), {}), event_id),
+            )
         self.connection.commit()
         self._refresh_event_participants([observation["id"]])
         return self.get_event(event_id)
 
     def get_event(self, event_id):
-        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json"])
+        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json", "aggregation_breakdown_json"])
         if row:
             row["participants"] = row.get("participants_json", [])
+            row["aggregation_breakdown"] = row.get("aggregation_breakdown_json", {})
             row["observation_ids"] = [item["observation_id"] for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (event_id,))]
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
@@ -681,7 +928,12 @@ class MemoryStore:
     def get_semantic_claim(self, claim_id):
         return self._decode(self._row("SELECT * FROM semantic_claims WHERE id = ?", (claim_id,)), ["supporting_event_ids_json", "evidence_ids_json"])
 
-    def maintain_semantic_claim(self, person_id, dimension, predicate, value_text, evidence_ids=None, event_ids=None, confidence=0.5, valid_from=None, valid_to=None):
+    def maintain_semantic_claim(self, person_id, dimension, predicate, value_text, evidence_ids=None, event_ids=None, confidence=0.5, valid_from=None, valid_to=None, confidence_source="derived"):
+        predicate = {
+            "参加过": "参与", "参加": "参与", "出席": "参与",
+            "出现于": "出现在", "位于": "出现在", "穿着": "穿着",
+            "拍摄了": "拍摄", "拍照": "拍摄", "家庭成员角色": "家庭角色",
+        }.get(str(predicate).strip(), str(predicate).strip())
         evidence_ids = list(dict.fromkeys(evidence_ids or []))
         event_ids = list(dict.fromkeys(event_ids or []))
         matching = self._row(
@@ -694,10 +946,10 @@ class MemoryStore:
             merged_evidence = list(dict.fromkeys(json.loads(matching["evidence_ids_json"] or "[]") + evidence_ids))
             merged_events = list(dict.fromkeys(json.loads(matching["supporting_event_ids_json"] or "[]") + event_ids))
             self.connection.execute(
-                """UPDATE semantic_claims SET evidence_ids_json = ?, supporting_event_ids_json = ?, confidence = MAX(confidence, ?),
+                """UPDATE semantic_claims SET evidence_ids_json = ?, supporting_event_ids_json = ?, confidence = MAX(confidence, ?), confidence_source = ?,
                 valid_from = COALESCE(valid_from, ?), valid_to = CASE WHEN valid_to IS NULL THEN ? ELSE valid_to END,
                 updated_at = ? WHERE id = ?""",
-                (json_value(merged_evidence, []), json_value(merged_events, []), float(confidence or 0), valid_from, valid_to, timestamp, matching["id"]),
+                (json_value(merged_evidence, []), json_value(merged_events, []), float(confidence or 0), confidence_source, valid_from, valid_to, timestamp, matching["id"]),
             )
             self.connection.commit()
             return self.get_semantic_claim(matching["id"])
@@ -712,23 +964,42 @@ class MemoryStore:
         self.connection.execute(
             """INSERT INTO semantic_claims(
                 id, person_id, dimension, predicate, value_text, valid_from, valid_to,
-                supporting_event_ids_json, evidence_ids_json, status, confidence, supersedes_claim_id, revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                supporting_event_ids_json, evidence_ids_json, status, confidence, confidence_source, supersedes_claim_id, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 claim_id, person_id, dimension, predicate, value_text, valid_from, valid_to,
-                json_value(event_ids, []), json_value(evidence_ids, []), status, float(confidence or 0),
+                json_value(event_ids, []), json_value(evidence_ids, []), status, float(confidence or 0), confidence_source,
                 active["id"] if active and status == "pending" else None, (active["revision"] + 1) if active and status == "pending" else 1, timestamp, timestamp,
             ),
         )
         self.connection.commit()
         return self.get_semantic_claim(claim_id)
 
-    def list_semantic_claims(self, person_id=None, limit=500):
+    def list_semantic_claims(self, person_id=None, limit=500, include_history=False):
+        status_clause = "" if include_history else " AND status IN ('active', 'pending')"
         if person_id:
-            rows = self._rows("SELECT * FROM semantic_claims WHERE person_id = ? ORDER BY updated_at DESC LIMIT ?", (person_id, limit))
+            rows = self._rows(f"SELECT * FROM semantic_claims WHERE person_id = ?{status_clause} ORDER BY updated_at DESC LIMIT ?", (person_id, limit))
         else:
-            rows = self._rows("SELECT * FROM semantic_claims ORDER BY updated_at DESC LIMIT ?", (limit,))
+            rows = self._rows(f"SELECT * FROM semantic_claims WHERE 1 = 1{status_clause} ORDER BY updated_at DESC LIMIT ?", (limit,))
         return [self._decode(row, ["supporting_event_ids_json", "evidence_ids_json"]) for row in rows]
+
+    def start_rebuild(self, run_version, scope):
+        timestamp = now_iso()
+        run_id = make_id("rebuild")
+        self.connection.execute(
+            "INSERT INTO rebuild_runs(id, run_version, scope, status, stats_json, created_at, updated_at) VALUES (?, ?, ?, 'running', '{}', ?, ?)",
+            (run_id, run_version, scope, timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self.get_rebuild(run_id)
+
+    def finish_rebuild(self, run_id, status, stats=None, error=None):
+        self.connection.execute("UPDATE rebuild_runs SET status = ?, stats_json = ?, error = ?, updated_at = ? WHERE id = ?", (status, json_value(stats, {}), error, now_iso(), run_id))
+        self.connection.commit()
+        return self.get_rebuild(run_id)
+
+    def get_rebuild(self, run_id):
+        return self._decode(self._row("SELECT * FROM rebuild_runs WHERE id = ?", (run_id,)), ["stats_json"])
 
     def create_query_gap(self, query, missing_dimension, candidate_asset_ids=None, evidence_ids=None):
         gap_id = make_id("gap")
@@ -768,57 +1039,105 @@ class MemoryStore:
             return None
         mentions = self._rows("SELECT DISTINCT observation_id FROM entity_mentions WHERE entity_id = ?", (person_id,))
         observation_ids = [row["observation_id"] for row in mentions]
+        mentions_by_event = {}
+        for observation_id in observation_ids:
+            for row in self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,)):
+                mentions_by_event.setdefault(row["event_id"], []).append(observation_id)
+        event_ids = self.entity_event_ids(person_id)
+        event_ids.extend(
+            row["event_id"] for row in self._rows("SELECT DISTINCT event_id FROM event_participants WHERE person_id = ?", (person_id,))
+            if row["event_id"] not in event_ids
+        )
+        # Derived claims are a rebuildable projection. User-confirmed identity
+        # claims and their audit history remain intact.
+        self.connection.execute(
+            "UPDATE semantic_claims SET status = 'superseded', updated_at = ? WHERE person_id = ? AND confidence_source = 'derived' AND status IN ('active', 'pending')",
+            (now_iso(), person_id),
+        )
         activities = []
         places = []
-        event_ids = []
-        captured_event_ids = []
-        for observation_id in observation_ids:
-            observation = self.get_observation(observation_id) or {}
-            event_rows = self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,))
-            linked_event_ids = [row["event_id"] for row in event_rows]
-            event_ids.extend(event_id for event_id in linked_event_ids if event_id not in event_ids)
-            if observation.get("activity") and observation["activity"] not in activities:
-                activities.append(observation["activity"])
-                self.maintain_semantic_claim(person_id, "activity", "参与", observation["activity"], [observation_id], linked_event_ids, observation.get("confidence", 0.5))
-            if observation.get("place") and observation["place"] not in places:
-                places.append(observation["place"])
-                self.maintain_semantic_claim(person_id, "place", "出现在", observation["place"], [observation_id], linked_event_ids, observation.get("confidence", 0.5))
-            for clothing in observation.get("clothing") or []:
-                value = clothing if isinstance(clothing, str) else clothing.get("description") or clothing.get("name")
-                if value:
-                    self.maintain_semantic_claim(person_id, "clothing", "穿着", value, [observation_id], linked_event_ids, observation.get("confidence", 0.5), observation.get("captured_at"), observation.get("captured_at"))
+        event_rows = [self.get_event(event_id) for event_id in event_ids]
+        event_rows = [event for event in event_rows if event]
+        all_evidence_ids = list(observation_ids)
+        for event in event_rows:
+            # An event establishes attendance, activity, and place. Appearance
+            # claims must be grounded in observations where this person was
+            # actually identified, never in every person visible at the event.
+            event_observation_ids = list(dict.fromkeys(mentions_by_event.get(event["id"], [])))
+            participation = self._row(
+                "SELECT evidence_ids_json FROM event_participants WHERE event_id = ? AND person_id = ? AND role = 'visible_subject'",
+                (event["id"], person_id),
+            )
+            if not event_observation_ids and participation:
+                event_observation_ids = json.loads(participation["evidence_ids_json"] or "[]")
+            all_evidence_ids.extend(event_observation_ids)
+            event_confidence = float(event.get("confidence", 0.5) or 0.5)
+            activity = str(event.get("activity") or "").strip()
+            if activity and activity not in activities:
+                activities.append(activity)
+                self.maintain_semantic_claim(
+                    person_id, "activity", "参与", activity, event_observation_ids, [event["id"]], event_confidence,
+                    event.get("time_start"), event.get("time_end"), confidence_source="derived",
+                )
+            place = str(event.get("place") or "").strip()
+            if place and place not in places:
+                places.append(place)
+                self.maintain_semantic_claim(
+                    person_id, "place", "出现在", place, event_observation_ids, [event["id"]], event_confidence,
+                    event.get("time_start"), event.get("time_end"), confidence_source="derived",
+                )
         participation_rows = self._rows("SELECT * FROM event_participants WHERE person_id = ?", (person_id,))
         for participation in participation_rows:
             event = self.get_event(participation["event_id"])
             if not event:
                 continue
-            event_id = event["id"]
-            if event_id not in event_ids:
-                event_ids.append(event_id)
-            if event.get("activity") and event["activity"] not in activities:
-                activities.append(event["activity"])
-            if event.get("place") and event["place"] not in places:
-                places.append(event["place"])
             evidence_ids = json.loads(participation["evidence_ids_json"] or "[]")
             if participation["role"] == "captured_by":
-                captured_event_ids.append(event_id)
-                self.maintain_semantic_claim(person_id, "capture", "拍摄", event.get("title") or event.get("event_type") or "家庭事件", evidence_ids, [event_id], participation.get("confidence", 0.5), event.get("time_start"), event.get("time_end"))
+                self.maintain_semantic_claim(
+                    person_id, "capture", "拍摄", event.get("title") or event.get("event_type") or "家庭事件",
+                    evidence_ids, [event["id"]], participation.get("confidence", 0.5), event.get("time_start"), event.get("time_end"),
+                    confidence_source="derived",
+                )
+                all_evidence_ids.extend(evidence_ids)
+        appearance_evidence = self.list_person_appearance_evidence(person_id)
+        clothing_values = []
+        for appearance in appearance_evidence:
+            evidence_id = appearance["id"]
+            observation_id = appearance["observation_id"]
+            event_ids_for_observation = [
+                row["event_id"]
+                for row in self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,))
+            ]
+            event_ids_for_observation = [event_id for event_id in event_ids_for_observation if event_id in event_ids]
+            observation = self.get_observation(observation_id) or {}
+            valid_from = observation.get("captured_at")
+            for clothing in appearance.get("clothing_json", []):
+                if clothing not in clothing_values:
+                    clothing_values.append(clothing)
+                self.maintain_semantic_claim(
+                    person_id, "clothing", "穿着", clothing, [evidence_id], event_ids_for_observation,
+                    appearance.get("confidence", 0.5), valid_from, confidence_source="derived",
+                )
+            all_evidence_ids.append(evidence_id)
         role = entity.get("family_role")
         if role:
-            self.maintain_semantic_claim(person_id, "identity", "家庭角色", role, observation_ids, event_ids, 1.0)
+            self.maintain_semantic_claim(person_id, "identity", "家庭角色", role, observation_ids, event_ids, 1.0, confidence_source="user")
         summary_parts = []
         if observation_ids:
             summary_parts.append(f"出现在{len(observation_ids)}条观察中")
-        if captured_event_ids:
-            summary_parts.append(f"作为拍摄者记录了{len(set(captured_event_ids))}个事件")
-        if event_ids and not captured_event_ids:
+        if event_ids:
             summary_parts.append(f"关联{len(event_ids)}个事件")
         summary = f"{entity['canonical_name']}已确认，" + "；".join(summary_parts or ["等待新的家庭记忆证据"] ) + "。"
+        activity_summary = "；".join(
+            f"{event.get('time_start') or '时间未知'} 在{event.get('place') or '地点未知'}：{event.get('activity') or event.get('title') or '家庭记录'}"
+            for event in event_rows[:12]
+        )
         profile = self.upsert_semantic_profile(person_id, {
             "summary_zh": summary,
-            "activity_summary_zh": "、".join(activities[:12]),
+            "activity_summary_zh": activity_summary or "暂无已确认活动",
             "place_summary_zh": "、".join(places[:12]),
-        }, observation_ids)
+            "appearance_summary_zh": "、".join(clothing_values[:12]) or "暂无可归属的人物级衣物证据",
+        }, list(dict.fromkeys(all_evidence_ids)))
         for event_id in event_ids:
             self.refresh_event_summary(event_id)
         return {"profile": profile, "claims": self.list_semantic_claims(person_id), "event_ids": event_ids, "observation_ids": observation_ids}
@@ -921,7 +1240,34 @@ class MemoryStore:
         person = self.get_person(person_id)
         if not person:
             return None
-        self.connection.execute("UPDATE persons SET name = ?, status = ?, updated_at = ? WHERE id = ?", (name or person["name"], status or person["status"], now_iso(), person_id))
+        next_name = name or person["name"]
+        next_status = status or person["status"]
+        timestamp = now_iso()
+        self.connection.execute("UPDATE persons SET name = ?, status = ?, updated_at = ? WHERE id = ?", (next_name, next_status, timestamp, person_id))
+        entity_id = f"entity_{person_id}"
+        entity = self.get_entity(entity_id)
+        if not entity:
+            self.connection.execute(
+                """INSERT INTO entities(
+                    id, entity_type, canonical_name, status, family_role, summary,
+                    confidence, created_at, updated_at
+                ) VALUES (?, 'person', ?, ?, NULL, '由旧人物接口同步', ?, ?, ?)""",
+                (entity_id, next_name, next_status, float(person.get("confidence", 0) or 0), timestamp, timestamp),
+            )
+            entity = self.get_entity(entity_id)
+        if entity:
+            self.connection.execute(
+                """UPDATE entities SET canonical_name = ?, status = ?, confidence = MAX(confidence, ?),
+                updated_at = ? WHERE id = ?""",
+                (next_name, next_status, float(person.get("confidence", 0) or 0), timestamp, entity_id),
+            )
+            if entity.get("canonical_name") != next_name:
+                self.connection.execute(
+                    """INSERT INTO entity_revisions(
+                        id, entity_id, field_name, old_value, new_value, source, created_at
+                    ) VALUES (?, ?, 'canonical_name', ?, ?, 'legacy_person_api', ?)""",
+                    (make_id("entity_revision"), entity_id, entity.get("canonical_name"), next_name, timestamp),
+                )
         self.connection.commit()
         return self.get_person(person_id)
 
@@ -992,7 +1338,7 @@ class MemoryStore:
 
     def list_entities(self, status=None):
         params = [status] if status else []
-        where = "WHERE status = ?" if status else ""
+        where = "WHERE status = ?" if status else "WHERE status != 'rejected'"
         entities = self._rows(f"SELECT * FROM entities {where} ORDER BY updated_at DESC", params)
         for entity in entities:
             entity["cluster_count"] = self.connection.execute("SELECT COUNT(*) FROM face_clusters WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
@@ -1010,20 +1356,99 @@ class MemoryStore:
         return self._row("SELECT * FROM entities WHERE id = ?", (entity_id,))
 
     def get_face_instance(self, instance_id):
-        return self._decode(
+        result = self._decode(
             self._row(
                 """SELECT fi.*, a.path AS asset_path, a.file_name, a.mime_type, a.media_type
                 FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE fi.id = ?""",
                 (instance_id,),
             ),
-            ["bbox_json", "embedding_json"],
+            ["bbox_json", "embedding_json", "pose_json"],
         )
+        if result:
+            result["pose"] = result.get("pose_json", [])
+        return result
+
+    def record_person_appearance_evidence(self, person_id, face_instance_id, crop_bbox, clothing, confidence, model_name):
+        """Persist target-person appearance evidence, never scene-level labels."""
+        person = self.get_entity(person_id)
+        instance = self.get_face_instance(face_instance_id)
+        if not person or person.get("status") != "confirmed":
+            raise ValueError("appearance evidence requires a confirmed person")
+        if not instance:
+            raise ValueError("face instance not found")
+        linked = self._row(
+            "SELECT 1 FROM entity_mentions WHERE entity_id = ? AND face_instance_id = ?",
+            (person_id, face_instance_id),
+        )
+        if not linked:
+            raise ValueError("face instance is not confirmed for this person")
+        values = []
+        for item in clothing or []:
+            value = str(item or "").strip()
+            if value:
+                values.append(value)
+        timestamp = now_iso()
+        existing = self._row(
+            "SELECT * FROM person_appearance_evidence WHERE person_id = ? AND face_instance_id = ? AND model_name = ?",
+            (person_id, face_instance_id, str(model_name or "unknown")),
+        )
+        if existing:
+            self.connection.execute(
+                """UPDATE person_appearance_evidence SET crop_bbox_json = ?, clothing_json = ?, confidence = ?,
+                status = 'confirmed', updated_at = ? WHERE id = ?""",
+                (json_value(crop_bbox, []), json_value(list(dict.fromkeys(values)), []), float(confidence or 0), timestamp, existing["id"]),
+            )
+            evidence_id = existing["id"]
+        else:
+            evidence_id = make_id("appearance")
+            self.connection.execute(
+                """INSERT INTO person_appearance_evidence(
+                    id, person_id, face_instance_id, observation_id, asset_id, crop_bbox_json,
+                    clothing_json, confidence, model_name, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    evidence_id, person_id, face_instance_id, instance["observation_id"], instance["asset_id"],
+                    json_value(crop_bbox, []), json_value(list(dict.fromkeys(values)), []), float(confidence or 0),
+                    str(model_name or "unknown"), timestamp, timestamp,
+                ),
+            )
+        self.connection.commit()
+        return self.get_person_appearance_evidence(evidence_id)
+
+    def get_person_appearance_evidence(self, evidence_id):
+        return self._decode(
+            self._row("SELECT * FROM person_appearance_evidence WHERE id = ?", (evidence_id,)),
+            ["crop_bbox_json", "clothing_json"],
+        )
+
+    def list_person_appearance_evidence(self, person_id, include_empty=False, limit=500):
+        where = "pae.person_id = ? AND pae.status = 'confirmed'"
+        if not include_empty:
+            where += " AND pae.clothing_json != '[]'"
+        rows = self._rows(
+            f"""SELECT pae.*, a.file_name, a.media_type FROM person_appearance_evidence pae
+            JOIN assets a ON a.id = pae.asset_id WHERE {where}
+            ORDER BY pae.confidence DESC, pae.updated_at DESC LIMIT ?""",
+            (person_id, limit),
+        )
+        return [self._decode(row, ["crop_bbox_json", "clothing_json"]) for row in rows]
+
+    def list_face_prototypes(self, cluster_id=None):
+        params = [cluster_id] if cluster_id else []
+        where = "WHERE cluster_id = ?" if cluster_id else ""
+        rows = self._rows(f"SELECT * FROM face_prototypes {where} ORDER BY quality DESC, pose_bucket ASC", params)
+        return [self._decode(row, ["embedding_json"]) for row in rows]
 
     def entity_event_ids(self, entity_id):
         rows = self._rows(
-            """SELECT DISTINCT eo.event_id FROM entity_mentions em
-            JOIN event_observations eo ON eo.observation_id = em.observation_id WHERE em.entity_id = ?""",
-            (entity_id,),
+            """SELECT DISTINCT event_id FROM (
+                SELECT eo.event_id FROM entity_mentions em
+                JOIN event_observations eo ON eo.observation_id = em.observation_id
+                WHERE em.entity_id = ?
+                UNION
+                SELECT event_id FROM event_participants WHERE person_id = ?
+            )""",
+            (entity_id, entity_id),
         )
         return [row["event_id"] for row in rows]
 
@@ -1053,6 +1478,7 @@ class MemoryStore:
             "facts": facts,
             "profile": self.get_semantic_profile(entity_id),
             "claims": self.list_semantic_claims(entity_id, 500),
+            "appearance_evidence": self.list_person_appearance_evidence(entity_id, include_empty=True),
         }
 
     def create_face_cluster(self, embedding, confidence=0.0):
@@ -1070,95 +1496,273 @@ class MemoryStore:
         self.connection.commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
 
-    def add_face_instance(self, asset_id, observation_id, face, threshold=0.55, model_name="buffalo_l"):
+    def _record_entity_revision(self, entity_id, field_name, old_value, new_value, source, evidence_ids=None):
+        self.connection.execute(
+            """INSERT INTO entity_revisions(id, entity_id, field_name, old_value, new_value, source, evidence_ids_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (make_id("entity_revision"), entity_id, field_name, old_value, new_value, source, json_value(evidence_ids, []), now_iso()),
+        )
+
+    def merge_face_clusters(self, target_cluster_id, source_cluster_id, source="user_merge"):
+        if target_cluster_id == source_cluster_id:
+            return self._row("SELECT * FROM face_clusters WHERE id = ?", (target_cluster_id,))
+        target = self._row("SELECT * FROM face_clusters WHERE id = ?", (target_cluster_id,))
+        other = self._row("SELECT * FROM face_clusters WHERE id = ?", (source_cluster_id,))
+        if not target or not other or target["status"] == "rejected" or other["status"] == "rejected":
+            return None
+        target_entity = self.get_entity(target["entity_id"]) if target.get("entity_id") else None
+        source_entity = self.get_entity(other["entity_id"]) if other.get("entity_id") else None
+        if target_entity and source_entity and target_entity["id"] != source_entity["id"] and target_entity["status"] == "confirmed" and source_entity["status"] == "confirmed":
+            raise ValueError("two confirmed people cannot be merged automatically")
+        self.connection.execute("UPDATE face_instances SET cluster_id = ? WHERE cluster_id = ?", (target_cluster_id, source_cluster_id))
+        self.connection.execute("UPDATE face_clusters SET status = 'rejected', member_count = 0, updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), source_cluster_id))
+        self._refresh_face_prototypes(target_cluster_id)
+        if target.get("entity_id"):
+            self._record_entity_revision(target["entity_id"], "face_cluster_merge", source_cluster_id, target_cluster_id, source, [])
+        self.connection.commit()
+        return self._row("SELECT * FROM face_clusters WHERE id = ?", (target_cluster_id,))
+
+    def split_face_instance(self, cluster_id, face_instance_id, source="user_split"):
+        cluster = self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
+        instance = self._row("SELECT * FROM face_instances WHERE id = ? AND cluster_id = ?", (face_instance_id, cluster_id))
+        if not cluster or not instance:
+            return None
+        new_cluster = self.create_face_cluster(json.loads(instance["embedding_json"] or "[]"), float(instance.get("quality", 0) or 0))
+        self.connection.execute("UPDATE face_instances SET cluster_id = ? WHERE id = ?", (new_cluster["id"], face_instance_id))
+        self._refresh_face_prototypes(cluster_id)
+        self._refresh_face_prototypes(new_cluster["id"])
+        if cluster.get("entity_id"):
+            self._record_entity_revision(cluster["entity_id"], "face_cluster_split", cluster_id, new_cluster["id"], source, [face_instance_id])
+        self.connection.commit()
+        return self._row("SELECT * FROM face_clusters WHERE id = ?", (new_cluster["id"],))
+
+    def add_face_instance(self, asset_id, observation_id, face, threshold=0.30, model_name="buffalo_l"):
         embedding = self._normalise_vector(face.get("embedding"))
+        if not embedding or face.get("identity_ready") is False:
+            return None
+        pose = [float(value) for value in (face.get("pose") or [])]
+        pose_bucket_value = face.get("pose_bucket")
+        quality = face.get("quality")
+        if quality is None:
+            from .face_embeddings import compute_face_quality, pose_bucket
+
+            pose_bucket_value = pose_bucket_value or pose_bucket(pose)
+            quality = compute_face_quality(
+                face.get("confidence", 0), face.get("area_ratio", 0), face.get("sharpness", 0), pose
+            )
+        else:
+            quality = float(quality)
+            if not pose_bucket_value:
+                from .face_embeddings import pose_bucket
+
+                pose_bucket_value = pose_bucket(pose)
+        embedding_model = str(face.get("embedding_model") or model_name or "unknown")
+        embedding_version = str(face.get("embedding_version") or "legacy")
+        identity_eligible = face.get("identity_eligible", True) is not False
+        if not identity_eligible:
+            instance_id = make_id("face")
+            self.connection.execute(
+                """INSERT INTO face_instances(
+                    id, asset_id, observation_id, cluster_id, bbox_json, embedding_json,
+                    detection_confidence, quality, pose_json, area_ratio, sharpness,
+                    pose_bucket, embedding_model, embedding_version, embedding_quality_signal, created_at
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    instance_id, asset_id, observation_id, json_value(face.get("bbox"), []), json_value(embedding, []),
+                    float(face.get("confidence", 0) or 0), float(quality or 0), json_value(pose, []), float(face.get("area_ratio", 0) or 0),
+                    float(face.get("sharpness", 0) or 0), str(pose_bucket_value or "unknown"), embedding_model, embedding_version,
+                    float(face.get("quality_signal", 0) or 0), now_iso(),
+                ),
+            )
+            self.connection.commit()
+            self.upsert_vector(
+                "visual", "face_instance", instance_id, embedding, embedding_model,
+                {"asset_id": asset_id, "observation_id": observation_id, "model_version": embedding_version,
+                 "quality": float(quality or 0), "pose_bucket": pose_bucket_value, "identity_eligible": False},
+            )
+            return {"id": instance_id, "cluster_id": None, "score": 0.0, "embedding": embedding}
         clusters = self._rows("SELECT * FROM face_clusters WHERE status IN ('pending', 'confirmed')")
         best = None
         best_score = 0.0
-        for cluster in clusters:
-            representative = json.loads(cluster["representative_embedding_json"] or "[]")
-            score = self._cosine(embedding, representative)
-            if score > best_score:
-                best, best_score = cluster, score
+        if quality >= 0.30:
+            for cluster in clusters:
+                prototypes = self.list_face_prototypes(cluster["id"])
+                cluster_signatures = {
+                    (item.get("model_name") or "unknown", item.get("model_version") or "unknown")
+                    for item in prototypes
+                }
+                embedding_signature = (embedding_model, embedding_version)
+                if cluster_signatures and embedding_signature not in cluster_signatures:
+                    continue
+                representatives = [
+                    item["embedding_json"] if isinstance(item["embedding_json"], list)
+                    else json.loads(item["embedding_json"] or "[]")
+                    for item in prototypes
+                ]
+                if not representatives:
+                    representatives = [json.loads(cluster["representative_embedding_json"] or "[]")]
+                score = max((self._cosine(embedding, representative) for representative in representatives), default=0.0)
+                if score > best_score:
+                    best, best_score = cluster, score
         if not best or best_score < threshold:
-            best = self.create_face_cluster(embedding, face.get("confidence", 0))
-        elif embedding:
-            members = self._rows("SELECT embedding_json FROM face_instances WHERE cluster_id = ?", (best["id"],))
-            vectors = [json.loads(item["embedding_json"] or "[]") for item in members if item["embedding_json"]]
-            vectors.append(embedding)
-            mean = [sum(values) / len(values) for values in zip(*vectors)] if vectors else embedding
-            self.connection.execute("UPDATE face_clusters SET representative_embedding_json = ?, member_count = ?, confidence = MAX(confidence, ?), revision = revision + 1, updated_at = ? WHERE id = ?", (json_value(self._normalise_vector(mean), []), len(vectors), float(face.get("confidence", 0) or 0), now_iso(), best["id"]))
+            best = self.create_face_cluster(embedding, quality)
         instance_id = make_id("face")
         self.connection.execute(
-            """INSERT INTO face_instances(id, asset_id, observation_id, cluster_id, bbox_json, embedding_json, detection_confidence, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (instance_id, asset_id, observation_id, best["id"], json_value(face.get("bbox"), []), json_value(embedding, []), float(face.get("confidence", 0) or 0), now_iso()),
+            """INSERT INTO face_instances(
+                id, asset_id, observation_id, cluster_id, bbox_json, embedding_json,
+                detection_confidence, quality, pose_json, area_ratio, sharpness,
+                pose_bucket, embedding_model, embedding_version, embedding_quality_signal, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                instance_id, asset_id, observation_id, best["id"], json_value(face.get("bbox"), []), json_value(embedding, []),
+                float(face.get("confidence", 0) or 0), float(quality or 0), json_value(pose, []), float(face.get("area_ratio", 0) or 0),
+                float(face.get("sharpness", 0) or 0), str(pose_bucket_value or "unknown"), embedding_model, embedding_version,
+                float(face.get("quality_signal", 0) or 0), now_iso(),
+            ),
         )
-        self.connection.execute("UPDATE face_clusters SET member_count = (SELECT COUNT(*) FROM face_instances WHERE cluster_id = ?), updated_at = ? WHERE id = ?", (best["id"], now_iso(), best["id"]))
+        self._refresh_face_prototypes(best["id"])
         self.connection.commit()
-        self.upsert_vector("visual", "face_instance", instance_id, embedding, model_name, {"cluster_id": best["id"], "asset_id": asset_id, "observation_id": observation_id})
+        self.upsert_vector("visual", "face_instance", instance_id, embedding, embedding_model, {"cluster_id": best["id"], "asset_id": asset_id, "observation_id": observation_id, "model_version": embedding_version, "quality": float(quality or 0), "pose_bucket": pose_bucket_value})
         return {"id": instance_id, "cluster_id": best["id"], "score": best_score, "embedding": embedding}
 
-    def recluster_faces(self, threshold=0.55):
-        """Globally regroup face embeddings and keep a high-quality medoid per cluster."""
-        instances = self._rows("SELECT id, cluster_id, embedding_json FROM face_instances WHERE embedding_json != '[]'")
+    def _refresh_face_prototypes(self, cluster_id):
+        rows = self._rows(
+            "SELECT * FROM face_instances WHERE cluster_id = ? ORDER BY quality DESC, created_at ASC",
+            (cluster_id,),
+        )
+        best_by_view = {}
+        for row in rows:
+            view = row.get("pose_bucket") or "unknown"
+            if view not in best_by_view:
+                best_by_view[view] = row
+        timestamp = now_iso()
+        self.connection.execute("DELETE FROM face_prototypes WHERE cluster_id = ?", (cluster_id,))
+        for row in best_by_view.values():
+            self.connection.execute(
+                """INSERT INTO face_prototypes(
+                    id, cluster_id, face_instance_id, pose_bucket, embedding_json,
+                    quality, model_name, model_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    make_id("prototype"), cluster_id, row["id"], row.get("pose_bucket") or "unknown",
+                    row["embedding_json"], float(row.get("quality", 0) or 0), row.get("embedding_model") or "unknown",
+                    row.get("embedding_version") or "unknown", timestamp, timestamp,
+                ),
+            )
+        representative = max(best_by_view.values(), key=lambda item: float(item.get("quality", 0) or 0), default=None)
+        self.connection.execute(
+            """UPDATE face_clusters SET representative_embedding_json = ?, member_count = ?,
+            confidence = MAX(confidence, ?), revision = revision + 1, updated_at = ? WHERE id = ?""",
+            (
+                representative["embedding_json"] if representative else "[]", len(rows),
+                float(representative.get("quality", 0) or 0) if representative else 0, timestamp, cluster_id,
+            ),
+        )
+
+    def recluster_faces(self, threshold=0.30, minimum_quality=0.30):
+        """Globally regroup faces with quality-aware multi-view prototypes."""
+        from .face_clustering import FaceClusterer, FaceSample
+
+        instances = self._rows(
+            """SELECT id, cluster_id, embedding_json, quality, detection_confidence,
+            pose_bucket, embedding_model, embedding_version
+            FROM face_instances WHERE embedding_json != '[]' AND cluster_id IS NOT NULL"""
+        )
         if not instances:
-            return {"instances": 0, "clusters": 0, "threshold": threshold}
-        embeddings = [json.loads(item["embedding_json"] or "[]") for item in instances]
-        parents = list(range(len(instances)))
-
-        def find(index):
-            while parents[index] != index:
-                parents[index] = parents[parents[index]]
-                index = parents[index]
-            return index
-
-        def union(left, right):
-            left, right = find(left), find(right)
-            if left != right:
-                parents[right] = left
-
-        for left in range(len(embeddings)):
-            for right in range(left + 1, len(embeddings)):
-                if self._cosine(embeddings[left], embeddings[right]) >= threshold:
-                    union(left, right)
-
-        groups = {}
-        for index in range(len(instances)):
-            groups.setdefault(find(index), []).append(index)
+            return {"instances": 0, "clusters": 0, "threshold": threshold, "minimum_quality": minimum_quality}
+        samples = []
+        for row in instances:
+            embedding = json.loads(row["embedding_json"] or "[]")
+            quality = float(row.get("quality", 0) or 0) or float(row.get("detection_confidence", 0) or 0)
+            samples.append(
+                FaceSample(
+                    row["id"], embedding, quality=quality,
+                    pose_bucket=row.get("pose_bucket") or "unknown",
+                    model_name=row.get("embedding_model") or "unknown",
+                    model_version=row.get("embedding_version") or "unknown",
+                    protected_cluster=(
+                        row["cluster_id"]
+                        if (self._row("SELECT status FROM face_clusters WHERE id = ?", (row["cluster_id"],)) or {}).get("status") == "confirmed"
+                        else None
+                    ),
+                )
+            )
+        result = FaceClusterer(match_threshold=threshold, minimum_quality=minimum_quality).fit(samples)
         timestamp = now_iso()
         active_cluster_ids = set()
-        for members in groups.values():
-            medoid = max(
-                members,
-                key=lambda candidate: sum(self._cosine(embeddings[candidate], embeddings[other]) for other in members),
-            )
-            keep_id = instances[members[0]]["cluster_id"]
+        for cluster in result.clusters:
+            member_ids = [item.id for item in cluster.members]
+            old_cluster_ids = [row["cluster_id"] for row in instances if row["id"] in member_ids]
+            confirmed_cluster_ids = [
+                old_id for old_id in dict.fromkeys(old_cluster_ids)
+                if (self._row("SELECT status FROM face_clusters WHERE id = ?", (old_id,)) or {}).get("status") == "confirmed"
+            ]
+            keep_id = confirmed_cluster_ids[0] if confirmed_cluster_ids else old_cluster_ids[0]
             active_cluster_ids.add(keep_id)
-            member_instance_ids = [instances[index]["id"] for index in members]
-            self.connection.executemany("UPDATE face_instances SET cluster_id = ? WHERE id = ?", [(keep_id, instance_id) for instance_id in member_instance_ids])
-            self.connection.execute(
-                """UPDATE face_clusters SET representative_embedding_json = ?, member_count = ?, revision = revision + 1, updated_at = ?, status = 'pending'
-                WHERE id = ?""",
-                (json_value(self._normalise_vector(embeddings[medoid]), []), len(members), timestamp, keep_id),
+            confirmed = bool(confirmed_cluster_ids)
+            self.connection.executemany(
+                "UPDATE face_instances SET cluster_id = ? WHERE id = ?",
+                [(keep_id, instance_id) for instance_id in member_ids],
             )
-            old_cluster_ids = {instances[index]["cluster_id"] for index in members if instances[index]["cluster_id"] != keep_id}
-            for old_cluster_id in old_cluster_ids:
-                self.connection.execute("UPDATE face_clusters SET status = 'rejected', member_count = 0, updated_at = ?, revision = revision + 1 WHERE id = ?", (timestamp, old_cluster_id))
-            for instance_id in member_instance_ids:
-                vector = self._row("SELECT metadata_json FROM memory_vectors WHERE source_type = 'face_instance' AND source_id = ? ORDER BY updated_at DESC LIMIT 1", (instance_id,))
+            self.connection.execute(
+                """UPDATE face_clusters SET member_count = ?, revision = revision + 1,
+                updated_at = ?, status = ? WHERE id = ?""",
+                (len(member_ids), timestamp, "confirmed" if confirmed else "pending", keep_id),
+            )
+            self._refresh_face_prototypes(keep_id)
+            for old_cluster_id in set(old_cluster_ids):
+                if old_cluster_id == keep_id:
+                    continue
+                self.connection.execute(
+                    """UPDATE face_clusters SET status = 'rejected', member_count = 0,
+                    updated_at = ?, revision = revision + 1 WHERE id = ?""",
+                    (timestamp, old_cluster_id),
+                )
+            for instance_id in member_ids:
+                vector = self._row(
+                    "SELECT metadata_json FROM memory_vectors WHERE source_type = 'face_instance' AND source_id = ? ORDER BY updated_at DESC LIMIT 1",
+                    (instance_id,),
+                )
                 metadata = json.loads(vector["metadata_json"] or "{}") if vector else {}
                 metadata["cluster_id"] = keep_id
                 self.connection.execute(
                     "UPDATE memory_vectors SET metadata_json = ?, updated_at = ? WHERE source_type = 'face_instance' AND source_id = ?",
                     (json_value(metadata, {}), timestamp, instance_id),
                 )
+        stale_ids = {
+            row["cluster_id"] for row in instances if row["cluster_id"] not in active_cluster_ids
+        }
+        for cluster_id in stale_ids:
+            self.connection.execute(
+                "UPDATE face_clusters SET status = 'rejected', member_count = 0, updated_at = ?, revision = revision + 1 WHERE id = ?",
+                (timestamp, cluster_id),
+            )
+        self._sync_face_entity_statuses(timestamp)
         self.connection.commit()
-        return {"instances": len(instances), "clusters": len(groups), "threshold": threshold}
+        return {
+            "instances": len(instances), "clusters": len(result.clusters),
+            "threshold": threshold, "minimum_quality": minimum_quality,
+            "noise": sum(1 for cluster in result.clusters if cluster.noise),
+        }
+
+    def _sync_face_entity_statuses(self, timestamp=None):
+        """Hide pending entities whose candidate face clusters were retired."""
+        timestamp = timestamp or now_iso()
+        entities = self._rows("SELECT id, status FROM entities WHERE entity_type = 'person'")
+        for entity in entities:
+            active_count = self.connection.execute(
+                "SELECT COUNT(*) FROM face_clusters WHERE entity_id = ? AND status IN ('pending', 'confirmed') AND member_count > 0",
+                (entity["id"],),
+            ).fetchone()[0]
+            if active_count == 0 and entity["status"] != "confirmed":
+                self.connection.execute(
+                    "UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ?",
+                    ("该人物候选已因全局重聚类失效，保留历史审计记录", timestamp, entity["id"]),
+                )
 
     def list_face_clusters(self, status=None):
         params = [status] if status else []
-        where = "WHERE fc.status = ?" if status else ""
+        where = "WHERE fc.status = ?" if status else "WHERE fc.status != 'rejected'"
         rows = self._rows(f"""SELECT fc.*, e.canonical_name, e.family_role, e.status AS entity_status
             FROM face_clusters fc LEFT JOIN entities e ON e.id = fc.entity_id {where} ORDER BY fc.updated_at DESC""", params)
         for row in rows:

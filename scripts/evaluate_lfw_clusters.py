@@ -1,14 +1,50 @@
 #!/usr/bin/env python3
-"""Evaluate unsupervised face clusters against LFW directory labels."""
+"""Evaluate a controlled LFW-backed album without leaking labels into Sentrix."""
 
 import json
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from backend.face_clustering import pairwise_metrics
 
-def evaluate(db_path):
+
+def _truth_from_manifest(manifest_path):
+    if not manifest_path:
+        return {}
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    return {item["file"]: item["source_identity"] for item in manifest.get("assets", [])}
+
+
+def evaluate(db_path, manifest_path=None):
     connection = sqlite3.connect(db_path)
+    truth_by_file = _truth_from_manifest(manifest_path)
+    if truth_by_file:
+        rows = connection.execute("""SELECT fi.id, fi.cluster_id, a.file_name
+            FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
+            WHERE fi.cluster_id IS NOT NULL""").fetchall()
+        rows = [row for row in rows if row[2] in truth_by_file]
+        predicted = {face_id: cluster_id for face_id, cluster_id, _ in rows}
+        truth = {face_id: truth_by_file[file_name] for face_id, _, file_name in rows}
+        metrics = pairwise_metrics(predicted, truth)
+        clusters = defaultdict(list)
+        for _, cluster_id, file_name in rows:
+            clusters[cluster_id].append(truth_by_file[file_name])
+        return {
+            "identity_samples": len(rows),
+            "known_identities": len(set(truth.values())),
+            "clusters": len(clusters),
+            **{key: round(value, 4) if isinstance(value, float) else value for key, value in metrics.items()},
+            "largest_clusters": sorted(
+                (
+                    {"cluster_id": cluster_id, "members": len(labels), "labels": Counter(labels).most_common(3)}
+                    for cluster_id, labels in clusters.items()
+                ),
+                key=lambda item: item["members"], reverse=True,
+            )[:10],
+        }
     rows = connection.execute("""SELECT fi.cluster_id, a.path
         FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
         WHERE json_extract(a.metadata_json, '$.benchmark') = 'lfw'""").fetchall()
@@ -31,5 +67,11 @@ def evaluate(db_path):
 
 
 if __name__ == "__main__":
+    import argparse
+
     root = Path(__file__).resolve().parents[1]
-    print(json.dumps(evaluate(root / "data" / "sentrix.db"), ensure_ascii=False, indent=2))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", type=Path, default=root / "data" / "sentrix.db")
+    parser.add_argument("--manifest", type=Path)
+    args = parser.parse_args()
+    print(json.dumps(evaluate(args.db, args.manifest), ensure_ascii=False, indent=2))

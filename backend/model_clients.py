@@ -5,6 +5,34 @@ import os
 import re
 from pathlib import Path
 
+from .face_embeddings import AdaFaceAdapter, FaceEmbeddingUnavailable, MagFaceAdapter, compute_face_quality
+
+
+def align_face_crop(image, bbox, landmarks=None):
+    """Return an RGB AdaFace input, using InsightFace's five-point alignment when available."""
+    from PIL import Image
+
+    if landmarks:
+        try:
+            import numpy as np
+            from insightface.utils import face_align
+
+            aligned_bgr = face_align.norm_crop(
+                image,
+                np.asarray(landmarks, dtype="float32"),
+                image_size=112,
+            )
+            return Image.fromarray(aligned_bgr[:, :, ::-1])
+        except (ImportError, TypeError, ValueError):
+            pass
+    left, top, right, bottom = (int(round(value)) for value in bbox)
+    image_height, image_width = image.shape[:2]
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(image_width, right), min(image_height, bottom)
+    if right <= left or bottom <= top:
+        raise FaceEmbeddingUnavailable("invalid face bounding box")
+    return Image.fromarray(image[top:bottom, left:right][:, :, ::-1])
+
 try:
     import httpx
 except ImportError:  # Keep pure parsing and SQLite tests runnable without optional runtime deps.
@@ -118,6 +146,7 @@ class GammaClient:
             "messages": [message],
             "stream": False,
             "format": "json",
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "0"),
             "options": {"temperature": 0},
         }
         try:
@@ -175,6 +204,27 @@ metadata: {json.dumps(metadata or {}, ensure_ascii=False)}"""
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.55)
         parsed["model"] = self.model
         return parsed
+
+    def analyze_person_appearance(self, path, metadata=None):
+        """Extract clothing only for the person represented by a body crop."""
+        file_path = Path(path)
+        encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "image/jpeg"
+        prompt = """你是家庭记忆人物外观观察器。输入图片是从一个已检测人脸向下扩展得到的同一目标人物裁剪。
+只描述这个目标人物能够明确看见的衣物、颜色、款式和配饰；不得描述背景或其他人物，不得猜测姓名、性别、关系或看不清的细节。
+严格只返回简体中文 JSON：clothing（数组）、confidence。无法可靠归属给目标人物时 clothing 返回空数组。
+目标人物裁剪元数据：""" + json.dumps(metadata or {}, ensure_ascii=False)
+        parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}]))
+        clothing = []
+        for item in as_list(parsed.get("clothing")):
+            value = as_text(item).strip()
+            if value:
+                clothing.append(value)
+        return {
+            "clothing": list(dict.fromkeys(clothing)),
+            "confidence": normalize_confidence(parsed.get("confidence"), 0.55),
+            "model": self.model,
+        }
 
     def analyze_text(self, text, source_type="text"):
         prompt = """从下面的家庭文本或音频转写中抽取事件观察和可维护事实。只返回 JSON，不要添加 Markdown。
@@ -298,7 +348,9 @@ class ClipAdapter:
     def __init__(self):
         self.enabled = os.getenv("CLIP_ENABLED", "true").lower() in {"1", "true", "yes"}
         self.model_name = os.getenv("CLIP_MODEL_NAME", "ViT-B-32")
-        self.checkpoint = os.getenv("CLIP_CHECKPOINT", "")
+        configured_checkpoint = os.getenv("CLIP_CHECKPOINT", "")
+        project_checkpoint = Path(__file__).resolve().parents[1] / "data" / "models" / "clip" / f"{self.model_name}.bin"
+        self.checkpoint = configured_checkpoint or (str(project_checkpoint) if project_checkpoint.is_file() else "")
         self._model = None
         self._preprocess = None
         self._tokenizer = None
@@ -364,6 +416,36 @@ class FaceAdapter:
         self.enabled = os.getenv("FACE_ENABLED", "true").lower() in {"1", "true", "yes"}
         self._app = None
         self.error = None
+        self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "adaface").lower()
+        self.identity_adapter = self._build_identity_adapter()
+        self.identity_error = None
+        self.identity_runtime_error = None
+        if self.identity_model not in {"none", "legacy", "adaface", "magface"}:
+            self.identity_error = f"unsupported face embedding mode: {self.identity_model}"
+        elif self.identity_model in {"adaface", "magface"} and not self.identity_adapter.available:
+            self.identity_error = f"{self.identity_model} checkpoint is unavailable"
+
+    def _build_identity_adapter(self):
+        if self.identity_model == "adaface":
+            return AdaFaceAdapter()
+        if self.identity_model == "magface":
+            return MagFaceAdapter(
+                model_version=os.getenv("MAGFACE_MODEL_VERSION", "unconfigured"),
+                backend=None,
+            )
+        return None
+
+    @property
+    def identity_configured(self):
+        return self.identity_model == "legacy" or bool(self.identity_adapter and self.identity_adapter.available)
+
+    @property
+    def identity_ready(self):
+        return self.identity_configured and self.identity_runtime_error is None
+
+    @property
+    def ready(self):
+        return self.enabled and self.error is None
 
     def detect(self, path):
         if not self.enabled:
@@ -394,15 +476,50 @@ class FaceAdapter:
                 if score < min_score or min(width, height) < min_size:
                     continue
                 area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
-                quality = min(1.0, score * 0.7 + min(1.0, min(width, height) / 160.0) * 0.3)
+                # Identity candidacy is deliberately stricter than face evidence.
+                # A weak/small face stays attached to the observation but cannot
+                # create a noisy pending person cluster.
+                sharpness = 0.0
+                quality = compute_face_quality(score, area_ratio, sharpness, getattr(face, "pose", []))
                 results.append({
                     "bbox": bbox,
                     "confidence": score,
                     "quality": quality,
                     "area_ratio": area_ratio,
+                    "sharpness": sharpness,
                     "pose": [float(item) for item in getattr(face, "pose", [])] if getattr(face, "pose", None) is not None else [],
+                    "landmarks": [[float(value) for value in point] for point in getattr(face, "kps", [])] if getattr(face, "kps", None) is not None else [],
                     "embedding": face.embedding.tolist() if getattr(face, "embedding", None) is not None else [],
                 })
+                result = results[-1]
+                if self.identity_model in {"adaface", "magface"}:
+                    result["embedding_model"] = self.identity_model
+                    result["embedding_version"] = self.identity_adapter.model_version
+                    result["identity_ready"] = self.identity_configured
+                    if not self.identity_configured:
+                        result["embedding"] = []
+                        result["identity_error"] = self.identity_error
+                    else:
+                        try:
+                            crop = align_face_crop(image, bbox, result["landmarks"])
+                            embedded = self.identity_adapter.embed(crop)
+                            result["embedding"] = embedded.embedding
+                            result["embedding_version"] = embedded.model_version
+                            result["quality_signal"] = embedded.quality_signal
+                            # AdaFace norm is stored as provenance, not treated as
+                            # a 0..10 score. It must not saturate all sample quality.
+                            result["identity_eligible"] = result["quality"] >= float(
+                                os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.70")
+                            )
+                        except FaceEmbeddingUnavailable as error:
+                            result["embedding"] = []
+                            result["identity_ready"] = False
+                            result["identity_error"] = str(error)
+                            self.identity_runtime_error = str(error)
+                elif self.identity_model == "legacy":
+                    result["embedding_model"] = "buffalo_l"
+                    result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
+                    result["identity_ready"] = True
             return results
         except Exception as error:  # Optional model should not block image memory.
             self.error = str(error)
