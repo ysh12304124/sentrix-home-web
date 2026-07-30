@@ -7,7 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.db import MemoryStore
 from backend.model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient
@@ -60,7 +60,7 @@ def rebuild(root, source):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--source", type=Path, default=None)
     args = parser.parse_args()
     source = args.source or (args.root / "data" / "test-albums")

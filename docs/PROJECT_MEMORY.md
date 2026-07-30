@@ -87,6 +87,20 @@ adapters. The major modules and ownership boundaries are:
 - **Operations and validation**: rebuild runs, model/version state, audit
   records, benchmark data, acceptance metrics, and service health.
 
+### Module Implementation Reference
+
+| Module | Implementation method | Authority / output |
+| --- | --- | --- |
+| `backend/app.py` | FastAPI routes construct the store, pipeline and agent once; file ingestion runs through the pipeline; cluster confirmation triggers participant, semantic and event-summary refresh. | HTTP API and application orchestration. |
+| `backend/db.py` | SQLite schema migration plus transactional CRUD/projections. `MemoryStore` owns all evidence joins, event candidate scoring, clustering persistence, semantic rebuilds, and audit status. | The only authoritative memory database. |
+| `backend/pipeline.py` | Normalizes allowed source provenance, calls modality adapters, persists immutable observations and vectors, then proposes/updates events. | `Asset`, `Observation`, visual vectors, event candidates. |
+| `backend/model_clients.py` | Thin adapters for Gemma visual/text JSON extraction, FunASR, buffalo_l detection, AdaFace embeddings and CLIP. Models never write to SQLite directly. | Structured model outputs with model/version provenance. |
+| `backend/face_embeddings.py` and `backend/face_clustering.py` | AdaFace face vectors plus quality/pose-aware multi-prototype global clustering. Low-quality detections remain evidence-only. | `FaceInstance`, `FaceCluster`, prototype and metric contracts. |
+| `backend/person_appearance.py` | Deterministic bounded expansion of a detected face to head-and-upper-body crop. | Crop coordinates used by person appearance evidence. |
+| `backend/agent.py` | Parses query constraints, retrieves claims/events/observations/vectors, validates evidence IDs, and answers deterministically when structured evidence is sufficient. | Answer, evidence layers, retrieval trace and query gaps. |
+| `src/` | Plain browser JavaScript renders backend-authoritative event, person, knowledge, asset and search views; `src/api.js` is the only browser API wrapper. | Local UI state only. |
+| `server.js` | Serves static files and proxies all `/api/*` requests to Sentrix FastAPI. | Same-origin web gateway; no alternate memory implementation. |
+
 ## End-to-End Data Pipeline
 
 The complete data path is the following. Each arrow represents a persisted
@@ -210,6 +224,31 @@ validation entries record commands, dates, and measured results. Do not place
 secrets, transient prompts, raw user identity data, or unverified benchmark
 claims in this file.
 
+### Repository Ownership
+
+This file is the single current-state handoff document. `README.md` contains
+only runnable entry points and links here. Approved historical designs and
+implementation plans remain under `docs/superpowers/`; Git history retains
+superseded root-level drafts and duplicate implementations. Do not create a
+second current architecture, implementation plan, or test-data document.
+
+The stable repository layout is:
+
+```text
+backend/                 authoritative API, persistence, pipeline, models, tests
+src/                     browser code and CSS
+scripts/runtime/         service lifecycle utilities
+scripts/maintenance/     explicit destructive or long-running operations
+scripts/benchmarks/      controlled evaluation tools
+scripts/fixtures/        reproducible test-data and metadata generators
+test/                    frontend and repository-layout regression tests
+docs/                    current memory and approved historical records
+```
+
+`server.js` is a static-file server and same-origin proxy to `backend.app`.
+It contains no mock API or Cognee fallback path. `backend.app` and its
+`MemoryStore` are the authoritative behavior and persistence boundaries.
+
 ## Source Data Contract
 
 Imported photos may contain only these external facts:
@@ -235,7 +274,7 @@ person.
 
 ## Validation Baseline
 
-The current automated baseline is 57 Python tests and 4 Node tests. Before
+The current automated baseline is 78 Python tests and 7 Node tests. Before
 claiming a change complete, run:
 
 ```bash
@@ -251,7 +290,8 @@ node --check src/api.js
 `data/full-chain` is public test imagery with synthetic, auditable capture
 time/location and neutral source-album provenance. It must not contain
 prewritten event names, family identities, roles, or relationships. Regenerate
-its metadata with `scripts/prepare_test_metadata.py` before a clean rebuild.
+its metadata with `scripts/fixtures/prepare_test_metadata.py` before a clean
+rebuild.
 
 ## Current Decisions (2026-07-29)
 
@@ -576,7 +616,7 @@ semantic memory.
 
 ### Runtime Gate
 
-- `scripts/start_sentrix_ollama.sh` owns the project-local Ollama listener on
+- `scripts/runtime/start_sentrix_ollama.sh` owns the project-local Ollama listener on
   `127.0.0.1:11435` and refuses to start it if shared `11434` has a resident
   model.
 - The dedicated runner was verified to use the RTX 3090 (`CUDA0`) with all
@@ -675,3 +715,47 @@ syntax checks, and Python compile checks passed. The known test-time warning
 that a synthetic `ClipAdapter` has no pretrained weights is limited to unit
 test construction; the deployed health endpoint reports the project checkpoint
 as ready.
+
+## Current Work Queue
+
+The following work is intentionally not represented as complete:
+
+1. **Event segmentation quality**: current event grouping combines capture
+   time/location, source provenance, activity/object overlap, visual place, and
+   confirmed-person overlap. It needs a controlled split/merge benchmark for
+   same-time same-place but distinct activities before its production threshold
+   is widened.
+2. **Appearance normalization**: face-scoped clothing evidence is correct and
+   traceable, but semantically equivalent values such as `深色西装外套` and
+   `黑色西装外套` are still separate claims. Add evidence-preserving attribute
+   normalization only after a reviewed Chinese vocabulary and evaluation set
+   exist.
+3. **Identity operations UI**: merge and split API/audit behavior exists;
+   complete the corresponding user review controls and regression coverage.
+4. **Video adapter**: the interface boundary is reserved only. No video
+   decoding, keyframe extraction, temporal evidence, or vector retrieval is
+   currently implemented.
+5. **Operationalization**: add a managed service definition for the Sentrix
+   API and dedicated Ollama runner after confirming host-level ownership and
+   restart policy. Do not alter the shared Ollama process.
+
+## Completed Work Snapshot
+
+- Evidence-first native SQLite memory model: assets, observations, events,
+  entities, face instances/clusters/prototypes, semantic profiles/claims,
+  person appearance evidence, vectors, feedback, and rebuild audit records.
+- Source metadata allowlist: capture time/location and album provenance only;
+  event labels, activities, identities, and relationships are rejected at
+  import.
+- AdaFace identity embeddings with buffalo_l face detection, quality-aware
+  candidate admission, multi-view global clustering, and controlled external
+  evaluation.
+- User naming propagation from face cluster to entity mentions, events,
+  profiles, claims, event summaries, and evidence-backed Agent recall.
+- Target-only person appearance extraction with an independent evidence record
+  before clothing claims can be created.
+- Dedicated CUDA-capable Sentrix Ollama runtime on `11435`, auto-unloading its
+  12B model to coexist with the shared `11434` service.
+- 120-image controlled acceptance, full backend/frontend regression suite, and
+  repository cleanup that removed stale root duplicate implementations, mock
+  gateway behavior, and duplicate test suites.

@@ -6,7 +6,7 @@ import mimetypes
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.db import MemoryStore, make_id
 from backend.model_clients import FaceAdapter
@@ -32,13 +32,14 @@ def ingest(root, source, limit):
         faces += len(detected)
         if processed % 50 == 0:
             print({"processed": processed, "faces": faces, "clusters": store.count("face_clusters")})
-    print({"processed": processed, "faces": faces, "clusters": store.count("face_clusters"), "entities": store.count("entities")})
+    recluster = store.recluster_faces()
+    print({"processed": processed, "faces": faces, "clusters": store.count("face_clusters"), "entities": store.count("entities"), "recluster": recluster})
     store.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=300)
     args = parser.parse_args()

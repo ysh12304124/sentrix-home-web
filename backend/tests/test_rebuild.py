@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from scripts.rebuild_memory import SUPPORTED, rebuild
+from scripts.maintenance.rebuild_memory import SUPPORTED, rebuild
 
 
 class RebuildInputTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class RebuildInputTests(unittest.TestCase):
             source = root / "source"
             source.mkdir()
 
-            with patch("scripts.rebuild_memory.FaceAdapter", return_value=UnavailableFace()):
+            with patch("scripts.maintenance.rebuild_memory.FaceAdapter", return_value=UnavailableFace()):
                 with self.assertRaisesRegex(RuntimeError, "identity embedding"):
                     rebuild(root, source)
 

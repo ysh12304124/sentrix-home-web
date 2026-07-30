@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 runtime_dir="$root/.ollama-sentrix"
 host="${SENTRIX_OLLAMA_HOST:-127.0.0.1:11435}"
 models_dir="${SENTRIX_OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}"

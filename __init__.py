@@ -1,1 +1,0 @@
-"""Sentrix independent memory backend."""

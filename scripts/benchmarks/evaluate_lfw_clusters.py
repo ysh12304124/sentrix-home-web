@@ -7,7 +7,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.face_clustering import pairwise_metrics
 
 
@@ -69,7 +69,7 @@ def evaluate(db_path, manifest_path=None):
 if __name__ == "__main__":
     import argparse
 
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=root / "data" / "sentrix.db")
     parser.add_argument("--manifest", type=Path)

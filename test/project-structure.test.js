@@ -1,0 +1,39 @@
+const fs = require("fs");
+const path = require("path");
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const root = path.resolve(__dirname, "..");
+const exists = (...parts) => fs.existsSync(path.join(root, ...parts));
+
+test("runtime and maintenance entry points use the documented layout", () => {
+  for (const file of [
+    ["src", "styles.css"],
+    ["scripts", "runtime", "start_sentrix_ollama.sh"],
+    ["scripts", "maintenance", "rebuild_memory.py"],
+    ["scripts", "benchmarks", "evaluate_lfw_clusters.py"],
+    ["scripts", "fixtures", "build_virtual_family_album.py"],
+  ]) assert.equal(exists(...file), true, file.join("/") + " must exist");
+  assert.match(fs.readFileSync(path.join(root, "index.html"), "utf8"), /href="\/src\/styles\.css"/);
+});
+
+test("root directory contains only application entry points and project metadata", () => {
+  for (const file of [
+    "agent.py", "app.py", "db.py", "pipeline.py", "model_clients.py", "rebuild_memory.py",
+    "api.js", "app.js", "normalizers.js", "styles.css", "architecture.md", "implementation-plan.md",
+    "test-datasets.md", "download_test_data.py", "evaluate_lfw_clusters.py", "ingest_face_benchmark.py",
+  ]) assert.equal(exists(file), false, file + " must not remain as a duplicate root entry point");
+});
+
+test("web gateway only proxies the authoritative Sentrix API", () => {
+  const source = fs.readFileSync(path.join(root, "server.js"), "utf8");
+  assert.doesNotMatch(source, /COGNEE_BASE_URL|mockSearch|function handleApi/);
+  assert.match(source, /return proxyBackend\(req, res, url\);/);
+});
+
+test("virtual fixture keeps evaluation labels outside imported metadata", () => {
+  const source = fs.readFileSync(path.join(root, "scripts", "fixtures", "build_virtual_family_album.py"), "utf8");
+  const metadataSection = source.split('"sentrix_metadata.json"')[1];
+  assert.ok(metadataSection);
+  assert.doesNotMatch(metadataSection, /activity_hint|source_identity|family_member|photographer/);
+});

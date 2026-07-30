@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build an auditable 120-image virtual family album from public LFW identities.
 
-The images retain their LFW identity provenance. Capture times, places,
-photographer labels, and event labels are explicitly synthetic test metadata;
-they are never presented as original EXIF facts.
+The images retain their LFW identity provenance. Capture times and locations
+are synthetic test provenance; identity and event labels remain external
+evaluation data and are never imported into Sentrix.
 """
 
 import argparse
@@ -14,12 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-IDENTITIES = [
-    ("George_W_Bush", "父亲"),
-    ("Colin_Powell", "母亲"),
-    ("Tony_Blair", "哥哥"),
-    ("Donald_Rumsfeld", "妹妹"),
-]
+IDENTITIES = ["George_W_Bush", "Colin_Powell", "Tony_Blair", "Donald_Rumsfeld"]
 
 EVENTS = [
     ("evt_birthday", "2025-05-10T18:00:00+00:00", "家中餐厅", "生日庆祝", "父亲"),
@@ -47,7 +42,7 @@ def build(source, output, per_identity=30):
         "license_note": "LFW is a public research benchmark; verify downstream use terms before redistribution.",
         "identity_count": len(IDENTITIES),
         "synthetic_metadata": True,
-        "metadata_note": "captured_at, captured_location, photographer, activity, and event_id are constructed for Sentrix tests.",
+        "metadata_note": "event labels and identity labels are external evaluation data only; imported metadata contains provenance, capture time, and capture location only.",
         "events": [
             {"event_id": event_id, "captured_at": captured_at, "location": location, "activity": activity, "photographer": photographer}
             for event_id, captured_at, location, activity, photographer in EVENTS
@@ -55,15 +50,14 @@ def build(source, output, per_identity=30):
         "assets": [],
     }
     files = []
-    for source_identity, family_role in IDENTITIES:
+    for source_identity in IDENTITIES:
         candidates = sorted((source / source_identity).glob("*.jpg"))[:per_identity]
         if len(candidates) < per_identity:
             raise ValueError(f"{source_identity} has only {len(candidates)} images")
-        files.extend((source_identity, family_role, path) for path in candidates)
+        files.extend((source_identity, path) for path in candidates)
 
     base = datetime(2025, 5, 10, 18, 0, tzinfo=timezone.utc)
-    for index, (source_identity, family_role, source_path) in enumerate(files):
-        event_id, event_time, location, activity, photographer = EVENTS[index % len(EVENTS)]
+    for index, (source_identity, source_path) in enumerate(files):
         # Keep every event populated by all four fixed family identities while
         # making the first two events share time and place but differ in activity.
         event_index = (index // len(IDENTITIES)) % len(EVENTS)
@@ -75,7 +69,6 @@ def build(source, output, per_identity=30):
         manifest["assets"].append({
             "file": target_name,
             "source_identity": source_identity,
-            "family_member": family_role,
             "captured_at": captured.isoformat(),
             "captured_location": location,
             "photographer": photographer,
@@ -88,16 +81,14 @@ def build(source, output, per_identity=30):
         item["file"]: {
             "captured_at": item["captured_at"],
             "captured_location": item["captured_location"],
-            "source_owner_id": f"family_{item['photographer']}",
-            "source_owner_label": item["photographer"],
+            "source_owner_id": f"test-album-owner-{index % len(IDENTITIES) + 1}",
+            "source_owner_label": f"测试相册归属成员 {index % len(IDENTITIES) + 1}",
             "source_device_id": "virtual-device-1",
-            "source_album_id": item["event_id"],
+            "source_album_id": f"test-album-{index // len(IDENTITIES) + 1}",
             "source_confidence": 1.0,
-            "event_id": item["event_id"],
-            "activity_hint": item["activity"],
             "metadata_origin": item["metadata_origin"],
         }
-        for item in manifest["assets"]
+        for index, item in enumerate(manifest["assets"])
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     (output / "virtual_album_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"assets": len(manifest["assets"]), "identities": len(IDENTITIES), "events": len(EVENTS), "output": str(output)}, ensure_ascii=False))
