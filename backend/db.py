@@ -393,8 +393,11 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_person_appearance_person ON person_appearance_evidence(person_id);
             CREATE INDEX IF NOT EXISTS idx_person_appearance_face ON person_appearance_evidence(face_instance_id);
             CREATE INDEX IF NOT EXISTS idx_entity_mentions_observation ON entity_mentions(observation_id);
+            CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
             CREATE INDEX IF NOT EXISTS idx_relationship_subject_object ON relationships(subject_entity_id, object_entity_id);
             CREATE INDEX IF NOT EXISTS idx_memory_vectors_space ON memory_vectors(space);
+            CREATE INDEX IF NOT EXISTS idx_memory_vectors_visual_asset ON memory_vectors(space, source_type, source_id, model_name);
+            CREATE INDEX IF NOT EXISTS idx_event_observations_observation ON event_observations(observation_id);
             CREATE INDEX IF NOT EXISTS idx_event_participants_event ON event_participants(event_id);
             CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id);
             CREATE INDEX IF NOT EXISTS idx_semantic_claims_person ON semantic_claims(person_id);
@@ -736,10 +739,8 @@ class MemoryStore:
         else:
             time_score = 0.25
         locations = {item["location"] for item in event_anchors if item["location"]}
-        albums = {item["album"] for item in event_anchors if item["album"]}
         visual_places = {item["visual_place"] for item in event_anchors if item["visual_place"]}
         location_score = 1.0 if anchor["location"] and anchor["location"] in locations else 0.0
-        album_score = 1.0 if anchor["album"] and anchor["album"] in albums else 0.0
         visual_place_score = 1.0 if anchor["visual_place"] and anchor["visual_place"] in visual_places else 0.0
         event_type = anchor["visual_event_type"]
         event_types = {item["visual_event_type"] for item in event_anchors if item["visual_event_type"]}
@@ -747,41 +748,110 @@ class MemoryStore:
         activity = str(observation.get("activity") or "").lower()
         existing_activity = str(event.get("activity") or "").lower()
         activity_score = 0.9 if activity and existing_activity and (activity == existing_activity or activity in existing_activity or existing_activity in activity) else 0.0
-        album_matches = bool(anchor["album"] and anchor["album"] in albums)
-        if activity and existing_activity and not activity_score and event_type and event_type not in event_types and not album_matches:
+        if activity and existing_activity and not activity_score and event_type and event_type not in event_types:
             activity_score = -0.8
         object_sets = [self._tokens(self.get_observation(item["observation_id"]).get("objects")) for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (event["id"],))]
         objects = self._tokens(observation.get("objects"))
         object_score = 0.8 if objects and any(objects.intersection(values) for values in object_sets) else 0.0
-        people = {str(item.get("entity_id") if isinstance(item, dict) else item) for item in observation.get("people") or []}
-        raw_people = event.get("participants_json") or []
-        if isinstance(raw_people, str):
-            try:
-                raw_people = json.loads(raw_people)
-            except json.JSONDecodeError:
-                raw_people = []
-        existing_people = {str(item.get("entity_id") if isinstance(item, dict) else item) for item in raw_people}
+        people = self._confirmed_entity_ids_for_observation(observation.get("id"))
+        existing_people = self._confirmed_entity_ids_for_event(event["id"])
         person_score = 0.8 if people and existing_people and people.intersection(existing_people) else 0.0
-        total = (
-            0.25 * time_score + 0.25 * location_score + 0.10 * album_score
-            + 0.15 * visual_place_score + 0.05 * event_type_score + 0.20 * activity_score
-            + 0.05 * object_score + 0.05 * person_score
+        visual_similarity, visual_available = self._event_visual_similarity(observation, event["id"])
+        semantic_conflict = bool(
+            activity and existing_activity and activity != existing_activity
+            and event_type and event_types and event_type not in event_types
         )
+        corroborated = bool(object_score or person_score)
+        split_guard = None
+        # Visual variation alone is normal for a family event: close-ups,
+        # group shots, and different camera angles need not look alike. Split
+        # only when independent semantic evidence also conflicts and no known
+        # person/object bridges the candidate event.
+        if visual_available and semantic_conflict and visual_similarity < 0.45 and not corroborated:
+            split_guard = "semantic_visual_conflict"
+        visual_boost = (
+            max(0.0, min(1.0, (visual_similarity - 0.70) / 0.30))
+            if visual_available else 0.0
+        )
+        total = (
+            0.25 * time_score + 0.25 * location_score + 0.15 * visual_place_score
+            + 0.05 * event_type_score + 0.20 * activity_score
+            + 0.05 * object_score + 0.20 * person_score + 0.05 * visual_boost
+        )
+        if split_guard:
+            total = 0.0
         return {
             "total": max(0.0, min(1.0, total)), "time": time_score, "location": location_score,
-            "album": album_score, "visual_place": visual_place_score, "event_type": event_type_score,
-            "activity": activity_score, "objects": object_score, "people": person_score,
+            "visual_place": visual_place_score, "event_type": event_type_score,
+            "activity": activity_score, "objects": object_score, "confirmed_people": person_score,
+            "visual_similarity": visual_similarity, "visual_available": visual_available,
+            "visual_boost": visual_boost, "semantic_conflict": semantic_conflict,
+            "split_guard": split_guard,
         }
+
+    def _event_visual_similarity(self, observation, event_id):
+        """Return the strongest asset-vector match for a candidate event."""
+        asset_id = observation.get("asset_id")
+        row = self._row(
+            """SELECT vector_json, model_name FROM memory_vectors WHERE space = 'visual'
+            AND source_type = 'asset' AND source_id = ? ORDER BY updated_at DESC LIMIT 1""",
+            (asset_id,),
+        )
+        if not row:
+            return 0.0, False
+        try:
+            incoming = json.loads(row["vector_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return 0.0, False
+        if not incoming:
+            return 0.0, False
+        rows = self._rows(
+            """SELECT mv.vector_json FROM memory_vectors mv JOIN observations o
+            ON o.asset_id = mv.source_id JOIN event_observations eo
+            ON eo.observation_id = o.id
+            WHERE mv.space = 'visual' AND mv.source_type = 'asset'
+            AND mv.model_name = ? AND eo.event_id = ?""",
+            (row["model_name"], event_id),
+        )
+        vectors = []
+        for item in rows:
+            try:
+                values = json.loads(item["vector_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if values and len(values) == len(incoming):
+                vectors.append(values)
+        if not vectors:
+            return 0.0, False
+        return max(self._cosine(incoming, values) for values in vectors), True
+
+    def _confirmed_entity_ids_for_observation(self, observation_id):
+        if not observation_id:
+            return set()
+        rows = self._rows(
+            """SELECT DISTINCT em.entity_id FROM entity_mentions em
+            JOIN entities e ON e.id = em.entity_id
+            WHERE em.observation_id = ? AND e.entity_type = 'person' AND e.status = 'confirmed'""",
+            (observation_id,),
+        )
+        return {row["entity_id"] for row in rows}
+
+    def _confirmed_entity_ids_for_event(self, event_id):
+        rows = self._rows(
+            """SELECT DISTINCT em.entity_id FROM entity_mentions em
+            JOIN entities e ON e.id = em.entity_id
+            JOIN event_observations eo ON eo.observation_id = em.observation_id
+            WHERE eo.event_id = ? AND e.entity_type = 'person' AND e.status = 'confirmed'""",
+            (event_id,),
+        )
+        return {row["entity_id"] for row in rows}
 
     def _event_anchor(self, observation):
         observation = observation or {}
         asset = self.get_asset(observation.get("asset_id")) or {}
-        metadata = asset.get("metadata_json") or {}
         return {
             "captured_at": asset.get("captured_at") or observation.get("captured_at"),
             "location": (asset.get("captured_location") or "").strip().lower(),
-            "album": (asset.get("source_album_id") or "").strip().lower(),
-            "event_hint": (metadata.get("event_hint") or "").strip().lower(),
             "visual_place": (observation.get("place") or "").strip().lower(),
             "visual_event_type": (observation.get("event_type") or "").strip().lower(),
         }
@@ -791,7 +861,11 @@ class MemoryStore:
         event = candidates[0] if candidates else None
         diagnostics = self._event_candidate_diagnostics(observation)
         anchor = self._event_anchor(observation)
-        people = dedupe_json_values((json.loads(event["participants_json"]) if event else []) + (observation.get("people") or []))
+        confirmed_people = [
+            {"entity_id": entity_id, "name": self.get_entity(entity_id)["canonical_name"], "status": "confirmed"}
+            for entity_id in sorted(self._confirmed_entity_ids_for_observation(observation.get("id")))
+        ]
+        people = dedupe_json_values((json.loads(event["participants_json"]) if event else []) + confirmed_people)
         captured_at = anchor["captured_at"]
         event_place = anchor["location"] or observation.get("place")
         event_type = "待判断"
@@ -813,7 +887,7 @@ class MemoryStore:
             self.connection.execute(
                 """INSERT INTO events(id, title, event_type, time_start, time_end, place, activity, summary,
                 participants_json, confidence, aggregation_breakdown_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (event_id, title, event_type, captured_at, captured_at, event_place, observation.get("activity"), observation.get("caption") or title, json_value(people, []), float(observation.get("confidence", 0) or 0), json_value({"selected": False, "ambiguity": len(diagnostics) > 1, "candidates": diagnostics[:5]}, {}), now_iso(), now_iso()),
+                (event_id, title, event_type, captured_at, captured_at, event_place, observation.get("activity"), observation.get("caption") or title, json_value(people, []), float(observation.get("confidence", 0) or 0), json_value({"selected": False, "ambiguity": len(diagnostics) > 1, "split_guard": next((item["breakdown"].get("split_guard") for item in diagnostics if item["breakdown"].get("split_guard")), None), "candidates": diagnostics[:5]}, {}), now_iso(), now_iso()),
             )
         self.connection.execute("INSERT OR IGNORE INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event_id, observation["id"]))
         if event:
@@ -1623,7 +1697,20 @@ class MemoryStore:
         self._refresh_face_prototypes(best["id"])
         self.connection.commit()
         self.upsert_vector("visual", "face_instance", instance_id, embedding, embedding_model, {"cluster_id": best["id"], "asset_id": asset_id, "observation_id": observation_id, "model_version": embedding_version, "quality": float(quality or 0), "pose_bucket": pose_bucket_value})
+        entity = self.get_entity(best.get("entity_id")) if best.get("entity_id") else None
+        if entity and entity.get("status") == "confirmed":
+            self._link_confirmed_entity_mention(entity, observation_id, instance_id, face.get("confidence"))
         return {"id": instance_id, "cluster_id": best["id"], "score": best_score, "embedding": embedding}
+
+    def _link_confirmed_entity_mention(self, entity, observation_id, face_instance_id, confidence=0.0):
+        self.connection.execute(
+            """INSERT OR IGNORE INTO entity_mentions(
+                id, entity_id, observation_id, face_instance_id, confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (make_id("mention"), entity["id"], observation_id, face_instance_id, float(confidence or 0), now_iso()),
+        )
+        self._add_entity_to_observation(observation_id, entity)
+        self.connection.commit()
 
     def _refresh_face_prototypes(self, cluster_id):
         rows = self._rows(
@@ -1785,13 +1872,13 @@ class MemoryStore:
         observation_ids = []
         for instance in instances:
             observation_ids.append(instance["observation_id"])
-            self.connection.execute("INSERT OR IGNORE INTO entity_mentions(id, entity_id, observation_id, face_instance_id, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?)", (make_id("mention"), entity["id"], instance["observation_id"], instance["id"], float(instance["detection_confidence"] or 0), now_iso()))
-            self._add_entity_to_observation(instance["observation_id"], entity)
+            self._link_confirmed_entity_mention(entity, instance["observation_id"], instance["id"], instance["detection_confidence"])
         if family_role:
             self.maintain_fact(name, "家庭角色", family_role, list(dict.fromkeys(observation_ids)), confidence=1.0)
         self.connection.execute("UPDATE entities SET summary = ?, updated_at = ? WHERE id = ?", (f"已确认人物，出现在 {len(set(observation_ids))} 条观察中", now_iso(), entity["id"]))
         self.connection.commit()
         self._refresh_event_participants(observation_ids)
+        self.resegment_events_for_confirmed_entity(entity["id"])
         memory = self.rebuild_person_memory(entity["id"])
         self.connection.commit()
         if memory:
@@ -1813,6 +1900,58 @@ class MemoryStore:
             values.append({"entity_id": entity["id"], "name": entity["canonical_name"], "status": entity["status"]})
         self.connection.execute("UPDATE observations SET people_json = ? WHERE id = ?", (json_value(values, []), observation_id))
 
+    def resegment_events_for_confirmed_entity(self, entity_id):
+        """Merge only events bridged by a newly confirmed person and compatible scores."""
+        event_ids = self.entity_event_ids(entity_id)
+        if len(event_ids) < 2:
+            return []
+        merged = []
+        for event_id in sorted(event_ids):
+            event = self.get_event(event_id)
+            if not event or event_id not in {item["id"] for item in self.list_events(1000)}:
+                continue
+            for other_id in sorted(event_ids):
+                if other_id == event_id:
+                    continue
+                other = self.get_event(other_id)
+                if not other:
+                    continue
+                observation_id = next((item for item in other["observation_ids"] if entity_id in self._confirmed_entity_ids_for_observation(item)), None)
+                if not observation_id:
+                    continue
+                score = self._event_candidate_score(self.get_observation(observation_id), event, [
+                    self._event_anchor(self.get_observation(item)) for item in event["observation_ids"]
+                ])
+                if score["total"] >= 0.50:
+                    self._merge_events(event_id, other_id)
+                    merged.append((event_id, other_id))
+                    break
+        return merged
+
+    def _merge_events(self, target_event_id, source_event_id):
+        if target_event_id == source_event_id:
+            return self.get_event(target_event_id)
+        target = self.get_event(target_event_id)
+        source = self.get_event(source_event_id)
+        if not target or not source:
+            return target
+        affected_people = self._confirmed_entity_ids_for_event(target_event_id) | self._confirmed_entity_ids_for_event(source_event_id)
+        self.connection.execute(
+            "INSERT OR IGNORE INTO event_observations(event_id, observation_id) SELECT ?, observation_id FROM event_observations WHERE event_id = ?",
+            (target_event_id, source_event_id),
+        )
+        for participant in self.list_event_participants(source_event_id):
+            self.upsert_event_participant(target_event_id, participant["person_id"], participant["role"], participant["evidence_ids_json"], participant["confidence"])
+        self.connection.execute("DELETE FROM event_observations WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("DELETE FROM memory_vectors WHERE source_type = 'event' AND source_id = ?", (source_event_id,))
+        self.connection.execute("DELETE FROM events WHERE id = ?", (source_event_id,))
+        self.connection.commit()
+        self._refresh_event_participants(target["observation_ids"] + source["observation_ids"])
+        for person_id in affected_people:
+            self.rebuild_person_memory(person_id)
+        return self.get_event(target_event_id)
+
     def _refresh_event_participants(self, observation_ids):
         for observation_id in set(observation_ids):
             rows = self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,))
@@ -1821,15 +1960,16 @@ class MemoryStore:
                 participants = event.get("participants") or []
                 observation = self.get_observation(observation_id) or {}
                 merged = participants[:]
-                for person in observation.get("people") or []:
-                    key = person.get("entity_id") if isinstance(person, dict) else person
-                    if key and not any((item.get("entity_id") if isinstance(item, dict) else item) == key for item in merged):
+                for key in self._confirmed_entity_ids_for_observation(observation_id):
+                    entity = self.get_entity(key)
+                    person = {"entity_id": key, "name": entity["canonical_name"], "status": "confirmed"}
+                    if not any((item.get("entity_id") if isinstance(item, dict) else item) == key for item in merged):
                         merged.append(person)
-                    if key:
-                        self.upsert_event_participant(row["event_id"], key, "visible_subject", [observation_id], 0.75)
+                    self.upsert_event_participant(row["event_id"], key, "visible_subject", [observation_id], 0.75)
                 asset = self.get_asset(observation.get("asset_id")) or {}
                 source_owner_id = asset.get("source_owner_id")
-                if source_owner_id:
+                source_owner = self.get_entity(source_owner_id) if source_owner_id else None
+                if source_owner and source_owner.get("status") == "confirmed":
                     self.upsert_event_participant(row["event_id"], source_owner_id, "captured_by", [observation_id], float(asset.get("source_confidence", 0.5) or 0.5))
                 self.connection.execute("UPDATE events SET participants_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?", (json_value(merged, []), now_iso(), event["id"]))
                 self.refresh_event_summary(row["event_id"])

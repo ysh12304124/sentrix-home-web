@@ -39,10 +39,18 @@ runtime dependency.
 1. Asset and Observation are immutable evidence-oriented records. Every event,
    semantic claim, and answer must link back to an Observation and its original
    Asset.
-2. Events are clustered first from original capture time and capture location.
-   The title, event type, activity, and summary are generated only after the
-   relevant observations are grouped. Import metadata must never supply an
-   event name or inferred activity.
+2. Events use capture time and capture location for candidate recall, then
+   combine observation activity/type, object and confirmed-person overlap,
+   visual-place evidence, and CLIP asset-vector similarity. Source provenance
+   is retained for audit and capture relationships only; it never contributes
+   to event grouping or cancels a semantic conflict.
+   A visual difference alone never splits a family event. Strong activity/type
+   disagreement can lower a candidate below the merge threshold; when visual
+   evidence is available, the explicit split guard additionally requires low
+   similarity and no confirmed-person/object bridge. The title, event type,
+   activity, and summary are generated only after the relevant observations
+   are grouped. Import metadata must never supply an event name or inferred
+   activity.
 3. Semantic memory is person-centred. `semantic_profiles` and
    `semantic_claims` describe confirmed people through supported events and
    evidence. Activity, place, attendance, and capture can be event-level
@@ -91,9 +99,9 @@ adapters. The major modules and ownership boundaries are:
 
 | Module | Implementation method | Authority / output |
 | --- | --- | --- |
-| `backend/app.py` | FastAPI routes construct the store, pipeline and agent once; file ingestion runs through the pipeline; cluster confirmation triggers participant, semantic and event-summary refresh. | HTTP API and application orchestration. |
-| `backend/db.py` | SQLite schema migration plus transactional CRUD/projections. `MemoryStore` owns all evidence joins, event candidate scoring, clustering persistence, semantic rebuilds, and audit status. | The only authoritative memory database. |
-| `backend/pipeline.py` | Normalizes allowed source provenance, calls modality adapters, persists immutable observations and vectors, then proposes/updates events. | `Asset`, `Observation`, visual vectors, event candidates. |
+| `backend/app.py` | FastAPI routes construct the store, pipeline and agent once; cluster confirmation triggers participant, conservative event re-segmentation, semantic, and event-summary refresh. | HTTP API and application orchestration. |
+| `backend/db.py` | SQLite schema migration plus transactional CRUD/projections. `MemoryStore` owns all evidence joins, explainable event candidate scoring (including CLIP cosine and conservative split guards), confirmed-identity event bridges, clustering persistence, semantic rebuilds, and audit status. | The only authoritative memory database. |
+| `backend/pipeline.py` | Normalizes allowed source provenance, calls modality adapters, persists image vectors and face instances before event selection, then updates event links after grouping. | `Asset`, `Observation`, face/entity evidence, visual vectors, event candidates. |
 | `backend/model_clients.py` | Thin adapters for Gemma visual/text JSON extraction, FunASR, buffalo_l detection, AdaFace embeddings and CLIP. Models never write to SQLite directly. | Structured model outputs with model/version provenance. |
 | `backend/face_embeddings.py` and `backend/face_clustering.py` | AdaFace face vectors plus quality/pose-aware multi-prototype global clustering. Low-quality detections remain evidence-only. | `FaceInstance`, `FaceCluster`, prototype and metric contracts. |
 | `backend/person_appearance.py` | Deterministic bounded expansion of a detected face to head-and-upper-body crop. | Crop coordinates used by person appearance evidence. |
@@ -138,7 +146,9 @@ Identity Candidate Layer
   ▼
 Event Builder
   ├─ capture-time and capture-location candidate grouping
-  ├─ source album/device and visual evidence compatibility
+  ├─ observation semantics, confirmed identity/object bridges, and CLIP
+  │  visual compatibility scoring
+  ├─ conservative semantic-plus-visual split guard
   ├─ event boundary and ambiguity record
   └─ post-group model summary
   │  output: Event -> Observation/Evidence and EventParticipant
@@ -259,9 +269,9 @@ Imported photos may contain only these external facts:
 - source album owner, device, and album ID.
 
 Album ownership is provenance, not a visible person, family role, event label,
-or relationship. The system must infer event content from observations and
-must wait for user confirmation before treating a face cluster as a named
-person.
+relationship, or event-grouping signal. The system must infer event content
+from observations and must wait for user confirmation before treating a face
+cluster as a named person.
 
 ## Identity Workflow
 
@@ -274,7 +284,7 @@ person.
 
 ## Validation Baseline
 
-The current automated baseline is 78 Python tests and 7 Node tests. Before
+The current automated baseline is 92 Python tests and 8 Node tests. Before
 claiming a change complete, run:
 
 ```bash
@@ -295,13 +305,12 @@ rebuild.
 
 ## Current Decisions (2026-07-29)
 
-The selected face-recognition direction is option 3: add a quality-aware face
-embedding model, with AdaFace as the primary candidate and MagFace as the
-comparison model. The adapter and quality-aware path are implemented, but the
-real checkpoint is not installed yet. The existing `buffalo_l`
-detector remains the initial detection boundary; the embedding model is kept
-behind a replaceable Sentrix adapter so the detector and identity model can be
-changed independently.
+The selected face-recognition direction is option 3: use AdaFace as the
+quality-aware embedding model, with MagFace reserved as a comparison candidate.
+The verified AdaFace checkpoint is installed outside the repository. The
+existing `buffalo_l` detector remains the initial detection boundary; the
+embedding model is kept behind a replaceable Sentrix adapter so the detector
+and identity model can be changed independently.
 
 The face solution must include more than a model swap:
 
@@ -317,11 +326,10 @@ The face solution must include more than a model swap:
 
 ## Current Findings
 
-The 153 Sentrix service was checked on 2026-07-29. The Sentrix API is on port
-8090, the web portal is on port 4174, and the unrelated FMA service on port 5173
-must remain untouched. The service reported Gemma, FunASR, InsightFace, and
-CLIP as ready. The 153 Sentrix repository is currently on `main` at commit
-`6ad4ae8`.
+The 153 Sentrix service is on API port 8090 and web port 4174; the unrelated
+FMA service on port 5173 must remain untouched. The formal backend commit
+destination is the `psh` branch on 153. Sentrix uses the dedicated Ollama
+listener on port 11435, while shared Ollama on 11434 remains out of scope.
 
 The current 153 database contains 54 assets, 54 observations, 4 events, 80
 face instances, and 16 face clusters. It contains no confirmed people, event
@@ -372,11 +380,11 @@ are deliberately deferred.
 
 | Priority | Area | Work | Status |
 | --- | --- | --- | --- |
-| P0 | Face | AdaFace adapter, model/version configuration, quality-aware embedding, and benchmark harness | Partial: adapter and quality path implemented; real checkpoint not installed |
-| P0 | Face | Multi-view prototypes, quality-weighted global clustering, and confirmed-person constraints | Implemented locally; 153 rebuild pending |
-| P0 | Face | Cluster merge/split APIs, audit revisions, and person-memory rebuild after confirmation | Implemented locally; 153 sync validation pending |
-| P0 | Face | Face benchmark with pairwise precision/recall/F1, singleton, false-merge, and missed-merge metrics | Implemented locally; real AdaFace benchmark blocked by checkpoint |
-| P0 | Events | Candidate scoring using time, location, source, activity, objects, visual place, and person overlap | Implemented locally; needs 153 data validation |
+| P0 | Face | AdaFace adapter, model/version configuration, quality-aware embedding, and benchmark harness | Implemented and validated on 153 with the installed checkpoint |
+| P0 | Face | Multi-view prototypes, quality-weighted global clustering, and confirmed-person constraints | Implemented and accepted on the controlled 153 rebuild |
+| P0 | Face | Cluster merge/split APIs, audit revisions, and person-memory rebuild after confirmation | Implemented and validated on 153 |
+| P0 | Face | Face benchmark with pairwise precision/recall/F1, singleton, false-merge, and missed-merge metrics | Implemented and accepted on the controlled candidate set |
+| P0 | Events | Candidate scoring using time, location, source, activity, objects, visual place, person overlap, and CLIP vectors | Implemented; calibration needs an observable activity benchmark |
 | P0 | Events | Event boundaries and deterministic handling of multiple candidates | Implemented locally; candidate ambiguity metadata and UI display added |
 | P0 | Entities | Unify legacy `persons` and native `entities` so two person systems cannot diverge | Core sync implemented; legacy endpoints remain compatibility wrappers |
 | P0 | Semantic | Evidence-backed Person -> Event -> Claim/Profile rebuild and versioned conflict handling | Core rebuild implemented; richer conflict policy remains P1 |
@@ -716,15 +724,93 @@ that a synthetic `ClipAdapter` has no pretrained weights is limited to unit
 test construction; the deployed health endpoint reports the project checkpoint
 as ready.
 
+## Event Segmentation Evaluation (2026-07-30)
+
+Event grouping now persists each image CLIP asset vector before candidate
+selection. For every recalled candidate event, `MemoryStore` compares the
+incoming vector against all of that event's asset vectors and records the
+maximum cosine score in `aggregation_breakdown_json` together with
+`visual_available`, `visual_boost`, `semantic_conflict`, and `split_guard`.
+Only vectors with the same CLIP `model_name` are comparable; a model upgrade
+therefore makes visual evidence unavailable for old vectors rather than mixing
+embedding spaces. The selected candidate remains explainable from the stored
+score breakdown.
+
+The split policy is deliberately conservative. Different camera angles,
+close-ups, and group photos in one household event often have low CLIP cosine
+similarity. Therefore low similarity alone is not a boundary. The current
+`semantic_visual_conflict` guard requires all of the following:
+
+1. an available asset vector with cosine similarity below `0.45`;
+2. explicit disagreement in both activity and event type;
+3. no overlapping known person or object evidence.
+
+High visual similarity adds only a bounded merge boost; it is not allowed to
+override contradictory evidence by itself. Strong activity/type disagreement
+can still place a candidate below the merge threshold when no vector is
+available. This prevents both provenance-label leakage and the first
+visual-only experiment from over-splitting the controlled album.
+
+`scripts/benchmarks/evaluate_event_segmentation.py` is the offline evaluator.
+It reads the completed SQLite event membership plus an external manifest and
+reports pairwise precision, recall, F1, true-event splits, predicted-event
+merges, and the concrete mappings. It accepts either `{\"assets\": [{\"file\":
+..., \"event_id\": ...}]}` or the test-source `{filename: {\"event_id\": ...}}`
+shape. For nested albums it uses the source-relative asset path, and only
+falls back to a basename when that basename is unique on both sides. It reports
+`unmatched_manifest_assets` instead of silently collapsing duplicate filenames.
+It reads only `event_id` and never writes external labels to Sentrix.
+Run it with:
+
+```bash
+.venv/bin/python scripts/benchmarks/evaluate_event_segmentation.py \
+  --db /path/to/sentrix.db \
+  --manifest /path/to/sentrix_metadata.json
+```
+
+Measured controls on the 120-image virtual family album:
+
+- The pre-change online database scored pairwise F1 `0.8739` (precision
+  `0.8387`, recall `0.9123`), with one split truth event and one merged
+  predicted event.
+- A visual-difference-only experiment completed `120/120` images but produced
+  10 events, pairwise F1 `0.7539`, six split truth events, and two merged
+  predicted events. It was rejected and its isolated database was not deployed.
+- Replaying the completed isolated data with the final dual-conflict rule
+  yielded five events, pairwise F1 `0.8507` (precision `0.7403`, recall `1.0`),
+  zero split truth events, and one merged predicted event.
+
+The remaining merged label pair (`evt_birthday` and `evt_repair`) is not a
+valid visual segmentation failure: the virtual album assigns those labels to
+LFW portrait images without observable birthday or repair evidence. The import
+boundary correctly ignores these labels, so no model-only implementation can
+legitimately separate them. Future calibration requires a benchmark with
+same-time/same-place but visibly distinct activities, scenes, objects, or
+participants. The production database was intentionally not replaced by any
+of these experimental rebuilds.
+
+Confirmed-person contract: pending clusters and model-generated anonymous
+`people` descriptions are never person bridges. A matching face instance can
+link a new observation to an entity only after that entity is user-confirmed.
+On confirmation, Sentrix refreshes participants and conservatively merges
+affected events only when the regular candidate score now passes with the
+confirmed person overlap. It rebuilds the affected person's semantic memory
+after a merge.
+
+Automated verification on 153 for this change: 92 Python tests and 8 Node
+tests passed, together with JavaScript syntax checks, Python compilation, and
+`git diff --check`.
+
 ## Current Work Queue
 
 The following work is intentionally not represented as complete:
 
-1. **Event segmentation quality**: current event grouping combines capture
-   time/location, source provenance, activity/object overlap, visual place, and
-   confirmed-person overlap. It needs a controlled split/merge benchmark for
-   same-time same-place but distinct activities before its production threshold
-   is widened.
+1. **Event segmentation calibration**: the visual-vector candidate score,
+   conservative split guard, and read-only benchmark are implemented. Add a
+   reviewed benchmark containing visually distinguishable same-time/same-place
+   activities before changing the `0.45` split threshold or widening the
+   production rule. The existing LFW-derived birthday/repair labels are not
+   observable from the images and are evaluation-only limitations.
 2. **Appearance normalization**: face-scoped clothing evidence is correct and
    traceable, but semantically equivalent values such as `深色西装外套` and
    `黑色西装外套` are still separate claims. Add evidence-preserving attribute

@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from scripts.maintenance.rebuild_memory import SUPPORTED, rebuild
+from scripts.maintenance.rebuild_memory import SUPPORTED, metadata_for_path, rebuild
 
 
 class RebuildInputTests(unittest.TestCase):
@@ -43,6 +43,24 @@ class RebuildInputTests(unittest.TestCase):
                     rebuild(root, source)
 
             self.assertEqual(database.read_bytes(), b"keep")
+
+    def test_metadata_uses_source_relative_path_before_duplicate_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            first = source / "album-a" / "IMG_0001.jpg"
+            second = source / "album-b" / "IMG_0001.jpg"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            metadata = {
+                "album-a/IMG_0001.jpg": {"captured_location": "客厅"},
+                "album-b/IMG_0001.jpg": {"captured_location": "厨房"},
+                "IMG_0001.jpg": {"captured_location": "legacy fallback"},
+            }
+
+            self.assertEqual(metadata_for_path(metadata, source, first)["captured_location"], "客厅")
+            self.assertEqual(metadata_for_path(metadata, source, second)["captured_location"], "厨房")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,17 @@ from backend.pipeline import IngestionPipeline
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".wav", ".mp3", ".m4a", ".flac", ".txt", ".md"}
 
 
+def metadata_for_path(metadata, source, path):
+    """Prefer a source-relative metadata key; retain flat-album compatibility."""
+    if not isinstance(metadata, dict):
+        return {}
+    try:
+        relative_path = path.relative_to(source).as_posix()
+    except ValueError:
+        relative_path = ""
+    return metadata.get(relative_path) or metadata.get(path.name) or {}
+
+
 def rebuild(root, source):
     face = FaceAdapter()
     if face.enabled and face.identity_model in {"adaface", "magface"} and not face.identity_configured:
@@ -42,7 +53,7 @@ def rebuild(root, source):
     processed = 0
     failed = 0
     for path in files:
-        asset = pipeline.create_asset(path, metadata=metadata.get(path.name))
+        asset = pipeline.create_asset(path, metadata=metadata_for_path(metadata, source, path))
         result = pipeline.process(asset["id"], summarize_event=False)
         if result.get("status") == "failed":
             failed += 1

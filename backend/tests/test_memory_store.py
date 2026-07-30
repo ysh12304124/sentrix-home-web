@@ -40,7 +40,7 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(self.store.count("events"), 1)
         self.assertEqual(self.store.count("event_observations"), 2)
 
-    def test_event_merge_deduplicates_structured_people_descriptions(self):
+    def test_event_does_not_promote_structured_people_descriptions_to_participants(self):
         asset = self.store.create_asset("structured_people", "people.jpg", "image", "/tmp/people.jpg")
         person = {"description": "一位成年人", "appearance": "短发"}
         observation_one = self.store.add_observation(asset["id"], {
@@ -62,9 +62,9 @@ class MemoryStoreTests(unittest.TestCase):
         merged = self.store.merge_observation_into_event(observation_two)
 
         self.assertEqual(event["id"], merged["id"])
-        self.assertEqual(merged["participants"], [person])
+        self.assertEqual(merged["participants"], [])
 
-    def test_event_merge_uses_original_asset_time_location_before_visual_labels(self):
+    def test_event_does_not_use_album_provenance_to_cancel_semantic_conflict(self):
         metadata = {
             "captured_location": "家中餐厅",
             "source_album_id": "birthday-2026",
@@ -93,9 +93,8 @@ class MemoryStoreTests(unittest.TestCase):
         event_one = self.store.merge_observation_into_event(first)
         event_two = self.store.merge_observation_into_event(second)
 
-        self.assertEqual(event_one["id"], event_two["id"])
-        self.assertEqual(event_two["place"], "家中餐厅")
-        self.assertEqual(self.store.count("events"), 1)
+        self.assertNotEqual(event_one["id"], event_two["id"])
+        self.assertEqual(self.store.count("events"), 2)
 
     def test_event_seed_never_uses_imported_event_hint_as_title(self):
         asset = self.store.create_asset("unlabeled", "photo.jpg", "image", "/tmp/photo.jpg", metadata={

@@ -113,8 +113,25 @@ class IngestionPipeline:
             else:
                 result = self._text_observation(asset)
             observation = self.store.add_observation(asset_id, result)
+            # Event selection needs the image vector itself, not a later
+            # projection of the selected event, so persist it before scoring.
+            self.store.upsert_vector(
+                "visual", "asset", asset_id, result.get("clip_embedding"), self.clip.model_name,
+                {"observation_id": observation["id"]},
+            )
+            cluster_ids = []
+            for face in result.get("face_candidates", []):
+                face_instance = self.store.add_face_instance(asset_id, observation["id"], face)
+                if face_instance:
+                    cluster_ids.append(face_instance["cluster_id"])
+            # A matching confirmed face writes an EntityMention above, so it is
+            # available as a real identity bridge during this event decision.
+            observation = self.store.get_observation(observation["id"])
             event = self.store.merge_observation_into_event(observation)
-            self.store.upsert_vector("visual", "asset", asset_id, result.get("clip_embedding"), self.clip.model_name, {"observation_id": observation["id"], "event_id": event["id"]})
+            self.store.upsert_vector(
+                "visual", "asset", asset_id, result.get("clip_embedding"), self.clip.model_name,
+                {"observation_id": observation["id"], "event_id": event["id"]},
+            )
             fact_text = " ".join(f"{item.get('subject', '')} {item.get('predicate', '')} {item.get('object', '')}" for item in result.get("facts", []))
             clothing_text = " ".join(str(item) for item in (observation.get("clothing") or []))
             text_embedding = self.clip.embed_text(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text])))
@@ -126,11 +143,6 @@ class IngestionPipeline:
                 if all(fact.get(key) for key in ("subject", "predicate", "object")):
                     saved = self.store.maintain_fact(fact["subject"], fact["predicate"], fact["object"], [observation["id"]], normalize_confidence(fact.get("confidence"), result.get("confidence", 0.5)))
                     fact_ids.append(saved["id"])
-            cluster_ids = []
-            for index, face in enumerate(result.get("face_candidates", [])):
-                face_instance = self.store.add_face_instance(asset_id, observation["id"], face)
-                if face_instance:
-                    cluster_ids.append(face_instance["cluster_id"])
             metadata = {"observation_id": observation["id"], "event_id": event["id"], "fact_ids": fact_ids, "cluster_ids": cluster_ids, "model": result.get("model"), "faces": [{key: value for key, value in face.items() if key != "embedding"} for face in result.get("face_candidates", [])]}
             saved_asset = self.store.update_asset(asset_id, "processed", metadata)
             if asset.get("source_owner_id"):

@@ -16,6 +16,18 @@ class FakeGamma:
         return {"title": "生日庆祝", "event_type": "庆祝活动", "activity": "围绕蛋糕庆祝", "summary": "一组照片记录了围绕蛋糕的庆祝活动。", "confidence": 0.88, "model": self.model}
 
 
+class GenericGamma(FakeGamma):
+    def analyze_image(self, path, metadata=None):
+        return {"caption": "一张家庭照片", "activity": "家庭活动", "place": "家里", "people": [], "objects": [], "ocr_text": "", "event_type": "家庭记录", "facts": [], "confidence": 0.8, "model": self.model}
+
+
+class ConflictingGamma(FakeGamma):
+    def analyze_image(self, path, metadata=None):
+        if Path(path).name == "first.jpg":
+            return {"caption": "餐桌旁准备晚餐", "activity": "准备晚餐", "place": "家里", "people": [], "objects": [], "ocr_text": "", "event_type": "用餐", "facts": [], "confidence": 0.8, "model": self.model}
+        return {"caption": "讲台上的公开发言", "activity": "公开演讲", "place": "家里", "people": [], "objects": [], "ocr_text": "", "event_type": "演讲", "facts": [], "confidence": 0.8, "model": self.model}
+
+
 class FakeClip:
     model_name = "test-clip"
     error = None
@@ -30,6 +42,14 @@ class FakeClip:
 class BrokenClip(FakeClip):
     def embed_text(self, text):
         raise RuntimeError("embedding failed")
+
+
+class SequencedClip(FakeClip):
+    def __init__(self, image_embeddings):
+        self.image_embeddings = list(image_embeddings)
+
+    def embed_image(self, path):
+        return self.image_embeddings.pop(0)
 
 
 class FakeFace:
@@ -98,6 +118,56 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(updated["title"], "生日庆祝")
             self.assertEqual(updated["event_type"], "庆祝活动")
             self.assertEqual(updated["summary"], "一组照片记录了围绕蛋糕的庆祝活动。")
+
+    def test_dissimilar_images_at_same_time_and_place_split_before_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_image = Path(directory) / "first.jpg"
+            second_image = Path(directory) / "second.jpg"
+            first_image.write_bytes(b"first")
+            second_image.write_bytes(b"second")
+            store = MemoryStore(f"{directory}/memory.db")
+            pipeline = IngestionPipeline(
+                store, gamma=ConflictingGamma(), face=FakeFace(),
+                clip=SequencedClip([[1.0, 0.0], [0.0, 1.0]]),
+            )
+            metadata = {"captured_at": "2026-07-01T18:00:00+08:00", "captured_location": "家中餐厅", "source_album_id": "shared-album"}
+
+            pipeline.process(pipeline.create_asset(first_image, metadata=metadata)["id"], summarize_event=False)
+            pipeline.process(pipeline.create_asset(second_image, metadata=metadata)["id"], summarize_event=False)
+
+            self.assertEqual(store.count("events"), 2)
+            events = store.list_events()
+            self.assertTrue(any(event["aggregation_breakdown"].get("split_guard") == "semantic_visual_conflict" for event in events))
+
+    def test_confirmed_face_is_available_to_event_scoring_before_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_image = Path(directory) / "first.jpg"
+            second_image = Path(directory) / "second.jpg"
+            first_image.write_bytes(b"first")
+            second_image.write_bytes(b"second")
+            store = MemoryStore(f"{directory}/memory.db")
+            metadata = {"captured_at": "2026-07-01T18:00:00+08:00", "captured_location": "家中餐厅"}
+            first_asset = store.create_asset("seed", first_image.name, "image", str(first_image), metadata=metadata)
+            first = store.add_observation(first_asset["id"], {
+                "captured_at": metadata["captured_at"], "place": "厨房近景", "activity": "准备晚餐", "event_type": "用餐",
+            })
+            store.upsert_vector("visual", "asset", first_asset["id"], [1.0, 0.0], "test-clip")
+            store.merge_observation_into_event(first)
+            face = store.add_face_instance(first_asset["id"], first["id"], {
+                "bbox": [0, 0, 10, 10], "confidence": 0.95, "embedding": [1.0, 0.0, 0.0],
+                "embedding_model": "test-face", "embedding_version": "v1",
+            })
+            store.confirm_face_cluster(face["cluster_id"], "妈妈", "母亲")
+            pipeline = IngestionPipeline(
+                store, gamma=ConflictingGamma(), face=FakeFace(), clip=SequencedClip([[0.0, 1.0]]),
+            )
+
+            result = pipeline.process(pipeline.create_asset(second_image, metadata=metadata)["id"], summarize_event=False)
+
+            self.assertEqual(result["status"], "processed")
+            self.assertEqual(store.count("events"), 1)
+            observation = store.get_observation(result["metadata_json"]["observation_id"])
+            self.assertTrue(any(person.get("name") == "妈妈" for person in observation["people"] if isinstance(person, dict)))
 
     def test_processing_an_asset_twice_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:

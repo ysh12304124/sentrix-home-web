@@ -64,6 +64,36 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(detail["semantic_profile"]["person_id"], cluster["entity_id"])
         self.assertTrue(any(claim["dimension"] == "identity" for claim in detail["semantic_claims"]))
 
+    def test_confirmation_resegments_split_events_using_confirmed_person_evidence(self):
+        for asset_id in ("a1", "a2"):
+            self.store.update_asset(asset_id, "queued", {
+                "captured_at": "2026-07-01T18:00:00+08:00",
+                "captured_location": "家中餐厅",
+            })
+        self.store.connection.execute(
+            "UPDATE observations SET captured_at = ?, place = ?, activity = ?, event_type = ? WHERE id = ?",
+            ("2026-07-01T18:00:00+08:00", "家中餐厅", "准备晚餐", "用餐", self.obs1["id"]),
+        )
+        self.store.connection.execute(
+            "UPDATE observations SET captured_at = ?, place = ?, activity = ?, event_type = ? WHERE id = ?",
+            ("2026-07-01T18:00:00+08:00", "家中餐厅", "公开演讲", "演讲", self.obs2["id"]),
+        )
+        self.store.connection.commit()
+        self.store.upsert_vector("visual", "asset", "a1", [1.0, 0.0], "test-clip")
+        self.store.upsert_vector("visual", "asset", "a2", [0.0, 1.0], "test-clip")
+        first_event = self.store.merge_observation_into_event(self.store.get_observation(self.obs1["id"]))
+        second_event = self.store.merge_observation_into_event(self.store.get_observation(self.obs2["id"]))
+        self.assertNotEqual(first_event["id"], second_event["id"])
+
+        first = self.store.add_face_instance("a1", self.obs1["id"], {"bbox": [1, 2, 30, 40], "confidence": 0.95, "embedding": [1, 0, 0]})
+        self.store.add_face_instance("a2", self.obs2["id"], {"bbox": [1, 2, 30, 40], "confidence": 0.94, "embedding": [0.99, 0.01, 0]})
+        self.store.confirm_face_cluster(first["cluster_id"], "妈妈", "母亲")
+
+        self.assertEqual(self.store.count("events"), 1)
+        event = self.store.list_events()[0]
+        self.assertEqual(len(event["observation_ids"]), 2)
+        self.assertTrue(any(item["person_name"] == "妈妈" for item in event["participant_roles"]))
+
     def test_person_memory_does_not_inherit_scene_clothing_as_person_attribute(self):
         self.store.connection.execute(
             "UPDATE observations SET clothing_json = ? WHERE id = ?",
