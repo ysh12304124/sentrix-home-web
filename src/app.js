@@ -10,7 +10,8 @@
     backendError: "",
     toast: "",
     spaces: [],
-    scopeId: window.localStorage?.getItem("sentrix.scopeId") || "home-default",
+    scopeId: "",
+    scopeInitialized: false,
     queue: [],
     dashboard: null,
     events: [],
@@ -138,7 +139,7 @@
   function shell() {
     const activeSpace = state.spaces.find((space) => space.id === state.scopeId);
     const spaceOptions = (state.spaces.length ? state.spaces : [{ id: state.scopeId, name: state.scopeId }]).map((space) => `<option value="${escapeHtml(space.id)}" ${space.id === state.scopeId ? "selected" : ""}>${escapeHtml(space.name || space.id)}</option>`).join("");
-    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><label class="space-switcher"><span class="avatar tiny">S</span><span><b>记忆空间</b><select id="space-select" aria-label="切换记忆空间">${spaceOptions}</select><small>${escapeHtml(activeSpace?.kind === "benchmark" ? "独立相册空间" : "本地家庭数据")}</small></span></label><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav"><button class="nav-item ${state.view === "settings" ? "active" : ""}" data-view="settings">${icon("◌")}<span>设备与隐私</span></button><button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs"><span>Sentrix Home</span>${state.view !== "overview" ? `<b>/</b><strong>${escapeHtml(navItems.find((item) => item.id === state.view)?.label || "设备与隐私")}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>${escapeHtml(activeSpace?.name || "本地家庭空间")}</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
+    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><label class="space-switcher"><span class="avatar tiny">S</span><span><b>${escapeHtml(activeSpace?.kind === "benchmark" ? "切换相册" : "记忆空间")}</b><select id="space-select" aria-label="切换相册或记忆空间">${spaceOptions}</select><small>${escapeHtml(activeSpace?.kind === "benchmark" ? "独立相册空间" : "本地家庭数据")}</small></span></label><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav"><button class="nav-item ${state.view === "settings" ? "active" : ""}" data-view="settings">${icon("◌")}<span>设备与隐私</span></button><button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs"><span>Sentrix Home</span>${state.view !== "overview" ? `<b>/</b><strong>${escapeHtml(navItems.find((item) => item.id === state.view)?.label || "设备与隐私")}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>${escapeHtml(activeSpace?.name || "本地家庭空间")}</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
     renderView();
   }
 
@@ -317,7 +318,17 @@
     const spaceResult = await Promise.allSettled([window.sentrixApi.memorySpaces()]);
     if (spaceResult[0].status === "fulfilled") {
       state.spaces = spaceResult[0].value.spaces || [];
-      if (state.spaces.length && !state.spaces.some((space) => space.id === state.scopeId)) state.scopeId = state.spaces[0].id;
+      if (!state.scopeInitialized) {
+        const storedScopeId = window.localStorage?.getItem("sentrix.scopeId") || "";
+        const storedSpace = state.spaces.find((space) => space.id === storedScopeId);
+        const benchmarkSpace = state.spaces.find((space) => space.kind === "benchmark");
+        state.scopeId = storedSpace && (storedSpace.kind !== "household" || !benchmarkSpace)
+          ? storedSpace.id
+          : benchmarkSpace?.id || storedSpace?.id || state.spaces[0]?.id || "home-default";
+        state.scopeInitialized = true;
+      } else if (state.spaces.length && !state.spaces.some((space) => space.id === state.scopeId)) {
+        state.scopeId = state.spaces.find((space) => space.kind === "benchmark")?.id || state.spaces[0].id;
+      }
     }
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
