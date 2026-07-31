@@ -306,9 +306,14 @@
     state.toast = "";
   }
 
-  async function refreshData() {
-    state.loading = true;
-    renderView();
+  let refreshInFlight = false;
+
+  async function refreshData(options = {}) {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    const silent = options.silent === true;
+    state.loading = !silent;
+    if (!silent) renderView();
     const spaceResult = await Promise.allSettled([window.sentrixApi.memorySpaces()]);
     if (spaceResult[0].status === "fulfilled") {
       state.spaces = spaceResult[0].value.spaces || [];
@@ -332,6 +337,7 @@
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
     renderShellNavigation();
+    refreshInFlight = false;
   }
 
   function renderShellNavigation() { shell(); }
@@ -470,4 +476,8 @@
 
   shell();
   refreshData();
+  window.setInterval(() => {
+    if (document.visibilityState === "hidden" || state.modal) return;
+    refreshData({ silent: true });
+  }, 5000);
 })();
