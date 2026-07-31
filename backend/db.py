@@ -464,6 +464,7 @@ class MemoryStore:
             "confidence": "REAL NOT NULL DEFAULT 0", "status": "TEXT NOT NULL DEFAULT 'active'",
             "aggregation_score": "REAL NOT NULL DEFAULT 0",
             "aggregation_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
+            "merged_into_event_id": "TEXT", "merge_reason": "TEXT",
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
@@ -969,6 +970,126 @@ class MemoryStore:
             return 0.0, False
         return max(self._cosine(incoming, values) for values in vectors), True
 
+    @staticmethod
+    def _geo_distance_meters(left, right):
+        try:
+            left_lat, left_lon = (float(value) for value in str(left).split(",")[:2])
+            right_lat, right_lon = (float(value) for value in str(right).split(",")[:2])
+        except (TypeError, ValueError):
+            return None
+        radius = 6371000.0
+        lat1, lat2 = math.radians(left_lat), math.radians(right_lat)
+        dlat = lat2 - lat1
+        dlon = math.radians(right_lon - left_lon)
+        haversine = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        return radius * 2 * math.asin(math.sqrt(min(1.0, haversine)))
+
+    def _event_asset_vectors(self, event):
+        asset_ids = [
+            (self.get_observation(observation_id) or {}).get("asset_id")
+            for observation_id in event.get("observation_ids", [])
+        ]
+        asset_ids = [asset_id for asset_id in asset_ids if asset_id]
+        if not asset_ids:
+            return []
+        placeholders = ",".join("?" for _ in asset_ids)
+        rows = self._rows(
+            f"SELECT vector_json FROM memory_vectors WHERE space = 'visual' AND source_type = 'asset' AND source_id IN ({placeholders})",
+            asset_ids,
+        )
+        values = []
+        for row in rows:
+            try:
+                vector = json.loads(row["vector_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                vector = []
+            if vector:
+                values.append(vector)
+        return values
+
+    def _event_face_clusters(self, event):
+        observation_ids = event.get("observation_ids", [])
+        if not observation_ids:
+            return set()
+        placeholders = ",".join("?" for _ in observation_ids)
+        rows = self._rows(
+            f"SELECT DISTINCT cluster_id FROM face_instances WHERE observation_id IN ({placeholders}) AND cluster_id IS NOT NULL",
+            observation_ids,
+        )
+        return {row["cluster_id"] for row in rows if row["cluster_id"]}
+
+    def _event_semantic_values(self, event):
+        values = set()
+        for observation_id in event.get("observation_ids", []):
+            observation = self.get_observation(observation_id) or {}
+            for key in ("activity", "event_type", "place"):
+                value = str(observation.get(key) or "").strip().lower()
+                if value:
+                    values.add(value)
+            for value in observation.get("objects") or []:
+                value = str(value.get("name") if isinstance(value, dict) else value).strip().lower()
+                if value and value not in {"人", "人物", "照片", "室内", "户外"}:
+                    values.add(value)
+        return values
+
+    @staticmethod
+    def _set_overlap(left, right):
+        if not left or not right:
+            return 0.0
+        if left.intersection(right):
+            return 1.0
+        for left_value in left:
+            for right_value in right:
+                if len(left_value) >= 2 and len(right_value) >= 2 and (left_value in right_value or right_value in left_value):
+                    return 0.7
+        return 0.0
+
+    def _event_pair_score(self, left, right):
+        left_times = [parse_time((self.get_asset((self.get_observation(item) or {}).get("asset_id")) or {}).get("captured_at")) for item in left.get("observation_ids", [])]
+        right_times = [parse_time((self.get_asset((self.get_observation(item) or {}).get("asset_id")) or {}).get("captured_at")) for item in right.get("observation_ids", [])]
+        time_distances = [abs((left_time - right_time).total_seconds()) / 60.0 for left_time in left_times for right_time in right_times if left_time and right_time]
+        time_score = max((max(0.0, 1.0 - min(value, 360.0) / 360.0) for value in time_distances), default=0.0)
+        left_locations = [(self.get_asset((self.get_observation(item) or {}).get("asset_id")) or {}).get("captured_location") for item in left.get("observation_ids", [])]
+        right_locations = [(self.get_asset((self.get_observation(item) or {}).get("asset_id")) or {}).get("captured_location") for item in right.get("observation_ids", [])]
+        distances = [self._geo_distance_meters(a, b) for a in left_locations for b in right_locations if a and b]
+        distances = [value for value in distances if value is not None]
+        location_score = max((max(0.0, 1.0 - min(value, 1000.0) / 1000.0) for value in distances), default=0.0)
+        left_vectors, right_vectors = self._event_asset_vectors(left), self._event_asset_vectors(right)
+        visual_score = max((self._cosine(a, b) for a in left_vectors for b in right_vectors), default=0.0)
+        semantic_score = self._set_overlap(self._event_semantic_values(left), self._event_semantic_values(right))
+        face_overlap = bool(self._event_face_clusters(left).intersection(self._event_face_clusters(right)))
+        merge = time_score >= 0.70 and (
+            (location_score >= 0.65 and (visual_score >= 0.55 or semantic_score > 0 or face_overlap))
+            or (visual_score >= 0.80 and (semantic_score > 0 or face_overlap))
+            or (location_score >= 0.85 and semantic_score > 0)
+        )
+        return {
+            "merge": merge, "time": time_score, "location": location_score,
+            "visual_similarity": visual_score, "semantic": semantic_score,
+            "face_overlap": face_overlap,
+            "total": 0.35 * time_score + 0.25 * location_score + 0.25 * visual_score + 0.10 * semantic_score + (0.05 if face_overlap else 0.0),
+        }
+
+    def consolidate_events(self, scope_id=None):
+        """Merge close event candidates after all observations have been imported."""
+        merged = []
+        while True:
+            events = self.list_events(1000, scope_id)
+            selected = None
+            for index, left in enumerate(events):
+                for right in events[index + 1:]:
+                    score = self._event_pair_score(left, right)
+                    if score["merge"] and (selected is None or score["total"] > selected[2]["total"]):
+                        selected = (left, right, score)
+            if selected is None:
+                break
+            left, right, score = selected
+            left_count, right_count = len(left.get("observation_ids", [])), len(right.get("observation_ids", []))
+            target, source = (left, right) if (left_count, left.get("time_start") or "") >= (right_count, right.get("time_start") or "") else (right, left)
+            self._merge_events(target["id"], source["id"], reason={"type": "global_consolidation", **score})
+            merged.append({"target_event_id": target["id"], "source_event_id": source["id"], **score})
+        return merged
+
     def _confirmed_entity_ids_for_observation(self, observation_id):
         if not observation_id:
             return set()
@@ -1049,6 +1170,12 @@ class MemoryStore:
             row["participants"] = row.get("participants_json", [])
             row["aggregation_breakdown"] = row.get("aggregation_breakdown_json", {})
             row["observation_ids"] = [item["observation_id"] for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (event_id,))]
+            row["asset_ids"] = [
+                item["asset_id"] for item in (
+                    self.get_observation(observation_id) or {} for observation_id in row["observation_ids"]
+                ) if item.get("asset_id")
+            ]
+            row["cover_asset_id"] = row["asset_ids"][0] if row["asset_ids"] else None
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
 
@@ -2083,7 +2210,7 @@ class MemoryStore:
             ),
         )
 
-    def recluster_faces(self, threshold=0.30, minimum_quality=0.30, scope_id=None):
+    def recluster_faces(self, threshold=0.30, minimum_quality=0.45, scope_id=None):
         """Globally regroup faces with quality-aware multi-view prototypes."""
         from .face_clustering import FaceClusterer, FaceSample
 
@@ -2091,9 +2218,9 @@ class MemoryStore:
             """SELECT fi.id, fi.cluster_id, fi.embedding_json, fi.quality, fi.detection_confidence,
             fi.pose_bucket, fi.embedding_model, fi.embedding_version
             FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
-            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL"""
+            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL AND fi.quality >= ?"""
             + (" AND a.scope_id = ?" if scope_id else ""),
-            (scope_id,) if scope_id else (),
+            (minimum_quality, scope_id) if scope_id else (minimum_quality,),
         )
         if not instances:
             return {"instances": 0, "clusters": 0, "threshold": threshold, "minimum_quality": minimum_quality}
@@ -2193,6 +2320,7 @@ class MemoryStore:
         rows = self._rows(f"""SELECT fc.*, e.canonical_name, e.family_role, e.status AS entity_status
             FROM face_clusters fc LEFT JOIN entities e ON e.id = fc.entity_id {where} ORDER BY fc.updated_at DESC""", params)
         for row in rows:
+            row["reviewable"] = row.get("status") != "pending" or int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.50
             row["samples"] = self._rows("""SELECT fi.id, fi.asset_id, fi.observation_id, fi.bbox_json, fi.detection_confidence, a.file_name, a.media_type
                 FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE fi.cluster_id = ? ORDER BY fi.created_at DESC LIMIT 12""", (row["id"],))
         return rows
@@ -2349,7 +2477,7 @@ class MemoryStore:
                     break
         return merged
 
-    def _merge_events(self, target_event_id, source_event_id):
+    def _merge_events(self, target_event_id, source_event_id, reason=None):
         if target_event_id == source_event_id:
             return self.get_event(target_event_id)
         target = self.get_event(target_event_id)
@@ -2357,18 +2485,46 @@ class MemoryStore:
         if not target or not source:
             return target
         affected_people = self._confirmed_entity_ids_for_event(target_event_id) | self._confirmed_entity_ids_for_event(source_event_id)
+        target_observation_ids = list(target["observation_ids"])
+        source_observation_ids = list(source["observation_ids"])
+        target_people = target.get("participants") or []
+        source_people = source.get("participants") or []
+        merged_people = dedupe_json_values(target_people + source_people)
+        start_values = [value for value in (target.get("time_start"), source.get("time_start")) if value]
+        end_values = [value for value in (target.get("time_end"), source.get("time_end")) if value]
         self.connection.execute(
             "INSERT OR IGNORE INTO event_observations(event_id, observation_id) SELECT ?, observation_id FROM event_observations WHERE event_id = ?",
             (target_event_id, source_event_id),
         )
         for participant in self.list_event_participants(source_event_id):
             self.upsert_event_participant(target_event_id, participant["person_id"], participant["role"], participant["evidence_ids_json"], participant["confidence"])
+        self.connection.execute(
+            """UPDATE events SET time_start = ?, time_end = ?, place = COALESCE(place, ?),
+            activity = COALESCE(activity, ?), participants_json = ?, confidence = MAX(confidence, ?),
+            revision = revision + 1, updated_at = ? WHERE id = ?""",
+            (
+                min(start_values) if start_values else None, max(end_values) if end_values else None,
+                source.get("place"), source.get("activity"), json_value(merged_people, []),
+                float(source.get("confidence", 0) or 0), now_iso(), target_event_id,
+            ),
+        )
+        for observation_id in source_observation_ids:
+            observation = self.get_observation(observation_id) or {}
+            asset = self.get_asset(observation.get("asset_id"))
+            if asset:
+                metadata = asset.get("metadata_json") or {}
+                metadata["event_id"] = target_event_id
+                self.connection.execute("UPDATE assets SET metadata_json = ?, updated_at = ? WHERE id = ?", (json_value(metadata, {}), now_iso(), asset["id"]))
+            vector = self._row("SELECT metadata_json FROM memory_vectors WHERE source_type = 'observation' AND source_id = ? ORDER BY updated_at DESC LIMIT 1", (observation_id,))
+            vector_metadata = json.loads(vector["metadata_json"] or "{}") if vector else {}
+            vector_metadata["event_id"] = target_event_id
+            self.connection.execute("UPDATE memory_vectors SET metadata_json = ?, updated_at = ? WHERE source_type = 'observation' AND source_id = ?", (json_value(vector_metadata, {}), now_iso(), observation_id))
         self.connection.execute("DELETE FROM event_observations WHERE event_id = ?", (source_event_id,))
         self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (source_event_id,))
         self.connection.execute("DELETE FROM memory_vectors WHERE source_type = 'event' AND source_id = ?", (source_event_id,))
         self.connection.execute("DELETE FROM events WHERE id = ?", (source_event_id,))
         self.connection.commit()
-        self._refresh_event_participants(target["observation_ids"] + source["observation_ids"])
+        self._refresh_event_participants(target_observation_ids + source_observation_ids)
         for person_id in affected_people:
             self.rebuild_person_memory(person_id)
         return self.get_event(target_event_id)

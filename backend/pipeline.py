@@ -182,8 +182,8 @@ class IngestionPipeline:
         except Exception:
             return self.store.get_event(event_id)
 
-    def summarize_events(self):
-        return [self.summarize_event(event["id"]) for event in self.store.list_events(1000)]
+    def summarize_events(self, scope_id=None):
+        return [self.summarize_event(event["id"]) for event in self.store.list_events(1000, scope_id)]
 
     def _image_observation(self, asset):
         path = asset["path"]

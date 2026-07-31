@@ -246,4 +246,8 @@ button { cursor: pointer; }
 .face-evidence-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 7px; background: var(--soft); }
 .face-evidence-item .text-button { margin-top: 7px; }
 .face-evidence-item small { display: block; color: var(--muted); font-size: 9px; line-height: 1.45; margin-top: 5px; overflow-wrap: anywhere; }
+.event-cover { min-height: 180px; padding: 0; overflow: hidden; justify-content: flex-end; position: relative; }
+.event-cover img { width: 100%; height: 132px; object-fit: cover; display: block; }
+.event-cover span { padding: 10px 14px 2px; }
+.event-cover b { padding: 0 14px 12px; }
 @media (max-width: 780px) { .face-evidence-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
