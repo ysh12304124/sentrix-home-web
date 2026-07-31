@@ -466,7 +466,7 @@ class FaceAdapter:
             faces = self._app.get(image)
             image_height, image_width = image.shape[:2]
             min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
-            min_score = float(os.getenv("FACE_MIN_DETECTION_SCORE", "0.65"))
+            min_score = float(os.getenv("FACE_MIN_DETECTION_SCORE", "0.72"))
             results = []
             for face in faces:
                 bbox = [float(item) for item in face.bbox]
@@ -509,7 +509,7 @@ class FaceAdapter:
                             # AdaFace norm is stored as provenance, not treated as
                             # a 0..10 score. It must not saturate all sample quality.
                             result["identity_eligible"] = result["quality"] >= float(
-                                os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.45")
+                                os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55")
                             )
                         except FaceEmbeddingUnavailable as error:
                             result["embedding"] = []

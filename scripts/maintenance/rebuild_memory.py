@@ -58,10 +58,12 @@ def rebuild(root, source=None, benchmark_manifest=None, scope_id=None):
     data_dir = root / "data"
     db_path = data_dir / "sentrix.db"
     media_dir = data_dir / "media"
-    if db_path.exists():
-        db_path.unlink()
-    if media_dir.exists():
-        shutil.rmtree(media_dir)
+    incremental = bool(benchmark_manifest and scope_id)
+    if not incremental:
+        if db_path.exists():
+            db_path.unlink()
+        if media_dir.exists():
+            shutil.rmtree(media_dir)
     media_dir.mkdir(parents=True, exist_ok=True)
 
     store = MemoryStore(str(db_path))

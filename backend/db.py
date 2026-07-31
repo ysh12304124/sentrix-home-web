@@ -662,11 +662,25 @@ class MemoryStore:
     def get_asset(self, asset_id):
         return self._decode(self._row("SELECT * FROM assets WHERE id = ?", (asset_id,)), ["metadata_json"])
 
-    def find_asset_by_hash(self, content_sha256):
+    def find_asset_by_hash(self, content_sha256, scope_id=None):
         if not content_sha256:
             return None
-        row = self._row("SELECT id FROM assets WHERE content_sha256 = ? ORDER BY created_at LIMIT 1", (content_sha256,))
+        if scope_id:
+            row = self._row("SELECT id FROM assets WHERE content_sha256 = ? AND scope_id = ? ORDER BY created_at LIMIT 1", (content_sha256, scope_id))
+        else:
+            row = self._row("SELECT id FROM assets WHERE content_sha256 = ? ORDER BY created_at LIMIT 1", (content_sha256,))
         return self.get_asset(row["id"]) if row else None
+
+    def is_confirmed_person_name(self, name, scope_id=None):
+        value = str(name or "").strip()
+        if not value:
+            return False
+        clauses = ["entity_type = 'person'", "status = 'confirmed'", "canonical_name = ?"]
+        params = [value]
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        return bool(self._row(f"SELECT id FROM entities WHERE {' AND '.join(clauses)} LIMIT 1", params))
 
     def list_assets(self, media_type=None, status=None, limit=200, scope_id=None):
         clauses = []
@@ -1874,7 +1888,7 @@ class MemoryStore:
             entity["relationship_count"] = self.connection.execute("SELECT COUNT(*) FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'", (entity["id"], entity["id"])).fetchone()[0]
             cluster_rows = self._rows("SELECT member_count, confidence, status FROM face_clusters WHERE entity_id = ?", (entity["id"],))
             entity["reviewable"] = entity["status"] == "confirmed" or any(
-                row["status"] != "rejected" and (int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.50)
+                row["status"] != "rejected" and (int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.65)
                 for row in cluster_rows
             )
             avatar = self._row(
@@ -2215,7 +2229,7 @@ class MemoryStore:
             ),
         )
 
-    def recluster_faces(self, threshold=0.30, minimum_quality=0.45, scope_id=None):
+    def recluster_faces(self, threshold=0.30, minimum_quality=0.55, scope_id=None):
         """Globally regroup faces with quality-aware multi-view prototypes."""
         from .face_clustering import FaceClusterer, FaceSample
 
@@ -2325,7 +2339,7 @@ class MemoryStore:
         rows = self._rows(f"""SELECT fc.*, e.canonical_name, e.family_role, e.status AS entity_status
             FROM face_clusters fc LEFT JOIN entities e ON e.id = fc.entity_id {where} ORDER BY fc.updated_at DESC""", params)
         for row in rows:
-            row["reviewable"] = row.get("status") != "pending" or int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.50
+            row["reviewable"] = row.get("status") != "pending" or int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.65
             row["samples"] = self._rows("""SELECT fi.id, fi.asset_id, fi.observation_id, fi.bbox_json, fi.detection_confidence, a.file_name, a.media_type
                 FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE fi.cluster_id = ? ORDER BY fi.created_at DESC LIMIT 12""", (row["id"],))
         return rows
@@ -2557,7 +2571,16 @@ class MemoryStore:
                 self.refresh_event_summary(row["event_id"])
 
     def reject_face_cluster(self, cluster_id):
-        self.connection.execute("UPDATE face_clusters SET status = 'rejected', updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), cluster_id))
+        cluster = self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
+        if not cluster:
+            return None
+        timestamp = now_iso()
+        self.connection.execute("UPDATE face_clusters SET status = 'rejected', updated_at = ?, revision = revision + 1 WHERE id = ?", (timestamp, cluster_id))
+        if cluster.get("entity_id"):
+            self.connection.execute(
+                "UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ? AND status != 'confirmed'",
+                ("候选人物簇已驳回，原始人脸证据仍保留", timestamp, cluster["entity_id"]),
+            )
         self.connection.commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
 

@@ -43,7 +43,7 @@ class IngestionPipeline:
         metadata = {key: value for key, value in (metadata or {}).items() if key in IMPORT_METADATA_KEYS}
         metadata.setdefault("content_sha256", self._sha256(path))
         metadata.setdefault("exif", self._extract_exif(path) if media_type == "image" else {})
-        existing = self.store.find_asset_by_hash(metadata["content_sha256"])
+        existing = self.store.find_asset_by_hash(metadata["content_sha256"], metadata.get("scope_id"))
         if existing:
             return existing
         for key in ("captured_at", "captured_location", "source_device_id"):
@@ -148,9 +148,10 @@ class IngestionPipeline:
             self.store.upsert_vector("episodic", "event", event["id"], text_embedding, self.clip.model_name, {"observation_id": observation["id"]})
             self.store.upsert_vector("semantic", "observation", observation["id"], text_embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event["id"]})
             fact_ids = []
+            scope_id = observation.get("scope_id") or (self.store.get_asset(asset_id) or {}).get("scope_id")
             for fact in result.get("facts", []):
-                if all(fact.get(key) for key in ("subject", "predicate", "object")):
-                    saved = self.store.maintain_fact(fact["subject"], fact["predicate"], fact["object"], [observation["id"]], normalize_confidence(fact.get("confidence"), result.get("confidence", 0.5)))
+                if all(fact.get(key) for key in ("subject", "predicate", "object")) and self.store.is_confirmed_person_name(fact.get("subject"), scope_id):
+                    saved = self.store.maintain_fact(fact["subject"], fact["predicate"], fact["object"], [observation["id"]], normalize_confidence(fact.get("confidence"), result.get("confidence", 0.5)), scope_id=scope_id)
                     fact_ids.append(saved["id"])
             metadata = {"observation_id": observation["id"], "event_id": event["id"], "fact_ids": fact_ids, "cluster_ids": cluster_ids, "model": result.get("model"), "faces": [{key: value for key, value in face.items() if key != "embedding"} for face in result.get("face_candidates", [])]}
             saved_asset = self.store.update_asset(asset_id, "processed", metadata)
