@@ -825,6 +825,51 @@ The following work is intentionally not represented as complete:
    API and dedicated Ollama runner after confirming host-level ownership and
    restart policy. Do not alter the shared Ollama process.
 
+## Memory Interaction Acceptance (2026-07-31)
+
+The memory-interaction plan is implemented on the 153 `psh` branch. The
+canonical identity write remains face-cluster confirmation; the legacy person
+confirmation route now resolves a native entity to its active face cluster
+before applying the same propagation chain. That chain updates entity naming,
+identity mentions, confirmed event participants, event summaries, semantic
+profile/claims, and face-scoped appearance evidence.
+
+The Agent now exposes a bounded local conversation turn contract. Query turns
+reuse the existing evidence retrieval and add a conversation ID, intent,
+structured image results, and prior-turn context. Feedback turns write to the
+existing query-gap/memory-feedback records without invoking normal recall.
+Clarification turns retain the previous bounded context and reuse evidence
+recall. `/api/search` remains a compatibility wrapper around the turn path;
+`/api/assistant/turn` is the browser-facing endpoint.
+
+The web search view stores the conversation ID and renders original image
+thumbnails from backend Asset URLs. Image results retain `asset_id`,
+`observation_id`, filename, capture time, caption, and `media_url`; the UI does
+not replace original evidence with generated thumbnails or filenames alone.
+
+Fresh 153 verification after the implementation:
+
+- `98` Python tests passed on the `stmem` environment; `9` Node tests passed;
+  JS syntax, Python compilation, and `git diff --check` passed.
+- Health reports AdaFace configured/ready, buffalo_l detection ready, project
+  CLIP ready, and Gemma using the dedicated `11435` listener.
+- The restored controlled database contains `120` assets, `120` observations,
+  `6` events, `148` face instances, `4` active face clusters, and `4` person
+  entities before confirmation. One controlled native-entity confirmation
+  produced one confirmed entity, one profile, five face-scoped appearance
+  records, five event-backed activity records, and linked event participants.
+- The activity query returned five supporting event IDs and event-level Chinese
+  activity summaries. A microphone evidence query returned `13` original image
+  results; an asset file endpoint returned HTTP `200`.
+- Sentrix web `4174`, FMA `5173`, Sentrix API `8090`, and the original asset
+  endpoint returned HTTP `200`. Both `11434` and `11435` had zero resident
+  models after the checks.
+
+The controlled confirmation intentionally remains a test-state mutation in the
+153 database. It is not a production family identity. Future acceptance runs
+must restore the clean fixture or rebuild from source before testing a new
+confirmation.
+
 ## Completed Work Snapshot
 
 - Evidence-first native SQLite memory model: assets, observations, events,

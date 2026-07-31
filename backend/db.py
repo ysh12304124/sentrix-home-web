@@ -1885,6 +1885,29 @@ class MemoryStore:
             return {**self.get_entity_detail(entity["id"]), "semantic_profile": memory["profile"], "semantic_claims": memory["claims"]}
         return self.get_entity_detail(entity["id"])
 
+    def confirm_person_entity(self, entity_id, name, family_role=None):
+        """Resolve a native person entity to its active face cluster."""
+        entity = self.get_entity(entity_id)
+        if not entity or entity.get("entity_type") != "person":
+            return None
+        cluster = self._row(
+            """SELECT id FROM face_clusters
+            WHERE entity_id = ? AND status IN ('pending', 'confirmed') AND member_count > 0
+            ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1""",
+            (entity_id,),
+        )
+        if cluster:
+            return self.confirm_face_cluster(cluster["id"], name, family_role)
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE entities SET canonical_name = ?, status = 'confirmed', family_role = ?,
+            confidence = MAX(confidence, 1), updated_at = ? WHERE id = ?""",
+            (name, family_role, timestamp, entity_id),
+        )
+        self.connection.commit()
+        memory = self.rebuild_person_memory(entity_id)
+        return {**self.get_entity_detail(entity_id), "semantic_profile": memory["profile"] if memory else None, "semantic_claims": memory["claims"] if memory else []}
+
     def _add_entity_to_observation(self, observation_id, entity):
         observation = self.get_observation(observation_id)
         if not observation:

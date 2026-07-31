@@ -37,3 +37,10 @@ test("virtual fixture keeps evaluation labels outside imported metadata", () => 
   assert.ok(metadataSection);
   assert.doesNotMatch(metadataSection, /activity_hint|source_identity|family_member|photographer/);
 });
+
+test("native confirmation and assistant turn routes are exposed by the browser API", () => {
+  const source = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  assert.match(source, /\/api\/persons\/\$\{encodeURIComponent\(id\)\}\/confirm/);
+  assert.match(source, /\/api\/assistant\/turn/);
+  assert.match(source, /family_role/);
+});

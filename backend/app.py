@@ -311,6 +311,16 @@ def confirm_person(person_id: str, payload: dict | None = None):
     name = (payload or {}).get("name", "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="person name is required")
+    family_role = str((payload or {}).get("family_role") or "").strip() or None
+    native = store.confirm_person_entity(person_id, name, family_role)
+    if native:
+        _analyze_confirmed_person_appearance(native["entity"]["id"])
+        for event_id in store.entity_event_ids(native["entity"]["id"]):
+            pipeline.summarize_event(event_id)
+        refreshed = store.get_entity_detail(native["entity"]["id"])
+        refreshed["semantic_profile"] = store.get_semantic_profile(native["entity"]["id"])
+        refreshed["semantic_claims"] = store.list_semantic_claims(native["entity"]["id"], 500)
+        return refreshed
     value = store.update_person(person_id, name, "confirmed")
     if not value:
         raise HTTPException(status_code=404, detail="person not found")
@@ -442,7 +452,22 @@ def create_invite(payload: dict):
 def search(request: SearchRequest):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
-    result = agent.answer(request.query.strip())
+    result = agent.answer_turn(request.query.strip())
+    result["retrievalTrace"] = result.get("retrieval_trace", [])
+    return result
+
+
+class AssistantTurnRequest(BaseModel):
+    message: str
+    conversation_id: str | None = None
+    feedback: dict | None = None
+
+
+@app.post("/api/assistant/turn")
+def assistant_turn(request: AssistantTurnRequest):
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="message is required")
+    result = agent.answer_turn(request.message.strip(), request.conversation_id, request.feedback)
     result["retrievalTrace"] = result.get("retrieval_trace", [])
     return result
 

@@ -124,6 +124,16 @@ class EventSegmentationTests(unittest.TestCase):
         self.assertNotEqual(first_event["id"], second_event["id"])
         self.assertEqual(second_event["aggregation_breakdown"]["split_guard"], "semantic_visual_conflict")
 
+    def test_event_lookup_indexes_exist_after_schema_creation(self):
+        indexes = {
+            row["name"] for row in self.store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+
+        self.assertIn("idx_event_observations_observation", indexes)
+        self.assertIn("idx_memory_vectors_visual_asset", indexes)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,13 @@ class RefusingGamma(FakeGamma):
 class RecordingGamma(FakeGamma):
     def __init__(self):
         self.focus_calls = 0
+        self.answer_calls = 0
+        self.contexts = []
+
+    def answer(self, query, context):
+        self.answer_calls += 1
+        self.contexts.append((query, context))
+        return super().answer(query, context)
 
     def analyze_image_focus(self, path, dimension, metadata=None):
         self.focus_calls += 1
@@ -240,6 +247,58 @@ class AgentEvidenceTests(unittest.TestCase):
 
             self.assertIn("麦克风", result["answer"])
             self.assertEqual(gamma.focus_calls, 0)
+
+    def test_answer_turn_routes_query_and_keeps_bounded_conversation_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "餐桌旁的家庭照片"})
+            store.merge_observation_into_event(observation)
+            gamma = RecordingGamma()
+            agent = MemoryAgent(store, gamma=gamma)
+
+            first = agent.answer_turn("餐桌旁发生了什么？", "conversation-1")
+            second = agent.answer_turn("继续说说这张照片。", "conversation-1")
+
+            self.assertEqual(first["intent"], "query")
+            self.assertEqual(second["conversation_id"], "conversation-1")
+            self.assertGreaterEqual(gamma.answer_calls, 2)
+            self.assertIn("餐桌旁发生了什么？", gamma.contexts[-1][1])
+
+    def test_answer_turn_feedback_persists_without_normal_recall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            gap = store.create_query_gap("哪天穿了红衣服", "clothing", ["asset_1"])
+            gamma = RecordingGamma()
+            agent = MemoryAgent(store, gamma=gamma)
+
+            result = agent.answer_turn(
+                "实际是红色针织衫",
+                "conversation-2",
+                {"query_gap_id": gap["id"], "correction": "红色针织衫"},
+            )
+
+            self.assertEqual(result["intent"], "feedback")
+            self.assertEqual(result["conversation_id"], "conversation-2")
+            self.assertEqual(store.get_query_gap(gap["id"])["status"], "resolved")
+            self.assertEqual(gamma.answer_calls, 0)
+
+    def test_image_query_returns_structured_asset_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "客厅里的家庭照片"})
+            store.merge_observation_into_event(observation)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn("客厅里的图片", "conversation-3")
+
+            self.assertTrue(result["image_results"])
+            self.assertEqual(result["image_results"][0]["asset_id"], "asset_1")
+            self.assertIn("/api/assets/asset_1/file", result["image_results"][0]["media_url"])
+
+    def test_intent_router_distinguishes_clarification(self):
+        agent = MemoryAgent(MemoryStore(":memory:"), gamma=FakeGamma())
+        self.assertEqual(agent.classify_intent("我说的是妈妈，不是爸爸"), "clarification")
 
 
 if __name__ == "__main__":

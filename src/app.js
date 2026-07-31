@@ -3,6 +3,7 @@
   const state = {
     view: "overview",
     query: "",
+    conversationId: "",
     searchResult: null,
     searchLoading: false,
     loading: true,
@@ -158,6 +159,12 @@
     return `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">${escapeHtml(title)}</p><h3>${values.length} 项</h3></div></div><div class="evidence-list">${values.slice(0, 12).map(evidenceCard).join("")}</div></section>`;
   }
 
+  function imageResults(result) {
+    const images = result?.image_results || [];
+    if (!images.length) return "";
+    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">原始图片</p><h3>${images.length} 张可回看的证据</h3></div></div><div class="image-result-grid">${images.map((item) => `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(item.file_name || "原始图片")}" loading="lazy" /><span><strong>${escapeHtml(item.file_name || item.asset_id)}</strong><small>${escapeHtml(item.captured_at || item.caption || "图片证据")}</small></span></button>`).join("")}</div></section>`;
+  }
+
   function traceLabel(item) {
     if (typeof item === "string") return item;
     return item?.stage || "检索阶段";
@@ -171,7 +178,7 @@
 
   function searchView() {
     const result = state.searchResult;
-    return `${pageHeader("记忆搜索 / Agent", "问一句，找到一段有证据的记忆。", "答案只来自本地事件、事实、Observation 和原生向量索引；每条证据都可以打开原始资料。")}${searchBar("例如：哪张图片里有冰箱？")}${state.searchLoading ? `<section class="empty-search"><div class="empty-symbol">◌</div><h2>正在检索本地记忆</h2><p>正在召回事件、事实、原始观察和语义上下文。</p></section>` : result ? `<section class="search-layout"><div><div class="answer-card"><div class="answer-meta"><span class="status-dot"></span>Sentrix 已完成本地检索 <span class="confidence">置信度 ${Math.round((result.confidence || 0) * 100)}% · ${escapeHtml(result.model || "本地 Agent")}</span></div><h2>检索结果</h2><p>${escapeHtml(result.answer || "证据不足，无法回答。").replace(/\n/g, "<br />")}</p><div class="answer-tags">${memoryPill("episodic", "事件证据")}${memoryPill("semantic", "事实证据")}${memoryPill("visual", "原始资料")}</div></div>${evidenceLayer("人物与事件", [...(result.evidence_layers?.people || []), ...(result.evidence_layers?.events || [])])}${evidenceLayer("语义声明", result.evidence_layers?.claims)}${evidenceLayer("观察证据", result.evidence_layers?.observations)}${evidenceLayer("原始 Asset", result.evidence_layers?.assets?.map((item) => ({ ...item, kind: "asset", file_name: item.id, summary: "打开原始资料" })))}${evidenceLayer("原始证据", !result.evidence_layers ? result.evidence : [])}${result.evidence_layers?.gaps?.length ? evidenceLayer("查询缺口", result.evidence_layers.gaps.map((gap) => ({ ...gap, kind: "query_gap", summary: `${gap.missing_dimension} · ${gap.status}` }))) : ""}</div><aside class="trace-panel"><div class="panel-title"><span>RETRIEVAL TRACE</span><span class="live-label"><i></i>本地</span></div><h3>这次回答经过了什么？</h3>${(result.retrievalTrace || []).map((item, i) => `<div class="trace-step"><span>${String(i + 1).padStart(2, "0")}</span><div><strong>${escapeHtml(traceLabel(item))}</strong><small>${escapeHtml(traceDetail(item))}</small></div><b>✓</b></div>`).join("")}<div class="trace-note">视频编码记忆 <span>接口预留</span></div></aside></section>` : `<section class="empty-search"><div class="empty-symbol">⌕</div><h2>从一个线索开始</h2><p>输入后会返回真实答案和原始证据，不会显示预填充结果。</p><div class="suggestions"><button data-query="图片里有什么？">图片里有什么？</button><button data-query="最近发生了什么？">最近发生了什么？</button><button data-query="哪些事实等待确认？">哪些事实等待确认？</button></div></section>`}`;
+    return `${pageHeader("记忆搜索 / Agent", "问一句，找到一段有证据的记忆。", "答案只来自本地事件、事实、Observation 和原生向量索引；每条证据都可以打开原始资料。")}${searchBar("例如：哪张图片里有冰箱？")}${state.searchLoading ? `<section class="empty-search"><div class="empty-symbol">◌</div><h2>正在检索本地记忆</h2><p>正在召回事件、事实、原始观察和语义上下文。</p></section>` : result ? `<section class="search-layout"><div><div class="answer-card"><div class="answer-meta"><span class="status-dot"></span>Sentrix 已完成本地检索 <span class="confidence">置信度 ${Math.round((result.confidence || 0) * 100)}% · ${escapeHtml(result.model || "本地 Agent")}</span></div><h2>检索结果</h2><p>${escapeHtml(result.answer || "证据不足，无法回答。").replace(/\n/g, "<br />")}</p><div class="answer-tags">${memoryPill("episodic", "事件证据")}${memoryPill("semantic", "事实证据")}${memoryPill("visual", "原始资料")}</div></div>${imageResults(result)}${evidenceLayer("人物与事件", [...(result.evidence_layers?.people || []), ...(result.evidence_layers?.events || [])])}${evidenceLayer("语义声明", result.evidence_layers?.claims)}${evidenceLayer("观察证据", result.evidence_layers?.observations)}${evidenceLayer("原始 Asset", result.evidence_layers?.assets?.map((item) => ({ ...item, kind: "asset", file_name: item.id, summary: "打开原始资料" })))}${evidenceLayer("原始证据", !result.evidence_layers ? result.evidence : [])}${result.evidence_layers?.gaps?.length ? evidenceLayer("查询缺口", result.evidence_layers.gaps.map((gap) => ({ ...gap, kind: "query_gap", summary: `${gap.missing_dimension} · ${gap.status}` }))) : ""}</div><aside class="trace-panel"><div class="panel-title"><span>RETRIEVAL TRACE</span><span class="live-label"><i></i>本地</span></div><h3>这次回答经过了什么？</h3>${(result.retrievalTrace || []).map((item, i) => `<div class="trace-step"><span>${String(i + 1).padStart(2, "0")}</span><div><strong>${escapeHtml(traceLabel(item))}</strong><small>${escapeHtml(traceDetail(item))}</small></div><b>✓</b></div>`).join("")}<div class="trace-note">视频编码记忆 <span>接口预留</span></div></aside></section>` : `<section class="empty-search"><div class="empty-symbol">⌕</div><h2>从一个线索开始</h2><p>输入后会返回真实答案和原始证据，不会显示预填充结果。</p><div class="suggestions"><button data-query="图片里有什么？">图片里有什么？</button><button data-query="最近发生了什么？">最近发生了什么？</button><button data-query="哪些事实等待确认？">哪些事实等待确认？</button></div></section>`}`;
   }
 
   function timelineView() {
@@ -333,7 +340,7 @@
     state.view = "search";
     state.searchLoading = true;
     renderShellNavigation();
-    try { state.searchResult = await window.sentrixApi.search(state.query); } catch (error) { state.searchResult = { answer: "检索失败，当前没有可用的本地答案。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true }; }
+    try { state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId); state.conversationId = state.searchResult.conversation_id || state.conversationId; } catch (error) { state.searchResult = { answer: "检索失败，当前没有可用的本地答案。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true }; }
     state.searchLoading = false;
     renderShellNavigation();
   }

@@ -1,5 +1,6 @@
 import json
 import re
+import uuid
 
 from .model_clients import ClipAdapter, GammaClient
 
@@ -23,6 +24,17 @@ class MemoryAgent:
         self.store = store
         self.gamma = gamma or GammaClient()
         self.clip = clip or ClipAdapter()
+        self._conversations = {}
+        self._conversation_limit = 8
+
+    @staticmethod
+    def classify_intent(message, feedback=None):
+        value = str(message or "").strip()
+        if any(token in value for token in ("我说的是", "指的是", "不是", "而是", "澄清")):
+            return "clarification"
+        if feedback or any(token in value for token in ("纠正", "更正", "实际是", "应该是", "记错了")):
+            return "feedback"
+        return "query"
 
     @staticmethod
     def _query_date(query):
@@ -320,7 +332,7 @@ class MemoryAgent:
             }
         return {"answer": f"当前本地记忆没有找到能回答“{query}”的证据。", "confidence": 0.0, "insufficient_evidence": True}
 
-    def answer(self, query):
+    def answer(self, query, conversation_context=None):
         retrieved = self.retrieve(query)
         retrieved, query_gap = self._refine_visual_memory(query, retrieved)
         evidence = []
@@ -375,7 +387,10 @@ class MemoryAgent:
             result["evidence"] = []
         else:
             try:
-                result = self.gamma.answer(query, self.context(retrieved))
+                context = self.context(retrieved)
+                if conversation_context:
+                    context += "\n[CONVERSATION_CONTEXT]\n" + conversation_context
+                result = self.gamma.answer(query, context)
             except Exception:
                 result = {"answer": "证据不足，模型暂时不可用。", "confidence": 0.2, "evidence": [], "insufficient_evidence": True, "model": self.gamma.model}
         result["modelEvidence"] = result.get("evidence", [])
@@ -413,3 +428,64 @@ class MemoryAgent:
         if query_gap:
             result["query_gap_id"] = query_gap["id"]
         return result
+
+    def _conversation_text(self, conversation_id):
+        turns = self._conversations.get(conversation_id, [])
+        return "\n".join(f"{turn['role']}: {turn['text']}" for turn in turns[-self._conversation_limit:])
+
+    def _remember_turn(self, conversation_id, role, text):
+        turns = self._conversations.setdefault(conversation_id, [])
+        turns.append({"role": role, "text": str(text or "")[:2000]})
+        del turns[:-self._conversation_limit]
+
+    def answer_turn(self, message, conversation_id=None, feedback=None):
+        conversation_id = conversation_id or f"conversation_{uuid.uuid4().hex[:12]}"
+        intent = self.classify_intent(message, feedback)
+        if intent == "feedback":
+            feedback = feedback or {}
+            gap_id = feedback.get("query_gap_id")
+            correction = feedback.get("correction") or str(message or "").strip()
+            persisted = None
+            if gap_id and self.store.get_query_gap(gap_id):
+                persisted = self.store.add_memory_feedback(
+                    gap_id, feedback.get("user_id"), feedback.get("accepted_answer"), correction, feedback.get("target_claim_id"),
+                )
+            result = {
+                "intent": "feedback", "conversation_id": conversation_id,
+                "answer": "已记录你的修正，相关记忆会保留原始证据并进入更新链。",
+                "confidence": 1.0 if persisted else 0.0, "insufficient_evidence": not bool(persisted),
+                "evidence": [], "image_results": [], "retrieval_trace": [{"stage": "feedback", "status": "complete", "counts": {"persisted": 1 if persisted else 0}}],
+                "model": "sentrix-feedback", "feedback": persisted,
+            }
+            self._remember_turn(conversation_id, "user", message)
+            self._remember_turn(conversation_id, "assistant", result["answer"])
+            return result
+        previous = self._conversation_text(conversation_id)
+        query = str(message or "").strip()
+        if intent == "clarification" and previous:
+            query = previous + "\n当前澄清：" + query
+        result = self.answer(query, previous)
+        result["intent"] = intent
+        result["conversation_id"] = conversation_id
+        result["image_results"] = self._image_results(result.get("evidence", []))
+        self._remember_turn(conversation_id, "user", message)
+        self._remember_turn(conversation_id, "assistant", result.get("answer", ""))
+        return result
+
+    @staticmethod
+    def _image_results(evidence):
+        results = []
+        seen = set()
+        for item in evidence or []:
+            if item.get("kind") != "observation" or item.get("media_type") != "image":
+                continue
+            asset_id = item.get("asset_id")
+            if not asset_id or asset_id in seen:
+                continue
+            seen.add(asset_id)
+            results.append({
+                "asset_id": asset_id, "observation_id": item.get("observation_id"),
+                "file_name": item.get("file_name"), "caption": item.get("caption"),
+                "captured_at": item.get("captured_at"), "media_url": f"/api/assets/{asset_id}/file",
+            })
+        return results[:24]

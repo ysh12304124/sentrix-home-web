@@ -148,6 +148,20 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(entity["canonical_name"], "妈妈")
         self.assertEqual(entity["status"], "confirmed")
 
+    def test_native_entity_confirmation_resolves_active_face_cluster(self):
+        face = self.store.add_face_instance(
+            "a1", self.obs1["id"],
+            {"bbox": [1, 2, 30, 40], "confidence": 0.95, "embedding": [1, 0, 0]},
+        )
+        entity_id = self.store._row("SELECT entity_id FROM face_clusters WHERE id = ?", (face["cluster_id"],))["entity_id"]
+
+        detail = self.store.confirm_person_entity(entity_id, "妈妈", "母亲")
+
+        self.assertEqual(detail["entity"]["id"], entity_id)
+        self.assertEqual(detail["entity"]["canonical_name"], "妈妈")
+        self.assertEqual(detail["entity"]["status"], "confirmed")
+        self.assertEqual(self.store._row("SELECT status FROM face_clusters WHERE id = ?", (face["cluster_id"],))["status"], "confirmed")
+
 
 if __name__ == "__main__":
     unittest.main()
