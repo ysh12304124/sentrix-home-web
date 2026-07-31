@@ -1872,6 +1872,11 @@ class MemoryStore:
             entity["cluster_count"] = self.connection.execute("SELECT COUNT(*) FROM face_clusters WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
             entity["mention_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_mentions WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
             entity["relationship_count"] = self.connection.execute("SELECT COUNT(*) FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'", (entity["id"], entity["id"])).fetchone()[0]
+            cluster_rows = self._rows("SELECT member_count, confidence, status FROM face_clusters WHERE entity_id = ?", (entity["id"],))
+            entity["reviewable"] = entity["status"] == "confirmed" or any(
+                row["status"] != "rejected" and (int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.50)
+                for row in cluster_rows
+            )
             avatar = self._row(
                 """SELECT fi.id FROM face_instances fi JOIN face_clusters fc ON fc.id = fi.cluster_id
                 WHERE fc.entity_id = ? AND fc.status != 'rejected' ORDER BY fi.detection_confidence DESC, fi.created_at ASC LIMIT 1""",

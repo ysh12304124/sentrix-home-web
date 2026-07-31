@@ -193,7 +193,7 @@
   }
 
   function peopleView() {
-    const people = state.persons.filter((person) => state.personFilter === "all" || !person.confirmed);
+    const people = state.persons.filter((person) => person.reviewable !== false && (state.personFilter === "all" || !person.confirmed));
     return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。确认、驳回和命名都会写入本地人物状态。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${state.persons.filter((person) => !person.confirmed).length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person) => `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, person.display_name || person.name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(person.display_name || person.name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p><div class="person-stats"><span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>${person.cluster_count || 0}</strong> 个人物簇</span></div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="split-person" data-person-id="${escapeHtml(person.id)}">驳回候选</button>`}</div></article>`).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
   }
 
@@ -308,6 +308,11 @@
     state.toast = "";
   }
 
+  function isUserEditing() {
+    const active = document.activeElement;
+    return Boolean(state.modal || active?.matches("input, textarea, select") || active?.closest("form"));
+  }
+
   let refreshInFlight = false;
 
   async function refreshData(options = {}) {
@@ -348,7 +353,7 @@
     const failed = calls.find((call) => call.status === "rejected");
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
-    renderShellNavigation();
+    if (!isUserEditing()) renderShellNavigation();
     refreshInFlight = false;
   }
 
@@ -489,7 +494,7 @@
   shell();
   refreshData();
   window.setInterval(() => {
-    if (document.visibilityState === "hidden" || state.modal) return;
+    if (document.visibilityState === "hidden" || isUserEditing()) return;
     refreshData({ silent: true });
   }, 5000);
 })();
