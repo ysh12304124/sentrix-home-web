@@ -880,7 +880,7 @@ from the pre-appearance snapshot and verified before further work. The current
 runtime baseline is:
 
 - `120` assets and `120` observations;
-- `148` face instances and `4` active face clusters;
+- `148` face instances and `4` face clusters (`1` confirmed and `3` pending);
 - `4` native person entities, with `1` confirmed (`测试成员甲`) and `3` pending;
 - `1` semantic profile, `107` semantic claims, `5` event participant rows, and
   `0` face-scoped appearance records;
