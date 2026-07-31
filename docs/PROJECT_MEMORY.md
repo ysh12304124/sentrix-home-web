@@ -865,10 +865,33 @@ Fresh 153 verification after the implementation:
   endpoint returned HTTP `200`. Both `11434` and `11435` had zero resident
   models after the checks.
 
-The controlled confirmation intentionally remains a test-state mutation in the
-153 database. It is not a production family identity. Future acceptance runs
-must restore the clean fixture or rebuild from source before testing a new
-confirmation.
+The controlled confirmation above was a temporary test-state mutation, not a
+production family identity. The extra diagnostic confirmation that produced
+the `爸爸` entity was identified as test residue and removed by restoring
+`/tmp/sentrix.db.before-person-appearance-20260730-201048`. The restored
+database keeps the earlier controlled `测试成员甲` confirmation so the
+propagation and Agent checks remain reproducible; a fully anonymous baseline
+still requires a fresh rebuild from source.
+
+## Clean Controlled Baseline (2026-07-31)
+
+After the memory-interaction acceptance checks, the 153 database was restored
+from the pre-appearance snapshot and verified before further work. The current
+runtime baseline is:
+
+- `120` assets and `120` observations;
+- `148` face instances and `4` active face clusters;
+- `4` native person entities, with `1` confirmed (`测试成员甲`) and `3` pending;
+- `1` semantic profile, `107` semantic claims, `5` event participant rows, and
+  `0` face-scoped appearance records;
+- one completed rebuild audit for the 120-image controlled album;
+- no resident models on either Sentrix `11435` or shared `11434` after the
+  verification.
+
+The restored snapshot is the starting point for the next controlled test. The
+backup of the pre-restore runtime database is retained on 153 under `/tmp`
+for rollback during this session only; it is runtime state, not project data
+or source control.
 
 ## Completed Work Snapshot
 
