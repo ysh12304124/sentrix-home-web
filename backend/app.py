@@ -72,31 +72,36 @@ def health():
     }
 
 
+@app.get("/api/memory-spaces")
+def memory_spaces():
+    return {"spaces": store.list_memory_spaces()}
+
+
 @app.get("/api/dashboard")
-def dashboard():
-    all_facts = store.list_facts(1000)
+def dashboard(scope_id: str | None = None):
+    all_facts = store.list_facts(1000, scope_id=scope_id)
     return {
         "stats": {
-            "assets": store.count("assets"),
-            "observations": store.count("observations"),
-            "events": store.count("events"),
-            "facts": store.count("facts"),
-            "persons": store.count("persons"),
-            "entities": store.count("entities"),
-            "faceClusters": store.count("face_clusters"),
-            "relationships": store.count("relationships"),
-            "vectors": store.count("memory_vectors"),
+            "assets": len(store.list_assets(limit=100000, scope_id=scope_id)),
+            "observations": len(store.list_observations(100000, scope_id=scope_id)),
+            "events": len(store.list_events(100000, scope_id=scope_id)),
+            "facts": len(all_facts),
+            "persons": len([item for item in store.list_entities(scope_id=scope_id) if item["entity_type"] == "person"]),
+            "entities": len(store.list_entities(scope_id=scope_id)),
+            "faceClusters": len([item for item in store.list_face_clusters() if not scope_id or item.get("scope_id") == scope_id]),
+            "relationships": len(store.list_relationships(scope_id=scope_id)),
+            "vectors": len(store._rows("SELECT id FROM memory_vectors" + (" WHERE scope_id = ?" if scope_id else ""), (scope_id,) if scope_id else ())),
         },
         "pendingFacts": len([item for item in all_facts if item["status"] == "pending"]),
-        "events": store.list_events(8),
-        "observations": store.list_observations(8),
-        "facts": store.list_facts(8),
+        "events": store.list_events(8, scope_id=scope_id),
+        "observations": store.list_observations(8, scope_id=scope_id),
+        "facts": store.list_facts(8, scope_id=scope_id),
     }
 
 
 @app.get("/api/events")
-def events():
-    return {"events": store.list_events(100)}
+def events(scope_id: str | None = None):
+    return {"events": store.list_events(100, scope_id=scope_id)}
 
 
 @app.get("/api/events/{event_id}")
@@ -135,13 +140,15 @@ def person_detail(person_id: str):
 
 
 @app.get("/api/people")
-def people(status: str | None = None):
-    values = [item for item in store.list_entities(status) if item["entity_type"] == "person"]
+def people(status: str | None = None, scope_id: str | None = None):
+    values = [item for item in store.list_entities(status, scope_id=scope_id) if item["entity_type"] == "person"]
     for item in values:
         item["display_name"] = item["canonical_name"]
         item["confirmed"] = item["status"] == "confirmed"
         item["profile"] = store.get_semantic_profile(item["id"])
         item["claims"] = store.list_semantic_claims(item["id"], 100)
+        item["event_memory"] = store.list_person_event_memory(item["id"], scope_id)
+        item["patterns"] = store.list_person_patterns(item["id"], scope_id)
     return {"people": values}
 
 
@@ -153,19 +160,31 @@ def person_profile(person_id: str):
     detail = store.get_entity_detail(person_id)
     detail["profile"] = store.get_semantic_profile(person_id)
     detail["claims"] = store.list_semantic_claims(person_id, 500)
+    detail["event_memory"] = store.list_person_event_memory(person_id)
+    detail["patterns"] = store.list_person_patterns(person_id)
     return detail
 
 
+@app.get("/api/people/{person_id}/evidence")
+def person_evidence(person_id: str, scope_id: str | None = None):
+    value = store.get_person_evidence(person_id)
+    if not value or value["entity"].get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    if scope_id and value.get("scope_id") != scope_id:
+        raise HTTPException(status_code=404, detail="person not found in memory space")
+    return value
+
+
 @app.get("/api/entities")
-def entities(status: str | None = None, includePeople: bool = False):
-    values = store.list_entities(status)
+def entities(status: str | None = None, includePeople: bool = False, scope_id: str | None = None):
+    values = store.list_entities(status, scope_id=scope_id)
     if not includePeople:
         values = [item for item in values if item["entity_type"] != "person"]
     return {"entities": values}
 
 
 @app.get("/api/knowledge")
-def knowledge(person_id: str | None = None):
+def knowledge(person_id: str | None = None, scope_id: str | None = None):
     claims = store.list_semantic_claims(person_id, 1000)
     profiles = []
     if person_id:
@@ -173,8 +192,8 @@ def knowledge(person_id: str | None = None):
         if profile:
             profiles.append(profile)
     else:
-        profiles = [item for item in (store.get_semantic_profile(entity["id"]) for entity in store.list_entities()) if item]
-    return {"profiles": profiles, "claims": claims}
+        profiles = [item for item in (store.get_semantic_profile(entity["id"]) for entity in store.list_entities(scope_id=scope_id)) if item]
+    return {"profiles": profiles, "claims": claims, "spaces": store.list_memory_spaces()}
 
 
 @app.get("/api/entities/{entity_id}")
@@ -186,8 +205,11 @@ def entity_detail(entity_id: str):
 
 
 @app.get("/api/face-clusters")
-def face_clusters(status: str | None = None):
-    return {"clusters": store.list_face_clusters(status)}
+def face_clusters(status: str | None = None, scope_id: str | None = None):
+    clusters = store.list_face_clusters(status)
+    if scope_id:
+        clusters = [item for item in clusters if item.get("scope_id") == scope_id]
+    return {"clusters": clusters}
 
 
 @app.post("/api/face-clusters/{cluster_id}/confirm")
@@ -198,12 +220,29 @@ def confirm_face_cluster(cluster_id: str, payload: dict):
     value = store.confirm_face_cluster(cluster_id, name, str(payload.get("family_role") or "").strip() or None)
     if not value:
         raise HTTPException(status_code=404, detail="face cluster not found")
-    _analyze_confirmed_person_appearance(value["entity"]["id"])
-    for event_id in store.entity_event_ids(value["entity"]["id"]):
+    return _refresh_confirmed_person(value["entity"]["id"], value.get("refresh_counts", {}))
+
+
+def _refresh_confirmed_person(person_id: str, refresh_counts: dict | None = None):
+    """Rebuild the person-rooted projections and return one authoritative response."""
+    _analyze_confirmed_person_appearance(person_id)
+    for event_id in store.entity_event_ids(person_id):
         pipeline.summarize_event(event_id)
-    refreshed = store.get_entity_detail(value["entity"]["id"])
-    refreshed["semantic_profile"] = store.get_semantic_profile(value["entity"]["id"])
-    refreshed["semantic_claims"] = store.list_semantic_claims(value["entity"]["id"], 500)
+    memory = store.rebuild_person_memory(person_id) or {}
+    refreshed = store.get_person_evidence(person_id) or store.get_entity_detail(person_id)
+    refreshed["semantic_profile"] = store.get_semantic_profile(person_id)
+    refreshed["semantic_claims"] = store.list_semantic_claims(person_id, 500)
+    refreshed["event_memory"] = store.list_person_event_memory(person_id)
+    refreshed["patterns"] = store.list_person_patterns(person_id)
+    counts = dict(refresh_counts or {})
+    counts.update({
+        "observations": len(memory.get("observation_ids", [])),
+        "events": len(memory.get("event_ids", [])),
+        "patterns": len(memory.get("patterns", [])),
+        "claims": len(memory.get("claims", [])),
+        "appearance": len(store.list_person_appearance_evidence(person_id, include_empty=True)),
+    })
+    refreshed["refresh_counts"] = counts
     return refreshed
 
 
@@ -281,9 +320,9 @@ def split_face_cluster(cluster_id: str, payload: dict):
 
 
 @app.get("/api/relationships")
-def relationships():
-    entities = store.list_entities()
-    values = store.list_relationships()
+def relationships(scope_id: str | None = None):
+    entities = store.list_entities(scope_id=scope_id)
+    values = store.list_relationships(scope_id=scope_id)
     nodes = [{"id": entity["id"], "label": entity["canonical_name"], "status": entity["status"], "entity_type": entity["entity_type"]} for entity in entities]
     edges = [{"source": item["subject_entity_id"], "target": item["object_entity_id"], "label": item["predicate"], "status": item["status"], "id": item["id"]} for item in values]
     return {"nodes": nodes, "edges": edges, "relationships": values}
@@ -314,13 +353,7 @@ def confirm_person(person_id: str, payload: dict | None = None):
     family_role = str((payload or {}).get("family_role") or "").strip() or None
     native = store.confirm_person_entity(person_id, name, family_role)
     if native:
-        _analyze_confirmed_person_appearance(native["entity"]["id"])
-        for event_id in store.entity_event_ids(native["entity"]["id"]):
-            pipeline.summarize_event(event_id)
-        refreshed = store.get_entity_detail(native["entity"]["id"])
-        refreshed["semantic_profile"] = store.get_semantic_profile(native["entity"]["id"])
-        refreshed["semantic_claims"] = store.list_semantic_claims(native["entity"]["id"], 500)
-        return refreshed
+        return _refresh_confirmed_person(native["entity"]["id"], native.get("refresh_counts", {}))
     value = store.update_person(person_id, name, "confirmed")
     if not value:
         raise HTTPException(status_code=404, detail="person not found")
@@ -336,8 +369,8 @@ def reject_person(person_id: str):
 
 
 @app.get("/api/observations")
-def observations(assetId: str | None = None, limit: int = 200):
-    values = store.list_observations(max(1, min(limit, 1000)))
+def observations(assetId: str | None = None, scope_id: str | None = None, limit: int = 200):
+    values = store.list_observations(max(1, min(limit, 1000)), scope_id=scope_id)
     if assetId:
         values = [item for item in values if item["asset_id"] == assetId]
     return {"observations": values}
@@ -361,8 +394,8 @@ def asset(asset_id: str):
 
 
 @app.get("/api/assets")
-def assets(mediaType: str | None = None, status: str | None = None, limit: int = 200):
-    return {"assets": store.list_assets(mediaType, status, max(1, min(limit, 1000)))}
+def assets(mediaType: str | None = None, status: str | None = None, scope_id: str | None = None, limit: int = 200):
+    return {"assets": store.list_assets(mediaType, status, max(1, min(limit, 1000)), scope_id=scope_id)}
 
 
 @app.get("/api/assets/{asset_id}/file")
@@ -452,7 +485,7 @@ def create_invite(payload: dict):
 def search(request: SearchRequest):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
-    result = agent.answer_turn(request.query.strip())
+    result = agent.answer_turn(request.query.strip(), scope_id=request.spaceId)
     result["retrievalTrace"] = result.get("retrieval_trace", [])
     return result
 
@@ -461,13 +494,14 @@ class AssistantTurnRequest(BaseModel):
     message: str
     conversation_id: str | None = None
     feedback: dict | None = None
+    scope_id: str = "home-default"
 
 
 @app.post("/api/assistant/turn")
 def assistant_turn(request: AssistantTurnRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
-    result = agent.answer_turn(request.message.strip(), request.conversation_id, request.feedback)
+    result = agent.answer_turn(request.message.strip(), request.conversation_id, request.feedback, request.scope_id)
     result["retrievalTrace"] = result.get("retrieval_trace", [])
     return result
 

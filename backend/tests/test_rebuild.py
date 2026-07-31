@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from scripts.maintenance.rebuild_memory import SUPPORTED, metadata_for_path, rebuild
+from scripts.maintenance.rebuild_memory import SUPPORTED, benchmark_imports, metadata_for_path, rebuild
 
 
 class RebuildInputTests(unittest.TestCase):
@@ -61,6 +61,39 @@ class RebuildInputTests(unittest.TestCase):
 
             self.assertEqual(metadata_for_path(metadata, source, first)["captured_location"], "客厅")
             self.assertEqual(metadata_for_path(metadata, source, second)["captured_location"], "厨房")
+
+    def test_benchmark_imports_resolve_album_files_and_allowlist_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "album1" / "images" / "keep.jpg"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"image")
+            manifest = {
+                "source_root": str(root),
+                "spaces": [{
+                    "scope_id": "album1",
+                    "import": {"files": [{
+                        "relative_path": "album1/images/keep.jpg",
+                        "file_name": "keep.jpg",
+                        "captured_at": "2025-01-01T10:00:00",
+                        "captured_location": "1.000000,2.000000",
+                        "source_album_id": "album1",
+                        "scope_id": "album1",
+                    }]},
+                    "evaluation": {"face_id_to_nicknames": {"1": ["不得导入"]}},
+                }],
+            }
+
+            values = list(benchmark_imports(manifest))
+
+            self.assertEqual(values[0][0], "album1")
+            self.assertTrue(values[0][1].is_file())
+            self.assertEqual(values[0][2], {
+                "captured_at": "2025-01-01T10:00:00",
+                "captured_location": "1.000000,2.000000",
+                "source_album_id": "album1",
+                "scope_id": "album1",
+            })
 
 
 if __name__ == "__main__":

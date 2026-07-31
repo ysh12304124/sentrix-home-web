@@ -58,12 +58,12 @@ class MemoryAgent:
                 matches.append(text)
         return list(dict.fromkeys(matches))
 
-    def retrieve(self, query):
-        events = self.store.list_events(100)
-        observations = self.store.list_observations(1000)
-        facts = self.store.list_facts(200)
+    def retrieve(self, query, scope_id=None):
+        events = self.store.list_events(100, scope_id=scope_id)
+        observations = self.store.list_observations(1000, scope_id=scope_id)
+        facts = self.store.list_facts(200, scope_id=scope_id)
         persons = self.store.list_persons()
-        entities = self.store.list_entities()
+        entities = self.store.list_entities(scope_id=scope_id)
         focused_people = [
             entity for entity in entities
             if entity.get("entity_type") == "person"
@@ -116,12 +116,12 @@ class MemoryAgent:
                 local_observations.append((exact, coverage, item))
         local_facts = [item for item in facts if contains(json.dumps(item, ensure_ascii=False), query)]
         query_embedding = self.clip.embed_text(query)
-        vector_hits = self.store.search_vectors("episodic", query_embedding, 12) + self.store.search_vectors("semantic", query_embedding, 12)
+        vector_hits = self.store.search_vectors("episodic", query_embedding, 12, scope_id=scope_id) + self.store.search_vectors("semantic", query_embedding, 12, scope_id=scope_id)
         vector_event_ids = [item["source_id"] for item in vector_hits if item["source_type"] == "event"]
         vector_events = [event for event in events if event["id"] in vector_event_ids]
         observation_event_ids = {item[2]["id"] for item in local_observations}
         observation_events = [event for event in events if observation_event_ids.intersection(event.get("observation_ids", []))]
-        relationships = self.store.list_relationships()
+        relationships = self.store.list_relationships(scope_id=scope_id)
         semantic_claims = []
         profiles = []
         if focused_ids:
@@ -132,6 +132,8 @@ class MemoryAgent:
                     profiles.append(profile)
         else:
             semantic_claims = self.store.list_semantic_claims(None, 500)
+            if scope_id:
+                semantic_claims = [claim for claim in semantic_claims if claim.get("scope_id") == scope_id]
         if dimension == "clothing" and focused_ids:
             semantic_claims = [claim for claim in semantic_claims if claim.get("dimension") == "clothing"]
         appearance_evidence = []
@@ -164,6 +166,7 @@ class MemoryAgent:
                 "dimension": dimension,
                 "event_filter": has_event_constraint,
             },
+            "scope_id": scope_id,
         }
 
     def context(self, retrieved):
@@ -263,7 +266,7 @@ class MemoryAgent:
             except Exception:
                 continue
         gap = self.store.create_query_gap(query, dimension, candidate_asset_ids, refined_ids)
-        return self.retrieve(query), gap
+        return self.retrieve(query, retrieved.get("scope_id")), gap
 
     @staticmethod
     def _is_activity_query(query):
@@ -332,8 +335,8 @@ class MemoryAgent:
             }
         return {"answer": f"当前本地记忆没有找到能回答“{query}”的证据。", "confidence": 0.0, "insufficient_evidence": True}
 
-    def answer(self, query, conversation_context=None):
-        retrieved = self.retrieve(query)
+    def answer(self, query, conversation_context=None, scope_id=None):
+        retrieved = self.retrieve(query, scope_id)
         retrieved, query_gap = self._refine_visual_memory(query, retrieved)
         evidence = []
         seen = set()
@@ -438,7 +441,7 @@ class MemoryAgent:
         turns.append({"role": role, "text": str(text or "")[:2000]})
         del turns[:-self._conversation_limit]
 
-    def answer_turn(self, message, conversation_id=None, feedback=None):
+    def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None):
         conversation_id = conversation_id or f"conversation_{uuid.uuid4().hex[:12]}"
         intent = self.classify_intent(message, feedback)
         if intent == "feedback":
@@ -464,7 +467,7 @@ class MemoryAgent:
         query = str(message or "").strip()
         if intent == "clarification" and previous:
             query = previous + "\n当前澄清：" + query
-        result = self.answer(query, previous)
+        result = self.answer(query, previous, scope_id)
         result["intent"] = intent
         result["conversation_id"] = conversation_id
         result["image_results"] = self._image_results(result.get("evidence", []))

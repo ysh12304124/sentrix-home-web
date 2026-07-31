@@ -12,7 +12,7 @@ from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, 
 IMPORT_METADATA_KEYS = {
     "content_sha256", "sha256", "exif", "captured_at", "captured_location",
     "source_owner_id", "source_owner_label", "source_device_id", "source_album_id",
-    "source_confidence",
+    "source_confidence", "scope_id",
 }
 
 
@@ -49,7 +49,16 @@ class IngestionPipeline:
         for key in ("captured_at", "captured_location", "source_device_id"):
             if metadata.get(key) is None and metadata["exif"].get(key):
                 metadata[key] = metadata["exif"][key]
-        return self.store.create_asset(asset_id, file_name or path.name, media_type, str(path), mime_type or mimetypes.guess_type(path.name)[0], path.stat().st_size, metadata)
+        return self.store.create_asset(
+            asset_id,
+            file_name or path.name,
+            media_type,
+            str(path),
+            mime_type or mimetypes.guess_type(path.name)[0],
+            path.stat().st_size,
+            metadata,
+            scope_id=metadata.get("scope_id"),
+        )
 
     @staticmethod
     def _sha256(path):

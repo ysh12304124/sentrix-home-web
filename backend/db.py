@@ -42,6 +42,28 @@ def dedupe_json_values(values):
     return result
 
 
+CLOTHING_NORMALIZATION = {
+    "深色西装外套": "西装外套",
+    "黑色西装外套": "西装外套",
+    "西装": "西装外套",
+    "西装外套": "西装外套",
+    "深色领带": "领带",
+    "红色领带": "领带",
+    "蓝色领带": "领带",
+    "条纹领带": "领带",
+    "带花纹的领带": "领带",
+    "有花纹的棕色系领带": "领带",
+    "白色衬衫": "衬衫",
+    "浅色衬衫": "衬衫",
+    "浅蓝色衬衫": "衬衫",
+}
+
+
+def normalize_clothing(value):
+    text = str(value or "").strip()
+    return CLOTHING_NORMALIZATION.get(text, text)
+
+
 class MemoryStore:
     def __init__(self, path):
         self.connection = sqlite3.connect(path, check_same_thread=False)
@@ -55,8 +77,18 @@ class MemoryStore:
     def _create_schema(self):
         self.connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS memory_spaces (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'household',
+                source_path TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS assets (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 file_name TEXT NOT NULL,
                 media_type TEXT NOT NULL,
                 path TEXT NOT NULL,
@@ -77,6 +109,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS observations (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 asset_id TEXT NOT NULL REFERENCES assets(id),
                 captured_at TEXT,
                 source_type TEXT NOT NULL,
@@ -100,6 +133,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 title TEXT NOT NULL,
                 event_type TEXT,
                 time_start TEXT,
@@ -144,6 +178,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS entities (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 entity_type TEXT NOT NULL,
                 canonical_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -165,6 +200,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS face_clusters (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 status TEXT NOT NULL DEFAULT 'pending',
                 entity_id TEXT REFERENCES entities(id),
                 representative_embedding_json TEXT NOT NULL DEFAULT '[]',
@@ -231,6 +267,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS relationships (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 subject_entity_id TEXT NOT NULL REFERENCES entities(id),
                 predicate TEXT NOT NULL,
                 object_entity_id TEXT NOT NULL REFERENCES entities(id),
@@ -244,6 +281,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS memory_vectors (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 space TEXT NOT NULL,
                 source_type TEXT NOT NULL,
                 source_id TEXT NOT NULL,
@@ -256,6 +294,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS facts (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 subject TEXT NOT NULL,
                 predicate TEXT NOT NULL,
                 object TEXT NOT NULL,
@@ -271,12 +310,15 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS semantic_profiles (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 person_id TEXT NOT NULL UNIQUE REFERENCES entities(id),
                 summary_zh TEXT NOT NULL DEFAULT '',
                 activity_summary_zh TEXT NOT NULL DEFAULT '',
                 place_summary_zh TEXT NOT NULL DEFAULT '',
                 appearance_summary_zh TEXT NOT NULL DEFAULT '',
                 preference_summary_zh TEXT NOT NULL DEFAULT '',
+                event_memory_json TEXT NOT NULL DEFAULT '[]',
+                patterns_json TEXT NOT NULL DEFAULT '[]',
                 evidence_ids_json TEXT NOT NULL DEFAULT '[]',
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
@@ -284,10 +326,14 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS semantic_claims (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 person_id TEXT NOT NULL REFERENCES entities(id),
                 dimension TEXT NOT NULL,
                 predicate TEXT NOT NULL,
                 value_text TEXT NOT NULL,
+                normalized_value_text TEXT,
+                normalization_version TEXT NOT NULL DEFAULT 'zh-v1',
+                support_count INTEGER NOT NULL DEFAULT 1,
                 value_entity_id TEXT REFERENCES entities(id),
                 valid_from TEXT,
                 valid_to TEXT,
@@ -300,6 +346,44 @@ class MemoryStore:
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS person_event_memory (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                event_id TEXT NOT NULL REFERENCES events(id),
+                role TEXT NOT NULL DEFAULT 'visible_subject',
+                activity_text TEXT NOT NULL DEFAULT '',
+                place_text TEXT NOT NULL DEFAULT '',
+                time_start TEXT,
+                time_end TEXT,
+                co_person_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(person_id, event_id, role)
+            );
+            CREATE TABLE IF NOT EXISTS person_patterns (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                pattern_type TEXT NOT NULL,
+                value_text TEXT NOT NULL,
+                normalized_key TEXT NOT NULL,
+                supporting_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                support_count INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT,
+                last_seen TEXT,
+                confidence REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(person_id, pattern_type, normalized_key)
             );
             CREATE TABLE IF NOT EXISTS query_gaps (
                 id TEXT PRIMARY KEY,
@@ -353,10 +437,12 @@ class MemoryStore:
         )
         self._migrate_face_instances_cluster_nullable()
         self._ensure_columns("assets", {
+            "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "source_owner_id": "TEXT", "source_owner_label": "TEXT", "source_device_id": "TEXT", "source_album_id": "TEXT",
             "source_confidence": "REAL NOT NULL DEFAULT 0", "content_sha256": "TEXT", "captured_at": "TEXT", "captured_location": "TEXT",
         })
         self._ensure_columns("observations", {
+            "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "canonical_json": "TEXT NOT NULL DEFAULT '{}'", "source_owner_id": "TEXT",
             "inferred_captured_by": "TEXT", "clothing_json": "TEXT NOT NULL DEFAULT '[]'",
             "spatial_relations_json": "TEXT NOT NULL DEFAULT '[]'", "revision": "INTEGER NOT NULL DEFAULT 1",
@@ -371,6 +457,7 @@ class MemoryStore:
             "embedding_version": "TEXT NOT NULL DEFAULT 'unknown'", "embedding_quality_signal": "REAL NOT NULL DEFAULT 0",
         })
         self._ensure_columns("events", {
+            "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "title": "TEXT NOT NULL DEFAULT '未命名事件'", "event_type": "TEXT",
             "time_start": "TEXT", "time_end": "TEXT", "place": "TEXT", "activity": "TEXT",
             "summary": "TEXT", "participants_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -379,11 +466,27 @@ class MemoryStore:
             "aggregation_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
+        self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("face_clusters", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("relationships", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("facts", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("memory_vectors", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("semantic_profiles", {
+            "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
+            "event_memory_json": "TEXT NOT NULL DEFAULT '[]'",
+            "patterns_json": "TEXT NOT NULL DEFAULT '[]'",
+        })
         self._ensure_columns("semantic_claims", {
+            "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "confidence_source": "TEXT NOT NULL DEFAULT 'derived'",
+            "normalized_value_text": "TEXT",
+            "normalization_version": "TEXT NOT NULL DEFAULT 'zh-v1'",
+            "support_count": "INTEGER NOT NULL DEFAULT 1",
         })
         self.connection.executescript(
             """
+            INSERT OR IGNORE INTO memory_spaces(id, name, kind, created_at, updated_at)
+            VALUES ('home-default', '默认家庭', 'household', datetime('now'), datetime('now'));
             CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(asset_id);
             CREATE INDEX IF NOT EXISTS idx_assets_content_sha256 ON assets(content_sha256);
             CREATE INDEX IF NOT EXISTS idx_events_time ON events(time_start);
@@ -395,12 +498,23 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_entity_mentions_observation ON entity_mentions(observation_id);
             CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
             CREATE INDEX IF NOT EXISTS idx_relationship_subject_object ON relationships(subject_entity_id, object_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_relationships_scope ON relationships(scope_id);
+            CREATE INDEX IF NOT EXISTS idx_facts_scope ON facts(scope_id);
             CREATE INDEX IF NOT EXISTS idx_memory_vectors_space ON memory_vectors(space);
             CREATE INDEX IF NOT EXISTS idx_memory_vectors_visual_asset ON memory_vectors(space, source_type, source_id, model_name);
             CREATE INDEX IF NOT EXISTS idx_event_observations_observation ON event_observations(observation_id);
             CREATE INDEX IF NOT EXISTS idx_event_participants_event ON event_participants(event_id);
             CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id);
             CREATE INDEX IF NOT EXISTS idx_semantic_claims_person ON semantic_claims(person_id);
+            CREATE INDEX IF NOT EXISTS idx_assets_scope ON assets(scope_id);
+            CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(scope_id);
+            CREATE INDEX IF NOT EXISTS idx_events_scope ON events(scope_id);
+            CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(scope_id);
+            CREATE INDEX IF NOT EXISTS idx_face_clusters_scope ON face_clusters(scope_id);
+            CREATE INDEX IF NOT EXISTS idx_person_event_memory_person ON person_event_memory(person_id, event_id);
+            CREATE INDEX IF NOT EXISTS idx_person_event_memory_scope ON person_event_memory(scope_id, event_id);
+            CREATE INDEX IF NOT EXISTS idx_person_patterns_person ON person_patterns(person_id, pattern_type);
+            CREATE INDEX IF NOT EXISTS idx_person_patterns_scope ON person_patterns(scope_id, pattern_type);
             CREATE INDEX IF NOT EXISTS idx_query_gaps_status ON query_gaps(status);
             """
         )
@@ -484,9 +598,26 @@ class MemoryStore:
         self.connection.commit()
 
     def count(self, table):
-        if table not in {"assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites"}:
+        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites"}:
             raise ValueError("unsupported table")
         return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def create_memory_space(self, scope_id, name, kind="household", source_path=None):
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO memory_spaces(id, name, kind, source_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
+            source_path = excluded.source_path, updated_at = excluded.updated_at""",
+            (scope_id, name, kind, source_path, timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
+
+    def list_memory_spaces(self, status="active"):
+        if status:
+            return self._rows("SELECT * FROM memory_spaces WHERE status = ? ORDER BY created_at", (status,))
+        return self._rows("SELECT * FROM memory_spaces ORDER BY created_at")
 
     def _row(self, query, params=()):
         row = self.connection.execute(query, params).fetchone()
@@ -506,17 +637,19 @@ class MemoryStore:
                 result[field] = []
         return result
 
-    def create_asset(self, asset_id, file_name, media_type, path, mime_type=None, size_bytes=0, metadata=None):
+    def create_asset(self, asset_id, file_name, media_type, path, mime_type=None, size_bytes=0, metadata=None, scope_id=None):
         metadata = metadata or {}
+        scope_id = scope_id or metadata.get("scope_id") or "home-default"
+        self.create_memory_space(scope_id, scope_id) if not self._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,)) else None
         timestamp = now_iso()
         self.connection.execute(
             """INSERT INTO assets(
-                id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
+                id, scope_id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
                 source_owner_id, source_owner_label, source_device_id, source_album_id, source_confidence,
                 content_sha256, captured_at, captured_location, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                asset_id, file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
+                asset_id, scope_id, file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
                 metadata.get("source_owner_id"), metadata.get("source_owner_label"), metadata.get("source_device_id"), metadata.get("source_album_id"),
                 float(metadata.get("source_confidence", 0) or 0), metadata.get("content_sha256") or metadata.get("sha256"), metadata.get("captured_at"), metadata.get("captured_location"),
                 timestamp, timestamp,
@@ -534,7 +667,7 @@ class MemoryStore:
         row = self._row("SELECT id FROM assets WHERE content_sha256 = ? ORDER BY created_at LIMIT 1", (content_sha256,))
         return self.get_asset(row["id"]) if row else None
 
-    def list_assets(self, media_type=None, status=None, limit=200):
+    def list_assets(self, media_type=None, status=None, limit=200, scope_id=None):
         clauses = []
         params = []
         if media_type:
@@ -543,6 +676,9 @@ class MemoryStore:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         rows = self._rows(f"SELECT * FROM assets {where} ORDER BY created_at DESC LIMIT ?", params)
@@ -603,17 +739,20 @@ class MemoryStore:
                 self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.commit()
 
-    def add_observation(self, asset_id, data):
+    def add_observation(self, asset_id, data, scope_id=None):
         observation_id = data.get("id") or make_id("obs")
+        asset = self.get_asset(asset_id) or {}
+        scope_id = scope_id or data.get("scope_id") or asset.get("scope_id") or "home-default"
         timestamp = now_iso()
         self.connection.execute(
             """INSERT INTO observations(
-                id, asset_id, captured_at, source_type, caption, activity, place,
+                id, scope_id, asset_id, captured_at, source_type, caption, activity, place,
                 people_json, objects_json, ocr_text, event_type, transcript, confidence, raw_json,
                 canonical_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 observation_id,
+                scope_id,
                 asset_id,
                 data.get("captured_at"),
                 data.get("source_type", "image"),
@@ -674,8 +813,11 @@ class MemoryStore:
             self.rebuild_person_memory(item["entity_id"])
         return self.get_observation(observation_id)
 
-    def list_observations(self, limit=100):
-        rows = self._rows("SELECT * FROM observations ORDER BY created_at DESC LIMIT ?", (limit,))
+    def list_observations(self, limit=100, scope_id=None):
+        if scope_id:
+            rows = self._rows("SELECT * FROM observations WHERE scope_id = ? ORDER BY created_at DESC LIMIT ?", (scope_id, limit))
+        else:
+            rows = self._rows("SELECT * FROM observations ORDER BY created_at DESC LIMIT ?", (limit,))
         values = []
         for row in rows:
             value = self._decode(row, ["people_json", "objects_json", "raw_json", "canonical_json", "clothing_json", "spatial_relations_json"])
@@ -689,7 +831,8 @@ class MemoryStore:
         return values
 
     def _event_candidates(self, observation):
-        rows = self._rows("SELECT * FROM events WHERE status = 'active' ORDER BY time_start DESC")
+        scope_id = (self.get_asset(observation.get("asset_id")) or {}).get("scope_id") or "home-default"
+        rows = self._rows("SELECT * FROM events WHERE status = 'active' AND scope_id = ? ORDER BY time_start DESC", (scope_id,))
         anchor = self._event_anchor(observation)
         captured = parse_time(anchor["captured_at"])
         candidates = []
@@ -708,7 +851,8 @@ class MemoryStore:
         return candidates
 
     def _event_candidate_diagnostics(self, observation):
-        rows = self._rows("SELECT * FROM events WHERE status = 'active' ORDER BY time_start DESC")
+        scope_id = (self.get_asset(observation.get("asset_id")) or {}).get("scope_id") or "home-default"
+        rows = self._rows("SELECT * FROM events WHERE status = 'active' AND scope_id = ? ORDER BY time_start DESC", (scope_id,))
         anchor = self._event_anchor(observation)
         captured = parse_time(anchor["captured_at"])
         diagnostics = []
@@ -885,9 +1029,9 @@ class MemoryStore:
             event_id = make_id("evt")
             title = "待总结事件"
             self.connection.execute(
-                """INSERT INTO events(id, title, event_type, time_start, time_end, place, activity, summary,
-                participants_json, confidence, aggregation_breakdown_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (event_id, title, event_type, captured_at, captured_at, event_place, observation.get("activity"), observation.get("caption") or title, json_value(people, []), float(observation.get("confidence", 0) or 0), json_value({"selected": False, "ambiguity": len(diagnostics) > 1, "split_guard": next((item["breakdown"].get("split_guard") for item in diagnostics if item["breakdown"].get("split_guard")), None), "candidates": diagnostics[:5]}, {}), now_iso(), now_iso()),
+                """INSERT INTO events(scope_id, id, title, event_type, time_start, time_end, place, activity, summary,
+                participants_json, confidence, aggregation_breakdown_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ((self.get_asset(observation.get("asset_id")) or {}).get("scope_id") or "home-default", event_id, title, event_type, captured_at, captured_at, event_place, observation.get("activity"), observation.get("caption") or title, json_value(people, []), float(observation.get("confidence", 0) or 0), json_value({"selected": False, "ambiguity": len(diagnostics) > 1, "split_guard": next((item["breakdown"].get("split_guard") for item in diagnostics if item["breakdown"].get("split_guard")), None), "candidates": diagnostics[:5]}, {}), now_iso(), now_iso()),
             )
         self.connection.execute("INSERT OR IGNORE INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event_id, observation["id"]))
         if event:
@@ -966,7 +1110,7 @@ class MemoryStore:
 
     def get_semantic_profile(self, person_id):
         row = self._row("SELECT * FROM semantic_profiles WHERE person_id = ?", (person_id,))
-        return self._decode(row, ["evidence_ids_json"])
+        return self._decode(row, ["evidence_ids_json", "event_memory_json", "patterns_json"])
 
     def upsert_semantic_profile(self, person_id, fields, evidence_ids=None):
         existing = self.get_semantic_profile(person_id)
@@ -977,23 +1121,25 @@ class MemoryStore:
             merged_evidence = list(dict.fromkeys(old_evidence + evidence_ids))
             assignments = []
             values = []
-            for key in ("summary_zh", "activity_summary_zh", "place_summary_zh", "appearance_summary_zh", "preference_summary_zh"):
+            for key in ("summary_zh", "activity_summary_zh", "place_summary_zh", "appearance_summary_zh", "preference_summary_zh", "event_memory_json", "patterns_json", "scope_id"):
                 if key in fields:
                     assignments.append(f"{key} = ?")
-                    values.append(fields[key])
+                    values.append(json_value(fields[key], []) if key.endswith("_json") else fields[key])
             assignments.extend(["evidence_ids_json = ?", "revision = revision + 1", "updated_at = ?"])
             values.extend([json_value(merged_evidence, []), timestamp, existing["id"]])
             self.connection.execute(f"UPDATE semantic_profiles SET {', '.join(assignments)} WHERE id = ?", values)
         else:
             self.connection.execute(
                 """INSERT INTO semantic_profiles(
-                    id, person_id, summary_zh, activity_summary_zh, place_summary_zh,
-                    appearance_summary_zh, preference_summary_zh, evidence_ids_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    id, scope_id, person_id, summary_zh, activity_summary_zh, place_summary_zh,
+                    appearance_summary_zh, preference_summary_zh, event_memory_json, patterns_json,
+                    evidence_ids_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    make_id("profile"), person_id, fields.get("summary_zh", ""), fields.get("activity_summary_zh", ""),
-                    fields.get("place_summary_zh", ""), fields.get("appearance_summary_zh", ""), fields.get("preference_summary_zh", ""),
-                    json_value(evidence_ids, []), timestamp, timestamp,
+                    make_id("profile"), fields.get("scope_id", "home-default"), person_id, fields.get("summary_zh", ""),
+                    fields.get("activity_summary_zh", ""), fields.get("place_summary_zh", ""), fields.get("appearance_summary_zh", ""),
+                    fields.get("preference_summary_zh", ""), json_value(fields.get("event_memory_json", fields.get("event_memory", [])), []),
+                    json_value(fields.get("patterns_json", fields.get("patterns", [])), []), json_value(evidence_ids, []), timestamp, timestamp,
                 ),
             )
         self.connection.commit()
@@ -1010,10 +1156,14 @@ class MemoryStore:
         }.get(str(predicate).strip(), str(predicate).strip())
         evidence_ids = list(dict.fromkeys(evidence_ids or []))
         event_ids = list(dict.fromkeys(event_ids or []))
+        normalized_value = normalize_clothing(value_text) if dimension == "clothing" else str(value_text or "").strip()
+        entity = self.get_entity(person_id) or {}
+        scope_id = entity.get("scope_id") or "home-default"
         matching = self._row(
-            """SELECT * FROM semantic_claims WHERE person_id = ? AND dimension = ? AND predicate = ? AND value_text = ?
+            """SELECT * FROM semantic_claims WHERE person_id = ? AND dimension = ? AND predicate = ?
+            AND COALESCE(normalized_value_text, value_text) = ?
             AND status IN ('active', 'pending') ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, revision DESC LIMIT 1""",
-            (person_id, dimension, predicate, value_text),
+            (person_id, dimension, predicate, normalized_value),
         )
         timestamp = now_iso()
         if matching:
@@ -1021,9 +1171,12 @@ class MemoryStore:
             merged_events = list(dict.fromkeys(json.loads(matching["supporting_event_ids_json"] or "[]") + event_ids))
             self.connection.execute(
                 """UPDATE semantic_claims SET evidence_ids_json = ?, supporting_event_ids_json = ?, confidence = MAX(confidence, ?), confidence_source = ?,
+                normalized_value_text = ?, support_count = ?,
                 valid_from = COALESCE(valid_from, ?), valid_to = CASE WHEN valid_to IS NULL THEN ? ELSE valid_to END,
                 updated_at = ? WHERE id = ?""",
-                (json_value(merged_evidence, []), json_value(merged_events, []), float(confidence or 0), confidence_source, valid_from, valid_to, timestamp, matching["id"]),
+                (json_value(merged_evidence, []), json_value(merged_events, []), float(confidence or 0), confidence_source,
+                 normalized_value, max(int(matching.get("support_count", 1) or 1), len(merged_events) or 1),
+                 valid_from, valid_to, timestamp, matching["id"]),
             )
             self.connection.commit()
             return self.get_semantic_claim(matching["id"])
@@ -1037,13 +1190,15 @@ class MemoryStore:
         claim_id = make_id("claim")
         self.connection.execute(
             """INSERT INTO semantic_claims(
-                id, person_id, dimension, predicate, value_text, valid_from, valid_to,
-                supporting_event_ids_json, evidence_ids_json, status, confidence, confidence_source, supersedes_claim_id, revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                id, scope_id, person_id, dimension, predicate, value_text, normalized_value_text,
+                valid_from, valid_to, supporting_event_ids_json, evidence_ids_json, status, confidence,
+                confidence_source, support_count, supersedes_claim_id, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                claim_id, person_id, dimension, predicate, value_text, valid_from, valid_to,
+                claim_id, scope_id, person_id, dimension, predicate, value_text, normalized_value, valid_from, valid_to,
                 json_value(event_ids, []), json_value(evidence_ids, []), status, float(confidence or 0), confidence_source,
-                active["id"] if active and status == "pending" else None, (active["revision"] + 1) if active and status == "pending" else 1, timestamp, timestamp,
+                max(1, len(event_ids)), active["id"] if active and status == "pending" else None,
+                (active["revision"] + 1) if active and status == "pending" else 1, timestamp, timestamp,
             ),
         )
         self.connection.commit()
@@ -1107,6 +1262,132 @@ class MemoryStore:
         self.connection.commit()
         return self._row("SELECT * FROM memory_feedback WHERE id = ?", (feedback_id,))
 
+    def list_person_event_memory(self, person_id, scope_id=None):
+        clauses = ["person_id = ?", "status = 'active'"]
+        params = [person_id]
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        rows = self._rows(
+            f"SELECT * FROM person_event_memory WHERE {' AND '.join(clauses)} ORDER BY time_start DESC, updated_at DESC",
+            params,
+        )
+        return [self._decode(row, ["co_person_ids_json", "evidence_ids_json"]) for row in rows]
+
+    def list_person_patterns(self, person_id, scope_id=None):
+        clauses = ["person_id = ?", "status = 'active'"]
+        params = [person_id]
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        rows = self._rows(
+            f"SELECT * FROM person_patterns WHERE {' AND '.join(clauses)} ORDER BY support_count DESC, last_seen DESC",
+            params,
+        )
+        return [self._decode(row, ["supporting_event_ids_json", "evidence_ids_json"]) for row in rows]
+
+    def get_person_memory(self, person_id, scope_id=None):
+        profile = self.get_semantic_profile(person_id)
+        return {
+            "profile": profile,
+            "event_memory": self.list_person_event_memory(person_id, scope_id),
+            "patterns": self.list_person_patterns(person_id, scope_id),
+            "claims": self.list_semantic_claims(person_id),
+        }
+
+    def _rebuild_person_event_memory(self, person_id, event_ids, mentions_by_event):
+        self.connection.execute("DELETE FROM person_event_memory WHERE person_id = ?", (person_id,))
+        entity = self.get_entity(person_id) or {}
+        scope_id = entity.get("scope_id") or "home-default"
+        for event_id in event_ids:
+            event = self.get_event(event_id)
+            if not event:
+                continue
+            evidence_ids = list(dict.fromkeys(mentions_by_event.get(event_id, [])))
+            roles = self._rows(
+                "SELECT role, evidence_ids_json FROM event_participants WHERE event_id = ? AND person_id = ?",
+                (event_id, person_id),
+            )
+            if roles:
+                role_values = roles
+                for role_row in roles:
+                    evidence_ids.extend(json.loads(role_row["evidence_ids_json"] or "[]"))
+            else:
+                role_values = [{"role": "visible_subject", "evidence_ids_json": "[]"}]
+            co_people = [
+                item["person_id"] for item in self._rows(
+                    "SELECT person_id FROM event_participants WHERE event_id = ? AND person_id != ? AND role = 'visible_subject'",
+                    (event_id, person_id),
+                )
+            ]
+            for role_row in role_values:
+                evidence = list(dict.fromkeys(evidence_ids + json.loads(role_row["evidence_ids_json"] or "[]")))
+                self.connection.execute(
+                    """INSERT INTO person_event_memory(
+                        id, scope_id, person_id, event_id, role, activity_text, place_text,
+                        time_start, time_end, co_person_ids_json, evidence_ids_json, confidence,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        make_id("pem"), scope_id, person_id, event_id, role_row["role"],
+                        event.get("activity") or event.get("event_type") or "",
+                        event.get("place") or "", event.get("time_start"), event.get("time_end"),
+                        json_value(list(dict.fromkeys(co_people)), []), json_value(evidence, []),
+                        float(event.get("confidence", 0.5) or 0.5), now_iso(), now_iso(),
+                    ),
+                )
+
+    def _rebuild_person_patterns(self, person_id):
+        self.connection.execute("DELETE FROM person_patterns WHERE person_id = ?", (person_id,))
+        entity = self.get_entity(person_id) or {}
+        scope_id = entity.get("scope_id") or "home-default"
+        grouped = {}
+
+        def add_pattern(pattern_type, value_text, event_id, evidence_ids, when, confidence):
+            value_text = str(value_text or "").strip()
+            if not value_text:
+                return
+            normalized = normalize_clothing(value_text) if pattern_type == "clothing" else value_text
+            key = (pattern_type, normalized)
+            item = grouped.setdefault(key, {"events": [], "evidence": [], "times": [], "confidence": 0.0})
+            if event_id and event_id not in item["events"]:
+                item["events"].append(event_id)
+            item["evidence"].extend(evidence_ids or [])
+            if when:
+                item["times"].append(when)
+            item["confidence"] = max(item["confidence"], float(confidence or 0))
+
+        for row in self.list_person_event_memory(person_id):
+            for event_id in [row["event_id"]]:
+                add_pattern("activity", row["activity_text"], event_id, row["evidence_ids_json"], row.get("time_start"), row.get("confidence"))
+                add_pattern("place", row["place_text"], event_id, row["evidence_ids_json"], row.get("time_start"), row.get("confidence"))
+            for co_person_id in row["co_person_ids_json"]:
+                co_person = self.get_entity(co_person_id)
+                add_pattern("co_person", co_person["canonical_name"] if co_person else co_person_id, row["event_id"], row["evidence_ids_json"], row.get("time_start"), row.get("confidence"))
+
+        for appearance in self.list_person_appearance_evidence(person_id):
+            event_ids = [row["event_id"] for row in self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (appearance["observation_id"],))]
+            for clothing in appearance.get("clothing_json", []):
+                for event_id in event_ids or [None]:
+                    add_pattern("clothing", clothing, event_id, [appearance["id"]], appearance.get("created_at"), appearance.get("confidence"))
+
+        for (pattern_type, normalized), item in grouped.items():
+            times = sorted(item["times"])
+            events = list(dict.fromkeys(item["events"]))
+            evidence = list(dict.fromkeys(item["evidence"]))
+            self.connection.execute(
+                """INSERT INTO person_patterns(
+                    id, scope_id, person_id, pattern_type, value_text, normalized_key,
+                    supporting_event_ids_json, evidence_ids_json, support_count, first_seen,
+                    last_seen, confidence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    make_id("pattern"), scope_id, person_id, pattern_type, normalized, normalized,
+                    json_value(events, []), json_value(evidence, []), max(len(events), len(evidence), 1),
+                    times[0] if times else None, times[-1] if times else None, item["confidence"], now_iso(), now_iso(),
+                ),
+            )
+
     def rebuild_person_memory(self, person_id):
         entity = self.get_entity(person_id)
         if not entity:
@@ -1122,6 +1403,8 @@ class MemoryStore:
             row["event_id"] for row in self._rows("SELECT DISTINCT event_id FROM event_participants WHERE person_id = ?", (person_id,))
             if row["event_id"] not in event_ids
         )
+        event_ids = list(dict.fromkeys(event_ids))
+        self._rebuild_person_event_memory(person_id, event_ids, mentions_by_event)
         # Derived claims are a rebuildable projection. User-confirmed identity
         # claims and their audit history remain intact.
         self.connection.execute(
@@ -1196,6 +1479,9 @@ class MemoryStore:
         role = entity.get("family_role")
         if role:
             self.maintain_semantic_claim(person_id, "identity", "家庭角色", role, observation_ids, event_ids, 1.0, confidence_source="user")
+        self._rebuild_person_patterns(person_id)
+        event_memory = self.list_person_event_memory(person_id)
+        patterns = self.list_person_patterns(person_id)
         summary_parts = []
         if observation_ids:
             summary_parts.append(f"出现在{len(observation_ids)}条观察中")
@@ -1211,13 +1497,26 @@ class MemoryStore:
             "activity_summary_zh": activity_summary or "暂无已确认活动",
             "place_summary_zh": "、".join(places[:12]),
             "appearance_summary_zh": "、".join(clothing_values[:12]) or "暂无可归属的人物级衣物证据",
+            "scope_id": entity.get("scope_id") or "home-default",
+            "event_memory_json": event_memory,
+            "patterns_json": patterns,
         }, list(dict.fromkeys(all_evidence_ids)))
         for event_id in event_ids:
             self.refresh_event_summary(event_id)
-        return {"profile": profile, "claims": self.list_semantic_claims(person_id), "event_ids": event_ids, "observation_ids": observation_ids}
+        return {
+            "profile": profile,
+            "claims": self.list_semantic_claims(person_id),
+            "event_memory": event_memory,
+            "patterns": patterns,
+            "event_ids": event_ids,
+            "observation_ids": observation_ids,
+        }
 
-    def list_events(self, limit=100):
-        rows = self._rows("SELECT * FROM events WHERE status = 'active' ORDER BY time_start DESC LIMIT ?", (limit,))
+    def list_events(self, limit=100, scope_id=None):
+        if scope_id:
+            rows = self._rows("SELECT * FROM events WHERE status = 'active' AND scope_id = ? ORDER BY time_start DESC LIMIT ?", (scope_id, limit))
+        else:
+            rows = self._rows("SELECT * FROM events WHERE status = 'active' ORDER BY time_start DESC LIMIT ?", (limit,))
         return [self.get_event(row["id"]) for row in rows]
 
     def get_event_detail(self, event_id):
@@ -1265,13 +1564,23 @@ class MemoryStore:
     def get_fact(self, fact_id):
         return self._fact_row(self._row("SELECT * FROM facts WHERE id = ?", (fact_id,)))
 
-    def list_facts(self, limit=200):
-        rows = self._rows("SELECT * FROM facts ORDER BY updated_at DESC LIMIT ?", (limit,))
+    def list_facts(self, limit=200, scope_id=None):
+        rows = self._rows(
+            "SELECT * FROM facts" + (" WHERE scope_id = ?" if scope_id else "") + " ORDER BY updated_at DESC LIMIT ?",
+            (scope_id, limit) if scope_id else (limit,),
+        )
         return [self._fact_row(row) for row in rows]
 
-    def maintain_fact(self, subject, predicate, object_value, evidence_ids, confidence=0.5):
-        active = self._row("SELECT * FROM facts WHERE subject = ? AND predicate = ? AND status = 'active' ORDER BY revision DESC LIMIT 1", (subject, predicate))
+    def maintain_fact(self, subject, predicate, object_value, evidence_ids, confidence=0.5, scope_id=None):
         evidence_ids = list(dict.fromkeys(evidence_ids or []))
+        if not scope_id and evidence_ids:
+            observation = self.get_observation(evidence_ids[0])
+            scope_id = (observation or {}).get("scope_id")
+        scope_id = scope_id or "home-default"
+        active = self._row(
+            "SELECT * FROM facts WHERE scope_id = ? AND subject = ? AND predicate = ? AND status = 'active' ORDER BY revision DESC LIMIT 1",
+            (scope_id, subject, predicate),
+        )
         if active and active["object"] == object_value:
             existing = json.loads(active["evidence_ids_json"] or "[]")
             merged = list(dict.fromkeys(existing + evidence_ids))
@@ -1282,9 +1591,9 @@ class MemoryStore:
         fact_id = make_id("fact")
         revision = (active["revision"] + 1) if active else 1
         self.connection.execute(
-            """INSERT INTO facts(id, subject, predicate, object, status, confidence, evidence_ids_json,
-            supersedes_fact_id, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (fact_id, subject, predicate, object_value, status, float(confidence), json_value(evidence_ids, []), active["id"] if active else None, revision, now_iso(), now_iso()),
+            """INSERT INTO facts(id, scope_id, subject, predicate, object, status, confidence, evidence_ids_json,
+            supersedes_fact_id, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (fact_id, scope_id, subject, predicate, object_value, status, float(confidence), json_value(evidence_ids, []), active["id"] if active else None, revision, now_iso(), now_iso()),
         )
         self.connection.commit()
         return self.get_fact(fact_id)
@@ -1372,23 +1681,38 @@ class MemoryStore:
         values = self._normalise_vector(vector)
         if not values:
             return None
+        metadata = dict(metadata or {})
+        scope_id = metadata.get("scope_id")
+        if not scope_id and metadata.get("asset_id"):
+            scope_id = (self.get_asset(metadata["asset_id"]) or {}).get("scope_id")
+        if not scope_id and source_type == "asset":
+            scope_id = (self.get_asset(source_id) or {}).get("scope_id")
+        if not scope_id and source_type == "observation":
+            scope_id = (self.get_observation(source_id) or {}).get("scope_id")
+        if not scope_id and source_type == "event":
+            scope_id = (self.get_event(source_id) or {}).get("scope_id")
+        metadata["scope_id"] = scope_id or "home-default"
         timestamp = now_iso()
         self.connection.execute(
-            """INSERT INTO memory_vectors(id, space, source_type, source_id, vector_json, model_name, metadata_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO memory_vectors(id, scope_id, space, source_type, source_id, vector_json, model_name, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(space, source_type, source_id, model_name) DO UPDATE SET
-                vector_json = excluded.vector_json, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at""",
-            (make_id("vec"), space, source_type, source_id, json_value(values, []), model_name, json_value(metadata, {}), timestamp, timestamp),
+                scope_id = excluded.scope_id, vector_json = excluded.vector_json, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at""",
+            (make_id("vec"), metadata["scope_id"], space, source_type, source_id, json_value(values, []), model_name, json_value(metadata, {}), timestamp, timestamp),
         )
         self.connection.commit()
         return self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
 
-    def search_vectors(self, space, vector, limit=10):
+    def search_vectors(self, space, vector, limit=10, scope_id=None):
         query = self._normalise_vector(vector)
         if not query:
             return []
         results = []
-        for row in self._rows("SELECT * FROM memory_vectors WHERE space = ?", (space,)):
+        rows = self._rows(
+            "SELECT * FROM memory_vectors WHERE space = ?" + (" AND scope_id = ?" if scope_id else ""),
+            (space, scope_id) if scope_id else (space,),
+        )
+        for row in rows:
             try:
                 candidate = json.loads(row["vector_json"] or "[]")
                 score = self._cosine(query, candidate)
@@ -1399,20 +1723,23 @@ class MemoryStore:
             results.append(result)
         return sorted(results, key=lambda item: item["score"], reverse=True)[:max(1, limit)]
 
-    def create_entity(self, name, entity_type="person", status="pending", family_role=None, confidence=0.0, summary=""):
+    def create_entity(self, name, entity_type="person", status="pending", family_role=None, confidence=0.0, summary="", scope_id="home-default"):
         entity_id = make_id("entity")
         timestamp = now_iso()
         self.connection.execute(
-            """INSERT INTO entities(id, entity_type, canonical_name, status, family_role, summary, confidence, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (entity_id, entity_type, name, status, family_role, summary, float(confidence or 0), timestamp, timestamp),
+            """INSERT INTO entities(scope_id, id, entity_type, canonical_name, status, family_role, summary, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (scope_id or "home-default", entity_id, entity_type, name, status, family_role, summary, float(confidence or 0), timestamp, timestamp),
         )
         self.connection.commit()
         return self.get_entity(entity_id)
 
-    def list_entities(self, status=None):
+    def list_entities(self, status=None, scope_id=None):
         params = [status] if status else []
         where = "WHERE status = ?" if status else "WHERE status != 'rejected'"
+        if scope_id:
+            where += " AND scope_id = ?"
+            params.append(scope_id)
         entities = self._rows(f"SELECT * FROM entities {where} ORDER BY updated_at DESC", params)
         for entity in entities:
             entity["cluster_count"] = self.connection.execute("SELECT COUNT(*) FROM face_clusters WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
@@ -1440,6 +1767,8 @@ class MemoryStore:
         )
         if result:
             result["pose"] = result.get("pose_json", [])
+            asset = self.get_asset(result["asset_id"])
+            result["scope_id"] = (asset or {}).get("scope_id") or "home-default"
         return result
 
     def record_person_appearance_evidence(self, person_id, face_instance_id, crop_bbox, clothing, confidence, model_name):
@@ -1555,17 +1884,17 @@ class MemoryStore:
             "appearance_evidence": self.list_person_appearance_evidence(entity_id, include_empty=True),
         }
 
-    def create_face_cluster(self, embedding, confidence=0.0):
+    def create_face_cluster(self, embedding, confidence=0.0, scope_id="home-default"):
         cluster_id = make_id("cluster")
         timestamp = now_iso()
         values = self._normalise_vector(embedding)
         self.connection.execute(
-            """INSERT INTO face_clusters(id, representative_embedding_json, member_count, confidence, created_at, updated_at)
-            VALUES (?, ?, 0, ?, ?, ?)""",
-            (cluster_id, json_value(values, []), float(confidence or 0), timestamp, timestamp),
+            """INSERT INTO face_clusters(scope_id, id, representative_embedding_json, member_count, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, 0, ?, ?, ?)""",
+            (scope_id or "home-default", cluster_id, json_value(values, []), float(confidence or 0), timestamp, timestamp),
         )
         self.connection.commit()
-        entity = self.create_entity(f"待确认人物簇 · {cluster_id}", "person", "pending", None, float(confidence or 0), "由 buffalo_l embedding 生成，等待用户确认")
+        entity = self.create_entity(f"待确认人物簇 · {cluster_id}", "person", "pending", None, float(confidence or 0), "由 buffalo_l embedding 生成，等待用户确认", scope_id=scope_id)
         self.connection.execute("UPDATE face_clusters SET entity_id = ? WHERE id = ?", (entity["id"], cluster_id))
         self.connection.commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
@@ -1584,6 +1913,8 @@ class MemoryStore:
         other = self._row("SELECT * FROM face_clusters WHERE id = ?", (source_cluster_id,))
         if not target or not other or target["status"] == "rejected" or other["status"] == "rejected":
             return None
+        if (target.get("scope_id") or "home-default") != (other.get("scope_id") or "home-default"):
+            raise ValueError("face clusters must belong to the same memory space")
         target_entity = self.get_entity(target["entity_id"]) if target.get("entity_id") else None
         source_entity = self.get_entity(other["entity_id"]) if other.get("entity_id") else None
         if target_entity and source_entity and target_entity["id"] != source_entity["id"] and target_entity["status"] == "confirmed" and source_entity["status"] == "confirmed":
@@ -1601,7 +1932,11 @@ class MemoryStore:
         instance = self._row("SELECT * FROM face_instances WHERE id = ? AND cluster_id = ?", (face_instance_id, cluster_id))
         if not cluster or not instance:
             return None
-        new_cluster = self.create_face_cluster(json.loads(instance["embedding_json"] or "[]"), float(instance.get("quality", 0) or 0))
+        new_cluster = self.create_face_cluster(
+            json.loads(instance["embedding_json"] or "[]"),
+            float(instance.get("quality", 0) or 0),
+            scope_id=cluster.get("scope_id") or "home-default",
+        )
         self.connection.execute("UPDATE face_instances SET cluster_id = ? WHERE id = ?", (new_cluster["id"], face_instance_id))
         self._refresh_face_prototypes(cluster_id)
         self._refresh_face_prototypes(new_cluster["id"])
@@ -1611,6 +1946,8 @@ class MemoryStore:
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (new_cluster["id"],))
 
     def add_face_instance(self, asset_id, observation_id, face, threshold=0.30, model_name="buffalo_l"):
+        asset = self.get_asset(asset_id) or {}
+        scope_id = asset.get("scope_id") or "home-default"
         embedding = self._normalise_vector(face.get("embedding"))
         if not embedding or face.get("identity_ready") is False:
             return None
@@ -1655,7 +1992,7 @@ class MemoryStore:
                  "quality": float(quality or 0), "pose_bucket": pose_bucket_value, "identity_eligible": False},
             )
             return {"id": instance_id, "cluster_id": None, "score": 0.0, "embedding": embedding}
-        clusters = self._rows("SELECT * FROM face_clusters WHERE status IN ('pending', 'confirmed')")
+        clusters = self._rows("SELECT * FROM face_clusters WHERE scope_id = ? AND status IN ('pending', 'confirmed')", (scope_id,))
         best = None
         best_score = 0.0
         if quality >= 0.30:
@@ -1679,7 +2016,7 @@ class MemoryStore:
                 if score > best_score:
                     best, best_score = cluster, score
         if not best or best_score < threshold:
-            best = self.create_face_cluster(embedding, quality)
+            best = self.create_face_cluster(embedding, quality, scope_id=scope_id)
         instance_id = make_id("face")
         self.connection.execute(
             """INSERT INTO face_instances(
@@ -1746,14 +2083,17 @@ class MemoryStore:
             ),
         )
 
-    def recluster_faces(self, threshold=0.30, minimum_quality=0.30):
+    def recluster_faces(self, threshold=0.30, minimum_quality=0.30, scope_id=None):
         """Globally regroup faces with quality-aware multi-view prototypes."""
         from .face_clustering import FaceClusterer, FaceSample
 
         instances = self._rows(
-            """SELECT id, cluster_id, embedding_json, quality, detection_confidence,
-            pose_bucket, embedding_model, embedding_version
-            FROM face_instances WHERE embedding_json != '[]' AND cluster_id IS NOT NULL"""
+            """SELECT fi.id, fi.cluster_id, fi.embedding_json, fi.quality, fi.detection_confidence,
+            fi.pose_bucket, fi.embedding_model, fi.embedding_version
+            FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
+            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL"""
+            + (" AND a.scope_id = ?" if scope_id else ""),
+            (scope_id,) if scope_id else (),
         )
         if not instances:
             return {"instances": 0, "clusters": 0, "threshold": threshold, "minimum_quality": minimum_quality}
@@ -1882,7 +2222,17 @@ class MemoryStore:
         memory = self.rebuild_person_memory(entity["id"])
         self.connection.commit()
         if memory:
-            return {**self.get_entity_detail(entity["id"]), "semantic_profile": memory["profile"], "semantic_claims": memory["claims"]}
+            detail = {**self.get_entity_detail(entity["id"]), "semantic_profile": memory["profile"], "semantic_claims": memory["claims"]}
+            detail["event_memory"] = memory["event_memory"]
+            detail["patterns"] = memory["patterns"]
+            detail["refresh_counts"] = {
+                "observations": len(memory["observation_ids"]),
+                "events": len(memory["event_ids"]),
+                "patterns": len(memory["patterns"]),
+                "claims": len(memory["claims"]),
+                "appearance": len(self.list_person_appearance_evidence(entity["id"], include_empty=True)),
+            }
+            return detail
         return self.get_entity_detail(entity["id"])
 
     def confirm_person_entity(self, entity_id, name, family_role=None):
@@ -1906,7 +2256,51 @@ class MemoryStore:
         )
         self.connection.commit()
         memory = self.rebuild_person_memory(entity_id)
-        return {**self.get_entity_detail(entity_id), "semantic_profile": memory["profile"] if memory else None, "semantic_claims": memory["claims"] if memory else []}
+        detail = {**self.get_entity_detail(entity_id), "semantic_profile": memory["profile"] if memory else None, "semantic_claims": memory["claims"] if memory else []}
+        if memory:
+            detail["event_memory"] = memory["event_memory"]
+            detail["patterns"] = memory["patterns"]
+            detail["refresh_counts"] = {
+                "observations": len(memory["observation_ids"]),
+                "events": len(memory["event_ids"]),
+                "patterns": len(memory["patterns"]),
+                "claims": len(memory["claims"]),
+                "appearance": len(self.list_person_appearance_evidence(entity_id, include_empty=True)),
+            }
+        return detail
+
+    def get_person_evidence(self, person_id):
+        detail = self.get_entity_detail(person_id)
+        if not detail:
+            return None
+        scope_id = detail["entity"].get("scope_id") or "home-default"
+        event_ids = self.entity_event_ids(person_id)
+        detail["events"] = [self.get_event(event_id) for event_id in event_ids if self.get_event(event_id)]
+        detail["event_memory"] = self.list_person_event_memory(person_id)
+        samples = []
+        assets = {}
+        for cluster in detail.get("clusters", []):
+            if (cluster.get("scope_id") or "home-default") != scope_id:
+                continue
+            for sample in cluster.get("samples", []):
+                asset = self.get_asset(sample["asset_id"])
+                if asset:
+                    assets[asset["id"]] = asset
+                samples.append({
+                    **sample,
+                    "cluster_id": cluster["id"],
+                    "scope_id": scope_id,
+                    "asset": asset,
+                    "crop_url": f"/api/face-instances/{sample['id']}/crop",
+                    "asset_url": f"/api/assets/{sample['asset_id']}/file",
+                })
+        detail["scope_id"] = scope_id
+        detail["face_samples"] = samples
+        detail["assets"] = list(assets.values())
+        detail["event_details"] = [
+            self.get_event_detail(event_id) for event_id in event_ids if self.get_event_detail(event_id)
+        ]
+        return detail
 
     def _add_entity_to_observation(self, observation_id, entity):
         observation = self.get_observation(observation_id)
@@ -1941,6 +2335,10 @@ class MemoryStore:
                     continue
                 observation_id = next((item for item in other["observation_ids"] if entity_id in self._confirmed_entity_ids_for_observation(item)), None)
                 if not observation_id:
+                    continue
+                event_time = parse_time(event.get("time_start"))
+                other_time = parse_time(other.get("time_start"))
+                if event_time and other_time and abs((event_time - other_time).total_seconds()) > 6 * 3600:
                     continue
                 score = self._event_candidate_score(self.get_observation(observation_id), event, [
                     self._event_anchor(self.get_observation(item)) for item in event["observation_ids"]
@@ -2002,19 +2400,25 @@ class MemoryStore:
         self.connection.commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
 
-    def list_relationships(self, entity_id=None):
+    def list_relationships(self, entity_id=None, scope_id=None):
+        scope_clause = " AND r.scope_id = ?" if scope_id else ""
         if entity_id:
             rows = self._rows("""SELECT r.*, s.canonical_name AS subject_name, o.canonical_name AS object_name
                 FROM relationships r JOIN entities s ON s.id = r.subject_entity_id JOIN entities o ON o.id = r.object_entity_id
-                WHERE r.subject_entity_id = ? OR r.object_entity_id = ? ORDER BY r.updated_at DESC""", (entity_id, entity_id))
+                WHERE (r.subject_entity_id = ? OR r.object_entity_id = ?)""" + scope_clause + " ORDER BY r.updated_at DESC", (entity_id, entity_id, scope_id) if scope_id else (entity_id, entity_id))
         else:
             rows = self._rows("""SELECT r.*, s.canonical_name AS subject_name, o.canonical_name AS object_name
-                FROM relationships r JOIN entities s ON s.id = r.subject_entity_id JOIN entities o ON o.id = r.object_entity_id ORDER BY r.updated_at DESC""")
+                FROM relationships r JOIN entities s ON s.id = r.subject_entity_id JOIN entities o ON o.id = r.object_entity_id""" + (" WHERE r.scope_id = ?" if scope_id else "") + " ORDER BY r.updated_at DESC", (scope_id,) if scope_id else ())
         return [self._decode(row, ["evidence_ids_json"]) for row in rows]
 
     def create_relationship(self, subject_entity_id, predicate, object_entity_id, evidence_ids=None, confidence=0.5, status="pending"):
         evidence_ids = list(dict.fromkeys(evidence_ids or []))
-        existing = self._row("SELECT * FROM relationships WHERE subject_entity_id = ? AND predicate = ? AND object_entity_id = ? AND status IN ('active', 'pending') ORDER BY revision DESC LIMIT 1", (subject_entity_id, predicate, object_entity_id))
+        subject = self.get_entity(subject_entity_id)
+        object_entity = self.get_entity(object_entity_id)
+        if not subject or not object_entity or (subject.get("scope_id") or "home-default") != (object_entity.get("scope_id") or "home-default"):
+            raise ValueError("relationship entities must belong to the same memory space")
+        scope_id = subject.get("scope_id") or "home-default"
+        existing = self._row("SELECT * FROM relationships WHERE scope_id = ? AND subject_entity_id = ? AND predicate = ? AND object_entity_id = ? AND status IN ('active', 'pending') ORDER BY revision DESC LIMIT 1", (scope_id, subject_entity_id, predicate, object_entity_id))
         if existing:
             old_evidence = json.loads(existing["evidence_ids_json"] or "[]")
             merged = list(dict.fromkeys(old_evidence + evidence_ids))
@@ -2024,8 +2428,8 @@ class MemoryStore:
             return next((item for item in self.list_relationships() if item["id"] == existing["id"]), None)
         relationship_id = make_id("rel")
         revision = 1
-        self.connection.execute("""INSERT INTO relationships(id, subject_entity_id, predicate, object_entity_id, status, confidence, evidence_ids_json, supersedes_relationship_id, revision, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""", (relationship_id, subject_entity_id, predicate, object_entity_id, status, float(confidence or 0), json_value(evidence_ids, []), revision, now_iso(), now_iso()))
+        self.connection.execute("""INSERT INTO relationships(id, scope_id, subject_entity_id, predicate, object_entity_id, status, confidence, evidence_ids_json, supersedes_relationship_id, revision, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""", (relationship_id, scope_id, subject_entity_id, predicate, object_entity_id, status, float(confidence or 0), json_value(evidence_ids, []), revision, now_iso(), now_iso()))
         self.connection.commit()
         return self.list_relationships()[0]
 

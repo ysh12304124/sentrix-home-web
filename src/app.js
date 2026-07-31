@@ -9,6 +9,8 @@
     loading: true,
     backendError: "",
     toast: "",
+    spaces: [],
+    scopeId: window.localStorage?.getItem("sentrix.scopeId") || "home-default",
     queue: [],
     dashboard: null,
     events: [],
@@ -134,7 +136,9 @@
   }
 
   function shell() {
-    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><div class="space-switcher"><span class="avatar tiny">S</span><div><b>本地家庭空间</b><small>数据只在本机流动</small></div></div><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav"><button class="nav-item ${state.view === "settings" ? "active" : ""}" data-view="settings">${icon("◌")}<span>设备与隐私</span></button><button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs"><span>Sentrix Home</span>${state.view !== "overview" ? `<b>/</b><strong>${escapeHtml(navItems.find((item) => item.id === state.view)?.label || "设备与隐私")}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>本地家庭空间</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
+    const activeSpace = state.spaces.find((space) => space.id === state.scopeId);
+    const spaceOptions = (state.spaces.length ? state.spaces : [{ id: state.scopeId, name: state.scopeId }]).map((space) => `<option value="${escapeHtml(space.id)}" ${space.id === state.scopeId ? "selected" : ""}>${escapeHtml(space.name || space.id)}</option>`).join("");
+    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><label class="space-switcher"><span class="avatar tiny">S</span><span><b>记忆空间</b><select id="space-select" aria-label="切换记忆空间">${spaceOptions}</select><small>${escapeHtml(activeSpace?.kind === "benchmark" ? "独立相册空间" : "本地家庭数据")}</small></span></label><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav"><button class="nav-item ${state.view === "settings" ? "active" : ""}" data-view="settings">${icon("◌")}<span>设备与隐私</span></button><button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs"><span>Sentrix Home</span>${state.view !== "overview" ? `<b>/</b><strong>${escapeHtml(navItems.find((item) => item.id === state.view)?.label || "设备与隐私")}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>${escapeHtml(activeSpace?.name || "本地家庭空间")}</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
     renderView();
   }
 
@@ -254,13 +258,22 @@
       body = `<form id="modal-form"><div class="modal-kicker">${modal.type === "event-create" ? "CREATE EVENT" : "EDIT EVENT"}</div><h2>${modal.type === "event-create" ? "新建人工事件" : "修正事件"}</h2><label>标题<input name="title" value="${escapeHtml(event.title || "")}" required /></label><label>摘要<textarea name="summary">${escapeHtml(event.summary || "")}</textarea></label><label>地点<input name="place" value="${escapeHtml(event.place || "")}" /></label><label>开始时间<input name="time_start" type="datetime-local" value="${event.time_start ? event.time_start.slice(0, 16) : ""}" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">保存事件</button></div></form>`;
     } else if (modal.type === "person") {
       const person = modal.person;
-      body = `<form id="modal-form"><div class="modal-kicker">PERSON CANDIDATE · ${escapeHtml(person.id)}</div><h2>${escapeHtml(person.name)}</h2><p class="modal-lead">这是人脸模型产生的候选，不是模型猜出的家庭成员姓名。确认后才会进入人物记忆。</p><label>家庭成员名称<input name="name" value="" placeholder="确认时填写名称" required /></label><div class="evidence-list">${person.source_json?.asset_id ? evidenceCard({ kind: "observation", id: person.source_json.observation_id || person.id, asset_id: person.source_json.asset_id, file_name: person.source_json.asset_id, caption: "人脸候选来源" }) : ""}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认人物</button></div></form>`;
+      body = `<form id="modal-form"><div class="modal-kicker">IDENTITY CONFIRMATION · ${escapeHtml(person.id)}</div><h2>确认人物身份</h2><p class="modal-lead">只在这里填写姓名和家庭角色。确认后会把该人物回写到相关事件、人物画像和语义记忆。</p><label>家庭成员名称<input name="name" value="" placeholder="确认时填写名称" required /></label><label>家庭角色<select name="family_role"><option value="">暂不确认</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认并更新记忆</button></div></form>`;
+    } else if (modal.type === "person-evidence") {
+      const detail = modal.detail;
+      const entity = detail.entity;
+      const samples = detail.face_samples || [];
+      const events = detail.events || [];
+      body = `<div class="modal-kicker">PERSON EVIDENCE · ${escapeHtml(entity.id)}</div><div class="profile-heading">${faceAvatar(samples[0]?.id || entity.avatar_face_instance_id, entity.canonical_name, entity.status === "confirmed" ? "green" : "gray")}<div><h2>${escapeHtml(entity.canonical_name)}</h2><p class="modal-lead">${escapeHtml(entity.status === "confirmed" ? "已确认人物，下面是可回看的原始证据。" : "待确认人物候选，先检查人脸样本再命名。")}</p></div></div><div class="detail-facts"><span>状态 · ${escapeHtml(entity.status)}</span><span>人脸样本 · ${samples.length}</span><span>关联事件 · ${events.length}</span></div><div class="section-head"><div><p class="section-kicker">人脸样本</p><h3>用于判断身份的头像证据</h3></div></div><div class="face-evidence-grid">${samples.length ? samples.map((sample) => `<article class="face-evidence-item"><img src="${escapeHtml(sample.crop_url)}" alt="人脸样本" loading="lazy" /><button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">查看原图 ${icon("→")}</button><small>${escapeHtml(sample.asset?.file_name || sample.file_name || sample.asset_id)} · ${escapeHtml(sample.cluster_id)}</small></article>`).join("") : emptyState("没有可用人脸样本", "当前候选没有可回看的 face instance。")}</div><div class="section-head"><div><p class="section-kicker">关联事件</p><h3>该人物出现过的事件</h3></div></div><div class="evidence-list">${events.length ? events.map((event) => `<button class="evidence-main" data-action="open-event" data-event-id="${escapeHtml(event.id)}"><strong>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.summary || "暂无事件摘要")}</p><small>${escapeHtml(formatDateTime(event.time_start))} · ${escapeHtml(event.place || "未标注地点")}</small></button>`).join("") : emptyState("还没有关联事件", "确认后，新的事件观察会继续维护人物画像。")}</div>${entity.status === "confirmed" ? "" : `<div class="modal-actions"><button class="button ghost" data-action="close-modal">关闭</button><button class="button primary" data-action="confirm-person" data-person-id="${escapeHtml(entity.id)}">确认姓名和关系</button></div>`}`;
     } else if (modal.type === "cluster-confirm") {
       const cluster = modal.cluster;
       body = `<form id="modal-form"><div class="modal-kicker">FACE CLUSTER · ${escapeHtml(cluster.id)}</div><h2>确认这个人物实体</h2><p class="modal-lead">这组样本由 153 上的 buffalo_l embedding 聚类得到。确认后，所有样本会统一绑定到同一个实体。</p><div class="cluster-samples modal-samples">${(cluster.samples || []).map((sample) => `<button type="button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">${faceAvatar(sample.id, "人脸样本")}</button>`).join("")}</div><label>姓名或称呼<input name="name" placeholder="例如：妈妈" required /></label><label>家庭角色<select name="family_role"><option value="">暂不确认</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><label>与已确认实体的关系（可选）<select name="relation_target"><option value="">暂不建立关系</option>${state.entities.filter((entity) => entity.status === "confirmed").map((entity) => `<option value="${escapeHtml(entity.id)}">${escapeHtml(entity.canonical_name)}</option>`).join("")}</select></label><label>关系类型（可选）<input name="relation_predicate" placeholder="例如：母亲、父亲、兄弟姐妹" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认并更新记忆</button></div></form>`;
     } else if (modal.type === "cluster-merge") {
       const choices = state.clusters.filter((cluster) => cluster.status === "pending" && cluster.id !== modal.cluster.id);
       body = `<form id="modal-form"><div class="modal-kicker">FACE CLUSTER MERGE</div><h2>选择目标人物簇</h2><p class="modal-lead">合并会保留原始样本，并写入人物实体 revision。两个已确认人物不会被合并。</p><label>目标簇<select name="target_cluster_id" required>${choices.map((cluster) => `<option value="${escapeHtml(cluster.id)}">${escapeHtml(cluster.id)} · ${cluster.member_count || 0} 张样本</option>`).join("")}</select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary" ${choices.length ? "" : "disabled"}>合并人物簇</button></div></form>`;
+    } else if (modal.type === "cluster-split") {
+      const sample = modal.sample;
+      body = `<form id="modal-form"><div class="modal-kicker">FACE CLUSTER SPLIT</div><h2>确认拆出这张人脸样本</h2><p class="modal-lead">拆分会创建同一记忆空间中的新候选簇，原始图片、人脸证据和审计记录都会保留。</p><div class="split-review"><img src="${escapeHtml(`/api/face-instances/${sample.id}/crop`)}" alt="待拆分人脸样本" /><div><strong>${escapeHtml(sample.file_name || sample.asset_id)}</strong><small>${escapeHtml(modal.cluster.id)} · ${escapeHtml(state.scopeId)}</small></div></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认拆分</button></div></form>`;
     } else if (modal.type === "person-profile") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -296,8 +309,14 @@
   async function refreshData() {
     state.loading = true;
     renderView();
+    const spaceResult = await Promise.allSettled([window.sentrixApi.memorySpaces()]);
+    if (spaceResult[0].status === "fulfilled") {
+      state.spaces = spaceResult[0].value.spaces || [];
+      if (state.spaces.length && !state.spaces.some((space) => space.id === state.scopeId)) state.scopeId = state.spaces[0].id;
+    }
+    const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
-      window.sentrixApi.dashboard(), window.sentrixApi.events(), window.sentrixApi.assets("?limit=1000"), window.sentrixApi.people(), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities(), window.sentrixApi.faceClusters(), window.sentrixApi.relationships(), window.sentrixApi.knowledge(),
+      window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -323,6 +342,8 @@
     document.querySelectorAll("[data-event-filter]").forEach((element) => element.addEventListener("click", () => { state.eventFilter = element.dataset.eventFilter; renderView(); }));
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
     document.querySelectorAll("[data-person-filter]").forEach((element) => element.addEventListener("click", () => { state.personFilter = element.dataset.personFilter; renderView(); }));
+    const spaceSelect = document.getElementById("space-select");
+    if (spaceSelect) spaceSelect.addEventListener("change", async (event) => { state.scopeId = event.target.value; window.localStorage?.setItem("sentrix.scopeId", state.scopeId); state.modal = null; await refreshData(); });
     const form = document.getElementById("search-form");
     if (form) form.addEventListener("submit", submitSearch);
     const modalForm = document.getElementById("modal-form");
@@ -340,7 +361,7 @@
     state.view = "search";
     state.searchLoading = true;
     renderShellNavigation();
-    try { state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId); state.conversationId = state.searchResult.conversation_id || state.conversationId; } catch (error) { state.searchResult = { answer: "检索失败，当前没有可用的本地答案。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true }; }
+    try { state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId); state.conversationId = state.searchResult.conversation_id || state.conversationId; } catch (error) { state.searchResult = { answer: "检索失败，当前没有可用的本地答案。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true }; }
     state.searchLoading = false;
     renderShellNavigation();
   }
@@ -381,15 +402,25 @@
     try {
       if (modal.type === "event-edit") await window.sentrixApi.updateEvent(modal.event.id, { title: form.get("title"), summary: form.get("summary"), place: form.get("place"), time_start: form.get("time_start") ? new Date(form.get("time_start")).toISOString() : modal.event.time_start });
       if (modal.type === "event-create") await window.sentrixApi.createEvent({ title: form.get("title"), summary: form.get("summary"), place: form.get("place"), time_start: form.get("time_start") ? new Date(form.get("time_start")).toISOString() : null });
-      if (modal.type === "person") await window.sentrixApi.confirmPerson(modal.person.id, form.get("name"));
+      if (modal.type === "person") {
+        const confirmed = await window.sentrixApi.confirmPerson(modal.person.id, form.get("name"), form.get("family_role"));
+        const counts = confirmed.refresh_counts || {};
+        state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
+      }
       if (modal.type === "cluster-confirm") {
         const confirmed = await window.sentrixApi.confirmFaceCluster(modal.cluster.id, { name: form.get("name"), family_role: form.get("family_role") });
         const target = String(form.get("relation_target") || "");
         const predicate = String(form.get("relation_predicate") || "").trim();
         if (target && predicate && confirmed.entity?.id) await window.sentrixApi.createRelationship({ subject_entity_id: confirmed.entity.id, predicate, object_entity_id: target, evidence_ids: (modal.cluster.samples || []).map((sample) => sample.observation_id), confidence: 1, status: "active" });
+        const counts = confirmed.refresh_counts || {};
+        state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
       }
       if (modal.type === "cluster-merge") {
         await window.sentrixApi.mergeFaceClusters(form.get("target_cluster_id"), modal.cluster.id);
+      }
+      if (modal.type === "cluster-split") {
+        await window.sentrixApi.splitFaceCluster(modal.cluster.id, modal.sample.id);
+        state.toast = "已拆出新人物簇，原始证据仍保留";
       }
       if (modal.type === "story-create") await window.sentrixApi.createStory({ title: form.get("title"), content: form.get("content"), event_ids: form.getAll("event_ids") });
       if (modal.type === "story-edit") await window.sentrixApi.updateStory(modal.story.id, { title: form.get("title"), content: form.get("content"), event_ids: form.getAll("event_ids") });
@@ -400,7 +431,7 @@
         state.modal = null; state.query = command; state.view = "search"; renderShellNavigation(); return submitSearch();
       }
       if (modal.type === "invite") { const invite = await window.sentrixApi.createInvite(form.get("label")); openModal({ type: "invite", invite }); return; }
-      state.modal = null; state.toast = "已保存到本地记忆"; await refreshData();
+      state.modal = null; state.toast = state.toast || "已保存到本地记忆"; await refreshData();
     } catch (error) { state.toast = `保存失败：${error.message}`; renderShellNavigation(); }
   }
 
@@ -415,12 +446,12 @@
     if (action === "create-story") return openModal({ type: "story-create", story: {} });
     if (action === "edit-story") { const story = state.stories.find((item) => item.id === element.dataset.storyId); return openModal({ type: "story-edit", story }); }
     if (action === "delete-story") { await window.sentrixApi.deleteStory(element.dataset.storyId); state.toast = "故事草稿已删除"; return refreshData(); }
-    if (action === "open-person") { const person = state.persons.find((item) => item.id === element.dataset.personId); return openModal({ type: "person", person }); }
+    if (action === "open-person") { openModal({ type: "loading" }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
     if (action === "open-person-profile") { openModal({ type: "loading" }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
-    if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId); return openModal({ type: "person", person }); }
+    if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
     if (action === "confirm-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-confirm", cluster }); }
     if (action === "merge-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-merge", cluster }); }
-    if (action === "split-face") { await window.sentrixApi.splitFaceCluster(element.dataset.clusterId, element.dataset.faceInstanceId); state.toast = "样本已拆出新人物簇，原始证据仍保留"; return refreshData(); }
+    if (action === "split-face") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); const sample = cluster?.samples?.find((item) => item.id === element.dataset.faceInstanceId); return openModal({ type: "cluster-split", cluster, sample }); }
     if (action === "reject-cluster") { await window.sentrixApi.rejectFaceCluster(element.dataset.clusterId); state.toast = "人物簇已驳回，原始人脸证据仍保留"; return refreshData(); }
     if (action === "split-person") { await window.sentrixApi.rejectPerson(element.dataset.personId); state.toast = "候选人物已驳回，原始人脸证据仍保留"; return refreshData(); }
     if (action === "confirm-fact") { await window.sentrixApi.confirmFact(element.dataset.fact); state.toast = "事实已确认并生成修订记录"; return refreshData(); }

@@ -984,3 +984,45 @@ remains intentionally outside this benchmark phase.
 - 120-image controlled acceptance, full backend/frontend regression suite, and
   repository cleanup that removed stale root duplicate implementations, mock
   gateway behavior, and duplicate test suites.
+
+## Benchmark Implementation Checkpoint (2026-07-31)
+
+The benchmark path is now implemented as a first-class end-to-end pipeline:
+
+```text
+samples/
+  -> prepare_household_benchmark.py
+  -> intersection manifest (images + time/GPS + album scope)
+  -> rebuild_memory.py --benchmark-manifest
+  -> MemorySpace / Asset / Observation / Event
+  -> buffalo_l + AdaFace + CLIP + gamma4_12B observations
+  -> native person-event semantic projections
+  -> evaluate_household_benchmark.py (read-only labels)
+```
+
+The importer resolves both root and nested metadata manifests, drops files
+that are absent from `images/`, records unmatched annotation counts, and keeps
+face names, face-id images, and query ground truth only under the evaluator's
+`evaluation` section. Each album is imported into an independent `MemorySpace`
+(`album1`, `album2`, `album3`); no benchmark identity name is written to an
+entity or event.
+
+The portal now selects the active memory space and passes it through dashboard,
+timeline, assets, people, knowledge, relationship, face-cluster, and Agent
+queries. Person evidence review is separate from identity confirmation and
+shows face crops, original assets, linked events, and status. Confirmation
+returns refresh counts for observations, events, patterns, semantic claims,
+and appearance evidence. Face-cluster merge and split actions retain audit
+records and the original space.
+
+The benchmark rebuild is running on 153 with the dedicated AdaFace checkpoint
+at `/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt`, the
+buffalo_l model directory under the Sentrix data directory, and the dedicated
+gamma4_12B endpoint `http://127.0.0.1:11435`. Sentrix may keep this model
+resident; the shared `11434` listener is outside this project boundary.
+
+For this benchmark run, `FACE_IDENTITY_MIN_QUALITY=0.35` is an explicit
+calibration setting. The global default remains stricter so weak faces stay
+as evidence-only records until the benchmark metrics justify a wider default.
+Aggregate metrics will be appended here only after the full run and read-only
+evaluator finish.

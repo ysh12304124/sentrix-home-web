@@ -44,3 +44,11 @@ test("native confirmation and assistant turn routes are exposed by the browser A
   assert.match(source, /\/api\/assistant\/turn/);
   assert.match(source, /family_role/);
 });
+
+test("memory-space and evidence governance are wired into the portal", () => {
+  const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(source, /space-select/);
+  assert.match(source, /person-evidence/);
+  assert.match(source, /cluster-split/);
+  assert.match(source, /refresh_counts/);
+});
