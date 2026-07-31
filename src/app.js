@@ -313,6 +313,19 @@
     return Boolean(state.modal || active?.matches("input, textarea, select") || active?.closest("form"));
   }
 
+  function updateLiveStats() {
+    const values = {
+      assets: state.dashboard?.stats?.assets ?? 0,
+      events: state.dashboard?.stats?.events ?? 0,
+      facts: state.dashboard?.stats?.facts ?? 0,
+      pendingFacts: state.dashboard?.pendingFacts ?? 0,
+    };
+    document.querySelectorAll("[data-live-stat]").forEach((element) => {
+      const key = element.dataset.liveStat;
+      if (Object.prototype.hasOwnProperty.call(values, key)) element.textContent = values[key];
+    });
+  }
+
   let refreshInFlight = false;
 
   async function refreshData(options = {}) {
@@ -353,7 +366,10 @@
     const failed = calls.find((call) => call.status === "rejected");
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
-    if (!isUserEditing()) renderShellNavigation();
+    if (!isUserEditing()) {
+      if (silent) updateLiveStats();
+      else renderShellNavigation();
+    }
     refreshInFlight = false;
   }
 
