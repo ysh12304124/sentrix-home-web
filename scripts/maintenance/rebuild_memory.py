@@ -94,11 +94,13 @@ def rebuild(root, source=None, benchmark_manifest=None, scope_id=None):
             print(f"OK {processed}/{len(files)} {path}")
     event_consolidation = {}
     event_summaries = {}
+    purged_facts = {}
     for current_scope in sorted({item[0] for item in files}):
         event_consolidation[current_scope] = store.consolidate_events(current_scope)
         event_summaries[current_scope] = len(pipeline.summarize_events(current_scope))
+        purged_facts[current_scope] = store.purge_unanchored_facts(current_scope)
     recluster = {current_scope: store.recluster_faces(scope_id=current_scope) for current_scope in sorted({item[0] for item in files})}
-    stats = {"files": len(files), "processed": processed, "failed": failed, "assets": store.count("assets"), "observations": store.count("observations"), "events": store.count("events"), "event_consolidation": event_consolidation, "event_summaries": event_summaries, "entities": store.count("entities"), "clusters": store.count("face_clusters"), "facts": store.count("facts"), "recluster": recluster}
+    stats = {"files": len(files), "processed": processed, "failed": failed, "assets": store.count("assets"), "observations": store.count("observations"), "events": store.count("events"), "event_consolidation": event_consolidation, "event_summaries": event_summaries, "purged_unanchored_facts": purged_facts, "entities": store.count("entities"), "clusters": store.count("face_clusters"), "facts": store.count("facts"), "recluster": recluster}
     store.finish_rebuild(run["id"], "completed" if failed == 0 else "completed_with_failures", stats)
     print(stats)
     store.close()

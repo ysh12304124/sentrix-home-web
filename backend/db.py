@@ -1748,6 +1748,22 @@ class MemoryStore:
         self.connection.commit()
         return self.get_fact(fact_id)
 
+    def purge_unanchored_facts(self, scope_id):
+        """Remove model facts that cannot be anchored to a confirmed person."""
+        cursor = self.connection.execute(
+            """DELETE FROM facts
+            WHERE scope_id = ? AND NOT EXISTS (
+                SELECT 1 FROM entities
+                WHERE entities.scope_id = facts.scope_id
+                  AND entities.entity_type = 'person'
+                  AND entities.status = 'confirmed'
+                  AND entities.canonical_name = facts.subject
+            )""",
+            (scope_id,),
+        )
+        self.connection.commit()
+        return cursor.rowcount
+
     def reject_fact(self, fact_id):
         self.connection.execute("UPDATE facts SET status = 'retracted', updated_at = ? WHERE id = ?", (now_iso(), fact_id))
         self.connection.commit()
