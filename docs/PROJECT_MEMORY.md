@@ -893,6 +893,77 @@ backup of the pre-restore runtime database is retained on 153 under `/tmp`
 for rollback during this session only; it is runtime state, not project data
 or source control.
 
+## Semantic Memory and Benchmark Integration (2026-07-31)
+
+The current semantic layer has a correct evidence path but a flat presentation:
+`Person -> SemanticClaim` rows carry `supporting_event_ids_json` and
+`evidence_ids_json`, while `EventParticipant` separately links confirmed
+people to events. This is why the knowledge view appears as unrelated facts.
+The next implementation makes the person-event link and cross-event summary
+first-class native SQLite projections:
+
+```text
+MemorySpace / Household
+  -> Asset -> Observation -> Event
+  -> PersonEventMemory
+  -> PersonPattern / SemanticClaim
+  -> original Asset or FaceInstance evidence
+```
+
+`PersonEventMemory` will store a confirmed person's role, activity, place,
+capture interval, co-persons, and evidence for one event. `PersonPattern` will
+aggregate repeated activities, places, co-persons, and normalized appearance
+values across events. `SemanticClaim` remains a detailed compatible view, but
+will expose support counts, normalized values, and its event/evidence chain.
+Original Observation captions remain immutable; confirmed names update event
+summaries, person projections, and Agent answers only.
+
+The person UI must distinguish evidence review from identity confirmation.
+`查看证据` opens face avatars, cluster samples, linked events, and original
+assets. `确认人物` opens the name/role form. A successful confirmation returns
+and displays affected observation, event, pattern, claim, and appearance
+counts before the page reloads authoritative data. The knowledge view should
+show a person-rooted profile with event timeline, cross-event patterns,
+appearance, relationships, and evidence; flat facts are a drill-down view.
+
+### Benchmark Contract
+
+The benchmark source is locally at `/Users/rm001/Downloads/samples` and has
+three independent album spaces:
+
+| Space | Current images | Full metadata entries | Face-map entries | Queries |
+| --- | ---: | ---: | ---: | ---: |
+| `album1` | 64 | 1069 | 78 | 20 |
+| `album2` | 58 | 1466 | 638 | 20 |
+| `album3` | 69 | 1047 | 257 | 20 |
+
+The current image sets are complete for the query ground-truth filenames,
+but metadata and face maps describe larger source albums. The importer must
+intersect both annotation sources with files actually present under
+`images/`, record unmatched entries, preserve unknown time/GPS as null, and
+support both root `metadata.json` and nested `metadata/metadata.json` layouts.
+
+The three albums become isolated `MemorySpace` records selectable in the web
+portal. Scope filtering applies to assets, observations, events, entities,
+vectors, semantic memory, and Agent retrieval; cross-space event grouping is
+forbidden.
+
+`face_info_cn.json`, `face_info_en.json`, and `face_id_images` are evaluation
+inputs only. Their names must never auto-confirm a cluster or create a family
+role. `query.json` ground-truth filenames are evaluation-only and must never
+become event names, facts, relationships, or prompts stored in memory. The
+benchmark evaluator reports input intersection diagnostics, face clustering
+metrics, scope isolation, event candidate diagnostics, query image retrieval
+precision/recall/hit rate, and post-confirmation propagation. It never writes
+evaluation labels to SQLite.
+
+The complete design is recorded in
+`docs/superpowers/specs/2026-07-31-semantic-benchmark-integration-design.md`.
+The active execution plan is
+`docs/superpowers/plans/2026-07-31-semantic-benchmark-integration-plan.md`.
+Implementation starts from this documentation checkpoint; video extraction
+remains intentionally outside this benchmark phase.
+
 ## Completed Work Snapshot
 
 - Evidence-first native SQLite memory model: assets, observations, events,
