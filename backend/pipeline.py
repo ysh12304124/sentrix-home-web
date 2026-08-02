@@ -202,24 +202,31 @@ class IngestionPipeline:
             "source_album_id": asset.get("source_album_id"),
         }
         started_at = time.perf_counter()
+        def timed(callable_):
+            step_started = time.perf_counter()
+            return callable_(), time.perf_counter() - step_started
         # Model adapters do not write to MemoryStore. Keep SQLite writes and
         # event selection on this caller thread after all three complete.
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sentrix-image") as executor:
-            vision_future = executor.submit(self.gamma.analyze_image, path, metadata)
-            face_future = executor.submit(self.face.detect, path)
-            clip_future = executor.submit(self.clip.embed_image, path)
-            analysis = vision_future.result()
-            vision_seconds = time.perf_counter() - started_at
-            faces = face_future.result()
-            face_seconds = time.perf_counter() - started_at
-            clip_embedding = clip_future.result()
-            clip_seconds = time.perf_counter() - started_at
+        parallel = os.getenv("SENTRIX_PARALLEL_IMAGE_ANALYSIS", "true").lower() in {"1", "true", "yes"}
+        if parallel:
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sentrix-image") as executor:
+                vision_future = executor.submit(timed, lambda: self.gamma.analyze_image(path, metadata))
+                face_future = executor.submit(timed, lambda: self.face.detect(path))
+                clip_future = executor.submit(timed, lambda: self.clip.embed_image(path))
+                analysis, vision_seconds = vision_future.result()
+                faces, face_seconds = face_future.result()
+                clip_embedding, clip_seconds = clip_future.result()
+        else:
+            analysis, vision_seconds = timed(lambda: self.gamma.analyze_image(path, metadata))
+            faces, face_seconds = timed(lambda: self.face.detect(path))
+            clip_embedding, clip_seconds = timed(lambda: self.clip.embed_image(path))
         analysis["clip_embedding"] = clip_embedding
         analysis["processing_timings"] = {
             "vision_seconds": round(vision_seconds, 4),
             "face_seconds": round(face_seconds, 4),
             "clip_seconds": round(clip_seconds, 4),
             "analysis_wall_seconds": round(time.perf_counter() - started_at, 4),
+            "parallel": parallel,
         }
         analysis["captured_at"] = captured_at
         analysis["source_owner_id"] = asset.get("source_owner_id")
