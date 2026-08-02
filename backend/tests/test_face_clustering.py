@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 import tempfile
 import unittest
@@ -165,7 +166,9 @@ class FaceEmbeddingContractTests(unittest.TestCase):
             adapter.identity_adapter = FakeIdentity()
             adapter.identity_error = None
 
-            with patch.dict(sys.modules, {"cv2": FakeCv2()}), patch("PIL.Image.fromarray", return_value="crop"):
+            with patch.dict(os.environ, {"FACE_MIN_SIZE": "1"}), patch.dict(
+                sys.modules, {"cv2": FakeCv2()}
+            ), patch("PIL.Image.fromarray", return_value="crop"):
                 results = adapter.detect(image_path)
 
         self.assertTrue(results, f"detect error={adapter.error!r}")
@@ -230,7 +233,9 @@ class FaceEmbeddingContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             image_path = f"{directory}/face.jpg"
             open(image_path, "wb").close()
-            with patch.dict(sys.modules, {"cv2": FakeCv2()}), patch(
+            with patch.dict(os.environ, {"FACE_MIN_SIZE": "1"}), patch.dict(
+                sys.modules, {"cv2": FakeCv2()}
+            ), patch(
                 "backend.model_clients.align_face_crop", return_value="aligned"
             ) as align:
                 results = adapter.detect(image_path)
@@ -307,7 +312,10 @@ class FaceEmbeddingContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             image_path = f"{directory}/face.jpg"
             open(image_path, "wb").close()
-            with patch.dict(sys.modules, {"cv2": FakeCv2()}), patch("PIL.Image.fromarray", return_value="crop"):
+            with patch.dict(
+                os.environ,
+                {"FACE_MIN_SIZE": "1", "FACE_MIN_DETECTION_SCORE": "0.01"},
+            ), patch.dict(sys.modules, {"cv2": FakeCv2()}), patch("PIL.Image.fromarray", return_value="crop"):
                 result = adapter.detect(image_path)[0]
 
         self.assertFalse(result["identity_eligible"])

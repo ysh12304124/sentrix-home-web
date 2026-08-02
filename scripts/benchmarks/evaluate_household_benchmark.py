@@ -3,8 +3,10 @@
 import argparse
 import itertools
 import json
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.agent import MemoryAgent
 from backend.db import MemoryStore
 
