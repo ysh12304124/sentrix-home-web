@@ -215,6 +215,7 @@ class FaceEmbeddingContractTests(unittest.TestCase):
             adapter.detect("unused.jpg")
 
         self.assertEqual(calls["allowed_modules"], ["detection", "landmark_2d_106"])
+        self.assertEqual(calls["providers"], ["CUDAExecutionProvider", "CPUExecutionProvider"])
 
     def test_face_adapter_passes_five_point_landmarks_to_alignment(self):
         class FakeDetection:

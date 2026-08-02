@@ -455,13 +455,32 @@ class FaceAdapter:
     def ready(self):
         return self.enabled and self.error is None
 
+    @staticmethod
+    def _configure_onnx_runtime_libraries():
+        """Expose pip-installed NVIDIA runtime libraries before ONNX imports."""
+        try:
+            import site
+
+            directories = []
+            for root in site.getsitepackages():
+                nvidia_root = Path(root) / "nvidia"
+                if nvidia_root.is_dir():
+                    directories.extend(str(path) for path in nvidia_root.glob("*/lib") if path.is_dir())
+            if directories:
+                existing = os.environ.get("LD_LIBRARY_PATH", "")
+                merged = ":".join(dict.fromkeys(directories + ([existing] if existing else [])))
+                os.environ["LD_LIBRARY_PATH"] = merged
+        except Exception:
+            pass
+
     def detect(self, path):
         if not self.enabled:
             return []
         try:
             if self._app is None:
+                self._configure_onnx_runtime_libraries()
                 from insightface.app import FaceAnalysis
-                providers = [item for item in os.getenv("FACE_PROVIDERS", "CPUExecutionProvider").split(",") if item]
+                providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
                 kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
                 if self.identity_model in {"adaface", "magface"}:
                     # AdaFace/MagFace produce the only identity vector. Avoid
