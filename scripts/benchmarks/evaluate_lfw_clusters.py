@@ -24,35 +24,46 @@ def _round_metrics(metrics):
 def evaluate(db_path, manifest_path):
     """Evaluate persisted clusters without storing benchmark labels in SQLite.
 
-    Every expected benchmark image is represented. A missing detection receives
-    a private predicted label so missing same-identity pairs count as false
-    negatives instead of silently inflating pairwise recall.
+    LFW manifests label one primary identity per image. The highest-confidence
+    face is therefore the labeled sample; other faces stay in diagnostics and
+    never inherit a label that the manifest did not provide. A missing primary
+    detection receives a private predicted label so missing same-identity pairs
+    count as false negatives instead of silently inflating recall.
     """
     truth_by_file = _truth_from_manifest(manifest_path)
     connection = sqlite3.connect(db_path)
     try:
         rows = connection.execute(
-            """SELECT fi.id, fi.cluster_id, a.file_name FROM face_instances fi
+            """SELECT fi.id, fi.cluster_id, fi.detection_confidence, fi.area_ratio,
+            fi.quality, a.file_name FROM face_instances fi
             JOIN assets a ON a.id = fi.asset_id
             WHERE fi.cluster_id IS NOT NULL"""
         ).fetchall()
     finally:
         connection.close()
     predicted_by_file = defaultdict(list)
-    for face_id, cluster_id, file_name in rows:
+    for face_id, cluster_id, confidence, area_ratio, quality, file_name in rows:
         if file_name in truth_by_file:
-            predicted_by_file[file_name].append((str(face_id), str(cluster_id)))
+            predicted_by_file[file_name].append({
+                "face_id": str(face_id), "cluster_id": str(cluster_id),
+                "confidence": float(confidence or 0), "area_ratio": float(area_ratio or 0),
+                "quality": float(quality or 0),
+            })
 
     predicted = {}
     truth = {}
     detected_samples = 0
     extra_detections = 0
     for file_name, identity in sorted(truth_by_file.items()):
-        candidates = sorted(predicted_by_file.get(file_name, []))
+        candidates = predicted_by_file.get(file_name, [])
         sample_id = f"expected:{file_name}"
         truth[sample_id] = identity
         if candidates:
-            predicted[sample_id] = candidates[0][1]
+            primary = max(
+                candidates,
+                key=lambda item: (item["confidence"], item["area_ratio"], item["quality"], item["face_id"]),
+            )
+            predicted[sample_id] = primary["cluster_id"]
             detected_samples += 1
             extra_detections += max(0, len(candidates) - 1)
         else:
@@ -61,8 +72,8 @@ def evaluate(db_path, manifest_path):
     metrics = pairwise_metrics(predicted, truth)
     clusters = defaultdict(list)
     for file_name, candidates in predicted_by_file.items():
-        for _, cluster_id in candidates:
-            clusters[cluster_id].append(truth_by_file[file_name])
+        for candidate in candidates:
+            clusters[candidate["cluster_id"]].append(truth_by_file[file_name])
     expected_samples = len(truth)
     result = {
         "expected_samples": expected_samples,

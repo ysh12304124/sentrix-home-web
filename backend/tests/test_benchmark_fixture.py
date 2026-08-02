@@ -45,11 +45,11 @@ class HouseholdBenchmarkEvaluatorTests(unittest.TestCase):
             root = Path(directory)
             database = root / "sentrix.db"
             store = MemoryStore(str(database))
-            for index, (file_name, embedding) in enumerate((
-                ("a1.jpg", [1.0, 0.0]),
-                ("a2.jpg", [1.0, 0.0]),
-                ("b1.jpg", [0.0, 1.0]),
-                ("b2.jpg", None),
+            for index, (file_name, embedding, confidence) in enumerate((
+                ("a1.jpg", [1.0, 0.0], 0.95),
+                ("a2.jpg", [1.0, 0.0], 0.95),
+                ("b1.jpg", [0.0, 1.0], 0.95),
+                ("b2.jpg", None, 0.0),
             )):
                 asset = store.create_asset(f"asset-{index}", file_name, "image", str(root / file_name))
                 observation = store.add_observation(asset["id"], {"caption": file_name})
@@ -57,9 +57,16 @@ class HouseholdBenchmarkEvaluatorTests(unittest.TestCase):
                     store.add_face_instance(
                         asset["id"],
                         observation["id"],
-                        {"embedding": embedding, "quality": 0.9, "confidence": 0.9},
+                        {"embedding": embedding, "quality": 0.9, "confidence": confidence},
                         model_name="adaface",
                     )
+                    if file_name == "a1.jpg":
+                        store.add_face_instance(
+                            asset["id"],
+                            observation["id"],
+                            {"embedding": [0.0, 1.0], "quality": 0.8, "confidence": 0.70},
+                            model_name="adaface",
+                        )
             store.close()
             manifest = root / "lfw.json"
             manifest.write_text(json.dumps({"assets": [
@@ -75,6 +82,7 @@ class HouseholdBenchmarkEvaluatorTests(unittest.TestCase):
             self.assertEqual(result["detected_samples"], 3)
             self.assertEqual(result["coverage"], 0.75)
             self.assertEqual(result["pairwise_f1"], 0.6667)
+            self.assertEqual(result["extra_detections"], 1)
             self.assertFalse(meets_gate(result, minimum_f1=0.95, minimum_coverage=0.95))
 
     def test_face_import_uses_manifest_mapping_without_persisting_identity_labels(self):
