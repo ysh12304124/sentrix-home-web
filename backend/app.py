@@ -566,7 +566,7 @@ def import_placeholder(request: ImportRequest):
 
 @app.post("/api/maintenance/recheck")
 def recheck(background_tasks: BackgroundTasks):
-    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed') ORDER BY created_at")]
+    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed', 'semantic_enriching') ORDER BY created_at")]
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
     return {"accepted": len(assets), "status": "recheck-queued"}
