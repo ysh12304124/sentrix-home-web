@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from backend.db import MemoryStore
+from scripts.benchmarks.ingest_face_benchmark import ingest
 from scripts.benchmarks.evaluate_lfw_clusters import evaluate as evaluate_lfw
 from scripts.benchmarks.evaluate_lfw_clusters import meets_gate
 from scripts.benchmarks.evaluate_household_benchmark import evaluate
@@ -75,6 +76,31 @@ class HouseholdBenchmarkEvaluatorTests(unittest.TestCase):
             self.assertEqual(result["coverage"], 0.75)
             self.assertEqual(result["pairwise_f1"], 0.6667)
             self.assertFalse(meets_gate(result, minimum_f1=0.95, minimum_coverage=0.95))
+
+    def test_face_import_uses_manifest_mapping_without_persisting_identity_labels(self):
+        class FakeFace:
+            def detect(self, _):
+                return [{"embedding": [1.0, 0.0], "quality": 0.9, "confidence": 0.9}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "images"
+            source.mkdir()
+            (source / "asset_001.jpg").write_bytes(b"image")
+            database = root / "benchmark.db"
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"assets": [{
+                "file": "asset_001.jpg", "source_identity": "evaluation-only-person",
+            }]}), encoding="utf-8")
+
+            result = ingest(database, source, manifest, face=FakeFace())
+
+            self.assertEqual(result["processed"], 1)
+            store = MemoryStore(str(database))
+            asset = store.get_asset(store._row("SELECT id FROM assets")["id"])
+            self.assertNotIn("source_identity", asset["metadata_json"])
+            self.assertEqual(store.count("face_instances"), 1)
+            store.close()
 
 
 if __name__ == "__main__":
