@@ -164,7 +164,7 @@ class GammaClient:
         prompt = """你是家庭记忆观察器。只根据图片和给定元数据抽取可验证观察，不要猜测姓名。
 严格只返回 JSON 对象，所有字段值必须使用简体中文；画面中没有人物时 people 返回空数组。
 字段必须为：
-caption（图片内容简述）、activity（活动）、place（地点，不确定为空字符串）、people（人物外观描述数组，不包含姓名）、objects（物体数组）、clothing（衣物和配饰数组）、spatial_relations（空间关系数组）、ocr_text（图片中可读文字，没有则为空字符串）、event_type（事件类型）、facts（可维护事实数组）。
+caption（图片内容简述）、activity（活动）、place（地点，不确定为空字符串）、people（人物外观描述数组，不包含姓名）、objects（物体数组）、clothing（衣物和配饰数组）、emotions（画面中可明确观察到的情感或氛围数组）、spatial_relations（空间关系数组）、ocr_text（图片中可读文字，没有则为空字符串）、event_type（事件类型）、facts（可维护事实数组）。
 facts 每项字段为 subject、predicate、object、confidence；不确定的事实不要放入 facts。
 不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。
 metadata: """ + json.dumps(metadata or {}, ensure_ascii=False)
@@ -177,6 +177,7 @@ metadata: """ + json.dumps(metadata or {}, ensure_ascii=False)
         parsed["people"] = as_list(parsed.get("people"))
         parsed["objects"] = as_list(parsed.get("objects"))
         parsed["clothing"] = as_list(parsed.get("clothing"))
+        parsed["emotions"] = as_list(parsed.get("emotions"))
         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
         normalize_analysis_fields(parsed)

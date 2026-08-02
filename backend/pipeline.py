@@ -2,6 +2,7 @@ import json
 import hashlib
 import mimetypes
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -114,6 +115,7 @@ class IngestionPipeline:
             result = self.video_memory_adapter.reserve(asset)
             return self.store.update_asset(asset_id, result["status"], result)
         self.store.update_asset(asset_id, "processing", {})
+        started_at = time.perf_counter()
         try:
             if asset["media_type"] == "image":
                 result = self._image_observation(asset)
@@ -122,8 +124,7 @@ class IngestionPipeline:
             else:
                 result = self._text_observation(asset)
             observation = self.store.add_observation(asset_id, result)
-            # Event selection needs the image vector itself, not a later
-            # projection of the selected event, so persist it before scoring.
+            # Event selection needs the image vector before an event exists.
             self.store.upsert_vector(
                 "visual", "asset", asset_id, result.get("clip_embedding"), self.clip.model_name,
                 {"observation_id": observation["id"]},
@@ -137,6 +138,8 @@ class IngestionPipeline:
             # available as a real identity bridge during this event decision.
             observation = self.store.get_observation(observation["id"])
             event = self.store.merge_observation_into_event(observation)
+            entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation["id"], event["id"])]
+            # Update the same vector with its final event link after selection.
             self.store.upsert_vector(
                 "visual", "asset", asset_id, result.get("clip_embedding"), self.clip.model_name,
                 {"observation_id": observation["id"], "event_id": event["id"]},
@@ -153,7 +156,7 @@ class IngestionPipeline:
                 if all(fact.get(key) for key in ("subject", "predicate", "object")) and self.store.is_confirmed_person_name(fact.get("subject"), scope_id):
                     saved = self.store.maintain_fact(fact["subject"], fact["predicate"], fact["object"], [observation["id"]], normalize_confidence(fact.get("confidence"), result.get("confidence", 0.5)), scope_id=scope_id)
                     fact_ids.append(saved["id"])
-            metadata = {"observation_id": observation["id"], "event_id": event["id"], "fact_ids": fact_ids, "cluster_ids": cluster_ids, "model": result.get("model"), "faces": [{key: value for key, value in face.items() if key != "embedding"} for face in result.get("face_candidates", [])]}
+            metadata = {"observation_id": observation["id"], "event_id": event["id"], "fact_ids": fact_ids, "cluster_ids": cluster_ids, "entity_ids": entity_ids, "model": result.get("model"), "faces": [{key: value for key, value in face.items() if key != "embedding"} for face in result.get("face_candidates", [])], "processing_seconds": round(time.perf_counter() - started_at, 4)}
             saved_asset = self.store.update_asset(asset_id, "processed", metadata)
             if asset.get("source_owner_id"):
                 self.store.rebuild_person_memory(asset["source_owner_id"])
@@ -204,7 +207,7 @@ class IngestionPipeline:
         analysis["source_owner_id"] = asset.get("source_owner_id")
         analysis["canonical"] = {
             key: analysis.get(key)
-            for key in ("caption", "activity", "place", "people", "objects", "clothing", "spatial_relations", "ocr_text", "event_type")
+            for key in ("caption", "activity", "place", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
         }
         analysis["source_type"] = "image"
         analysis["face_candidates"] = faces

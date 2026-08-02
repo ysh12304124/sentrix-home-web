@@ -162,6 +162,23 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(detail["entity"]["status"], "confirmed")
         self.assertEqual(self.store._row("SELECT status FROM face_clusters WHERE id = ?", (face["cluster_id"],))["status"], "confirmed")
 
+    def test_observation_entities_link_place_objects_emotion_and_event_evidence(self):
+        self.store.connection.execute(
+            "UPDATE observations SET place = ?, objects_json = ?, raw_json = ? WHERE id = ?",
+            ("家中餐厅", '["生日蛋糕"]', '{"emotions": ["喜悦"]}', self.obs1["id"]),
+        )
+        self.store.connection.commit()
+        event = self.store.merge_observation_into_event(self.store.get_observation(self.obs1["id"]))
+
+        entities = self.store.maintain_observation_entities(self.obs1["id"], event["id"])
+
+        self.assertEqual({item["entity_type"] for item in entities}, {"place", "object", "emotion"})
+        cake = next(item for item in entities if item["canonical_name"] == "生日蛋糕")
+        detail = self.store.get_entity_detail(cake["id"])
+        self.assertEqual(detail["events"][0]["id"], event["id"])
+        self.assertEqual(detail["observations"][0]["id"], self.obs1["id"])
+        self.assertTrue(any(item["predicate"] == "出现在" for item in detail["relationships"]))
+
 
 if __name__ == "__main__":
     unittest.main()

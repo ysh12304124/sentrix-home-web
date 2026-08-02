@@ -77,9 +77,10 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(observation["ocr_text"], "生日快乐")
             self.assertEqual(store.count("events"), 1)
             self.assertEqual(store.count("face_clusters"), 1)
-            self.assertEqual(store.count("entities"), 1)
+            self.assertEqual({item["entity_type"] for item in store.list_entities()}, {"person", "place", "object"})
             self.assertGreaterEqual(store.count("memory_vectors"), 3)
             self.assertEqual(store.get_asset(asset["id"])["metadata_json"]["faces"][0]["embedding_model"], "test-face")
+            self.assertGreaterEqual(store.get_asset(asset["id"])["metadata_json"]["processing_seconds"], 0)
 
     def test_source_member_builds_semantic_profile_without_being_visible_in_photo(self):
         with tempfile.TemporaryDirectory() as directory:

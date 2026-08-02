@@ -115,8 +115,15 @@ class MemoryAgent:
                 coverage = sum(term in searchable_text for term in terms)
                 local_observations.append((exact, coverage, item))
         local_facts = [item for item in facts if contains(json.dumps(item, ensure_ascii=False), query)]
-        query_embedding = self.clip.embed_text(query)
-        vector_hits = self.store.search_vectors("episodic", query_embedding, 12, scope_id=scope_id) + self.store.search_vectors("semantic", query_embedding, 12, scope_id=scope_id)
+        # Structured semantic/event constraints are authoritative and cheaper
+        # than a full vector scan. Only fall back to vector recall when they do
+        # not produce usable local evidence.
+        structured_hit = bool(has_event_constraint or local_observations or local_facts or focused_ids)
+        query_embedding = []
+        vector_hits = []
+        if not structured_hit:
+            query_embedding = self.clip.embed_text(query)
+            vector_hits = self.store.search_vectors("episodic", query_embedding, 12, scope_id=scope_id) + self.store.search_vectors("semantic", query_embedding, 12, scope_id=scope_id)
         vector_event_ids = [item["source_id"] for item in vector_hits if item["source_type"] == "event"]
         vector_events = [event for event in events if event["id"] in vector_event_ids]
         observation_event_ids = {item[2]["id"] for item in local_observations}
@@ -161,6 +168,7 @@ class MemoryAgent:
             "entities": entities[:100],
             "relationships": relationships[:100],
             "vectors": vector_hits,
+            "vector_skipped": structured_hit,
             "intent": {
                 "activity": self._is_activity_query(query),
                 "dimension": dimension,
@@ -414,7 +422,7 @@ class MemoryAgent:
         result["retrieval_trace"] = [
             {"stage": "lexical", "status": "complete", "counts": {"events": len(retrieved.get("events", [])), "observations": len(retrieved.get("observations", [])), "facts": len(retrieved.get("facts", []))}},
             {"stage": "semantic", "status": "complete", "counts": {"claims": len(retrieved.get("semantic_claims", [])), "entities": len(retrieved.get("entities", [])), "relationships": len(retrieved.get("relationships", []))}},
-            {"stage": "vector", "status": "complete", "counts": {"hits": len(retrieved.get("vectors", []))}},
+            {"stage": "vector", "status": "skipped" if retrieved.get("vector_skipped") else "complete", "counts": {"hits": len(retrieved.get("vectors", []))}},
             {"stage": "evidence_validation", "status": "complete", "counts": {"evidence": len(evidence)}},
         ]
         result["evidence_layers"] = {

@@ -265,6 +265,14 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 UNIQUE(entity_id, observation_id, face_instance_id)
             );
+            CREATE TABLE IF NOT EXISTS entity_observations (
+                entity_id TEXT NOT NULL REFERENCES entities(id),
+                observation_id TEXT NOT NULL REFERENCES observations(id),
+                confidence REAL NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'observation_extraction',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(entity_id, observation_id)
+            );
             CREATE TABLE IF NOT EXISTS relationships (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -746,6 +754,7 @@ class MemoryStore:
         )
         for observation_id in observation_ids:
             self.connection.execute("DELETE FROM facts WHERE evidence_ids_json LIKE ?", (f'%{observation_id}%',))
+        self.connection.execute(f"DELETE FROM entity_observations WHERE observation_id IN ({placeholders})", observation_ids)
         self.connection.execute(f"DELETE FROM event_observations WHERE observation_id IN ({placeholders})", observation_ids)
         self.connection.execute(f"DELETE FROM entity_mentions WHERE observation_id IN ({placeholders})", observation_ids)
         self.connection.execute(f"DELETE FROM observations WHERE id IN ({placeholders})", observation_ids)
@@ -1891,6 +1900,63 @@ class MemoryStore:
         self.connection.commit()
         return self.get_entity(entity_id)
 
+    def _find_or_create_entity(self, name, entity_type, scope_id, confidence, summary):
+        name = str(name or "").strip()
+        if not name:
+            return None
+        existing = self._row(
+            """SELECT * FROM entities WHERE scope_id = ? AND entity_type = ? AND canonical_name = ?
+            AND status != 'rejected' ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'confirmed' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1""",
+            (scope_id or "home-default", entity_type, name),
+        )
+        if existing:
+            self.connection.execute(
+                "UPDATE entities SET confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
+                (float(confidence or 0), now_iso(), existing["id"]),
+            )
+            self.connection.commit()
+            return self.get_entity(existing["id"])
+        return self.create_entity(name, entity_type, "pending", confidence=confidence, summary=summary, scope_id=scope_id)
+
+    def maintain_observation_entities(self, observation_id, event_id=None):
+        """Create evidence-backed non-person entities from existing observations."""
+        observation = self.get_observation(observation_id)
+        if not observation:
+            return []
+        asset = self.get_asset(observation["asset_id"]) or {}
+        scope_id = observation.get("scope_id") or asset.get("scope_id") or "home-default"
+        raw = observation.get("raw") or {}
+        values = [
+            ("place", observation.get("place") or asset.get("captured_location"), "由图片观察或采集地点维护"),
+            ("object", observation.get("objects") or [], "由图片观察到的物体"),
+            ("emotion", raw.get("emotions") or [], "由图片观察到的情感"),
+        ]
+        entities = []
+        place_entity = None
+        for entity_type, names, summary in values:
+            for name in names if isinstance(names, list) else [names]:
+                entity = self._find_or_create_entity(name, entity_type, scope_id, observation.get("confidence", 0), summary)
+                if not entity:
+                    continue
+                self.connection.execute(
+                    """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
+                    VALUES (?, ?, ?, 'observation_extraction', ?) ON CONFLICT(entity_id, observation_id)
+                    DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
+                    (entity["id"], observation_id, float(observation.get("confidence", 0) or 0), now_iso()),
+                )
+                if entity_type == "place":
+                    place_entity = entity
+                entities.append(entity)
+        if place_entity:
+            for entity in entities:
+                if entity["id"] != place_entity["id"]:
+                    self.create_relationship(
+                        entity["id"], "出现在", place_entity["id"], [observation_id, event_id] if event_id else [observation_id],
+                        observation.get("confidence", 0),
+                    )
+        self.connection.commit()
+        return entities
+
     def list_entities(self, status=None, scope_id=None):
         params = [status] if status else []
         where = "WHERE status = ?" if status else "WHERE status != 'rejected'"
@@ -2012,8 +2078,12 @@ class MemoryStore:
                 WHERE em.entity_id = ?
                 UNION
                 SELECT event_id FROM event_participants WHERE person_id = ?
+                UNION
+                SELECT eo.event_id FROM entity_observations eob
+                JOIN event_observations eo ON eo.observation_id = eob.observation_id
+                WHERE eob.entity_id = ?
             )""",
-            (entity_id, entity_id),
+            (entity_id, entity_id, entity_id),
         )
         return [row["event_id"] for row in rows]
 
@@ -2036,6 +2106,12 @@ class MemoryStore:
             )
         relationships = self.list_relationships(entity_id)
         facts = [fact for fact in self.list_facts(1000) if fact["subject"] == entity["canonical_name"] or fact["object"] == entity["canonical_name"]]
+        event_ids = self.entity_event_ids(entity_id)
+        observations = self._rows(
+            """SELECT o.* FROM entity_observations eob JOIN observations o ON o.id = eob.observation_id
+            WHERE eob.entity_id = ? ORDER BY o.captured_at DESC LIMIT 100""",
+            (entity_id,),
+        )
         return {
             "entity": entity,
             "clusters": clusters,
@@ -2044,6 +2120,8 @@ class MemoryStore:
             "profile": self.get_semantic_profile(entity_id),
             "claims": self.list_semantic_claims(entity_id, 500),
             "appearance_evidence": self.list_person_appearance_evidence(entity_id, include_empty=True),
+            "events": [self.get_event(event_id) for event_id in event_ids if self.get_event(event_id)],
+            "observations": [self.get_observation(row["id"]) for row in observations],
         }
 
     def create_face_cluster(self, embedding, confidence=0.0, scope_id="home-default"):

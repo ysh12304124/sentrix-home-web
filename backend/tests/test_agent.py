@@ -168,6 +168,8 @@ class AgentEvidenceTests(unittest.TestCase):
                 event_ids = [item["event_id"] for item in result["evidence"] if item["kind"] == "event"]
                 self.assertEqual(event_ids, [restaurant_event["id"]])
                 self.assertIn("家中餐厅聚餐", result["answer"])
+                vector_stage = next(item for item in result["retrieval_trace"] if item["stage"] == "vector")
+                self.assertEqual(vector_stage["status"], "skipped")
 
     def test_person_clothing_and_object_queries_use_specific_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
