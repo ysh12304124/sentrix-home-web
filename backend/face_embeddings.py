@@ -77,10 +77,10 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
     a vector produced by another model under the AdaFace name.
     """
 
-    def __init__(self, model_path=None, architecture="ir_50", device="cpu", model_version=None, backend=None):
+    def __init__(self, model_path=None, architecture="ir_50", device=None, model_version=None, backend=None):
         self.model_path = Path(model_path or os.getenv("ADAFACE_MODEL_PATH", ""))
         self.architecture = architecture or os.getenv("ADAFACE_ARCHITECTURE", "ir_50")
-        self.device = device or os.getenv("ADAFACE_DEVICE", "cpu")
+        self.device = device or os.getenv("ADAFACE_DEVICE", "auto")
         self._model = None
         self._torch = None
         self._using_external_backend = backend is not None
@@ -88,6 +88,13 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
             self.model_path.name if str(self.model_path) else "unconfigured"
         )
         super().__init__("adaface", version, backend or self._infer)
+
+    def _device(self, torch):
+        requested = str(self.device or "auto").strip().lower()
+        if requested == "auto":
+            cuda = getattr(torch, "cuda", None)
+            return "cuda:0" if cuda and cuda.is_available() else "cpu"
+        return requested
 
     @property
     def available(self):
@@ -127,6 +134,7 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
             # The official AdaFace file is a trusted Lightning checkpoint. It
             # contains a ModelCheckpoint object, so PyTorch 2.6's restricted
             # weights-only loader cannot deserialize it.
+            self.device = self._device(torch)
             checkpoint = torch.load(str(self.model_path), map_location=self.device, weights_only=False)
             state_dict = checkpoint.get("state_dict", checkpoint)
             state_dict = {

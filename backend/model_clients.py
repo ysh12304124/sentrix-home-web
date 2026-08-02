@@ -356,6 +356,11 @@ class ClipAdapter:
         self._preprocess = None
         self._tokenizer = None
         self.error = None
+        self.device = os.getenv("CLIP_DEVICE", "auto")
+
+    def _device(self, torch):
+        requested = str(self.device or "auto").strip().lower()
+        return "cuda:0" if requested == "auto" and torch.cuda.is_available() else requested
 
     def _load(self):
         if self._model is not None:
@@ -367,13 +372,15 @@ class ClipAdapter:
             return None, None
         try:
             import open_clip
+            import torch
             kwargs = {"model_name": self.model_name, "pretrained": "openai" if not self.checkpoint else None, "load_weights": not bool(self.checkpoint)}
             self._model, _, self._preprocess = open_clip.create_model_and_transforms(**kwargs)
             if self.checkpoint:
-                import torch
                 state = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
                 self._model.load_state_dict(state, strict=False)
             self._tokenizer = open_clip.get_tokenizer(self.model_name)
+            self.device = self._device(torch)
+            self._model.to(self.device)
             self._model.eval()
             return self._model, self._preprocess
         except Exception as error:
@@ -387,7 +394,7 @@ class ClipAdapter:
         try:
             import torch
             from PIL import Image
-            image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0)
+            image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 embedding = model.encode_image(image)
             return embedding[0].cpu().tolist()
@@ -401,7 +408,7 @@ class ClipAdapter:
             return []
         try:
             import torch
-            tokens = self._tokenizer([str(text)])
+            tokens = self._tokenizer([str(text)]).to(self.device)
             with torch.no_grad():
                 embedding = model.encode_text(tokens)
             return embedding[0].cpu().tolist()
