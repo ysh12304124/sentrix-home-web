@@ -1026,3 +1026,227 @@ calibration setting. The global default remains stricter so weak faces stay
 as evidence-only records until the benchmark metrics justify a wider default.
 Aggregate metrics will be appended here only after the full run and read-only
 evaluator finish.
+
+## Current Executable Verification (2026-08-02)
+
+This section is the current implementation status verified against the live
+153 `psh` worktree, API, web service, SQLite database, and test commands. It
+supersedes statements in older historical checkpoints that describe a run as
+still in progress. The current source commit is `dab0f66` (`fix: tighten
+people review and clean semantic facts`). The 153 working tree was clean at
+the time of verification.
+
+### Runtime That Is Actually Available
+
+- Sentrix API is listening on `8090`; the Sentrix web gateway is listening on
+  `4174`; the unrelated FMA service on `5173` was not changed.
+- The API health endpoint reports the dedicated Sentrix Ollama endpoint
+  `http://127.0.0.1:11435`. The health field is named `gamma4_12B`, but the
+  actual configured model name returned by the running code is
+  `gemma4:12b`; this is a naming/configuration mismatch, not evidence of a
+  different model being loaded.
+- FunASR reports ready with `paraformer-zh`, `fsmn-vad`, and `ct-punc`.
+- `buffalo_l` face detection and the configured AdaFace identity adapter
+  report ready. The repository uses `buffalo_l` for detection and AdaFace for
+  the identity embedding boundary; they are not the same model.
+- CLIP is enabled as `ViT-B-32`. The database contains 512-dimensional
+  vectors and the project checkpoint file exists. The adapter loads lazily,
+  so the health endpoint alone is not a full inference proof. The isolated
+  test adapter still logs a missing-pretrained-weight warning; a production
+  checkpoint inference and similarity benchmark remain an acceptance task.
+- Video extraction is not enabled. A video asset can be reserved by
+  `VideoMemoryAdapter`, but no decoding, key-frame extraction, temporal
+  observation, video embedding, or video event memory is implemented.
+
+### Completed And Runnable Functions
+
+The following items have executable code paths, persistence, and API/UI entry
+points. They are implementation-complete at the current scope, but do not all
+have a passing real-album acceptance result.
+
+1. **Original asset intake and album isolation**
+
+   `IngestionPipeline.create_asset()` computes SHA-256 identity, keeps only
+   allowlisted capture time/location/device/album provenance, falls back to
+   image EXIF when explicit values are absent, and deduplicates within a
+   `scope_id`. `rebuild_memory.py` imports the benchmark intersection manifest
+   into independent `album1`, `album2`, and `album3` memory spaces. The API and
+   browser pass `scope_id` through all major reads and Agent queries.
+
+2. **Image, audio, and text observation extraction**
+
+   Image processing calls the local 12B model for structured observation JSON,
+   normalizes scalar fields and lists to Chinese, and stores the original
+   model JSON. Audio processing calls FunASR and then the text-analysis path;
+   text files use the same structured text-analysis path. An observation is
+   immutable evidence linked to its asset, while later enrichment creates a
+   revised observation record.
+
+3. **Native visual memory**
+
+   The pipeline writes CLIP image vectors before event selection, then writes
+   episodic and semantic observation/event vectors. `MemoryStore` keeps these
+   vectors as native SQLite JSON records and performs cosine search locally.
+   The implemented spaces are `visual`, `episodic`, and `semantic`; every
+   vector retains source type, source ID, model name, scope, and metadata.
+
+4. **Face detection, identity candidates, and review lifecycle**
+
+   `FaceAdapter` calls `buffalo_l`; aligned face crops are embedded through the
+   AdaFace adapter. Detection confidence, face area, sharpness, pose, and
+   quality are persisted. `recluster_faces()` uses quality-aware multi-view
+   prototypes and stores `face_instances`, `face_clusters`, and
+   `face_prototypes`. Weak detections remain evidence-only or are hidden from
+   review. The API and UI support pending/confirmed/rejected states, cluster
+   merge, cluster split, and revision records.
+
+5. **Evidence-based event memory**
+
+   A new observation first becomes an event candidate. The candidate score in
+   `MemoryStore` combines capture-time proximity, geographic proximity,
+   activity/event-type and object overlap, visual-place signals, confirmed
+   person overlap, and CLIP asset similarity. A semantic conflict plus low
+   visual compatibility can activate the conservative split guard. A second
+   album-wide consolidation pass merges compatible events and records an
+   explainable score breakdown. Only after grouping does the 12B model generate
+   the event title, type, activity, and summary; import album labels and query
+   ground truth are not used as event names.
+
+6. **Event evidence and original-media access**
+
+   `events`, `event_observations`, and the event detail endpoint connect every
+   event to observations and original assets. The timeline renders a real
+   event cover image, event evidence counts, and a detail view that can open
+   the original asset. This is not a generated placeholder image.
+
+7. **Person-centred semantic memory**
+
+   Unconfirmed face clusters do not become person facts. After a user confirms
+   a cluster name and optional family role, the API updates identity mentions,
+   event participants, event summaries, person appearance evidence, semantic
+   claims, and the person profile. `person_event_memory` stores one confirmed
+   person's role/activity/place/time/co-person/evidence chain per event;
+   `person_patterns` aggregates repeated activities, places, co-persons, and
+   appearance values. `semantic_claims` is a detailed, versioned, evidence-
+   backed view, not the primary conceptual unit. Facts and claims preserve
+   active/superseded/rejected status and evidence IDs.
+
+8. **Agent retrieval and visual fallback**
+
+   `MemoryAgent` classifies query intent, retrieves person profiles/claims,
+   events, observations, facts, relationships, and vectors, validates evidence
+   references, and returns structured retrieval trace/evidence layers. For
+   clothing, object, or spatial questions whose observations are incomplete,
+   it can call the 12B image-focus path on a bounded set of original assets,
+   enrich the observation, write a semantic vector, and create a query gap.
+   `/api/assistant/turn` supports bounded conversation context and feedback;
+   `/api/search` remains a compatibility wrapper.
+
+9. **Browser product surface and live updates**
+
+   The browser has overview, search, event timeline, people, entity/knowledge,
+   asset library, stories, imports, and settings views. It supports memory
+   space switching, original asset and face-crop evidence, person confirmation
+   and rejection, fact confirmation/rejection, event editing, cluster
+   merge/split, and Agent evidence display. The five-second poll is silent;
+   while it runs, the current page and media DOM are not rebuilt, and active
+   form/modal input is protected. Only live counters are updated during silent
+   polling.
+
+### Current 153 Database State
+
+The live database is `/home/asus/Github/Sentrix-Home-Web/data/sentrix.db`.
+These counts are database facts, not expected benchmark totals:
+
+| Record | Total | album1 | album2 | album3 |
+| --- | ---: | ---: | ---: | ---: |
+| Assets | 189 | 62 | 58 | 69 |
+| Processed assets | 183 | 60 | 57 | 66 |
+| Failed assets | 6 | 2 | 1 | 3 |
+| Observations | 183 | 60 | 57 | 66 |
+| Active events | 92 | 26 | 34 | 32 |
+| Event-observation links | 183 | 60 | 57 | 66 |
+| Event participants | 14 | 1 | 13 | 0 |
+| Face instances | 73 | 10 | 38 | 25 |
+| Face clusters | 11 | 5 | 4 | 2 |
+| Native person entities | 11 | 5 | 4 | 2 |
+| Semantic profiles | 3 | 1 | 2 | 0 |
+| Semantic claims | 86 | 7 total rows | 79 total rows | 0 |
+| Person-event memory rows | 14 | 1 | 13 | 0 |
+| Person pattern rows | 29 | 2 | 27 | 0 |
+| Facts | 2 | 1 | 1 | 0 |
+| Relationships | 0 | 0 | 0 | 0 |
+| Memory vectors | 714 | 216 | 243 | 255 |
+| Query gaps / feedback | 0 / 0 | - | - | - |
+| Rebuild runs | 3 | 1 | 1 | 1 |
+
+The entity state is `album1: 1 confirmed + 4 pending`, `album2: 2
+confirmed + 2 pending`, and `album3: 2 pending`. All three rebuild runs are
+`completed_with_failures`; this is why the six failed assets are a current MVP
+risk. The current database has no persisted relationship rows and no semantic
+profile for album3. This is a factual limitation of the current data state,
+not a claim that the relationship or profile schema is absent.
+
+### Verification Performed
+
+- `backend/tests`: the current Python suite ran with all reported test cases
+  passing in the 153 environment; the suite includes Agent evidence/fallback,
+  native confirmation propagation, benchmark evaluator isolation, and event
+  and clustering regression coverage.
+- `node --test test/*.test.js`: 10 tests passed.
+- `node --check src/app.js`, `node --check src/api.js`, Python compilation,
+  and `git diff --check` passed.
+- API health returned `200`; web `4174` returned `200`; the dedicated Ollama
+  listener `11435` was listening.
+- The benchmark evaluator and event evaluator are read-only tools, but no
+  current 153 benchmark metric output was generated in this verification.
+  Therefore current face precision/recall, event segmentation quality, and
+  query hit rate are not accepted claims.
+
+### Distance To A Usable MVP
+
+The current code is a functioning evidence-first prototype, not yet a closed
+MVP acceptance build. The remaining work is:
+
+1. **Finish a clean data run.** Diagnose and retry the six failed assets,
+   verify every available benchmark image has an observation, and record the
+   final rebuild statistics. Until then, queries and summaries are incomplete
+   by construction.
+2. **Run the real benchmark gates.** Execute the read-only face clustering,
+   event segmentation, scope-isolation, and query-image retrieval evaluators
+   against the current database. Set explicit acceptance thresholds and retain
+   per-album results; code presence alone is not a quality result.
+3. **Complete CLIP runtime acceptance.** Force one production image/text
+   inference through the configured checkpoint, verify the model is not
+   randomly initialized, and record cross-modal/similarity metrics. The
+   current vector rows prove that the vector pipeline ran, but not by
+   themselves that the intended pretrained weights were used.
+4. **Complete user identity closure.** Review the pending clusters, confirm or
+   reject them, and verify that the post-confirmation response and UI display
+   affected event, claim, pattern, and appearance counts. The propagation code
+   exists, but the live benchmark state still contains pending candidates and
+   zero relationships.
+5. **Make semantic knowledge visibly relational.** The backend has the
+   `Person -> Event -> Claim/Profile` projections, but the current knowledge UI
+   still presents many claims as a flat list and does not show the full
+   person-event-pattern chain in one view. Render the chain and evidence paths,
+   then test person-focused questions against the benchmark.
+6. **Close query acceptance.** Run the supplied query set, check original
+   image hit rate and evidence correctness, and exercise the visual fallback
+   followed by a second query. Query-gap and feedback tables are currently
+   empty, so the maintenance loop has not been demonstrated on this live data.
+7. **Keep deferred scope explicit.** Video event extraction/encoding memory,
+   proactive household recommendations, production service supervision, and
+   normalized clothing vocabulary are outside the current MVP and remain
+   unfinished.
+
+### Status Boundary
+
+The reliable claim for the current project is:
+
+> Sentrix now has a runnable native evidence pipeline for benchmark-scoped
+> images, local audio/text adapters, CLIP-backed visual indexing, buffalo_l +
+> AdaFace identity candidates, explainable event grouping, person-centred
+> semantic projections, evidence-backed Agent retrieval, and a functional web
+> review surface. It has not yet passed clean-data, real-benchmark quality,
+> CLIP-weight, or end-to-end query acceptance, and it does not process video.
