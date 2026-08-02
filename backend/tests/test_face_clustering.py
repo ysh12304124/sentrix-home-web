@@ -188,6 +188,34 @@ class FaceEmbeddingContractTests(unittest.TestCase):
         self.assertEqual(results[0]["embedding_version"], "ada-test")
         self.assertEqual(results[0]["quality_signal"], 7.5)
 
+    def test_face_adapter_limits_insightface_modules_when_adaface_owns_identity(self):
+        calls = {}
+
+        class FakeAnalysis:
+            def __init__(self, **kwargs):
+                calls.update(kwargs)
+
+            def prepare(self, **kwargs):
+                return None
+
+        adapter = FaceAdapter.__new__(FaceAdapter)
+        adapter.enabled = True
+        adapter._app = None
+        adapter.error = None
+        adapter.identity_model = "adaface"
+        adapter.identity_adapter = type("Identity", (), {"available": True, "model_version": "test"})()
+        adapter.identity_error = None
+
+        class FakeCv2:
+            @staticmethod
+            def imread(_):
+                return None
+
+        with patch.dict(sys.modules, {"insightface.app": type("App", (), {"FaceAnalysis": FakeAnalysis})(), "cv2": FakeCv2()}):
+            adapter.detect("unused.jpg")
+
+        self.assertEqual(calls["allowed_modules"], ["detection", "landmark_2d_106"])
+
     def test_face_adapter_passes_five_point_landmarks_to_alignment(self):
         class FakeDetection:
             bbox = [0, 0, 60, 60]

@@ -456,6 +456,10 @@ class FaceAdapter:
                 from insightface.app import FaceAnalysis
                 providers = [item for item in os.getenv("FACE_PROVIDERS", "CPUExecutionProvider").split(",") if item]
                 kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
+                if self.identity_model in {"adaface", "magface"}:
+                    # AdaFace/MagFace produce the only identity vector. Avoid
+                    # loading buffalo_l recognition and demographic models.
+                    kwargs["allowed_modules"] = ["detection", "landmark_2d_106"]
                 if os.getenv("FACE_MODEL_ROOT"):
                     kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
                 self._app = FaceAnalysis(**kwargs)
