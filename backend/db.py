@@ -66,6 +66,7 @@ def normalize_clothing(value):
 
 class MemoryStore:
     def __init__(self, path):
+        self.path = str(path)
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")

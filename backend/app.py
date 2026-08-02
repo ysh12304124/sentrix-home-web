@@ -74,7 +74,7 @@ def health():
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
         "videoExtraction": "reserved",
-        "database": str(DATA_DIR / "sentrix.db"),
+        "database": store.path,
     }
 
 
