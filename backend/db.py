@@ -129,7 +129,8 @@ class MemoryStore:
                 clothing_json TEXT NOT NULL DEFAULT '[]',
                 spatial_relations_json TEXT NOT NULL DEFAULT '[]',
                 revision INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
@@ -453,7 +454,7 @@ class MemoryStore:
             "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "canonical_json": "TEXT NOT NULL DEFAULT '{}'", "source_owner_id": "TEXT",
             "inferred_captured_by": "TEXT", "clothing_json": "TEXT NOT NULL DEFAULT '[]'",
-            "spatial_relations_json": "TEXT NOT NULL DEFAULT '[]'", "revision": "INTEGER NOT NULL DEFAULT 1",
+            "spatial_relations_json": "TEXT NOT NULL DEFAULT '[]'", "revision": "INTEGER NOT NULL DEFAULT 1", "updated_at": "TEXT",
         })
         self._ensure_columns("face_instances", {
             "asset_id": "TEXT", "observation_id": "TEXT", "cluster_id": "TEXT",
@@ -772,8 +773,8 @@ class MemoryStore:
             """INSERT INTO observations(
                 id, scope_id, asset_id, captured_at, source_type, caption, activity, place,
                 people_json, objects_json, ocr_text, event_type, transcript, confidence, raw_json,
-                canonical_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                canonical_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 observation_id,
                 scope_id,
@@ -796,6 +797,7 @@ class MemoryStore:
                 json_value(data.get("clothing"), []),
                 json_value(data.get("spatial_relations"), []),
                 int(data.get("revision", 1) or 1),
+                timestamp,
                 timestamp,
             ),
         )
@@ -820,7 +822,7 @@ class MemoryStore:
         canonical = {**(observation.get("canonical") or {}), **{key: value for key, value in details.items() if value not in (None, "", [], {})}}
         assignments = ["canonical_json = ?", "revision = revision + 1"]
         params = [json_value(canonical, {})]
-        for key, column in (("clothing", "clothing_json"), ("spatial_relations", "spatial_relations_json")):
+        for key, column in (("objects", "objects_json"), ("clothing", "clothing_json"), ("spatial_relations", "spatial_relations_json")):
             if key in details:
                 assignments.append(f"{column} = ?")
                 params.append(json_value(details[key], []))

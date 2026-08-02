@@ -168,6 +168,77 @@ class IngestionPipeline:
             self.store.cleanup_asset_derivatives(asset_id)
             return self.store.update_asset(asset_id, "failed", {"error": str(error)})
 
+    def process_fast_image(self, asset_id):
+        """Persist immediately useful image evidence without claiming semantic completion."""
+        asset = self.store.get_asset(asset_id)
+        if not asset:
+            raise KeyError(asset_id)
+        if asset.get("media_type") != "image":
+            raise ValueError("fast processing is only available for images")
+        if asset.get("status") in {"processed", "semantic_enriching"}:
+            return asset
+        started_at = time.perf_counter()
+        self.store.update_asset(asset_id, "processing", {})
+        try:
+            path = asset["path"]
+            captured_at = asset.get("captured_at") or file_time(path)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sentrix-fast") as executor:
+                face_future = executor.submit(self.face.detect, path)
+                clip_future = executor.submit(self.clip.embed_image, path)
+                faces = face_future.result()
+                clip_embedding = clip_future.result()
+            observation = self.store.add_observation(asset_id, {
+                "source_type": "image_fast_evidence", "caption": "", "captured_at": captured_at,
+                "place": asset.get("captured_location") or "", "confidence": 0.0,
+                "source_owner_id": asset.get("source_owner_id"), "canonical": {"semantic_status": "pending"},
+                "raw": {"fast_evidence": True, "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces]},
+            })
+            self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"]})
+            cluster_ids = []
+            for face in faces:
+                instance = self.store.add_face_instance(asset_id, observation["id"], face)
+                if instance and instance.get("cluster_id"):
+                    cluster_ids.append(instance["cluster_id"])
+            observation = self.store.get_observation(observation["id"])
+            event = self.store.merge_observation_into_event(observation)
+            entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation["id"], event["id"])]
+            self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"], "event_id": event["id"]})
+            return self.store.update_asset(asset_id, "semantic_enriching", {
+                "observation_id": observation["id"], "event_id": event["id"], "cluster_ids": cluster_ids,
+                "entity_ids": entity_ids, "semantic_status": "pending",
+                "fast_processing_seconds": round(time.perf_counter() - started_at, 4),
+            })
+        except Exception as error:
+            self.store.cleanup_asset_derivatives(asset_id)
+            return self.store.update_asset(asset_id, "failed", {"error": str(error)})
+
+    def enrich_fast_image(self, asset_id, summarize_event=True):
+        """Complete an explicitly pending image observation with Gemma semantics."""
+        asset = self.store.get_asset(asset_id)
+        metadata = (asset or {}).get("metadata_json") or {}
+        if not asset or asset.get("status") != "semantic_enriching" or not metadata.get("observation_id"):
+            raise ValueError("asset is not awaiting semantic enrichment")
+        started_at = time.perf_counter()
+        observation_id = metadata["observation_id"]
+        analysis = self.gamma.analyze_image(asset["path"], {
+            "file_name": asset["file_name"], "captured_at": asset.get("captured_at") or file_time(asset["path"]),
+            "captured_location": asset.get("captured_location") or "", "source_owner_id": asset.get("source_owner_id"),
+        })
+        analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
+        analysis["raw"] = {"gamma": analysis.copy(), "semantic_status": "complete"}
+        observation = self.store.enrich_observation(observation_id, analysis, source="deferred_vision_enrichment")
+        event_id = metadata.get("event_id")
+        entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation_id, event_id)]
+        text = " ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), " ".join(observation.get("objects") or [])]))
+        embedding = self.clip.embed_text(text)
+        self.store.upsert_vector("episodic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
+        self.store.upsert_vector("semantic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
+        if event_id:
+            self.store.upsert_vector("episodic", "event", event_id, embedding, self.clip.model_name, {"observation_id": observation_id})
+            if summarize_event:
+                self.summarize_event(event_id)
+        return self.store.update_asset(asset_id, "processed", {"semantic_status": "complete", "entity_ids": entity_ids, "semantic_enrichment_seconds": round(time.perf_counter() - started_at, 4)})
+
     def summarize_event(self, event_id):
         detail = self.store.get_event_detail(event_id)
         if not detail or not detail["observations"] or not hasattr(self.gamma, "summarize_event"):

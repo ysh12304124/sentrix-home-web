@@ -43,7 +43,13 @@ class ImportRequest(BaseModel):
 
 
 def process_asset(asset_id):
-    pipeline.process(asset_id)
+    asset = store.get_asset(asset_id) or {}
+    if asset.get("media_type") != "image":
+        pipeline.process(asset_id)
+        return
+    fast = pipeline.process_fast_image(asset_id)
+    if fast.get("status") == "semantic_enriching":
+        pipeline.enrich_fast_image(asset_id)
 
 
 @app.get("/api/health")

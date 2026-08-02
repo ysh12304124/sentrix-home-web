@@ -189,6 +189,29 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(store.count("face_instances"), 1)
             self.assertEqual(store.count("events"), 1)
 
+    def test_fast_image_processing_exposes_evidence_before_semantic_enrichment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "family.jpg"
+            image.write_bytes(b"test")
+            store = MemoryStore(f"{directory}/memory.db")
+            pipeline = IngestionPipeline(store, gamma=FakeGamma(), face=FakeFace(), clip=FakeClip())
+            asset = pipeline.create_asset(image, metadata={"captured_location": "家里"})
+
+            fast = pipeline.process_fast_image(asset["id"])
+
+            self.assertEqual(fast["status"], "semantic_enriching")
+            self.assertEqual(store.count("face_instances"), 1)
+            self.assertEqual(store.count("events"), 1)
+            observation = store.get_observation(fast["metadata_json"]["observation_id"])
+            self.assertEqual(observation["caption"], "")
+            self.assertEqual(observation["canonical"]["semantic_status"], "pending")
+
+            complete = pipeline.enrich_fast_image(asset["id"], summarize_event=False)
+
+            self.assertEqual(complete["status"], "processed")
+            self.assertEqual(store.get_observation(observation["id"])["caption"], "一张带文字的家庭照片")
+            self.assertTrue(any(item["canonical_name"] == "蛋糕" for item in store.list_entities()))
+
     def test_asset_import_persists_sha256_and_exif_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "family.jpg"
