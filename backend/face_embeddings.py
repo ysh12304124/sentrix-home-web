@@ -97,6 +97,16 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
             return True
         return self.model_path.is_file()
 
+    def _repository_root(self):
+        """Find the official AdaFace source shipped beside a configured checkpoint."""
+        configured = os.getenv("ADAFACE_REPO_ROOT", "").strip()
+        candidates = [Path(configured)] if configured else []
+        candidates.extend(getattr(self.model_path, "parents", ()))
+        for candidate in candidates:
+            if (candidate / "net.py").is_file():
+                return str(candidate)
+        return None
+
     def _load_model(self):
         if self._model is not None:
             return self._model
@@ -108,7 +118,7 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
             import sys
             import torch
 
-            repo_root = os.getenv("ADAFACE_REPO_ROOT")
+            repo_root = self._repository_root()
             if repo_root and repo_root not in sys.path:
                 sys.path.insert(0, repo_root)
             import net

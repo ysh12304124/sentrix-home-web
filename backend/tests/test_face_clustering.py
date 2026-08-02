@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 try:
@@ -94,6 +95,17 @@ class FaceEmbeddingContractTests(unittest.TestCase):
                 adapter._load_model()
 
         self.assertFalse(calls["weights_only"])
+
+    def test_official_checkpoint_loader_discovers_adjacent_official_net_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            checkpoint = repo_root / "pretrained" / "official.ckpt"
+            checkpoint.parent.mkdir()
+            checkpoint.write_bytes(b"checkpoint")
+            (repo_root / "net.py").write_text("# official adapter entry\n", encoding="utf-8")
+            adapter = AdaFaceAdapter(model_path=checkpoint)
+
+            self.assertEqual(adapter._repository_root(), str(repo_root))
 
     def test_face_adapter_reports_detection_and_identity_readiness_separately(self):
         with patch.dict("os.environ", {"FACE_EMBEDDING_MODE": "adaface", "ADAFACE_MODEL_PATH": "/tmp/missing.ckpt"}, clear=False):
