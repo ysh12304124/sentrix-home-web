@@ -81,6 +81,7 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(store.count("memory_vectors"), 3)
             self.assertEqual(store.get_asset(asset["id"])["metadata_json"]["faces"][0]["embedding_model"], "test-face")
             self.assertGreaterEqual(store.get_asset(asset["id"])["metadata_json"]["processing_seconds"], 0)
+            self.assertIn("analysis_wall_seconds", store.get_asset(asset["id"])["metadata_json"]["processing_timings"])
 
     def test_source_member_builds_semantic_profile_without_being_visible_in_photo(self):
         with tempfile.TemporaryDirectory() as directory:

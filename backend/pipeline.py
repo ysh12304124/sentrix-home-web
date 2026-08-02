@@ -3,6 +3,7 @@ import hashlib
 import mimetypes
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -156,7 +157,7 @@ class IngestionPipeline:
                 if all(fact.get(key) for key in ("subject", "predicate", "object")) and self.store.is_confirmed_person_name(fact.get("subject"), scope_id):
                     saved = self.store.maintain_fact(fact["subject"], fact["predicate"], fact["object"], [observation["id"]], normalize_confidence(fact.get("confidence"), result.get("confidence", 0.5)), scope_id=scope_id)
                     fact_ids.append(saved["id"])
-            metadata = {"observation_id": observation["id"], "event_id": event["id"], "fact_ids": fact_ids, "cluster_ids": cluster_ids, "entity_ids": entity_ids, "model": result.get("model"), "faces": [{key: value for key, value in face.items() if key != "embedding"} for face in result.get("face_candidates", [])], "processing_seconds": round(time.perf_counter() - started_at, 4)}
+            metadata = {"observation_id": observation["id"], "event_id": event["id"], "fact_ids": fact_ids, "cluster_ids": cluster_ids, "entity_ids": entity_ids, "model": result.get("model"), "faces": [{key: value for key, value in face.items() if key != "embedding"} for face in result.get("face_candidates", [])], "processing_timings": result.get("processing_timings", {}), "processing_seconds": round(time.perf_counter() - started_at, 4)}
             saved_asset = self.store.update_asset(asset_id, "processed", metadata)
             if asset.get("source_owner_id"):
                 self.store.rebuild_person_memory(asset["source_owner_id"])
@@ -200,9 +201,26 @@ class IngestionPipeline:
             "source_device_id": asset.get("source_device_id"),
             "source_album_id": asset.get("source_album_id"),
         }
-        analysis = self.gamma.analyze_image(path, metadata)
-        faces = self.face.detect(path)
-        analysis["clip_embedding"] = self.clip.embed_image(path)
+        started_at = time.perf_counter()
+        # Model adapters do not write to MemoryStore. Keep SQLite writes and
+        # event selection on this caller thread after all three complete.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sentrix-image") as executor:
+            vision_future = executor.submit(self.gamma.analyze_image, path, metadata)
+            face_future = executor.submit(self.face.detect, path)
+            clip_future = executor.submit(self.clip.embed_image, path)
+            analysis = vision_future.result()
+            vision_seconds = time.perf_counter() - started_at
+            faces = face_future.result()
+            face_seconds = time.perf_counter() - started_at
+            clip_embedding = clip_future.result()
+            clip_seconds = time.perf_counter() - started_at
+        analysis["clip_embedding"] = clip_embedding
+        analysis["processing_timings"] = {
+            "vision_seconds": round(vision_seconds, 4),
+            "face_seconds": round(face_seconds, 4),
+            "clip_seconds": round(clip_seconds, 4),
+            "analysis_wall_seconds": round(time.perf_counter() - started_at, 4),
+        }
         analysis["captured_at"] = captured_at
         analysis["source_owner_id"] = asset.get("source_owner_id")
         analysis["canonical"] = {
