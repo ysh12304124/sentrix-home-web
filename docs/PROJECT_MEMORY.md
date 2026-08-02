@@ -36,8 +36,7 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
 
 - 153 仓库：`/home/asus/Github/Sentrix-Home-Web`
 - 正式后端提交分支：`psh`
-- 当前提交：`853ff66169b9d17402e4d0d9a16cf4914741707a`
-  (`docs: verify current executable project status`，2026-08-02 13:58:35 +08:00)
+- 当前提交：`d588c53` (`perf: accelerate core image semantics`，2026-08-03)。
 - 当前工作树：干净。
 - Web：`http://192.168.0.153:4174`
 - API：端口 `8090`
@@ -58,7 +57,7 @@ Sentrix 使用项目独立 Ollama：`127.0.0.1:11435`。共享系统 Ollama 位�
   `/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt`。
 - 视觉向量：CLIP `ViT-B-32`；当前数据库图像向量为 512 维。
 - Sentrix 进程必须设置：`OLLAMA_BASE_URL=http://127.0.0.1:11435`、
-  `OLLAMA_MODEL=gemma4:12b`、`OLLAMA_KEEP_ALIVE=0`。
+  `OLLAMA_MODEL=gemma4:12b`；生产默认 `OLLAMA_KEEP_ALIVE=0`。
 - `keep_alive=0` 会在请求结束后卸载 12B 模型，防止同一时间与其他项目常驻两个
   12B 模型而 OOM。长任务前需检查 `11434` 和 `11435` 的 `/api/ps`；当前
   `11435` 无常驻模型。
@@ -67,6 +66,9 @@ Sentrix 使用项目独立 Ollama：`127.0.0.1:11435`。共享系统 Ollama 位�
   运行日志作为 GPU 验证来源。
 - 当前 API health 显示 AdaFace、`buffalo_l`、FunASR、CLIP ready。health 字段
   `gamma4_12B` 是历史命名，实际配置模型为 `gemma4:12b`。
+- `scripts/runtime/start_sentrix_api.sh` 在进程启动前配置 NVIDIA pip runtime
+  动态库，并优先使用 `CUDAExecutionProvider`。当前正式 `8090` 仍为旧直接
+  `uvicorn` 进程；切换须在维护窗口执行。
 
 ## 仓库结构
 
@@ -135,8 +137,9 @@ MemorySpace / Household
 
 1. **资料导入**：`IngestionPipeline.create_asset()` 计算 SHA-256，只保留时间、
    地点、设备、相册归属等白名单来源；缺失时读取 EXIF；在同一 `scope_id` 内去重。
-2. **媒体处理**：图片由本地 12B 模型生成结构化 Observation；音频经 FunASR 后
-   走文本分析；文本走同一文本分析路径；视频只返回预留状态。
+2. **媒体处理**：图片先写入 AdaFace、CLIP、元数据和事件的快速证据，再以
+   896px、禁用思考模式、320 token 的核心中文 JSON 完成语义丰富；音频经 FunASR
+   后走文本分析；文本走同一文本分析路径；视频只返回预留状态。
 3. **证据规范化**：保存中文规范字段、原始模型 JSON、对象、场景衣物、空间关系、
    OCR、转写、人脸实例和模型版本。
 4. **视觉与身份索引**：事件选择前写入 CLIP Asset 向量；`buffalo_l` 检测、对齐后
@@ -144,7 +147,9 @@ MemorySpace / Household
 5. **事件构建**：先按时间地点召回，再综合活动/类型、对象、视觉地点、已确认人物、
    CLIP 相似度和地理邻近度。仅当活动和类型均冲突、无确认人物/对象桥接且向量可比
    时，低视觉兼容度才触发保守拆分保护。
-6. **事件总结**：事件成员确定后才生成中文标题、类型、活动和摘要；导入标签绝不参与。
+6. **事件总结**：导入热路径只建立可检索的事件和 Observation 证据；待总结事件由
+   `POST /api/maintenance/summarize-events` 的后台维护任务生成中文标题、类型、活动
+   和摘要，避免同一事件随每张图片重复推理。导入标签绝不参与。
 7. **人物确认**：确认姓名和可选角色后，刷新实体提及、参与者、事件摘要、
    `person_event_memory`、`person_patterns`、画像和声明。原始 Observation 的匿名
    模型描述不被改写。
@@ -253,6 +258,14 @@ MemorySpace / Household
 - 独立 GPU Ollama `11435`，自动释放 12B 模型；仓库根目录重复实现已清理，脚本已
   按运行、维护、夹具和基准分类。
 - 家庭基准交集生成器和只读评估器已实现。
+- LFW 主脸隔离基准与自动质量门禁：120 图 coverage `0.9917`、pairwise F1 `0.9916`，
+  超过 95% 目标；基准只评估，不写入正式记忆。
+- 分层 Agent 已按语义、事件、Observation/Asset 证据检索；时间、地点、人物、物体等
+  结构化命中可跳过向量检索，置信度不足时降级为事件与原始证据回答。
+- 地点、物体、情感实体、`entity_observations` 和带证据 ID 的实体关系已进入记忆库；
+  搜索页显示可折叠的算法判断依据。
+- 核心视觉语义已加入只读 `evaluate_vision_model.py` 门禁；并发后台导入为每任务独立
+  SQLite 连接，初始化锁避免 schema migration 和 GPU 模型重复加载竞争。
 
 ### 已通过的受控历史验收
 
@@ -267,24 +280,25 @@ MemorySpace / Household
   “生日/维修”标签没有可观察画面差异，不能作为模型应该切开的有效测试。
 - 已验证独立 Ollama GPU 卸载和闲置后模型卸载。
 
-## 最近验证（2026-08-02）
+## 最近验证（2026-08-03）
 
-- `psh` 当前提交为 `853ff66`，工作树干净。
+- `psh` 当前提交为 `d588c53`，工作树干净。正式 API `8090`、Web `4174` 与 FMA
+  `5173` 正常；FMA 未修改。专用 Ollama `11435` 已卸载模型。
+- 人脸门禁：`evaluate_lfw_clusters.py` 在隔离库输出 coverage `0.9917`、pairwise
+  F1 `0.9916`，通过 95% 目标。
+- 核心视觉模型门禁：三张真实场景图均返回完整中文 JSON、必需字段和证据字段，均值
+  `3.2791s/图`，相对 `18.14s/图` 旧视觉基线为 `5.5321x`。
+- 临时 GPU API `8095` 的预热稳定态三图完整语义：`9.8922s`，对比旧同步完整路径
+  `54.4271s`，为 `5.502x`；三个 Asset 均为 `processed`，日志确认
+  `CUDAExecutionProvider`。临时 API 已停止，测试仅写入 `/tmp`。
+- 相关 Python 回归：69 项通过，包括并发 SQLite、FaceAdapter 契约、管道、模型请求
+  参数和视觉门禁。正式 `8090` 尚未重启加载本轮代码。
 - `GET /api/health` 返回 `200`；AdaFace、`buffalo_l`、FunASR、CLIP 均报告 ready；
   `GET http://127.0.0.1:11435/api/ps` 返回空模型列表。
 - Web `4174` 返回 `200`；FMA `5173` 未改动。
 - `node --test test/*.test.js`：10 项通过。
 - `node --check src/app.js`、`node --check src/api.js`、
   `.venv/bin/python -m compileall -q backend scripts`、`git diff --check` 均通过。
-- Python 全套 `unittest discover -s backend/tests` 已结束：共 108 项，2 个失败、
-  1 个错误。失败集中在 `FaceEmbeddingContractTests`：
-  `test_face_adapter_uses_configured_identity_adapter_result`、
-  `test_face_adapter_passes_five_point_landmarks_to_alignment` 与
-  `test_detection_marks_small_low_confidence_face_as_evidence_only`。三者均因
-  `FaceAdapter.detect()` 未返回测试提供的伪检测人脸；前两项断言空结果，后一项
-  因空数组发生 `IndexError`。这是身份适配/检测测试契约的当前回归，不能将本轮
-  Python 全套标记为通过。
-
 已知测试警告：隔离测试构造的 `ClipAdapter` 输出
 `No pretrained weights loaded for model 'ViT-B-32'. Model initialized randomly.`。
 这不证明生产运行随机初始化，但也不能替代生产 checkpoint 图文推理验收。
@@ -293,15 +307,14 @@ MemorySpace / Household
 
 ### P0：MVP 门槛
 
-1. **清理失败资料并完成可复现重建**：定位 `album1` 2 个、`album2` 1 个、
+1. **生产切换与烟雾验证**：在维护窗口将 `8090` 从直接 `uvicorn` 切换到
+   `scripts/runtime/start_sentrix_api.sh`，确认 health、CUDA provider、快速证据、核心
+   语义和待总结事件维护任务；准备并验证回滚命令，不影响 FMA。
+2. **清理失败资料并完成可复现重建**：定位 `album1` 2 个、`album2` 1 个、
    `album3` 3 个失败 Asset 的阶段和错误，针对性重试或明确记录不可处理原因；确保
    每个可用图片都有 Observation、事件链接、空间和处理状态；所有重建不再为
    `completed_with_failures` 后才可谈完整性验收。
-2. **修复 FaceAdapter 回归并恢复全量测试**：诊断为何测试注入的 `FakeApp`、
-   `FakeDetection` 和 `FakeCv2` 被 `FaceAdapter.detect()` 过滤或异常吞掉，修复
-   测试契约或实现后重新运行 108 项 Python 套件。必须同时覆盖身份适配器结果、
-   五点关键点对齐和小/低置信人脸仅证据化三种场景。
-3. **运行真实基准并设定门槛**：对当前数据库运行人脸聚类、事件分割、空间隔离、
+3. **运行真实基准并设定门槛**：对当前数据库运行事件分割、空间隔离、
    查询原图召回的只读评估；按相册记录输入交集、precision、recall、F1、误合并、
    漏合并、事件拆分/合并、hit rate 和证据正确性。在有可观察的同时间同地点不同
    活动资料前，不改事件拆分 `0.45` 阈值或放宽生产规则。
@@ -342,7 +355,7 @@ scripts/runtime/start_sentrix_ollama.sh
 
 FACE_MODEL_ROOT=$PWD/data/face-models \
 FACE_MODEL_NAME=buffalo_l \
-FACE_PROVIDERS=CPUExecutionProvider \
+FACE_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider \
 FACE_EMBEDDING_MODE=adaface \
 ADAFACE_ARCHITECTURE=ir_50 \
 ADAFACE_DEVICE=cuda \
@@ -351,7 +364,7 @@ ADAFACE_REPO_ROOT=/home/asus/models/AdaFace \
 OLLAMA_BASE_URL=http://127.0.0.1:11435 \
 OLLAMA_MODEL=gemma4:12b \
 OLLAMA_KEEP_ALIVE=0 \
-.venv/bin/python -m uvicorn backend.app:app --host 0.0.0.0 --port 8090
+scripts/runtime/start_sentrix_api.sh
 
 SENTRIX_BACKEND_URL=http://127.0.0.1:8090 PORT=4174 npm run dev
 ```
@@ -385,6 +398,7 @@ git diff --check
 | 2026-07-31 | `bf286a1` | 引入 MemorySpace、三相册基准、人物事件投影和只读评估工具。 |
 | 2026-07-31 | `d00cd02` 至 `dab0f66` | 改进重建期间页面更新、基准默认相册、事件合并、轮询输入/媒体保护、增量相册隔离和人物事实清理。 |
 | 2026-08-02 | `853ff66` | 对 153 工作树、服务、数据库和未完成 MVP 门槛完成当前状态核验。 |
+| 2026-08-03 | `878579b`、`d588c53` | 加入视觉模型门禁、核心语义快速路径、延迟事件总结与并发导入修复；隔离稳定态完整语义达到 `5.502x`。 |
 
 ## 接手原则
 
