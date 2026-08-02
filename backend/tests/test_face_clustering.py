@@ -201,6 +201,7 @@ class FaceEmbeddingContractTests(unittest.TestCase):
         adapter = FaceAdapter.__new__(FaceAdapter)
         adapter.enabled = True
         adapter._app = None
+        adapter._load_lock = __import__("threading").Lock()
         adapter.error = None
         adapter.identity_model = "adaface"
         adapter.identity_adapter = type("Identity", (), {"available": True, "model_version": "test"})()

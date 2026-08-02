@@ -43,13 +43,25 @@ class ImportRequest(BaseModel):
 
 
 def process_asset(asset_id):
-    asset = store.get_asset(asset_id) or {}
-    if asset.get("media_type") != "image":
-        pipeline.process(asset_id)
-        return
-    fast = pipeline.process_fast_image(asset_id)
-    if fast.get("status") == "semantic_enriching":
-        pipeline.enrich_fast_image(asset_id)
+    # BackgroundTasks may process uploads concurrently. Each task must own its
+    # SQLite connection; sharing the request-store connection interleaves its
+    # transactions and raises "cannot start a transaction within a transaction".
+    task_store = MemoryStore(store.path)
+    task_pipeline = IngestionPipeline(
+        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+    )
+    try:
+        asset = task_store.get_asset(asset_id) or {}
+        if asset.get("media_type") != "image":
+            task_pipeline.process(asset_id)
+            return
+        fast = task_pipeline.process_fast_image(asset_id)
+        if fast.get("status") == "semantic_enriching":
+            # Event summaries are a separate semantic projection. The event and
+            # observation evidence are already queryable after core enrichment.
+            task_pipeline.enrich_fast_image(asset_id, summarize_event=False)
+    finally:
+        task_store.close()
 
 
 @app.get("/api/health")
@@ -570,6 +582,16 @@ def recheck(background_tasks: BackgroundTasks):
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
     return {"accepted": len(assets), "status": "recheck-queued"}
+
+
+@app.post("/api/maintenance/summarize-events")
+def summarize_pending_events(background_tasks: BackgroundTasks, scope_id: str | None = None, limit: int = 100):
+    accepted = len([
+        event for event in store.list_events(max(1, limit), scope_id)
+        if event.get("title") == "待总结事件"
+    ])
+    background_tasks.add_task(pipeline.summarize_pending_events, scope_id, max(1, limit))
+    return {"accepted": accepted, "status": "event-summary-queued"}
 
 
 @app.get("/api/query-gaps")

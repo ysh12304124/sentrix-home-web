@@ -1,4 +1,5 @@
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 
 from backend.db import MemoryStore
@@ -285,6 +286,27 @@ class MemoryStoreTests(unittest.TestCase):
 
         self.assertEqual(updated["content_sha256"], "digest")
         self.assertEqual(updated["metadata_json"]["exif"]["device"], "phone")
+
+    def test_independent_task_connections_can_write_same_database(self):
+        database = f"{self.temp_dir.name}/concurrent.db"
+
+        def write(index):
+            store = MemoryStore(database)
+            try:
+                asset = store.create_asset(f"asset_{index}", f"{index}.jpg", "image", f"/tmp/{index}.jpg")
+                return store.update_asset(asset["id"], "processing")["status"]
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            statuses = list(executor.map(write, range(3)))
+
+        verifier = MemoryStore(database)
+        try:
+            self.assertEqual(statuses, ["processing", "processing", "processing"])
+            self.assertEqual(verifier.count("assets"), 3)
+        finally:
+            verifier.close()
 
 
 if __name__ == "__main__":

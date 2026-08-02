@@ -1,8 +1,10 @@
 import base64
+from io import BytesIO
 import json
 import mimetypes
 import os
 import re
+import threading
 from pathlib import Path
 
 from .face_embeddings import AdaFaceAdapter, FaceEmbeddingUnavailable, MagFaceAdapter, compute_face_quality
@@ -135,7 +137,7 @@ class GammaClient:
         self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
 
-    def chat(self, prompt, images=None):
+    def chat(self, prompt, images=None, vision_options=None):
         if httpx is None:
             raise ModelError("httpx is not installed")
         message = {"role": "user", "content": prompt}
@@ -149,6 +151,12 @@ class GammaClient:
             "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "0"),
             "options": {"temperature": 0},
         }
+        if vision_options:
+            payload["think"] = vision_options.get("think", False)
+            payload["options"].update({
+                "num_ctx": vision_options["num_ctx"],
+                "num_predict": vision_options["num_predict"],
+            })
         try:
             response = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
             response.raise_for_status()
@@ -157,18 +165,40 @@ class GammaClient:
         except (httpx.HTTPError, ValueError) as error:
             raise ModelError(f"gamma request failed: {error}") from error
 
+    def _core_vision_options(self):
+        return {
+            "think": False,
+            "num_ctx": int(os.getenv("VISION_CORE_NUM_CTX", "4096")),
+            "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "320")),
+        }
+
+    def _encode_core_image(self, path):
+        """Downsample only the model input; the source asset remains untouched."""
+        file_path = Path(path)
+        max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "896"))
+        try:
+            from PIL import Image
+
+            with Image.open(file_path) as source:
+                image = source.convert("RGB")
+                image.thumbnail((max_dimension, max_dimension))
+                output = BytesIO()
+                image.save(output, format="JPEG", quality=90, optimize=True)
+                return base64.b64encode(output.getvalue()).decode("ascii"), "image/jpeg"
+        except Exception:
+            encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
+            mime_type = mimetypes.guess_type(file_path.name)[0] or "image/jpeg"
+            return encoded, mime_type
+
     def analyze_image(self, path, metadata=None):
         file_path = Path(path)
-        encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
-        mime_type = mimetypes.guess_type(file_path.name)[0] or "image/jpeg"
-        prompt = """你是家庭记忆观察器。只根据图片和给定元数据抽取可验证观察，不要猜测姓名。
-严格只返回 JSON 对象，所有字段值必须使用简体中文；画面中没有人物时 people 返回空数组。
-字段必须为：
-caption（图片内容简述）、activity（活动）、place（地点，不确定为空字符串）、people（人物外观描述数组，不包含姓名）、objects（物体数组）、clothing（衣物和配饰数组）、emotions（画面中可明确观察到的情感或氛围数组）、spatial_relations（空间关系数组）、ocr_text（图片中可读文字，没有则为空字符串）、event_type（事件类型）、facts（可维护事实数组）。
-facts 每项字段为 subject、predicate、object、confidence；不确定的事实不要放入 facts。
+        encoded, mime_type = self._encode_core_image(file_path)
+        prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
+严格返回简体中文 JSON 对象，不要解释。每个字段必须完整但简短：caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；看不清用空数组或空字符串。
+字段固定为：caption、activity、place、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。facts 项仅含 subject、predicate、object、confidence。
 不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。
 metadata: """ + json.dumps(metadata or {}, ensure_ascii=False)
-        parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}]))
+        parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
         scalar_text = " ".join(as_text(parsed.get(key)) for key in ("caption", "activity", "place", "event_type", "ocr_text"))
         if contains_latin_text(scalar_text):
             canonical_prompt = """把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。
@@ -355,6 +385,7 @@ class ClipAdapter:
         self._model = None
         self._preprocess = None
         self._tokenizer = None
+        self._load_lock = threading.Lock()
         self.error = None
         self.device = os.getenv("CLIP_DEVICE", "auto")
 
@@ -365,27 +396,30 @@ class ClipAdapter:
     def _load(self):
         if self._model is not None:
             return self._model, self._preprocess
-        if not self.enabled:
-            return None, None
-        if not self.checkpoint and os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() not in {"1", "true", "yes"}:
-            self.error = "CLIP_CHECKPOINT is not configured"
-            return None, None
-        try:
-            import open_clip
-            import torch
-            kwargs = {"model_name": self.model_name, "pretrained": "openai" if not self.checkpoint else None, "load_weights": not bool(self.checkpoint)}
-            self._model, _, self._preprocess = open_clip.create_model_and_transforms(**kwargs)
-            if self.checkpoint:
-                state = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
-                self._model.load_state_dict(state, strict=False)
-            self._tokenizer = open_clip.get_tokenizer(self.model_name)
-            self.device = self._device(torch)
-            self._model.to(self.device)
-            self._model.eval()
-            return self._model, self._preprocess
-        except Exception as error:
-            self.error = str(error)
-            return None, None
+        with self._load_lock:
+            if self._model is not None:
+                return self._model, self._preprocess
+            if not self.enabled:
+                return None, None
+            if not self.checkpoint and os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() not in {"1", "true", "yes"}:
+                self.error = "CLIP_CHECKPOINT is not configured"
+                return None, None
+            try:
+                import open_clip
+                import torch
+                kwargs = {"model_name": self.model_name, "pretrained": "openai" if not self.checkpoint else None, "load_weights": not bool(self.checkpoint)}
+                self._model, _, self._preprocess = open_clip.create_model_and_transforms(**kwargs)
+                if self.checkpoint:
+                    state = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
+                    self._model.load_state_dict(state, strict=False)
+                self._tokenizer = open_clip.get_tokenizer(self.model_name)
+                self.device = self._device(torch)
+                self._model.to(self.device)
+                self._model.eval()
+                return self._model, self._preprocess
+            except Exception as error:
+                self.error = str(error)
+                return None, None
 
     def embed_image(self, path):
         model, preprocess = self._load()
@@ -423,6 +457,7 @@ class FaceAdapter:
     def __init__(self):
         self.enabled = os.getenv("FACE_ENABLED", "true").lower() in {"1", "true", "yes"}
         self._app = None
+        self._load_lock = threading.Lock()
         self.error = None
         self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "adaface").lower()
         self.identity_adapter = self._build_identity_adapter()
@@ -478,18 +513,20 @@ class FaceAdapter:
             return []
         try:
             if self._app is None:
-                self._configure_onnx_runtime_libraries()
-                from insightface.app import FaceAnalysis
-                providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
-                kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
-                if self.identity_model in {"adaface", "magface"}:
-                    # AdaFace/MagFace produce the only identity vector. Avoid
-                    # loading buffalo_l recognition and demographic models.
-                    kwargs["allowed_modules"] = ["detection", "landmark_2d_106"]
-                if os.getenv("FACE_MODEL_ROOT"):
-                    kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
-                self._app = FaceAnalysis(**kwargs)
-                self._app.prepare(ctx_id=-1, det_size=(640, 640))
+                with getattr(self, "_load_lock", threading.Lock()):
+                    if self._app is None:
+                        self._configure_onnx_runtime_libraries()
+                        from insightface.app import FaceAnalysis
+                        providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
+                        kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
+                        if self.identity_model in {"adaface", "magface"}:
+                            # AdaFace/MagFace produce the only identity vector. Avoid
+                            # loading buffalo_l recognition and demographic models.
+                            kwargs["allowed_modules"] = ["detection", "landmark_2d_106"]
+                        if os.getenv("FACE_MODEL_ROOT"):
+                            kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
+                        self._app = FaceAnalysis(**kwargs)
+                        self._app.prepare(ctx_id=-1, det_size=(640, 640))
             import cv2
             image = cv2.imread(str(path))
             if image is None:

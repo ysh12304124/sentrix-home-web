@@ -261,6 +261,14 @@ class IngestionPipeline:
     def summarize_events(self, scope_id=None):
         return [self.summarize_event(event["id"]) for event in self.store.list_events(1000, scope_id)]
 
+    def summarize_pending_events(self, scope_id=None, limit=100):
+        """Build deferred event projections without reprocessing image evidence."""
+        pending = [
+            event for event in self.store.list_events(max(1, limit), scope_id)
+            if event.get("title") == "待总结事件"
+        ]
+        return [self.summarize_event(event["id"]) for event in pending]
+
     def _image_observation(self, asset):
         path = asset["path"]
         captured_at = asset.get("captured_at") or file_time(path)

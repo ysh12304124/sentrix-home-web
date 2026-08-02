@@ -33,6 +33,21 @@ class ModelClientTests(unittest.TestCase):
 
         self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], "0")
 
+    @patch("backend.model_clients.httpx.post")
+    def test_core_vision_options_disable_thinking_and_bound_generation(self, post):
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {"message": {"content": "{}"}}
+
+        GammaClient(base_url="http://sentrix-ollama").chat(
+            "测试", [{"base64": "image", "mime_type": "image/jpeg"}],
+            {"think": False, "num_ctx": 4096, "num_predict": 320},
+        )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertFalse(payload["think"])
+        self.assertEqual(payload["options"]["num_ctx"], 4096)
+        self.assertEqual(payload["options"]["num_predict"], 320)
+
     def test_clip_uses_project_checkpoint_when_environment_is_unset(self):
         checkpoint = Path(__file__).resolve().parents[2] / "data" / "models" / "clip" / "ViT-B-32.bin"
         with patch.dict("os.environ", {"CLIP_CHECKPOINT": ""}, clear=False), patch.object(Path, "is_file", autospec=True) as is_file:

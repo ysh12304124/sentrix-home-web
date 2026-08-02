@@ -1,6 +1,7 @@
 import json
 import math
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 
@@ -65,12 +66,23 @@ def normalize_clothing(value):
 
 
 class MemoryStore:
+    _schema_locks = {}
+    _schema_locks_guard = threading.Lock()
+
+    @classmethod
+    def _schema_lock(cls, path):
+        with cls._schema_locks_guard:
+            return cls._schema_locks.setdefault(str(path), threading.Lock())
+
     def __init__(self, path):
         self.path = str(path)
-        self.connection = sqlite3.connect(path, check_same_thread=False)
+        self.connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
-        self._create_schema()
+        with self._schema_lock(path):
+            self.connection.execute("PRAGMA busy_timeout = 30000")
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            self._create_schema()
 
     def close(self):
         self.connection.close()

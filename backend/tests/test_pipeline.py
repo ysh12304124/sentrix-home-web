@@ -212,6 +212,38 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(store.get_observation(observation["id"])["caption"], "一张带文字的家庭照片")
             self.assertTrue(any(item["canonical_name"] == "蛋糕" for item in store.list_entities()))
 
+    def test_fast_enrichment_can_leave_event_summary_for_later_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "family.jpg"
+            image.write_bytes(b"test")
+            store = MemoryStore(f"{directory}/memory.db")
+            pipeline = IngestionPipeline(store, gamma=FakeGamma(), face=FakeFace(), clip=FakeClip())
+            asset = pipeline.create_asset(image)
+
+            pipeline.process_fast_image(asset["id"])
+            complete = pipeline.enrich_fast_image(asset["id"], summarize_event=False)
+            event = store.get_event(complete["metadata_json"]["event_id"])
+
+            self.assertEqual(complete["status"], "processed")
+            self.assertNotEqual(event["summary"], "一组照片记录了围绕蛋糕的庆祝活动。")
+
+    def test_pending_event_summary_is_built_without_reprocessing_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "family.jpg"
+            image.write_bytes(b"test")
+            store = MemoryStore(f"{directory}/memory.db")
+            pipeline = IngestionPipeline(store, gamma=FakeGamma(), face=FakeFace(), clip=FakeClip())
+            asset = pipeline.create_asset(image)
+
+            pipeline.process_fast_image(asset["id"])
+            complete = pipeline.enrich_fast_image(asset["id"], summarize_event=False)
+            event_id = complete["metadata_json"]["event_id"]
+            summaries = pipeline.summarize_pending_events()
+
+            self.assertEqual([item["id"] for item in summaries], [event_id])
+            self.assertEqual(store.get_event(event_id)["summary"], "一组照片记录了围绕蛋糕的庆祝活动。")
+            self.assertEqual(store.count("observations"), 1)
+
     def test_fast_image_recovery_does_not_duplicate_evidence_before_enrichment(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "family.jpg"
