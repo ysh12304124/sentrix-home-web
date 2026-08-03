@@ -254,6 +254,15 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_revisions (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL REFERENCES events(id),
+                field_name TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                source TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS event_observations (
                 event_id TEXT NOT NULL REFERENCES events(id),
                 observation_id TEXT NOT NULL REFERENCES observations(id),
@@ -627,6 +636,7 @@ class MemoryStore:
             "aggregation_score": "REAL NOT NULL DEFAULT 0",
             "aggregation_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
             "merged_into_event_id": "TEXT", "merge_reason": "TEXT",
+            "cover_asset_id": "TEXT",
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
@@ -653,6 +663,7 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(asset_id);
             CREATE INDEX IF NOT EXISTS idx_assets_content_sha256 ON assets(content_sha256);
             CREATE INDEX IF NOT EXISTS idx_events_time ON events(time_start);
+            CREATE INDEX IF NOT EXISTS idx_event_revisions_event ON event_revisions(event_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_facts_subject_predicate ON facts(subject, predicate);
             CREATE INDEX IF NOT EXISTS idx_face_instances_cluster ON face_instances(cluster_id);
             CREATE INDEX IF NOT EXISTS idx_face_prototypes_cluster ON face_prototypes(cluster_id);
@@ -1359,7 +1370,7 @@ class MemoryStore:
                     self.get_observation(observation_id) or {} for observation_id in row["observation_ids"]
                 ) if item.get("asset_id")
             ]
-            row["cover_asset_id"] = row["asset_ids"][0] if row["asset_ids"] else None
+            row["cover_asset_id"] = row.get("cover_asset_id") if row.get("cover_asset_id") in row["asset_ids"] else (row["asset_ids"][0] if row["asset_ids"] else None)
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
 
@@ -2007,7 +2018,8 @@ class MemoryStore:
                 observation["asset"] = self.get_asset(observation["asset_id"])
                 observations.append(observation)
         facts = [fact for fact in self.list_facts(500) if any(item["id"] in fact["evidence_ids_json"] for item in observations)]
-        return {"event": event, "observations": observations, "facts": facts, "entities": self.list_event_entities(event_id)}
+        revisions = self._rows("SELECT * FROM event_revisions WHERE event_id = ? ORDER BY created_at DESC", (event_id,))
+        return {"event": event, "observations": observations, "facts": facts, "entities": self.list_event_entities(event_id), "event_revisions": revisions}
 
     def upsert_event_entity(self, event_id, entity_id, relation, evidence_ids=None, confidence=0.0):
         evidence_ids = list(dict.fromkeys(evidence_ids or []))
@@ -2070,13 +2082,22 @@ class MemoryStore:
         event = self.get_event(event_id)
         if not event:
             return None
-        allowed = {"title", "event_type", "time_start", "time_end", "place", "activity", "summary", "status"}
+        allowed = {"title", "event_type", "time_start", "time_end", "place", "activity", "summary", "status", "cover_asset_id"}
         values = {key: value for key, value in fields.items() if key in allowed}
         if not values:
             return event
+        cover_asset_id = values.get("cover_asset_id")
+        if cover_asset_id and cover_asset_id not in event["asset_ids"]:
+            raise ValueError("event cover must be an asset already linked to this event")
         assignments = ", ".join(f"{key} = ?" for key in values)
         params = list(values.values()) + [now_iso(), event_id]
         self.connection.execute(f"UPDATE events SET {assignments}, revision = revision + 1, updated_at = ? WHERE id = ?", params)
+        for key, value in values.items():
+            if event.get(key) != value:
+                self.connection.execute(
+                    "INSERT INTO event_revisions(id, event_id, field_name, old_value, new_value, source, created_at) VALUES (?, ?, ?, ?, ?, 'user', ?)",
+                    (make_id("event_revision"), event_id, key, str(event.get(key) or ""), str(value or ""), now_iso()),
+                )
         self.connection.commit()
         return self.get_event(event_id)
 

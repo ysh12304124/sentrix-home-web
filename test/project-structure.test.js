@@ -97,6 +97,13 @@ test("trip candidates have explicit user confirmation and rejection actions", ()
   assert.match(appSource, /reject-trip/);
 });
 
+test("event edit exposes type, end time, and evidence-backed cover controls", () => {
+  const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(source, /name="event_type"/);
+  assert.match(source, /name="time_end"/);
+  assert.match(source, /name="cover_asset_id"/);
+});
+
 test("entity reindex maintenance isolates its SQLite connection and rejects concurrent runs", () => {
   const source = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
   assert.match(source, /maintenance_lock/);

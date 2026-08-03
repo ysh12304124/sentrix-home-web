@@ -245,6 +245,36 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(self.store.derive_trip_candidates(), [])
         self.assertEqual(self.store.get_trip_detail(candidate["id"])["revisions"][0]["action"], "rejected")
 
+    def test_user_event_edit_preserves_evidence_and_records_cover_revision(self):
+        event = self.store.create_event({
+            "id": "editable_event", "title": "待修正事件", "event_type": "日常", "time_start": "2025-05-01T10:00:00+08:00",
+        })
+        self.store.connection.executemany(
+            "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+            [(event["id"], self.obs1["id"]), (event["id"], self.obs2["id"])],
+        )
+        self.store.connection.commit()
+
+        updated = self.store.update_event(event["id"], {
+            "event_type": "旅行", "time_end": "2025-05-02T18:00:00+08:00", "cover_asset_id": "a2",
+        })
+        detail = self.store.get_event_detail(event["id"])
+
+        self.assertEqual(updated["event_type"], "旅行")
+        self.assertEqual(updated["time_end"], "2025-05-02T18:00:00+08:00")
+        self.assertEqual(updated["cover_asset_id"], "a2")
+        self.assertEqual(set(updated["asset_ids"]), {"a1", "a2"})
+        self.assertEqual(detail["event_revisions"][0]["field_name"], "cover_asset_id")
+        self.assertEqual(detail["event_revisions"][0]["new_value"], "a2")
+
+    def test_event_cover_must_be_evidence_asset_from_that_event(self):
+        event = self.store.create_event({"id": "editable_event", "title": "待修正事件"})
+        self.store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], self.obs1["id"]))
+        self.store.connection.commit()
+
+        with self.assertRaises(ValueError):
+            self.store.update_event(event["id"], {"cover_asset_id": "missing-asset"})
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)
