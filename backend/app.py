@@ -254,6 +254,16 @@ def entity_detail(entity_id: str):
     return value
 
 
+@app.put("/api/entities/{entity_id}/properties/{property_key}")
+def set_entity_property(entity_id: str, property_key: str, payload: dict):
+    try:
+        return store.set_entity_property(entity_id, property_key, payload.get("value"), payload.get("evidence_ids") or [])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="entity not found")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
 @app.get("/api/face-clusters")
 def face_clusters(status: str | None = None, scope_id: str | None = None):
     clusters = store.list_face_clusters(status)

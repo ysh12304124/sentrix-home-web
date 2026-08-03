@@ -214,6 +214,20 @@ class MemoryStore:
                 evidence_ids_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS entity_properties (
+                id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL REFERENCES entities(id),
+                property_key TEXT NOT NULL,
+                value_json TEXT NOT NULL DEFAULT 'null',
+                source TEXT NOT NULL DEFAULT 'derived',
+                confidence REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                supersedes_property_id TEXT REFERENCES entity_properties(id),
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS face_clusters (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -535,6 +549,8 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(scope_id);
             CREATE INDEX IF NOT EXISTS idx_events_scope ON events(scope_id);
             CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(scope_id);
+            CREATE INDEX IF NOT EXISTS idx_entity_properties_entity_key ON entity_properties(entity_id, property_key, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_entity_properties_status ON entity_properties(status);
             CREATE INDEX IF NOT EXISTS idx_face_clusters_scope ON face_clusters(scope_id);
             CREATE INDEX IF NOT EXISTS idx_person_event_memory_person ON person_event_memory(person_id, event_id);
             CREATE INDEX IF NOT EXISTS idx_person_event_memory_scope ON person_event_memory(scope_id, event_id);
@@ -2196,6 +2212,8 @@ class MemoryStore:
             }
         return {
             "entity": entity,
+            "properties": self.list_entity_properties(entity_id),
+            "property_history": self.list_entity_properties(entity_id, include_history=True),
             "clusters": clusters,
             "relationships": relationships,
             "facts": facts,
@@ -2228,6 +2246,100 @@ class MemoryStore:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (make_id("entity_revision"), entity_id, field_name, old_value, new_value, source, json_value(evidence_ids, []), now_iso()),
         )
+
+    @staticmethod
+    def _property_row(row):
+        if not row:
+            return row
+        value = dict(row)
+        try:
+            value["value"] = json.loads(value.pop("value_json") or "null")
+        except (TypeError, json.JSONDecodeError):
+            value["value"] = None
+        try:
+            value["evidence_ids"] = json.loads(value.pop("evidence_ids_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            value["evidence_ids"] = []
+        return value
+
+    def list_entity_properties(self, entity_id, include_history=False):
+        status_clause = "" if include_history else " AND status IN ('active', 'pending')"
+        rows = self._rows(
+            "SELECT * FROM entity_properties WHERE entity_id = ?" + status_clause + " ORDER BY property_key, revision DESC, updated_at DESC",
+            (entity_id,),
+        )
+        return [self._property_row(row) for row in rows]
+
+    def _current_entity_property(self, entity_id, property_key):
+        return self._row(
+            """SELECT * FROM entity_properties WHERE entity_id = ? AND property_key = ?
+            AND status IN ('active', 'pending') ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,
+            revision DESC, updated_at DESC LIMIT 1""",
+            (entity_id, property_key),
+        )
+
+    def maintain_entity_property(self, entity_id, property_key, value, confidence=0.0, evidence_ids=None, source="derived"):
+        """Record a derived value without replacing a user-maintained current value."""
+        if not self.get_entity(entity_id):
+            raise KeyError(entity_id)
+        property_key = str(property_key or "").strip()
+        if not property_key:
+            raise ValueError("property_key is required")
+        evidence_ids = list(dict.fromkeys(evidence_ids or []))
+        current = self._current_entity_property(entity_id, property_key)
+        encoded = json_value(value, None)
+        if current and current["source"] == "user":
+            return self._property_row(current)
+        if current and current["value_json"] == encoded:
+            self.connection.execute(
+                "UPDATE entity_properties SET confidence = MAX(confidence, ?), evidence_ids_json = ?, updated_at = ? WHERE id = ?",
+                (float(confidence or 0), json_value(list(dict.fromkeys(json.loads(current["evidence_ids_json"] or "[]") + evidence_ids)), []), now_iso(), current["id"]),
+            )
+            self.connection.commit()
+            return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (current["id"],)))
+        timestamp = now_iso()
+        status = "active" if not current else "pending"
+        property_id = make_id("entity_property")
+        self.connection.execute(
+            """INSERT INTO entity_properties(id, entity_id, property_key, value_json, source, confidence, status,
+            evidence_ids_json, supersedes_property_id, revision, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (property_id, entity_id, property_key, encoded, source, float(confidence or 0), status,
+             json_value(evidence_ids, []), current["id"] if current else None,
+             int(current["revision"] or 0) + 1 if current else 1, timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
+
+    def set_entity_property(self, entity_id, property_key, value, evidence_ids=None):
+        """Make a user value current and preserve all older revisions for audit."""
+        if not self.get_entity(entity_id):
+            raise KeyError(entity_id)
+        property_key = str(property_key or "").strip()
+        if not property_key:
+            raise ValueError("property_key is required")
+        evidence_ids = list(dict.fromkeys(evidence_ids or []))
+        current = self._current_entity_property(entity_id, property_key)
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                "UPDATE entity_properties SET status = 'superseded', updated_at = ? WHERE entity_id = ? AND property_key = ? AND status IN ('active', 'pending')",
+                (timestamp, entity_id, property_key),
+            )
+        property_id = make_id("entity_property")
+        self.connection.execute(
+            """INSERT INTO entity_properties(id, entity_id, property_key, value_json, source, confidence, status,
+            evidence_ids_json, supersedes_property_id, revision, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'user', 1, 'active', ?, ?, ?, ?, ?)""",
+            (property_id, entity_id, property_key, json_value(value, None), json_value(evidence_ids, []),
+             current["id"] if current else None, int(current["revision"] or 0) + 1 if current else 1, timestamp, timestamp),
+        )
+        self._record_entity_revision(
+            entity_id, f"property:{property_key}", current["value_json"] if current else None,
+            json_value(value, None), "user", evidence_ids,
+        )
+        self.connection.commit()
+        return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
 
     def merge_face_clusters(self, target_cluster_id, source_cluster_id, source="user_merge"):
         if target_cluster_id == source_cluster_id:

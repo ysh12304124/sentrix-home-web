@@ -57,6 +57,27 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertTrue(cluster["reviewable"])
         self.assertTrue(cluster["single_sample"])
 
+    def test_user_entity_property_supersedes_derived_value_and_blocks_later_derived_update(self):
+        place = self.store.create_entity("家中餐厅", "place", confidence=0.7)
+        derived = self.store.maintain_entity_property(place["id"], "alias", "餐厅", 0.7, [self.obs1["id"]])
+        user = self.store.set_entity_property(place["id"], "alias", "我们的饭桌", [self.obs2["id"]])
+        retained = self.store.maintain_entity_property(place["id"], "alias", "模型餐厅", 0.95, [self.obs1["id"]])
+        detail = self.store.get_entity_detail(place["id"])
+
+        self.assertEqual(derived["status"], "active")
+        self.assertEqual(user["status"], "active")
+        self.assertEqual(retained["id"], user["id"])
+        self.assertEqual(detail["properties"][0]["value"], "我们的饭桌")
+        self.assertEqual(detail["properties"][0]["source"], "user")
+        self.assertEqual([item["status"] for item in detail["property_history"]], ["active", "superseded"])
+
+    def test_conflicting_derived_property_stays_pending_for_review(self):
+        place = self.store.create_entity("家中餐厅", "place", confidence=0.7)
+        self.store.maintain_entity_property(place["id"], "scene_type", "餐厅", 0.7, [self.obs1["id"]])
+        candidate = self.store.maintain_entity_property(place["id"], "scene_type", "厨房", 0.8, [self.obs2["id"]])
+
+        self.assertEqual(candidate["status"], "pending")
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)
