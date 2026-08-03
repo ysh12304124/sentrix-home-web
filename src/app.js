@@ -321,10 +321,26 @@
       const detail = modal.detail;
       const entity = detail.entity;
       const observations = detail.observations || [];
+      const properties = detail.properties || [];
+      const propertyHistory = detail.property_history || properties;
+      const evidenceById = new Map((detail.evidence_files || []).map((item) => [item.evidence_id, item]));
       const preview = observations[0]?.asset?.id && observations[0]?.asset?.media_type === "image" ? `<img class="entity-detail-thumb" src="/api/assets/${encodeURIComponent(observations[0].asset.id)}/file" alt="${escapeHtml(observations[0].asset.file_name || entity.canonical_name)}的证据缩略图" />` : "";
       const relationRows = detail.relationships.concat(detail.facts.map((fact) => ({ ...fact, subject_name: fact.subject, object_name: fact.object, predicate: fact.predicate, status: fact.status }))).map((item) => `<div class="fact-review-row"><div><strong>${escapeHtml(item.subject_name || item.subject)} ${escapeHtml(item.predicate)} ${escapeHtml(item.object_name || item.object)}</strong><small>${escapeHtml(item.status)}</small></div></div>`).join("");
       const evidenceRows = observations.map((observation) => `<button class="evidence-main entity-observation" data-action="open-asset" data-asset-id="${escapeHtml(observation.asset_id)}"><strong>${escapeHtml(observation.asset?.file_name || observation.asset_id)}</strong><p>${escapeHtml(observation.caption || observation.transcript || "原始观察证据")}</p><small>${escapeHtml(formatDateTime(observation.captured_at))} · 置信度 ${Math.round((observation.confidence || entity.confidence || 0) * 100)}%</small></button>`).join("");
-      body = `<div class="modal-kicker">ENTITY · ${escapeHtml(entity.entity_type)}</div><div class="profile-heading">${preview}<div><h2>${escapeHtml(entity.canonical_name)}</h2><p class="modal-lead">${escapeHtml(entity.summary || "这是跨多个事件维护的实体，不是单张图片的描述。")}</p></div></div><div class="detail-facts"><span>类型 · ${escapeHtml(entity.entity_type)}</span><span>原始证据 · ${observations.length}</span><span>置信度 · ${Math.round((entity.confidence || 0) * 100)}%</span></div><div class="section-head"><div><p class="section-kicker">关联事件与关系</p><h3>${detail.relationships.length} 条关系 · ${detail.facts.length} 条事实</h3></div></div><div class="evidence-list">${relationRows || emptyState("暂无关系和事实", "新资料会继续补充实体关系。")}</div><div class="section-head"><div><p class="section-kicker">原始证据</p><h3>可打开的文件与观察描述</h3></div></div><div class="evidence-list">${evidenceRows || emptyState("暂无原始证据", "该实体尚未关联可查看的 Observation。")}</div>`;
+      const propertyRows = properties.map((property) => {
+        const evidenceLinks = (property.evidence_ids || []).map((id) => evidenceById.get(id)).filter(Boolean).map((item) => `<button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}">${escapeHtml(item.file_name || item.asset_id)} ${icon("→")}</button>`).join("");
+        const value = typeof property.value === "boolean" ? (property.value ? "已开启" : "未开启") : Array.isArray(property.value) ? property.value.join("、") : String(property.value ?? "未设置");
+        return `<div class="property-row"><strong>${escapeHtml(property.property_key)} · ${escapeHtml(value)}</strong><small>${escapeHtml(property.source)} · ${escapeHtml(property.status)} · 置信度 ${Math.round((property.confidence || 0) * 100)}% · v${property.revision}</small>${evidenceLinks ? `<div class="claim-evidence-links">${evidenceLinks}</div>` : ""}</div>`;
+      }).join("");
+      const placeControls = entity.entity_type === "place" ? `<button class="button small ghost" data-action="edit-entity-properties">修正地点属性</button>` : "";
+      body = `<div class="modal-kicker">ENTITY · ${escapeHtml(entity.entity_type)}</div><div class="profile-heading">${preview}<div><h2>${escapeHtml(entity.canonical_name)}</h2><p class="modal-lead">${escapeHtml(entity.summary || "这是跨多个事件维护的实体，不是单张图片的描述。")}</p></div></div><div class="detail-facts"><span>类型 · ${escapeHtml(entity.entity_type)}</span><span>原始证据 · ${observations.length}</span><span>属性版本 · ${propertyHistory.length}</span><span>置信度 · ${Math.round((entity.confidence || 0) * 100)}%</span></div><div class="section-head"><div><p class="section-kicker">当前属性</p><h3>来源、置信度与证据</h3></div>${placeControls}</div><div class="property-list">${propertyRows || emptyState("暂无维护属性", "模型或用户修正后，会在这里显示当前版本和可回溯证据。")}</div><div class="section-head"><div><p class="section-kicker">关联事件与关系</p><h3>${detail.relationships.length} 条关系 · ${detail.facts.length} 条事实</h3></div></div><div class="evidence-list">${relationRows || emptyState("暂无关系和事实", "新资料会继续补充实体关系。")}</div><div class="section-head"><div><p class="section-kicker">原始证据</p><h3>可打开的文件与观察描述</h3></div></div><div class="evidence-list">${evidenceRows || emptyState("暂无原始证据", "该实体尚未关联可查看的 Observation。")}</div>`;
+    } else if (modal.type === "entity-property-edit") {
+      const detail = modal.detail;
+      const properties = new Map((detail.properties || []).map((property) => [property.property_key, property]));
+      const alias = properties.get("alias")?.value || "";
+      const privateFlag = Boolean(properties.get("private_flag")?.value);
+      const evidenceOptions = (detail.observations || []).map((observation) => `<label class="property-evidence-option"><input type="checkbox" name="evidence_ids" value="${escapeHtml(observation.id)}" />${escapeHtml(observation.asset?.file_name || observation.asset_id)}</label>`).join("");
+      body = `<form id="modal-form"><div class="modal-kicker">PLACE PROPERTY EDIT</div><h2>修正地点属性</h2><p class="modal-lead">保存后以你的值为准；后续模型推断只会形成待审核版本，不能覆盖此设置。</p><label>自定义别名<input name="alias" value="${escapeHtml(alias)}" placeholder="例如：我们的老地方" /></label><label class="property-toggle"><input type="checkbox" name="private_flag" ${privateFlag ? "checked" : ""} />在普通页面和问答中隐藏精确地点</label><div class="property-evidence"><strong>支撑本次修正的原始证据（可选）</strong>${evidenceOptions || "<small>当前没有可选 Observation。</small>"}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="open-entity" data-entity-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存地点属性</button></div></form>`;
     } else if (modal.type === "story-create" || modal.type === "story-edit") {
       const story = modal.story || {};
       body = `<form id="modal-form"><div class="modal-kicker">STORY ${modal.type === "story-create" ? "DRAFT" : "EDITOR"}</div><h2>${modal.type === "story-create" ? "创建故事草稿" : "编辑故事"}</h2><label>标题<input name="title" value="${escapeHtml(story.title || "")}" required /></label><label>故事内容<textarea name="content" rows="5">${escapeHtml(story.content || "")}</textarea></label><div class="story-event-select"><strong>选择事件证据</strong>${state.events.map((event) => `<label><input type="checkbox" name="event_ids" value="${escapeHtml(event.id)}" ${(story.event_ids || []).includes(event.id) ? "checked" : ""} />${escapeHtml(event.title)}</label>`).join("") || `<small>当前没有事件，请先导入资料。</small>`}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">保存故事</button></div></form>`;
@@ -485,6 +501,12 @@
     try {
       if (modal.type === "event-edit") await window.sentrixApi.updateEvent(modal.event.id, { title: form.get("title"), summary: form.get("summary"), place: form.get("place"), time_start: form.get("time_start") ? new Date(form.get("time_start")).toISOString() : modal.event.time_start });
       if (modal.type === "event-create") await window.sentrixApi.createEvent({ title: form.get("title"), summary: form.get("summary"), place: form.get("place"), time_start: form.get("time_start") ? new Date(form.get("time_start")).toISOString() : null });
+      if (modal.type === "entity-property-edit") {
+        const evidenceIds = form.getAll("evidence_ids");
+        await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "alias", String(form.get("alias") || "").trim(), evidenceIds);
+        await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "private_flag", form.get("private_flag") === "on", evidenceIds);
+        state.toast = "地点属性已按你的修正保存，并保留版本和证据";
+      }
       if (modal.type === "person") {
         const confirmed = await window.sentrixApi.confirmPerson(modal.person.id, form.get("name"), form.get("family_role"));
         const counts = confirmed.refresh_counts || {};
@@ -531,6 +553,7 @@
     if (action === "edit-event") return openEvent(element.dataset.eventId, true);
     if (action === "open-asset") return openAsset(element.dataset.assetId);
     if (action === "open-entity") return openEntity(element.dataset.entityId);
+    if (action === "edit-entity-properties") return openModal({ type: "entity-property-edit", detail: state.modal.detail });
     if (action === "open-observation") { const observation = await window.sentrixApi.observation(element.dataset.observationId); return openAsset(observation.asset_id); }
     if (action === "create-event") return openModal({ type: "event-create", event: {} });
     if (action === "create-story") return openModal({ type: "story-create", story: {} });

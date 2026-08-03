@@ -45,6 +45,17 @@ test("native confirmation and assistant turn routes are exposed by the browser A
   assert.match(source, /family_role/);
 });
 
+test("entity property corrections are exposed with evidence-aware UI controls", () => {
+  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(apiSource, /setEntityProperty/);
+  assert.match(apiSource, /\/api\/entities\/\$\{encodeURIComponent\(id\)\}\/properties\/\$\{encodeURIComponent\(propertyKey\)\}/);
+  assert.match(appSource, /entity-property-edit/);
+  assert.match(appSource, /edit-entity-properties/);
+  assert.match(appSource, /property_history/);
+  assert.match(appSource, /evidence_ids/);
+});
+
 test("memory-space and evidence governance are wired into the portal", () => {
   const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(source, /space-select/);

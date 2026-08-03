@@ -31,6 +31,7 @@
     knowledge: (personId = "", scopeId = "") => request("/api/knowledge" + new URLSearchParams({ ...(personId ? { person_id: personId } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")),
     entities: (status = "", scopeId = "") => request(`/api/entities${new URLSearchParams({ ...(status ? { status } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")}`),
     entity: (id) => request(`/api/entities/${encodeURIComponent(id)}`),
+    setEntityProperty: (id, propertyKey, value, evidenceIds = []) => request(`/api/entities/${encodeURIComponent(id)}/properties/${encodeURIComponent(propertyKey)}`, { method: "PUT", body: JSON.stringify({ value, evidence_ids: evidenceIds }) }),
     faceClusters: (status = "", scopeId = "") => request(`/api/face-clusters${new URLSearchParams({ ...(status ? { status } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")}`),
     confirmFaceCluster: (id, payload) => request(`/api/face-clusters/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify(payload) }),
     rejectFaceCluster: (id) => request(`/api/face-clusters/${encodeURIComponent(id)}/reject`, { method: "POST" }),
