@@ -72,6 +72,13 @@ test("person profiles expose user-maintained identity properties", () => {
   assert.match(appSource, /groups/);
 });
 
+test("relationship candidates expose evidence counts before confirmation", () => {
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(appSource, /关系候选与证据/);
+  assert.match(appSource, /evidence_ids_json/);
+  assert.match(appSource, /确认关系/);
+});
+
 test("memory-space and evidence governance are wired into the portal", () => {
   const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(source, /space-select/);
