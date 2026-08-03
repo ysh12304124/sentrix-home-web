@@ -2054,7 +2054,7 @@ class MemoryStore:
             total += len(self.maintain_observation_entities(row["id"], event_row["event_id"] if event_row else None))
         return {"observations": len(rows), "entity_links": total, "scope_id": scope_id}
 
-    def list_entities(self, status=None, scope_id=None):
+    def list_entities(self, status=None, scope_id=None, public=True):
         params = [status] if status else []
         where = "WHERE status = ?" if status else "WHERE status != 'rejected'"
         if scope_id:
@@ -2093,7 +2093,7 @@ class MemoryStore:
             entity["preview_asset_id"] = preview["asset_id"] if preview else None
             entity["preview_file_name"] = preview["file_name"] if preview else None
             entity["preview_media_type"] = preview["media_type"] if preview else None
-        return entities
+        return [self.public_entity(entity) for entity in entities] if public else entities
 
     def get_entity(self, entity_id):
         return self._row("SELECT * FROM entities WHERE id = ?", (entity_id,))
@@ -2304,6 +2304,19 @@ class MemoryStore:
             (entity_id,),
         )
         return [self._property_row(row) for row in rows]
+
+    def public_entity(self, entity):
+        """Return a standard-list-safe entity projection without changing its stable identity."""
+        if not entity or entity.get("entity_type") != "place":
+            return entity
+        value = dict(entity)
+        properties = {item["property_key"]: item for item in self.list_entity_properties(entity["id"])}
+        if properties.get("private_flag", {}).get("value") is True:
+            value["canonical_name"] = str(properties.get("alias", {}).get("value") or "私密地点")
+            value["private"] = True
+        else:
+            value["private"] = False
+        return value
 
     def _current_entity_property(self, entity_id, property_key):
         return self._row(

@@ -60,7 +60,7 @@ class MemoryAgent:
 
     def _private_place_replacements(self, scope_id=None):
         replacements = {}
-        for entity in self.store.list_entities(scope_id=scope_id):
+        for entity in self.store.list_entities(scope_id=scope_id, public=False):
             if entity.get("entity_type") != "place":
                 continue
             properties = {item["property_key"]: item for item in self.store.list_entity_properties(entity["id"])}

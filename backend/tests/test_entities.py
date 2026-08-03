@@ -117,6 +117,17 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(time_properties["season"]["value"], "夏")
         self.assertEqual(time_properties["part_of_day"]["value"], ["傍晚"])
 
+    def test_private_place_has_an_alias_for_standard_entity_lists(self):
+        place = self.store.create_entity("家中餐厅", "place", confidence=1.0)
+        self.store.set_entity_property(place["id"], "alias", "我们的饭桌", [self.obs1["id"]])
+        self.store.set_entity_property(place["id"], "private_flag", True, [self.obs1["id"]])
+
+        listed = self.store.public_entity(self.store.get_entity(place["id"]))
+
+        self.assertEqual(listed["canonical_name"], "我们的饭桌")
+        self.assertTrue(listed["private"])
+        self.assertEqual(self.store.get_entity(place["id"])["canonical_name"], "家中餐厅")
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)
