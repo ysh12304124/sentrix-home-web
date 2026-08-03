@@ -104,6 +104,33 @@ class MemoryAgent:
             trace.append({"tool": "request_clarification", "permission": "read", "status": "required", "reason": "insufficient_evidence"})
         return trace
 
+    def _clarification_candidates(self, query, scope_id=None):
+        value = str(query or "")
+        candidates_by_type = {}
+        for entity in self.store.list_entities(scope_id=scope_id):
+            name = str(entity.get("canonical_name") or "")
+            if not name:
+                continue
+            clues = {name[index:index + size] for size in range(2, min(4, len(name)) + 1) for index in range(len(name) - size + 1)}
+            if not any(clue in value for clue in clues):
+                continue
+            candidates_by_type.setdefault(entity["entity_type"], []).append({
+                "id": entity["id"], "name": name, "entity_type": entity["entity_type"],
+                "evidence_count": entity.get("evidence_count", 0), "confidence": entity.get("confidence", 0),
+            })
+        eligible = [
+            (entity_type, values)
+            for entity_type, values in candidates_by_type.items()
+            if len(values) >= 2
+        ]
+        if not eligible:
+            return []
+        entity_type, values = max(
+            eligible,
+            key=lambda item: (sum(value["evidence_count"] for value in item[1]), len(item[1]), item[0]),
+        )
+        return sorted(values, key=lambda item: (-item["evidence_count"], -item["confidence"], item["name"]))[:6]
+
     def _comparison_answer(self, people):
         event_sets = {person["id"]: set(self.store.entity_event_ids(person["id"])) for person in people[:2]}
         first, second = people[:2]
@@ -582,19 +609,25 @@ class MemoryAgent:
                     "confidence": appearance.get("confidence", 0), "model": appearance.get("model_name"),
                 })
         if not evidence:
+            candidates = self._clarification_candidates(query, scope_id)
             candidate_asset_ids = list(dict.fromkeys(
                 item.get("metadata", {}).get("asset_id") for item in public_retrieved.get("vectors", [])
                 if item.get("metadata", {}).get("asset_id")
             ))
             gap = self.store.create_query_gap(query, intent.get("dimension") or "semantic", candidate_asset_ids, [])
+            answer = (
+                "当前有多个可能的实体，请确认你指的是：" + "、".join(item["name"] for item in candidates) + "。"
+                if len(candidates) >= 2 else f"当前本地记忆没有找到能回答“{query}”的证据。"
+            )
             result = {
-                "answer": f"当前本地记忆没有找到能回答“{query}”的证据。",
+                "answer": answer,
                 "confidence": 0.0,
                 "insufficient_evidence": True,
                 "model": "sentrix-evidence-fallback",
                 "modelEvidence": [],
                 "evidence": [],
                 "query_gap_id": gap["id"],
+                "clarification_candidates": candidates if len(candidates) >= 2 else [],
             }
             result["retrieval_trace"] = [
                 {"stage": "lexical", "status": "complete", "counts": {"events": 0, "observations": 0, "facts": 0}},

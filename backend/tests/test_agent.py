@@ -137,6 +137,64 @@ class AgentEvidenceTests(unittest.TestCase):
             tools = [item["tool"] for item in result["tool_trace"]]
             self.assertEqual(tools[:3], ["resolve_constraints", "find_events", "trace_timeline"])
 
+    def test_steward_clarifies_multiple_entity_candidates_before_declaring_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            east = store.create_entity("东湖边", "place", confidence=0.8)
+            west = store.create_entity("西湖边", "place", confidence=0.8)
+            for index, entity in enumerate((east, west), 1):
+                asset = store.create_asset(f"asset_{index}", f"{index}.jpg", "image", f"/tmp/{index}.jpg")
+                observation = store.add_observation(asset["id"], {"caption": entity["canonical_name"]})
+                store.connection.execute("INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, 0.8, 'test', datetime('now'))", (entity["id"], observation["id"]))
+            store.connection.commit()
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("湖边在哪里")
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertIn("东湖边", result["answer"])
+            self.assertIn("西湖边", result["answer"])
+            self.assertEqual(result["tool_trace"][-1]["tool"], "request_clarification")
+            self.assertEqual(len(result["clarification_candidates"]), 2)
+
+    def test_steward_does_not_clarify_candidates_from_different_entity_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            store.create_entity("东湖边", "place", confidence=0.8)
+            store.create_entity("西湖边", "object", confidence=0.8)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("湖边在哪里")
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertIn("没有找到", result["answer"])
+            self.assertEqual(result["clarification_candidates"], [])
+
+    def test_steward_prefers_anchored_evidence_over_clarification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            for name in ("东湖边", "西湖边"):
+                store.create_entity(name, "place", confidence=0.8)
+            asset = store.create_asset("asset_1", "lake.jpg", "image", "/tmp/lake.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "东湖边散步", "place": "东湖边"})
+            store.merge_observation_into_event(observation)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("东湖边在哪里")
+
+            self.assertFalse(result["insufficient_evidence"])
+            self.assertEqual(result.get("clarification_candidates"), None)
+            self.assertTrue(result["evidence"])
+
+    def test_steward_never_clarifies_with_candidates_from_another_memory_space(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            store.create_entity("东湖边", "place", confidence=0.8, scope_id="album_a")
+            store.create_entity("西湖边", "place", confidence=0.8, scope_id="album_a")
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("湖边在哪里", scope_id="album_b")
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertIn("没有找到", result["answer"])
+            self.assertEqual(result["clarification_candidates"], [])
+
     def test_steward_routes_two_confirmed_people_to_evidence_backed_comparison(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")
