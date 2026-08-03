@@ -176,6 +176,27 @@ class AgentEvidenceTests(unittest.TestCase):
                 vector_stage = next(item for item in result["retrieval_trace"] if item["stage"] == "vector")
                 self.assertEqual(vector_stage["status"], "skipped")
 
+    def test_private_place_uses_user_alias_in_agent_context_and_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "dinner.jpg", "image", "/tmp/dinner.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "家中餐厅聚餐", "place": "家中餐厅"})
+            event = store.create_event({"id": "event_1", "title": "晚餐", "place": "家中餐厅", "summary": "家中餐厅聚餐"})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            place = store.create_entity("家中餐厅", "place", confidence=1.0)
+            store.set_entity_property(place["id"], "alias", "我们的饭桌", [observation["id"]])
+            store.set_entity_property(place["id"], "private_flag", True, [observation["id"]])
+            gamma = RecordingGamma()
+
+            agent = MemoryAgent(store, gamma=gamma)
+            result = agent.answer("晚餐")
+
+            self.assertIn("我们的饭桌", result["answer"])
+            self.assertNotIn("家中餐厅", result["answer"])
+            self.assertEqual(result["evidence"][0]["place"], "我们的饭桌")
+            self.assertNotIn("家中餐厅", gamma.contexts[0][1])
+
     def test_person_clothing_and_object_queries_use_specific_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")

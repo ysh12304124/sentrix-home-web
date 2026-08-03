@@ -93,6 +93,30 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(merged["confidence"], 0.8)
         self.assertEqual(merged["revision"], 2)
 
+    def test_observation_entities_derive_explainable_place_and_time_properties(self):
+        self.store.update_asset("a1", "queued", {"captured_at": "2026-08-03T19:30:00+08:00"})
+        self.store.connection.execute(
+            "UPDATE observations SET captured_at = ?, place = ? WHERE id = ?",
+            ("2026-08-03T19:30:00+08:00", "家中餐厅", self.obs1["id"]),
+        )
+        self.store.connection.commit()
+
+        self.store.maintain_observation_entities(self.obs1["id"])
+        entities = {(item["entity_type"], item["canonical_name"]): item for item in self.store.list_entities()}
+        place_detail = self.store.get_entity_detail(entities[("place", "家中餐厅")]["id"])
+        time_detail = self.store.get_entity_detail(entities[("time", "2026-08-03")]["id"])
+        place_properties = {item["property_key"]: item for item in place_detail["properties"]}
+        time_properties = {item["property_key"]: item for item in time_detail["properties"]}
+
+        self.assertEqual(place_properties["scene_type"]["value"], "家中餐厅")
+        self.assertEqual(place_properties["scene_type"]["source"], "observation_extraction")
+        self.assertEqual(place_properties["scene_type"]["evidence_ids"], [self.obs1["id"]])
+        self.assertEqual(time_properties["date"]["value"], "2026-08-03")
+        self.assertEqual(time_properties["year"]["value"], 2026)
+        self.assertEqual(time_properties["month"]["value"], 8)
+        self.assertEqual(time_properties["season"]["value"], "夏")
+        self.assertEqual(time_properties["part_of_day"]["value"], ["傍晚"])
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)

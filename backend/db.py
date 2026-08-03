@@ -67,6 +67,24 @@ def normalize_clothing(value):
     return CLOTHING_NORMALIZATION.get(text, text)
 
 
+def time_semantics(value):
+    """Return deterministic calendar labels for an EXIF-backed timestamp."""
+    if value.hour < 5:
+        part_of_day = "凌晨"
+    elif value.hour < 8:
+        part_of_day = "清晨"
+    elif value.hour < 12:
+        part_of_day = "上午"
+    elif value.hour < 17:
+        part_of_day = "午后"
+    elif value.hour < 20:
+        part_of_day = "傍晚"
+    else:
+        part_of_day = "夜晚"
+    season = "春" if value.month in (3, 4, 5) else "夏" if value.month in (6, 7, 8) else "秋" if value.month in (9, 10, 11) else "冬"
+    return {"date": value.date().isoformat(), "year": value.year, "month": value.month, "season": season, "part_of_day": part_of_day}
+
+
 class MemoryStore:
     _schema_locks = {}
     _schema_locks_guard = threading.Lock()
@@ -1993,6 +2011,23 @@ class MemoryStore:
                 if entity_type == "time":
                     time_entity = entity
                 entities.append(entity)
+        evidence_ids = [observation_id, event_id] if event_id else [observation_id]
+        if place_entity:
+            self.maintain_entity_property(
+                place_entity["id"], "scene_type", place_entity["canonical_name"],
+                observation.get("confidence", 0), evidence_ids, "observation_extraction",
+            )
+        if time_entity and captured_at:
+            semantics = time_semantics(captured_at)
+            for key in ("date", "year", "month", "season"):
+                self.maintain_entity_property(
+                    time_entity["id"], key, semantics[key], observation.get("confidence", 0), evidence_ids,
+                    "timestamp_derivation",
+                )
+            self.maintain_entity_property_values(
+                time_entity["id"], "part_of_day", [semantics["part_of_day"]],
+                observation.get("confidence", 0), evidence_ids, "timestamp_derivation",
+            )
         for entity in entities:
             if place_entity and entity["id"] != place_entity["id"]:
                 self.create_relationship(
@@ -2310,6 +2345,24 @@ class MemoryStore:
         )
         self.connection.commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
+
+    def maintain_entity_property_values(self, entity_id, property_key, values, confidence=0.0, evidence_ids=None, source="derived"):
+        """Merge deterministic multi-value observations without overriding user values."""
+        current = self._current_entity_property(entity_id, property_key)
+        if current and current["source"] == "user":
+            return self._property_row(current)
+        existing = self._property_row(current).get("value", []) if current else []
+        existing = existing if isinstance(existing, list) else [existing]
+        merged = list(dict.fromkeys([item for item in existing + list(values or []) if item]))
+        if not current:
+            return self.maintain_entity_property(entity_id, property_key, merged, confidence, evidence_ids, source)
+        old_evidence = json.loads(current["evidence_ids_json"] or "[]")
+        self.connection.execute(
+            "UPDATE entity_properties SET value_json = ?, confidence = MAX(confidence, ?), evidence_ids_json = ?, updated_at = ? WHERE id = ?",
+            (json_value(merged, []), float(confidence or 0), json_value(list(dict.fromkeys(old_evidence + list(evidence_ids or []))), []), now_iso(), current["id"]),
+        )
+        self.connection.commit()
+        return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (current["id"],)))
 
     def set_entity_property(self, entity_id, property_key, value, evidence_ids=None):
         """Make a user value current and preserve all older revisions for audit."""

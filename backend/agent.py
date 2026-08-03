@@ -58,6 +58,33 @@ class MemoryAgent:
                 matches.append(text)
         return list(dict.fromkeys(matches))
 
+    def _private_place_replacements(self, scope_id=None):
+        replacements = {}
+        for entity in self.store.list_entities(scope_id=scope_id):
+            if entity.get("entity_type") != "place":
+                continue
+            properties = {item["property_key"]: item for item in self.store.list_entity_properties(entity["id"])}
+            private = properties.get("private_flag")
+            if not private or private.get("value") is not True:
+                continue
+            alias = properties.get("alias", {}).get("value") or "私密地点"
+            replacements[entity["canonical_name"]] = str(alias)
+        return replacements
+
+    @staticmethod
+    def _redact_private_places(value, replacements):
+        if not replacements:
+            return value
+        if isinstance(value, str):
+            for private_name, alias in replacements.items():
+                value = value.replace(private_name, alias)
+            return value
+        if isinstance(value, list):
+            return [MemoryAgent._redact_private_places(item, replacements) for item in value]
+        if isinstance(value, dict):
+            return {key: MemoryAgent._redact_private_places(item, replacements) for key, item in value.items()}
+        return value
+
     def retrieve(self, query, scope_id=None):
         events = self.store.list_events(100, scope_id=scope_id)
         observations = self.store.list_observations(1000, scope_id=scope_id)
@@ -412,11 +439,13 @@ class MemoryAgent:
             return self._pending_identity_answer(query, scope_id)
         retrieved = self.retrieve(query, scope_id)
         retrieved, query_gap = self._refine_visual_memory(query, retrieved)
+        private_places = self._private_place_replacements(scope_id)
+        public_retrieved = self._redact_private_places(retrieved, private_places)
         evidence = []
         seen = set()
         activity_query = self._is_activity_query(query)
-        intent = retrieved.get("intent", {})
-        for event in retrieved["events"][:8]:
+        intent = public_retrieved.get("intent", {})
+        for event in public_retrieved["events"][:8]:
             detail = self.store.get_event_detail(event["id"])
             if not detail:
                 continue
@@ -424,18 +453,19 @@ class MemoryAgent:
             item = {"kind": "event", "id": event["id"], "event_id": event["id"], "asset_ids": asset_ids, "summary": event.get("summary", ""), "time_start": event.get("time_start"), "place": event.get("place")}
             evidence.append(item)
             seen.add(event["id"])
-            observations = sorted(detail["observations"], key=lambda item: item["id"] not in retrieved.get("focus_observation_ids", set()))
+            observations = sorted(detail["observations"], key=lambda item: item["id"] not in public_retrieved.get("focus_observation_ids", set()))
             if intent.get("dimension") == "object":
                 observations = [
                     observation for observation in observations
                     if self._object_values_for_query(query, observation.get("objects") or [])
                 ]
             for observation in observations[:8]:
+                observation = self._redact_private_places(observation, private_places)
                 asset = observation.get("asset") or {}
                 evidence.append({"kind": "observation", "id": observation["id"], "observation_id": observation["id"], "event_id": event["id"], "asset_id": observation.get("asset_id"), "file_name": asset.get("file_name"), "media_type": asset.get("media_type"), "captured_at": observation.get("captured_at"), "caption": observation.get("caption"), "transcript": observation.get("transcript"), "clothing": observation.get("clothing", []), "objects": observation.get("objects", []), "spatial_relations": observation.get("spatial_relations", []), "source_owner_id": asset.get("source_owner_id"), "raw": observation.get("raw_json", {})})
-        for fact in retrieved["facts"][:12]:
+        for fact in public_retrieved["facts"][:12]:
             evidence.append({"kind": "fact", "id": fact["id"], "fact_id": fact["id"], "subject": fact["subject"], "predicate": fact["predicate"], "object": fact["object"], "status": fact["status"], "evidence_ids": fact.get("evidence_ids_json", [])})
-        claims = retrieved.get("semantic_claims", [])
+        claims = public_retrieved.get("semantic_claims", [])
         if activity_query:
             activity_claims = [claim for claim in claims if claim.get("dimension") == "activity"]
             other_claims = [claim for claim in claims if claim.get("dimension") != "activity"]
@@ -444,7 +474,7 @@ class MemoryAgent:
         for claim in claims[:claim_limit]:
             evidence.append({"kind": "semantic_claim", "id": claim["id"], "claim_id": claim["id"], "person_id": claim["person_id"], "dimension": claim["dimension"], "predicate": claim["predicate"], "value_text": claim["value_text"], "status": claim["status"], "evidence_ids": claim.get("evidence_ids_json", []), "supporting_event_ids": claim.get("supporting_event_ids_json", [])})
         if intent.get("dimension") == "clothing":
-            for appearance in retrieved.get("appearance_evidence", []):
+            for appearance in public_retrieved.get("appearance_evidence", []):
                 evidence.append({
                     "kind": "person_appearance", "id": appearance["id"], "person_id": appearance["person_id"],
                     "face_instance_id": appearance["face_instance_id"], "observation_id": appearance["observation_id"],
@@ -453,8 +483,8 @@ class MemoryAgent:
                     "confidence": appearance.get("confidence", 0), "model": appearance.get("model_name"),
                 })
         deterministic_query = (
-            (activity_query and retrieved.get("focused_people"))
-            or (intent.get("dimension") == "clothing" and retrieved.get("focused_people"))
+            (activity_query and public_retrieved.get("focused_people"))
+            or (intent.get("dimension") == "clothing" and public_retrieved.get("focused_people"))
             or intent.get("dimension") == "object"
             or intent.get("event_filter")
         )
@@ -464,7 +494,7 @@ class MemoryAgent:
             result["evidence"] = []
         else:
             try:
-                context = self.context(retrieved)
+                context = self.context(public_retrieved)
                 if conversation_context:
                     context += "\n[CONVERSATION_CONTEXT]\n" + conversation_context
                 result = self.gamma.answer(query, context)
@@ -476,7 +506,7 @@ class MemoryAgent:
         valid_model_evidence = [item for item in model_evidence if isinstance(item, dict) and item.get("id") in known_ids]
         if evidence and (result.get("insufficient_evidence") or not valid_model_evidence):
             result.update(self._fallback_answer(query, evidence))
-        if retrieved.get("focused_people") and retrieved.get("semantic_claims") and activity_query:
+        if public_retrieved.get("focused_people") and public_retrieved.get("semantic_claims") and activity_query:
             semantic_answer = self._fallback_answer(query, evidence)
             activity_values = [
                 item.get("value_text") for item in evidence
@@ -484,11 +514,12 @@ class MemoryAgent:
             ]
             if semantic_answer.get("answer") and not all(value and value in str(result.get("answer") or "") for value in activity_values):
                 result.update(semantic_answer)
+        result["answer"] = self._redact_private_places(result.get("answer", ""), private_places)
         result["evidence"] = evidence
         result["retrieval_trace"] = [
-            {"stage": "lexical", "status": "complete", "counts": {"events": len(retrieved.get("events", [])), "observations": len(retrieved.get("observations", [])), "facts": len(retrieved.get("facts", []))}},
-            {"stage": "semantic", "status": "complete", "counts": {"claims": len(retrieved.get("semantic_claims", [])), "entities": len(retrieved.get("entities", [])), "relationships": len(retrieved.get("relationships", []))}},
-            {"stage": "vector", "status": "skipped" if retrieved.get("vector_skipped") else "complete", "counts": {"hits": len(retrieved.get("vectors", []))}},
+            {"stage": "lexical", "status": "complete", "counts": {"events": len(public_retrieved.get("events", [])), "observations": len(public_retrieved.get("observations", [])), "facts": len(public_retrieved.get("facts", []))}},
+            {"stage": "semantic", "status": "complete", "counts": {"claims": len(public_retrieved.get("semantic_claims", [])), "entities": len(public_retrieved.get("entities", [])), "relationships": len(public_retrieved.get("relationships", []))}},
+            {"stage": "vector", "status": "skipped" if public_retrieved.get("vector_skipped") else "complete", "counts": {"hits": len(public_retrieved.get("vectors", []))}},
             {"stage": "evidence_validation", "status": "complete", "counts": {"evidence": len(evidence)}},
         ]
         result["evidence_layers"] = {
