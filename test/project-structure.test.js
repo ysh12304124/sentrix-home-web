@@ -79,6 +79,15 @@ test("relationship candidates expose evidence counts before confirmation", () =>
   assert.match(appSource, /确认关系/);
 });
 
+test("pending trip candidates are loaded as evidence-backed semantic memory", () => {
+  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(apiSource, /trips:/);
+  assert.match(appSource, /行程候选/);
+  assert.match(appSource, /trip-candidate/);
+  assert.match(appSource, /evidence_ids_json/);
+});
+
 test("memory-space and evidence governance are wired into the portal", () => {
   const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(source, /space-select/);

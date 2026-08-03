@@ -122,6 +122,11 @@ def events(scope_id: str | None = None):
     return {"events": store.list_events(100, scope_id=scope_id)}
 
 
+@app.get("/api/trips")
+def trips(scope_id: str | None = None, status: str | None = None):
+    return {"trips": store.list_trips(scope_id, status)}
+
+
 @app.get("/api/events/{event_id}")
 def event_detail(event_id: str):
     value = store.get_event_detail(event_id)

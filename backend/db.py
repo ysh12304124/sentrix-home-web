@@ -4,7 +4,7 @@ import sqlite3
 import threading
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
 def make_id(prefix):
@@ -236,6 +236,23 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(event_id, entity_id, relation)
+            );
+            CREATE TABLE IF NOT EXISTS trips (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                time_start TEXT,
+                time_end TEXT,
+                event_ids_json TEXT NOT NULL DEFAULT '[]',
+                place_names_json TEXT NOT NULL DEFAULT '[]',
+                companion_ids_json TEXT NOT NULL DEFAULT '[]',
+                trip_type TEXT,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS entities (
                 id TEXT PRIMARY KEY,
@@ -591,6 +608,7 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id);
             CREATE INDEX IF NOT EXISTS idx_event_entities_event ON event_entities(event_id);
             CREATE INDEX IF NOT EXISTS idx_event_entities_entity ON event_entities(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_trips_scope_status ON trips(scope_id, status, time_start);
             CREATE INDEX IF NOT EXISTS idx_semantic_claims_person ON semantic_claims(person_id);
             CREATE INDEX IF NOT EXISTS idx_assets_scope ON assets(scope_id);
             CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(scope_id);
@@ -686,7 +704,7 @@ class MemoryStore:
         self.connection.commit()
 
     def count(self, table):
-        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites"}:
+        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites", "trips"}:
             raise ValueError("unsupported table")
         return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
@@ -1774,6 +1792,80 @@ class MemoryStore:
         else:
             rows = self._rows("SELECT * FROM events WHERE status = 'active' ORDER BY time_start DESC LIMIT ?", (limit,))
         return [self.get_event(row["id"]) for row in rows]
+
+    def list_trips(self, scope_id=None, status=None):
+        clauses = []
+        params = []
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._rows("SELECT * FROM trips" + where + " ORDER BY time_start DESC, updated_at DESC", params)
+        return [self._decode(row, ["event_ids_json", "place_names_json", "companion_ids_json", "evidence_ids_json"]) for row in rows]
+
+    def _upsert_trip_candidate(self, scope_id, events):
+        event_ids = [event["id"] for event in events]
+        places = list(dict.fromkeys(str(event.get("place") or "").strip() for event in events if str(event.get("place") or "").strip()))
+        evidence_ids = []
+        companion_ids = []
+        for event in events:
+            evidence_ids.extend(event.get("observation_ids") or [])
+            companion_ids.extend(item["person_id"] for item in self.list_event_participants(event["id"]) if item.get("person_status") == "confirmed")
+        evidence_ids = list(dict.fromkeys(evidence_ids))
+        companion_ids = list(dict.fromkeys(companion_ids))
+        start, end = events[0].get("time_start"), events[-1].get("time_start")
+        name = f"{str(start or '')[:10]} 至 {str(end or '')[:10]} 的行程候选"
+        confidence = min(0.9, 0.45 + 0.08 * len(events) + 0.04 * len(places))
+        existing = self._row("SELECT * FROM trips WHERE scope_id = ? AND event_ids_json = ? AND status = 'pending'", (scope_id, json_value(event_ids, [])))
+        timestamp = now_iso()
+        if existing:
+            self.connection.execute(
+                "UPDATE trips SET name = ?, time_start = ?, time_end = ?, place_names_json = ?, companion_ids_json = ?, evidence_ids_json = ?, confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
+                (name, start, end, json_value(places, []), json_value(companion_ids, []), json_value(evidence_ids, []), confidence, timestamp, existing["id"]),
+            )
+            self.connection.commit()
+            return next(item for item in self.list_trips(scope_id, "pending") if item["id"] == existing["id"])
+        trip_id = make_id("trip")
+        self.connection.execute(
+            """INSERT INTO trips(id, scope_id, name, status, time_start, time_end, event_ids_json, place_names_json,
+            companion_ids_json, evidence_ids_json, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trip_id, scope_id, name, start, end, json_value(event_ids, []), json_value(places, []), json_value(companion_ids, []), json_value(evidence_ids, []), confidence, timestamp, timestamp),
+        )
+        self.connection.commit()
+        return next(item for item in self.list_trips(scope_id, "pending") if item["id"] == trip_id)
+
+    def derive_trip_candidates(self, scope_id=None):
+        events = self.list_events(100000, scope_id)
+        by_scope = {}
+        for event in events:
+            captured = parse_time(event.get("time_start"))
+            if captured:
+                by_scope.setdefault(event.get("scope_id") or "home-default", []).append((captured, event))
+        candidates = []
+        for current_scope, rows in by_scope.items():
+            sequence = []
+            for captured, event in sorted(rows, key=lambda item: item[0]):
+                if sequence and captured - sequence[-1][0] > timedelta(days=14):
+                    candidates.extend(self._derive_trip_candidates_for_sequence(current_scope, [item[1] for item in sequence]))
+                    sequence = []
+                sequence.append((captured, event))
+            candidates.extend(self._derive_trip_candidates_for_sequence(current_scope, [item[1] for item in sequence]))
+        return candidates
+
+    def _derive_trip_candidates_for_sequence(self, scope_id, events):
+        if len(events) < 2:
+            return []
+        start = parse_time(events[0].get("time_start"))
+        end = parse_time(events[-1].get("time_start"))
+        places = {str(event.get("place") or "").strip() for event in events if str(event.get("place") or "").strip()}
+        cross_day = bool(start and end and start.date() != end.date())
+        if not (cross_day or len(places) >= 2):
+            return []
+        return [self._upsert_trip_candidate(scope_id, events)]
 
     def get_event_detail(self, event_id):
         event = self.get_event(event_id)

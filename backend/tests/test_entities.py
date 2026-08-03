@@ -155,6 +155,31 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(candidates[0]["evidence_ids_json"], [self.obs1["id"]])
         self.assertGreaterEqual(candidates[0]["confidence"], 0.5)
 
+    def test_trip_candidate_requires_a_cross_day_or_cross_place_event_sequence(self):
+        first = self.store.create_event({
+            "id": "event_one", "title": "第一天抵达", "place": "杭州", "time_start": "2025-05-01T10:00:00+08:00",
+        })
+        second = self.store.create_event({
+            "id": "event_two", "title": "第二天游览", "place": "西湖", "time_start": "2025-05-02T10:00:00+08:00",
+        })
+        ordinary = self.store.create_event({
+            "id": "event_three", "title": "晚餐", "place": "家中餐厅", "time_start": "2025-08-01T18:00:00+08:00",
+        })
+        self.store.connection.executemany(
+            "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+            [(first["id"], self.obs1["id"]), (second["id"], self.obs2["id"])],
+        )
+        self.store.connection.commit()
+
+        trips = self.store.derive_trip_candidates()
+
+        self.assertEqual(len(trips), 1)
+        self.assertEqual(trips[0]["status"], "pending")
+        self.assertEqual(trips[0]["event_ids_json"], [first["id"], second["id"]])
+        self.assertEqual(trips[0]["place_names_json"], ["杭州", "西湖"])
+        self.assertEqual(trips[0]["evidence_ids_json"], [self.obs1["id"], self.obs2["id"]])
+        self.assertNotIn(ordinary["id"], trips[0]["event_ids_json"])
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)

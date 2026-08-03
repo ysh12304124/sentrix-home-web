@@ -17,6 +17,7 @@
     memorySpaces: () => request("/api/memory-spaces"),
     dashboard: (scopeId = "") => request(`/api/dashboard${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     events: (scopeId = "") => request(`/api/events${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
+    trips: (scopeId = "", status = "") => request(`/api/trips${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(status ? { status } : {}) }).toString().replace(/^/, "?")}`),
     event: (id) => request(`/api/events/${encodeURIComponent(id)}`),
     createEvent: (payload) => request("/api/events", { method: "POST", body: JSON.stringify(payload) }),
     updateEvent: (id, payload) => request(`/api/events/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(payload) }),

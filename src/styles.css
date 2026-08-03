@@ -244,6 +244,10 @@ button { cursor: pointer; }
 .event-entity-row strong, .event-entity-row small { display: block; }
 .event-entity-row strong { margin-top: 7px; font-size: 12px; }
 .event-entity-row small { margin-top: 4px; color: var(--muted); font-size: 9px; }
+.trip-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.trip-candidate { min-height: 136px; padding: 14px; border: 1px solid var(--line); background: var(--wash); }
+.trip-candidate h3 { margin: 10px 0 7px; font-size: 15px; }
+.trip-candidate p, .trip-candidate small { display: block; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .entity-card-head, .cluster-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .entity-card h2 { margin: 15px 0 4px; font-size: 20px; }
 .entity-card p, .cluster-card p { color: var(--muted); font-size: 10px; margin: 0; }
@@ -264,6 +268,8 @@ button { cursor: pointer; }
 @media (max-width: 900px) { .knowledge-summary, .entity-grid, .cluster-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 580px) { .knowledge-summary, .entity-grid, .cluster-grid { grid-template-columns: 1fr; } }
 @media (max-width: 580px) { .event-entity-list { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { .trip-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 580px) { .trip-grid { grid-template-columns: 1fr; } }
 .space-switcher { align-items: flex-start; }
 .space-switcher > span:last-child { min-width: 0; display: grid; gap: 4px; }
 .space-switcher select { max-width: 150px; border: 0; background: transparent; color: var(--ink); font-weight: 800; font-size: 12px; padding: 0; }
