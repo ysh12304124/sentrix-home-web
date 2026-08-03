@@ -608,6 +608,9 @@ class MemoryStore:
                 accepted_answer TEXT,
                 correction TEXT,
                 target_claim_id TEXT REFERENCES semantic_claims(id),
+                target_entity_id TEXT REFERENCES entities(id),
+                target_event_id TEXT REFERENCES events(id),
+                target_property_key TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS rebuild_runs (
@@ -674,6 +677,10 @@ class MemoryStore:
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("memory_feedback", {
+            "target_entity_id": "TEXT REFERENCES entities(id)", "target_event_id": "TEXT REFERENCES events(id)",
+            "target_property_key": "TEXT",
+        })
         self._ensure_columns("entity_merge_candidates", {"target_entity_id": "TEXT REFERENCES entities(id)"})
         self._ensure_columns("face_clusters", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("relationships", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
@@ -1667,14 +1674,26 @@ class MemoryStore:
             rows = self._rows("SELECT * FROM query_gaps ORDER BY updated_at DESC LIMIT ?", (limit,))
         return [self._decode(row, ["candidate_asset_ids_json", "evidence_ids_json"]) for row in rows]
 
-    def add_memory_feedback(self, gap_id, user_id=None, accepted_answer=None, correction=None, target_claim_id=None):
+    def add_memory_feedback(self, gap_id=None, user_id=None, accepted_answer=None, correction=None, target_claim_id=None,
+                            target_entity_id=None, target_event_id=None, target_property_key=None):
+        if not gap_id and not any((target_claim_id, target_entity_id, target_event_id)):
+            raise ValueError("feedback requires a query gap or an explicit memory target")
+        if target_entity_id and not self.get_entity(target_entity_id):
+            raise KeyError(target_entity_id)
+        if target_event_id and not self.get_event(target_event_id):
+            raise KeyError(target_event_id)
+        if target_property_key and not target_entity_id:
+            raise ValueError("a property feedback target requires an entity")
         feedback_id = make_id("feedback")
         self.connection.execute(
-            """INSERT INTO memory_feedback(id, query_gap_id, user_id, accepted_answer, correction, target_claim_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (feedback_id, gap_id, user_id, accepted_answer, correction, target_claim_id, now_iso()),
+            """INSERT INTO memory_feedback(id, query_gap_id, user_id, accepted_answer, correction, target_claim_id,
+            target_entity_id, target_event_id, target_property_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (feedback_id, gap_id, user_id, accepted_answer, correction, target_claim_id, target_entity_id,
+             target_event_id, target_property_key, now_iso()),
         )
-        self.connection.execute("UPDATE query_gaps SET status = 'resolved', resolution = ?, updated_at = ? WHERE id = ?", (correction or accepted_answer or "confirmed", now_iso(), gap_id))
+        if gap_id:
+            self.connection.execute("UPDATE query_gaps SET status = 'resolved', resolution = ?, updated_at = ? WHERE id = ?", (correction or accepted_answer or "confirmed", now_iso(), gap_id))
         self.connection.commit()
         return self._row("SELECT * FROM memory_feedback WHERE id = ?", (feedback_id,))
 

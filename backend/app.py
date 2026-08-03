@@ -736,6 +736,9 @@ def query_gap_feedback(gap_id: str, payload: dict):
         payload.get("accepted_answer"),
         payload.get("correction"),
         payload.get("target_claim_id"),
+        payload.get("target_entity_id"),
+        payload.get("target_event_id"),
+        payload.get("target_property_key"),
     )
 
 

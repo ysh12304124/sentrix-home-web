@@ -526,6 +526,23 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(store.get_query_gap(gap["id"])["status"], "resolved")
             self.assertEqual(gamma.answer_calls, 0)
 
+    def test_feedback_can_bind_to_an_explicit_entity_property_without_rewriting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            entity = store.create_entity("湖边", "place", confidence=0.8)
+            agent = MemoryAgent(store, gamma=RecordingGamma())
+
+            result = agent.answer_turn(
+                "这里应叫作西湖边",
+                feedback={"correction": "这里应叫作西湖边", "target_entity_id": entity["id"], "target_property_key": "alias"},
+            )
+
+            self.assertEqual(result["intent"], "feedback")
+            self.assertFalse(result["insufficient_evidence"])
+            self.assertEqual(result["feedback"]["target_entity_id"], entity["id"])
+            self.assertEqual(result["feedback"]["target_property_key"], "alias")
+            self.assertEqual(store.list_entity_properties(entity["id"]), [])
+
     def test_pending_identity_query_uses_review_fallback_and_keeps_candidate_name_private(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")

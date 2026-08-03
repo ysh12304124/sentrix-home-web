@@ -758,9 +758,14 @@ class MemoryAgent:
             gap_id = feedback.get("query_gap_id")
             correction = feedback.get("correction") or str(message or "").strip()
             persisted = None
-            if gap_id and self.store.get_query_gap(gap_id):
+            target_entity_id = feedback.get("target_entity_id")
+            target_event_id = feedback.get("target_event_id")
+            target_claim_id = feedback.get("target_claim_id")
+            target_property_key = feedback.get("target_property_key")
+            if (gap_id and self.store.get_query_gap(gap_id)) or any((target_entity_id, target_event_id, target_claim_id)):
                 persisted = self.store.add_memory_feedback(
-                    gap_id, feedback.get("user_id"), feedback.get("accepted_answer"), correction, feedback.get("target_claim_id"),
+                    gap_id, feedback.get("user_id"), feedback.get("accepted_answer"), correction, target_claim_id,
+                    target_entity_id, target_event_id, target_property_key,
                 )
             result = {
                 "intent": "feedback", "conversation_id": conversation_id,
