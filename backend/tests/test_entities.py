@@ -78,6 +78,21 @@ class NativeEntityMemoryTests(unittest.TestCase):
 
         self.assertEqual(candidate["status"], "pending")
 
+    def test_equivalent_relationships_merge_evidence_instead_of_creating_duplicates(self):
+        cake = self.store.create_entity("生日蛋糕", "object", confidence=0.7)
+        place = self.store.create_entity("家中餐厅", "place", confidence=0.7)
+
+        first = self.store.create_relationship(cake["id"], "出现在", place["id"], [self.obs1["id"]], 0.6)
+        merged = self.store.create_relationship(cake["id"], "出现在", place["id"], [self.obs2["id"]], 0.8, "active")
+
+        relationships = self.store.list_relationships(cake["id"])
+        self.assertEqual(len(relationships), 1)
+        self.assertEqual(merged["id"], first["id"])
+        self.assertEqual(merged["status"], "active")
+        self.assertEqual(merged["evidence_ids_json"], [self.obs1["id"], self.obs2["id"]])
+        self.assertEqual(merged["confidence"], 0.8)
+        self.assertEqual(merged["revision"], 2)
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)
