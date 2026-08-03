@@ -538,6 +538,52 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(result["evidence_order"][0]["source_level"], "derived_event")
             self.assertTrue(all("confidence" in item and "time" in item for item in result["evidence_order"]))
 
+    def test_dialogue_resolves_pronoun_to_the_verified_person_event_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("妈妈", "person", "confirmed", confidence=1.0, scope_id="album_a")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg", scope_id="album_a")
+            observation = store.add_observation(asset["id"], {"caption": "妈妈在客厅看书"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            first = agent.answer_turn("介绍一下妈妈", "dialogue-pronoun", scope_id="album_a")
+            second = agent.answer_turn("她后来呢？", "dialogue-pronoun", scope_id="album_a")
+
+            self.assertIn(event["id"], first["dialogue_state"]["active_event_ids"])
+            self.assertEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
+            self.assertIn(event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
+
+    def test_dialogue_does_not_reuse_context_when_memory_space_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg", scope_id="album_a")
+            observation = store.add_observation(asset["id"], {"caption": "餐桌旁聚会"})
+            store.merge_observation_into_event(observation)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            agent.answer_turn("餐桌旁发生了什么？", "dialogue-scope", scope_id="album_a")
+            second = agent.answer_turn("然后呢？", "dialogue-scope", scope_id="album_b")
+
+            self.assertNotEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
+
+    def test_dialogue_keeps_only_verified_state_across_agent_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg", scope_id="album_a")
+            observation = store.add_observation(asset["id"], {"caption": "餐桌旁聚会"})
+            event = store.merge_observation_into_event(observation)
+            first_agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            first_agent.answer_turn("餐桌旁发生了什么？", "dialogue-persisted", scope_id="album_a")
+            restarted_agent = MemoryAgent(MemoryStore(f"{directory}/memory.db"), gamma=RefusingGamma())
+            second = restarted_agent.answer_turn("然后呢？", "dialogue-persisted", scope_id="album_a")
+
+            self.assertEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
+            self.assertIn(event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
+            self.assertEqual(set(second["dialogue_state"]), {"scope_id", "active_event_ids", "active_entity_ids", "evidence_ids", "unresolved_ambiguity"})
+
     def test_dialogue_uses_narrative_style_for_an_entity_introduction(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")

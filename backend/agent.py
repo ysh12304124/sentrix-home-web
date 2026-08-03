@@ -114,7 +114,10 @@ class MemoryAgent:
     @staticmethod
     def _is_contextual_follow_up(message):
         value = str(message or "").strip()
-        return any(token in value for token in ("然后", "后来", "接着", "继续", "为什么", "具体", "详细", "还有呢", "那呢"))
+        return any(token in value for token in (
+            "然后", "后来", "接着", "继续", "为什么", "具体", "详细", "还有呢", "那呢",
+            "他呢", "她呢", "它呢", "这里呢", "那里呢", "这段呢", "那个呢",
+        ))
 
     @staticmethod
     def _dialogue_style(query, result):
@@ -886,7 +889,7 @@ class MemoryAgent:
             self._remember_turn(conversation_id, "assistant", result["answer"])
             return result
         previous = self._conversation_text(conversation_id)
-        prior_state = self._dialogue_states.get(conversation_id, {})
+        prior_state = self._dialogue_states.get(conversation_id) or self.store.get_dialogue_state(conversation_id, scope_id) or {}
         query = str(message or "").strip()
         contextual_follow_up = (
             self._is_contextual_follow_up(query)
@@ -929,6 +932,7 @@ class MemoryAgent:
             "unresolved_ambiguity": bool(result.get("clarification_candidates") or result.get("insufficient_evidence")),
         }
         self._dialogue_states[conversation_id] = dialogue_state
+        self.store.save_dialogue_state(conversation_id, scope_id or "home-default", dialogue_state)
         result["dialogue_plan"] = {
             "mode": dialogue_mode, "style": self._dialogue_style(message, result),
             "layers": ["semantic", "episodic", "original_evidence"],

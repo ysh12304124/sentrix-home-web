@@ -613,6 +613,12 @@ class MemoryStore:
                 target_property_key TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS dialogue_states (
+                conversation_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS rebuild_runs (
                 id TEXT PRIMARY KEY,
                 run_version TEXT NOT NULL,
@@ -821,7 +827,7 @@ class MemoryStore:
         self.connection.commit()
 
     def count(self, table):
-        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "entity_merge_candidates", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites", "trips"}:
+        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "entity_merge_candidates", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "dialogue_states", "rebuild_runs", "stories", "invites", "trips"}:
             raise ValueError("unsupported table")
         return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
@@ -1696,6 +1702,27 @@ class MemoryStore:
             self.connection.execute("UPDATE query_gaps SET status = 'resolved', resolution = ?, updated_at = ? WHERE id = ?", (correction or accepted_answer or "confirmed", now_iso(), gap_id))
         self.connection.commit()
         return self._row("SELECT * FROM memory_feedback WHERE id = ?", (feedback_id,))
+
+    def get_dialogue_state(self, conversation_id, scope_id=None):
+        row = self._row("SELECT * FROM dialogue_states WHERE conversation_id = ?", (conversation_id,))
+        if not row or (scope_id and row.get("scope_id") != scope_id):
+            return None
+        try:
+            return json.loads(row.get("state_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def save_dialogue_state(self, conversation_id, scope_id, state):
+        allowed = {"scope_id", "active_event_ids", "active_entity_ids", "evidence_ids", "unresolved_ambiguity"}
+        value = {key: state.get(key) for key in allowed if key in state}
+        self.connection.execute(
+            """INSERT INTO dialogue_states(conversation_id, scope_id, state_json, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET scope_id = excluded.scope_id,
+            state_json = excluded.state_json, updated_at = excluded.updated_at""",
+            (conversation_id, scope_id or "home-default", json_value(value, {}), now_iso()),
+        )
+        self.connection.commit()
+        return self.get_dialogue_state(conversation_id, scope_id)
 
     def list_person_event_memory(self, person_id, scope_id=None):
         clauses = ["person_id = ?", "status = 'active'"]
