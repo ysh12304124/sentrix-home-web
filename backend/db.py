@@ -70,6 +70,8 @@ OBJECT_CATEGORIES = {
     "服饰": ("衣", "帽", "鞋", "包", "眼镜", "领带"),
 }
 
+TRIP_MIN_GPS_DISPLACEMENT_KM = 50.0
+
 
 def normalize_clothing(value):
     text = str(value or "").strip()
@@ -100,6 +102,29 @@ def object_category(label):
         if any(term in text for term in terms):
             return category
     return "其他"
+
+
+def parse_gps_place(value):
+    """Parse an EXIF-style latitude,longitude place only when it is usable."""
+    try:
+        latitude, longitude = (float(part.strip()) for part in str(value or "").split(",", 1))
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return None
+    if latitude == 0 and longitude == 0:
+        return None
+    return latitude, longitude
+
+
+def gps_distance_km(first, second):
+    """Return the great-circle distance in kilometres between two GPS points."""
+    latitude_one, longitude_one = map(math.radians, first)
+    latitude_two, longitude_two = map(math.radians, second)
+    delta_latitude = latitude_two - latitude_one
+    delta_longitude = longitude_two - longitude_one
+    a = math.sin(delta_latitude / 2) ** 2 + math.cos(latitude_one) * math.cos(latitude_two) * math.sin(delta_longitude / 2) ** 2
+    return 6371.0088 * 2 * math.asin(math.sqrt(a))
 
 
 class MemoryStore:
@@ -1862,9 +1887,16 @@ class MemoryStore:
         start = parse_time(events[0].get("time_start"))
         end = parse_time(events[-1].get("time_start"))
         places = {str(event.get("place") or "").strip() for event in events if str(event.get("place") or "").strip()}
+        gps_places = [parse_gps_place(event.get("place")) for event in events]
+        gps_places = [place for place in gps_places if place]
+        material_displacement = any(
+            gps_distance_km(first, second) >= TRIP_MIN_GPS_DISPLACEMENT_KM
+            for index, first in enumerate(gps_places)
+            for second in gps_places[index + 1:]
+        )
         cross_day = bool(start and end and start.date() != end.date())
         within_duration = bool(start and end and end - start <= timedelta(days=10))
-        if not (cross_day and within_duration and len(places) >= 2):
+        if not (cross_day and within_duration and len(places) >= 2 and material_displacement):
             return []
         return [self._upsert_trip_candidate(scope_id, events)]
 
