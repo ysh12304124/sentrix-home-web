@@ -103,6 +103,23 @@ class MemoryAgent:
             return {key: MemoryAgent._redact_private_places(item, replacements) for key, item in value.items()}
         return value
 
+    def _vector_hit_has_textual_anchor(self, hit, events):
+        """A semantic similarity score is a ranking signal, not standalone evidence."""
+        event_id = hit.get("source_id") if hit.get("source_type") == "event" else hit.get("metadata", {}).get("event_id")
+        if event_id:
+            event = next((item for item in events if item["id"] == event_id), None)
+            if event and contains(json.dumps(event, ensure_ascii=False), hit.get("query", "")):
+                return True
+            detail = self.store.get_event_detail(event_id) or {}
+            return any(
+                contains(json.dumps(observation, ensure_ascii=False), hit.get("query", ""))
+                for observation in detail.get("observations", [])
+            )
+        if hit.get("source_type") == "observation":
+            observation = self.store.get_observation(hit.get("source_id"))
+            return bool(observation and contains(json.dumps(observation, ensure_ascii=False), hit.get("query", "")))
+        return False
+
     def retrieve(self, query, scope_id=None):
         events = self.store.list_events(100, scope_id=scope_id)
         observations = self.store.list_observations(1000, scope_id=scope_id)
@@ -171,7 +188,10 @@ class MemoryAgent:
         if not structured_hit and vector_available:
             query_embedding = self.clip.embed_text(query)
             vector_candidates = self.store.search_vectors("episodic", query_embedding, 12, scope_id=scope_id) + self.store.search_vectors("semantic", query_embedding, 12, scope_id=scope_id)
-            vector_hits = [item for item in vector_candidates if float(item.get("score", 0) or 0) >= VECTOR_EVIDENCE_MIN_SCORE]
+            scored_hits = [item for item in vector_candidates if float(item.get("score", 0) or 0) >= VECTOR_EVIDENCE_MIN_SCORE]
+            for item in scored_hits:
+                item["query"] = query
+            vector_hits = [item for item in scored_hits if self._vector_hit_has_textual_anchor(item, events)]
         vector_event_ids = [item["source_id"] for item in vector_hits if item["source_type"] == "event"]
         vector_event_ids.extend(item.get("metadata", {}).get("event_id") for item in vector_hits if item.get("metadata", {}).get("event_id"))
         vector_events = [event for event in events if event["id"] in vector_event_ids]
