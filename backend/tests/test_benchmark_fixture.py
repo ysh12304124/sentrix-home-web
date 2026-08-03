@@ -40,6 +40,37 @@ class HouseholdBenchmarkEvaluatorTests(unittest.TestCase):
             self.assertTrue(result["scope_isolation"]["passed"])
             self.assertEqual(result["spaces"]["album1"]["queries"]["hit_rate"], 1.0)
 
+    def test_household_face_metrics_exclude_ambiguous_multi_person_detection_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "sentrix.db"
+            store = MemoryStore(str(database))
+            for index, (file_name, embeddings) in enumerate((
+                ("a-one.jpg", [[1.0, 0.0]]),
+                ("a-two.jpg", [[1.0, 0.0]]),
+                # The two labels in this picture have no bbox alignment.  Its
+                # detection order must not change the face accuracy result.
+                ("pair.jpg", [[0.0, 1.0], [1.0, 0.0]]),
+            )):
+                asset = store.create_asset(f"asset-{index}", file_name, "image", str(root / file_name), scope_id="album1")
+                observation = store.add_observation(asset["id"], {"scope_id": "album1"}, scope_id="album1")
+                for embedding in embeddings:
+                    store.add_face_instance(asset["id"], observation["id"], {"embedding": embedding, "quality": 0.9, "confidence": 0.95})
+            store.close()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"spaces": [{
+                "scope_id": "album1", "import": {"files": []}, "diagnostics": {},
+                "evaluation": {"image_to_face_ids": {
+                    "a-one.jpg": ["a"], "a-two.jpg": ["a"], "pair.jpg": ["a", "b"],
+                }, "queries": []},
+            }]}), encoding="utf-8")
+
+            metrics = evaluate(manifest, database)["spaces"]["album1"]["face_clustering"]
+
+            self.assertEqual(metrics["validated_occurrences"], 2)
+            self.assertEqual(metrics["ambiguous_occurrences"], 2)
+            self.assertEqual(metrics["f1"], 1.0)
+
     def test_lfw_evaluator_counts_missing_faces_and_enforces_pairwise_gate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

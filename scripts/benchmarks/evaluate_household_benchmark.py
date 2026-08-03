@@ -49,25 +49,56 @@ def _face_metrics(store, space):
     predicted_by_file = {}
     for row in rows:
         predicted_by_file.setdefault(row["file_name"], []).append(row)
+    # The provided household labels identify people per image, not face boxes.
+    # A detector's order is not a valid identity alignment.  Only an image with
+    # exactly one authorized label and one clustered detection can establish a
+    # direct, order-independent evaluation sample.  Multi-person images remain
+    # visible in coverage diagnostics instead of inflating or corrupting F1.
     samples = []
+    direct_rows = []
     matched_faces = 0
     unmatched_truth = 0
     unmatched_prediction = 0
     for file_name, face_ids in truth_by_file.items():
+        labels = [str(value) for value in face_ids]
         predicted = predicted_by_file.get(file_name, [])
-        for truth_id, prediction in zip(sorted(map(str, face_ids)), predicted):
-            samples.append((truth_id, prediction["cluster_id"]))
-            matched_faces += 1
-        unmatched_truth += max(0, len(face_ids) - len(predicted))
-        unmatched_prediction += max(0, len(predicted) - len(face_ids))
+        if len(labels) == len(predicted) == 1:
+            direct_rows.append((file_name, labels[0], predicted[0]["cluster_id"]))
+        else:
+            unmatched_truth += len(labels)
+            unmatched_prediction += len(predicted)
+
+    label_clusters = {}
+    cluster_labels = {}
+    for _, label, cluster_id in direct_rows:
+        label_clusters.setdefault(label, set()).add(cluster_id)
+        cluster_labels.setdefault(cluster_id, set()).add(label)
+    stable_labels = {
+        label for label, cluster_ids in label_clusters.items()
+        if len(cluster_ids) == 1 and len(cluster_labels[next(iter(cluster_ids))]) == 1
+    }
+    for _, label, cluster_id in direct_rows:
+        if label not in stable_labels:
+            unmatched_truth += 1
+            unmatched_prediction += 1
+            continue
+        samples.append((label, cluster_id))
+        matched_faces += 1
     metrics = _pair_metrics(samples)
+    truth_occurrences = sum(len(value) for value in truth_by_file.values())
+    predicted_occurrences = sum(len(value) for value in predicted_by_file.values())
+    ambiguous_occurrences = truth_occurrences - matched_faces
     metrics.update({
-        "truth_occurrences": sum(len(value) for value in truth_by_file.values()),
-        "predicted_occurrences": sum(len(value) for value in predicted_by_file.values()),
+        "truth_occurrences": truth_occurrences,
+        "predicted_occurrences": predicted_occurrences,
         "matched_occurrences": matched_faces,
+        "validated_occurrences": matched_faces,
+        "ambiguous_occurrences": ambiguous_occurrences,
         "unmatched_truth_occurrences": unmatched_truth,
         "unmatched_prediction_occurrences": unmatched_prediction,
-        "assignment": "按文件名和排序后的 face instance 配对；缺少 bbox 对齐标注时仅评估可配对样本",
+        "detection_coverage": round(sum(min(len(value), len(predicted_by_file.get(file_name, []))) for file_name, value in truth_by_file.items()) / truth_occurrences, 4) if truth_occurrences else 0.0,
+        "validation_coverage": round(matched_faces / truth_occurrences, 4) if truth_occurrences else 0.0,
+        "assignment": "仅单标签且单检测的图片建立无序身份映射；多人或数量不一致样本只计入覆盖率",
     })
     return metrics
 
