@@ -164,7 +164,9 @@ def people(status: str | None = None, scope_id: str | None = None):
     for item in values:
         if item["status"] == "pending":
             pending_index += 1
-            item["display_name"] = f"待命名成员 {pending_index}"
+            item["canonical_name"] = item["display_name"] = f"待命名成员 {pending_index}"
+            item["family_role"] = None
+            item["summary"] = "由人脸聚类生成，等待用户确认"
         else:
             item["display_name"] = item["canonical_name"]
         item["confirmed"] = item["status"] == "confirmed"
@@ -185,6 +187,11 @@ def person_profile(person_id: str):
     detail["claims"] = store.list_semantic_claims(person_id, 500)
     detail["event_memory"] = store.list_person_event_memory(person_id)
     detail["patterns"] = store.list_person_patterns(person_id)
+    entity = detail.get("entity") or {}
+    if entity.get("status") == "pending":
+        entity["canonical_name"] = "待命名成员"
+        entity["family_role"] = None
+        entity["summary"] = "由人脸聚类生成，等待用户确认"
     return detail
 
 
@@ -195,6 +202,11 @@ def person_evidence(person_id: str, scope_id: str | None = None):
         raise HTTPException(status_code=404, detail="person not found")
     if scope_id and value.get("scope_id") != scope_id:
         raise HTTPException(status_code=404, detail="person not found in memory space")
+    entity = value.get("entity") or {}
+    if entity.get("status") == "pending":
+        entity["canonical_name"] = "待命名成员"
+        entity["family_role"] = None
+        entity["summary"] = "由人脸聚类生成，等待用户确认"
     return value
 
 
@@ -203,6 +215,11 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
     values = store.list_entities(status, scope_id=scope_id)
     if not includePeople:
         values = [item for item in values if item["entity_type"] != "person"]
+    for item in values:
+        if item.get("entity_type") == "person" and item.get("status") == "pending":
+            item["canonical_name"] = "待命名成员"
+            item["family_role"] = None
+            item["summary"] = "由人脸聚类生成，等待用户确认"
     return {"entities": values}
 
 
@@ -235,6 +252,10 @@ def face_clusters(status: str | None = None, scope_id: str | None = None):
     clusters = store.list_face_clusters(status)
     if scope_id:
         clusters = [item for item in clusters if item.get("scope_id") == scope_id]
+    for cluster in clusters:
+        if cluster.get("entity_status") == "pending":
+            cluster["canonical_name"] = "待命名成员"
+            cluster["family_role"] = None
     return {"clusters": clusters}
 
 
