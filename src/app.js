@@ -212,14 +212,18 @@
     const candidates = result.clarification_candidates || [];
     const evidence = primary.length ? evidenceLayer("本次依据", primary) : "";
     const followups = candidates.length ? `<div class="assistant-followups"><p>你可以继续说明：</p>${candidates.map((item) => `<button data-action="continue-assistant" data-query="${escapeHtml(item.name)}">${escapeHtml(item.name)} <small>${escapeHtml(item.entity_type)} · ${item.evidence_count || 0} 条证据</small></button>`).join("")}</div>` : "";
-    return `${followups}${imageResults(result)}${evidence}${toolTrace(result)}${algorithmEvidence(result)}`;
+    const ordered = result.evidence_order || [];
+    const order = ordered.length ? `<details class="algorithm-evidence"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
+    return `${followups}${imageResults(result)}${evidence}${order}${toolTrace(result)}${algorithmEvidence(result)}`;
   }
 
   function assistantMessage(message) {
     if (message.role === "user") return `<article class="assistant-message user"><div class="assistant-bubble"><p>${escapeHtml(message.text)}</p></div></article>`;
     const result = message.result || {};
     const status = result.insufficient_evidence ? "需要补充线索" : `${Math.round((result.confidence || 0) * 100)}% 证据置信度`;
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭记忆助手</span><small>${escapeHtml(status)}</small></div><div class="assistant-bubble"><p>${escapeHtml(result.answer || "当前没有可回答的本地证据。").replace(/\n/g, "<br />")}</p>${assistantEvidence(result)}</div></article>`;
+    const plan = result.dialogue_plan || {};
+    const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭记忆助手</span><small>${escapeHtml(status)} · ${escapeHtml(mode)}</small></div><div class="assistant-bubble"><p>${escapeHtml(result.answer || "当前没有可回答的本地证据。").replace(/\n/g, "<br />")}</p>${assistantEvidence(result)}</div></article>`;
   }
 
   function searchView() {

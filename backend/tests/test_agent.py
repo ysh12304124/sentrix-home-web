@@ -505,8 +505,52 @@ class AgentEvidenceTests(unittest.TestCase):
 
             self.assertEqual(first["intent"], "query")
             self.assertEqual(second["conversation_id"], "conversation-1")
-            self.assertGreaterEqual(gamma.answer_calls, 2)
-            self.assertIn("餐桌旁发生了什么？", gamma.contexts[-1][1])
+            self.assertEqual(gamma.answer_calls, 1)
+            self.assertEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
+
+    def test_dialogue_follow_up_reuses_verified_events_within_the_same_memory_space(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg", scope_id="album_a")
+            observation = store.add_observation(asset["id"], {"caption": "妈妈在餐桌旁切蛋糕", "captured_at": "2025-05-01T10:00:00+00:00"})
+            event = store.merge_observation_into_event(observation)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            first = agent.answer_turn("餐桌旁发生了什么？", "dialogue-1", scope_id="album_a")
+            second = agent.answer_turn("然后呢？", "dialogue-1", scope_id="album_a")
+
+            self.assertIn(event["id"], first["dialogue_state"]["active_event_ids"])
+            self.assertEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
+            self.assertIn(event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
+            self.assertEqual(second["dialogue_state"]["scope_id"], "album_a")
+            self.assertEqual(store.count("query_gaps"), 0)
+
+    def test_dialogue_evidence_exposes_source_level_time_and_confidence_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "客厅聚会", "confidence": 0.8, "captured_at": "2025-05-01T10:00:00+00:00"})
+            store.merge_observation_into_event(observation)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn("客厅发生了什么？")
+
+            self.assertTrue(result["evidence_order"])
+            self.assertEqual(result["evidence_order"][0]["source_level"], "derived_event")
+            self.assertTrue(all("confidence" in item and "time" in item for item in result["evidence_order"]))
+
+    def test_dialogue_uses_narrative_style_for_an_entity_introduction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("妈妈", "person", "confirmed", confidence=1.0)
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "妈妈在客厅看书", "captured_at": "2025-05-01T10:00:00+00:00"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn("介绍一下妈妈")
+
+            self.assertEqual(result["dialogue_plan"]["style"], "narrative")
+            self.assertIn("根据目前可回溯的记忆", result["answer"])
 
     def test_answer_turn_feedback_persists_without_normal_recall(self):
         with tempfile.TemporaryDirectory() as directory:

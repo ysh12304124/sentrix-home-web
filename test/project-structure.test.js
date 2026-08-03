@@ -57,6 +57,9 @@ test("family memory assistant presents an evidence-backed conversation surface",
   assert.match(appSource, /assistant-message/);
   assert.match(appSource, /clarification_candidates/);
   assert.match(appSource, /continue-assistant/);
+  assert.match(appSource, /evidence_order/);
+  assert.match(appSource, /证据顺序与可信度/);
+  assert.match(appSource, /dialogue_plan/);
 });
 
 test("entity property corrections are exposed with evidence-aware UI controls", () => {

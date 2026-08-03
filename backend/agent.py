@@ -43,6 +43,7 @@ class MemoryAgent:
         self.gamma = gamma or GammaClient()
         self.clip = clip or ClipAdapter()
         self._conversations = {}
+        self._dialogue_states = {}
         self._conversation_limit = 8
 
     @staticmethod
@@ -109,6 +110,113 @@ class MemoryAgent:
         if insufficient:
             trace.append({"tool": "request_clarification", "permission": "read", "status": "required", "reason": "insufficient_evidence"})
         return trace
+
+    @staticmethod
+    def _is_contextual_follow_up(message):
+        value = str(message or "").strip()
+        return any(token in value for token in ("然后", "后来", "接着", "继续", "为什么", "具体", "详细", "还有呢", "那呢"))
+
+    @staticmethod
+    def _dialogue_style(query, result):
+        if result.get("insufficient_evidence"):
+            return "clarifying"
+        if any(token in str(query or "") for token in ("介绍", "时间线", "回顾", "比较", "经历", "然后", "后来", "继续")):
+            return "narrative"
+        return "concise"
+
+    @staticmethod
+    def _narrative_answer(query, result):
+        if result.get("insufficient_evidence"):
+            return result
+        events = [item for item in result.get("evidence", []) if item.get("kind") == "event"]
+        if not events:
+            return result
+        details = []
+        for event in events[:3]:
+            when = str(event.get("time_start") or "").replace("T", " ")[:16]
+            place = event.get("place") or "地点未标注"
+            summary = event.get("summary") or event.get("event_id")
+            details.append(" · ".join(item for item in (when, place, summary) if item))
+        prefix = "根据目前可回溯的记忆，"
+        if any(token in str(query or "") for token in ("比较", "区别", "不同", "共同")):
+            prefix = "从已确认的共同与独立事件来看，"
+        elif any(token in str(query or "") for token in ("回顾", "推荐", "回忆")):
+            prefix = "沿着有原始证据的回忆，可以这样回顾："
+        result["answer"] = prefix + "；".join(details) + "。"
+        result["model"] = "sentrix-dialogue-evidence"
+        return result
+
+    @staticmethod
+    def _evidence_order(evidence):
+        source_levels = {
+            "fact": ("confirmed_fact", 0),
+            "semantic_claim": ("semantic_claim", 1),
+            "event": ("derived_event", 2),
+            "observation": ("original_observation", 3),
+            "person_appearance": ("original_person_appearance", 4),
+        }
+        ordered = []
+        for item in evidence or []:
+            source_level, source_rank = source_levels.get(item.get("kind"), ("other", 5))
+            ordered.append({
+                "id": item.get("id"), "kind": item.get("kind"), "source_level": source_level,
+                "time": item.get("time_start") or item.get("captured_at"),
+                "confidence": float(item.get("confidence", 0) or 0),
+                "event_id": item.get("event_id"), "asset_id": item.get("asset_id"),
+                "source_rank": source_rank,
+            })
+        return [
+            {key: value for key, value in item.items() if key != "source_rank"}
+            for item in sorted(ordered, key=lambda item: (item["source_rank"], item["time"] or "9999", -item["confidence"], item["id"] or ""))
+        ]
+
+    @staticmethod
+    def _contextual_follow_up_answer(result):
+        events = [item for item in result.get("evidence", []) if item.get("kind") == "event"]
+        if not events:
+            return result
+        summaries = [item.get("summary") or item.get("event_id") for item in events[:3]]
+        result["answer"] = "沿着刚才这段记忆，仍能确认的是：" + "；".join(summaries) + "。"
+        result["model"] = "sentrix-dialogue-evidence"
+        result["confidence"] = min(0.9, max(float(item.get("confidence", 0.62) or 0.62) for item in events))
+        return result
+
+    def _answer_from_verified_events(self, query, events):
+        evidence = []
+        for event in events[:8]:
+            detail = self.store.get_event_detail(event["id"]) or {}
+            observations = detail.get("observations", [])
+            evidence.append({
+                "kind": "event", "id": event["id"], "event_id": event["id"], "summary": event.get("summary", ""),
+                "time_start": event.get("time_start"), "place": event.get("place"),
+                "confidence": event.get("confidence", 0.62),
+                "asset_ids": [item.get("asset_id") for item in observations if item.get("asset_id")],
+            })
+            for observation in observations[:8]:
+                asset = observation.get("asset") or self.store.get_asset(observation["asset_id"]) or {}
+                evidence.append({
+                    "kind": "observation", "id": observation["id"], "observation_id": observation["id"], "event_id": event["id"],
+                    "asset_id": observation.get("asset_id"), "file_name": asset.get("file_name"), "media_type": asset.get("media_type"),
+                    "captured_at": observation.get("captured_at"), "caption": observation.get("caption"),
+                    "transcript": observation.get("transcript"), "confidence": observation.get("confidence", 0),
+                    "raw": observation.get("raw_json", {}),
+                })
+        result = {
+            "answer": "", "confidence": 0.0, "insufficient_evidence": not bool(evidence), "model": "sentrix-dialogue-evidence",
+            "modelEvidence": [], "evidence": evidence, "query": query,
+        }
+        result = self._contextual_follow_up_answer(result)
+        result["retrieval_trace"] = [
+            {"stage": "dialogue_state", "status": "complete", "counts": {"verified_events": len(events)}},
+            {"stage": "evidence_validation", "status": "complete", "counts": {"evidence": len(evidence)}},
+        ]
+        result["evidence_layers"] = {
+            "answers": [{"id": None, "text": result["answer"]}], "people": [],
+            "events": [item for item in evidence if item["kind"] == "event"], "claims": [], "appearance": [],
+            "observations": [item for item in evidence if item["kind"] == "observation"],
+            "assets": [{"kind": "asset", "id": item["asset_id"]} for item in evidence if item.get("asset_id")], "gaps": [],
+        }
+        return result
 
     @staticmethod
     def _recall_recommendation_answer(events):
@@ -778,13 +886,57 @@ class MemoryAgent:
             self._remember_turn(conversation_id, "assistant", result["answer"])
             return result
         previous = self._conversation_text(conversation_id)
+        prior_state = self._dialogue_states.get(conversation_id, {})
         query = str(message or "").strip()
-        if intent == "clarification" and previous:
+        contextual_follow_up = (
+            self._is_contextual_follow_up(query)
+            and prior_state.get("scope_id") == scope_id
+            and prior_state.get("active_event_ids")
+        )
+        if contextual_follow_up:
+            event_ids = prior_state["active_event_ids"]
+            events = [self.store.get_event(event_id) for event_id in event_ids]
+            events = [event for event in events if event and (not scope_id or event.get("scope_id") == scope_id)]
+            result = self._answer_from_verified_events(query, events)
+            result["tool_trace"] = [
+                {"tool": "resolve_constraints", "permission": "read", "status": "complete", "constraints": {"reused_events": event_ids}},
+                {"tool": "trace_timeline", "permission": "read", "status": "complete", "event_count": len(events)},
+                {"tool": "open_evidence", "permission": "read", "status": "complete", "evidence_count": len(result["evidence"])},
+            ]
+            dialogue_mode = "contextual_follow_up"
+        elif intent == "clarification" and previous:
             query = previous + "\n当前澄清：" + query
-        result = self.answer(query, previous, scope_id)
+            result = self.answer(query, previous, scope_id)
+            dialogue_mode = "clarification"
+        else:
+            result = self.answer(query, previous, scope_id)
+            dialogue_mode = "planned_query"
         result["intent"] = intent
         result["conversation_id"] = conversation_id
         result["image_results"] = self._image_results(result.get("evidence", []))
+        result["evidence_order"] = self._evidence_order(result.get("evidence", []))
+        active_event_ids = list(dict.fromkeys(
+            item.get("event_id") or item.get("id")
+            for item in result.get("evidence", []) if item.get("kind") == "event"
+        ))
+        active_entity_ids = list(dict.fromkeys(
+            item.get("person_id") for item in result.get("evidence", []) if item.get("person_id")
+        ))
+        dialogue_state = {
+            "scope_id": scope_id, "active_event_ids": active_event_ids[:8],
+            "active_entity_ids": active_entity_ids[:8],
+            "evidence_ids": [item.get("id") for item in result.get("evidence", []) if item.get("id")][:40],
+            "unresolved_ambiguity": bool(result.get("clarification_candidates") or result.get("insufficient_evidence")),
+        }
+        self._dialogue_states[conversation_id] = dialogue_state
+        result["dialogue_plan"] = {
+            "mode": dialogue_mode, "style": self._dialogue_style(message, result),
+            "layers": ["semantic", "episodic", "original_evidence"],
+        }
+        if result["dialogue_plan"]["style"] == "narrative":
+            result = self._narrative_answer(message, result)
+            result["evidence_layers"]["answers"] = [{"id": result.get("query"), "text": result.get("answer", "")}]
+        result["dialogue_state"] = dialogue_state
         self._remember_turn(conversation_id, "user", message)
         self._remember_turn(conversation_id, "assistant", result.get("answer", ""))
         return result
