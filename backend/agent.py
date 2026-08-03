@@ -63,6 +63,42 @@ class MemoryAgent:
         return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
 
     @staticmethod
+    def _is_timeline_query(query):
+        return any(token in str(query or "") for token in ("时间线", "时间轴", "先后", "经历", "历程"))
+
+    @staticmethod
+    def _is_entity_introduction_query(query, focused_people):
+        return bool(focused_people) and any(token in str(query or "") for token in ("介绍", "是谁", "了解", "档案", "画像"))
+
+    @staticmethod
+    def _is_evidence_request(query):
+        return any(token in str(query or "") for token in ("证据", "原图", "照片", "图片", "依据", "为什么"))
+
+    def _tool_trace(self, query, retrieved, evidence_count=0, insufficient=False):
+        """Describe the bounded read-only memory tools used for this turn."""
+        intent = retrieved.get("intent", {})
+        focused_people = retrieved.get("focused_people", [])
+        constraints = {
+            "people": [item["id"] for item in focused_people],
+            "date": self._query_date(query),
+            "dimension": intent.get("dimension"),
+            "event_filter": bool(intent.get("event_filter")),
+        }
+        trace = [{"tool": "resolve_constraints", "permission": "read", "status": "complete", "constraints": constraints}]
+        if self._is_entity_introduction_query(query, focused_people):
+            trace.append({"tool": "describe_entity", "permission": "read", "status": "complete", "entity_ids": constraints["people"]})
+        elif self._is_timeline_query(query):
+            trace.append({"tool": "find_events", "permission": "read", "status": "complete", "event_count": len(retrieved.get("events", []))})
+            trace.append({"tool": "trace_timeline", "permission": "read", "status": "complete", "event_count": len(retrieved.get("events", []))})
+        else:
+            trace.append({"tool": "find_events", "permission": "read", "status": "complete", "event_count": len(retrieved.get("events", []))})
+        if self._is_evidence_request(query) or evidence_count:
+            trace.append({"tool": "open_evidence", "permission": "read", "status": "complete" if evidence_count else "empty", "evidence_count": evidence_count})
+        if insufficient:
+            trace.append({"tool": "request_clarification", "permission": "read", "status": "required", "reason": "insufficient_evidence"})
+        return trace
+
+    @staticmethod
     def _object_values_for_query(query, objects):
         value = str(query or "")
         candidates = set()
@@ -550,6 +586,7 @@ class MemoryAgent:
             ]
             result["evidence_layers"] = {"answers": [{"id": None, "text": result["answer"]}], "people": [], "events": [], "claims": [], "appearance": [], "observations": [], "assets": [], "gaps": [gap]}
             result["query"] = query
+            result["tool_trace"] = self._tool_trace(query, public_retrieved, insufficient=True)
             return result
         deterministic_query = (
             (activity_query and public_retrieved.get("focused_people"))
@@ -602,6 +639,7 @@ class MemoryAgent:
             "gaps": [query_gap] if query_gap else [],
         }
         result["query"] = query
+        result["tool_trace"] = self._tool_trace(query, public_retrieved, len(evidence), result.get("insufficient_evidence", False))
         if query_gap:
             result["query_gap_id"] = query_gap["id"]
         return result

@@ -593,6 +593,7 @@ def search(request: SearchRequest):
         raise HTTPException(status_code=400, detail="query is required")
     result = agent.answer_turn(request.query.strip(), scope_id=request.spaceId)
     result["retrievalTrace"] = result.get("retrieval_trace", [])
+    result["toolTrace"] = result.get("tool_trace", [])
     return result
 
 
@@ -609,6 +610,7 @@ def assistant_turn(request: AssistantTurnRequest):
         raise HTTPException(status_code=400, detail="message is required")
     result = agent.answer_turn(request.message.strip(), request.conversation_id, request.feedback, request.scope_id)
     result["retrievalTrace"] = result.get("retrieval_trace", [])
+    result["toolTrace"] = result.get("tool_trace", [])
     return result
 
 

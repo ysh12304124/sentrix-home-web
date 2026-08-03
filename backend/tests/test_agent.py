@@ -106,6 +106,37 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertIn("observations", result["evidence_layers"])
             self.assertIn("assets", result["evidence_layers"])
 
+    def test_steward_returns_read_only_tool_trace_for_person_introduction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "妈妈在客厅"})
+            event = store.create_event({"id": "event_1", "title": "家庭时光", "summary": "妈妈在客厅"})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            store.rebuild_person_memory(person["id"])
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("介绍一下妈妈")
+
+            tools = [item["tool"] for item in result["tool_trace"]]
+            self.assertEqual(tools[:2], ["resolve_constraints", "describe_entity"])
+            self.assertTrue(all(item["permission"] == "read" for item in result["tool_trace"]))
+            self.assertIn("event_1", [item["event_id"] for item in result["evidence"] if item["kind"] == "event"])
+
+    def test_steward_uses_event_timeline_tools_for_timeline_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "客厅聚会", "place": "客厅"})
+            store.merge_observation_into_event(observation)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("客厅的时间线")
+
+            tools = [item["tool"] for item in result["tool_trace"]]
+            self.assertEqual(tools[:3], ["resolve_constraints", "find_events", "trace_timeline"])
+
     def test_retrieve_ranks_exact_lexical_match_before_unrelated_vector_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")

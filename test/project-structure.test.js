@@ -39,10 +39,15 @@ test("virtual fixture keeps evaluation labels outside imported metadata", () => 
 });
 
 test("native confirmation and assistant turn routes are exposed by the browser API", () => {
+  const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
   const source = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(source, /\/api\/persons\/\$\{encodeURIComponent\(id\)\}\/confirm/);
   assert.match(source, /\/api\/assistant\/turn/);
   assert.match(source, /family_role/);
+  assert.match(backendSource, /toolTrace/);
+  assert.match(appSource, /工具调用/);
+  assert.match(appSource, /toolTrace/);
 });
 
 test("entity property corrections are exposed with evidence-aware UI controls", () => {
