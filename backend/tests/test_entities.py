@@ -415,6 +415,24 @@ class NativeEntityMemoryTests(unittest.TestCase):
             for relationship in self.store.list_relationships(joyful["id"])
         ))
 
+    def test_reindex_retires_unclassified_legacy_mood_without_erasing_raw_observation(self):
+        legacy = self.store.create_entity("可爱", "emotion", confidence=0.6)
+        self.store.connection.execute(
+            "UPDATE observations SET raw_json = ? WHERE id = ?",
+            ('{"gamma": {"emotions": ["可爱"]}}', self.obs1["id"]),
+        )
+        self.store.connection.execute(
+            "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, ?, ?, ?)",
+            (legacy["id"], self.obs1["id"], 0.6, "observation_extraction", "2026-08-03T00:00:00+00:00"),
+        )
+        self.store.connection.commit()
+
+        result = self.store.reindex_observation_entities()
+
+        self.assertEqual(result["retired_unclassified_moods"], 1)
+        self.assertEqual(self.store.get_entity(legacy["id"])["status"], "rejected")
+        self.assertEqual(self.store.get_observation(self.obs1["id"])["raw"]["gamma"]["emotions"], ["可爱"])
+
     def test_event_projects_linked_entities_with_observation_evidence(self):
         self.store.connection.execute(
             "UPDATE observations SET captured_at = ?, place = ?, objects_json = ?, raw_json = ? WHERE id = ?",

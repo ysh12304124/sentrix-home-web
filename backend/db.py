@@ -2329,8 +2329,8 @@ class MemoryStore:
         for row in rows:
             event_row = self._row("SELECT event_id FROM event_observations WHERE observation_id = ? LIMIT 1", (row["id"],))
             total += len(self.maintain_observation_entities(row["id"], event_row["event_id"] if event_row else None))
-        normalized_moods = self.normalize_legacy_mood_entities(scope_id)
-        return {"observations": len(rows), "entity_links": total, "normalized_moods": normalized_moods, "scope_id": scope_id}
+        mood_cleanup = self.normalize_legacy_mood_entities(scope_id)
+        return {"observations": len(rows), "entity_links": total, "normalized_moods": mood_cleanup["normalized"], "retired_unclassified_moods": mood_cleanup["retired"], "scope_id": scope_id}
 
     def normalize_legacy_mood_entities(self, scope_id=None):
         """Retire prior model-only mood labels after moving every evidence edge."""
@@ -2341,11 +2341,20 @@ class MemoryStore:
             params.append(scope_id)
         legacy_entities = self._rows("SELECT * FROM entities WHERE " + " AND ".join(clauses), params)
         normalized_count = 0
+        retired_count = 0
         for legacy in legacy_entities:
             normalized_name = normalize_mood(legacy["canonical_name"])
-            if not normalized_name or normalized_name == legacy["canonical_name"]:
+            if normalized_name == legacy["canonical_name"]:
                 continue
             if self._row("SELECT 1 FROM entity_properties WHERE entity_id = ? AND source = 'user' LIMIT 1", (legacy["id"],)):
+                continue
+            if not normalized_name:
+                self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (legacy["id"],))
+                self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+                self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (legacy["id"], legacy["id"]))
+                self.connection.execute("UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ?", ("原始模型标签未进入受控情感词表，保留在观察证据中", now_iso(), legacy["id"]))
+                self.connection.commit()
+                retired_count += 1
                 continue
             target = self._find_or_create_entity(
                 normalized_name, "emotion", legacy.get("scope_id"), legacy.get("confidence", 0), "由图片观察到的情感",
@@ -2380,7 +2389,7 @@ class MemoryStore:
             self.connection.execute("UPDATE entities SET status = 'rejected', updated_at = ? WHERE id = ?", (now_iso(), legacy["id"]))
             self.connection.commit()
             normalized_count += 1
-        return normalized_count
+        return {"normalized": normalized_count, "retired": retired_count}
 
     def list_entities(self, status=None, scope_id=None, public=True):
         params = [status] if status else []
