@@ -137,6 +137,27 @@ class AgentEvidenceTests(unittest.TestCase):
             tools = [item["tool"] for item in result["tool_trace"]]
             self.assertEqual(tools[:3], ["resolve_constraints", "find_events", "trace_timeline"])
 
+    def test_steward_routes_two_confirmed_people_to_evidence_backed_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            mother = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            father = store.create_entity("爸爸", "person", "confirmed", "父亲", 1.0)
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "父母在客厅"})
+            event = store.create_event({"id": "event_1", "title": "家庭时光", "summary": "父母在客厅"})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            for person in (mother, father):
+                store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+                store.rebuild_person_memory(person["id"])
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("比较妈妈和爸爸的回忆")
+
+            tools = [item["tool"] for item in result["tool_trace"]]
+            self.assertEqual(tools[:2], ["resolve_constraints", "compare_memories"])
+            self.assertIn("共同事件", result["answer"])
+            self.assertIn("event_1", [item["event_id"] for item in result["evidence"] if item["kind"] == "event"])
+
     def test_retrieve_ranks_exact_lexical_match_before_unrelated_vector_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")

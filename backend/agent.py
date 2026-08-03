@@ -71,6 +71,10 @@ class MemoryAgent:
         return bool(focused_people) and any(token in str(query or "") for token in ("介绍", "是谁", "了解", "档案", "画像"))
 
     @staticmethod
+    def _is_comparison_query(query, focused_people):
+        return len(focused_people) >= 2 and any(token in str(query or "") for token in ("比较", "区别", "不同", "共同", "对比"))
+
+    @staticmethod
     def _is_evidence_request(query):
         return any(token in str(query or "") for token in ("证据", "原图", "照片", "图片", "依据", "为什么"))
 
@@ -85,7 +89,9 @@ class MemoryAgent:
             "event_filter": bool(intent.get("event_filter")),
         }
         trace = [{"tool": "resolve_constraints", "permission": "read", "status": "complete", "constraints": constraints}]
-        if self._is_entity_introduction_query(query, focused_people):
+        if self._is_comparison_query(query, focused_people):
+            trace.append({"tool": "compare_memories", "permission": "read", "status": "complete", "entity_ids": constraints["people"]})
+        elif self._is_entity_introduction_query(query, focused_people):
             trace.append({"tool": "describe_entity", "permission": "read", "status": "complete", "entity_ids": constraints["people"]})
         elif self._is_timeline_query(query):
             trace.append({"tool": "find_events", "permission": "read", "status": "complete", "event_count": len(retrieved.get("events", []))})
@@ -97,6 +103,18 @@ class MemoryAgent:
         if insufficient:
             trace.append({"tool": "request_clarification", "permission": "read", "status": "required", "reason": "insufficient_evidence"})
         return trace
+
+    def _comparison_answer(self, people):
+        event_sets = {person["id"]: set(self.store.entity_event_ids(person["id"])) for person in people[:2]}
+        first, second = people[:2]
+        shared = event_sets[first["id"]].intersection(event_sets[second["id"]])
+        first_only = event_sets[first["id"]] - event_sets[second["id"]]
+        second_only = event_sets[second["id"]] - event_sets[first["id"]]
+        answer = (
+            f"根据已确认的人物事件证据，{first['canonical_name']}与{second['canonical_name']}有 {len(shared)} 个共同事件；"
+            f"{first['canonical_name']}另有 {len(first_only)} 个已关联事件，{second['canonical_name']}另有 {len(second_only)} 个已关联事件。"
+        )
+        return answer, shared | first_only | second_only
 
     @staticmethod
     def _object_values_for_query(query, objects):
@@ -594,7 +612,18 @@ class MemoryAgent:
             or intent.get("dimension") == "object"
             or intent.get("event_filter")
         )
-        if deterministic_query:
+        comparison_query = self._is_comparison_query(query, public_retrieved.get("focused_people", []))
+        if comparison_query:
+            answer, compared_event_ids = self._comparison_answer(public_retrieved["focused_people"])
+            result = {
+                "answer": answer,
+                "confidence": 0.9,
+                "insufficient_evidence": False,
+                "model": "sentrix-evidence",
+                "evidence": [],
+                "compared_event_ids": sorted(compared_event_ids),
+            }
+        elif deterministic_query:
             result = self._fallback_answer(query, evidence)
             result["model"] = "sentrix-evidence"
             result["evidence"] = []
@@ -610,7 +639,7 @@ class MemoryAgent:
         known_ids = {item["id"] for item in evidence}
         model_evidence = result.get("modelEvidence") or []
         valid_model_evidence = [item for item in model_evidence if isinstance(item, dict) and item.get("id") in known_ids]
-        if evidence and (result.get("insufficient_evidence") or not valid_model_evidence):
+        if evidence and not comparison_query and (result.get("insufficient_evidence") or not valid_model_evidence):
             result.update(self._fallback_answer(query, evidence))
         if public_retrieved.get("focused_people") and public_retrieved.get("semantic_claims") and activity_query:
             semantic_answer = self._fallback_answer(query, evidence)
