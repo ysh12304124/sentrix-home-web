@@ -253,6 +253,7 @@ class NativeEntityMemoryTests(unittest.TestCase):
             "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
             [(event["id"], self.obs1["id"]), (event["id"], self.obs2["id"])],
         )
+        self.store.connection.execute("UPDATE events SET cover_asset_id = ? WHERE id = ?", ("a1", event["id"]))
         self.store.connection.commit()
 
         updated = self.store.update_event(event["id"], {
@@ -264,8 +265,8 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(updated["time_end"], "2025-05-02T18:00:00+08:00")
         self.assertEqual(updated["cover_asset_id"], "a2")
         self.assertEqual(set(updated["asset_ids"]), {"a1", "a2"})
-        self.assertEqual(detail["event_revisions"][0]["field_name"], "cover_asset_id")
-        self.assertEqual(detail["event_revisions"][0]["new_value"], "a2")
+        cover_revision = next(item for item in detail["event_revisions"] if item["field_name"] == "cover_asset_id")
+        self.assertEqual(cover_revision["new_value"], "a2")
 
     def test_event_cover_must_be_evidence_asset_from_that_event(self):
         event = self.store.create_event({"id": "editable_event", "title": "待修正事件"})

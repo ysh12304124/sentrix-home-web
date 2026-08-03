@@ -23,7 +23,8 @@ def contains(value, query):
     # Chinese questions often contain one continuous block (for example,
     # "餐桌旁发生了什么"). Recover meaningful 2-6 character clues without
     # falling back to unrelated records merely because the full sentence differs.
-    chinese_blocks = re.findall(r"[\u4e00-\u9fff]{2,}", normalized_query)
+    semantic_query = re.sub(r"(发生了什么|在哪里|是什么|有哪些|相关证据|这张照片|这张图片|图片|照片|请问|吗|呢|的)", "", normalized_query)
+    chinese_blocks = re.findall(r"[\u4e00-\u9fff]{2,}", semantic_query)
     clues = {
         block[index:index + size]
         for block in chinese_blocks
@@ -31,7 +32,9 @@ def contains(value, query):
         for index in range(len(block) - size + 1)
         if block[index:index + size] not in {"什么", "哪里", "如何", "哪些", "发生", "图片"}
     }
-    return any(clue in value for clue in clues)
+    matched_clues = {clue for clue in clues if clue in value}
+    required_clues = 2 if any(len(block) >= 6 for block in chinese_blocks) else 1
+    return len(matched_clues) >= required_clues
 
 
 class MemoryAgent:
@@ -45,7 +48,7 @@ class MemoryAgent:
     @staticmethod
     def classify_intent(message, feedback=None):
         value = str(message or "").strip()
-        if any(token in value for token in ("我说的是", "指的是", "不是", "而是", "澄清")):
+        if any(token in value for token in ("我说的是", "指的是", "不是", "而是", "澄清", "继续")):
             return "clarification"
         if feedback or any(token in value for token in ("纠正", "更正", "实际是", "应该是", "记错了")):
             return "feedback"
