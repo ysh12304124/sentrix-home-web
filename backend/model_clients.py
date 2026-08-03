@@ -132,10 +132,11 @@ def contains_latin_text(value):
 
 
 class GammaClient:
-    def __init__(self, base_url=None, model=None, timeout=None):
+    def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None):
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+        self.keep_alive = str(keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0"))
 
     def chat(self, prompt, images=None, vision_options=None):
         if httpx is None:
@@ -148,7 +149,7 @@ class GammaClient:
             "messages": [message],
             "stream": False,
             "format": "json",
-            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "0"),
+            "keep_alive": self.keep_alive,
             "options": {"temperature": 0},
         }
         if vision_options:

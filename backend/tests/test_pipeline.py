@@ -77,7 +77,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(observation["ocr_text"], "生日快乐")
             self.assertEqual(store.count("events"), 1)
             self.assertEqual(store.count("face_clusters"), 1)
-            self.assertEqual({item["entity_type"] for item in store.list_entities()}, {"person", "place", "object"})
+            self.assertEqual({item["entity_type"] for item in store.list_entities()}, {"person", "place", "object", "time"})
             self.assertGreaterEqual(store.count("memory_vectors"), 3)
             self.assertEqual(store.get_asset(asset["id"])["metadata_json"]["faces"][0]["embedding_model"], "test-face")
             self.assertGreaterEqual(store.get_asset(asset["id"])["metadata_json"]["processing_seconds"], 0)
@@ -121,6 +121,20 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(updated["title"], "生日庆祝")
             self.assertEqual(updated["event_type"], "庆祝活动")
             self.assertEqual(updated["summary"], "一组照片记录了围绕蛋糕的庆祝活动。")
+
+    def test_complete_image_processing_keeps_event_summary_as_deferred_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "cake.jpg"
+            image.write_bytes(b"test")
+            store = MemoryStore(f"{directory}/memory.db")
+            pipeline = IngestionPipeline(store, gamma=FakeGamma(), face=FakeFace(), clip=FakeClip())
+            asset = pipeline.create_asset(image)
+
+            pipeline.process(asset["id"], summarize_event=False)
+            event = store.list_events()[0]
+
+            self.assertEqual(event["title"], "待总结事件")
+            self.assertEqual(event["summary"], "一张带文字的家庭照片")
 
     def test_dissimilar_images_at_same_time_and_place_split_before_summary(self):
         with tempfile.TemporaryDirectory() as directory:

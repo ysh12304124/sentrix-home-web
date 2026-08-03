@@ -980,6 +980,9 @@ class MemoryStore:
         self.connection.execute(f"DELETE FROM observations WHERE id IN ({placeholders})", observation_ids)
         for event_id in event_ids:
             if self.connection.execute("SELECT COUNT(*) FROM event_observations WHERE event_id = ?", (event_id,)).fetchone()[0] == 0:
+                self.connection.execute("DELETE FROM event_entities WHERE event_id = ?", (event_id,))
+                self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (event_id,))
+                self.connection.execute("DELETE FROM event_revisions WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.commit()
 
