@@ -1302,7 +1302,27 @@ class MemoryStore:
                 (make_id("event_person"), event_id, person_id, role, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
             )
         self.connection.commit()
+        self._maintain_event_cooccurrence_candidates(event_id)
         return self.list_event_participants(event_id)
+
+    def _maintain_event_cooccurrence_candidates(self, event_id):
+        """Suggest co-occurrence only; users decide whether it represents a real relationship."""
+        participants = [
+            item for item in self.list_event_participants(event_id)
+            if item.get("role") == "visible_subject" and item.get("person_status") == "confirmed"
+        ]
+        for index, left in enumerate(participants):
+            for right in participants[index + 1:]:
+                subject_id, object_id = sorted((left["person_id"], right["person_id"]))
+                evidence_ids = list(dict.fromkeys((left.get("evidence_ids_json") or []) + (right.get("evidence_ids_json") or [])))
+                support_rows = self._rows(
+                    """SELECT DISTINCT ep.event_id FROM event_participants ep
+                    JOIN event_participants other ON other.event_id = ep.event_id
+                    WHERE ep.person_id = ? AND other.person_id = ? AND ep.role = 'visible_subject' AND other.role = 'visible_subject'""",
+                    (subject_id, object_id),
+                )
+                confidence = min(0.9, 0.45 + 0.1 * len(support_rows))
+                self.create_relationship(subject_id, "共同出现", object_id, evidence_ids, confidence, "pending")
 
     def list_event_participants(self, event_id=None):
         clauses = []

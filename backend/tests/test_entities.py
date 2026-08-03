@@ -141,6 +141,20 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(properties["groups"]["value"], ["家人", "旅行伙伴"])
         self.assertEqual(retained["id"], properties["relation_to_user"]["id"])
 
+    def test_confirmed_people_in_one_event_create_a_pending_cooccurrence_candidate(self):
+        event = self.store.merge_observation_into_event(self.obs1)
+        first = self.store.create_entity("妈妈", "person", "confirmed", confidence=1.0)
+        second = self.store.create_entity("明哥", "person", "confirmed", confidence=1.0)
+        self.store.upsert_event_participant(event["id"], first["id"], "visible_subject", [self.obs1["id"]], 0.9)
+        self.store.upsert_event_participant(event["id"], second["id"], "visible_subject", [self.obs1["id"]], 0.9)
+
+        candidates = [item for item in self.store.list_relationships() if item["predicate"] == "共同出现"]
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["status"], "pending")
+        self.assertEqual(candidates[0]["evidence_ids_json"], [self.obs1["id"]])
+        self.assertGreaterEqual(candidates[0]["confidence"], 0.5)
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)
