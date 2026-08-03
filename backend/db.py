@@ -389,6 +389,7 @@ class MemoryStore:
                 confidence REAL NOT NULL DEFAULT 0,
                 evidence_ids_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'pending',
+                target_entity_id TEXT REFERENCES entities(id),
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -673,6 +674,7 @@ class MemoryStore:
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("entity_merge_candidates", {"target_entity_id": "TEXT REFERENCES entities(id)"})
         self._ensure_columns("face_clusters", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("relationships", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("facts", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
@@ -2569,7 +2571,7 @@ class MemoryStore:
 
     def list_entities(self, status=None, scope_id=None, public=True):
         params = [status] if status else []
-        where = "WHERE status = ?" if status else "WHERE status != 'rejected'"
+        where = "WHERE status = ?" if status else "WHERE status NOT IN ('rejected', 'superseded')"
         if scope_id:
             where += " AND scope_id = ?"
             params.append(scope_id)
@@ -2707,6 +2709,70 @@ class MemoryStore:
             candidates.append(self._merge_candidate_row(self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,))))
         self.connection.commit()
         return candidates
+
+    def confirm_entity_merge_candidate(self, candidate_id, target_entity_id):
+        """Apply an explicit user-approved non-person semantic entity merge."""
+        candidate = self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,))
+        target = self.get_entity(target_entity_id)
+        if not candidate:
+            raise KeyError(candidate_id)
+        if candidate["status"] != "pending":
+            raise ValueError("only pending entity merge candidates can be confirmed")
+        entity_ids = json.loads(candidate["entity_ids_json"] or "[]")
+        if target_entity_id not in entity_ids or not target:
+            raise ValueError("target entity must belong to this merge candidate")
+        if target["entity_type"] == "person" or target["entity_type"] != candidate["entity_type"]:
+            raise ValueError("person entities and mismatched entity types cannot be semantically merged")
+        if target.get("scope_id") != candidate.get("scope_id"):
+            raise ValueError("entity merge must remain within one memory space")
+        timestamp = now_iso()
+        sources = [self.get_entity(entity_id) for entity_id in entity_ids if entity_id != target_entity_id]
+        sources = [entity for entity in sources if entity and entity.get("status") != "superseded"]
+        for source in sources:
+            if source["entity_type"] != target["entity_type"] or source.get("scope_id") != target.get("scope_id"):
+                raise ValueError("candidate contains an incompatible source entity")
+            for evidence in self._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (source["id"],)):
+                self.connection.execute(
+                    """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_id, observation_id)
+                    DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
+                    (target_entity_id, evidence["observation_id"], evidence["confidence"], "user_semantic_merge", timestamp),
+                )
+            for link in self._rows("SELECT * FROM event_entities WHERE entity_id = ?", (source["id"],)):
+                self.upsert_event_entity(link["event_id"], target_entity_id, link["relation"], json.loads(link["evidence_ids_json"] or "[]"), link["confidence"])
+            for relationship in self._rows(
+                "SELECT * FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'",
+                (source["id"], source["id"]),
+            ):
+                subject_id = target_entity_id if relationship["subject_entity_id"] == source["id"] else relationship["subject_entity_id"]
+                object_id = target_entity_id if relationship["object_entity_id"] == source["id"] else relationship["object_entity_id"]
+                if subject_id != object_id:
+                    self.create_relationship(subject_id, relationship["predicate"], object_id, json.loads(relationship["evidence_ids_json"] or "[]"), relationship["confidence"], relationship["status"])
+            self._record_entity_revision(source["id"], "semantic_merge_target", source["canonical_name"], target_entity_id, "user_semantic_merge", json.loads(candidate["evidence_ids_json"] or "[]"))
+            self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (source["id"],))
+            self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (source["id"],))
+            self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (source["id"], source["id"]))
+            self.connection.execute("UPDATE entities SET status = 'superseded', updated_at = ? WHERE id = ?", (timestamp, source["id"]))
+        self._record_entity_revision(target_entity_id, "semantic_merge_sources", None, json_value([item["id"] for item in sources], []), "user_semantic_merge", json.loads(candidate["evidence_ids_json"] or "[]"))
+        self.connection.execute(
+            "UPDATE entity_merge_candidates SET status = 'confirmed', target_entity_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+            (target_entity_id, timestamp, candidate_id),
+        )
+        self.connection.commit()
+        return self._merge_candidate_row(self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,)))
+
+    def reject_entity_merge_candidate(self, candidate_id):
+        candidate = self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,))
+        if not candidate:
+            raise KeyError(candidate_id)
+        if candidate["status"] != "pending":
+            raise ValueError("only pending entity merge candidates can be rejected")
+        self.connection.execute(
+            "UPDATE entity_merge_candidates SET status = 'rejected', revision = revision + 1, updated_at = ? WHERE id = ?",
+            (now_iso(), candidate_id),
+        )
+        self.connection.commit()
+        return self._merge_candidate_row(self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,)))
 
     def get_entity(self, entity_id):
         return self._row("SELECT * FROM entities WHERE id = ?", (entity_id,))

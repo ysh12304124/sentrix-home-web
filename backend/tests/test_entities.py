@@ -136,6 +136,28 @@ class NativeEntityMemoryTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
+    def test_user_confirmation_merges_candidate_into_selected_stable_entity_with_audit(self):
+        lakeside = self.store.create_entity("湖边", "place", confidence=0.8)
+        waterside = self.store.create_entity("水边", "place", confidence=0.8)
+        for entity, observation in ((lakeside, self.obs1), (waterside, self.obs2)):
+            self.store.connection.execute(
+                "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, 0.8, 'test', datetime('now'))",
+                (entity["id"], observation["id"]),
+            )
+        self.store.connection.commit()
+        candidate = self.store.derive_entity_merge_candidates()[0]
+
+        merged = self.store.confirm_entity_merge_candidate(candidate["id"], lakeside["id"])
+
+        self.assertEqual(merged["status"], "confirmed")
+        self.assertEqual(merged["target_entity_id"], lakeside["id"])
+        self.assertEqual(self.store.get_entity(lakeside["id"])["status"], "pending")
+        self.assertEqual(self.store.get_entity(waterside["id"])["status"], "superseded")
+        target_evidence = self.store.get_entity_detail(lakeside["id"])["evidence_files"]
+        self.assertEqual({item["evidence_id"] for item in target_evidence}, {self.obs1["id"], self.obs2["id"]})
+        revisions = self.store._rows("SELECT * FROM entity_revisions WHERE entity_id = ?", (waterside["id"],))
+        self.assertTrue(any(item["field_name"] == "semantic_merge_target" for item in revisions))
+
     def test_observation_entities_derive_explainable_place_and_time_properties(self):
         self.store.update_asset("a1", "queued", {"captured_at": "2026-08-03T19:30:00+08:00"})
         self.store.connection.execute(

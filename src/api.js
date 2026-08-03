@@ -36,6 +36,8 @@
     entities: (status = "", scopeId = "") => request(`/api/entities${new URLSearchParams({ ...(status ? { status } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")}`),
     entityMergeCandidates: (scopeId = "", status = "pending") => request(`/api/entity-merge-candidates${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(status ? { status } : {}) }).toString().replace(/^/, "?")}`),
     deriveEntityMergeCandidates: (scopeId = "") => request(`/api/maintenance/entity-merge-candidates${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`, { method: "POST" }),
+    confirmEntityMergeCandidate: (id, targetEntityId) => request(`/api/entity-merge-candidates/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify({ target_entity_id: targetEntityId }) }),
+    rejectEntityMergeCandidate: (id) => request(`/api/entity-merge-candidates/${encodeURIComponent(id)}/reject`, { method: "POST" }),
     entity: (id) => request(`/api/entities/${encodeURIComponent(id)}`),
     setEntityProperty: (id, propertyKey, value, evidenceIds = []) => request(`/api/entities/${encodeURIComponent(id)}/properties/${encodeURIComponent(propertyKey)}`, { method: "PUT", body: JSON.stringify({ value, evidence_ids: evidenceIds }) }),
     faceClusters: (status = "", scopeId = "") => request(`/api/face-clusters${new URLSearchParams({ ...(status ? { status } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")}`),

@@ -275,6 +275,26 @@ def derive_entity_merge_candidates(scope_id: str | None = None):
         maintenance_lock.release()
 
 
+@app.post("/api/entity-merge-candidates/{candidate_id}/confirm")
+def confirm_entity_merge_candidate(candidate_id: str, payload: dict):
+    try:
+        return store.confirm_entity_merge_candidate(candidate_id, payload.get("target_entity_id"))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="entity merge candidate not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.post("/api/entity-merge-candidates/{candidate_id}/reject")
+def reject_entity_merge_candidate(candidate_id: str):
+    try:
+        return store.reject_entity_merge_candidate(candidate_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="entity merge candidate not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.get("/api/knowledge")
 def knowledge(person_id: str | None = None, scope_id: str | None = None):
     claims = store.list_semantic_claims(person_id, 1000)
