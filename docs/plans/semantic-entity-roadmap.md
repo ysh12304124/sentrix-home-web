@@ -113,6 +113,58 @@ derived person projections without changing user-authored properties.
 Acceptance: an ordinary single-day event cannot be promoted to a trip; mood
 normalization retains raw labels and evidence.
 
+## P1: Semantic Entity Consolidation
+
+1. Generate same-type semantic entity clusters for Place, Object and Mood from
+   normalized labels, text similarity and shared Observation/Event context.
+2. Keep every source entity stable until a user confirms a merge. A candidate
+   stores canonical suggestion, aliases, confidence, similarity rationale and
+   all original evidence IDs.
+3. Never cluster people with this mechanism. Identity remains face-evidence
+   governed. Never merge entities across MemorySpace boundaries.
+4. Exclude private place aliases from cross-entity similarity text; use their
+   stable IDs only after permission checks.
+5. Add merge, reject and split review with revision history; a rejected
+   candidate must not reappear unchanged.
+
+Acceptance: near-equivalent labels such as "湖边" and "水边" can be presented
+as a review candidate with source observations, while raw labels and stable
+IDs remain intact until confirmation.
+
+## P1: Digital Memory Steward
+
+The accepted product role is a neutral household memory steward, not an
+imitation of a family member. Full protocol: `digital-memory-steward.md`.
+
+1. Introduce a read-only tool registry for constraint resolution, entity
+   introduction, event lookup, timeline, comparison, recommendation and
+   original evidence opening.
+2. Route structured constraints before semantic/vector retrieval. Record the
+   selected tools in an ordered `tool_trace` alongside `retrieval_trace`.
+3. Return clarification candidates on ambiguity; return a query gap on missing
+   evidence; never use a vector score as standalone evidence.
+4. Bind user feedback to an explicit entity, event, property or relationship.
+   Review/confirmation are separate, audited write tools.
+5. Build an offline household question set for lookup, explanation, compare,
+   recommendation, ambiguity and refusal acceptance gates.
+
+Acceptance: all answers expose their tool route and evidence layers; no
+feedback or model output can create a fact without an explicit audited target.
+
+## Cross-Cutting Delivery Gaps
+
+1. Produce a reliable labeled household face benchmark before claiming a
+   95-percent household clustering result; LFW alone is not a substitute.
+2. Publish a reproducible end-to-end performance benchmark with fixed hardware
+   and data before claiming the five-times processing target.
+3. Add local, auditable POI data before reverse geocoding; do not send family
+   coordinates to a network service. Backfill historical `geo` only through a
+   separately backed-up maintenance run.
+4. Complete Time festivals/life stages, Object salience/OCR presentation, Mood
+   score/style/user correction, and Trip cities/companions only with evidence.
+5. Add service supervision, task progress, retry/recovery metrics, backup
+   restore drills and a bounded video evidence plan.
+
 ## Verification Sequence
 
 1. Add a failing unittest for each property/revision rule.
