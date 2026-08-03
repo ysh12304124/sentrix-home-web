@@ -5,6 +5,7 @@
     query: "",
     conversationId: "",
     searchResult: null,
+    assistantMessages: [],
     searchLoading: false,
     loading: true,
     backendError: "",
@@ -36,7 +37,7 @@
 
   const navItems = [
     { id: "overview", icon: "⌂", label: "家庭概览" },
-    { id: "search", icon: "⌕", label: "记忆搜索" },
+    { id: "search", icon: "⌕", label: "家庭记忆助手" },
     { id: "timeline", icon: "↕", label: "事件时间线" },
     { id: "people", icon: "◎", label: "人物与关系" },
     { id: "knowledge", icon: "◇", label: "实体与知识" },
@@ -115,8 +116,8 @@
     return `<div class="page-heading"><div><p class="eyebrow">${escapeHtml(kicker)}</p><h1>${escapeHtml(title)}</h1><p class="page-description">${escapeHtml(description)}</p></div>${action}</div>`;
   }
 
-  function searchBar(placeholder = "搜索人物、事件、地点或原始资料…") {
-    return `<form class="search-bar" id="search-form"><span class="search-symbol">⌕</span><input id="search-input" value="${escapeHtml(state.query)}" placeholder="${escapeHtml(placeholder)}" /><kbd>Enter</kbd><button type="submit" aria-label="执行搜索">→</button></form>`;
+  function searchBar(placeholder = "问人物、地点、事件或想回顾的片段…") {
+    return `<form class="search-bar assistant-composer" id="search-form"><span class="search-symbol">⌕</span><input id="search-input" value="${escapeHtml(state.query)}" placeholder="${escapeHtml(placeholder)}" /><kbd>Enter</kbd><button type="submit" aria-label="发送给家庭记忆助手">→</button></form>`;
   }
 
   function memoryPill(type, label, stateLabel = "已建立") {
@@ -205,9 +206,27 @@
     return `<details class="algorithm-evidence"><summary>工具调用</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}</dd></div>`).join("")}</dl></div></details>`;
   }
 
+  function assistantEvidence(result) {
+    const layers = result.evidence_layers || {};
+    const primary = [...(layers.events || []), ...(layers.observations || []), ...(layers.claims || [])];
+    const candidates = result.clarification_candidates || [];
+    const evidence = primary.length ? evidenceLayer("本次依据", primary) : "";
+    const followups = candidates.length ? `<div class="assistant-followups"><p>你可以继续说明：</p>${candidates.map((item) => `<button data-action="continue-assistant" data-query="${escapeHtml(item.name)}">${escapeHtml(item.name)} <small>${escapeHtml(item.entity_type)} · ${item.evidence_count || 0} 条证据</small></button>`).join("")}</div>` : "";
+    return `${followups}${imageResults(result)}${evidence}${toolTrace(result)}${algorithmEvidence(result)}`;
+  }
+
+  function assistantMessage(message) {
+    if (message.role === "user") return `<article class="assistant-message user"><div class="assistant-bubble"><p>${escapeHtml(message.text)}</p></div></article>`;
+    const result = message.result || {};
+    const status = result.insufficient_evidence ? "需要补充线索" : `${Math.round((result.confidence || 0) * 100)}% 证据置信度`;
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭记忆助手</span><small>${escapeHtml(status)}</small></div><div class="assistant-bubble"><p>${escapeHtml(result.answer || "当前没有可回答的本地证据。").replace(/\n/g, "<br />")}</p>${assistantEvidence(result)}</div></article>`;
+  }
+
   function searchView() {
-    const result = state.searchResult;
-    return `${pageHeader("记忆搜索 / Agent", "问一句，找到一段有证据的记忆。", "答案只来自本地事件、事实、Observation 和原生向量索引；每条证据都可以打开原始资料。")}${searchBar("例如：哪张图片里有冰箱？")}${state.searchLoading ? `<section class="empty-search"><div class="empty-symbol">◌</div><h2>正在检索本地记忆</h2><p>正在召回事件、事实、原始观察和语义上下文。</p></section>` : result ? `<section class="search-layout"><div><div class="answer-card"><div class="answer-meta"><span class="status-dot"></span>Sentrix 已完成本地检索 <span class="confidence">置信度 ${Math.round((result.confidence || 0) * 100)}% · ${escapeHtml(result.model || "本地 Agent")}</span></div><h2>检索结果</h2><p>${escapeHtml(result.answer || "证据不足，无法回答。").replace(/\n/g, "<br />")}</p><div class="answer-tags">${memoryPill("episodic", "事件证据")}${memoryPill("semantic", "事实证据")}${memoryPill("visual", "原始资料")}</div></div>${imageResults(result)}${evidenceLayer("人物与事件", [...(result.evidence_layers?.people || []), ...(result.evidence_layers?.events || [])])}${evidenceLayer("语义声明", result.evidence_layers?.claims)}${evidenceLayer("观察证据", result.evidence_layers?.observations)}${evidenceLayer("原始 Asset", result.evidence_layers?.assets?.map((item) => ({ ...item, kind: "asset", file_name: item.id, summary: "打开原始资料" })))}${evidenceLayer("原始证据", !result.evidence_layers ? result.evidence : [])}${result.evidence_layers?.gaps?.length ? evidenceLayer("查询缺口", result.evidence_layers.gaps.map((gap) => ({ ...gap, kind: "query_gap", summary: `${gap.missing_dimension} · ${gap.status}` }))) : ""}</div><aside class="trace-panel"><div class="panel-title"><span>RETRIEVAL TRACE</span><span class="live-label"><i></i>本地</span></div><h3>这次回答经过了什么？</h3>${(result.retrievalTrace || []).map((item, i) => `<div class="trace-step"><span>${String(i + 1).padStart(2, "0")}</span><div><strong>${escapeHtml(traceLabel(item))}</strong><small>${escapeHtml(traceDetail(item))}</small></div><b>✓</b></div>`).join("")}${toolTrace(result)}${algorithmEvidence(result)}<div class="trace-note">视频编码记忆 <span>接口预留</span></div></aside></section>` : `<section class="empty-search"><div class="empty-symbol">⌕</div><h2>从一个线索开始</h2><p>输入后会返回真实答案和原始证据，不会显示预填充结果。</p><div class="suggestions"><button data-query="图片里有什么？">图片里有什么？</button><button data-query="最近发生了什么？">最近发生了什么？</button><button data-query="哪些事实等待确认？">哪些事实等待确认？</button></div></section>`}`;
+    const messages = state.assistantMessages;
+    const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">LOCAL MEMORY STEWARD</p><h2>家庭记忆助手</h2><p>我会根据当前相册中的语义、事件与原始资料回答。没有足够依据时，我会说明需要补充的线索。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(state.spaces.find((item) => item.id === state.scopeId)?.name || state.scopeId)}</strong></div></section>`;
+    const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
+    return `${pageHeader("家庭记忆 / 对话", "家庭记忆助手", "一个中性的本地记忆管家。它只依据可回溯的家庭资料回答，不会主动推送或把推测当作事实。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>从一个人物、地点、时间或事件开始。</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭记忆助手</span></div><div class="assistant-bubble"><p>正在从本地事件和原始证据中查找。</p></div></article>` : ""}</section>${searchBar()}`;
   }
 
   function timelineView() {
@@ -477,7 +496,7 @@
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
     document.querySelectorAll("[data-person-filter]").forEach((element) => element.addEventListener("click", () => { state.personFilter = element.dataset.personFilter; renderView(); }));
     const spaceSelect = document.getElementById("space-select");
-    if (spaceSelect) spaceSelect.addEventListener("change", async (event) => { state.scopeId = event.target.value; window.localStorage?.setItem("sentrix.scopeId", state.scopeId); state.modal = null; await refreshData(); });
+    if (spaceSelect) spaceSelect.addEventListener("change", async (event) => { state.scopeId = event.target.value; window.localStorage?.setItem("sentrix.scopeId", state.scopeId); state.modal = null; state.conversationId = ""; state.searchResult = null; state.assistantMessages = []; await refreshData(); });
     const form = document.getElementById("search-form");
     if (form) form.addEventListener("submit", submitSearch);
     const modalForm = document.getElementById("modal-form");
@@ -493,9 +512,17 @@
     state.query = input ? input.value.trim() : state.query.trim();
     if (!state.query) return;
     state.view = "search";
+    state.assistantMessages.push({ role: "user", text: state.query });
     state.searchLoading = true;
     renderShellNavigation();
-    try { state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId); state.conversationId = state.searchResult.conversation_id || state.conversationId; } catch (error) { state.searchResult = { answer: "检索失败，当前没有可用的本地答案。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true }; }
+    try {
+      state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId);
+      state.conversationId = state.searchResult.conversation_id || state.conversationId;
+    } catch (error) {
+      state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
+    }
+    state.assistantMessages.push({ role: "steward", result: state.searchResult });
+    state.query = "";
     state.searchLoading = false;
     renderShellNavigation();
   }
@@ -627,6 +654,7 @@
     if (action === "open-folder") { document.getElementById("file-input")?.click(); return; }
     if (action === "toggle-sort") { state.assetSort = state.assetSort === "newest" ? "oldest" : "newest"; renderView(); return; }
     if (action === "toggle-entity-type") { const type = element.dataset.entityType; state.expandedEntityTypes[type] = !state.expandedEntityTypes[type]; renderView(); return; }
+    if (action === "continue-assistant") { state.query = element.dataset.query || ""; return submitSearch(); }
     if (action === "derive-entity-merge-candidates") { await window.sentrixApi.deriveEntityMergeCandidates(state.scopeId); state.toast = "已生成待审核的语义归并候选，实体尚未合并"; return refreshData(); }
     if (action === "review-entity-merge-candidate") { const candidate = state.entityMergeCandidates.find((item) => item.id === element.dataset.candidateId); return candidate && openModal({ type: "entity-merge-confirm", candidate }); }
     if (action === "reject-entity-merge-candidate") { await window.sentrixApi.rejectEntityMergeCandidate(element.dataset.candidateId); state.toast = "已保留原有实体，不会再次显示同一归并候选"; return refreshData(); }

@@ -50,6 +50,15 @@ test("native confirmation and assistant turn routes are exposed by the browser A
   assert.match(appSource, /toolTrace/);
 });
 
+test("family memory assistant presents an evidence-backed conversation surface", () => {
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(appSource, /家庭记忆助手/);
+  assert.match(appSource, /assistantMessages/);
+  assert.match(appSource, /assistant-message/);
+  assert.match(appSource, /clarification_candidates/);
+  assert.match(appSource, /continue-assistant/);
+});
+
 test("entity property corrections are exposed with evidence-aware UI controls", () => {
   const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
   const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
