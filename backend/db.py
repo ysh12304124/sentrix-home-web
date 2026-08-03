@@ -2322,8 +2322,11 @@ class MemoryStore:
         extracted = raw.get("gamma") if isinstance(raw.get("gamma"), dict) else raw
         captured_at = parse_time(observation.get("captured_at") or asset.get("captured_at"))
         captured_day = captured_at.date().isoformat() if captured_at else ""
+        gps_place = parse_gps_place(asset.get("captured_location"))
+        place_name = asset.get("captured_location") if gps_place else (observation.get("place") or asset.get("captured_location"))
+        scene_type = observation.get("place") or ""
         values = [
-            ("place", observation.get("place") or asset.get("captured_location"), "由图片观察或采集地点维护"),
+            ("place", place_name, "由图片观察或采集地点维护"),
             ("object", observation.get("objects") or [], "由图片观察到的物体"),
             ("emotion", [normalize_mood(value) for value in (extracted.get("emotions") or raw.get("emotions") or []) if normalize_mood(value)], "由图片观察到的情感"),
             ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
@@ -2349,10 +2352,16 @@ class MemoryStore:
                 entities.append(entity)
         evidence_ids = [observation_id, event_id] if event_id else [observation_id]
         if place_entity:
-            self.maintain_entity_property(
-                place_entity["id"], "scene_type", place_entity["canonical_name"],
-                observation.get("confidence", 0), evidence_ids, "observation_extraction",
-            )
+            if gps_place:
+                self.maintain_entity_property(
+                    place_entity["id"], "geo", {"latitude": gps_place[0], "longitude": gps_place[1]},
+                    observation.get("confidence", 0), evidence_ids, "asset_gps",
+                )
+            if scene_type:
+                self.maintain_entity_property(
+                    place_entity["id"], "scene_type", scene_type,
+                    observation.get("confidence", 0), evidence_ids, "observation_extraction",
+                )
         for entity in entities:
             if entity["entity_type"] != "object":
                 continue

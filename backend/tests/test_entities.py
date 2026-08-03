@@ -117,6 +117,22 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(time_properties["season"]["value"], "夏")
         self.assertEqual(time_properties["part_of_day"]["value"], ["傍晚"])
 
+    def test_gps_place_keeps_coordinates_separate_from_visual_scene_type(self):
+        self.store.update_asset("a1", "queued", {"captured_location": "30.274100,120.155100"})
+        self.store.connection.execute(
+            "UPDATE observations SET place = ? WHERE id = ?", ("西湖湖畔", self.obs1["id"])
+        )
+        self.store.connection.commit()
+
+        self.store.maintain_observation_entities(self.obs1["id"])
+        place = next(item for item in self.store.list_entities() if item["entity_type"] == "place")
+        properties = {item["property_key"]: item for item in self.store.get_entity_detail(place["id"])["properties"]}
+
+        self.assertEqual(place["canonical_name"], "30.274100,120.155100")
+        self.assertEqual(properties["geo"]["value"], {"latitude": 30.2741, "longitude": 120.1551})
+        self.assertEqual(properties["geo"]["source"], "asset_gps")
+        self.assertEqual(properties["scene_type"]["value"], "西湖湖畔")
+
     def test_private_place_has_an_alias_for_standard_entity_lists(self):
         place = self.store.create_entity("家中餐厅", "place", confidence=1.0)
         self.store.set_entity_property(place["id"], "alias", "我们的饭桌", [self.obs1["id"]])
