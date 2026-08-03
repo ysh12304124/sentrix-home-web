@@ -285,6 +285,24 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(store.get_query_gap(gap["id"])["status"], "resolved")
             self.assertEqual(gamma.answer_calls, 0)
 
+    def test_pending_identity_query_uses_review_fallback_and_keeps_candidate_name_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "家庭照片"})
+            cluster = store.create_face_cluster([0.1, 0.2, 0.3], 0.71)
+            gamma = RecordingGamma()
+
+            result = MemoryAgent(store, gamma=gamma).answer("还有哪些待命名人物？")
+
+            self.assertEqual(result["model"], "sentrix-identity-review")
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertEqual(gamma.answer_calls, 0)
+            self.assertIn("1 位待命名成员", result["answer"])
+            self.assertNotIn(cluster["id"], result["answer"])
+            self.assertEqual(result["evidence"][0]["name"], "待命名成员 1")
+            self.assertEqual(store.get_query_gap(result["query_gap_id"])["missing_dimension"], "identity")
+
     def test_image_query_returns_structured_asset_result(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")

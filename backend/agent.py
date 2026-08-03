@@ -177,6 +177,70 @@ class MemoryAgent:
             "scope_id": scope_id,
         }
 
+    @staticmethod
+    def _is_pending_identity_query(query):
+        value = str(query or "")
+        return any(token in value for token in ("待命名", "未命名人物", "未命名成员", "候选人物", "谁还没命名"))
+
+    def _pending_identity_answer(self, query, retrieved):
+        """Return an evidence-only review request without exposing candidate labels."""
+        pending_people = [
+            entity for entity in retrieved.get("entities", [])
+            if entity.get("entity_type") == "person" and entity.get("status") == "pending"
+        ]
+        clusters_by_entity = {}
+        for cluster in self.store.list_face_clusters():
+            if retrieved.get("scope_id") and cluster.get("scope_id") != retrieved["scope_id"]:
+                continue
+            if cluster.get("entity_id"):
+                clusters_by_entity.setdefault(cluster["entity_id"], []).append(cluster)
+
+        evidence = []
+        candidate_asset_ids = []
+        for index, entity in enumerate(pending_people, 1):
+            clusters = clusters_by_entity.get(entity["id"], [])
+            sample_asset_ids = list(dict.fromkeys(
+                sample.get("asset_id") for cluster in clusters for sample in cluster.get("samples", []) if sample.get("asset_id")
+            ))
+            candidate_asset_ids.extend(sample_asset_ids)
+            evidence.append({
+                "kind": "person", "id": entity["id"], "person_id": entity["id"],
+                "name": f"待命名成员 {index}", "status": "pending",
+                "confidence": entity.get("confidence", 0),
+                "cluster_ids": [cluster["id"] for cluster in clusters],
+                "asset_ids": sample_asset_ids,
+            })
+        gap = self.store.create_query_gap(
+            query, "identity", list(dict.fromkeys(candidate_asset_ids)), [item["id"] for item in evidence],
+        )
+        count = len(evidence)
+        answer = (
+            f"当前有 {count} 位待命名成员，系统尚未确认其姓名。"
+            "请在人脸与关系页面查看每个簇的原始样本后确认或驳回；在确认前不会把候选身份写入长期人物记忆。"
+            if count else "当前范围内没有待命名成员。"
+        )
+        return {
+            "answer": answer,
+            "confidence": 0.0 if count else 1.0,
+            "insufficient_evidence": bool(count),
+            "model": "sentrix-identity-review",
+            "modelEvidence": [],
+            "evidence": evidence,
+            "retrieval_trace": [
+                {"stage": "identity_review", "status": "complete", "counts": {"pending_people": count, "query_gaps": 1 if count else 0}},
+                {"stage": "vector", "status": "skipped", "counts": {"hits": 0}},
+                {"stage": "evidence_validation", "status": "complete", "counts": {"evidence": len(evidence)}},
+            ],
+            "evidence_layers": {
+                "answers": [{"id": None, "text": answer}], "people": evidence, "events": [], "claims": [],
+                "appearance": [], "observations": [], "assets": [
+                    {"kind": "asset", "id": asset_id} for asset_id in dict.fromkeys(candidate_asset_ids)
+                ], "gaps": [gap] if count else [],
+            },
+            "query": query,
+            "query_gap_id": gap["id"] if count else None,
+        }
+
     def context(self, retrieved):
         lines = [
             "Sentrix evidence only. Evidence不足时明确说明，不得编造。",
@@ -345,6 +409,8 @@ class MemoryAgent:
 
     def answer(self, query, conversation_context=None, scope_id=None):
         retrieved = self.retrieve(query, scope_id)
+        if self._is_pending_identity_query(query):
+            return self._pending_identity_answer(query, retrieved)
         retrieved, query_gap = self._refine_visual_memory(query, retrieved)
         evidence = []
         seen = set()

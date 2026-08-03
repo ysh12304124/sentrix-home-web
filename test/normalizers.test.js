@@ -48,6 +48,7 @@ test("normalizes confirmed and pending persons without losing source ids", () =>
   assert.equal(result[1].id, "p2");
   assert.equal(result[1].confirmed, false);
   assert.equal(result[1].count, "1");
+  assert.equal(result[1].name, "待命名成员 2");
 });
 
 test("builds an agent context with events, people, and explicit evidence rules", () => {

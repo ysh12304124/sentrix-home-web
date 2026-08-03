@@ -160,8 +160,13 @@ def person_detail(person_id: str):
 @app.get("/api/people")
 def people(status: str | None = None, scope_id: str | None = None):
     values = [item for item in store.list_entities(status, scope_id=scope_id) if item["entity_type"] == "person"]
+    pending_index = 0
     for item in values:
-        item["display_name"] = item["canonical_name"]
+        if item["status"] == "pending":
+            pending_index += 1
+            item["display_name"] = f"待命名成员 {pending_index}"
+        else:
+            item["display_name"] = item["canonical_name"]
         item["confirmed"] = item["status"] == "confirmed"
         item["profile"] = store.get_semantic_profile(item["id"])
         item["claims"] = store.list_semantic_claims(item["id"], 100)
@@ -219,6 +224,9 @@ def entity_detail(entity_id: str):
     value = store.get_entity_detail(entity_id)
     if not value:
         raise HTTPException(status_code=404, detail="entity not found")
+    entity = value.get("entity") or {}
+    if entity.get("entity_type") == "person" and entity.get("status") == "pending":
+        entity["canonical_name"] = "待命名成员"
     return value
 
 

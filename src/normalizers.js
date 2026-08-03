@@ -54,8 +54,10 @@ function normalizeDashboard(payload = {}) {
 
 function normalizePersons(persons = []) {
   return (Array.isArray(persons) ? persons : []).map((person, index) => {
-    const name = firstValue(person.display_name, person.name, person.label, `待命名成员 ${index + 1}`);
     const confirmed = Boolean(person.confirmed || person.status === "confirmed");
+    const name = confirmed
+      ? firstValue(person.display_name, person.name, person.label, `家庭成员 ${index + 1}`)
+      : `待命名成员 ${index + 1}`;
     return {
       id: String(firstValue(person.id, person.person_id, `person_${index + 1}`)),
       name: String(name),

@@ -1,8 +1,9 @@
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 import unittest
+from datetime import timezone
 
-from backend.db import MemoryStore
+from backend.db import MemoryStore, parse_time
 
 
 class MemoryStoreTests(unittest.TestCase):
@@ -40,6 +41,13 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(event_one["id"], event_two["id"])
         self.assertEqual(self.store.count("events"), 1)
         self.assertEqual(self.store.count("event_observations"), 2)
+
+    def test_naive_capture_time_is_normalized_before_event_comparison(self):
+        naive = parse_time("2018-06-28T12:16:02")
+        aware = parse_time("2018-06-28T12:16:02+00:00")
+
+        self.assertEqual(naive.tzinfo, timezone.utc)
+        self.assertEqual((naive - aware).total_seconds(), 0)
 
     def test_event_does_not_promote_structured_people_descriptions_to_participants(self):
         asset = self.store.create_asset("structured_people", "people.jpg", "image", "/tmp/people.jpg")
