@@ -105,6 +105,20 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(len(event["observation_ids"]), 2)
         self.assertTrue(any(item["person_name"] == "妈妈" for item in event["participant_roles"]))
 
+    def test_person_profile_summarizes_evidence_backed_places_and_activities(self):
+        self.store.connection.execute(
+            "UPDATE observations SET place = ?, activity = ? WHERE id = ?",
+            ("家中餐厅", "准备晚餐", self.obs1["id"]),
+        )
+        self.store.connection.commit()
+        self.store.merge_observation_into_event(self.store.get_observation(self.obs1["id"]))
+        face = self.store.add_face_instance("a1", self.obs1["id"], {"bbox": [1, 2, 30, 40], "confidence": 0.95, "embedding": [1, 0, 0]})
+
+        detail = self.store.confirm_face_cluster(face["cluster_id"], "妈妈", "母亲")
+
+        self.assertIn("常见地点：家中餐厅", detail["semantic_profile"]["summary_zh"])
+        self.assertIn("常见活动：准备晚餐", detail["semantic_profile"]["summary_zh"])
+
     def test_person_memory_does_not_inherit_scene_clothing_as_person_attribute(self):
         self.store.connection.execute(
             "UPDATE observations SET clothing_json = ? WHERE id = ?",

@@ -3,6 +3,7 @@ import math
 import sqlite3
 import threading
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 
 
@@ -1653,6 +1654,12 @@ class MemoryStore:
             summary_parts.append(f"出现在{len(observation_ids)}条观察中")
         if event_ids:
             summary_parts.append(f"关联{len(event_ids)}个事件")
+        common_places = [value for value, _ in Counter(places).most_common(3)]
+        common_activities = [value for value, _ in Counter(activities).most_common(3)]
+        if common_places:
+            summary_parts.append("常见地点：" + "、".join(common_places))
+        if common_activities:
+            summary_parts.append("常见活动：" + "、".join(common_activities))
         summary = f"{entity['canonical_name']}已确认，" + "；".join(summary_parts or ["等待新的家庭记忆证据"] ) + "。"
         activity_summary = "；".join(
             f"{event.get('time_start') or '时间未知'} 在{event.get('place') or '地点未知'}：{event.get('activity') or event.get('title') or '家庭记录'}"
