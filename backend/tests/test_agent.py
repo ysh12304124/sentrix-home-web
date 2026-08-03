@@ -36,6 +36,11 @@ class RecordingGamma(FakeGamma):
         return {"objects": ["补全物体"], "confidence": 0.8}
 
 
+class FailingClip:
+    def embed_text(self, text):
+        raise AssertionError("pending identity review must not use vector recall")
+
+
 class AgentEvidenceTests(unittest.TestCase):
     def test_search_terms_do_not_match_every_filename_by_one_common_token(self):
         self.assertTrue(contains("SR_AWS_N_0016.jpg", "SR_AWS_N_0016.jpg"))
@@ -293,7 +298,7 @@ class AgentEvidenceTests(unittest.TestCase):
             cluster = store.create_face_cluster([0.1, 0.2, 0.3], 0.71)
             gamma = RecordingGamma()
 
-            result = MemoryAgent(store, gamma=gamma).answer("还有哪些待命名人物？")
+            result = MemoryAgent(store, gamma=gamma, clip=FailingClip()).answer("还有哪些待命名人物？")
 
             self.assertEqual(result["model"], "sentrix-identity-review")
             self.assertTrue(result["insufficient_evidence"])

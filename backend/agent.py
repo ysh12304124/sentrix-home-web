@@ -182,15 +182,15 @@ class MemoryAgent:
         value = str(query or "")
         return any(token in value for token in ("待命名", "未命名人物", "未命名成员", "候选人物", "谁还没命名"))
 
-    def _pending_identity_answer(self, query, retrieved):
+    def _pending_identity_answer(self, query, scope_id=None):
         """Return an evidence-only review request without exposing candidate labels."""
         pending_people = [
-            entity for entity in retrieved.get("entities", [])
+            entity for entity in self.store.list_entities(scope_id=scope_id)
             if entity.get("entity_type") == "person" and entity.get("status") == "pending"
         ]
         clusters_by_entity = {}
         for cluster in self.store.list_face_clusters():
-            if retrieved.get("scope_id") and cluster.get("scope_id") != retrieved["scope_id"]:
+            if scope_id and cluster.get("scope_id") != scope_id:
                 continue
             if cluster.get("entity_id"):
                 clusters_by_entity.setdefault(cluster["entity_id"], []).append(cluster)
@@ -408,9 +408,9 @@ class MemoryAgent:
         return {"answer": f"当前本地记忆没有找到能回答“{query}”的证据。", "confidence": 0.0, "insufficient_evidence": True}
 
     def answer(self, query, conversation_context=None, scope_id=None):
-        retrieved = self.retrieve(query, scope_id)
         if self._is_pending_identity_query(query):
-            return self._pending_identity_answer(query, retrieved)
+            return self._pending_identity_answer(query, scope_id)
+        retrieved = self.retrieve(query, scope_id)
         retrieved, query_gap = self._refine_visual_memory(query, retrieved)
         evidence = []
         seen = set()
