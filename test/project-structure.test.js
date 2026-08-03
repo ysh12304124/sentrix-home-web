@@ -12,6 +12,7 @@ test("runtime and maintenance entry points use the documented layout", () => {
     ["scripts", "runtime", "start_sentrix_ollama.sh"],
     ["scripts", "maintenance", "rebuild_memory.py"],
     ["scripts", "benchmarks", "evaluate_lfw_clusters.py"],
+    ["scripts", "benchmarks", "evaluate_memory_steward.py"],
     ["scripts", "fixtures", "build_virtual_family_album.py"],
   ]) assert.equal(exists(...file), true, file.join("/") + " must exist");
   assert.match(fs.readFileSync(path.join(root, "index.html"), "utf8"), /href="\/src\/styles\.css"/);
