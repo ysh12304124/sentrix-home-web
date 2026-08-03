@@ -399,6 +399,15 @@ git diff --check
 | 2026-07-31 | `d00cd02` 至 `dab0f66` | 改进重建期间页面更新、基准默认相册、事件合并、轮询输入/媒体保护、增量相册隔离和人物事实清理。 |
 | 2026-08-02 | `853ff66` | 对 153 工作树、服务、数据库和未完成 MVP 门槛完成当前状态核验。 |
 | 2026-08-03 | `878579b`、`d588c53` | 加入视觉模型门禁、核心语义快速路径、延迟事件总结与并发导入修复；隔离稳定态完整语义达到 `5.502x`。 |
+| 2026-08-03 | `cefb3f1`、`065f784`、`8c291d5` | 三相册使用 GPU 管线重跑并替换正式派生库：`189/189` Asset 均已处理，全部人物保持待命名。身份查询直接返回可审阅簇、原图证据和 `identity` 查询缺口，跳过向量与大模型；待确认簇内部标识不再从 API/UI 泄漏。 |
+
+## 当前生产结果（2026-08-03）
+
+- 正式 SQLite 已备份为 `data/backups/sentrix-before-household-rerun-20260803.db`，不纳入 Git。
+- 当前 `data/sentrix.db` 完整性为 `ok`：`album1=62/62`、`album2=58/58`、`album3=69/69`，合计 `189/189` 均为 `processed`；所有人物实体为 `pending`，确认人物数为 `0`。
+- `8090` 由 `scripts/runtime/start_sentrix_api.sh` 启动，进程环境含
+  `FACE_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider` 与 NVIDIA runtime 库路径；Web `4174` 和 FMA `5173` 均在本次切换后返回 `200`，未改动 FMA。
+- 真实相册标签没有人脸框，且存在漏检和标注人数不一致；不能以此宣称三相册人脸 F1 达到 95%。LFW 受控门禁结果仍为 coverage `0.9917`、F1 `0.9916`。
 
 ## 接手原则
 
