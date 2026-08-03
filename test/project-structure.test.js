@@ -88,6 +88,13 @@ test("pending trip candidates are loaded as evidence-backed semantic memory", ()
   assert.match(appSource, /evidence_ids_json/);
 });
 
+test("entity reindex maintenance isolates its SQLite connection and rejects concurrent runs", () => {
+  const source = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
+  assert.match(source, /maintenance_lock/);
+  assert.match(source, /MemoryStore\(store\.path\)/);
+  assert.match(source, /status_code=409/);
+});
+
 test("memory-space and evidence governance are wired into the portal", () => {
   const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(source, /space-select/);

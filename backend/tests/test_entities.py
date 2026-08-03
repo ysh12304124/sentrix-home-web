@@ -391,6 +391,30 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(properties["raw_mood_labels"]["value"], ["面带微笑"])
         self.assertEqual(properties["raw_mood_labels"]["evidence_ids"], [self.obs1["id"]])
 
+    def test_reindex_migrates_legacy_raw_mood_entity_to_normalized_entity(self):
+        legacy = self.store.create_entity("面带微笑", "emotion", confidence=0.7)
+        place = self.store.create_entity("家中餐厅", "place", confidence=0.8)
+        self.store.create_relationship(legacy["id"], "出现在", place["id"], [self.obs1["id"]], 0.7)
+        self.store.connection.execute(
+            "UPDATE observations SET raw_json = ? WHERE id = ?",
+            ('{"gamma": {"emotions": ["面带微笑"]}}', self.obs1["id"]),
+        )
+        self.store.connection.commit()
+
+        result = self.store.reindex_observation_entities()
+        emotions = [item for item in self.store.list_entities(public=False) if item["entity_type"] == "emotion"]
+        joyful = next(item for item in emotions if item["canonical_name"] == "喜悦")
+        properties = {item["property_key"]: item for item in self.store.list_entity_properties(joyful["id"])}
+
+        self.assertEqual(result["normalized_moods"], 1)
+        self.assertFalse(any(item["id"] == legacy["id"] for item in emotions))
+        self.assertEqual(joyful["evidence_count"], 1)
+        self.assertEqual(properties["raw_mood_labels"]["value"], ["面带微笑"])
+        self.assertTrue(any(
+            relationship["subject_entity_id"] == joyful["id"] and relationship["object_entity_id"] == place["id"]
+            for relationship in self.store.list_relationships(joyful["id"])
+        ))
+
     def test_event_projects_linked_entities_with_observation_evidence(self):
         self.store.connection.execute(
             "UPDATE observations SET captured_at = ?, place = ?, objects_json = ?, raw_json = ? WHERE id = ?",

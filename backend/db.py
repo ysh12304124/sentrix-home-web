@@ -2329,7 +2329,58 @@ class MemoryStore:
         for row in rows:
             event_row = self._row("SELECT event_id FROM event_observations WHERE observation_id = ? LIMIT 1", (row["id"],))
             total += len(self.maintain_observation_entities(row["id"], event_row["event_id"] if event_row else None))
-        return {"observations": len(rows), "entity_links": total, "scope_id": scope_id}
+        normalized_moods = self.normalize_legacy_mood_entities(scope_id)
+        return {"observations": len(rows), "entity_links": total, "normalized_moods": normalized_moods, "scope_id": scope_id}
+
+    def normalize_legacy_mood_entities(self, scope_id=None):
+        """Retire prior model-only mood labels after moving every evidence edge."""
+        clauses = ["entity_type = 'emotion'", "status != 'rejected'"]
+        params = []
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        legacy_entities = self._rows("SELECT * FROM entities WHERE " + " AND ".join(clauses), params)
+        normalized_count = 0
+        for legacy in legacy_entities:
+            normalized_name = normalize_mood(legacy["canonical_name"])
+            if not normalized_name or normalized_name == legacy["canonical_name"]:
+                continue
+            if self._row("SELECT 1 FROM entity_properties WHERE entity_id = ? AND source = 'user' LIMIT 1", (legacy["id"],)):
+                continue
+            target = self._find_or_create_entity(
+                normalized_name, "emotion", legacy.get("scope_id"), legacy.get("confidence", 0), "由图片观察到的情感",
+            )
+            evidence_rows = self._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+            evidence_ids = [row["observation_id"] for row in evidence_rows]
+            for evidence in evidence_rows:
+                self.connection.execute(
+                    """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_id, observation_id)
+                    DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
+                    (target["id"], evidence["observation_id"], evidence["confidence"], evidence["source"], evidence["created_at"]),
+                )
+            for link in self._rows("SELECT * FROM event_entities WHERE entity_id = ?", (legacy["id"],)):
+                self.upsert_event_entity(link["event_id"], target["id"], link["relation"], json.loads(link["evidence_ids_json"] or "[]"), link["confidence"])
+            for relationship in self._rows(
+                "SELECT * FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'",
+                (legacy["id"], legacy["id"]),
+            ):
+                subject_id = target["id"] if relationship["subject_entity_id"] == legacy["id"] else relationship["subject_entity_id"]
+                object_id = target["id"] if relationship["object_entity_id"] == legacy["id"] else relationship["object_entity_id"]
+                self.create_relationship(
+                    subject_id, relationship["predicate"], object_id, json.loads(relationship["evidence_ids_json"] or "[]"),
+                    relationship["confidence"], relationship["status"],
+                )
+            self.maintain_entity_property(target["id"], "mood_label", normalized_name, legacy.get("confidence", 0), evidence_ids, "mood_normalization_v1")
+            self.maintain_entity_property_values(target["id"], "raw_mood_labels", [legacy["canonical_name"]], legacy.get("confidence", 0), evidence_ids, "mood_normalization_v1")
+            self._record_entity_revision(target["id"], "mood_normalization", legacy["canonical_name"], normalized_name, "mood_normalization_v1", evidence_ids)
+            self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (legacy["id"],))
+            self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+            self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (legacy["id"], legacy["id"]))
+            self.connection.execute("UPDATE entities SET status = 'rejected', updated_at = ? WHERE id = ?", (now_iso(), legacy["id"]))
+            self.connection.commit()
+            normalized_count += 1
+        return normalized_count
 
     def list_entities(self, status=None, scope_id=None, public=True):
         params = [status] if status else []

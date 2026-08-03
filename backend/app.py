@@ -2,6 +2,7 @@ import os
 import shutil
 import hashlib
 import tempfile
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -30,6 +31,7 @@ agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
 
 app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+maintenance_lock = threading.Lock()
 
 
 class SearchRequest(BaseModel):
@@ -245,7 +247,14 @@ def knowledge(person_id: str | None = None, scope_id: str | None = None):
 
 @app.post("/api/maintenance/reindex-entities")
 def reindex_entities(scope_id: str | None = None):
-    return store.reindex_observation_entities(scope_id)
+    if not maintenance_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="entity reindex is already running")
+    maintenance_store = MemoryStore(store.path)
+    try:
+        return maintenance_store.reindex_observation_entities(scope_id)
+    finally:
+        maintenance_store.close()
+        maintenance_lock.release()
 
 
 @app.get("/api/entities/{entity_id}")
