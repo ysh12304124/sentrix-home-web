@@ -22,4 +22,19 @@ if ((${#runtime_dirs[@]})); then
 fi
 
 export FACE_PROVIDERS="${FACE_PROVIDERS:-CUDAExecutionProvider,CPUExecutionProvider}"
+export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-adaface}"
+export ADAFACE_MODEL_PATH="${ADAFACE_MODEL_PATH:-/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt}"
+export ADAFACE_REPO_ROOT="${ADAFACE_REPO_ROOT:-/home/asus/models/AdaFace}"
+
+if [[ "$FACE_EMBEDDING_MODE" == "adaface" ]]; then
+  if [[ ! -f "$ADAFACE_MODEL_PATH" ]]; then
+    echo "AdaFace checkpoint is unavailable: $ADAFACE_MODEL_PATH" >&2
+    exit 1
+  fi
+  if [[ ! -f "$ADAFACE_REPO_ROOT/net.py" ]]; then
+    echo "AdaFace repository is unavailable: $ADAFACE_REPO_ROOT/net.py" >&2
+    exit 1
+  fi
+fi
+
 exec "$python_bin" -m uvicorn backend.app:app --host "${SENTRIX_API_HOST:-0.0.0.0}" --port "$port"

@@ -555,6 +555,44 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
             self.assertIn(event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
 
+    def test_dialogue_explicit_new_subject_does_not_reuse_previous_event_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            father = store.create_entity("爸爸", "person", "confirmed", confidence=1.0, scope_id="album_a")
+            mother = store.create_entity("妈妈", "person", "confirmed", confidence=1.0, scope_id="album_a")
+            father_asset = store.create_asset("father_asset", "father.jpg", "image", "/tmp/father.jpg", scope_id="album_a")
+            father_observation = store.add_observation(father_asset["id"], {"caption": "爸爸在书房看书"})
+            father_event = store.merge_observation_into_event(father_observation)
+            store.upsert_event_participant(father_event["id"], father["id"], "visible_subject", [father_observation["id"]], 0.9)
+            mother_asset = store.create_asset("mother_asset", "mother.jpg", "image", "/tmp/mother.jpg", scope_id="album_a")
+            mother_observation = store.add_observation(mother_asset["id"], {"caption": "妈妈在花园浇花"})
+            mother_event = store.merge_observation_into_event(mother_observation)
+            store.upsert_event_participant(mother_event["id"], mother["id"], "visible_subject", [mother_observation["id"]], 0.9)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            agent.answer_turn("介绍一下爸爸", "dialogue-topic-switch", scope_id="album_a")
+            second = agent.answer_turn("然后介绍一下妈妈", "dialogue-topic-switch", scope_id="album_a")
+
+            self.assertEqual(second["dialogue_plan"]["mode"], "planned_query")
+            self.assertIn(mother_event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
+            self.assertNotIn(father_event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
+
+    def test_dialogue_selected_clarification_candidate_becomes_active_entity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            east = store.create_entity("东湖边", "place", confidence=0.9, scope_id="album_a")
+            west = store.create_entity("西湖边", "place", confidence=0.9, scope_id="album_a")
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            first = agent.answer_turn("湖边在哪里", "dialogue-selection", scope_id="album_a")
+            second = agent.answer_turn("东湖边", "dialogue-selection", scope_id="album_a", selected_entity_id=east["id"])
+
+            self.assertTrue(first["clarification_candidates"])
+            self.assertEqual(second["dialogue_plan"]["mode"], "clarification_selection")
+            self.assertIn(east["id"], second["dialogue_state"]["active_entity_ids"])
+            self.assertNotIn(west["id"], second["dialogue_state"]["active_entity_ids"])
+            self.assertEqual(second["tool_trace"][0]["constraints"]["selected_entity_id"], east["id"])
+
     def test_dialogue_does_not_reuse_context_when_memory_space_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")

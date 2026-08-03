@@ -15,6 +15,9 @@ test("runtime and maintenance entry points use the documented layout", () => {
     ["scripts", "benchmarks", "evaluate_memory_steward.py"],
     ["scripts", "fixtures", "build_virtual_family_album.py"],
   ]) assert.equal(exists(...file), true, file.join("/") + " must exist");
+  const apiStartScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_api.sh"), "utf8");
+  assert.match(apiStartScript, /ADAFACE_MODEL_PATH/, "API startup must configure the AdaFace checkpoint");
+  assert.match(apiStartScript, /ADAFACE_REPO_ROOT/, "API startup must configure the AdaFace repository root");
   assert.match(fs.readFileSync(path.join(root, "index.html"), "utf8"), /href="\/src\/styles\.css"/);
 });
 

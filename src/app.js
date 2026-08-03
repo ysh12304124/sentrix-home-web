@@ -211,7 +211,7 @@
     const primary = [...(layers.events || []), ...(layers.observations || []), ...(layers.claims || [])];
     const candidates = result.clarification_candidates || [];
     const evidence = primary.length ? evidenceLayer("本次依据", primary) : "";
-    const followups = candidates.length ? `<div class="assistant-followups"><p>你可以继续说明：</p>${candidates.map((item) => `<button data-action="continue-assistant" data-query="${escapeHtml(item.name)}">${escapeHtml(item.name)} <small>${escapeHtml(item.entity_type)} · ${item.evidence_count || 0} 条证据</small></button>`).join("")}</div>` : "";
+    const followups = candidates.length ? `<div class="assistant-followups"><p>你可以继续说明：</p>${candidates.map((item) => `<button data-action="continue-assistant" data-query="${escapeHtml(item.name)}" data-entity-id="${escapeHtml(item.id)}">${escapeHtml(item.name)} <small>${escapeHtml(item.entity_type)} · ${item.evidence_count || 0} 条证据</small></button>`).join("")}</div>` : "";
     const ordered = result.evidence_order || [];
     const order = ordered.length ? `<details class="algorithm-evidence"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
     return `${followups}${imageResults(result)}${evidence}${order}${toolTrace(result)}${algorithmEvidence(result)}`;
@@ -510,7 +510,7 @@
     if (fileInput) fileInput.addEventListener("change", handleFiles);
   }
 
-  async function submitSearch(event) {
+  async function submitSearch(event, selectedEntityId = "") {
     if (event?.preventDefault) event.preventDefault();
     const input = document.getElementById("search-input");
     state.query = input ? input.value.trim() : state.query.trim();
@@ -520,7 +520,7 @@
     state.searchLoading = true;
     renderShellNavigation();
     try {
-      state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId);
+      state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
       state.conversationId = state.searchResult.conversation_id || state.conversationId;
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
@@ -658,7 +658,7 @@
     if (action === "open-folder") { document.getElementById("file-input")?.click(); return; }
     if (action === "toggle-sort") { state.assetSort = state.assetSort === "newest" ? "oldest" : "newest"; renderView(); return; }
     if (action === "toggle-entity-type") { const type = element.dataset.entityType; state.expandedEntityTypes[type] = !state.expandedEntityTypes[type]; renderView(); return; }
-    if (action === "continue-assistant") { state.query = element.dataset.query || ""; return submitSearch(); }
+    if (action === "continue-assistant") { state.query = element.dataset.query || ""; return submitSearch(null, element.dataset.entityId || ""); }
     if (action === "derive-entity-merge-candidates") { await window.sentrixApi.deriveEntityMergeCandidates(state.scopeId); state.toast = "已生成待审核的语义归并候选，实体尚未合并"; return refreshData(); }
     if (action === "review-entity-merge-candidate") { const candidate = state.entityMergeCandidates.find((item) => item.id === element.dataset.candidateId); return candidate && openModal({ type: "entity-merge-confirm", candidate }); }
     if (action === "reject-entity-merge-candidate") { await window.sentrixApi.rejectEntityMergeCandidate(element.dataset.candidateId); state.toast = "已保留原有实体，不会再次显示同一归并候选"; return refreshData(); }

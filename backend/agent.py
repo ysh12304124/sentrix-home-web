@@ -119,6 +119,15 @@ class MemoryAgent:
             "他呢", "她呢", "它呢", "这里呢", "那里呢", "这段呢", "那个呢",
         ))
 
+    def _has_explicit_entity_reference(self, message, scope_id, active_entity_ids):
+        """A named entity starts a new subject unless it is already in focus."""
+        value = str(message or "")
+        for entity in self.store.list_entities(scope_id=scope_id):
+            name = str(entity.get("canonical_name") or "").strip()
+            if name and name in value and entity["id"] not in set(active_entity_ids or []):
+                return True
+        return False
+
     @staticmethod
     def _dialogue_style(query, result):
         if result.get("insufficient_evidence"):
@@ -861,7 +870,7 @@ class MemoryAgent:
         turns.append({"role": role, "text": str(text or "")[:2000]})
         del turns[:-self._conversation_limit]
 
-    def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None):
+    def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None, selected_entity_id=None):
         conversation_id = conversation_id or f"conversation_{uuid.uuid4().hex[:12]}"
         intent = self.classify_intent(message, feedback)
         if intent == "feedback":
@@ -891,12 +900,25 @@ class MemoryAgent:
         previous = self._conversation_text(conversation_id)
         prior_state = self._dialogue_states.get(conversation_id) or self.store.get_dialogue_state(conversation_id, scope_id) or {}
         query = str(message or "").strip()
+        selected_entity = self.store.get_entity(selected_entity_id) if selected_entity_id else None
+        if selected_entity and selected_entity.get("scope_id") != (scope_id or "home-default"):
+            selected_entity = None
+        explicit_new_subject = self._has_explicit_entity_reference(query, scope_id, prior_state.get("active_entity_ids"))
         contextual_follow_up = (
             self._is_contextual_follow_up(query)
             and prior_state.get("scope_id") == scope_id
             and prior_state.get("active_event_ids")
+            and not explicit_new_subject
         )
-        if contextual_follow_up:
+        if selected_entity:
+            result = self.answer(query, previous, scope_id)
+            result.setdefault("tool_trace", []).insert(0, {
+                "tool": "resolve_constraints", "permission": "read", "status": "complete",
+                "constraints": {"selected_entity_id": selected_entity["id"]},
+            })
+            result["clarification_candidates"] = []
+            dialogue_mode = "clarification_selection"
+        elif contextual_follow_up:
             event_ids = prior_state["active_event_ids"]
             events = [self.store.get_event(event_id) for event_id in event_ids]
             events = [event for event in events if event and (not scope_id or event.get("scope_id") == scope_id)]
@@ -925,6 +947,8 @@ class MemoryAgent:
         active_entity_ids = list(dict.fromkeys(
             item.get("person_id") for item in result.get("evidence", []) if item.get("person_id")
         ))
+        if selected_entity:
+            active_entity_ids.insert(0, selected_entity["id"])
         dialogue_state = {
             "scope_id": scope_id, "active_event_ids": active_event_ids[:8],
             "active_entity_ids": active_entity_ids[:8],

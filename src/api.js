@@ -49,7 +49,7 @@
     createRelationship: (payload) => request("/api/relationships", { method: "POST", body: JSON.stringify(payload) }),
     confirmRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/confirm`, { method: "POST" }),
     confirmPerson: (id, name, familyRole = "") => request(`/api/persons/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify({ name, family_role: familyRole }) }),
-    assistantTurn: (message, conversationId = "", feedback = null, scopeId = "home-default") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId }) }),
+    assistantTurn: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null }) }),
     rejectPerson: (id) => request(`/api/persons/${encodeURIComponent(id)}/reject`, { method: "POST" }),
     stories: () => request("/api/stories"),
     createStory: (payload) => request("/api/stories", { method: "POST", body: JSON.stringify(payload) }),
