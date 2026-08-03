@@ -75,6 +75,10 @@ class MemoryAgent:
         return len(focused_people) >= 2 and any(token in str(query or "") for token in ("比较", "区别", "不同", "共同", "对比"))
 
     @staticmethod
+    def _is_recall_recommendation_query(query):
+        return any(token in str(query or "") for token in ("推荐", "回顾", "回忆一下", "看看回忆"))
+
+    @staticmethod
     def _is_evidence_request(query):
         return any(token in str(query or "") for token in ("证据", "原图", "照片", "图片", "依据", "为什么"))
 
@@ -91,6 +95,8 @@ class MemoryAgent:
         trace = [{"tool": "resolve_constraints", "permission": "read", "status": "complete", "constraints": constraints}]
         if self._is_comparison_query(query, focused_people):
             trace.append({"tool": "compare_memories", "permission": "read", "status": "complete", "entity_ids": constraints["people"]})
+        elif self._is_recall_recommendation_query(query):
+            trace.append({"tool": "suggest_recall", "permission": "read", "status": "complete" if evidence_count else "requires_anchor", "entity_ids": constraints["people"]})
         elif self._is_entity_introduction_query(query, focused_people):
             trace.append({"tool": "describe_entity", "permission": "read", "status": "complete", "entity_ids": constraints["people"]})
         elif self._is_timeline_query(query):
@@ -103,6 +109,11 @@ class MemoryAgent:
         if insufficient:
             trace.append({"tool": "request_clarification", "permission": "read", "status": "required", "reason": "insufficient_evidence"})
         return trace
+
+    @staticmethod
+    def _recall_recommendation_answer(events):
+        summaries = [item.get("summary") or item.get("title") or item.get("id") for item in events[:3]]
+        return "根据已锚定的本地事件证据，推荐回顾：" + "；".join(summaries) + "。"
 
     def _clarification_candidates(self, query, scope_id=None):
         value = str(query or "")
@@ -571,6 +582,7 @@ class MemoryAgent:
         seen = set()
         activity_query = self._is_activity_query(query)
         intent = public_retrieved.get("intent", {})
+        recall_recommendation = self._is_recall_recommendation_query(query)
         for event in public_retrieved["events"][:8]:
             detail = self.store.get_event_detail(event["id"])
             if not detail:
@@ -609,6 +621,24 @@ class MemoryAgent:
                     "confidence": appearance.get("confidence", 0), "model": appearance.get("model_name"),
                 })
         if not evidence:
+            if recall_recommendation:
+                result = {
+                    "answer": "请先告诉我想回顾的人物、地点或日期，我会只从有原始证据的事件中推荐。",
+                    "confidence": 0.0,
+                    "insufficient_evidence": True,
+                    "model": "sentrix-evidence-fallback",
+                    "modelEvidence": [], "evidence": [], "clarification_candidates": [],
+                }
+                result["retrieval_trace"] = [
+                    {"stage": "lexical", "status": "complete", "counts": {"events": 0, "observations": 0, "facts": 0}},
+                    {"stage": "semantic", "status": "complete", "counts": {"claims": 0, "entities": len(public_retrieved.get("entities", [])), "relationships": 0}},
+                    {"stage": "vector", "status": "skipped", "counts": {"hits": 0, "accepted": 0, "candidates": 0}},
+                    {"stage": "evidence_validation", "status": "requires_anchor", "counts": {"evidence": 0, "query_gaps": 0}},
+                ]
+                result["evidence_layers"] = {"answers": [{"id": None, "text": result["answer"]}], "people": [], "events": [], "claims": [], "appearance": [], "observations": [], "assets": [], "gaps": []}
+                result["query"] = query
+                result["tool_trace"] = self._tool_trace(query, public_retrieved, insufficient=True)
+                return result
             candidates = self._clarification_candidates(query, scope_id)
             candidate_asset_ids = list(dict.fromkeys(
                 item.get("metadata", {}).get("asset_id") for item in public_retrieved.get("vectors", [])
@@ -656,6 +686,11 @@ class MemoryAgent:
                 "evidence": [],
                 "compared_event_ids": sorted(compared_event_ids),
             }
+        elif recall_recommendation:
+            result = {
+                "answer": self._recall_recommendation_answer([item for item in evidence if item["kind"] == "event"]),
+                "confidence": 0.75, "insufficient_evidence": False, "model": "sentrix-evidence", "evidence": [],
+            }
         elif deterministic_query:
             result = self._fallback_answer(query, evidence)
             result["model"] = "sentrix-evidence"
@@ -672,7 +707,7 @@ class MemoryAgent:
         known_ids = {item["id"] for item in evidence}
         model_evidence = result.get("modelEvidence") or []
         valid_model_evidence = [item for item in model_evidence if isinstance(item, dict) and item.get("id") in known_ids]
-        if evidence and not comparison_query and (result.get("insufficient_evidence") or not valid_model_evidence):
+        if evidence and not (comparison_query or recall_recommendation) and (result.get("insufficient_evidence") or not valid_model_evidence):
             result.update(self._fallback_answer(query, evidence))
         if public_retrieved.get("focused_people") and public_retrieved.get("semantic_claims") and activity_query:
             semantic_answer = self._fallback_answer(query, evidence)

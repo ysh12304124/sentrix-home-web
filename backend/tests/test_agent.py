@@ -137,6 +137,32 @@ class AgentEvidenceTests(unittest.TestCase):
             tools = [item["tool"] for item in result["tool_trace"]]
             self.assertEqual(tools[:3], ["resolve_constraints", "find_events", "trace_timeline"])
 
+    def test_steward_recommends_only_explicitly_requested_anchored_memories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("妈妈", "person", "confirmed", confidence=1.0)
+            asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "妈妈在客厅看书"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("推荐一些妈妈的回忆")
+
+            self.assertFalse(result["insufficient_evidence"])
+            self.assertIn("推荐", result["answer"])
+            self.assertIn(event["id"], [item["event_id"] for item in result["evidence"] if item["kind"] == "event"])
+            self.assertIn("suggest_recall", [item["tool"] for item in result["tool_trace"]])
+
+    def test_steward_refuses_unanchored_memory_recommendation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("推荐一些回忆")
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertIn("人物、地点或日期", result["answer"])
+            self.assertIn("request_clarification", [item["tool"] for item in result["tool_trace"]])
+
     def test_steward_clarifies_multiple_entity_candidates_before_declaring_gap(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")
