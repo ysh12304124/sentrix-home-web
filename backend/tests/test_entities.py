@@ -1,7 +1,17 @@
 import tempfile
 import unittest
+from pathlib import Path
+import importlib.util
 
 from backend.db import MemoryStore
+
+
+def load_cover_maintenance():
+    path = Path(__file__).resolve().parents[2] / "scripts" / "maintenance" / "backfill_event_covers.py"
+    spec = importlib.util.spec_from_file_location("backfill_event_covers", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class NativeEntityMemoryTests(unittest.TestCase):
@@ -315,6 +325,23 @@ class NativeEntityMemoryTests(unittest.TestCase):
 
         self.assertEqual(retained["cover_asset_id"], "a1")
         self.assertEqual(retained["cover_selection"]["source"], "user")
+
+    def test_cover_backfill_reports_before_apply_and_preserves_user_selection(self):
+        event = self.store.create_event({"id": "backfill_event", "title": "待回填封面"})
+        self.store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], self.obs1["id"]))
+        self.store.connection.commit()
+        module = load_cover_maintenance()
+
+        report = module.backfill_event_covers(self.store, apply=False)
+        self.assertEqual(report["eligible"], 1)
+        self.assertEqual(self.store.get_event(event["id"])["cover_selection"], {})
+
+        applied = module.backfill_event_covers(self.store, apply=True)
+        self.assertEqual(applied["updated"], 1)
+        self.assertEqual(self.store.get_event(event["id"])["cover_selection"]["source"], "derived")
+
+        self.store.update_event(event["id"], {"cover_asset_id": "a1"})
+        self.assertEqual(module.backfill_event_covers(self.store, apply=True)["updated"], 0)
 
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
