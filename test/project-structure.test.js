@@ -56,6 +56,13 @@ test("entity property corrections are exposed with evidence-aware UI controls", 
   assert.match(appSource, /evidence_ids/);
 });
 
+test("event detail exposes its evidence-backed entity projection", () => {
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(appSource, /eventEntities/);
+  assert.match(appSource, /事件实体/);
+  assert.match(appSource, /event-entity-row/);
+});
+
 test("memory-space and evidence governance are wired into the portal", () => {
   const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(source, /space-select/);

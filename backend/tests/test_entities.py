@@ -303,6 +303,29 @@ class NativeEntityMemoryTests(unittest.TestCase):
 
         self.assertTrue(any(item["entity_type"] == "emotion" and item["canonical_name"] == "温馨" for item in self.store.list_entities()))
 
+    def test_event_projects_linked_entities_with_observation_evidence(self):
+        self.store.connection.execute(
+            "UPDATE observations SET captured_at = ?, place = ?, objects_json = ?, raw_json = ? WHERE id = ?",
+            ("2026-08-03T10:30:00+08:00", "家中餐厅", '["生日蛋糕"]', '{"emotions": ["喜悦"]}', self.obs1["id"]),
+        )
+        self.store.connection.commit()
+        event = self.store.merge_observation_into_event(self.store.get_observation(self.obs1["id"]))
+        person = self.store.create_entity("妈妈", "person", "confirmed", confidence=1.0)
+        self.store.upsert_event_participant(event["id"], person["id"], "visible_subject", [self.obs1["id"]], 0.9)
+        self.store.maintain_observation_entities(self.obs1["id"], event["id"])
+
+        detail = self.store.get_event_detail(event["id"])
+        by_type = {item["entity_type"]: item for item in detail["entities"]}
+
+        self.assertEqual(set(by_type), {"person", "place", "object", "emotion", "time"})
+        self.assertEqual(by_type["person"]["relation"], "参与")
+        self.assertEqual(by_type["place"]["relation"], "地点")
+        self.assertEqual(by_type["object"]["relation"], "包含物件")
+        self.assertEqual(by_type["emotion"]["relation"], "情感氛围")
+        self.assertEqual(by_type["time"]["relation"], "时间")
+        self.assertEqual(by_type["object"]["evidence_ids_json"], [self.obs1["id"]])
+        self.assertEqual(by_type["object"]["evidence_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

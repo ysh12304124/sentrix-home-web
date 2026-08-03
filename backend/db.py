@@ -210,6 +210,16 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_entities (
+                event_id TEXT NOT NULL REFERENCES events(id),
+                entity_id TEXT NOT NULL REFERENCES entities(id),
+                relation TEXT NOT NULL,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(event_id, entity_id, relation)
+            );
             CREATE TABLE IF NOT EXISTS entities (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -562,6 +572,8 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_event_observations_observation ON event_observations(observation_id);
             CREATE INDEX IF NOT EXISTS idx_event_participants_event ON event_participants(event_id);
             CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id);
+            CREATE INDEX IF NOT EXISTS idx_event_entities_event ON event_entities(event_id);
+            CREATE INDEX IF NOT EXISTS idx_event_entities_entity ON event_entities(entity_id);
             CREATE INDEX IF NOT EXISTS idx_semantic_claims_person ON semantic_claims(person_id);
             CREATE INDEX IF NOT EXISTS idx_assets_scope ON assets(scope_id);
             CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(scope_id);
@@ -1737,7 +1749,52 @@ class MemoryStore:
                 observation["asset"] = self.get_asset(observation["asset_id"])
                 observations.append(observation)
         facts = [fact for fact in self.list_facts(500) if any(item["id"] in fact["evidence_ids_json"] for item in observations)]
-        return {"event": event, "observations": observations, "facts": facts}
+        return {"event": event, "observations": observations, "facts": facts, "entities": self.list_event_entities(event_id)}
+
+    def upsert_event_entity(self, event_id, entity_id, relation, evidence_ids=None, confidence=0.0):
+        evidence_ids = list(dict.fromkeys(evidence_ids or []))
+        existing = self._row(
+            "SELECT * FROM event_entities WHERE event_id = ? AND entity_id = ? AND relation = ?",
+            (event_id, entity_id, relation),
+        )
+        timestamp = now_iso()
+        if existing:
+            merged = list(dict.fromkeys(json.loads(existing["evidence_ids_json"] or "[]") + evidence_ids))
+            self.connection.execute(
+                "UPDATE event_entities SET evidence_ids_json = ?, confidence = MAX(confidence, ?), updated_at = ? WHERE event_id = ? AND entity_id = ? AND relation = ?",
+                (json_value(merged, []), float(confidence or 0), timestamp, event_id, entity_id, relation),
+            )
+        else:
+            self.connection.execute(
+                "INSERT INTO event_entities(event_id, entity_id, relation, evidence_ids_json, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (event_id, entity_id, relation, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
+            )
+        self.connection.commit()
+        return self.list_event_entities(event_id)
+
+    def list_event_entities(self, event_id):
+        rows = self._rows(
+            """SELECT ee.*, e.id AS entity_id_value, e.entity_type, e.canonical_name, e.status, e.summary
+            FROM event_entities ee JOIN entities e ON e.id = ee.entity_id
+            WHERE ee.event_id = ? ORDER BY CASE e.entity_type WHEN 'person' THEN 0 WHEN 'place' THEN 1 WHEN 'time' THEN 2 WHEN 'object' THEN 3 WHEN 'emotion' THEN 4 ELSE 5 END, e.canonical_name""",
+            (event_id,),
+        )
+        values = []
+        for row in rows:
+            value = self._decode(row, ["evidence_ids_json"])
+            value["id"] = value.pop("entity_id_value")
+            value["evidence_count"] = len(value["evidence_ids_json"])
+            values.append(self.public_entity(value))
+        for participant in self.list_event_participants(event_id):
+            entity = self.get_entity(participant["person_id"])
+            if not entity:
+                continue
+            values.append({
+                **self.public_entity(entity), "event_id": event_id, "entity_id": entity["id"],
+                "relation": "参与", "role": participant["role"], "confidence": participant["confidence"],
+                "evidence_ids_json": participant["evidence_ids_json"], "evidence_count": len(participant["evidence_ids_json"]),
+            })
+        return sorted(values, key=lambda item: ({"person": 0, "place": 1, "time": 2, "object": 3, "emotion": 4}.get(item["entity_type"], 5), item["canonical_name"]))
 
     def create_event(self, data):
         event_id = data.get("id") or make_id("evt")
@@ -2029,6 +2086,9 @@ class MemoryStore:
                 observation.get("confidence", 0), evidence_ids, "timestamp_derivation",
             )
         for entity in entities:
+            if event_id:
+                relation = {"place": "地点", "time": "时间", "object": "包含物件", "emotion": "情感氛围"}.get(entity["entity_type"], "关联实体")
+                self.upsert_event_entity(event_id, entity["id"], relation, [observation_id], observation.get("confidence", 0))
             if place_entity and entity["id"] != place_entity["id"]:
                 self.create_relationship(
                     entity["id"], "出现在", place_entity["id"], [observation_id, event_id] if event_id else [observation_id],
