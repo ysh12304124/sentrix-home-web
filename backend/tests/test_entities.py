@@ -165,6 +165,9 @@ class NativeEntityMemoryTests(unittest.TestCase):
         ordinary = self.store.create_event({
             "id": "event_three", "title": "晚餐", "place": "家中餐厅", "time_start": "2025-08-01T18:00:00+08:00",
         })
+        distant = self.store.create_event({
+            "id": "event_four", "title": "下一周的日常", "place": "办公室", "time_start": "2025-05-09T10:00:00+08:00",
+        })
         self.store.connection.executemany(
             "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
             [(first["id"], self.obs1["id"]), (second["id"], self.obs2["id"])],
@@ -179,6 +182,7 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(trips[0]["place_names_json"], ["杭州", "西湖"])
         self.assertEqual(trips[0]["evidence_ids_json"], [self.obs1["id"], self.obs2["id"]])
         self.assertNotIn(ordinary["id"], trips[0]["event_ids_json"])
+        self.assertNotIn(distant["id"], trips[0]["event_ids_json"])
 
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)

@@ -1849,7 +1849,7 @@ class MemoryStore:
         for current_scope, rows in by_scope.items():
             sequence = []
             for captured, event in sorted(rows, key=lambda item: item[0]):
-                if sequence and captured - sequence[-1][0] > timedelta(days=14):
+                if sequence and captured - sequence[-1][0] > timedelta(days=3):
                     candidates.extend(self._derive_trip_candidates_for_sequence(current_scope, [item[1] for item in sequence]))
                     sequence = []
                 sequence.append((captured, event))
@@ -1863,7 +1863,8 @@ class MemoryStore:
         end = parse_time(events[-1].get("time_start"))
         places = {str(event.get("place") or "").strip() for event in events if str(event.get("place") or "").strip()}
         cross_day = bool(start and end and start.date() != end.date())
-        if not (cross_day or len(places) >= 2):
+        within_duration = bool(start and end and end - start <= timedelta(days=10))
+        if not (cross_day and within_duration and len(places) >= 2):
             return []
         return [self._upsert_trip_candidate(scope_id, events)]
 
