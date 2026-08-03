@@ -61,6 +61,15 @@ CLOTHING_NORMALIZATION = {
     "浅蓝色衬衫": "衬衫",
 }
 
+OBJECT_CATEGORIES = {
+    "食物": ("蛋糕", "餐", "饭", "水果", "面包", "饮料", "咖啡", "茶", "酒"),
+    "交通工具": ("自行车", "汽车", "车辆", "火车", "飞机", "摩托", "轮船", "船"),
+    "宠物": ("猫", "狗", "鸟", "兔", "宠物"),
+    "电子设备": ("手机", "相机", "电脑", "屏幕", "耳机", "麦克风", "电视"),
+    "文具与出版物": ("书", "笔", "证书", "毕业证", "杂志"),
+    "服饰": ("衣", "帽", "鞋", "包", "眼镜", "领带"),
+}
+
 
 def normalize_clothing(value):
     text = str(value or "").strip()
@@ -83,6 +92,14 @@ def time_semantics(value):
         part_of_day = "夜晚"
     season = "春" if value.month in (3, 4, 5) else "夏" if value.month in (6, 7, 8) else "秋" if value.month in (9, 10, 11) else "冬"
     return {"date": value.date().isoformat(), "year": value.year, "month": value.month, "season": season, "part_of_day": part_of_day}
+
+
+def object_category(label):
+    text = str(label or "").strip()
+    for category, terms in OBJECT_CATEGORIES.items():
+        if any(term in text for term in terms):
+            return category
+    return "其他"
 
 
 class MemoryStore:
@@ -2073,6 +2090,17 @@ class MemoryStore:
             self.maintain_entity_property(
                 place_entity["id"], "scene_type", place_entity["canonical_name"],
                 observation.get("confidence", 0), evidence_ids, "observation_extraction",
+            )
+        for entity in entities:
+            if entity["entity_type"] != "object":
+                continue
+            self.maintain_entity_property(
+                entity["id"], "label", entity["canonical_name"], observation.get("confidence", 0), evidence_ids,
+                "observation_extraction",
+            )
+            self.maintain_entity_property(
+                entity["id"], "category", object_category(entity["canonical_name"]), observation.get("confidence", 0), evidence_ids,
+                "object_taxonomy_v1",
             )
         if time_entity and captured_at:
             semantics = time_semantics(captured_at)

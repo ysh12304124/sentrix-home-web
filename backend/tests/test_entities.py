@@ -326,6 +326,27 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(by_type["object"]["evidence_ids_json"], [self.obs1["id"]])
         self.assertEqual(by_type["object"]["evidence_count"], 1)
 
+    def test_object_entities_preserve_raw_label_and_add_controlled_category(self):
+        self.store.connection.execute(
+            "UPDATE observations SET objects_json = ? WHERE id = ?",
+            ('["生日蛋糕", "自行车"]', self.obs1["id"]),
+        )
+        self.store.connection.commit()
+
+        self.store.maintain_observation_entities(self.obs1["id"])
+        objects = {
+            item["canonical_name"]: item for item in self.store.list_entities()
+            if item["entity_type"] == "object"
+        }
+        cake = {item["property_key"]: item for item in self.store.get_entity_detail(objects["生日蛋糕"]["id"])["properties"]}
+        bicycle = {item["property_key"]: item for item in self.store.get_entity_detail(objects["自行车"]["id"])["properties"]}
+
+        self.assertEqual(cake["label"]["value"], "生日蛋糕")
+        self.assertEqual(cake["category"]["value"], "食物")
+        self.assertEqual(bicycle["category"]["value"], "交通工具")
+        self.assertEqual(cake["label"]["evidence_ids"], [self.obs1["id"]])
+        self.assertNotIn("salience", cake)
+
 
 if __name__ == "__main__":
     unittest.main()
