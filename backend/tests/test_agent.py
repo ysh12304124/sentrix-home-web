@@ -62,6 +62,10 @@ class AgentEvidenceTests(unittest.TestCase):
         self.assertTrue(contains("SR_AWS_N_0016.jpg", "请查看 SR_AWS_N_0016.jpg 中的人做了什么"))
         self.assertFalse(contains("SR_AWS_N_0054.jpg", "请查看 SR_AWS_N_0016.jpg 中的人做了什么"))
 
+    def test_multi_concept_chinese_query_rejects_incidental_short_clues(self):
+        self.assertTrue(contains("餐桌旁的家庭照片", "餐桌旁发生了什么？"))
+        self.assertFalse(contains("阴天下的繁忙集装箱港口", "火星海边生日派对"))
+
     def test_answer_returns_asset_observation_and_raw_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")
@@ -131,6 +135,21 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(result["evidence"], [])
             self.assertIn("没有找到", result["answer"])
             self.assertEqual(store.get_query_gap(result["query_gap_id"])["missing_dimension"], "spatial_relation")
+            vector = next(item for item in result["retrieval_trace"] if item["stage"] == "vector")
+            self.assertEqual(vector["counts"]["accepted"], 0)
+
+    def test_high_similarity_vector_without_query_clues_cannot_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "harbor.jpg", "image", "/tmp/harbor.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "港口集装箱", "place": "港口"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_vector("episodic", "event", event["id"], [1.0, 0.0], "controlled-clip")
+
+            result = MemoryAgent(store, gamma=FakeGamma(), clip=ControlledClip([1.0, 0.0])).answer("火星海边生日派对")
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertEqual(result["evidence"], [])
             vector = next(item for item in result["retrieval_trace"] if item["stage"] == "vector")
             self.assertEqual(vector["counts"]["accepted"], 0)
 
