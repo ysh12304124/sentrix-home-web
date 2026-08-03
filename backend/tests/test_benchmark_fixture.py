@@ -8,6 +8,7 @@ from scripts.benchmarks.ingest_face_benchmark import ingest
 from scripts.benchmarks.evaluate_lfw_clusters import evaluate as evaluate_lfw
 from scripts.benchmarks.evaluate_lfw_clusters import meets_gate
 from scripts.benchmarks.evaluate_household_benchmark import evaluate
+from scripts.benchmarks.ingest_household_face_benchmark import ingest as ingest_household_faces
 
 
 class HouseholdBenchmarkEvaluatorTests(unittest.TestCase):
@@ -140,6 +141,32 @@ class HouseholdBenchmarkEvaluatorTests(unittest.TestCase):
             self.assertNotIn("source_identity", asset["metadata_json"])
             self.assertEqual(store.count("face_instances"), 1)
             store.close()
+
+    def test_household_face_import_keeps_authorized_labels_out_of_the_database(self):
+        class FakeFace:
+            def detect(self, _):
+                return [{"embedding": [1.0, 0.0], "quality": 0.9, "confidence": 0.9}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_root = root / "album1" / "images"
+            image_root.mkdir(parents=True)
+            (image_root / "family.jpg").write_bytes(b"image")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"source_root": str(root), "spaces": [{
+                "scope_id": "album1", "import": {"files": [{"file_name": "family.jpg", "relative_path": "album1/images/family.jpg"}]},
+                "evaluation": {"face_id_to_nicknames": {"1": ["evaluation-only"]}, "image_to_face_ids": {"family.jpg": ["1"]}},
+            }]}), encoding="utf-8")
+
+            result = ingest_household_faces(manifest, root / "faces.db", face=FakeFace())
+
+            self.assertEqual(result["processed"], 1)
+            store = MemoryStore(str(root / "faces.db"))
+            try:
+                self.assertNotIn("evaluation-only", str(store.get_asset(store._row("SELECT id FROM assets LIMIT 1" )["id"])))
+                self.assertEqual(store.count("face_instances"), 1)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":
