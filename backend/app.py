@@ -226,6 +226,8 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
 @app.get("/api/knowledge")
 def knowledge(person_id: str | None = None, scope_id: str | None = None):
     claims = store.list_semantic_claims(person_id, 1000)
+    if scope_id:
+        claims = [claim for claim in claims if claim.get("scope_id") == scope_id]
     profiles = []
     if person_id:
         profile = store.get_semantic_profile(person_id)
@@ -234,6 +236,11 @@ def knowledge(person_id: str | None = None, scope_id: str | None = None):
     else:
         profiles = [item for item in (store.get_semantic_profile(entity["id"]) for entity in store.list_entities(scope_id=scope_id)) if item]
     return {"profiles": profiles, "claims": claims, "spaces": store.list_memory_spaces()}
+
+
+@app.post("/api/maintenance/reindex-entities")
+def reindex_entities(scope_id: str | None = None):
+    return store.reindex_observation_entities(scope_id)
 
 
 @app.get("/api/entities/{entity_id}")

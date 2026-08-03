@@ -28,6 +28,7 @@
     assetFilter: "all",
     assetSort: "newest",
     personFilter: "all",
+    saving: false,
   };
 
   const navItems = [
@@ -206,8 +207,9 @@
   }
 
   function peopleView() {
-    const people = state.persons.filter((person) => person.reviewable !== false && (state.personFilter === "all" || !person.confirmed));
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。确认、驳回和命名都会写入本地人物状态。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${state.persons.filter((person) => !person.confirmed).length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person, index) => { const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`; return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p><div class="person-stats"><span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>${person.cluster_count || 0}</strong> 个人物簇</span></div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="split-person" data-person-id="${escapeHtml(person.id)}">驳回候选</button>`}</div></article>`; }).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
+    const people = state.persons.filter((person) => state.personFilter === "all" || !person.confirmed);
+    const pending = state.persons.filter((person) => !person.confirmed);
+    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会明确标注，仍可查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person, index) => { const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`; const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : ""; return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${caution}<div class="person-stats"><span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>${person.cluster_count || 0}</strong> 个人物簇</span></div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="split-person" data-person-id="${escapeHtml(person.id)}">驳回候选</button>`}</div></article>`; }).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
   }
 
   function knowledgeView() {
@@ -242,10 +244,11 @@
 
   function semanticKnowledgeView() {
     const people = state.persons.filter((person) => person.confirmed);
-    const claims = state.knowledge.claims || people.flatMap((person) => person.claims || []);
-    const claimCards = claims.map((claim) => "<article class=\"fact-review-row\"><div><strong>" + escapeHtml(claim.predicate) + " · " + escapeHtml(claim.value_text) + "</strong><small>" + escapeHtml(claim.dimension) + " · " + escapeHtml(claim.status) + " · 置信度 " + Math.round((claim.confidence || 0) * 100) + "% · 证据 " + escapeHtml((claim.evidence_ids_json || claim.evidence_ids || []).join(", ")) + "</small></div></article>").join("");
-    const personCards = people.map((person) => "<article class=\"entity-card\"><div class=\"entity-card-head\">" + faceAvatar(person.avatar_face_instance_id, person.display_name, "green") + "<span class=\"confirmed\">已确认</span></div><h2>" + escapeHtml(person.display_name) + "</h2><p>" + escapeHtml(person.family_role || "家庭成员") + "</p><p>" + escapeHtml(person.profile?.summary_zh || "正在从事件和证据形成画像。") + "</p><div class=\"entity-stats\"><span><strong>" + (person.claims || []).length + "</strong> 条声明</span><span><strong>" + (person.mention_count || 0) + "</strong> 次出现</span></div><button class=\"button small ghost\" data-action=\"open-person-profile\" data-person-id=\"" + escapeHtml(person.id) + "\">查看画像和证据</button></article>").join("");
-    return pageHeader("语义记忆 / 人物知识", "看见每个人长期形成的知识。", "活动、地点、衣物、偏好和习惯都必须回到人物或事件证据，不再把人物混在普通实体里。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>人物语义声明</span></article><article><strong>" + state.entities.length + "</strong><span>非人物实体</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>旧事实待维护</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物画像</p><h2>语义记忆的主轴</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物关联知识</p><h2>带时间和证据的语义声明</h2></div><span class=\"result-count\">" + claims.length + " 条</span></div><div class=\"fact-review-list\">" + (claimCards || emptyState("还没有人物语义声明", "人物确认后，活动、地点、衣物和家庭角色会从关联事件中汇总。")) + "</div></section>";
+    const claims = (state.knowledge.claims || people.flatMap((person) => person.claims || [])).filter((claim) => claim.status !== "superseded");
+    const groups = [["place", "地点", "地点总结"], ["object", "物件", "物件记忆"], ["time", "时间", "时间坐标"], ["emotion", "情感氛围", "情绪与氛围"]];
+    const personCards = people.map((person) => "<article class=\"entity-card\"><div class=\"entity-card-head\">" + faceAvatar(person.avatar_face_instance_id, person.display_name, "green") + "<span class=\"confirmed\">已确认</span></div><h2>" + escapeHtml(person.display_name) + "</h2><p>" + escapeHtml(person.profile?.summary_zh || person.summary || "正在从事件和证据形成画像。") + "</p><div class=\"entity-stats\"><span><strong>" + (person.event_memory || []).length + "</strong> 个事件</span><span><strong>" + claims.filter((claim) => claim.person_id === person.id).length + "</strong> 条当前声明</span></div><button class=\"button small ghost\" data-action=\"open-person-profile\" data-person-id=\"" + escapeHtml(person.id) + "\">查看画像和证据</button></article>").join("");
+    const entitySection = ([type, label, description]) => { const entities = state.entities.filter((entity) => entity.entity_type === type && entity.evidence_count > 0); return `<section class="content-section"><div class="section-head"><div><p class="section-kicker">${label}</p><h2>${description}</h2></div><span class="result-count">${entities.length} 项</span></div><div class="entity-grid">${entities.length ? entities.map((entity) => `<button class="entity-card" data-action="open-entity" data-entity-id="${escapeHtml(entity.id)}"><div class="entity-card-head"><span class="avatar person-avatar blue">${escapeHtml(entity.canonical_name.slice(0, 1))}</span><span class="needs-label">证据 ${entity.evidence_count}</span></div><h2>${escapeHtml(entity.canonical_name)}</h2><p>${escapeHtml(entity.summary || "由本地观察维护")}</p><div class="entity-stats"><span><strong>${entity.relationship_count || 0}</strong> 条关系</span><span><strong>${Math.round((entity.confidence || 0) * 100)}%</strong> 置信度</span></div></button>`).join("") : emptyState(`尚未形成${label}实体`, "等待带有可回溯观察证据的资料。")}</div></section>`; };
+    return pageHeader("语义记忆 / 实体目录", "人物、地点与细节共同组成回忆。", "每个实体都来自本地 Observation，可打开查看关联事件、原图、置信度和算法证据。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>当前人物声明</span></article><article><strong>" + state.entities.length + "</strong><span>非人物实体</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>待维护事实</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物总结</p><h2>跨事件形成的熟人档案</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section>" + groups.map(entitySection).join("");
   }
 
   function renderView() {
@@ -380,7 +383,7 @@
     const failed = calls.find((call) => call.status === "rejected");
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
-    if (!isUserEditing()) {
+    if (options.forceRender || !isUserEditing()) {
       if (silent) updateLiveStats();
       else renderShellNavigation();
     }
@@ -450,8 +453,12 @@
 
   async function handleModalSubmit(event) {
     event.preventDefault();
+    if (state.saving) return;
     const form = new FormData(event.target);
     const modal = state.modal;
+    state.saving = true;
+    const submitButton = event.target.querySelector("button[type='submit']");
+    if (submitButton) { submitButton.disabled = true; submitButton.textContent = "正在更新记忆..."; }
     try {
       if (modal.type === "event-edit") await window.sentrixApi.updateEvent(modal.event.id, { title: form.get("title"), summary: form.get("summary"), place: form.get("place"), time_start: form.get("time_start") ? new Date(form.get("time_start")).toISOString() : modal.event.time_start });
       if (modal.type === "event-create") await window.sentrixApi.createEvent({ title: form.get("title"), summary: form.get("summary"), place: form.get("place"), time_start: form.get("time_start") ? new Date(form.get("time_start")).toISOString() : null });
@@ -484,8 +491,15 @@
         state.modal = null; state.query = command; state.view = "search"; renderShellNavigation(); return submitSearch();
       }
       if (modal.type === "invite") { const invite = await window.sentrixApi.createInvite(form.get("label")); openModal({ type: "invite", invite }); return; }
-      state.modal = null; state.toast = state.toast || "已保存到本地记忆"; await refreshData();
-    } catch (error) { state.toast = `保存失败：${error.message}`; renderShellNavigation(); }
+      state.modal = null;
+      await refreshData({ forceRender: true });
+      state.toast = state.toast || "已保存到本地记忆";
+      renderShellNavigation();
+    } catch (error) {
+      state.toast = `保存失败：${error.message}`;
+      if (submitButton) { submitButton.disabled = false; submitButton.textContent = "重试保存"; }
+      renderShellNavigation();
+    } finally { state.saving = false; }
   }
 
   async function handleAction(action, element) {

@@ -1942,13 +1942,17 @@ class MemoryStore:
         asset = self.get_asset(observation["asset_id"]) or {}
         scope_id = observation.get("scope_id") or asset.get("scope_id") or "home-default"
         raw = observation.get("raw") or {}
+        captured_at = parse_time(observation.get("captured_at") or asset.get("captured_at"))
+        captured_day = captured_at.date().isoformat() if captured_at else ""
         values = [
             ("place", observation.get("place") or asset.get("captured_location"), "由图片观察或采集地点维护"),
             ("object", observation.get("objects") or [], "由图片观察到的物体"),
             ("emotion", raw.get("emotions") or [], "由图片观察到的情感"),
+            ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
         ]
         entities = []
         place_entity = None
+        time_entity = None
         for entity_type, names, summary in values:
             for name in names if isinstance(names, list) else [names]:
                 entity = self._find_or_create_entity(name, entity_type, scope_id, observation.get("confidence", 0), summary)
@@ -1962,16 +1966,34 @@ class MemoryStore:
                 )
                 if entity_type == "place":
                     place_entity = entity
+                if entity_type == "time":
+                    time_entity = entity
                 entities.append(entity)
-        if place_entity:
-            for entity in entities:
-                if entity["id"] != place_entity["id"]:
-                    self.create_relationship(
-                        entity["id"], "出现在", place_entity["id"], [observation_id, event_id] if event_id else [observation_id],
-                        observation.get("confidence", 0),
-                    )
+        for entity in entities:
+            if place_entity and entity["id"] != place_entity["id"]:
+                self.create_relationship(
+                    entity["id"], "出现在", place_entity["id"], [observation_id, event_id] if event_id else [observation_id],
+                    observation.get("confidence", 0),
+                )
+            if time_entity and entity["id"] != time_entity["id"]:
+                self.create_relationship(
+                    entity["id"], "记录于", time_entity["id"], [observation_id, event_id] if event_id else [observation_id],
+                    observation.get("confidence", 0),
+                )
         self.connection.commit()
         return entities
+
+    def reindex_observation_entities(self, scope_id=None):
+        """Idempotently rebuild evidence-backed non-person entity links."""
+        rows = self._rows(
+            "SELECT id FROM observations" + (" WHERE scope_id = ?" if scope_id else ""),
+            (scope_id,) if scope_id else (),
+        )
+        total = 0
+        for row in rows:
+            event_row = self._row("SELECT event_id FROM event_observations WHERE observation_id = ? LIMIT 1", (row["id"],))
+            total += len(self.maintain_observation_entities(row["id"], event_row["event_id"] if event_row else None))
+        return {"observations": len(rows), "entity_links": total, "scope_id": scope_id}
 
     def list_entities(self, status=None, scope_id=None):
         params = [status] if status else []
@@ -1983,12 +2005,19 @@ class MemoryStore:
         for entity in entities:
             entity["cluster_count"] = self.connection.execute("SELECT COUNT(*) FROM face_clusters WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
             entity["mention_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_mentions WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
+            entity["evidence_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_observations WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
             entity["relationship_count"] = self.connection.execute("SELECT COUNT(*) FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'", (entity["id"], entity["id"])).fetchone()[0]
             cluster_rows = self._rows("SELECT member_count, confidence, status FROM face_clusters WHERE entity_id = ?", (entity["id"],))
-            entity["reviewable"] = entity["status"] == "confirmed" or any(
-                row["status"] != "rejected" and (int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.65)
-                for row in cluster_rows
-            )
+            if entity["entity_type"] == "person":
+                entity["reviewable"] = entity["status"] == "confirmed" or any(
+                    row["status"] != "rejected" and int(row.get("member_count", 0) or 0) > 0
+                    for row in cluster_rows
+                )
+                entity["single_sample"] = entity["status"] != "confirmed" and all(
+                    int(row.get("member_count", 0) or 0) <= 1 for row in cluster_rows
+                )
+            else:
+                entity["reviewable"] = entity["evidence_count"] > 0
             avatar = self._row(
                 """SELECT fi.id FROM face_instances fi JOIN face_clusters fc ON fc.id = fi.cluster_id
                 WHERE fc.entity_id = ? AND fc.status != 'rejected' ORDER BY fi.detection_confidence DESC, fi.created_at ASC LIMIT 1""",
@@ -2128,6 +2157,13 @@ class MemoryStore:
             WHERE eob.entity_id = ? ORDER BY o.captured_at DESC LIMIT 100""",
             (entity_id,),
         )
+        evidence_observations = []
+        for row in observations:
+            observation = self.get_observation(row["id"])
+            if observation:
+                observation["asset"] = self.get_asset(observation["asset_id"])
+                evidence_observations.append(observation)
+        entity["evidence_count"] = len(evidence_observations)
         return {
             "entity": entity,
             "clusters": clusters,
@@ -2137,7 +2173,7 @@ class MemoryStore:
             "claims": self.list_semantic_claims(entity_id, 500),
             "appearance_evidence": self.list_person_appearance_evidence(entity_id, include_empty=True),
             "events": [self.get_event(event_id) for event_id in event_ids if self.get_event(event_id)],
-            "observations": [self.get_observation(row["id"]) for row in observations],
+            "observations": evidence_observations,
         }
 
     def create_face_cluster(self, embedding, confidence=0.0, scope_id="home-default"):
@@ -2449,7 +2485,8 @@ class MemoryStore:
         rows = self._rows(f"""SELECT fc.*, e.canonical_name, e.family_role, e.status AS entity_status
             FROM face_clusters fc LEFT JOIN entities e ON e.id = fc.entity_id {where} ORDER BY fc.updated_at DESC""", params)
         for row in rows:
-            row["reviewable"] = row.get("status") != "pending" or int(row.get("member_count", 0) or 0) >= 2 or float(row.get("confidence", 0) or 0) >= 0.65
+            row["reviewable"] = row.get("status") != "rejected" and int(row.get("member_count", 0) or 0) > 0
+            row["single_sample"] = row.get("status") == "pending" and int(row.get("member_count", 0) or 0) <= 1
             row["samples"] = self._rows("""SELECT fi.id, fi.asset_id, fi.observation_id, fi.bbox_json, fi.detection_confidence, a.file_name, a.media_type
                 FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE fi.cluster_id = ? ORDER BY fi.created_at DESC LIMIT 12""", (row["id"],))
         return rows

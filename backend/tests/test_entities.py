@@ -46,6 +46,17 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(entity["avatar_face_instance_id"], face["id"])
         self.assertEqual(avatar["bbox_json"], [1, 2, 30, 40])
 
+    def test_single_sample_pending_face_is_reviewable(self):
+        face = self.store.add_face_instance("a1", self.obs1["id"], {"bbox": [1, 2, 30, 40], "confidence": 0.55, "embedding": [1, 0, 0]})
+        entity_id = self.store._row("SELECT entity_id FROM face_clusters WHERE id = ?", (face["cluster_id"],))["entity_id"]
+        entity = next(item for item in self.store.list_entities() if item["id"] == entity_id)
+        cluster = next(item for item in self.store.list_face_clusters() if item["id"] == face["cluster_id"])
+
+        self.assertTrue(entity["reviewable"])
+        self.assertTrue(entity["single_sample"])
+        self.assertTrue(cluster["reviewable"])
+        self.assertTrue(cluster["single_sample"])
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)
@@ -178,6 +189,20 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(detail["events"][0]["id"], event["id"])
         self.assertEqual(detail["observations"][0]["id"], self.obs1["id"])
         self.assertTrue(any(item["predicate"] == "出现在" for item in detail["relationships"]))
+
+    def test_entity_index_adds_capture_day_and_can_be_rebuilt(self):
+        self.store.connection.execute(
+            "UPDATE observations SET captured_at = ?, place = ?, objects_json = ?, raw_json = ? WHERE id = ?",
+            ("2026-08-03T10:30:00+08:00", "家中餐厅", '["生日蛋糕"]', '{"emotions": ["喜悦"]}', self.obs1["id"]),
+        )
+        self.store.connection.commit()
+        result = self.store.reindex_observation_entities()
+        entities = self.store.list_entities()
+        names_by_type = {(item["entity_type"], item["canonical_name"]) for item in entities}
+
+        self.assertEqual(result["observations"], 2)
+        self.assertIn(("time", "2026-08-03"), names_by_type)
+        self.assertTrue(all(item["reviewable"] for item in entities if item["entity_type"] != "person"))
 
 
 if __name__ == "__main__":
