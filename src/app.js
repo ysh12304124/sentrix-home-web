@@ -21,6 +21,7 @@
     knowledge: { profiles: [], claims: [] },
     clusters: [],
     relationships: [],
+    entityMergeCandidates: [],
     stories: [],
     trips: [],
     health: null,
@@ -268,7 +269,8 @@
       return `<section class="content-section"><div class="section-head"><div><p class="section-kicker">${label}</p><h2>${description}</h2></div><span class="result-count">${entities.length} 项</span></div><div class="entity-grid entity-grid-collapsed">${entities.length ? visible.map(card).join("") : emptyState(`尚未形成${label}实体`, "等待带有可回溯观察证据的资料。")}</div>${entities.length > 6 ? `<div class="entity-expand"><button class="button small ghost" data-action="toggle-entity-type" data-entity-type="${type}">${expanded ? "收起" : `查看全部 ${entities.length} 项`}</button></div>` : ""}</section>`;
     };
     const tripCards = state.trips.map((trip) => `<article class="trip-candidate"><span class="needs-label">${escapeHtml(trip.status)}</span><h3>${escapeHtml(trip.name)}</h3><p>${escapeHtml(formatDate(trip.time_start))} 至 ${escapeHtml(formatDate(trip.time_end))}</p><small>${(trip.place_names_json || []).map(escapeHtml).join("、") || "地点待补充"} · ${(trip.event_ids_json || []).length} 个事件 · ${(trip.evidence_ids_json || []).length} 条证据</small>${trip.status === "pending" ? `<div class="person-actions"><button class="button small primary" data-action="confirm-trip" data-trip-id="${escapeHtml(trip.id)}">命名并确认</button><button class="button small ghost" data-action="reject-trip" data-trip-id="${escapeHtml(trip.id)}">不是行程</button></div>` : `<small>类型 · ${escapeHtml(trip.trip_type || "未分类")} · revision ${trip.revision || 1}</small>`}</article>`).join("");
-    return pageHeader("语义记忆 / 实体目录", "人物、地点与细节共同组成回忆。", "每个实体都来自本地 Observation，可打开查看关联事件、原图、置信度和算法证据。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>当前人物声明</span></article><article><strong>" + state.entities.length + "</strong><span>非人物实体</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>待维护事实</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物总结</p><h2>跨事件形成的熟人档案</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">行程候选</p><h2>跨事件的长线回忆</h2></div><span class=\"result-count\">" + state.trips.length + " 项</span></div><div class=\"trip-grid\">" + (tripCards || emptyState("暂无行程候选", "只有跨日或跨地点的连续事件才会成为待确认行程。")) + "</div></section>" + groups.map(entitySection).join("");
+    const mergeCards = state.entityMergeCandidates.map((candidate) => `<article class="trip-candidate"><span class="needs-label">待审核</span><h3>${escapeHtml(candidate.suggested_name)}</h3><p>${escapeHtml(candidate.entity_type)} · ${escapeHtml((candidate.rationale?.source_labels || []).join("、"))}</p><small>${(candidate.evidence_ids || []).length} 条原始证据 · 置信度 ${Math.round((candidate.confidence || 0) * 100)}% · 当前不会自动合并实体</small></article>`).join("");
+    return pageHeader("语义记忆 / 实体目录", "人物、地点与细节共同组成回忆。", "每个实体都来自本地 Observation，可打开查看关联事件、原图、置信度和算法证据。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>当前人物声明</span></article><article><strong>" + state.entities.length + "</strong><span>非人物实体</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>待维护事实</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物总结</p><h2>跨事件形成的熟人档案</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">语义归并候选</p><h2>相近描述，等待你的确认</h2></div><button class=\"button small ghost\" data-action=\"derive-entity-merge-candidates\">生成候选</button></div><div class=\"trip-grid\">" + (mergeCards || emptyState("暂无可审核候选", "只会在当前相册内比较地点、物件和情感；不会自动合并。")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">行程候选</p><h2>跨事件的长线回忆</h2></div><span class=\"result-count\">" + state.trips.length + " 项</span></div><div class=\"trip-grid\">" + (tripCards || emptyState("暂无行程候选", "只有跨日或跨地点的连续事件才会成为待确认行程。")) + "</div></section>" + groups.map(entitySection).join("");
   }
 
   function renderView() {
@@ -438,7 +440,7 @@
     }
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
-          window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"),
+          window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -451,6 +453,7 @@
     state.relationships = calls[8].status === "fulfilled" ? calls[8].value.relationships || [] : [];
         state.knowledge = calls[9].status === "fulfilled" ? calls[9].value : { profiles: [], claims: [] };
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
+        state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
     const failed = calls.find((call) => call.status === "rejected");
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
@@ -619,6 +622,7 @@
     if (action === "open-folder") { document.getElementById("file-input")?.click(); return; }
     if (action === "toggle-sort") { state.assetSort = state.assetSort === "newest" ? "oldest" : "newest"; renderView(); return; }
     if (action === "toggle-entity-type") { const type = element.dataset.entityType; state.expandedEntityTypes[type] = !state.expandedEntityTypes[type]; renderView(); return; }
+    if (action === "derive-entity-merge-candidates") { await window.sentrixApi.deriveEntityMergeCandidates(state.scopeId); state.toast = "已生成待审核的语义归并候选，实体尚未合并"; return refreshData(); }
     if (action === "reload") return refreshData();
     if (action === "recheck") { await fetch("/api/maintenance/recheck", { method: "POST" }); state.toast = "已提交失败任务重试"; return refreshData(); }
     if (action === "relationship-graph") { openModal({ type: "loading" }); const graph = await window.sentrixApi.relationships(); return openModal({ type: "relation", graph }); }

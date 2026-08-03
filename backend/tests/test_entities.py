@@ -103,6 +103,39 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(merged["confidence"], 0.8)
         self.assertEqual(merged["revision"], 2)
 
+    def test_semantic_consolidation_creates_review_candidate_without_merging_entities(self):
+        lakeside = self.store.create_entity("湖边", "place", confidence=0.8)
+        waterside = self.store.create_entity("水边", "place", confidence=0.8)
+        self.store.connection.execute(
+            "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, 0.8, 'test', datetime('now'))",
+            (lakeside["id"], self.obs1["id"]),
+        )
+        self.store.connection.execute(
+            "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, 0.8, 'test', datetime('now'))",
+            (waterside["id"], self.obs2["id"]),
+        )
+        self.store.connection.commit()
+
+        candidates = self.store.derive_entity_merge_candidates()
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["status"], "pending")
+        self.assertEqual(candidates[0]["entity_type"], "place")
+        self.assertEqual(set(candidates[0]["entity_ids"]), {lakeside["id"], waterside["id"]})
+        self.assertEqual(set(candidates[0]["evidence_ids"]), {self.obs1["id"], self.obs2["id"]})
+        self.assertEqual(self.store.get_entity(lakeside["id"])["status"], "pending")
+        self.assertEqual(self.store.get_entity(waterside["id"])["status"], "pending")
+
+    def test_semantic_consolidation_never_groups_people_or_memory_spaces(self):
+        self.store.create_entity("湖边", "person", scope_id="album_a")
+        self.store.create_entity("水边", "person", scope_id="album_a")
+        self.store.create_entity("湖边", "place", scope_id="album_a")
+        self.store.create_entity("水边", "place", scope_id="album_b")
+
+        candidates = self.store.derive_entity_merge_candidates()
+
+        self.assertEqual(candidates, [])
+
     def test_observation_entities_derive_explainable_place_and_time_properties(self):
         self.store.update_asset("a1", "queued", {"captured_at": "2026-08-03T19:30:00+08:00"})
         self.store.connection.execute(

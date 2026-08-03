@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import sqlite3
 import threading
 import uuid
@@ -94,6 +95,23 @@ MOOD_NORMALIZATION = {
     "专注": "专注",
     "好奇": "好奇",
     "警觉": "警觉",
+}
+
+SEMANTIC_ENTITY_EQUIVALENTS = {
+    "place": {
+        "湖边": "滨水区域",
+        "水边": "滨水区域",
+        "河边": "滨水区域",
+        "河岸": "滨水区域",
+        "湖畔": "滨水区域",
+        "博物馆": "展览空间",
+        "展厅": "展览空间",
+        "展览厅": "展览空间",
+        "展览馆": "展览空间",
+        "美术馆": "展览空间",
+        "画廊": "展览空间",
+    },
+    "emotion": MOOD_NORMALIZATION,
 }
 
 
@@ -360,6 +378,21 @@ class MemoryStore:
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_merge_candidates (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                entity_type TEXT NOT NULL,
+                entity_ids_json TEXT NOT NULL DEFAULT '[]',
+                suggested_name TEXT NOT NULL,
+                rationale_json TEXT NOT NULL DEFAULT '{}',
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(scope_id, entity_type, entity_ids_json, suggested_name)
             );
             CREATE TABLE IF NOT EXISTS face_clusters (
                 id TEXT PRIMARY KEY,
@@ -690,6 +723,7 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(scope_id);
             CREATE INDEX IF NOT EXISTS idx_entity_properties_entity_key ON entity_properties(entity_id, property_key, updated_at);
             CREATE INDEX IF NOT EXISTS idx_entity_properties_status ON entity_properties(status);
+            CREATE INDEX IF NOT EXISTS idx_entity_merge_candidates_scope_status ON entity_merge_candidates(scope_id, status, entity_type);
             CREATE INDEX IF NOT EXISTS idx_face_clusters_scope ON face_clusters(scope_id);
             CREATE INDEX IF NOT EXISTS idx_person_event_memory_person ON person_event_memory(person_id, event_id);
             CREATE INDEX IF NOT EXISTS idx_person_event_memory_scope ON person_event_memory(scope_id, event_id);
@@ -778,7 +812,7 @@ class MemoryStore:
         self.connection.commit()
 
     def count(self, table):
-        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites", "trips"}:
+        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "entity_merge_candidates", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites", "trips"}:
             raise ValueError("unsupported table")
         return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
@@ -2573,6 +2607,106 @@ class MemoryStore:
             entity["preview_file_name"] = preview["file_name"] if preview else None
             entity["preview_media_type"] = preview["media_type"] if preview else None
         return [self.public_entity(entity) for entity in entities] if public else entities
+
+    @staticmethod
+    def _semantic_entity_key(entity_type, name):
+        """Return an explainable normalized label used only for merge review."""
+        label = re.sub(r"\s+", "", str(name or "").strip())
+        equivalents = SEMANTIC_ENTITY_EQUIVALENTS.get(entity_type, {})
+        if label in equivalents:
+            return equivalents[label], {"strategy": "controlled_equivalence", "matched_label": label}
+        for term, normalized in equivalents.items():
+            if term in label:
+                return normalized, {"strategy": "controlled_equivalence", "matched_label": term}
+        return label, {"strategy": "exact_label", "matched_label": label}
+
+    @staticmethod
+    def _merge_candidate_row(row):
+        value = dict(row)
+        for key, fallback in (("entity_ids_json", []), ("rationale_json", {}), ("evidence_ids_json", [])):
+            try:
+                value[key.replace("_json", "")] = json.loads(value.pop(key) or json_value(fallback, fallback))
+            except (TypeError, json.JSONDecodeError):
+                value[key.replace("_json", "")] = fallback
+        return value
+
+    def list_entity_merge_candidates(self, scope_id=None, status="pending"):
+        clauses, params = [], []
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._rows(
+            "SELECT * FROM entity_merge_candidates" + where + " ORDER BY confidence DESC, created_at DESC",
+            params,
+        )
+        return [self._merge_candidate_row(row) for row in rows]
+
+    def derive_entity_merge_candidates(self, scope_id=None):
+        """Create review-only semantic merge candidates within a MemorySpace.
+
+        This never mutates entities, their links, or their names.  A user must
+        explicitly accept a candidate before any stable identity can change.
+        """
+        allowed_types = {"place", "object", "emotion"}
+        entities = self.list_entities(scope_id=scope_id, public=False)
+        groups = {}
+        for entity in entities:
+            entity_type = entity.get("entity_type")
+            if entity_type not in allowed_types or entity.get("status") == "rejected":
+                continue
+            key, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"))
+            if rationale["strategy"] == "exact_label":
+                continue
+            groups.setdefault((entity.get("scope_id") or "home-default", entity_type, key), []).append((entity, rationale))
+        candidates = []
+        for (candidate_scope, entity_type, suggested_name), members in groups.items():
+            if len(members) < 2:
+                continue
+            entity_ids = sorted(member[0]["id"] for member in members)
+            evidence_ids = []
+            source_labels = []
+            for entity, _ in members:
+                source_labels.append(entity["canonical_name"])
+                evidence_ids.extend(row["observation_id"] for row in self._rows(
+                    "SELECT observation_id FROM entity_observations WHERE entity_id = ? ORDER BY observation_id", (entity["id"],)
+                ))
+            evidence_ids = list(dict.fromkeys(evidence_ids))
+            rationale = {
+                "strategy": "controlled_equivalence",
+                "source_labels": source_labels,
+                "normalized_key": suggested_name,
+                "automatic_merge": False,
+            }
+            encoded_ids = json_value(entity_ids, [])
+            existing = self._row(
+                "SELECT * FROM entity_merge_candidates WHERE scope_id = ? AND entity_type = ? AND entity_ids_json = ? AND suggested_name = ?",
+                (candidate_scope, entity_type, encoded_ids, suggested_name),
+            )
+            timestamp = now_iso()
+            if existing:
+                if existing["status"] == "rejected":
+                    continue
+                self.connection.execute(
+                    "UPDATE entity_merge_candidates SET evidence_ids_json = ?, confidence = MAX(confidence, ?), rationale_json = ?, updated_at = ? WHERE id = ?",
+                    (json_value(evidence_ids, []), 0.8, json_value(rationale, {}), timestamp, existing["id"]),
+                )
+                candidate_id = existing["id"]
+            else:
+                candidate_id = make_id("entity_merge")
+                self.connection.execute(
+                    """INSERT INTO entity_merge_candidates(id, scope_id, entity_type, entity_ids_json, suggested_name,
+                    rationale_json, confidence, evidence_ids_json, status, revision, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)""",
+                    (candidate_id, candidate_scope, entity_type, encoded_ids, suggested_name, json_value(rationale, {}), 0.8,
+                     json_value(evidence_ids, []), timestamp, timestamp),
+                )
+            candidates.append(self._merge_candidate_row(self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,))))
+        self.connection.commit()
+        return candidates
 
     def get_entity(self, entity_id):
         return self._row("SELECT * FROM entities WHERE id = ?", (entity_id,))

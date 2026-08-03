@@ -258,6 +258,23 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
     return {"entities": values}
 
 
+@app.get("/api/entity-merge-candidates")
+def entity_merge_candidates(scope_id: str | None = None, status: str | None = "pending"):
+    return {"candidates": store.list_entity_merge_candidates(scope_id, status)}
+
+
+@app.post("/api/maintenance/entity-merge-candidates")
+def derive_entity_merge_candidates(scope_id: str | None = None):
+    if not maintenance_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="entity merge candidate generation is already running")
+    maintenance_store = MemoryStore(store.path)
+    try:
+        return {"candidates": maintenance_store.derive_entity_merge_candidates(scope_id)}
+    finally:
+        maintenance_store.close()
+        maintenance_lock.release()
+
+
 @app.get("/api/knowledge")
 def knowledge(person_id: str | None = None, scope_id: str | None = None):
     claims = store.list_semantic_claims(person_id, 1000)
