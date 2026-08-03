@@ -51,6 +51,10 @@ class ControlledClip:
         return self.embedding
 
 
+class UntrustedClip(ControlledClip):
+    evidence_ready = False
+
+
 class AgentEvidenceTests(unittest.TestCase):
     def test_search_terms_do_not_match_every_filename_by_one_common_token(self):
         self.assertTrue(contains("SR_AWS_N_0016.jpg", "SR_AWS_N_0016.jpg"))
@@ -142,6 +146,21 @@ class AgentEvidenceTests(unittest.TestCase):
 
             self.assertFalse(result["insufficient_evidence"])
             self.assertIn(event["id"], [item["event_id"] for item in result["evidence"] if item["kind"] == "event"])
+
+    def test_untrusted_vector_model_cannot_supply_agent_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "harbor.jpg", "image", "/tmp/harbor.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "港口集装箱", "place": "港口"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_vector("episodic", "event", event["id"], [1.0, 0.0], "untrusted-clip")
+
+            result = MemoryAgent(store, gamma=FakeGamma(), clip=UntrustedClip([1.0, 0.0])).answer("火星生日派对")
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertEqual(result["evidence"], [])
+            vector = next(item for item in result["retrieval_trace"] if item["stage"] == "vector")
+            self.assertEqual(vector["status"], "unavailable")
 
     def test_person_activity_query_uses_event_level_semantic_claims(self):
         with tempfile.TemporaryDirectory() as directory:

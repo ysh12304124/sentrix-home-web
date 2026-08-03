@@ -167,7 +167,8 @@ class MemoryAgent:
         query_embedding = []
         vector_hits = []
         vector_candidates = []
-        if not structured_hit:
+        vector_available = bool(getattr(self.clip, "evidence_ready", True))
+        if not structured_hit and vector_available:
             query_embedding = self.clip.embed_text(query)
             vector_candidates = self.store.search_vectors("episodic", query_embedding, 12, scope_id=scope_id) + self.store.search_vectors("semantic", query_embedding, 12, scope_id=scope_id)
             vector_hits = [item for item in vector_candidates if float(item.get("score", 0) or 0) >= VECTOR_EVIDENCE_MIN_SCORE]
@@ -219,6 +220,7 @@ class MemoryAgent:
             "vectors": vector_hits,
             "vector_candidate_count": len(vector_candidates),
             "vector_skipped": structured_hit,
+            "vector_available": vector_available,
             "intent": {
                 "activity": self._is_activity_query(query),
                 "dimension": dimension,
@@ -523,7 +525,7 @@ class MemoryAgent:
             result["retrieval_trace"] = [
                 {"stage": "lexical", "status": "complete", "counts": {"events": 0, "observations": 0, "facts": 0}},
                 {"stage": "semantic", "status": "complete", "counts": {"claims": 0, "entities": len(public_retrieved.get("entities", [])), "relationships": 0}},
-                {"stage": "vector", "status": "complete", "counts": {"hits": len(public_retrieved.get("vectors", [])), "accepted": len(public_retrieved.get("vectors", [])), "candidates": public_retrieved.get("vector_candidate_count", 0)}},
+                {"stage": "vector", "status": "unavailable" if not public_retrieved.get("vector_available", True) else "complete", "counts": {"hits": len(public_retrieved.get("vectors", [])), "accepted": len(public_retrieved.get("vectors", [])), "candidates": public_retrieved.get("vector_candidate_count", 0)}},
                 {"stage": "evidence_validation", "status": "insufficient", "counts": {"evidence": 0, "query_gaps": 1}},
             ]
             result["evidence_layers"] = {"answers": [{"id": None, "text": result["answer"]}], "people": [], "events": [], "claims": [], "appearance": [], "observations": [], "assets": [], "gaps": [gap]}
@@ -566,7 +568,7 @@ class MemoryAgent:
         result["retrieval_trace"] = [
             {"stage": "lexical", "status": "complete", "counts": {"events": len(public_retrieved.get("events", [])), "observations": len(public_retrieved.get("observations", [])), "facts": len(public_retrieved.get("facts", []))}},
             {"stage": "semantic", "status": "complete", "counts": {"claims": len(public_retrieved.get("semantic_claims", [])), "entities": len(public_retrieved.get("entities", [])), "relationships": len(public_retrieved.get("relationships", []))}},
-            {"stage": "vector", "status": "skipped" if public_retrieved.get("vector_skipped") else "complete", "counts": {"hits": len(public_retrieved.get("vectors", [])), "accepted": len(public_retrieved.get("vectors", [])), "candidates": public_retrieved.get("vector_candidate_count", 0)}},
+            {"stage": "vector", "status": "skipped" if public_retrieved.get("vector_skipped") else "unavailable" if not public_retrieved.get("vector_available", True) else "complete", "counts": {"hits": len(public_retrieved.get("vectors", [])), "accepted": len(public_retrieved.get("vectors", [])), "candidates": public_retrieved.get("vector_candidate_count", 0)}},
             {"stage": "evidence_validation", "status": "complete", "counts": {"evidence": len(evidence)}},
         ]
         result["evidence_layers"] = {

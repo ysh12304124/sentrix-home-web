@@ -84,7 +84,7 @@ def health():
                 "error": pipeline.face.error,
                 "identityError": pipeline.face.identity_runtime_error or pipeline.face.identity_error,
             },
-            "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.error is None, "error": pipeline.clip.error},
+            "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.evidence_ready, "evidenceReady": pipeline.clip.evidence_ready, "error": pipeline.clip.error},
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
         "videoExtraction": "reserved",

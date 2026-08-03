@@ -388,6 +388,12 @@ class ClipAdapter:
         self._load_lock = threading.Lock()
         self.error = None
         self.device = os.getenv("CLIP_DEVICE", "auto")
+        # A randomly initialized model must never be used as retrieval evidence.
+        self.weights_ready = bool(self.checkpoint) or os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() in {"1", "true", "yes"}
+
+    @property
+    def evidence_ready(self):
+        return self.enabled and self.weights_ready and self.error is None
 
     def _device(self, torch):
         requested = str(self.device or "auto").strip().lower()
@@ -403,6 +409,7 @@ class ClipAdapter:
                 return None, None
             if not self.checkpoint and os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() not in {"1", "true", "yes"}:
                 self.error = "CLIP_CHECKPOINT is not configured"
+                self.weights_ready = False
                 return None, None
             try:
                 import open_clip
@@ -419,6 +426,7 @@ class ClipAdapter:
                 return self._model, self._preprocess
             except Exception as error:
                 self.error = str(error)
+                self.weights_ready = False
                 return None, None
 
     def embed_image(self, path):
