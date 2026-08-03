@@ -1942,12 +1942,13 @@ class MemoryStore:
         asset = self.get_asset(observation["asset_id"]) or {}
         scope_id = observation.get("scope_id") or asset.get("scope_id") or "home-default"
         raw = observation.get("raw") or {}
+        extracted = raw.get("gamma") if isinstance(raw.get("gamma"), dict) else raw
         captured_at = parse_time(observation.get("captured_at") or asset.get("captured_at"))
         captured_day = captured_at.date().isoformat() if captured_at else ""
         values = [
             ("place", observation.get("place") or asset.get("captured_location"), "由图片观察或采集地点维护"),
             ("object", observation.get("objects") or [], "由图片观察到的物体"),
-            ("emotion", raw.get("emotions") or [], "由图片观察到的情感"),
+            ("emotion", extracted.get("emotions") or raw.get("emotions") or [], "由图片观察到的情感"),
             ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
         ]
         entities = []

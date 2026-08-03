@@ -204,6 +204,16 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertIn(("time", "2026-08-03"), names_by_type)
         self.assertTrue(all(item["reviewable"] for item in entities if item["entity_type"] != "person"))
 
+    def test_entity_index_reads_emotion_from_persisted_model_payload(self):
+        self.store.connection.execute(
+            "UPDATE observations SET raw_json = ? WHERE id = ?",
+            ('{"gamma": {"emotions": ["温馨"]}}', self.obs1["id"]),
+        )
+        self.store.connection.commit()
+        self.store.reindex_observation_entities()
+
+        self.assertTrue(any(item["entity_type"] == "emotion" and item["canonical_name"] == "温馨" for item in self.store.list_entities()))
+
 
 if __name__ == "__main__":
     unittest.main()
