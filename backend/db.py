@@ -2032,6 +2032,16 @@ class MemoryStore:
                 (entity["id"],),
             )
             entity["avatar_face_instance_id"] = avatar["id"] if avatar else None
+            preview = self._row(
+                """SELECT a.id AS asset_id, a.file_name, a.media_type
+                FROM entity_observations eob JOIN observations o ON o.id = eob.observation_id
+                JOIN assets a ON a.id = o.asset_id
+                WHERE eob.entity_id = ? ORDER BY o.captured_at DESC, o.id DESC LIMIT 1""",
+                (entity["id"],),
+            )
+            entity["preview_asset_id"] = preview["asset_id"] if preview else None
+            entity["preview_file_name"] = preview["file_name"] if preview else None
+            entity["preview_media_type"] = preview["media_type"] if preview else None
         return entities
 
     def get_entity(self, entity_id):
@@ -2172,6 +2182,18 @@ class MemoryStore:
                 observation["asset"] = self.get_asset(observation["asset_id"])
                 evidence_observations.append(observation)
         entity["evidence_count"] = len(evidence_observations)
+        evidence_files = {}
+        for observation in evidence_observations:
+            asset = observation.get("asset") or {}
+            evidence_files[observation["id"]] = {
+                "evidence_id": observation["id"], "asset_id": observation["asset_id"],
+                "file_name": asset.get("file_name") or observation["asset_id"], "kind": "observation",
+            }
+        for appearance in self.list_person_appearance_evidence(entity_id, include_empty=True):
+            evidence_files[appearance["id"]] = {
+                "evidence_id": appearance["id"], "asset_id": appearance["asset_id"],
+                "file_name": appearance.get("file_name") or appearance["asset_id"], "kind": "appearance",
+            }
         return {
             "entity": entity,
             "clusters": clusters,
@@ -2182,6 +2204,7 @@ class MemoryStore:
             "appearance_evidence": self.list_person_appearance_evidence(entity_id, include_empty=True),
             "events": [self.get_event(event_id) for event_id in event_ids if self.get_event(event_id)],
             "observations": evidence_observations,
+            "evidence_files": list(evidence_files.values()),
         }
 
     def create_face_cluster(self, embedding, confidence=0.0, scope_id="home-default"):

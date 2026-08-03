@@ -203,6 +203,10 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(detail["events"][0]["id"], event["id"])
         self.assertEqual(detail["observations"][0]["id"], self.obs1["id"])
         self.assertTrue(any(item["predicate"] == "出现在" for item in detail["relationships"]))
+        self.assertEqual(detail["evidence_files"][0]["file_name"], "one.jpg")
+        listed = next(item for item in self.store.list_entities() if item["id"] == cake["id"])
+        self.assertEqual(listed["preview_asset_id"], "a1")
+        self.assertEqual(listed["preview_file_name"], "one.jpg")
 
     def test_entity_index_adds_capture_day_and_can_be_rebuilt(self):
         self.store.connection.execute(

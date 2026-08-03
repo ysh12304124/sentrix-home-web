@@ -219,6 +219,14 @@ button { cursor: pointer; }
 .entity-card, .cluster-card { border: 1px solid var(--line); border-radius: 10px; background: #fff; padding: 16px; text-align: left; }
 .entity-card { cursor: pointer; }
 .entity-card:hover { border-color: var(--green); background: #fbfdf9; }
+.entity-media-card { padding: 0; overflow: hidden; }
+.entity-media-card .entity-card-copy { padding: 12px; }
+.entity-media-card h2 { margin: 8px 0 4px; }
+.entity-thumb { width: 100%; aspect-ratio: 1 / .62; object-fit: cover; display: block; background: var(--soft); }
+.entity-thumb.fallback { display: grid; place-items: center; color: var(--muted); font-size: 28px; }
+.entity-expand { display: flex; justify-content: center; margin-top: 12px; }
+.entity-detail-thumb { width: 92px; height: 92px; object-fit: cover; border-radius: 6px; flex: 0 0 auto; }
+.claim-evidence-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .entity-card-head, .cluster-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .entity-card h2 { margin: 15px 0 4px; font-size: 20px; }
 .entity-card p, .cluster-card p { color: var(--muted); font-size: 10px; margin: 0; }
