@@ -128,6 +128,19 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertTrue(listed["private"])
         self.assertEqual(self.store.get_entity(place["id"])["canonical_name"], "家中餐厅")
 
+    def test_person_user_properties_are_versioned_and_not_overwritten_by_derivation(self):
+        person = self.store.create_entity("妈妈", "person", "confirmed", confidence=1.0)
+        self.store.set_entity_property(person["id"], "is_self", True, [self.obs1["id"]])
+        self.store.set_entity_property(person["id"], "relation_to_user", "本人", [self.obs1["id"]])
+        self.store.set_entity_property(person["id"], "groups", ["家人", "旅行伙伴"], [self.obs2["id"]])
+        retained = self.store.maintain_entity_property(person["id"], "relation_to_user", "同事", 0.9, [self.obs2["id"]])
+        properties = {item["property_key"]: item for item in self.store.get_entity_detail(person["id"])["properties"]}
+
+        self.assertTrue(properties["is_self"]["value"])
+        self.assertEqual(properties["relation_to_user"]["value"], "本人")
+        self.assertEqual(properties["groups"]["value"], ["家人", "旅行伙伴"])
+        self.assertEqual(retained["id"], properties["relation_to_user"]["id"])
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)

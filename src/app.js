@@ -311,6 +311,7 @@
       const detail = modal.detail;
       const entity = detail.entity;
       const claims = detail.claims || [];
+      const properties = detail.properties || [];
       const evidenceById = new Map((detail.evidence_files || []).map((item) => [item.evidence_id, item]));
       const claimEvidence = (claim) => (claim.evidence_ids_json || []).map((id) => evidenceById.get(id)).filter(Boolean);
       const claimRows = claims.map((claim) => {
@@ -318,7 +319,18 @@
         const evidenceLinks = evidence.length ? evidence.map((item) => `<button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}">${escapeHtml(item.file_name || item.asset_id)} ${icon("→")}</button>`).join("") : "<small>暂无可直接打开的原始证据</small>";
         return `<div class="fact-review-row"><div><strong>${escapeHtml(claim.predicate)} · ${escapeHtml(claim.value_text)}</strong><small>${escapeHtml(claim.dimension)} · ${escapeHtml(claim.status)} · 置信度 ${Math.round((claim.confidence || 0) * 100)}%</small><div class="claim-evidence-links">${evidenceLinks}</div></div></div>`;
       }).join("");
-      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(detail.profile?.summary_zh || entity.summary || "暂无人物画像") + "</p></div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
+      const identityRows = properties.filter((item) => ["is_self", "relation_to_user", "groups"].includes(item.property_key)).map((item) => {
+        const value = typeof item.value === "boolean" ? (item.value ? "是" : "否") : Array.isArray(item.value) ? item.value.join("、") : String(item.value ?? "未设置");
+        return `<div class="property-row"><strong>${escapeHtml(item.property_key)} · ${escapeHtml(value)}</strong><small>${escapeHtml(item.source)} · v${item.revision}</small></div>`;
+      }).join("");
+      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(detail.profile?.summary_zh || entity.summary || "暂无人物画像") + "</p></div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div><div class=\"section-head\"><div><p class=\"section-kicker\">用户维护档案</p><h3>身份、关系与圈子</h3></div><button class=\"button small ghost\" data-action=\"edit-person-properties\">修正档案</button></div><div class=\"property-list\">" + (identityRows || emptyState("尚未维护身份属性", "这些字段只由你维护，模型不会覆盖。")) + "</div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
+    } else if (modal.type === "person-property-edit") {
+      const detail = modal.detail;
+      const properties = new Map((detail.properties || []).map((item) => [item.property_key, item]));
+      const isSelf = Boolean(properties.get("is_self")?.value);
+      const relation = properties.get("relation_to_user")?.value || "";
+      const groups = Array.isArray(properties.get("groups")?.value) ? properties.get("groups").value.join("、") : "";
+      body = `<form id="modal-form"><div class="modal-kicker">PERSON PROPERTY EDIT</div><h2>修正人物档案</h2><p class="modal-lead">这些是用户维护字段，会保留版本且不会被模型推断覆盖。</p><label class="property-toggle"><input type="checkbox" name="is_self" ${isSelf ? "checked" : ""} />这是相册主人</label><label>与相册主人的关系<input name="relation_to_user" value="${escapeHtml(relation)}" placeholder="例如：本人、母亲、同事" /></label><label>所属圈子<input name="groups" value="${escapeHtml(groups)}" placeholder="例如：家人、大学同学" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-person-profile" data-person-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存人物档案</button></div></form>`;
     } else if (modal.type === "entity") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -509,6 +521,12 @@
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "private_flag", form.get("private_flag") === "on", evidenceIds);
         state.toast = "地点属性已按你的修正保存，并保留版本和证据";
       }
+      if (modal.type === "person-property-edit") {
+        await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "is_self", form.get("is_self") === "on");
+        await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "relation_to_user", String(form.get("relation_to_user") || "").trim());
+        await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "groups", String(form.get("groups") || "").split(/[、,，]/).map((item) => item.trim()).filter(Boolean));
+        state.toast = "人物档案已按你的修正保存";
+      }
       if (modal.type === "person") {
         const confirmed = await window.sentrixApi.confirmPerson(modal.person.id, form.get("name"), form.get("family_role"));
         const counts = confirmed.refresh_counts || {};
@@ -563,6 +581,7 @@
     if (action === "delete-story") { await window.sentrixApi.deleteStory(element.dataset.storyId); state.toast = "故事草稿已删除"; return refreshData(); }
     if (action === "open-person") { openModal({ type: "loading" }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
     if (action === "open-person-profile") { openModal({ type: "loading" }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
+    if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
     if (action === "confirm-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-confirm", cluster }); }
     if (action === "merge-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-merge", cluster }); }

@@ -63,6 +63,15 @@ test("event detail exposes its evidence-backed entity projection", () => {
   assert.match(appSource, /event-entity-row/);
 });
 
+test("person profiles expose user-maintained identity properties", () => {
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(appSource, /person-property-edit/);
+  assert.match(appSource, /edit-person-properties/);
+  assert.match(appSource, /relation_to_user/);
+  assert.match(appSource, /is_self/);
+  assert.match(appSource, /groups/);
+});
+
 test("memory-space and evidence governance are wired into the portal", () => {
   const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(source, /space-select/);
