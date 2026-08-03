@@ -636,7 +636,7 @@ class MemoryStore:
             "aggregation_score": "REAL NOT NULL DEFAULT 0",
             "aggregation_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
             "merged_into_event_id": "TEXT", "merge_reason": "TEXT",
-            "cover_asset_id": "TEXT",
+            "cover_asset_id": "TEXT", "cover_selection_json": "TEXT NOT NULL DEFAULT '{}'",
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
@@ -1356,11 +1356,12 @@ class MemoryStore:
                 (float(event.get("aggregation_score", 0) or 0), json_value(event.get("aggregation_breakdown", {}), {}), event_id),
             )
         self.connection.commit()
+        self.select_event_cover(event_id)
         self._refresh_event_participants([observation["id"]])
         return self.get_event(event_id)
 
     def get_event(self, event_id):
-        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json", "aggregation_breakdown_json"])
+        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json", "aggregation_breakdown_json", "cover_selection_json"])
         if row:
             row["participants"] = row.get("participants_json", [])
             row["aggregation_breakdown"] = row.get("aggregation_breakdown_json", {})
@@ -1371,8 +1372,45 @@ class MemoryStore:
                 ) if item.get("asset_id")
             ]
             row["cover_asset_id"] = row.get("cover_asset_id") if row.get("cover_asset_id") in row["asset_ids"] else (row["asset_ids"][0] if row["asset_ids"] else None)
+            row["cover_selection"] = row.get("cover_selection_json", {})
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
+
+    def select_event_cover(self, event_id):
+        """Choose an event cover from its own image evidence, without replacing user choice."""
+        event = self.get_event(event_id)
+        if not event:
+            return None
+        selection = event.get("cover_selection") or {}
+        if event.get("cover_asset_id") and selection.get("source") == "user":
+            return event
+        candidates = []
+        for observation_id in event.get("observation_ids", []):
+            observation = self.get_observation(observation_id) or {}
+            asset = self.get_asset(observation.get("asset_id")) or {}
+            if asset.get("media_type") != "image":
+                continue
+            candidates.append((
+                float(observation.get("confidence", 0) or 0),
+                str(observation.get("captured_at") or asset.get("captured_at") or ""),
+                str(asset.get("id") or ""), observation, asset,
+            ))
+        if not candidates:
+            return event
+        _, _, _, observation, asset = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+        selection = {
+            "source": "derived", "asset_id": asset["id"], "evidence_observation_id": observation["id"],
+            "criteria": {
+                "media_type": "image", "observation_confidence": float(observation.get("confidence", 0) or 0),
+                "captured_at": observation.get("captured_at") or asset.get("captured_at"), "candidate_count": len(candidates),
+            },
+        }
+        self.connection.execute(
+            "UPDATE events SET cover_asset_id = ?, cover_selection_json = ?, updated_at = ? WHERE id = ?",
+            (asset["id"], json_value(selection, {}), now_iso(), event_id),
+        )
+        self.connection.commit()
+        return self.get_event(event_id)
 
     def upsert_event_participant(self, event_id, person_id, role, evidence_ids=None, confidence=0.5):
         if not self.get_entity(person_id):
@@ -2092,6 +2130,12 @@ class MemoryStore:
         assignments = ", ".join(f"{key} = ?" for key in values)
         params = list(values.values()) + [now_iso(), event_id]
         self.connection.execute(f"UPDATE events SET {assignments}, revision = revision + 1, updated_at = ? WHERE id = ?", params)
+        if cover_asset_id:
+            selection = {"source": "user", "asset_id": cover_asset_id, "criteria": {"reason": "user_selected"}}
+            self.connection.execute(
+                "UPDATE events SET cover_selection_json = ? WHERE id = ?",
+                (json_value(selection, {}), event_id),
+            )
         for key, value in values.items():
             if event.get(key) != value:
                 self.connection.execute(

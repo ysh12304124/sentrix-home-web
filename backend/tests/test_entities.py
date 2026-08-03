@@ -292,6 +292,30 @@ class NativeEntityMemoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.update_event(event["id"], {"cover_asset_id": "missing-asset"})
 
+    def test_derived_event_cover_uses_event_image_evidence_and_preserves_user_choice(self):
+        event = self.store.create_event({"id": "cover_event", "title": "封面选择"})
+        self.store.connection.execute("UPDATE observations SET confidence = ? WHERE id = ?", (0.45, self.obs1["id"]))
+        self.store.connection.execute("UPDATE observations SET confidence = ? WHERE id = ?", (0.9, self.obs2["id"]))
+        self.store.connection.executemany(
+            "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+            [(event["id"], self.obs1["id"]), (event["id"], self.obs2["id"])],
+        )
+        self.store.connection.commit()
+
+        selected = self.store.select_event_cover(event["id"])
+
+        self.assertEqual(selected["cover_asset_id"], "a2")
+        self.assertEqual(selected["cover_selection"]["source"], "derived")
+        self.assertEqual(selected["cover_selection"]["asset_id"], "a2")
+        self.assertEqual(selected["cover_selection"]["evidence_observation_id"], self.obs2["id"])
+        self.assertEqual(selected["cover_selection"]["criteria"]["media_type"], "image")
+
+        self.store.update_event(event["id"], {"cover_asset_id": "a1"})
+        retained = self.store.select_event_cover(event["id"])
+
+        self.assertEqual(retained["cover_asset_id"], "a1")
+        self.assertEqual(retained["cover_selection"]["source"], "user")
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)

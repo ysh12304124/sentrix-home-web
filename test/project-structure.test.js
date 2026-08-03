@@ -102,6 +102,8 @@ test("event edit exposes type, end time, and evidence-backed cover controls", ()
   assert.match(source, /name="event_type"/);
   assert.match(source, /name="time_end"/);
   assert.match(source, /name="cover_asset_id"/);
+  assert.match(source, /封面选择依据/);
+  assert.match(source, /cover_selection/);
 });
 
 test("entity reindex maintenance isolates its SQLite connection and rejects concurrent runs", () => {
