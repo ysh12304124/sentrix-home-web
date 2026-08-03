@@ -88,6 +88,15 @@ test("pending trip candidates are loaded as evidence-backed semantic memory", ()
   assert.match(appSource, /evidence_ids_json/);
 });
 
+test("trip candidates have explicit user confirmation and rejection actions", () => {
+  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(apiSource, /confirmTrip/);
+  assert.match(apiSource, /rejectTrip/);
+  assert.match(appSource, /confirm-trip/);
+  assert.match(appSource, /reject-trip/);
+});
+
 test("entity reindex maintenance isolates its SQLite connection and rejects concurrent runs", () => {
   const source = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
   assert.match(source, /maintenance_lock/);

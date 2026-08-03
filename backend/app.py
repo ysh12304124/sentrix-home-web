@@ -129,6 +129,34 @@ def trips(scope_id: str | None = None, status: str | None = None):
     return {"trips": store.list_trips(scope_id, status)}
 
 
+@app.get("/api/trips/{trip_id}")
+def trip_detail(trip_id: str):
+    value = store.get_trip_detail(trip_id)
+    if not value:
+        raise HTTPException(status_code=404, detail="trip not found")
+    return value
+
+
+@app.post("/api/trips/{trip_id}/confirm")
+def confirm_trip(trip_id: str, payload: dict):
+    try:
+        return store.confirm_trip(trip_id, payload.get("name"), payload.get("trip_type"))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="trip not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.post("/api/trips/{trip_id}/reject")
+def reject_trip(trip_id: str):
+    try:
+        return store.reject_trip(trip_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="trip not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.get("/api/events/{event_id}")
 def event_detail(event_id: str):
     value = store.get_event_detail(event_id)

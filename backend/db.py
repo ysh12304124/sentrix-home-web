@@ -307,6 +307,15 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS trip_revisions (
+                id TEXT PRIMARY KEY,
+                trip_id TEXT NOT NULL REFERENCES trips(id),
+                action TEXT NOT NULL,
+                old_value_json TEXT NOT NULL DEFAULT '{}',
+                new_value_json TEXT NOT NULL DEFAULT '{}',
+                source TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS entities (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -662,6 +671,7 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_event_entities_event ON event_entities(event_id);
             CREATE INDEX IF NOT EXISTS idx_event_entities_entity ON event_entities(entity_id);
             CREATE INDEX IF NOT EXISTS idx_trips_scope_status ON trips(scope_id, status, time_start);
+            CREATE INDEX IF NOT EXISTS idx_trip_revisions_trip ON trip_revisions(trip_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_semantic_claims_person ON semantic_claims(person_id);
             CREATE INDEX IF NOT EXISTS idx_assets_scope ON assets(scope_id);
             CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(scope_id);
@@ -1859,6 +1869,61 @@ class MemoryStore:
         rows = self._rows("SELECT * FROM trips" + where + " ORDER BY time_start DESC, updated_at DESC", params)
         return [self._decode(row, ["event_ids_json", "place_names_json", "companion_ids_json", "evidence_ids_json"]) for row in rows]
 
+    def get_trip(self, trip_id):
+        return self._decode(self._row("SELECT * FROM trips WHERE id = ?", (trip_id,)), ["event_ids_json", "place_names_json", "companion_ids_json", "evidence_ids_json"])
+
+    def list_trip_revisions(self, trip_id):
+        return [self._decode(row, ["old_value_json", "new_value_json"]) for row in self._rows(
+            "SELECT * FROM trip_revisions WHERE trip_id = ? ORDER BY created_at DESC", (trip_id,),
+        )]
+
+    def get_trip_detail(self, trip_id):
+        trip = self.get_trip(trip_id)
+        if not trip:
+            return None
+        return {
+            "trip": trip,
+            "events": [event for event_id in trip["event_ids_json"] if (event := self.get_event(event_id))],
+            "revisions": self.list_trip_revisions(trip_id),
+        }
+
+    def _record_trip_revision(self, trip_id, action, old_value, new_value, source="user"):
+        self.connection.execute(
+            """INSERT INTO trip_revisions(id, trip_id, action, old_value_json, new_value_json, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (make_id("trip_revision"), trip_id, action, json_value(old_value, {}), json_value(new_value, {}), source, now_iso()),
+        )
+
+    def confirm_trip(self, trip_id, name, trip_type=None):
+        trip = self.get_trip(trip_id)
+        if not trip:
+            raise KeyError(trip_id)
+        if trip["status"] != "pending":
+            raise ValueError("only pending trip candidates can be confirmed")
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("trip name is required")
+        old_value = {"status": trip["status"], "name": trip["name"], "trip_type": trip.get("trip_type")}
+        new_value = {"status": "active", "name": name, "trip_type": str(trip_type or "").strip() or None}
+        self.connection.execute(
+            "UPDATE trips SET status = 'active', name = ?, trip_type = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+            (new_value["name"], new_value["trip_type"], now_iso(), trip_id),
+        )
+        self._record_trip_revision(trip_id, "confirmed", old_value, new_value)
+        self.connection.commit()
+        return self.get_trip(trip_id)
+
+    def reject_trip(self, trip_id):
+        trip = self.get_trip(trip_id)
+        if not trip:
+            raise KeyError(trip_id)
+        if trip["status"] != "pending":
+            raise ValueError("only pending trip candidates can be rejected")
+        self.connection.execute("UPDATE trips SET status = 'rejected', revision = revision + 1, updated_at = ? WHERE id = ?", (now_iso(), trip_id))
+        self._record_trip_revision(trip_id, "rejected", {"status": "pending"}, {"status": "rejected"})
+        self.connection.commit()
+        return self.get_trip(trip_id)
+
     def _upsert_trip_candidate(self, scope_id, events):
         event_ids = [event["id"] for event in events]
         places = list(dict.fromkeys(str(event.get("place") or "").strip() for event in events if str(event.get("place") or "").strip()))
@@ -1872,15 +1937,17 @@ class MemoryStore:
         start, end = events[0].get("time_start"), events[-1].get("time_start")
         name = f"{str(start or '')[:10]} 至 {str(end or '')[:10]} 的行程候选"
         confidence = min(0.9, 0.45 + 0.08 * len(events) + 0.04 * len(places))
-        existing = self._row("SELECT * FROM trips WHERE scope_id = ? AND event_ids_json = ? AND status = 'pending'", (scope_id, json_value(event_ids, [])))
+        existing = self._row("SELECT * FROM trips WHERE scope_id = ? AND event_ids_json = ? AND status IN ('pending', 'active', 'rejected')", (scope_id, json_value(event_ids, [])))
         timestamp = now_iso()
-        if existing:
+        if existing and existing["status"] == "pending":
             self.connection.execute(
                 "UPDATE trips SET name = ?, time_start = ?, time_end = ?, place_names_json = ?, companion_ids_json = ?, evidence_ids_json = ?, confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
                 (name, start, end, json_value(places, []), json_value(companion_ids, []), json_value(evidence_ids, []), confidence, timestamp, existing["id"]),
             )
             self.connection.commit()
             return next(item for item in self.list_trips(scope_id, "pending") if item["id"] == existing["id"])
+        if existing:
+            return None
         trip_id = make_id("trip")
         self.connection.execute(
             """INSERT INTO trips(id, scope_id, name, status, time_start, time_end, event_ids_json, place_names_json,
@@ -1926,7 +1993,8 @@ class MemoryStore:
         within_duration = bool(start and end and end - start <= timedelta(days=10))
         if not (cross_day and within_duration and len(places) >= 2 and material_displacement):
             return []
-        return [self._upsert_trip_candidate(scope_id, events)]
+        candidate = self._upsert_trip_candidate(scope_id, events)
+        return [candidate] if candidate else []
 
     def get_event_detail(self, event_id):
         event = self.get_event(event_id)

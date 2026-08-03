@@ -199,6 +199,52 @@ class NativeEntityMemoryTests(unittest.TestCase):
 
         self.assertEqual(self.store.derive_trip_candidates(), [])
 
+    def test_user_can_confirm_trip_without_losing_evidence_or_stable_identity(self):
+        first = self.store.create_event({
+            "id": "trip_event_one", "title": "出发", "place": "30.274100,120.155100", "time_start": "2025-05-01T10:00:00+08:00",
+        })
+        second = self.store.create_event({
+            "id": "trip_event_two", "title": "抵达", "place": "31.230400,121.473700", "time_start": "2025-05-02T10:00:00+08:00",
+        })
+        self.store.connection.executemany(
+            "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+            [(first["id"], self.obs1["id"]), (second["id"], self.obs2["id"])],
+        )
+        self.store.connection.commit()
+        candidate = self.store.derive_trip_candidates()[0]
+
+        confirmed = self.store.confirm_trip(candidate["id"], "五一沪杭行", "旅行")
+        detail = self.store.get_trip_detail(candidate["id"])
+
+        self.assertEqual(confirmed["id"], candidate["id"])
+        self.assertEqual(confirmed["status"], "active")
+        self.assertEqual(confirmed["name"], "五一沪杭行")
+        self.assertEqual(confirmed["trip_type"], "旅行")
+        self.assertEqual(confirmed["evidence_ids_json"], [self.obs1["id"], self.obs2["id"]])
+        self.assertEqual(detail["events"][0]["id"], first["id"])
+        self.assertEqual(detail["revisions"][0]["action"], "confirmed")
+        self.assertEqual(self.store.derive_trip_candidates(), [])
+
+    def test_user_can_reject_trip_and_candidate_does_not_reappear(self):
+        first = self.store.create_event({
+            "id": "trip_event_one", "title": "出发", "place": "30.274100,120.155100", "time_start": "2025-05-01T10:00:00+08:00",
+        })
+        second = self.store.create_event({
+            "id": "trip_event_two", "title": "抵达", "place": "31.230400,121.473700", "time_start": "2025-05-02T10:00:00+08:00",
+        })
+        self.store.connection.executemany(
+            "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+            [(first["id"], self.obs1["id"]), (second["id"], self.obs2["id"])],
+        )
+        self.store.connection.commit()
+        candidate = self.store.derive_trip_candidates()[0]
+
+        rejected = self.store.reject_trip(candidate["id"])
+
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(self.store.derive_trip_candidates(), [])
+        self.assertEqual(self.store.get_trip_detail(candidate["id"])["revisions"][0]["action"], "rejected")
+
     def test_confirmation_rebuilds_event_roles_and_person_knowledge(self):
         event_one = self.store.merge_observation_into_event(self.obs1)
         event_two = self.store.merge_observation_into_event(self.obs2)
