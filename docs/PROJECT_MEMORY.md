@@ -182,8 +182,9 @@ MemorySpace / Household
   活跃人脸簇，再执行同一传播链，避免实体 ID 被旧 `persons` 路由误判为 404。
 - 人物证据查看与确认分开：查看显示人脸裁剪、原图、关联事件和状态；确认才打开
   姓名/角色表单。
-- `POST /api/assistant/turn` 接收 message、`conversation_id`、feedback、`scope_id`，
-  区分 `query`、`feedback`、`clarification`。`POST /api/search` 是兼容包装器。
+- `POST /api/assistant/turn` 接收 message、`conversation_id`、feedback、`scope_id` 和
+  可选 `selected_entity_id`，区分 `query`、`feedback`、`clarification`。`POST /api/search`
+  是兼容包装器。
 - 图片结果带 `asset_id`、`observation_id`、文件名、时间、caption、`media_url`，前端
   展示 `/api/assets/{asset_id}/file` 原图缩略图和打开入口。
 - 头像统一使用 `/api/face-instances/{face_instance_id}/crop`，不使用整图冒充头像。
@@ -327,6 +328,12 @@ MemorySpace / Household
 6. **完成查询和反馈闭环验收**：用三相册 query 集评估原图命中率、答案事实性和
    证据链；实际执行一次视觉补全后二次查询，及一次接受/纠正反馈，验证
    `query_gaps`、`memory_feedback` 与后续结果。
+7. **三相册人脸验收数据补齐**：为每个授权身份出现提供 bbox 或 `face_instance_id`
+   对齐；验收同时要求 pairwise F1 `>=0.95` 和可验证覆盖率 `>=0.95`，单人图片局部
+   F1 不得替代该门槛。
+8. **全量端到端性能验收**：以同一三相册 manifest、固定硬件和可审计旧基线运行隔离
+   全量管线；报告导入、视觉、AdaFace、CLIP、事件/实体投影和总结耗时，只有实际平均
+   速度比 `>=5x` 才可关闭性能目标。历史三图受控 `5.502x` 仅供参考。
 
 ### P1：产品可用性与语义质量
 
@@ -410,6 +417,14 @@ git diff --check
 - `8090` 由 `scripts/runtime/start_sentrix_api.sh` 启动，进程环境含
   `FACE_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider` 与 NVIDIA runtime 库路径；Web `4174` 和 FMA `5173` 均在本次切换后返回 `200`，未改动 FMA。
 - 真实相册标签没有人脸框，且存在漏检和标注人数不一致；不能以此宣称三相册人脸 F1 达到 95%。LFW 受控门禁结果仍为 coverage `0.9917`、F1 `0.9916`。
+- 隔离 AdaFace GPU 评估处理了 manifest 内 `191` 张原图、`74` 个检测，失败数为 `0`，
+  生产 SQLite 哈希前后一致。严格评估只接受“单标签且单检测”的无序对齐样本：
+  `threshold=0.20–0.28` 时加权 F1 为 `1.0`，但仅覆盖 `16/34=47.06%` 授权人脸出现。
+  因此全量三相册 `F1>=0.95` 且验证覆盖率 `>=0.95` 仍未通过；需要 bbox/face-instance
+  级标注或显式人工对齐审阅。
+- 本次 `8090` 进程显式配置 AdaFace checkpoint 与仓库根目录；对现有 `album2` 原图实测
+  返回一张 `512` 维 AdaFace 向量且质量门槛通过，ONNX 使用 `CUDAExecutionProvider`。
+  主机 `nvidia-smi` 受 NVML driver/library mismatch 影响不可作为 GPU 成功与否的唯一信号。
 
 ## 实体模型待办
 

@@ -13,6 +13,7 @@ test("runtime and maintenance entry points use the documented layout", () => {
     ["scripts", "maintenance", "rebuild_memory.py"],
     ["scripts", "benchmarks", "evaluate_lfw_clusters.py"],
     ["scripts", "benchmarks", "ingest_household_face_benchmark.py"],
+    ["scripts", "benchmarks", "evaluate_household_memory_steward.py"],
     ["scripts", "benchmarks", "evaluate_memory_steward.py"],
     ["scripts", "fixtures", "build_virtual_family_album.py"],
   ]) assert.equal(exists(...file), true, file.join("/") + " must exist");
