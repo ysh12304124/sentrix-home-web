@@ -374,6 +374,23 @@ class NativeEntityMemoryTests(unittest.TestCase):
 
         self.assertTrue(any(item["entity_type"] == "emotion" and item["canonical_name"] == "温馨" for item in self.store.list_entities()))
 
+    def test_mood_entities_normalize_raw_model_labels_and_preserve_evidence(self):
+        self.store.connection.execute(
+            "UPDATE observations SET raw_json = ? WHERE id = ?",
+            ('{"gamma": {"emotions": ["面带微笑", "轻松"]}}', self.obs1["id"]),
+        )
+        self.store.connection.commit()
+
+        entities = self.store.maintain_observation_entities(self.obs1["id"])
+        emotions = {item["canonical_name"]: item for item in entities if item["entity_type"] == "emotion"}
+        joyful = self.store.get_entity_detail(emotions["喜悦"]["id"])
+
+        self.assertEqual(set(emotions), {"喜悦", "放松"})
+        properties = {item["property_key"]: item for item in joyful["properties"]}
+        self.assertEqual(properties["mood_label"]["value"], "喜悦")
+        self.assertEqual(properties["raw_mood_labels"]["value"], ["面带微笑"])
+        self.assertEqual(properties["raw_mood_labels"]["evidence_ids"], [self.obs1["id"]])
+
     def test_event_projects_linked_entities_with_observation_evidence(self):
         self.store.connection.execute(
             "UPDATE observations SET captured_at = ?, place = ?, objects_json = ?, raw_json = ? WHERE id = ?",

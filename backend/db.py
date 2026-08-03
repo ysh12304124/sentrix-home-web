@@ -72,6 +72,30 @@ OBJECT_CATEGORIES = {
 
 TRIP_MIN_GPS_DISPLACEMENT_KM = 50.0
 
+MOOD_NORMALIZATION = {
+    "平静": "平静",
+    "宁静": "平静",
+    "平和": "平静",
+    "安详": "平静",
+    "淡定": "平静",
+    "表情平淡": "平静",
+    "愉快": "喜悦",
+    "愉悦": "喜悦",
+    "喜悦": "喜悦",
+    "温馨": "温馨",
+    "微笑": "喜悦",
+    "面带微笑": "喜悦",
+    "欢快": "喜悦",
+    "兴奋": "兴奋",
+    "兴奋感": "兴奋",
+    "轻松": "放松",
+    "放松": "放松",
+    "悠闲": "放松",
+    "专注": "专注",
+    "好奇": "好奇",
+    "警觉": "警觉",
+}
+
 
 def normalize_clothing(value):
     text = str(value or "").strip()
@@ -102,6 +126,10 @@ def object_category(label):
         if any(term in text for term in terms):
             return category
     return "其他"
+
+
+def normalize_mood(value):
+    return MOOD_NORMALIZATION.get(str(value or "").strip())
 
 
 def parse_gps_place(value):
@@ -2208,7 +2236,7 @@ class MemoryStore:
         values = [
             ("place", observation.get("place") or asset.get("captured_location"), "由图片观察或采集地点维护"),
             ("object", observation.get("objects") or [], "由图片观察到的物体"),
-            ("emotion", extracted.get("emotions") or raw.get("emotions") or [], "由图片观察到的情感"),
+            ("emotion", [normalize_mood(value) for value in (extracted.get("emotions") or raw.get("emotions") or []) if normalize_mood(value)], "由图片观察到的情感"),
             ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
         ]
         entities = []
@@ -2246,6 +2274,22 @@ class MemoryStore:
             self.maintain_entity_property(
                 entity["id"], "category", object_category(entity["canonical_name"]), observation.get("confidence", 0), evidence_ids,
                 "object_taxonomy_v1",
+            )
+        for entity in entities:
+            if entity["entity_type"] != "emotion":
+                continue
+            raw_moods = [
+                str(value).strip()
+                for value in (extracted.get("emotions") or raw.get("emotions") or [])
+                if normalize_mood(value) == entity["canonical_name"] and str(value).strip()
+            ]
+            self.maintain_entity_property(
+                entity["id"], "mood_label", entity["canonical_name"], observation.get("confidence", 0), evidence_ids,
+                "mood_normalization_v1",
+            )
+            self.maintain_entity_property_values(
+                entity["id"], "raw_mood_labels", raw_moods, observation.get("confidence", 0), evidence_ids,
+                "mood_normalization_v1",
             )
         if time_entity and captured_at:
             semantics = time_semantics(captured_at)
