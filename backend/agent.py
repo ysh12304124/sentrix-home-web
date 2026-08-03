@@ -4,6 +4,8 @@ import uuid
 
 from .model_clients import ClipAdapter, GammaClient
 
+VECTOR_EVIDENCE_MIN_SCORE = 0.35
+
 
 def contains(value, query):
     value = str(value or "").lower()
@@ -16,7 +18,20 @@ def contains(value, query):
     identifiers = [term for term in terms if "_" in term or any(character.isdigit() for character in term)]
     if identifiers and any(term in value for term in identifiers):
         return True
-    return bool(terms) and all(term in value for term in terms)
+    if bool(terms) and all(term in value for term in terms):
+        return True
+    # Chinese questions often contain one continuous block (for example,
+    # "餐桌旁发生了什么"). Recover meaningful 2-6 character clues without
+    # falling back to unrelated records merely because the full sentence differs.
+    chinese_blocks = re.findall(r"[\u4e00-\u9fff]{2,}", normalized_query)
+    clues = {
+        block[index:index + size]
+        for block in chinese_blocks
+        for size in range(2, min(6, len(block)) + 1)
+        for index in range(len(block) - size + 1)
+        if block[index:index + size] not in {"什么", "哪里", "如何", "哪些", "发生", "图片"}
+    }
+    return any(clue in value for clue in clues)
 
 
 class MemoryAgent:
@@ -148,10 +163,13 @@ class MemoryAgent:
         structured_hit = bool(has_event_constraint or local_observations or local_facts or focused_ids)
         query_embedding = []
         vector_hits = []
+        vector_candidates = []
         if not structured_hit:
             query_embedding = self.clip.embed_text(query)
-            vector_hits = self.store.search_vectors("episodic", query_embedding, 12, scope_id=scope_id) + self.store.search_vectors("semantic", query_embedding, 12, scope_id=scope_id)
+            vector_candidates = self.store.search_vectors("episodic", query_embedding, 12, scope_id=scope_id) + self.store.search_vectors("semantic", query_embedding, 12, scope_id=scope_id)
+            vector_hits = [item for item in vector_candidates if float(item.get("score", 0) or 0) >= VECTOR_EVIDENCE_MIN_SCORE]
         vector_event_ids = [item["source_id"] for item in vector_hits if item["source_type"] == "event"]
+        vector_event_ids.extend(item.get("metadata", {}).get("event_id") for item in vector_hits if item.get("metadata", {}).get("event_id"))
         vector_events = [event for event in events if event["id"] in vector_event_ids]
         observation_event_ids = {item[2]["id"] for item in local_observations}
         observation_events = [event for event in events if observation_event_ids.intersection(event.get("observation_ids", []))]
@@ -165,9 +183,10 @@ class MemoryAgent:
                 if profile:
                     profiles.append(profile)
         else:
-            semantic_claims = self.store.list_semantic_claims(None, 500)
-            if scope_id:
-                semantic_claims = [claim for claim in semantic_claims if claim.get("scope_id") == scope_id]
+            semantic_claims = [
+                claim for claim in self.store.list_semantic_claims(None, 500)
+                if (not scope_id or claim.get("scope_id") == scope_id) and contains(json.dumps(claim, ensure_ascii=False), query)
+            ]
         if dimension == "clothing" and focused_ids:
             semantic_claims = [claim for claim in semantic_claims if claim.get("dimension") == "clothing"]
         appearance_evidence = []
@@ -183,10 +202,10 @@ class MemoryAgent:
             }
             ranked_observations = [item for item in observations if item["id"] in relevant_observation_ids]
         return {
-            "events": local_events if has_event_constraint else (local_events or observation_events or vector_events or events[:8]),
-            "observations": ranked_observations or observations[:16],
+            "events": local_events if has_event_constraint else (local_events or observation_events or vector_events),
+            "observations": ranked_observations,
             "focus_observation_ids": observation_event_ids,
-            "facts": local_facts or facts[:16],
+            "facts": local_facts,
             "semantic_claims": semantic_claims,
             "appearance_evidence": appearance_evidence,
             "profiles": profiles,
@@ -195,6 +214,7 @@ class MemoryAgent:
             "entities": entities[:100],
             "relationships": relationships[:100],
             "vectors": vector_hits,
+            "vector_candidate_count": len(vector_candidates),
             "vector_skipped": structured_hit,
             "intent": {
                 "activity": self._is_activity_query(query),
@@ -482,6 +502,30 @@ class MemoryAgent:
                     "crop_bbox": appearance.get("crop_bbox_json", []), "clothing": appearance.get("clothing_json", []),
                     "confidence": appearance.get("confidence", 0), "model": appearance.get("model_name"),
                 })
+        if not evidence:
+            candidate_asset_ids = list(dict.fromkeys(
+                item.get("metadata", {}).get("asset_id") for item in public_retrieved.get("vectors", [])
+                if item.get("metadata", {}).get("asset_id")
+            ))
+            gap = self.store.create_query_gap(query, intent.get("dimension") or "semantic", candidate_asset_ids, [])
+            result = {
+                "answer": f"当前本地记忆没有找到能回答“{query}”的证据。",
+                "confidence": 0.0,
+                "insufficient_evidence": True,
+                "model": "sentrix-evidence-fallback",
+                "modelEvidence": [],
+                "evidence": [],
+                "query_gap_id": gap["id"],
+            }
+            result["retrieval_trace"] = [
+                {"stage": "lexical", "status": "complete", "counts": {"events": 0, "observations": 0, "facts": 0}},
+                {"stage": "semantic", "status": "complete", "counts": {"claims": 0, "entities": len(public_retrieved.get("entities", [])), "relationships": 0}},
+                {"stage": "vector", "status": "complete", "counts": {"hits": len(public_retrieved.get("vectors", [])), "accepted": len(public_retrieved.get("vectors", [])), "candidates": public_retrieved.get("vector_candidate_count", 0)}},
+                {"stage": "evidence_validation", "status": "insufficient", "counts": {"evidence": 0, "query_gaps": 1}},
+            ]
+            result["evidence_layers"] = {"answers": [{"id": None, "text": result["answer"]}], "people": [], "events": [], "claims": [], "appearance": [], "observations": [], "assets": [], "gaps": [gap]}
+            result["query"] = query
+            return result
         deterministic_query = (
             (activity_query and public_retrieved.get("focused_people"))
             or (intent.get("dimension") == "clothing" and public_retrieved.get("focused_people"))
@@ -519,7 +563,7 @@ class MemoryAgent:
         result["retrieval_trace"] = [
             {"stage": "lexical", "status": "complete", "counts": {"events": len(public_retrieved.get("events", [])), "observations": len(public_retrieved.get("observations", [])), "facts": len(public_retrieved.get("facts", []))}},
             {"stage": "semantic", "status": "complete", "counts": {"claims": len(public_retrieved.get("semantic_claims", [])), "entities": len(public_retrieved.get("entities", [])), "relationships": len(public_retrieved.get("relationships", []))}},
-            {"stage": "vector", "status": "skipped" if public_retrieved.get("vector_skipped") else "complete", "counts": {"hits": len(public_retrieved.get("vectors", []))}},
+            {"stage": "vector", "status": "skipped" if public_retrieved.get("vector_skipped") else "complete", "counts": {"hits": len(public_retrieved.get("vectors", [])), "accepted": len(public_retrieved.get("vectors", [])), "candidates": public_retrieved.get("vector_candidate_count", 0)}},
             {"stage": "evidence_validation", "status": "complete", "counts": {"evidence": len(evidence)}},
         ]
         result["evidence_layers"] = {

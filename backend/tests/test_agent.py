@@ -41,6 +41,16 @@ class FailingClip:
         raise AssertionError("pending identity review must not use vector recall")
 
 
+class ControlledClip:
+    model_name = "controlled-clip"
+
+    def __init__(self, embedding):
+        self.embedding = embedding
+
+    def embed_text(self, text):
+        return self.embedding
+
+
 class AgentEvidenceTests(unittest.TestCase):
     def test_search_terms_do_not_match_every_filename_by_one_common_token(self):
         self.assertTrue(contains("SR_AWS_N_0016.jpg", "SR_AWS_N_0016.jpg"))
@@ -101,6 +111,37 @@ class AgentEvidenceTests(unittest.TestCase):
             result = MemoryAgent(store, gamma=FakeGamma()).retrieve("冰箱")
 
             self.assertEqual(result["observations"][0]["id"], first_observation["id"])
+
+    def test_low_similarity_vector_hit_degrades_to_query_gap_instead_of_answering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "harbor.jpg", "image", "/tmp/harbor.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "港口集装箱", "place": "港口"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_vector("episodic", "event", event["id"], [0.1, 0.995], "controlled-clip")
+
+            result = MemoryAgent(store, gamma=FakeGamma(), clip=ControlledClip([1.0, 0.0])).answer("火星生日派对在哪里")
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertEqual(result["confidence"], 0.0)
+            self.assertEqual(result["evidence"], [])
+            self.assertIn("没有找到", result["answer"])
+            self.assertEqual(store.get_query_gap(result["query_gap_id"])["missing_dimension"], "spatial_relation")
+            vector = next(item for item in result["retrieval_trace"] if item["stage"] == "vector")
+            self.assertEqual(vector["counts"]["accepted"], 0)
+
+    def test_high_similarity_vector_hit_can_recover_anchored_event_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "harbor.jpg", "image", "/tmp/harbor.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "港口集装箱", "place": "港口"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_vector("episodic", "event", event["id"], [1.0, 0.0], "controlled-clip")
+
+            result = MemoryAgent(store, gamma=RefusingGamma(), clip=ControlledClip([1.0, 0.0])).answer("港口的活动")
+
+            self.assertFalse(result["insufficient_evidence"])
+            self.assertIn(event["id"], [item["event_id"] for item in result["evidence"] if item["kind"] == "event"])
 
     def test_person_activity_query_uses_event_level_semantic_claims(self):
         with tempfile.TemporaryDirectory() as directory:
