@@ -325,7 +325,7 @@ class AnnotationStore:
         ignore_streak = 0 if accepted else int(current.get("ignore_streak", 0) or 0) + (1 if ignored else 0)
         level = int(current.get("level", 2) or 2)
         if ignore_streak >= 2:
-            level = max(0, level - 1)
+            level = 0
         if outcome == "enabled":
             enabled = True
             level = max(level, 1)

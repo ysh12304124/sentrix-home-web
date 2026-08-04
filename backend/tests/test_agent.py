@@ -939,7 +939,8 @@ class AgentEvidenceTests(unittest.TestCase):
             result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn("介绍一下妈妈")
 
             self.assertEqual(result["dialogue_plan"]["style"], "narrative")
-            self.assertIn("根据目前可回溯的记忆", result["answer"])
+            self.assertIn("妈妈", result["answer"])
+            self.assertNotIn("2025-05-01 10:00", result["answer"])
 
     def test_answer_turn_feedback_persists_without_normal_recall(self):
         with tempfile.TemporaryDirectory() as directory:
