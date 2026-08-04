@@ -66,6 +66,8 @@ test("native confirmation and assistant turn routes are exposed by the browser A
   assert.match(appSource, /toolTrace/);
   assert.match(source, /entityGroups/);
   assert.match(backendSource, /\/api\/entity-groups/);
+  assert.match(backendSource, /evidencePresentation/);
+  assert.match(backendSource, /originalEvidenceRequested/);
 });
 
 test("family memory assistant presents an evidence-backed conversation surface", () => {
@@ -78,6 +80,14 @@ test("family memory assistant presents an evidence-backed conversation surface",
   assert.match(appSource, /evidence_order/);
   assert.match(appSource, /证据顺序与可信度/);
   assert.match(appSource, /dialogue_plan/);
+});
+
+test("memory answers always expose evidence state and direct original media", () => {
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(appSource, /evidence_presentation/);
+  assert.match(appSource, /original_evidence_requested/);
+  assert.match(appSource, /证据缺口/);
+  assert.match(appSource, /直接查看原始证据/);
 });
 
 test("entity property corrections are exposed with evidence-aware UI controls", () => {

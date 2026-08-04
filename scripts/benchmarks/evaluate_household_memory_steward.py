@@ -29,6 +29,8 @@ def _check(result, tools=(), evidence=False, mode=None):
     names = [item.get("tool") for item in trace]
     passed = all(tool in names for tool in tools)
     if evidence:
+        passed = passed and bool(result.get("memory_used")) and bool(result.get("evidence_required"))
+        passed = passed and result.get("evidence_status") == "anchored"
         passed = passed and bool(result.get("evidence")) and bool(result.get("evidence_order"))
     if mode:
         passed = passed and result.get("dialogue_plan", {}).get("mode") == mode
@@ -40,6 +42,11 @@ def _check(result, tools=(), evidence=False, mode=None):
         "evidence_count": len(result.get("evidence") or []),
         "ordered_evidence": len(result.get("evidence_order") or []),
         "insufficient_evidence": bool(result.get("insufficient_evidence")),
+        "memory_used": bool(result.get("memory_used")),
+        "evidence_required": bool(result.get("evidence_required")),
+        "evidence_status": result.get("evidence_status"),
+        "original_evidence_requested": bool(result.get("original_evidence_requested")),
+        "image_count": len(result.get("image_results") or []),
     }
 
 

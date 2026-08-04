@@ -617,6 +617,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS query_gaps (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 query TEXT NOT NULL,
                 missing_dimension TEXT NOT NULL,
                 candidate_asset_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -708,6 +709,7 @@ class MemoryStore:
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("query_gaps", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("memory_feedback", {
             "target_entity_id": "TEXT REFERENCES entities(id)", "target_event_id": "TEXT REFERENCES events(id)",
             "target_property_key": "TEXT",
@@ -1687,13 +1689,13 @@ class MemoryStore:
     def get_rebuild(self, run_id):
         return self._decode(self._row("SELECT * FROM rebuild_runs WHERE id = ?", (run_id,)), ["stats_json"])
 
-    def create_query_gap(self, query, missing_dimension, candidate_asset_ids=None, evidence_ids=None):
+    def create_query_gap(self, query, missing_dimension, candidate_asset_ids=None, evidence_ids=None, scope_id=None):
         gap_id = make_id("gap")
         timestamp = now_iso()
         self.connection.execute(
-            """INSERT INTO query_gaps(id, query, missing_dimension, candidate_asset_ids_json, evidence_ids_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (gap_id, query, missing_dimension, json_value(candidate_asset_ids, []), json_value(evidence_ids, []), timestamp, timestamp),
+            """INSERT INTO query_gaps(id, scope_id, query, missing_dimension, candidate_asset_ids_json, evidence_ids_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (gap_id, scope_id or "home-default", query, missing_dimension, json_value(candidate_asset_ids, []), json_value(evidence_ids, []), timestamp, timestamp),
         )
         self.connection.commit()
         return self.get_query_gap(gap_id)
@@ -1701,11 +1703,17 @@ class MemoryStore:
     def get_query_gap(self, gap_id):
         return self._decode(self._row("SELECT * FROM query_gaps WHERE id = ?", (gap_id,)), ["candidate_asset_ids_json", "evidence_ids_json"])
 
-    def list_query_gaps(self, status=None, limit=200):
+    def list_query_gaps(self, status=None, limit=200, scope_id=None):
+        clauses, params = [], []
         if status:
-            rows = self._rows("SELECT * FROM query_gaps WHERE status = ? ORDER BY updated_at DESC LIMIT ?", (status, limit))
-        else:
-            rows = self._rows("SELECT * FROM query_gaps ORDER BY updated_at DESC LIMIT ?", (limit,))
+            clauses.append("status = ?")
+            params.append(status)
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        rows = self._rows(f"SELECT * FROM query_gaps{where} ORDER BY updated_at DESC LIMIT ?", params)
         return [self._decode(row, ["candidate_asset_ids_json", "evidence_ids_json"]) for row in rows]
 
     def add_memory_feedback(self, gap_id=None, user_id=None, accepted_answer=None, correction=None, target_claim_id=None,

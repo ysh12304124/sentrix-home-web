@@ -185,6 +185,15 @@ MemorySpace / Household
 - `POST /api/assistant/turn` 接收 message、`conversation_id`、feedback、`scope_id` 和
   可选 `selected_entity_id`，区分 `query`、`feedback`、`clarification`。`POST /api/search`
   是兼容包装器。
+- Agent 记忆回答必须返回 `memory_used`、`evidence_required`、`evidence_status` 和
+  `evidence_presentation`；有具体事实时状态为 `anchored` 并至少绑定 Event、Observation
+  或 Asset 证据，无依据时状态为 `gap` 并返回查询缺口。普通聊天明确标记为
+  `memory_used=false`，不读取家庭记忆。
+- 证据默认可在对话下方折叠查看，但不得从记忆回答中省略；用户明确要求原图、照片或
+  原始资料时，`original_evidence_requested=true`，前端直接展示可打开的原始媒体或
+  Observation。语义实体组是非人物实体的默认召回入口，成员实体 ID 和原始证据保持不变。
+- Agent 反馈目标和 `query_gap` 均按 `scope_id` 校验；未确认目标、跨空间目标或缺少依据时
+  不写入事实。以上修改只涉及 Agent、assistant API、对话 UI 和 Agent 评估，不改变记忆生成管线。
 - 图片结果带 `asset_id`、`observation_id`、文件名、时间、caption、`media_url`，前端
   展示 `/api/assets/{asset_id}/file` 原图缩略图和打开入口。
 - 头像统一使用 `/api/face-instances/{face_instance_id}/crop`，不使用整图冒充头像。

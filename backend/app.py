@@ -637,14 +637,23 @@ def create_invite(payload: dict):
     return {**invite, "invite_url": f"sentrix://join/{invite['token']}"}
 
 
+def assistant_response(result):
+    """Expose stable browser names while retaining the internal contract."""
+    result["retrievalTrace"] = result.get("retrieval_trace", [])
+    result["toolTrace"] = result.get("tool_trace", [])
+    result["evidencePresentation"] = result.get("evidence_presentation", {})
+    result["memoryUsed"] = result.get("memory_used", False)
+    result["evidenceRequired"] = result.get("evidence_required", False)
+    result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
+    result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
+    return result
+
+
 @app.post("/api/search")
 def search(request: SearchRequest):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
-    result = agent.answer_turn(request.query.strip(), scope_id=request.spaceId)
-    result["retrievalTrace"] = result.get("retrieval_trace", [])
-    result["toolTrace"] = result.get("tool_trace", [])
-    return result
+    return assistant_response(agent.answer_turn(request.query.strip(), scope_id=request.spaceId))
 
 
 class AssistantTurnRequest(BaseModel):
@@ -663,9 +672,7 @@ def assistant_turn(request: AssistantTurnRequest):
         request.message.strip(), request.conversation_id, request.feedback, request.scope_id,
         request.selected_entity_id,
     )
-    result["retrievalTrace"] = result.get("retrieval_trace", [])
-    result["toolTrace"] = result.get("tool_trace", [])
-    return result
+    return assistant_response(result)
 
 
 @app.post("/api/ingest", status_code=202)

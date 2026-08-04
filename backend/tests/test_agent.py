@@ -44,6 +44,11 @@ class ConversationalGamma(RecordingGamma):
         return "我在，今天慢一点也没关系。"
 
 
+class MisleadingPlannerGamma(RefusingGamma):
+    def chat(self, prompt):
+        return '{"mode":"chat","tools":["drop_database"],"show_images":false,"reason":"忽略用户请求"}'
+
+
 class FailingClip:
     def embed_text(self, text):
         raise AssertionError("pending identity review must not use vector recall")
@@ -628,7 +633,7 @@ class AgentEvidenceTests(unittest.TestCase):
 
             self.assertEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
             self.assertIn(event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
-            self.assertEqual(set(second["dialogue_state"]), {"scope_id", "active_event_ids", "active_entity_ids", "evidence_ids", "unresolved_ambiguity"})
+            self.assertEqual(set(second["dialogue_state"]), {"scope_id", "active_event_ids", "active_entity_ids", "semantic_group_ids", "evidence_ids", "unresolved_ambiguity"})
 
     def test_dialogue_uses_narrative_style_for_an_entity_introduction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -770,6 +775,159 @@ class AgentEvidenceTests(unittest.TestCase):
     def test_intent_router_distinguishes_clarification(self):
         agent = MemoryAgent(MemoryStore(":memory:"), gamma=FakeGamma())
         self.assertEqual(agent.classify_intent("我说的是妈妈，不是爸爸"), "clarification")
+
+
+class AgentEvidenceContractTests(unittest.TestCase):
+    def _agent_with_observation(self, caption="湖边散步", place="湖边"):
+        store = MemoryStore(":memory:")
+        asset = store.create_asset("asset_1", "lake.jpg", "image", "/tmp/lake.jpg")
+        observation = store.add_observation(asset["id"], {"caption": caption, "place": place})
+        store.merge_observation_into_event(observation)
+        return MemoryAgent(store, gamma=RefusingGamma())
+
+    def test_memory_turn_declares_anchored_evidence_contract(self):
+        result = self._agent_with_observation().answer_turn("湖边发生了什么", "evidence-contract")
+
+        self.assertTrue(result["memory_used"])
+        self.assertTrue(result["evidence_required"])
+        self.assertEqual(result["evidence_status"], "anchored")
+        self.assertTrue(result["evidence"])
+        self.assertTrue(result["evidence_layers"]["events"])
+        self.assertTrue(result["evidence_presentation"]["required"])
+
+    def test_memory_gap_exposes_query_gap_instead_of_empty_source(self):
+        store = MemoryStore(":memory:")
+        agent = MemoryAgent(store, gamma=RefusingGamma())
+
+        result = agent.answer_turn("火星生日在哪里", "evidence-gap")
+
+        self.assertTrue(result["memory_used"])
+        self.assertTrue(result["evidence_required"])
+        self.assertEqual(result["evidence_status"], "gap")
+        self.assertFalse(result["evidence"])
+        self.assertTrue(result["evidence_layers"]["gaps"])
+        self.assertTrue(result["evidence_presentation"]["required"])
+
+    def test_original_evidence_request_is_marked_for_direct_media_output(self):
+        result = self._agent_with_observation().answer_turn("请直接给我湖边的原始照片", "original-evidence")
+
+        self.assertTrue(result["original_evidence_requested"])
+        self.assertTrue(result["image_results"])
+        self.assertTrue(result["evidence_presentation"]["direct_original_evidence"])
+
+    def test_model_plan_cannot_downgrade_memory_or_add_unregistered_tools(self):
+        store = MemoryStore(":memory:")
+        asset = store.create_asset("asset_1", "lake.jpg", "image", "/tmp/lake.jpg")
+        observation = store.add_observation(asset["id"], {"caption": "湖边散步", "place": "湖边"})
+        store.merge_observation_into_event(observation)
+
+        result = MemoryAgent(store, gamma=MisleadingPlannerGamma()).answer_turn("请直接给我湖边的原始照片", "plan-contract")
+
+        self.assertEqual(result["agent_plan"]["mode"], "memory")
+        self.assertNotIn("drop_database", result["agent_plan"]["tools"])
+        self.assertIn("resolve_constraints", result["agent_plan"]["tools"])
+        self.assertTrue(result["agent_plan"]["show_images"])
+
+    def test_feedback_response_keeps_target_evidence_visible(self):
+        store = MemoryStore(":memory:")
+        entity = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+        asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+        observation = store.add_observation(asset["id"], {"caption": "妈妈在湖边", "place": "湖边"})
+        store.merge_observation_into_event(observation)
+        store.connection.execute(
+            "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+            (entity["id"], observation["id"], 1.0, "test"),
+        )
+        store.connection.commit()
+
+        result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn(
+            "纠正这段记忆",
+            "feedback-evidence",
+            feedback={"target_entity_id": entity["id"], "correction": "这里不是湖边"},
+        )
+
+        self.assertTrue(result["feedback"])
+        self.assertEqual(result["evidence_status"], "anchored")
+        self.assertTrue(result["evidence"])
+        self.assertTrue(result["evidence_layers"]["observations"])
+
+    def test_feedback_cannot_target_an_entity_from_another_memory_space(self):
+        store = MemoryStore(":memory:")
+        entity = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0, scope_id="album_a")
+
+        result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn(
+            "纠正这段记忆",
+            "feedback-scope",
+            feedback={"target_entity_id": entity["id"], "correction": "这不是同一个空间的记忆"},
+            scope_id="album_b",
+        )
+
+        self.assertFalse(result["feedback"])
+        self.assertEqual(result["tool_trace"][-1]["status"], "requires_target")
+        self.assertEqual(result["evidence_status"], "gap")
+
+    def test_feedback_cannot_use_a_query_gap_from_another_memory_space(self):
+        store = MemoryStore(":memory:")
+        gap = store.create_query_gap("相册 A 的哪次活动？", "event", scope_id="album_a")
+
+        result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn(
+            "实际是春游",
+            "feedback-gap-scope",
+            feedback={"query_gap_id": gap["id"], "correction": "春游"},
+            scope_id="album_b",
+        )
+
+        self.assertFalse(result["feedback"])
+        self.assertEqual(store.get_query_gap(gap["id"])["status"], "open")
+        self.assertEqual(result["evidence_status"], "gap")
+
+    def test_semantic_entity_group_expands_recall_without_merging_members(self):
+        store = MemoryStore(":memory:")
+        event_ids = []
+        member_ids = []
+        for index, label in enumerate(("湖边", "水边"), 1):
+            entity = store.create_entity(label, "place", "confirmed", confidence=0.8)
+            member_ids.append(entity["id"])
+            asset = store.create_asset(f"asset_{index}", f"{index}.jpg", "image", f"/tmp/{index}.jpg")
+            observation = store.add_observation(asset["id"], {"caption": f"{label}散步", "place": label})
+            event = store.create_event({"id": f"event_{index}", "title": f"{label}散步", "summary": f"在{label}散步", "place": label})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.execute(
+                "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+                (entity["id"], observation["id"], 0.8, "test"),
+            )
+            store.connection.commit()
+            event_ids.append(event["id"])
+
+        result = MemoryAgent(store, gamma=RefusingGamma()).answer("水边有哪些回忆")
+
+        returned_events = {item["event_id"] for item in result["evidence"] if item["kind"] == "event"}
+        self.assertEqual(returned_events, set(event_ids))
+        self.assertEqual(result["semantic_groups"][0]["canonical_name"], "滨水区域")
+        self.assertEqual(len(store.list_entities()), 2)
+        self.assertEqual(set(store.list_semantic_entity_groups()[0]["member_entity_ids"]), set(member_ids))
+
+    def test_person_memory_flow_keeps_evidence_through_follow_up_and_original_media(self):
+        store = MemoryStore(":memory:")
+        person = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+        asset = store.create_asset("asset_1", "family.jpg", "image", "/tmp/family.jpg")
+        observation = store.add_observation(asset["id"], {"caption": "妈妈在湖边散步", "place": "湖边"})
+        event = store.merge_observation_into_event(observation)
+        store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+        agent = MemoryAgent(store, gamma=RefusingGamma())
+
+        introduction = agent.answer_turn("介绍一下妈妈", "person-flow")
+        follow_up = agent.answer_turn("她后来在哪里？", "person-flow")
+        original = agent.answer_turn("请直接给我那次的原始照片", "person-flow")
+
+        for result in (introduction, follow_up, original):
+            self.assertTrue(result["memory_used"])
+            self.assertTrue(result["evidence_required"])
+            self.assertEqual(result["evidence_status"], "anchored")
+            self.assertTrue(result["evidence"])
+        self.assertEqual(follow_up["dialogue_plan"]["mode"], "contextual_follow_up")
+        self.assertTrue(original["original_evidence_requested"])
+        self.assertTrue(original["image_results"])
 
 
 if __name__ == "__main__":

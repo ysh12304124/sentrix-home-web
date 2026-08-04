@@ -209,14 +209,21 @@
 
   function assistantEvidence(result) {
     const layers = result.evidence_layers || {};
+    const presentation = result.evidence_presentation || {};
     const primary = [...(layers.events || []), ...(layers.observations || []), ...(layers.claims || [])].sort((left, right) => (right.relevance || 0) - (left.relevance || 0));
     const candidates = result.clarification_candidates || [];
     const evidence = primary.length ? evidenceLayer("本次依据（按相关度）", primary.slice(0, 6)) : "";
+    const gaps = layers.gaps || [];
+    const gapContent = gaps.length ? `<section class="evidence-gap"><div class="section-head"><div><p class="section-kicker">证据缺口</p><h3>当前没有足够的原始依据</h3></div></div><p>${escapeHtml(gaps[0].reason || "请补充人物、地点、日期或其他线索。")}</p></section>` : "";
     const followups = candidates.length ? `<div class="assistant-followups"><p>你可以继续说明：</p>${candidates.map((item) => `<button data-action="continue-assistant" data-query="${escapeHtml(item.name)}" data-entity-id="${escapeHtml(item.id)}">${escapeHtml(item.name)} <small>${escapeHtml(item.entity_type)} · ${item.evidence_count || 0} 条证据</small></button>`).join("")}</div>` : "";
     const ordered = result.evidence_order || [];
     const order = ordered.length ? `<details class="algorithm-evidence"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
-    const basis = result.intent === "chat" ? "" : `<details class="assistant-basis"><summary>查看这次回答的依据</summary><div class="assistant-basis-body">${imageResults(result)}${evidence}${order}${toolTrace(result)}${algorithmEvidence(result)}</div></details>`;
-    return `${followups}${basis}`;
+    const directEvidence = Boolean(result.original_evidence_requested || presentation.direct_original_evidence);
+    const requiresEvidence = result.intent !== "chat" && result.memory_used !== false && presentation.required !== false;
+    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
+    const optionalImages = directEvidence ? "" : imageResults(result);
+    const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看这次回答的依据</summary><div class="assistant-basis-body">${optionalImages}${evidence}${gapContent}${order}${toolTrace(result)}${algorithmEvidence(result)}</div></details>` : "";
+    return `${followups}${directOriginal}${basis}`;
   }
 
   function assistantMessage(message) {

@@ -152,9 +152,14 @@ class MemoryAgent:
             tools = ["record_feedback"]
         else:
             tools = list(dict.fromkeys(["resolve_constraints", *tools, "request_clarification"]))
+        show_images = bool(parsed.get("show_images")) and mode == "memory"
+        if fallback.get("show_images"):
+            # An explicit request for original evidence cannot be suppressed
+            # by a model plan that otherwise passed schema validation.
+            show_images = True
         return {
             "mode": mode, "tools": tools,
-            "show_images": bool(parsed.get("show_images")) and mode == "memory",
+            "show_images": show_images,
             "reason": str(parsed.get("reason") or fallback["reason"])[:240], "planner": "model",
         }
 
@@ -186,6 +191,14 @@ class MemoryAgent:
         ranked.sort(key=lambda item: (-item["relevance"], -float(item.get("confidence", 0) or 0), item.get("id", "")))
         result["evidence"] = ranked
         image_candidates = [item for item in ranked if item.get("kind") == "observation" and item.get("media_type") == "image" and item.get("asset_id") and item["relevance"] >= 0.42]
+        if plan.get("show_images") and not image_candidates:
+            # An explicit original-evidence request may use an anchored
+            # observation even when the long natural-language query scores
+            # below the normal image relevance threshold.
+            image_candidates = [
+                item for item in ranked
+                if item.get("kind") == "observation" and item.get("media_type") == "image" and item.get("asset_id")
+            ][:3]
         result["image_results"] = self._image_results(image_candidates[:3]) if plan.get("show_images") else []
         result["evidence_presentation"] = {
             "image_limit": 3 if plan.get("show_images") else 0,
@@ -266,7 +279,7 @@ class MemoryAgent:
         value = str(message or "").strip()
         return any(token in value for token in (
             "然后", "后来", "接着", "继续", "为什么", "具体", "详细", "还有呢", "那呢",
-            "他呢", "她呢", "它呢", "这里呢", "那里呢", "这段呢", "那个呢",
+            "他呢", "她呢", "它呢", "这里呢", "那里呢", "这段呢", "那个呢", "那次", "那段", "这次",
         ))
 
     def _has_explicit_entity_reference(self, message, scope_id, active_entity_ids):
@@ -488,6 +501,13 @@ class MemoryAgent:
         facts = self.store.list_facts(200, scope_id=scope_id)
         persons = self.store.list_persons()
         entities = self.store.list_entities(scope_id=scope_id)
+        semantic_groups = [
+            group for group in self.store.list_semantic_entity_groups(scope_id)
+            if any(label and label in str(query or "") for label in [group.get("canonical_name"), *(group.get("source_labels") or [])])
+        ]
+        semantic_group_entity_ids = {
+            entity_id for group in semantic_groups for entity_id in group.get("member_entity_ids", [])
+        }
         focused_people = [
             entity for entity in entities
             if entity.get("entity_type") == "person"
@@ -499,12 +519,19 @@ class MemoryAgent:
         focused_event_ids = {
             event_id for entity_id in focused_ids for event_id in self.store.entity_event_ids(entity_id)
         }
+        semantic_group_event_ids = {
+            event_id for entity_id in semantic_group_entity_ids for event_id in self.store.entity_event_ids(entity_id)
+        }
         dimension = self._query_dimension(query)
         date = self._query_date(query)
         place_event_ids = {
             event["id"] for event in events
             if event.get("place") and str(event["place"]) in str(query or "")
         }
+        if semantic_group_event_ids:
+            # A matched semantic group broadens the raw place hit to all
+            # stable members while preserving each member and its evidence.
+            place_event_ids.update(semantic_group_event_ids)
         date_event_ids = {
             event["id"] for event in events
             if date and str(event.get("time_start") or "")[:10] == date
@@ -520,7 +547,7 @@ class MemoryAgent:
         }
         constrained_event_ids = {event["id"] for event in events}
         has_event_constraint = False
-        for event_ids in (focused_event_ids, place_event_ids, date_event_ids, object_event_ids):
+        for event_ids in (focused_event_ids, semantic_group_event_ids, place_event_ids, date_event_ids, object_event_ids):
             if event_ids:
                 constrained_event_ids.intersection_update(event_ids)
                 has_event_constraint = True
@@ -598,6 +625,7 @@ class MemoryAgent:
             "focused_people": focused_people,
             "persons": persons[:50],
             "entities": entities[:100],
+            "semantic_groups": semantic_groups,
             "relationships": relationships[:100],
             "vectors": vector_hits,
             "vector_candidate_count": len(vector_candidates),
@@ -645,7 +673,7 @@ class MemoryAgent:
                 "asset_ids": sample_asset_ids,
             })
         gap = self.store.create_query_gap(
-            query, "identity", list(dict.fromkeys(candidate_asset_ids)), [item["id"] for item in evidence],
+            query, "identity", list(dict.fromkeys(candidate_asset_ids)), [item["id"] for item in evidence], scope_id,
         )
         count = len(evidence)
         answer = (
@@ -771,7 +799,7 @@ class MemoryAgent:
                     self.store.upsert_vector("semantic", "observation", observation["id"], vector, self.clip.model_name, {"asset_id": observation["asset_id"], "event_id": event_id, "refined_dimension": dimension})
             except Exception:
                 continue
-        gap = self.store.create_query_gap(query, dimension, candidate_asset_ids, refined_ids)
+        gap = self.store.create_query_gap(query, dimension, candidate_asset_ids, refined_ids, retrieved.get("scope_id"))
         return self.retrieve(query, retrieved.get("scope_id")), gap
 
     @staticmethod
@@ -914,7 +942,7 @@ class MemoryAgent:
                 item.get("metadata", {}).get("asset_id") for item in public_retrieved.get("vectors", [])
                 if item.get("metadata", {}).get("asset_id")
             ))
-            gap = self.store.create_query_gap(query, intent.get("dimension") or "semantic", candidate_asset_ids, [])
+            gap = self.store.create_query_gap(query, intent.get("dimension") or "semantic", candidate_asset_ids, [], scope_id)
             answer = (
                 "当前有多个可能的实体，请确认你指的是：" + "、".join(item["name"] for item in candidates) + "。"
                 if len(candidates) >= 2 else f"当前本地记忆没有找到能回答“{query}”的证据。"
@@ -1006,6 +1034,7 @@ class MemoryAgent:
             "gaps": [query_gap] if query_gap else [],
         }
         result["query"] = query
+        result["semantic_groups"] = public_retrieved.get("semantic_groups", [])
         result["tool_trace"] = self._tool_trace(query, public_retrieved, len(evidence), result.get("insufficient_evidence", False))
         if query_gap:
             result["query_gap_id"] = query_gap["id"]
@@ -1019,6 +1048,86 @@ class MemoryAgent:
         turns = self._conversations.setdefault(conversation_id, [])
         turns.append({"role": role, "text": str(text or "")[:2000]})
         del turns[:-self._conversation_limit]
+
+    @staticmethod
+    def _apply_evidence_contract(result, memory_used, original_evidence_requested=False):
+        """Normalize the user-visible evidence boundary for every turn."""
+        result["memory_used"] = bool(memory_used)
+        result["evidence_required"] = bool(memory_used)
+        result["original_evidence_requested"] = bool(original_evidence_requested and memory_used)
+        layers = result.setdefault("evidence_layers", {})
+        layers.setdefault("answers", [])
+        layers.setdefault("people", [])
+        layers.setdefault("events", [])
+        layers.setdefault("claims", [])
+        layers.setdefault("appearance", [])
+        layers.setdefault("observations", [])
+        layers.setdefault("assets", [])
+        layers.setdefault("gaps", [])
+        evidence = result.get("evidence") or []
+        if not memory_used:
+            status = "not_applicable"
+        elif evidence and not result.get("insufficient_evidence"):
+            status = "anchored"
+        else:
+            status = "gap"
+            if not layers["gaps"]:
+                layers["gaps"] = [{
+                    "kind": "evidence_gap",
+                    "status": "insufficient" if result.get("insufficient_evidence") else "requires_target",
+                    "reason": "没有可绑定到本轮记忆回答的原始证据。",
+                }]
+        result["evidence_status"] = status
+        presentation = result.setdefault("evidence_presentation", {})
+        presentation["required"] = bool(memory_used)
+        presentation["available"] = bool(evidence or layers["gaps"])
+        presentation["direct_original_evidence"] = bool(result["original_evidence_requested"])
+        presentation["source_state"] = status
+        return result
+
+    def _feedback_target_evidence(self, entity_id=None, event_id=None, scope_id=None):
+        """Load read-only evidence for the object a correction targets."""
+        expected_scope = scope_id or "home-default"
+        evidence = []
+        if entity_id:
+            detail = self.store.get_entity_detail(entity_id)
+            entity = (detail or {}).get("entity") or {}
+            if entity and entity.get("scope_id", "home-default") == expected_scope:
+                for event in (detail.get("events") or [])[:8]:
+                    asset_ids = [item.get("asset_id") for item in (self.store.get_event_detail(event["id"]) or {}).get("observations", []) if item.get("asset_id")]
+                    evidence.append({
+                        "kind": "event", "id": event["id"], "event_id": event["id"],
+                        "asset_ids": list(dict.fromkeys(asset_ids)), "summary": event.get("summary", ""),
+                        "time_start": event.get("time_start"), "place": event.get("place"),
+                    })
+                for observation in (detail.get("observations") or [])[:12]:
+                    asset = observation.get("asset") or {}
+                    evidence.append({
+                        "kind": "observation", "id": observation["id"], "observation_id": observation["id"],
+                        "asset_id": observation.get("asset_id"), "file_name": asset.get("file_name"),
+                        "media_type": asset.get("media_type"), "captured_at": observation.get("captured_at"),
+                        "caption": observation.get("caption"), "transcript": observation.get("transcript"),
+                        "raw": observation.get("raw_json", {}),
+                    })
+        if event_id and not evidence:
+            event = self.store.get_event(event_id)
+            if event and event.get("scope_id", expected_scope) == expected_scope:
+                detail = self.store.get_event_detail(event_id) or {}
+                evidence.append({
+                    "kind": "event", "id": event["id"], "event_id": event["id"],
+                    "asset_ids": [item.get("asset_id") for item in detail.get("observations", []) if item.get("asset_id")],
+                    "summary": event.get("summary", ""), "time_start": event.get("time_start"), "place": event.get("place"),
+                })
+                for observation in (detail.get("observations") or [])[:12]:
+                    asset = observation.get("asset") or {}
+                    evidence.append({
+                        "kind": "observation", "id": observation["id"], "observation_id": observation["id"],
+                        "event_id": event["id"], "asset_id": observation.get("asset_id"),
+                        "file_name": asset.get("file_name"), "media_type": asset.get("media_type"),
+                        "captured_at": observation.get("captured_at"), "caption": observation.get("caption"),
+                        "transcript": observation.get("transcript"), "raw": observation.get("raw_json", {}),
+                    })
+        return evidence
 
     def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None, selected_entity_id=None):
         conversation_id = conversation_id or f"conversation_{uuid.uuid4().hex[:12]}"
@@ -1035,7 +1144,16 @@ class MemoryAgent:
             target_event_id = feedback.get("target_event_id")
             target_claim_id = feedback.get("target_claim_id")
             target_property_key = feedback.get("target_property_key")
-            if (gap_id and self.store.get_query_gap(gap_id)) or any((target_entity_id, target_event_id, target_claim_id)):
+            expected_scope = scope_id or "home-default"
+            entity_target = self.store.get_entity(target_entity_id) if target_entity_id else None
+            event_target = self.store.get_event(target_event_id) if target_event_id else None
+            target_in_scope = all(
+                target.get("scope_id", expected_scope) == expected_scope
+                for target in (entity_target, event_target) if target
+            ) and not (target_entity_id and not entity_target) and not (target_event_id and not event_target)
+            gap = self.store.get_query_gap(gap_id) if gap_id else None
+            valid_gap = bool(gap and gap.get("scope_id", "home-default") == expected_scope)
+            if (valid_gap or any((target_entity_id, target_event_id, target_claim_id))) and target_in_scope:
                 persisted = self.store.add_memory_feedback(
                     gap_id, feedback.get("user_id"), feedback.get("accepted_answer"), correction, target_claim_id,
                     target_entity_id, target_event_id, target_property_key,
@@ -1047,8 +1165,18 @@ class MemoryAgent:
                 "evidence": [], "image_results": [], "retrieval_trace": [{"stage": "feedback", "status": "complete", "counts": {"persisted": 1 if persisted else 0}}],
                 "model": "sentrix-feedback", "feedback": persisted,
             }
+            target_evidence = self._feedback_target_evidence(target_entity_id, target_event_id, scope_id)
+            result["evidence"] = target_evidence
+            result["evidence_layers"] = {
+                "answers": [{"id": None, "text": result["answer"]}],
+                "people": [], "events": [item for item in target_evidence if item["kind"] == "event"],
+                "claims": [], "appearance": [], "observations": [item for item in target_evidence if item["kind"] == "observation"],
+                "assets": [{"kind": "asset", "id": item["asset_id"]} for item in target_evidence if item.get("asset_id")],
+                "gaps": [],
+            }
             result["agent_plan"] = turn_plan
             result["tool_trace"] = [{"tool": "plan_turn", "permission": "read", "status": "complete", "mode": turn_plan["mode"], "reason": turn_plan["reason"]}, {"tool": "record_feedback", "permission": "explicit_user_action", "status": "complete" if persisted else "requires_target"}]
+            self._apply_evidence_contract(result, memory_used=True)
             self._remember_turn(conversation_id, "user", message)
             self._remember_turn(conversation_id, "assistant", result["answer"])
             return result
@@ -1061,7 +1189,9 @@ class MemoryAgent:
                 "evidence_layers": {"answers": [{"id": None, "text": "自然对话未引用家庭记忆"}], "people": [], "events": [], "claims": [], "appearance": [], "observations": [], "assets": [], "gaps": []},
                 "tool_trace": [{"tool": "plan_turn", "permission": "read", "status": "complete", "mode": "chat", "reason": turn_plan["reason"]}],
                 "agent_plan": turn_plan,
+                "dialogue_plan": {"mode": "chat", "style": "chat", "layers": []},
             }
+            self._apply_evidence_contract(result, memory_used=False)
             self._remember_turn(conversation_id, "user", message)
             self._remember_turn(conversation_id, "assistant", result["answer"])
             return result
@@ -1120,6 +1250,7 @@ class MemoryAgent:
         dialogue_state = {
             "scope_id": scope_id, "active_event_ids": active_event_ids[:8],
             "active_entity_ids": active_entity_ids[:8],
+            "semantic_group_ids": [item["id"] for item in result.get("semantic_groups", [])[:8]],
             "evidence_ids": [item.get("id") for item in result.get("evidence", []) if item.get("id")][:40],
             "unresolved_ambiguity": bool(result.get("clarification_candidates") or result.get("insufficient_evidence")),
         }
@@ -1144,6 +1275,7 @@ class MemoryAgent:
         if result["dialogue_plan"]["style"] == "narrative":
             result = self._narrative_answer(message, result)
             result["evidence_layers"]["answers"] = [{"id": result.get("query"), "text": result.get("answer", "")}]
+        self._apply_evidence_contract(result, memory_used=True, original_evidence_requested=turn_plan.get("show_images"))
         result["dialogue_state"] = dialogue_state
         self._remember_turn(conversation_id, "user", message)
         self._remember_turn(conversation_id, "assistant", result.get("answer", ""))

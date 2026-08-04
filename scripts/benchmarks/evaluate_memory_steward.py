@@ -25,6 +25,10 @@ def _result_contract(result, expected_tools=(), require_evidence=False, follow_u
     tool_names = [item.get("tool") for item in trace]
     ordered = result.get("evidence_order") or []
     passed = bool(result.get("dialogue_plan")) and all(tool in tool_names for tool in expected_tools)
+    memory_used = bool(result.get("memory_used"))
+    evidence_required = bool(result.get("evidence_required"))
+    if require_evidence:
+        passed = passed and memory_used and evidence_required and result.get("evidence_status") == "anchored"
     if require_evidence:
         passed = passed and bool(result.get("evidence")) and bool(ordered)
     if follow_up:
@@ -37,6 +41,11 @@ def _result_contract(result, expected_tools=(), require_evidence=False, follow_u
         "evidence_count": len(result.get("evidence") or []),
         "ordered_evidence": len(ordered),
         "insufficient_evidence": bool(result.get("insufficient_evidence")),
+        "memory_used": memory_used,
+        "evidence_required": evidence_required,
+        "evidence_status": result.get("evidence_status"),
+        "original_evidence_requested": bool(result.get("original_evidence_requested")),
+        "image_count": len(result.get("image_results") or []),
     }
 
 
@@ -53,8 +62,10 @@ def evaluate(database):
 
         introduction = agent.answer_turn("介绍一下妈妈", "steward-introduction", scope_id=scope_id)
         follow_up = agent.answer_turn("她后来呢？", "steward-introduction", scope_id=scope_id)
+        original = agent.answer_turn("请直接给我那次的原始照片", "steward-introduction", scope_id=scope_id)
         recommendation = agent.answer_turn("推荐一些妈妈的回忆", "steward-recommendation", scope_id=scope_id)
         unanchored = agent.answer_turn("推荐一些回忆", "steward-unanchored", scope_id=scope_id)
+        chat = agent.answer_turn("今天有点累，想聊聊天", "steward-chat", scope_id=scope_id)
         ambiguous_store = MemoryStore(":memory:")
         try:
             ambiguous_store.create_entity("东湖边", "place", confidence=0.8, scope_id="ambiguous")
@@ -65,11 +76,16 @@ def evaluate(database):
         checks = {
             "introduction": _result_contract(introduction, ("resolve_constraints", "describe_entity", "open_evidence"), True),
             "follow_up": _result_contract(follow_up, ("resolve_constraints", "trace_timeline", "open_evidence"), True, True),
+            "original_evidence": _result_contract(original, ("resolve_constraints", "trace_timeline", "open_evidence"), True),
             "recommendation": _result_contract(recommendation, ("resolve_constraints", "suggest_recall", "open_evidence"), True),
             "unanchored_recommendation": _result_contract(unanchored, ("resolve_constraints", "suggest_recall", "request_clarification")),
+            "ordinary_chat": _result_contract(chat),
             "ambiguity": _result_contract(ambiguous, ("resolve_constraints", "request_clarification")),
         }
+        checks["original_evidence"]["passed"] = checks["original_evidence"]["passed"] and original.get("original_evidence_requested") and bool(original.get("image_results"))
         checks["unanchored_recommendation"]["passed"] = checks["unanchored_recommendation"]["passed"] and checks["unanchored_recommendation"]["insufficient_evidence"]
+        checks["unanchored_recommendation"]["passed"] = checks["unanchored_recommendation"]["passed"] and unanchored.get("evidence_status") == "gap" and bool((unanchored.get("evidence_layers") or {}).get("gaps"))
+        checks["ordinary_chat"]["passed"] = checks["ordinary_chat"]["passed"] and not chat.get("memory_used") and not chat.get("evidence_required") and not chat.get("evidence")
         checks["ambiguity"]["passed"] = checks["ambiguity"]["passed"] and bool(ambiguous.get("clarification_candidates"))
         return {"passed": all(item["passed"] for item in checks.values()), "checks": checks}
     finally:
