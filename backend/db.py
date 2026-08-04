@@ -114,6 +114,31 @@ SEMANTIC_ENTITY_EQUIVALENTS = {
     "emotion": MOOD_NORMALIZATION,
 }
 
+SEMANTIC_PLACE_CONCEPTS = (
+    ("滨水空间", ("湖", "河", "海", "港", "码头", "水域", "水边", "水池", "滨水")),
+    ("展览空间", ("博物馆", "展厅", "展览", "美术馆", "画廊", "展柜", "科普馆")),
+    ("餐饮空间", ("餐厅", "餐馆", "餐饮", "厨房", "餐桌", "咖啡", "烘焙", "快餐", "茶室")),
+    ("园林与公园", ("园林", "公园", "花园", "植物园", "温室", "果园", "庭院")),
+    ("商业空间", ("商店", "商场", "购物", "店铺", "超市", "摊位")),
+    ("交通出行空间", ("机场", "地铁", "车厢", "停机坪", "登机桥", "车站", "高架", "公路")),
+    ("演出活动空间", ("剧场", "舞台", "演艺", "活动现场")),
+    ("居住室内空间", ("卧室", "客厅", "室内", "房间", "走廊", "门口", "室内环境")),
+    ("户外公共空间", ("广场", "街道", "户外", "室外", "景区", "道路", "观景")),
+)
+
+SEMANTIC_OBJECT_CONCEPTS = (
+    ("手机与移动设备", ("手机", "平板", "相机")),
+    ("展示与标识", ("海报", "横幅", "宣传", "标牌", "展板", "告示", "路标", "灯牌", "菜单")),
+    ("餐具与容器", ("碗", "杯", "盘", "勺", "叉", "筷", "锅", "茶具", "餐具", "容器")),
+    ("食物与饮品", ("蛋糕", "甜点", "饮料", "面条", "沙拉", "肉", "虾", "玉米", "番茄", "薯条", "牛角", "饭", "菜")),
+    ("花卉与植物", ("花", "树", "草", "绿植", "盆栽", "棕榈", "樱花", "梅花")),
+    ("建筑与工程", ("建筑", "房屋", "大坝", "高塔", "电线杆", "厂房", "机械", "起重机", "桥", "围墙")),
+    ("围栏与公共设施", ("围栏", "栏杆", "护栏", "路灯", "扶手", "井盖")),
+    ("交通工具", ("汽车", "车辆", "自行车", "摩托", "飞机", "船", "轮渡", "公交", "三轮车")),
+    ("服饰与配件", ("背包", "项链", "戒指", "眼镜", "手表", "鞋", "钥匙", "项圈")),
+    ("毛绒与玩具", ("毛绒", "玩偶", "气球")),
+)
+
 
 def normalize_clothing(value):
     text = str(value or "").strip()
@@ -2452,8 +2477,15 @@ class MemoryStore:
         captured_at = parse_time(observation.get("captured_at") or asset.get("captured_at"))
         captured_day = captured_at.date().isoformat() if captured_at else ""
         gps_place = parse_gps_place(asset.get("captured_location"))
-        place_name = asset.get("captured_location") if gps_place else (observation.get("place") or asset.get("captured_location"))
-        scene_type = observation.get("place") or ""
+        visual_place = str(observation.get("place") or "").strip()
+        selected_scene = str((observation.get("canonical") or {}).get("scene_type") or "").strip()
+        # GPS remains a location anchor. Without it, the model-selected scene
+        # type becomes the stable semantic place entity; free text stays as
+        # evidence instead of creating a new entity for every phrasing.
+        place_name = asset.get("captured_location") if gps_place else (
+            selected_scene if selected_scene and selected_scene != "其他或不确定" else (visual_place or asset.get("captured_location"))
+        )
+        scene_type = selected_scene if selected_scene and selected_scene != "其他或不确定" else visual_place
         values = [
             ("place", place_name, "由图片观察或采集地点维护"),
             ("object", observation.get("objects") or [], "由图片观察到的物体"),
@@ -2491,13 +2523,18 @@ class MemoryStore:
                     place_entity["id"], "scene_type", scene_type,
                     observation.get("confidence", 0), evidence_ids, "observation_extraction",
                 )
+            if visual_place and visual_place != scene_type:
+                self.maintain_entity_property_values(
+                    place_entity["id"], "visual_place_descriptions", [visual_place],
+                    observation.get("confidence", 0), evidence_ids, "observation_extraction",
+                )
         for entity in entities:
             if entity["entity_type"] != "object":
                 continue
             self.maintain_entity_property(
                 entity["id"], "label", entity["canonical_name"], observation.get("confidence", 0), evidence_ids,
-                "observation_extraction",
-            )
+                    "observation_extraction",
+                )
             self.maintain_entity_property(
                 entity["id"], "category", object_category(entity["canonical_name"]), observation.get("confidence", 0), evidence_ids,
                 "object_taxonomy_v1",
@@ -2661,7 +2698,7 @@ class MemoryStore:
 
     @staticmethod
     def _semantic_entity_key(entity_type, name):
-        """Return an explainable normalized label used only for merge review."""
+        """Return an explainable semantic concept for automatic grouping."""
         label = re.sub(r"\s+", "", str(name or "").strip())
         equivalents = SEMANTIC_ENTITY_EQUIVALENTS.get(entity_type, {})
         if label in equivalents:
@@ -2669,6 +2706,11 @@ class MemoryStore:
         for term, normalized in equivalents.items():
             if term in label:
                 return normalized, {"strategy": "controlled_equivalence", "matched_label": term}
+        concepts = SEMANTIC_PLACE_CONCEPTS if entity_type == "place" else SEMANTIC_OBJECT_CONCEPTS if entity_type == "object" else ()
+        for normalized, terms in concepts:
+            matched = [term for term in terms if term in label]
+            if matched:
+                return normalized, {"strategy": "semantic_concept", "matched_label": matched[0]}
         return label, {"strategy": "exact_label", "matched_label": label}
 
     @staticmethod

@@ -141,6 +141,21 @@ cumulative evidence, events and original media. This automatic grouping needs
 no user confirmation because it is the default semantic memory view, not a
 destructive rewrite of source entities.
 
+### Scene-Type Ingestion Contract
+
+Place aggregation is decided during image understanding, not by later string
+matching alone. The image model must select exactly one `scene_type` from the
+controlled taxonomy: residential indoor, dining, commercial, exhibition,
+park/garden, waterfront, mountain/nature, outdoor public, transport,
+performance/event, office/study, industrial/engineering, or unknown. Without
+GPS, this selected scene is the stable Place entity and cluster key. The model's
+free-text `place` remains a `visual_place_descriptions` evidence property.
+GPS and user-maintained place identities continue to take precedence.
+
+Existing images use `scripts/maintenance/backfill_scene_types.py`: dry-run by
+default; `--apply` requires a SQLite backup and rebuilds only the affected
+derived place projections.
+
 ## P1: Digital Memory Steward
 
 The accepted product role is a neutral household memory steward, not an

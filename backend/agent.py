@@ -84,7 +84,13 @@ class MemoryAgent:
 请像一个熟悉家庭生活的助手一样自然交谈，不要把回答写成检索结果，不要主动讲工具、数据库、证据或置信度。可以共情、讨论和提出有帮助的下一步；只有在下方长期记忆中存在时，才把具体家庭往事当作事实说出。对不在记忆中的细节保持自然的不确定性，不要编造。
 家庭长期记忆：""" + json.dumps(self._household_memory_identity(scope_id), ensure_ascii=False) + "\n最近对话：" + str(conversation_context or "")[-1200:] + "\n用户：" + value + "\n请直接自然回答，不要使用 Markdown 列表。"
         try:
-            answer = str(self.gamma.chat(prompt) or "").strip()
+            try:
+                answer = str(self.gamma.chat(prompt, json_mode=False) or "").strip()
+            except TypeError:  # Lightweight test adapters may expose chat(prompt) only.
+                answer = str(self.gamma.chat(prompt) or "").strip()
+            if answer.startswith("{"):
+                parsed = json.loads(answer)
+                answer = str(parsed.get("answer") or parsed.get("response") or "").strip()
             return answer or "我在听。"
         except Exception:
             return "我在听。"

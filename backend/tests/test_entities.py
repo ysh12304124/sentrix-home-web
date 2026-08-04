@@ -694,6 +694,36 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual({item["id"] for item in detail["observations"]}, {self.obs1["id"], self.obs2["id"]})
         self.assertEqual(len([item for item in self.store.list_entities() if item["entity_type"] == "place"]), 2)
 
+    def test_semantic_entity_groups_auto_cluster_realistic_scene_descriptions(self):
+        labels = ("城市河流岸边", "户外湖泊", "海滩、海岸线")
+        for index, label in enumerate(labels, 1):
+            entity = self.store.create_entity(label, "place", confidence=0.7)
+            observation = self.obs1 if index == 1 else self.obs2
+            self.store.connection.execute(
+                "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, 0.7, 'test', datetime('now'))",
+                (entity["id"], observation["id"]),
+            )
+        self.store.connection.commit()
+
+        waterfront = next(item for item in self.store.list_semantic_entity_groups() if item["canonical_name"] == "滨水空间")
+
+        self.assertEqual(set(waterfront["source_labels"]), set(labels))
+        self.assertTrue(waterfront["is_semantic_cluster"])
+        self.assertEqual(waterfront["rationale"]["strategy"], "semantic_concept")
+
+    def test_model_selected_scene_type_is_the_stable_place_entity(self):
+        self.store.enrich_observation(self.obs1["id"], {
+            "place": "城市河流岸边", "scene_type": "滨水空间", "caption": "河边散步",
+        })
+
+        entities = self.store.maintain_observation_entities(self.obs1["id"])
+        place = next(item for item in entities if item["entity_type"] == "place")
+        properties = {item["property_key"]: item for item in self.store.get_entity_detail(place["id"])["properties"]}
+
+        self.assertEqual(place["canonical_name"], "滨水空间")
+        self.assertEqual(properties["scene_type"]["value"], "滨水空间")
+        self.assertEqual(properties["visual_place_descriptions"]["value"], ["城市河流岸边"])
+
 
 if __name__ == "__main__":
     unittest.main()

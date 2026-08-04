@@ -25,6 +25,13 @@ test("runtime and maintenance entry points use the documented layout", () => {
   assert.match(fs.readFileSync(path.join(root, "index.html"), "utf8"), /href="\/src\/styles\.css"/);
 });
 
+test("scene-type backfill is explicit and requires a SQLite backup", () => {
+  const source = fs.readFileSync(path.join(root, "scripts", "maintenance", "backfill_scene_types.py"), "utf8");
+  assert.match(source, /--apply requires --backup/);
+  assert.match(source, /scene_type_backfill/);
+  assert.match(source, /maintain_observation_entities/);
+});
+
 test("root directory contains only application entry points and project metadata", () => {
   for (const file of [
     "agent.py", "app.py", "db.py", "pipeline.py", "model_clients.py", "rebuild_memory.py",

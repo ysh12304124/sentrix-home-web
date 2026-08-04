@@ -224,7 +224,7 @@ class IngestionPipeline:
             "file_name": asset["file_name"], "captured_at": asset.get("captured_at") or file_time(asset["path"]),
             "captured_location": asset.get("captured_location") or "", "source_owner_id": asset.get("source_owner_id"),
         })
-        analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
+        analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
         analysis["raw"] = {"gamma": analysis.copy(), "semantic_status": "complete"}
         observation = self.store.enrich_observation(observation_id, analysis, source="deferred_vision_enrichment")
         event_id = metadata.get("event_id")

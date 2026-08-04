@@ -113,7 +113,20 @@ def normalize_confidence(value, default=0.5):
 def normalize_analysis_fields(parsed):
     for key in ("caption", "activity", "place", "event_type", "transcript", "ocr_text"):
         parsed[key] = as_text(parsed.get(key))
+    parsed["scene_type"] = normalize_scene_type(parsed.get("scene_type"))
     return parsed
+
+
+SCENE_TYPE_OPTIONS = (
+    "居住室内", "餐饮空间", "商业空间", "展览空间", "园林公园", "滨水空间",
+    "山地与自然", "户外公共空间", "交通出行空间", "演出活动空间", "办公学习空间",
+    "工业与工程空间", "其他或不确定",
+)
+
+
+def normalize_scene_type(value):
+    text = as_text(value).strip()
+    return text if text in SCENE_TYPE_OPTIONS else "其他或不确定"
 
 
 def normalize_fact_confidences(facts, default):
@@ -138,7 +151,7 @@ class GammaClient:
         self.timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
         self.keep_alive = str(keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0"))
 
-    def chat(self, prompt, images=None, vision_options=None):
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True):
         if httpx is None:
             raise ModelError("httpx is not installed")
         message = {"role": "user", "content": prompt}
@@ -148,10 +161,11 @@ class GammaClient:
             "model": self.model,
             "messages": [message],
             "stream": False,
-            "format": "json",
             "keep_alive": self.keep_alive,
             "options": {"temperature": 0},
         }
+        if json_mode:
+            payload["format"] = "json"
         if vision_options:
             payload["think"] = vision_options.get("think", False)
             payload["options"].update({
@@ -196,14 +210,16 @@ class GammaClient:
         encoded, mime_type = self._encode_core_image(file_path)
         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
 严格返回简体中文 JSON 对象，不要解释。每个字段必须完整但简短：caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；看不清用空数组或空字符串。
-字段固定为：caption、activity、place、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。facts 项仅含 subject、predicate、object、confidence。
-不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。
-metadata: """ + json.dumps(metadata or {}, ensure_ascii=False)
+字段固定为：caption、activity、place、scene_type、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。scene_type 必须从以下主场景选一个："""
+        prompt += "、".join(SCENE_TYPE_OPTIONS)
+        prompt += "。facts 项仅含 subject、predicate、object、confidence。\n不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。\nmetadata: "
+        prompt += json.dumps(metadata or {}, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
         scalar_text = " ".join(as_text(parsed.get(key)) for key in ("caption", "activity", "place", "event_type", "ocr_text"))
         if contains_latin_text(scalar_text):
-            canonical_prompt = """把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。
-原始观察：""" + json.dumps(parsed, ensure_ascii=False)
+            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。scene_type 必须保留为下列之一："
+            canonical_prompt += "、".join(SCENE_TYPE_OPTIONS)
+            canonical_prompt += "。\n原始观察：" + json.dumps(parsed, ensure_ascii=False)
             parsed = parse_json_response(self.chat(canonical_prompt))
         parsed["people"] = as_list(parsed.get("people"))
         parsed["objects"] = as_list(parsed.get("objects"))
