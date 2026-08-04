@@ -43,6 +43,16 @@ class ModelClientTests(unittest.TestCase):
 
         self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], "15m")
 
+    @patch.dict("os.environ", {"OLLAMA_KEEP_ALIVE": "-1"}, clear=False)
+    @patch("backend.model_clients.httpx.post")
+    def test_indefinite_keep_alive_is_sent_as_numeric_minus_one(self, post):
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {"message": {"content": "{}"}}
+
+        GammaClient(base_url="http://sentrix-ollama").chat("测试")
+
+        self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], -1)
+
     @patch("backend.model_clients.httpx.post")
     def test_core_vision_options_disable_thinking_and_bound_generation(self, post):
         post.return_value.raise_for_status.return_value = None

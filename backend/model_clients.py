@@ -147,7 +147,10 @@ class GammaClient:
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
-        self.keep_alive = str(keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0"))
+        configured_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
+        # Ollama expects numeric -1 for indefinite residency; the string "-1"
+        # is rejected by its request schema.
+        self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
 
     def chat(self, prompt, images=None, vision_options=None, json_mode=True):
         if httpx is None:
