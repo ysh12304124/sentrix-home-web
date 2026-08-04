@@ -57,9 +57,10 @@ Sentrix 使用项目独立 Ollama：`127.0.0.1:11435`。共享系统 Ollama 位�
   `/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt`。
 - 视觉向量：CLIP `ViT-B-32`；当前数据库图像向量为 512 维。
 - Sentrix 进程必须设置：`OLLAMA_BASE_URL=http://127.0.0.1:11435`、
-  `OLLAMA_MODEL=gemma4:12b`；生产默认 `OLLAMA_KEEP_ALIVE=0`。
-- `keep_alive=0` 会在请求结束后卸载 12B 模型，防止同一时间与其他项目常驻两个
-  12B 模型而 OOM。长任务前需检查 `11434` 和 `11435` 的 `/api/ps`；当前
+  `OLLAMA_MODEL=gemma4:12b`；生产默认 `OLLAMA_KEEP_ALIVE=-1`，让专用 12B
+  模型常驻以避免每次请求重复加载。
+- `keep_alive=-1` 要发送为数值而不是字符串；模型约占 6.9 GB VRAM。长任务前仍需
+  检查 `11434` 和 `11435` 的 `/api/ps`，确保专用模型不会与其他项目争抢显存；当前
   `11435` 无常驻模型。
 - 2026-07-30 已验证独立运行器识别 RTX 3090，并将 Gemma `49/49` 层卸载至
   `CUDA0`。`nvidia-smi` 受 NVML 用户态/内核版本不一致影响不可用；以 Ollama CUDA
@@ -379,7 +380,7 @@ ADAFACE_MODEL_PATH=/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt
 ADAFACE_REPO_ROOT=/home/asus/models/AdaFace \
 OLLAMA_BASE_URL=http://127.0.0.1:11435 \
 OLLAMA_MODEL=gemma4:12b \
-OLLAMA_KEEP_ALIVE=0 \
+OLLAMA_KEEP_ALIVE=-1 \
 scripts/runtime/start_sentrix_api.sh
 
 SENTRIX_BACKEND_URL=http://127.0.0.1:8090 PORT=4174 npm run dev
