@@ -207,12 +207,19 @@ class GammaClient:
         file_path = Path(path)
         encoded, mime_type = self._encode_core_image(file_path)
         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
-严格返回简体中文 JSON 对象，不要解释。每个字段必须完整但简短：caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；看不清用空数组或空字符串。
+严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；确实看不清才用空数组或空字符串。
 字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。"""
         prompt += "、".join(SCENE_TYPE_OPTIONS)
         prompt += "。facts 项仅含 subject、predicate、object、confidence。\n不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。\nmetadata: "
         prompt += json.dumps(metadata or {}, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
+        if not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text")) and not parsed.get("people") and not parsed.get("objects"):
+            recovery_prompt = """首轮图片结果只有分类或为空，请补齐可验证的自然语言观察。只根据图片，不猜测姓名，不输出坐标。
+严格返回简体中文 JSON：caption（图片中看到什么，20字内）、activity（正在发生什么，10字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，10字内）、event_type（10字内）、people（最多2项）、objects（最多4项）、ocr_text（20字内）。画面确实看不清才留空；不要只返回分类字段。"""
+            recovered = parse_json_response(self.chat(recovery_prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
+            for key in ("caption", "activity", "place", "event_type", "people", "objects", "ocr_text"):
+                if recovered.get(key) not in (None, "", []):
+                    parsed[key] = recovered[key]
         scalar_text = " ".join(as_text(parsed.get(key)) for key in ("caption", "activity", "place", "event_type", "ocr_text"))
         if contains_latin_text(scalar_text):
             canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："

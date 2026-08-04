@@ -184,3 +184,8 @@ test("default evidence tiles do not expose filenames or internal identifiers", (
   assert.match(source, /技术信息/);
   assert.match(source, /technical-evidence/);
 });
+
+test("image imports automatically schedule event summarization after semantic enrichment", () => {
+  const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
+  assert.match(backendSource, /enrich_fast_image\(asset_id, summarize_event=True\)/);
+});

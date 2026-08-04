@@ -66,7 +66,7 @@ class ModelClientTests(unittest.TestCase):
             with patch.object(client, "chat", return_value=json.dumps({"scene_type": "餐饮空间"})) as chat:
                 client.analyze_image(image.name)
 
-        prompt = chat.call_args.args[0]
+        prompt = chat.call_args_list[0].args[0]
         self.assertIn("医疗与公共服务", prompt)
         self.assertIn("农场与乡村", prompt)
         self.assertIn("semantic", prompt)
@@ -93,6 +93,35 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(result["semantic"]["objects"][0]["label"], "蛋糕")
         self.assertEqual(result["semantic"]["atmosphere"]["labels"], ["温馨"])
         self.assertEqual(result["raw_labels"]["place"], "湖边餐厅")
+
+    def test_image_analysis_recovers_descriptive_observation_when_first_response_only_has_semantics(self):
+        client = GammaClient()
+        first = {
+            "semantic": {
+                "place": {"primary": "居住空间", "details": ["室内"]},
+                "objects": [],
+                "atmosphere": {"labels": [], "details": []},
+            },
+        }
+        recovery = {
+            "caption": "孩子在客厅玩耍",
+            "activity": "玩耍",
+            "place": "家中客厅",
+            "event_type": "日常活动",
+            "people": ["孩子"],
+            "objects": ["玩具"],
+            "ocr_text": "",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
+            image.write(b"synthetic-image")
+            image.flush()
+            with patch.object(client, "chat", side_effect=[json.dumps(first), json.dumps(recovery)]) as chat:
+                result = client.analyze_image(image.name)
+
+        self.assertEqual(result["caption"], "孩子在客厅玩耍")
+        self.assertEqual(result["activity"], "玩耍")
+        self.assertEqual(result["place"], "家中客厅")
+        self.assertEqual(chat.call_count, 2)
 
     def test_clip_uses_project_checkpoint_when_environment_is_unset(self):
         checkpoint = Path(__file__).resolve().parents[2] / "data" / "models" / "clip" / "ViT-B-32.bin"

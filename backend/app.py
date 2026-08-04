@@ -59,9 +59,9 @@ def process_asset(asset_id):
             return
         fast = task_pipeline.process_fast_image(asset_id)
         if fast.get("status") == "semantic_enriching":
-            # Event summaries are a separate semantic projection. The event and
-            # observation evidence are already queryable after core enrichment.
-            task_pipeline.enrich_fast_image(asset_id, summarize_event=False)
+            # Finish the semantic observation and summarize its event in the
+            # same background pipeline; imports must not require maintenance UI.
+            task_pipeline.enrich_fast_image(asset_id, summarize_event=True)
     finally:
         task_store.close()
 
