@@ -9,10 +9,14 @@ from backend.pipeline import IngestionPipeline
 class FakeGamma:
     model = "test-gamma"
 
+    def __init__(self):
+        self.summary_inputs = []
+
     def analyze_image(self, path, metadata=None):
         return {"caption": "一张带文字的家庭照片", "activity": "聚会", "place": "家里", "people": [], "objects": ["蛋糕"], "ocr_text": "生日快乐", "event_type": "聚会", "facts": [], "confidence": 0.8, "model": self.model}
 
     def summarize_event(self, event, observations):
+        self.summary_inputs.append((event, observations))
         return {"title": "生日庆祝", "event_type": "庆祝活动", "activity": "围绕蛋糕庆祝", "summary": "一组照片记录了围绕蛋糕的庆祝活动。", "confidence": 0.88, "model": self.model}
 
 
@@ -260,6 +264,38 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in summaries], [event_id])
             self.assertEqual(store.get_event(event_id)["summary"], "一组照片记录了围绕蛋糕的庆祝活动。")
             self.assertEqual(store.count("observations"), 1)
+
+    def test_completed_batch_summarizes_each_affected_event_once_from_all_observation_descriptions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_image = Path(directory) / "first.jpg"
+            second_image = Path(directory) / "second.jpg"
+            first_image.write_bytes(b"first")
+            second_image.write_bytes(b"second")
+            store = MemoryStore(f"{directory}/memory.db")
+            gamma = FakeGamma()
+            pipeline = IngestionPipeline(store, gamma=gamma, face=FakeFace(), clip=FakeClip())
+            store.create_ingest_batch("batch-1")
+            metadata = {
+                "batch_id": "batch-1",
+                "captured_at": "2026-07-01T18:00:00+08:00",
+                "captured_location": "家中餐厅",
+            }
+
+            for image in (first_image, second_image):
+                asset = pipeline.create_asset(image, metadata=metadata)
+                pipeline.process_fast_image(asset["id"])
+                pipeline.enrich_fast_image(asset["id"], summarize_event=False)
+
+            self.assertEqual(gamma.summary_inputs, [])
+            self.assertEqual(pipeline.finalize_ingest_batch("batch-1")["status"], "open")
+
+            store.complete_ingest_batch("batch-1")
+            result = pipeline.finalize_ingest_batch("batch-1")
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(gamma.summary_inputs), 1)
+            self.assertEqual(len(gamma.summary_inputs[0][1]), 2)
+            self.assertEqual(store.get_event(gamma.summary_inputs[0][0]["id"])["title"], "生日庆祝")
 
     def test_fast_image_recovery_does_not_duplicate_evidence_before_enrichment(self):
         with tempfile.TemporaryDirectory() as directory:

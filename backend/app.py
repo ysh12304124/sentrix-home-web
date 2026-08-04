@@ -52,16 +52,30 @@ def process_asset(asset_id):
     task_pipeline = IngestionPipeline(
         task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
+    batch_id = None
     try:
         asset = task_store.get_asset(asset_id) or {}
+        batch_id = asset.get("batch_id")
         if asset.get("media_type") != "image":
-            task_pipeline.process(asset_id)
-            return
-        fast = task_pipeline.process_fast_image(asset_id)
-        if fast.get("status") == "semantic_enriching":
-            # Finish the semantic observation and summarize its event in the
-            # same background pipeline; imports must not require maintenance UI.
-            task_pipeline.enrich_fast_image(asset_id, summarize_event=True)
+            task_pipeline.process(asset_id, summarize_event=not batch_id)
+        else:
+            fast = task_pipeline.process_fast_image(asset_id)
+            if fast.get("status") == "semantic_enriching":
+                # Batch imports defer event summaries until every member asset is terminal.
+                task_pipeline.enrich_fast_image(asset_id, summarize_event=not batch_id)
+    finally:
+        if batch_id:
+            finalize_import_batch(batch_id)
+        task_store.close()
+
+
+def finalize_import_batch(batch_id):
+    task_store = MemoryStore(store.path)
+    task_pipeline = IngestionPipeline(
+        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+    )
+    try:
+        return task_pipeline.finalize_ingest_batch(batch_id)
     finally:
         task_store.close()
 
@@ -684,7 +698,11 @@ async def ingest(
     sourceAlbumId: str | None = Form(None),
     capturedAt: str | None = Form(None),
     capturedLocation: str | None = Form(None),
+    batchId: str | None = Form(None),
 ):
+    batch_id = str(batchId or "").strip() or None
+    if batch_id:
+        store.create_ingest_batch(batch_id)
     safe_name = Path(file.filename or "upload.bin").name
     asset_id = make_id("asset")
     destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
@@ -700,6 +718,7 @@ async def ingest(
         "source_confidence": 1.0 if sourceOwnerId else 0.0,
         "captured_at": capturedAt,
         "captured_location": capturedLocation,
+        "batch_id": batch_id,
         "content_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
         "exif": pipeline._extract_exif(destination) if media_type == "image" else {},
     }
@@ -708,7 +727,7 @@ async def ingest(
     existing = store.find_asset_by_hash(metadata["content_sha256"])
     if existing:
         destination.unlink(missing_ok=True)
-        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "deduplicated": True}
+        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "batchId": batch_id, "deduplicated": True}
     created = store.create_asset(
         asset_id,
         safe_name,
@@ -719,7 +738,16 @@ async def ingest(
         metadata,
     )
     background_tasks.add_task(process_asset, asset_id)
-    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type}
+    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type, "batchId": batch_id}
+
+
+@app.post("/api/ingest-batches/{batch_id}/complete", status_code=202)
+def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
+    batch = store.complete_ingest_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="ingest batch not found")
+    background_tasks.add_task(finalize_import_batch, batch_id)
+    return {"accepted": True, "batchId": batch_id, "status": batch["status"]}
 
 
 @app.post("/api/import", status_code=202)

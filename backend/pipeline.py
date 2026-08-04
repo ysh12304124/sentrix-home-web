@@ -15,7 +15,7 @@ from .semantic_taxonomy import normalize_semantic_analysis
 IMPORT_METADATA_KEYS = {
     "content_sha256", "sha256", "exif", "captured_at", "captured_location",
     "source_owner_id", "source_owner_label", "source_device_id", "source_album_id",
-    "source_confidence", "scope_id",
+    "source_confidence", "scope_id", "batch_id",
 }
 
 
@@ -270,6 +270,25 @@ class IngestionPipeline:
             if event.get("title") == "待总结事件"
         ]
         return [self.summarize_event(event["id"]) for event in pending]
+
+    def finalize_ingest_batch(self, batch_id):
+        """Summarize only events touched by a completed import batch."""
+        batch = self.store.get_ingest_batch(batch_id)
+        if not batch:
+            raise KeyError(batch_id)
+        if batch["status"] == "open":
+            return batch
+        if batch["status"] == "complete":
+            if not self.store.claim_ingest_batch_summary(batch_id):
+                return self.store.get_ingest_batch(batch_id)
+            batch = self.store.get_ingest_batch(batch_id)
+        elif batch["status"] == "summarizing":
+            return batch
+        else:
+            return batch
+        for event_id in self.store.batch_event_ids(batch_id):
+            self.summarize_event(event_id)
+        return self.store.finish_ingest_batch(batch_id)
 
     def _image_observation(self, asset):
         path = asset["path"]

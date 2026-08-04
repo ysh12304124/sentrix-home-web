@@ -63,11 +63,13 @@
     search: (query) => request("/api/search", { method: "POST", body: JSON.stringify({ query }) }),
     queryGaps: () => request("/api/query-gaps"),
     queryGapFeedback: (id, payload) => request("/api/query-gaps/" + encodeURIComponent(id) + "/feedback", { method: "POST", body: JSON.stringify(payload) }),
-    importAsset: (file, mediaType) => {
+    importAsset: (file, mediaType, batchId) => {
       if (typeof file === "string") return request("/api/import", { method: "POST", body: JSON.stringify({ fileName: file, mediaType }) });
       const form = new FormData();
       form.append("file", file, file.name);
+      if (batchId) form.append("batchId", batchId);
       return request("/api/ingest", { method: "POST", body: form });
     },
+    completeImportBatch: (batchId) => request(`/api/ingest-batches/${encodeURIComponent(batchId)}/complete`, { method: "POST" }),
   };
 })();

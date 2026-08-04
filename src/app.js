@@ -566,11 +566,18 @@
 
   async function handleFiles(event) {
     const files = Array.from(event.target.files || []);
-    for (const file of files) {
-      state.queue.unshift({ fileName: file.name, status: "uploading" });
-      try { const result = await window.sentrixApi.importAsset(file); state.queue[0].assetId = result.assetId; state.queue[0].status = result.status; } catch { state.queue[0].status = "failed"; }
+    const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    let completionFailed = false;
+    try {
+      for (const file of files) {
+        state.queue.unshift({ fileName: file.name, status: "uploading" });
+        try { const result = await window.sentrixApi.importAsset(file, undefined, batchId); state.queue[0].assetId = result.assetId; state.queue[0].status = result.status; } catch { state.queue[0].status = "failed"; }
+      }
+      if (files.length) await window.sentrixApi.completeImportBatch(batchId);
+    } catch {
+      completionFailed = true;
     }
-    state.toast = `${files.length} 个资料已进入本地处理队列`;
+    state.toast = completionFailed ? "批次完成信号提交失败，请稍后刷新状态" : `${files.length} 个资料已进入本地处理队列`;
     await refreshData();
     state.view = "imports";
     renderShellNavigation();

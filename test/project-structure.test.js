@@ -185,7 +185,12 @@ test("default evidence tiles do not expose filenames or internal identifiers", (
   assert.match(source, /technical-evidence/);
 });
 
-test("image imports automatically schedule event summarization after semantic enrichment", () => {
+test("image imports defer event summarization until the upload batch is complete", () => {
   const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
-  assert.match(backendSource, /enrich_fast_image\(asset_id, summarize_event=True\)/);
+  const browserSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  assert.match(backendSource, /enrich_fast_image\(asset_id, summarize_event=not batch_id\)/);
+  assert.match(backendSource, /\/api\/ingest-batches\/\{batch_id\}\/complete/);
+  assert.match(browserSource, /completeImportBatch\(batchId\)/);
+  assert.match(apiSource, /batchId/);
 });

@@ -234,9 +234,18 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ingest_batches (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS assets (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
+                batch_id TEXT,
                 file_name TEXT NOT NULL,
                 media_type TEXT NOT NULL,
                 path TEXT NOT NULL,
@@ -680,6 +689,7 @@ class MemoryStore:
         self._migrate_face_instances_cluster_nullable()
         self._ensure_columns("assets", {
             "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
+            "batch_id": "TEXT",
             "source_owner_id": "TEXT", "source_owner_label": "TEXT", "source_device_id": "TEXT", "source_album_id": "TEXT",
             "source_confidence": "REAL NOT NULL DEFAULT 0", "content_sha256": "TEXT", "captured_at": "TEXT", "captured_location": "TEXT",
         })
@@ -738,6 +748,7 @@ class MemoryStore:
             INSERT OR IGNORE INTO memory_spaces(id, name, kind, created_at, updated_at)
             VALUES ('home-default', '默认家庭', 'household', datetime('now'), datetime('now'));
             CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(asset_id);
+            CREATE INDEX IF NOT EXISTS idx_assets_batch ON assets(batch_id);
             CREATE INDEX IF NOT EXISTS idx_assets_content_sha256 ON assets(content_sha256);
             CREATE INDEX IF NOT EXISTS idx_events_time ON events(time_start);
             CREATE INDEX IF NOT EXISTS idx_event_revisions_event ON event_revisions(event_id, created_at DESC);
@@ -902,12 +913,12 @@ class MemoryStore:
         timestamp = now_iso()
         self.connection.execute(
             """INSERT INTO assets(
-                id, scope_id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
+                id, scope_id, batch_id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
                 source_owner_id, source_owner_label, source_device_id, source_album_id, source_confidence,
                 content_sha256, captured_at, captured_location, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                asset_id, scope_id, file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
+                asset_id, scope_id, metadata.get("batch_id"), file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
                 metadata.get("source_owner_id"), metadata.get("source_owner_label"), metadata.get("source_device_id"), metadata.get("source_album_id"),
                 float(metadata.get("source_confidence", 0) or 0), metadata.get("content_sha256") or metadata.get("sha256"), metadata.get("captured_at"), metadata.get("captured_location"),
                 timestamp, timestamp,
@@ -961,10 +972,10 @@ class MemoryStore:
         current = self.get_asset(asset_id) or {}
         merged_metadata = {**(current.get("metadata_json") or {}), **metadata}
         self.connection.execute(
-            """UPDATE assets SET status = ?, metadata_json = ?, source_owner_id = ?, source_owner_label = ?, source_device_id = ?,
+            """UPDATE assets SET status = ?, batch_id = ?, metadata_json = ?, source_owner_id = ?, source_owner_label = ?, source_device_id = ?,
                 source_album_id = ?, source_confidence = ?, content_sha256 = ?, captured_at = ?, captured_location = ?, updated_at = ? WHERE id = ?""",
             (
-                status, json_value(merged_metadata, {}), metadata.get("source_owner_id", current.get("source_owner_id")),
+                status, metadata.get("batch_id", current.get("batch_id")), json_value(merged_metadata, {}), metadata.get("source_owner_id", current.get("source_owner_id")),
                 metadata.get("source_owner_label", current.get("source_owner_label")), metadata.get("source_device_id", current.get("source_device_id")), metadata.get("source_album_id", current.get("source_album_id")),
                 float(metadata.get("source_confidence", current.get("source_confidence", 0)) or 0),
                 metadata.get("content_sha256", metadata.get("sha256", current.get("content_sha256"))),
@@ -974,6 +985,65 @@ class MemoryStore:
         )
         self.connection.commit()
         return self.get_asset(asset_id)
+
+    def create_ingest_batch(self, batch_id, scope_id="home-default"):
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT OR IGNORE INTO ingest_batches(id, scope_id, status, created_at, updated_at)
+            VALUES (?, ?, 'open', ?, ?)""",
+            (str(batch_id), scope_id or "home-default", timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
+    def get_ingest_batch(self, batch_id):
+        return self._row("SELECT * FROM ingest_batches WHERE id = ?", (str(batch_id),))
+
+    def complete_ingest_batch(self, batch_id):
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'summarizing') THEN status ELSE 'complete' END,
+            updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?""",
+            (timestamp, timestamp, str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
+    def claim_ingest_batch_summary(self, batch_id):
+        batch_id = str(batch_id)
+        batch = self.get_ingest_batch(batch_id)
+        if not batch or batch["status"] != "complete":
+            return False
+        pending = self._row(
+            "SELECT COUNT(*) AS count FROM assets WHERE batch_id = ? AND status IN ('queued', 'processing', 'semantic_enriching')",
+            (batch_id,),
+        )
+        if pending and pending["count"]:
+            return False
+        cursor = self.connection.execute(
+            "UPDATE ingest_batches SET status = 'summarizing', updated_at = ? WHERE id = ? AND status = 'complete'",
+            (now_iso(), batch_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount == 1
+
+    def finish_ingest_batch(self, batch_id):
+        self.connection.execute(
+            "UPDATE ingest_batches SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'summarizing'",
+            (now_iso(), str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
+    def batch_event_ids(self, batch_id):
+        rows = self._rows(
+            """SELECT DISTINCT eo.event_id FROM event_observations eo
+            JOIN observations o ON o.id = eo.observation_id
+            JOIN assets a ON a.id = o.asset_id
+            WHERE a.batch_id = ? ORDER BY eo.event_id""",
+            (str(batch_id),),
+        )
+        return [row["event_id"] for row in rows]
 
     def cleanup_asset_derivatives(self, asset_id):
         """Remove only derived records owned by one failed asset."""
