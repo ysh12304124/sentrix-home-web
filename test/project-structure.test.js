@@ -30,6 +30,7 @@ test("scene-type backfill is explicit and requires a SQLite backup", () => {
   assert.match(source, /--apply requires --backup/);
   assert.match(source, /scene_type_backfill/);
   assert.match(source, /maintain_observation_entities/);
+  assert.match(source, /--reproject-only/);
 });
 
 test("root directory contains only application entry points and project metadata", () => {

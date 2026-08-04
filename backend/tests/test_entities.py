@@ -724,6 +724,16 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(properties["scene_type"]["value"], "滨水空间")
         self.assertEqual(properties["visual_place_descriptions"]["value"], ["城市河流岸边"])
 
+    def test_scene_type_replaces_old_free_text_place_projection_for_same_observation(self):
+        self.store.enrich_observation(self.obs1["id"], {"place": "湖边", "caption": "湖边散步"})
+        old_place = next(item for item in self.store.maintain_observation_entities(self.obs1["id"]) if item["entity_type"] == "place")
+        self.store.enrich_observation(self.obs1["id"], {"place": "湖边", "scene_type": "滨水空间"})
+        current_place = next(item for item in self.store.maintain_observation_entities(self.obs1["id"]) if item["entity_type"] == "place")
+
+        self.assertEqual(current_place["canonical_name"], "滨水空间")
+        old_links = self.store._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (old_place["id"],))
+        self.assertEqual(old_links, [])
+
 
 if __name__ == "__main__":
     unittest.main()

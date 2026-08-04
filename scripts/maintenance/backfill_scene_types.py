@@ -28,14 +28,15 @@ def missing_scene_type(observation):
     return not scene or scene == "其他或不确定"
 
 
-def backfill_scene_types(store, gamma, apply=False, scope_id=None, limit=None):
+def backfill_scene_types(store, gamma, apply=False, scope_id=None, limit=None, reproject_only=False):
     observations = [
         item for item in store.list_observations(100000, scope_id=scope_id)
-        if (store.get_asset(item["asset_id"]) or {}).get("media_type") == "image" and missing_scene_type(item)
+        if (store.get_asset(item["asset_id"]) or {}).get("media_type") == "image"
+        and ((item.get("canonical") or {}).get("scene_type") if reproject_only else missing_scene_type(item))
     ]
     if limit is not None:
         observations = observations[:limit]
-    result = {"scope_id": scope_id, "scanned": len(observations), "updated": 0, "skipped": 0, "failed": 0}
+    result = {"scope_id": scope_id, "scanned": len(observations), "updated": 0, "skipped": 0, "failed": 0, "reproject_only": reproject_only}
     if not apply:
         return result
     for observation in observations:
@@ -44,12 +45,16 @@ def backfill_scene_types(store, gamma, apply=False, scope_id=None, limit=None):
             result["skipped"] += 1
             continue
         try:
+            event = store._row("SELECT event_id FROM event_observations WHERE observation_id = ? LIMIT 1", (observation["id"],))
+            if reproject_only:
+                store.maintain_observation_entities(observation["id"], event["event_id"] if event else None)
+                result["updated"] += 1
+                continue
             analysis = gamma.analyze_image(asset["path"], {
                 "file_name": asset.get("file_name"), "captured_at": asset.get("captured_at"),
                 "captured_location": asset.get("captured_location") or "", "source_owner_id": asset.get("source_owner_id"),
             })
             store.enrich_observation(observation["id"], analysis, source="scene_type_backfill")
-            event = store._row("SELECT event_id FROM event_observations WHERE observation_id = ? LIMIT 1", (observation["id"],))
             store.maintain_observation_entities(observation["id"], event["event_id"] if event else None)
             result["updated"] += 1
         except Exception:
@@ -63,6 +68,7 @@ def main():
     parser.add_argument("--scope-id")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--reproject-only", action="store_true", help="rebuild place links from existing scene_type values without model calls")
     parser.add_argument("--backup", type=Path, help="required with --apply")
     args = parser.parse_args()
     if args.apply and not args.backup:
@@ -71,7 +77,7 @@ def main():
         backup_database(args.database, args.backup)
     store = MemoryStore(str(args.database))
     try:
-        print(json.dumps(backfill_scene_types(store, GammaClient(), args.apply, args.scope_id, args.limit), ensure_ascii=False))
+        print(json.dumps(backfill_scene_types(store, GammaClient(), args.apply, args.scope_id, args.limit, args.reproject_only), ensure_ascii=False))
     finally:
         store.close()
 

@@ -2528,6 +2528,33 @@ class MemoryStore:
                     place_entity["id"], "visual_place_descriptions", [visual_place],
                     observation.get("confidence", 0), evidence_ids, "observation_extraction",
                 )
+            # A scene-type backfill must replace the former free-text place
+            # projection for this observation. The original text remains on
+            # the selected scene entity, while stale place cards and event
+            # links no longer remain visible beside it.
+            stale_places = self._rows(
+                """SELECT eob.entity_id FROM entity_observations eob JOIN entities e ON e.id = eob.entity_id
+                WHERE eob.observation_id = ? AND e.entity_type = 'place' AND eob.entity_id != ?
+                AND eob.source = 'observation_extraction'""",
+                (observation_id, place_entity["id"]),
+            )
+            for stale in stale_places:
+                stale_id = stale["entity_id"]
+                self.connection.execute(
+                    "DELETE FROM entity_observations WHERE entity_id = ? AND observation_id = ? AND source = 'observation_extraction'",
+                    (stale_id, observation_id),
+                )
+                if event_id:
+                    link = self._row("SELECT * FROM event_entities WHERE event_id = ? AND entity_id = ?", (event_id, stale_id))
+                    if link:
+                        linked_evidence = [item for item in json.loads(link["evidence_ids_json"] or "[]") if item != observation_id]
+                        if linked_evidence:
+                            self.connection.execute(
+                                "UPDATE event_entities SET evidence_ids_json = ?, updated_at = ? WHERE event_id = ? AND entity_id = ?",
+                                (json_value(linked_evidence, []), now_iso(), event_id, stale_id),
+                            )
+                        else:
+                            self.connection.execute("DELETE FROM event_entities WHERE event_id = ? AND entity_id = ?", (event_id, stale_id))
         for entity in entities:
             if entity["entity_type"] != "object":
                 continue
