@@ -469,3 +469,15 @@ P0 的属性版本、用户覆盖和关系聚合，之后依赖顺序推进地�
 5. 不得用相册来源、评估标签、匿名模型人物描述或场景衣物替代已确认人物证据。
 6. 完成后先运行新鲜验证，再更新本文档中的当前状态、实测结果和待办，并提交到
    153 `psh`。
+
+## 当前接手状态（2026-08-04 album1）
+
+- 代码提交：`8b08021 fix: complete semantic reprojection and event merging`，153 `psh` 工作树干净。
+- 本阶段完成语义词表兼容投影：地点使用受控主类，GPS 只写入 `geo`，自由地点描述保留为视觉证据；物品与氛围支持主类、细节和原始标签；旧 `emotion` 仅在可映射时转为 `atmosphere`，未知标签保留原始观察并退出默认目录。
+- 网页默认证据卡只显示原始证据缩略图、时间和语义摘要；文件名、Asset/Observation ID、模型和技术字段放入技术详情或不再展示。Node UI 回归为 `23/23`。
+- 按用户要求先只重跑 `album1`。manifest 有 64 条记录，64/64 处理成功；当前数据库包含 62 个 Asset、62 个 Observation、27 个 Event、36 个 Entity、4 个 face cluster，`rebuild_runs` 为 `completed`，SQLite `integrity_check` 为 `ok`。数据库当前只包含 `album1`，`album2/3` 尚未执行。
+- 重跑前回滚数据库保留在 `/tmp/sentrix.db.before-full-rerun-20260804`；此前语义迁移备份为 `/tmp/sentrix.db.before-semantic-taxonomy-20260804`。这些文件不纳入 Git。
+- 服务状态：Sentrix API `8090`、Web `4174`、FMA `5173` 均为 `200`；FMA 未停止、未修改。AdaFace、Gemma、FunASR 和 CLIP 健康接口均为 ready。
+- 修复了事件合并删除前未迁移 `event_entities`、`event_revisions`、`person_event_memory` 和 feedback 外键投影的问题；Python 回归 `215/215`，Node 回归 `23/23`。
+
+下一步先由用户检查 album1 的地点、物品、氛围语义质量，再决定是否输入 album2/3 的重跑命令。不要自动继续重跑其他相册。
