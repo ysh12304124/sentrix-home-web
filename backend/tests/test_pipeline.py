@@ -223,7 +223,10 @@ class PipelineTests(unittest.TestCase):
             complete = pipeline.enrich_fast_image(asset["id"], summarize_event=False)
 
             self.assertEqual(complete["status"], "processed")
-            self.assertEqual(store.get_observation(observation["id"])["caption"], "一张带文字的家庭照片")
+            enriched = store.get_observation(observation["id"])
+            self.assertEqual(enriched["caption"], "一张带文字的家庭照片")
+            self.assertIn("semantic", enriched["canonical"])
+            self.assertIn("place", enriched["canonical"]["semantic"])
             self.assertTrue(any(item["canonical_name"] == "蛋糕" for item in store.list_entities()))
 
     def test_fast_enrichment_can_leave_event_summary_for_later_projection(self):

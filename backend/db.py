@@ -7,6 +7,8 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 
+from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
+
 
 def make_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
@@ -2482,22 +2484,40 @@ class MemoryStore:
         scope_id = observation.get("scope_id") or asset.get("scope_id") or "home-default"
         raw = observation.get("raw") or {}
         extracted = raw.get("gamma") if isinstance(raw.get("gamma"), dict) else raw
+        canonical = observation.get("canonical") or {}
+        analysis = {**extracted, **canonical}
+        normalized = normalize_semantic_analysis(analysis)
+        semantic = normalized.get("semantic") or {}
+        semantic_place = semantic.get("place") if isinstance(semantic.get("place"), dict) else {}
+        semantic_objects = semantic.get("objects") if isinstance(semantic.get("objects"), list) else []
+        semantic_atmosphere = semantic.get("atmosphere") if isinstance(semantic.get("atmosphere"), dict) else {}
         captured_at = parse_time(observation.get("captured_at") or asset.get("captured_at"))
         captured_day = captured_at.date().isoformat() if captured_at else ""
         gps_place = parse_gps_place(asset.get("captured_location"))
         visual_place = str(observation.get("place") or "").strip()
-        selected_scene = str((observation.get("canonical") or {}).get("scene_type") or "").strip()
-        # GPS remains a location anchor. Without it, the model-selected scene
-        # type becomes the stable semantic place entity; free text stays as
-        # evidence instead of creating a new entity for every phrasing.
-        place_name = asset.get("captured_location") if gps_place else (
-            selected_scene if selected_scene and selected_scene != "其他或不确定" else (visual_place or asset.get("captured_location"))
-        )
-        scene_type = selected_scene if selected_scene and selected_scene != "其他或不确定" else visual_place
+        has_semantic_place = bool(semantic.get("available"))
+        selected_scene = str(semantic_place.get("primary") or "").strip() if has_semantic_place else ""
+        # GPS remains a location anchor only. A semantic primary is the stable
+        # place entity; free text is retained as evidence, never as a GPS name.
+        place_name = selected_scene or visual_place or "其他或不确定"
+        scene_type = selected_scene or (visual_place if not has_semantic_place else "")
+        object_specs = [
+            item for item in semantic_objects
+            if isinstance(item, dict) and (item.get("label") or item.get("primary"))
+        ]
+        object_names = [str(item.get("label") or item.get("primary")).strip() for item in object_specs]
+        if not object_names:
+            object_names = [str(item).strip() for item in (observation.get("objects") or []) if str(item).strip()]
+        atmosphere_names = [str(item).strip() for item in (semantic_atmosphere.get("labels") or []) if str(item).strip()]
+        if not atmosphere_names:
+            atmosphere_names = [normalize_mood(value) for value in (extracted.get("emotions") or raw.get("emotions") or []) if normalize_mood(value)]
+        raw_atmosphere_labels = [
+            str(item).strip() for item in (normalized.get("raw_labels") or {}).get("atmosphere", []) if str(item).strip()
+        ]
         values = [
             ("place", place_name, "由图片观察或采集地点维护"),
-            ("object", observation.get("objects") or [], "由图片观察到的物体"),
-            ("emotion", [normalize_mood(value) for value in (extracted.get("emotions") or raw.get("emotions") or []) if normalize_mood(value)], "由图片观察到的情感"),
+            ("object", object_names, "由图片观察到的物体"),
+            ("atmosphere", atmosphere_names, "由图片观察到的画面氛围"),
             ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
         ]
         entities = []
@@ -2531,7 +2551,16 @@ class MemoryStore:
                     place_entity["id"], "scene_type", scene_type,
                     observation.get("confidence", 0), evidence_ids, "observation_extraction",
                 )
-            if visual_place and visual_place != scene_type:
+            if has_semantic_place:
+                self.maintain_entity_property(
+                    place_entity["id"], "semantic_primary", selected_scene or "其他或不确定",
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
+                self.maintain_entity_property_values(
+                    place_entity["id"], "semantic_details", semantic_place.get("details") or [],
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
+            if visual_place and (visual_place != scene_type or has_semantic_place):
                 self.maintain_entity_property_values(
                     place_entity["id"], "visual_place_descriptions", [visual_place],
                     observation.get("confidence", 0), evidence_ids, "observation_extraction",
@@ -2574,21 +2603,31 @@ class MemoryStore:
                 entity["id"], "category", object_category(entity["canonical_name"]), observation.get("confidence", 0), evidence_ids,
                 "object_taxonomy_v1",
             )
+            spec = next((item for item in object_specs if str(item.get("label") or item.get("primary")).strip() == entity["canonical_name"]), None)
+            if spec:
+                self.maintain_entity_property(
+                    entity["id"], "semantic_primary", spec.get("primary") or "其他或不确定",
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
+                self.maintain_entity_property_values(
+                    entity["id"], "semantic_details", spec.get("details") or [],
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
         for entity in entities:
-            if entity["entity_type"] != "emotion":
+            if entity["entity_type"] not in {"emotion", "atmosphere"}:
                 continue
             raw_moods = [
                 str(value).strip()
                 for value in (extracted.get("emotions") or raw.get("emotions") or [])
                 if normalize_mood(value) == entity["canonical_name"] and str(value).strip()
             ]
-            self.maintain_entity_property(
-                entity["id"], "mood_label", entity["canonical_name"], observation.get("confidence", 0), evidence_ids,
-                "mood_normalization_v1",
-            )
+            property_key = "atmosphere_label" if entity["entity_type"] == "atmosphere" else "mood_label"
+            self.maintain_entity_property(entity["id"], property_key, entity["canonical_name"], observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1" if entity["entity_type"] == "atmosphere" else "mood_normalization_v1")
+            if entity["entity_type"] == "atmosphere":
+                self.maintain_entity_property_values(entity["id"], "semantic_details", semantic_atmosphere.get("details") or [], observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1")
             self.maintain_entity_property_values(
-                entity["id"], "raw_mood_labels", raw_moods, observation.get("confidence", 0), evidence_ids,
-                "mood_normalization_v1",
+                entity["id"], "raw_atmosphere_labels" if entity["entity_type"] == "atmosphere" else "raw_mood_labels", raw_atmosphere_labels if entity["entity_type"] == "atmosphere" else raw_moods, observation.get("confidence", 0), evidence_ids,
+                "semantic_taxonomy_v1" if entity["entity_type"] == "atmosphere" else "mood_normalization_v1",
             )
         if time_entity and captured_at:
             semantics = time_semantics(captured_at)
@@ -2603,7 +2642,7 @@ class MemoryStore:
             )
         for entity in entities:
             if event_id:
-                relation = {"place": "地点", "time": "时间", "object": "包含物件", "emotion": "情感氛围"}.get(entity["entity_type"], "关联实体")
+                relation = {"place": "地点", "time": "时间", "object": "包含物件", "emotion": "情感氛围", "atmosphere": "画面氛围"}.get(entity["entity_type"], "关联实体")
                 self.upsert_event_entity(event_id, entity["id"], relation, [observation_id], observation.get("confidence", 0))
             if place_entity and entity["id"] != place_entity["id"]:
                 self.create_relationship(
@@ -2655,10 +2694,28 @@ class MemoryStore:
                 self.connection.commit()
                 retired_count += 1
                 continue
+            atmosphere_name = ATMOSPHERE_PRIMARY_ALIASES.get(normalized_name, normalized_name)
+            if atmosphere_name not in ATMOSPHERE_PRIMARY_TYPES:
+                atmosphere_name = OTHER
             target = self._find_or_create_entity(
-                normalized_name, "emotion", legacy.get("scope_id"), legacy.get("confidence", 0), "由图片观察到的情感",
+                atmosphere_name, "atmosphere", legacy.get("scope_id"), legacy.get("confidence", 0), "由图片观察到的画面氛围",
             )
             evidence_rows = self._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+            if not evidence_rows:
+                for observation in self._rows("SELECT id, raw_json FROM observations"):
+                    try:
+                        payload = json.loads(observation.get("raw_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    gamma = payload.get("gamma") if isinstance(payload.get("gamma"), dict) else payload
+                    labels = gamma.get("emotions") if isinstance(gamma, dict) else []
+                    if legacy["canonical_name"] in (labels or []):
+                        evidence_rows.append({
+                            "observation_id": observation["id"],
+                            "confidence": legacy.get("confidence", 0),
+                            "source": "legacy_mood_migration",
+                            "created_at": now_iso(),
+                        })
             evidence_ids = [row["observation_id"] for row in evidence_rows]
             for evidence in evidence_rows:
                 self.connection.execute(
@@ -2679,9 +2736,9 @@ class MemoryStore:
                     subject_id, relationship["predicate"], object_id, json.loads(relationship["evidence_ids_json"] or "[]"),
                     relationship["confidence"], relationship["status"],
                 )
-            self.maintain_entity_property(target["id"], "mood_label", normalized_name, legacy.get("confidence", 0), evidence_ids, "mood_normalization_v1")
-            self.maintain_entity_property_values(target["id"], "raw_mood_labels", [legacy["canonical_name"]], legacy.get("confidence", 0), evidence_ids, "mood_normalization_v1")
-            self._record_entity_revision(target["id"], "mood_normalization", legacy["canonical_name"], normalized_name, "mood_normalization_v1", evidence_ids)
+            self.maintain_entity_property(target["id"], "atmosphere_label", atmosphere_name, legacy.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1")
+            self.maintain_entity_property_values(target["id"], "raw_atmosphere_labels", [legacy["canonical_name"]], legacy.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1")
+            self._record_entity_revision(target["id"], "atmosphere_normalization", legacy["canonical_name"], atmosphere_name, "semantic_taxonomy_v1", evidence_ids)
             self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (legacy["id"],))
             self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
             self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (legacy["id"], legacy["id"]))
@@ -2731,18 +2788,18 @@ class MemoryStore:
             entity["preview_media_type"] = preview["media_type"] if preview else None
         return [self.public_entity(entity) for entity in entities] if public else entities
 
-    @staticmethod
-    def _semantic_entity_key(entity_type, name):
+    def _semantic_entity_key(self, entity_type, name, entity=None):
         """Return an explainable semantic concept for automatic grouping."""
         label = re.sub(r"\s+", "", str(name or "").strip())
-        gps = parse_gps_place(label)
-        if entity_type == "place" and gps:
-            # Metadata often varies by a few metres between frames.  Use an
-            # approximately 1km grid only for the semantic browse group;
-            # exact coordinates remain on each member entity and its Asset.
-            latitude, longitude = gps
-            grid = f"{latitude:.2f},{longitude:.2f}"
-            return f"附近地点（{grid}）", {"strategy": "nearby_gps_grid", "matched_label": grid}
+        properties = {
+            item["property_key"]: item
+            for item in self.list_entity_properties((entity or {}).get("id"))
+        } if (entity or {}).get("id") else {}
+        primary = properties.get("semantic_primary", {}).get("value")
+        if primary and entity_type in {"place", "object", "atmosphere"}:
+            return str(primary), {"strategy": "semantic_primary", "matched_label": str(primary)}
+        if entity_type == "emotion":
+            entity_type = "atmosphere"
         equivalents = SEMANTIC_ENTITY_EQUIVALENTS.get(entity_type, {})
         if label in equivalents:
             return equivalents[label], {"strategy": "controlled_equivalence", "matched_label": label}
@@ -2793,7 +2850,7 @@ class MemoryStore:
             entity_type = entity.get("entity_type")
             if entity_type == "person" or entity.get("status") in {"rejected", "superseded"}:
                 continue
-            label, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"))
+            label, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"), entity)
             key = (entity.get("scope_id") or "home-default", entity_type, label)
             group = grouped.setdefault(key, {
                 "id": "semantic_group:" + ":".join((entity.get("scope_id") or "home-default", entity_type, label)),
@@ -2803,6 +2860,7 @@ class MemoryStore:
                 "members": [],
                 "member_entity_ids": [],
                 "source_labels": [],
+                "semantic_details": [],
                 "evidence_count": 0,
                 "relationship_count": 0,
                 "confidence": 0.0,
@@ -2814,6 +2872,11 @@ class MemoryStore:
             group["members"].append(self.public_entity(entity))
             group["member_entity_ids"].append(entity["id"])
             group["source_labels"].append(entity["canonical_name"])
+            properties = {item["property_key"]: item for item in self.list_entity_properties(entity["id"])}
+            details = properties.get("semantic_details", {}).get("value") or []
+            if not isinstance(details, list):
+                details = [details]
+            group["semantic_details"] = list(dict.fromkeys(group["semantic_details"] + [str(item) for item in details if str(item).strip()]))
             group["evidence_count"] += int(entity.get("evidence_count", 0) or 0)
             group["relationship_count"] += int(entity.get("relationship_count", 0) or 0)
             group["confidence"] = max(group["confidence"], float(entity.get("confidence", 0) or 0))
@@ -2862,7 +2925,7 @@ class MemoryStore:
             entity_type = entity.get("entity_type")
             if entity_type not in allowed_types or entity.get("status") == "rejected":
                 continue
-            key, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"))
+            key, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"), entity)
             if rationale["strategy"] == "exact_label":
                 continue
             groups.setdefault((entity.get("scope_id") or "home-default", entity_type, key), []).append((entity, rationale))

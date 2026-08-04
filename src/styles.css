@@ -225,6 +225,22 @@ button { cursor: pointer; }
 .entity-media-card h2 { margin: 8px 0 4px; }
 .entity-thumb { width: 100%; aspect-ratio: 1 / .62; object-fit: cover; display: block; background: var(--soft); }
 .entity-thumb.fallback { display: grid; place-items: center; color: var(--muted); font-size: 28px; }
+.semantic-group-card .entity-card-copy { display: grid; gap: 8px; }
+.semantic-group-card .entity-card-head { align-items: center; }
+.semantic-type-label, .semantic-evidence-label { color: var(--muted); font-size: 10px; }
+.semantic-detail-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.semantic-detail-tags span { padding: 4px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: var(--soft); font-size: 10px; }
+.semantic-open-link { color: var(--green-dark, #43624d); font-size: 11px; }
+.semantic-detail-section { margin-top: 22px; }
+.semantic-detail-section > p:not(.section-kicker) { max-width: 58ch; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.semantic-evidence-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.semantic-evidence-tile { display: grid; gap: 7px; width: 100%; padding: 0; border: 0; background: transparent; text-align: left; color: var(--ink); cursor: pointer; }
+.semantic-evidence-tile img { width: 100%; aspect-ratio: 1 / .78; object-fit: cover; border-radius: 6px; background: var(--soft); }
+.semantic-evidence-tile span { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.technical-evidence { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 12px; color: var(--muted); font-size: 10px; }
+.technical-evidence summary { cursor: pointer; color: var(--ink); }
+.technical-evidence div { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.technical-evidence small { color: var(--faint); }
 .entity-expand { display: flex; justify-content: center; margin-top: 12px; }
 .entity-detail-thumb { width: 92px; height: 92px; object-fit: cover; border-radius: 6px; flex: 0 0 auto; }
 .claim-evidence-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
@@ -268,6 +284,7 @@ button { cursor: pointer; }
 .avatar.green { background: var(--green); color: #fff; }
 @media (max-width: 900px) { .knowledge-summary, .entity-grid, .cluster-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 580px) { .knowledge-summary, .entity-grid, .cluster-grid { grid-template-columns: 1fr; } }
+@media (max-width: 580px) { .semantic-evidence-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 580px) { .event-entity-list { grid-template-columns: 1fr; } }
 @media (max-width: 900px) { .trip-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 580px) { .trip-grid { grid-template-columns: 1fr; } }

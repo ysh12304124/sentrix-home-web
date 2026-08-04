@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,7 +183,7 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(time_properties["season"]["value"], "夏")
         self.assertEqual(time_properties["part_of_day"]["value"], ["傍晚"])
 
-    def test_gps_place_keeps_coordinates_separate_from_visual_scene_type(self):
+    def test_gps_place_keeps_coordinates_separate_from_visual_place_name(self):
         self.store.update_asset("a1", "queued", {"captured_location": "30.274100,120.155100"})
         self.store.connection.execute(
             "UPDATE observations SET place = ? WHERE id = ?", ("西湖湖畔", self.obs1["id"])
@@ -193,10 +194,36 @@ class NativeEntityMemoryTests(unittest.TestCase):
         place = next(item for item in self.store.list_entities() if item["entity_type"] == "place")
         properties = {item["property_key"]: item for item in self.store.get_entity_detail(place["id"])["properties"]}
 
-        self.assertEqual(place["canonical_name"], "30.274100,120.155100")
+        self.assertEqual(place["canonical_name"], "西湖湖畔")
         self.assertEqual(properties["geo"]["value"], {"latitude": 30.2741, "longitude": 120.1551})
         self.assertEqual(properties["geo"]["source"], "asset_gps")
         self.assertEqual(properties["scene_type"]["value"], "西湖湖畔")
+
+    def test_semantic_place_primary_wins_over_gps_as_entity_name(self):
+        self.store.update_asset("a1", "queued", {"captured_location": "30.274100,120.155100"})
+        self.store.connection.execute(
+            "UPDATE observations SET place = ?, canonical_json = ? WHERE id = ?",
+            (
+                "湖边餐厅",
+                json.dumps({
+                    "place": "湖边餐厅",
+                    "scene_type": "餐饮空间",
+                    "semantic": {"place": {"primary": "餐饮空间", "details": ["室内", "有餐桌"]}},
+                }, ensure_ascii=False),
+                self.obs1["id"],
+            ),
+        )
+        self.store.connection.commit()
+
+        self.store.maintain_observation_entities(self.obs1["id"])
+        place = next(item for item in self.store.list_entities() if item["entity_type"] == "place")
+        properties = {item["property_key"]: item for item in self.store.get_entity_detail(place["id"])["properties"]}
+
+        self.assertEqual(place["canonical_name"], "餐饮空间")
+        self.assertEqual(properties["geo"]["value"], {"latitude": 30.2741, "longitude": 120.1551})
+        self.assertEqual(properties["semantic_primary"]["value"], "餐饮空间")
+        self.assertEqual(properties["semantic_details"]["value"], ["室内", "有餐桌"])
+        self.assertEqual(properties["visual_place_descriptions"]["value"], ["湖边餐厅"])
 
     def test_private_place_has_an_alias_for_standard_entity_lists(self):
         place = self.store.create_entity("家中餐厅", "place", confidence=1.0)
@@ -528,17 +555,27 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(detail["entity"]["status"], "confirmed")
         self.assertEqual(self.store._row("SELECT status FROM face_clusters WHERE id = ?", (face["cluster_id"],))["status"], "confirmed")
 
-    def test_observation_entities_link_place_objects_emotion_and_event_evidence(self):
+    def test_observation_entities_link_place_objects_atmosphere_and_event_evidence(self):
         self.store.connection.execute(
-            "UPDATE observations SET place = ?, objects_json = ?, raw_json = ? WHERE id = ?",
-            ("家中餐厅", '["生日蛋糕"]', '{"emotions": ["喜悦"]}', self.obs1["id"]),
+            "UPDATE observations SET place = ?, objects_json = ?, raw_json = ?, canonical_json = ? WHERE id = ?",
+            (
+                "家中餐厅", '["生日蛋糕"]', '{"emotions": ["温馨"]}',
+                json.dumps({
+                    "semantic": {
+                        "place": {"primary": "餐饮空间", "details": ["室内"]},
+                        "objects": [{"primary": "食品与饮品", "label": "生日蛋糕", "details": ["桌面"]}],
+                        "atmosphere": {"labels": ["温馨"], "details": ["暖色光线"]},
+                    }
+                }, ensure_ascii=False),
+                self.obs1["id"],
+            ),
         )
         self.store.connection.commit()
         event = self.store.merge_observation_into_event(self.store.get_observation(self.obs1["id"]))
 
         entities = self.store.maintain_observation_entities(self.obs1["id"], event["id"])
 
-        self.assertEqual({item["entity_type"] for item in entities}, {"place", "object", "emotion"})
+        self.assertEqual({item["entity_type"] for item in entities}, {"place", "object", "atmosphere"})
         cake = next(item for item in entities if item["canonical_name"] == "生日蛋糕")
         detail = self.store.get_entity_detail(cake["id"])
         self.assertEqual(detail["events"][0]["id"], event["id"])
@@ -563,32 +600,32 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertIn(("time", "2026-08-03"), names_by_type)
         self.assertTrue(all(item["reviewable"] for item in entities if item["entity_type"] != "person"))
 
-    def test_entity_index_reads_emotion_from_persisted_model_payload(self):
+    def test_entity_index_reads_atmosphere_from_persisted_model_payload(self):
         self.store.connection.execute(
-            "UPDATE observations SET raw_json = ? WHERE id = ?",
-            ('{"gamma": {"emotions": ["温馨"]}}', self.obs1["id"]),
+            "UPDATE observations SET canonical_json = ? WHERE id = ?",
+            ('{"semantic": {"atmosphere": {"labels": ["温馨"], "details": ["暖色光线"]}}}', self.obs1["id"]),
         )
         self.store.connection.commit()
         self.store.reindex_observation_entities()
 
-        self.assertTrue(any(item["entity_type"] == "emotion" and item["canonical_name"] == "温馨" for item in self.store.list_entities()))
+        self.assertTrue(any(item["entity_type"] == "atmosphere" and item["canonical_name"] == "温馨" for item in self.store.list_entities()))
 
-    def test_mood_entities_normalize_raw_model_labels_and_preserve_evidence(self):
+    def test_atmosphere_entities_preserve_labels_and_evidence(self):
         self.store.connection.execute(
-            "UPDATE observations SET raw_json = ? WHERE id = ?",
-            ('{"gamma": {"emotions": ["面带微笑", "轻松"]}}', self.obs1["id"]),
+            "UPDATE observations SET canonical_json = ? WHERE id = ?",
+            ('{"semantic": {"atmosphere": {"labels": ["温馨", "轻松"], "details": ["暖色光线"]}}}', self.obs1["id"]),
         )
         self.store.connection.commit()
 
         entities = self.store.maintain_observation_entities(self.obs1["id"])
-        emotions = {item["canonical_name"]: item for item in entities if item["entity_type"] == "emotion"}
-        joyful = self.store.get_entity_detail(emotions["喜悦"]["id"])
+        atmospheres = {item["canonical_name"]: item for item in entities if item["entity_type"] == "atmosphere"}
+        warm = self.store.get_entity_detail(atmospheres["温馨"]["id"])
 
-        self.assertEqual(set(emotions), {"喜悦", "放松"})
-        properties = {item["property_key"]: item for item in joyful["properties"]}
-        self.assertEqual(properties["mood_label"]["value"], "喜悦")
-        self.assertEqual(properties["raw_mood_labels"]["value"], ["面带微笑"])
-        self.assertEqual(properties["raw_mood_labels"]["evidence_ids"], [self.obs1["id"]])
+        self.assertEqual(set(atmospheres), {"温馨", "轻松"})
+        properties = {item["property_key"]: item for item in warm["properties"]}
+        self.assertEqual(properties["atmosphere_label"]["value"], "温馨")
+        self.assertEqual(properties["semantic_details"]["value"], ["暖色光线"])
+        self.assertEqual(properties["semantic_details"]["evidence_ids"], [self.obs1["id"]])
 
     def test_reindex_migrates_legacy_raw_mood_entity_to_normalized_entity(self):
         legacy = self.store.create_entity("面带微笑", "emotion", confidence=0.7)
@@ -601,14 +638,14 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.store.connection.commit()
 
         result = self.store.reindex_observation_entities()
-        emotions = [item for item in self.store.list_entities(public=False) if item["entity_type"] == "emotion"]
-        joyful = next(item for item in emotions if item["canonical_name"] == "喜悦")
+        atmospheres = [item for item in self.store.list_entities(public=False) if item["entity_type"] == "atmosphere"]
+        joyful = next(item for item in atmospheres if item["canonical_name"] == "热闹")
         properties = {item["property_key"]: item for item in self.store.list_entity_properties(joyful["id"])}
 
         self.assertEqual(result["normalized_moods"], 1)
-        self.assertFalse(any(item["id"] == legacy["id"] for item in emotions))
+        self.assertFalse(any(item["id"] == legacy["id"] for item in self.store.list_entities(public=False)))
         self.assertEqual(joyful["evidence_count"], 1)
-        self.assertEqual(properties["raw_mood_labels"]["value"], ["面带微笑"])
+        self.assertEqual(properties["raw_atmosphere_labels"]["value"], ["面带微笑"])
         self.assertTrue(any(
             relationship["subject_entity_id"] == joyful["id"] and relationship["object_entity_id"] == place["id"]
             for relationship in self.store.list_relationships(joyful["id"])
@@ -646,11 +683,11 @@ class NativeEntityMemoryTests(unittest.TestCase):
         detail = self.store.get_event_detail(event["id"])
         by_type = {item["entity_type"]: item for item in detail["entities"]}
 
-        self.assertEqual(set(by_type), {"person", "place", "object", "emotion", "time"})
+        self.assertEqual(set(by_type), {"person", "place", "object", "atmosphere", "time"})
         self.assertEqual(by_type["person"]["relation"], "参与")
         self.assertEqual(by_type["place"]["relation"], "地点")
         self.assertEqual(by_type["object"]["relation"], "包含物件")
-        self.assertEqual(by_type["emotion"]["relation"], "情感氛围")
+        self.assertEqual(by_type["atmosphere"]["relation"], "画面氛围")
         self.assertEqual(by_type["time"]["relation"], "时间")
         self.assertEqual(by_type["object"]["evidence_ids_json"], [self.obs1["id"]])
         self.assertEqual(by_type["object"]["evidence_count"], 1)
@@ -724,6 +761,26 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(properties["scene_type"]["value"], "滨水空间")
         self.assertEqual(properties["visual_place_descriptions"]["value"], ["城市河流岸边"])
 
+    def test_semantic_group_uses_primary_property_and_aggregates_details(self):
+        restaurant = self.store.create_entity("餐厅", "place", confidence=0.8)
+        cafe = self.store.create_entity("咖啡馆", "place", confidence=0.8)
+        for entity, observation, details in (
+            (restaurant, self.obs1, ["室内", "有餐桌"]),
+            (cafe, self.obs2, ["室内", "咖啡或茶"]),
+        ):
+            self.store.connection.execute(
+                "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, 0.8, 'test', datetime('now'))",
+                (entity["id"], observation["id"]),
+            )
+            self.store.maintain_entity_property(entity["id"], "semantic_primary", "餐饮空间", 0.8, [observation["id"]], "semantic_taxonomy_v1")
+            self.store.maintain_entity_property_values(entity["id"], "semantic_details", details, 0.8, [observation["id"]], "semantic_taxonomy_v1")
+        self.store.connection.commit()
+
+        group = next(item for item in self.store.list_semantic_entity_groups() if item["canonical_name"] == "餐饮空间")
+
+        self.assertEqual(set(group["source_labels"]), {"餐厅", "咖啡馆"})
+        self.assertEqual(set(group["semantic_details"]), {"室内", "有餐桌", "咖啡或茶"})
+
     def test_scene_type_replaces_old_free_text_place_projection_for_same_observation(self):
         self.store.enrich_observation(self.obs1["id"], {"place": "湖边", "caption": "湖边散步"})
         old_place = next(item for item in self.store.maintain_observation_entities(self.obs1["id"]) if item["entity_type"] == "place")
@@ -734,7 +791,7 @@ class NativeEntityMemoryTests(unittest.TestCase):
         old_links = self.store._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (old_place["id"],))
         self.assertEqual(old_links, [])
 
-    def test_nearby_gps_places_share_one_semantic_browse_group(self):
+    def test_gps_places_do_not_create_a_semantic_group_without_a_primary(self):
         first = self.store.create_entity("30.091900,120.496900", "place", confidence=0.8)
         second = self.store.create_entity("30.092200,120.501000", "place", confidence=0.8)
         for entity, observation in ((first, self.obs1), (second, self.obs2)):
@@ -745,10 +802,11 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.store.connection.commit()
 
         groups = self.store.list_semantic_entity_groups()
-        nearby = next(item for item in groups if item["rationale"]["strategy"] == "nearby_gps_grid")
-
-        self.assertEqual(len(nearby["member_entity_ids"]), 2)
-        self.assertTrue(nearby["is_semantic_cluster"])
+        self.assertFalse(any(item["rationale"]["strategy"] == "nearby_gps_grid" for item in groups))
+        self.assertEqual(
+            {item["canonical_name"] for item in groups if item["entity_type"] == "place"},
+            {"30.091900,120.496900", "30.092200,120.501000"},
+        )
 
 
 if __name__ == "__main__":

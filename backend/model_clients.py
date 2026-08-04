@@ -40,6 +40,8 @@ try:
 except ImportError:  # Keep pure parsing and SQLite tests runnable without optional runtime deps.
     httpx = None
 
+from .semantic_taxonomy import PLACE_PRIMARY_TYPES, normalize_semantic_analysis
+
 
 class ModelError(RuntimeError):
     pass
@@ -117,11 +119,7 @@ def normalize_analysis_fields(parsed):
     return parsed
 
 
-SCENE_TYPE_OPTIONS = (
-    "居住室内", "餐饮空间", "商业空间", "展览空间", "园林公园", "滨水空间",
-    "山地与自然", "户外公共空间", "交通出行空间", "演出活动空间", "办公学习空间",
-    "工业与工程空间", "其他或不确定",
-)
+SCENE_TYPE_OPTIONS = PLACE_PRIMARY_TYPES
 
 
 def normalize_scene_type(value):
@@ -210,14 +208,14 @@ class GammaClient:
         encoded, mime_type = self._encode_core_image(file_path)
         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
 严格返回简体中文 JSON 对象，不要解释。每个字段必须完整但简短：caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；看不清用空数组或空字符串。
-字段固定为：caption、activity、place、scene_type、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。scene_type 必须从以下主场景选一个："""
+字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。"""
         prompt += "、".join(SCENE_TYPE_OPTIONS)
         prompt += "。facts 项仅含 subject、predicate、object、confidence。\n不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。\nmetadata: "
         prompt += json.dumps(metadata or {}, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
         scalar_text = " ".join(as_text(parsed.get(key)) for key in ("caption", "activity", "place", "event_type", "ocr_text"))
         if contains_latin_text(scalar_text):
-            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。scene_type 必须保留为下列之一："
+            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："
             canonical_prompt += "、".join(SCENE_TYPE_OPTIONS)
             canonical_prompt += "。\n原始观察：" + json.dumps(parsed, ensure_ascii=False)
             parsed = parse_json_response(self.chat(canonical_prompt))
@@ -228,6 +226,7 @@ class GammaClient:
         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
         normalize_analysis_fields(parsed)
+        parsed = normalize_semantic_analysis(parsed)
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
         parsed["model"] = self.model
         return parsed

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .db import MemoryStore, make_id
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, ModelError, normalize_confidence
+from .semantic_taxonomy import normalize_semantic_analysis
 
 
 IMPORT_METADATA_KEYS = {
@@ -224,7 +225,8 @@ class IngestionPipeline:
             "file_name": asset["file_name"], "captured_at": asset.get("captured_at") or file_time(asset["path"]),
             "captured_location": asset.get("captured_location") or "", "source_owner_id": asset.get("source_owner_id"),
         })
-        analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
+        analysis = normalize_semantic_analysis(analysis)
+        analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
         analysis["raw"] = {"gamma": analysis.copy(), "semantic_status": "complete"}
         observation = self.store.enrich_observation(observation_id, analysis, source="deferred_vision_enrichment")
         event_id = metadata.get("event_id")
@@ -299,6 +301,7 @@ class IngestionPipeline:
             analysis, vision_seconds = timed(lambda: self.gamma.analyze_image(path, metadata))
             faces, face_seconds = timed(lambda: self.face.detect(path))
             clip_embedding, clip_seconds = timed(lambda: self.clip.embed_image(path))
+        analysis = normalize_semantic_analysis(analysis)
         analysis["clip_embedding"] = clip_embedding
         analysis["processing_timings"] = {
             "vision_seconds": round(vision_seconds, 4),
@@ -311,7 +314,7 @@ class IngestionPipeline:
         analysis["source_owner_id"] = asset.get("source_owner_id")
         analysis["canonical"] = {
             key: analysis.get(key)
-            for key in ("caption", "activity", "place", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
+            for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
         }
         analysis["source_type"] = "image"
         analysis["face_candidates"] = faces

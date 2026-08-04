@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -56,6 +57,42 @@ class ModelClientTests(unittest.TestCase):
         self.assertFalse(payload["think"])
         self.assertEqual(payload["options"]["num_ctx"], 4096)
         self.assertEqual(payload["options"]["num_predict"], 320)
+
+    def test_image_prompt_uses_approved_place_taxonomy(self):
+        client = GammaClient()
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
+            image.write(b"synthetic-image")
+            image.flush()
+            with patch.object(client, "chat", return_value=json.dumps({"scene_type": "餐饮空间"})) as chat:
+                client.analyze_image(image.name)
+
+        prompt = chat.call_args.args[0]
+        self.assertIn("医疗与公共服务", prompt)
+        self.assertIn("农场与乡村", prompt)
+        self.assertIn("semantic", prompt)
+        self.assertNotIn("居住室内", prompt)
+
+    def test_image_analysis_returns_normalized_semantic_contract(self):
+        client = GammaClient()
+        payload = {
+            "place": "湖边餐厅",
+            "scene_type": "餐饮空间",
+            "semantic": {
+                "place": {"primary": "餐饮空间", "details": ["室内"]},
+                "objects": [{"primary": "食品与饮品", "label": "蛋糕", "details": ["桌面"]}],
+                "atmosphere": {"labels": ["温馨"], "details": ["暖色光线"]},
+            },
+        }
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
+            image.write(b"synthetic-image")
+            image.flush()
+            with patch.object(client, "chat", return_value=json.dumps(payload)):
+                result = client.analyze_image(image.name)
+
+        self.assertEqual(result["semantic"]["place"]["primary"], "餐饮空间")
+        self.assertEqual(result["semantic"]["objects"][0]["label"], "蛋糕")
+        self.assertEqual(result["semantic"]["atmosphere"]["labels"], ["温馨"])
+        self.assertEqual(result["raw_labels"]["place"], "湖边餐厅")
 
     def test_clip_uses_project_checkpoint_when_environment_is_unset(self):
         checkpoint = Path(__file__).resolve().parents[2] / "data" / "models" / "clip" / "ViT-B-32.bin"

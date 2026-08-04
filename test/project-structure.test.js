@@ -165,3 +165,14 @@ test("memory-space and evidence governance are wired into the portal", () => {
   assert.match(source, /cluster-split/);
   assert.match(source, /refresh_counts/);
 });
+
+test("semantic directory is semantic-first and evidence-backed", () => {
+  const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(source, /semantic-group-card/);
+  assert.match(source, /语义摘要/);
+  assert.match(source, /细节语义/);
+  assert.match(source, /原始证据/);
+  assert.match(source, /semantic_details/);
+  assert.match(source, /technical-evidence/);
+  assert.match(source, /data-action="open-asset"/);
+});
