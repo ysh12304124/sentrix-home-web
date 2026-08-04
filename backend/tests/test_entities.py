@@ -734,6 +734,22 @@ class NativeEntityMemoryTests(unittest.TestCase):
         old_links = self.store._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (old_place["id"],))
         self.assertEqual(old_links, [])
 
+    def test_nearby_gps_places_share_one_semantic_browse_group(self):
+        first = self.store.create_entity("30.091900,120.496900", "place", confidence=0.8)
+        second = self.store.create_entity("30.092200,120.501000", "place", confidence=0.8)
+        for entity, observation in ((first, self.obs1), (second, self.obs2)):
+            self.store.connection.execute(
+                "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, 0.8, 'gps', datetime('now'))",
+                (entity["id"], observation["id"]),
+            )
+        self.store.connection.commit()
+
+        groups = self.store.list_semantic_entity_groups()
+        nearby = next(item for item in groups if item["rationale"]["strategy"] == "nearby_gps_grid")
+
+        self.assertEqual(len(nearby["member_entity_ids"]), 2)
+        self.assertTrue(nearby["is_semantic_cluster"])
+
 
 if __name__ == "__main__":
     unittest.main()

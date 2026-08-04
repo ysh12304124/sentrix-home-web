@@ -2727,6 +2727,14 @@ class MemoryStore:
     def _semantic_entity_key(entity_type, name):
         """Return an explainable semantic concept for automatic grouping."""
         label = re.sub(r"\s+", "", str(name or "").strip())
+        gps = parse_gps_place(label)
+        if entity_type == "place" and gps:
+            # Metadata often varies by a few metres between frames.  Use an
+            # approximately 1km grid only for the semantic browse group;
+            # exact coordinates remain on each member entity and its Asset.
+            latitude, longitude = gps
+            grid = f"{latitude:.2f},{longitude:.2f}"
+            return f"附近地点（{grid}）", {"strategy": "nearby_gps_grid", "matched_label": grid}
         equivalents = SEMANTIC_ENTITY_EQUIVALENTS.get(entity_type, {})
         if label in equivalents:
             return equivalents[label], {"strategy": "controlled_equivalence", "matched_label": label}
