@@ -481,3 +481,11 @@ P0 的属性版本、用户覆盖和关系聚合，之后依赖顺序推进地�
 - 修复了事件合并删除前未迁移 `event_entities`、`event_revisions`、`person_event_memory` 和 feedback 外键投影的问题；Python 回归 `215/215`，Node 回归 `23/23`。
 
 下一步先由用户检查 album1 的地点、物品、氛围语义质量，再决定是否输入 album2/3 的重跑命令。不要自动继续重跑其他相册。
+
+## 2026-08-04 自动导入记忆生成修复
+
+- 最新代码提交：`4ae1fd7 fix: auto-complete image descriptions and event summaries`。
+- 视觉提示词现在明确要求同时输出 `caption/activity/place/event_type` 等自然语言观察，不能只返回受控语义选择；若首轮只返回语义结构或空对象，会自动对同一图片发起一次描述恢复请求。
+- `/api/ingest` 的后台任务在图片语义丰富完成后自动调用事件总结，用户不需要手动调用 `/api/maintenance/summarize-events`。音频、文本原本已经使用自动总结路径。
+- 旧 album1 已落库的空观察不会被代码热更新自动重写；当前 album1 的历史语义恢复需要另行执行并先备份数据库。新导入会直接走恢复与事件总结路径。
+- 新鲜验证：Python `216/216`、Node `24/24`；真实 album1 图片恢复测试得到“一个铺满干果碎的芒果蛋糕 / 展示甜点特写 / 室内餐厅或咖啡馆”。
