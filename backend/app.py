@@ -258,6 +258,19 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
     return {"entities": values}
 
 
+@app.get("/api/entity-groups")
+def entity_groups(scope_id: str | None = None):
+    return {"groups": store.list_semantic_entity_groups(scope_id)}
+
+
+@app.get("/api/entity-groups/{group_id}")
+def entity_group(group_id: str, scope_id: str | None = None):
+    value = store.get_semantic_entity_group(group_id, scope_id)
+    if not value:
+        raise HTTPException(status_code=404, detail="semantic entity group not found")
+    return value
+
+
 @app.get("/api/entity-merge-candidates")
 def entity_merge_candidates(scope_id: str | None = None, status: str | None = "pending"):
     return {"candidates": store.list_entity_merge_candidates(scope_id, status)}

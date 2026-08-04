@@ -36,6 +36,14 @@ class RecordingGamma(FakeGamma):
         return {"objects": ["补全物体"], "confidence": 0.8}
 
 
+class ConversationalGamma(RecordingGamma):
+    def chat(self, prompt):
+        self.contexts.append(("chat", prompt))
+        if "行动规划器" in prompt:
+            return '{"mode":"chat","tools":[],"show_images":false,"reason":"自然交流"}'
+        return "我在，今天慢一点也没关系。"
+
+
 class FailingClip:
     def embed_text(self, text):
         raise AssertionError("pending identity review must not use vector recall")
@@ -701,6 +709,63 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertTrue(result["image_results"])
             self.assertEqual(result["image_results"][0]["asset_id"], "asset_1")
             self.assertIn("/api/assets/asset_1/file", result["image_results"][0]["media_url"])
+
+    def test_autonomous_turn_keeps_ordinary_chat_outside_memory_retrieval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            agent = MemoryAgent(store, gamma=RecordingGamma())
+
+            result = agent.answer_turn("今天有点累，想聊聊天", "chat-conversation")
+
+            self.assertEqual(result["intent"], "chat")
+            self.assertEqual(result["agent_plan"]["mode"], "chat")
+            self.assertEqual(result["agent_plan"]["tools"], [])
+            self.assertEqual(result["evidence"], [])
+            self.assertEqual(result["image_results"], [])
+            self.assertEqual(agent.gamma.answer_calls, 0)
+
+    def test_natural_chat_uses_household_long_term_memory_without_exposing_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            agent = MemoryAgent(store, gamma=ConversationalGamma())
+
+            result = agent.answer_turn("今天有点累", "chat-with-memory")
+
+            self.assertEqual(result["intent"], "chat")
+            self.assertEqual(result["answer"], "我在，今天慢一点也没关系。")
+            self.assertEqual(result["evidence"], [])
+            self.assertTrue(any("家庭长期记忆" in prompt and "妈妈" in prompt for _, prompt in agent.gamma.contexts))
+
+    def test_memory_turn_hides_images_without_explicit_evidence_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("asset_1", "lake.jpg", "image", "/tmp/lake.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "湖边散步", "place": "湖边"})
+            store.merge_observation_into_event(observation)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn("湖边发生了什么", "memory-conversation")
+
+            self.assertEqual(result["agent_plan"]["mode"], "memory")
+            self.assertFalse(result["agent_plan"]["show_images"])
+            self.assertEqual(result["image_results"], [])
+            self.assertTrue(all("relevance" in item for item in result["evidence"]))
+
+    def test_explicit_evidence_request_limits_images_and_ranks_relevance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            for index, caption in enumerate(("湖边散步", "湖边野餐", "湖边日落", "客厅聚会"), 1):
+                asset = store.create_asset(f"asset_{index}", f"{index}.jpg", "image", f"/tmp/{index}.jpg")
+                observation = store.add_observation(asset["id"], {"caption": caption, "place": "湖边" if "湖边" in caption else "客厅"})
+                store.merge_observation_into_event(observation)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn("给我看湖边的照片证据", "evidence-conversation")
+
+            self.assertTrue(result["agent_plan"]["show_images"])
+            self.assertLessEqual(len(result["image_results"]), 3)
+            self.assertEqual(result["evidence_presentation"]["image_limit"], 3)
+            scores = [item["relevance"] for item in result["evidence"]]
+            self.assertEqual(scores, sorted(scores, reverse=True))
 
     def test_intent_router_distinguishes_clarification(self):
         agent = MemoryAgent(MemoryStore(":memory:"), gamma=FakeGamma())

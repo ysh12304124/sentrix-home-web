@@ -676,6 +676,24 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(cake["label"]["evidence_ids"], [self.obs1["id"]])
         self.assertNotIn("salience", cake)
 
+    def test_semantic_entity_groups_keep_members_and_evidence_without_physical_merge(self):
+        self.store.connection.execute("UPDATE observations SET place = ? WHERE id = ?", ("湖边", self.obs1["id"]))
+        self.store.connection.execute("UPDATE observations SET place = ? WHERE id = ?", ("水边", self.obs2["id"]))
+        self.store.connection.commit()
+        self.store.maintain_observation_entities(self.obs1["id"])
+        self.store.maintain_observation_entities(self.obs2["id"])
+
+        groups = self.store.list_semantic_entity_groups()
+        waterfront = next(item for item in groups if item["canonical_name"] == "滨水区域")
+
+        self.assertTrue(waterfront["is_semantic_cluster"])
+        self.assertEqual(waterfront["source_labels"], ["水边", "湖边"])
+        self.assertEqual(len(waterfront["member_entity_ids"]), 2)
+        self.assertEqual(waterfront["evidence_count"], 2)
+        detail = self.store.get_semantic_entity_group(waterfront["id"])
+        self.assertEqual({item["id"] for item in detail["observations"]}, {self.obs1["id"], self.obs2["id"]})
+        self.assertEqual(len([item for item in self.store.list_entities() if item["entity_type"] == "place"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

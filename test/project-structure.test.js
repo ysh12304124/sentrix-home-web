@@ -54,8 +54,10 @@ test("native confirmation and assistant turn routes are exposed by the browser A
   assert.match(source, /\/api\/assistant\/turn/);
   assert.match(source, /family_role/);
   assert.match(backendSource, /toolTrace/);
-  assert.match(appSource, /工具调用/);
+  assert.match(appSource, /本轮判断与工具/);
   assert.match(appSource, /toolTrace/);
+  assert.match(source, /entityGroups/);
+  assert.match(backendSource, /\/api\/entity-groups/);
 });
 
 test("family memory assistant presents an evidence-backed conversation surface", () => {

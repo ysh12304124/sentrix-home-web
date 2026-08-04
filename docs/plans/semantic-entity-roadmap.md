@@ -131,6 +131,16 @@ Acceptance: near-equivalent labels such as "湖边" and "水边" can be presente
 as a review candidate with source observations, while raw labels and stable
 IDs remain intact until confirmation.
 
+### Implemented Browse Projection
+
+The default entity directory and semantic recall now read an automatically
+maintained semantic-group projection. Every non-person source entity remains
+stable, while same-type labels that resolve to the same controlled semantic
+key appear in one card. The card and detail view show its member labels,
+cumulative evidence, events and original media. This automatic grouping needs
+no user confirmation because it is the default semantic memory view, not a
+destructive rewrite of source entities.
+
 ## P1: Digital Memory Steward
 
 The accepted product role is a neutral household memory steward, not an

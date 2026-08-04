@@ -49,6 +49,31 @@ redaction, evidence validation, and audit records.
    returning unrelated memories.
 7. A write tool is unavailable until the user explicitly confirms an action.
 
+## Autonomous Turn Contract
+
+Each user turn starts with a model-generated JSON action plan. The plan is
+limited to `chat`, `memory`, `feedback`, or `clarify`; the backend validates
+both its mode and its tool names before any data is read or written.
+
+- `chat` reads no family memory and returns no evidence media.
+- `memory` may use only the approved read tools needed for the question.
+- `feedback` records an explicitly targeted correction; it never changes a
+  fact by itself.
+- `clarify` preserves the current scoped context and asks for the smallest
+  missing constraint.
+
+The deterministic router is the safety fallback. A model is not allowed to
+turn an explicit memory, feedback, or clarification request into casual chat.
+Previously verified conversation focus and an explicit entity selection also
+take priority over a chat plan.
+
+Evidence is ranked before presentation using query-term coverage, direct
+entity alignment, source confidence and direct Observation matches. Images
+are opt-in: only an explicit request for photos/original evidence can return
+them, and then only the first three image Observations scoring at least `0.42`
+relevance. The browser shows that relevance score and leaves the complete
+ordered evidence trail inspectable.
+
 ## Conversation State
 
 Store only a bounded local conversation state:
@@ -97,3 +122,7 @@ may reuse the previous constrained result only if the scope remains unchanged.
   and confirmation.
 - Each answer returns an ordered `tool_trace` that explains the chosen memory
   layers.
+- Ordinary chat performs zero memory-tool reads and returns zero images.
+- A memory answer ranks evidence and does not render unrelated images by
+  default; an explicit evidence request renders at most three thresholded
+  images.

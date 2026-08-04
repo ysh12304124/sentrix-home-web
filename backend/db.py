@@ -2696,6 +2696,74 @@ class MemoryStore:
         )
         return [self._merge_candidate_row(row) for row in rows]
 
+    def list_semantic_entity_groups(self, scope_id=None):
+        """Return a read-only semantic projection for browsing and recall.
+
+        A group never replaces its members.  This keeps original labels,
+        user-maintained IDs and Observation links stable while avoiding a UI
+        made of many cards that describe the same concept.
+        """
+        grouped = {}
+        for entity in self.list_entities(scope_id=scope_id, public=False):
+            entity_type = entity.get("entity_type")
+            if entity_type == "person" or entity.get("status") in {"rejected", "superseded"}:
+                continue
+            label, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"))
+            key = (entity.get("scope_id") or "home-default", entity_type, label)
+            group = grouped.setdefault(key, {
+                "id": "semantic_group:" + ":".join((entity.get("scope_id") or "home-default", entity_type, label)),
+                "scope_id": entity.get("scope_id") or "home-default",
+                "entity_type": entity_type,
+                "canonical_name": label,
+                "members": [],
+                "member_entity_ids": [],
+                "source_labels": [],
+                "evidence_count": 0,
+                "relationship_count": 0,
+                "confidence": 0.0,
+                "preview_asset_id": None,
+                "preview_file_name": None,
+                "preview_media_type": None,
+                "rationale": {"strategy": rationale["strategy"], "normalized_key": label},
+            })
+            group["members"].append(self.public_entity(entity))
+            group["member_entity_ids"].append(entity["id"])
+            group["source_labels"].append(entity["canonical_name"])
+            group["evidence_count"] += int(entity.get("evidence_count", 0) or 0)
+            group["relationship_count"] += int(entity.get("relationship_count", 0) or 0)
+            group["confidence"] = max(group["confidence"], float(entity.get("confidence", 0) or 0))
+            if not group["preview_asset_id"] and entity.get("preview_asset_id"):
+                group["preview_asset_id"] = entity["preview_asset_id"]
+                group["preview_file_name"] = entity.get("preview_file_name")
+                group["preview_media_type"] = entity.get("preview_media_type")
+        values = list(grouped.values())
+        for group in values:
+            group["members"].sort(key=lambda item: (-int(item.get("evidence_count", 0) or 0), item.get("canonical_name", "")))
+            group["member_entity_ids"].sort()
+            group["source_labels"] = [item["canonical_name"] for item in group["members"]]
+            group["is_semantic_cluster"] = len(group["members"]) > 1
+        return sorted(values, key=lambda item: (item["entity_type"], -item["evidence_count"], item["canonical_name"]))
+
+    def get_semantic_entity_group(self, group_id, scope_id=None):
+        for group in self.list_semantic_entity_groups(scope_id):
+            if group["id"] != group_id:
+                continue
+            details = [self.get_entity_detail(entity_id) for entity_id in group["member_entity_ids"]]
+            observations, events, relationships = [], [], []
+            seen_observations, seen_events, seen_relationships = set(), set(), set()
+            for detail in details:
+                for observation in detail.get("observations", []):
+                    if observation["id"] not in seen_observations:
+                        observations.append(observation); seen_observations.add(observation["id"])
+                for event in detail.get("events", []):
+                    if event["id"] not in seen_events:
+                        events.append(event); seen_events.add(event["id"])
+                for relationship in detail.get("relationships", []):
+                    if relationship["id"] not in seen_relationships:
+                        relationships.append(relationship); seen_relationships.add(relationship["id"])
+            return {"group": group, "members": details, "observations": observations, "events": events, "relationships": relationships}
+        return None
+
     def derive_entity_merge_candidates(self, scope_id=None):
         """Create review-only semantic merge candidates within a MemorySpace.
 

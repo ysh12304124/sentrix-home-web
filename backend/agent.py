@@ -56,6 +56,150 @@ class MemoryAgent:
         return "query"
 
     @staticmethod
+    def _looks_like_memory_question(message):
+        value = str(message or "").strip()
+        return any(token in value for token in (
+            "照片", "图片", "相册", "回忆", "记得", "去年", "前年", "我们", "家里", "谁", "哪里",
+            "什么时候", "发生", "介绍", "时间线", "比较", "推荐", "证据", "原图", "地点", "人物",
+        ))
+
+    def _household_memory_identity(self, scope_id=None):
+        """Build a compact long-term memory primer for natural conversation."""
+        people = [item for item in self.store.list_entities(scope_id=scope_id) if item.get("entity_type") == "person" and item.get("status") == "confirmed"]
+        profiles = [self.store.get_semantic_profile(item["id"]) for item in people]
+        groups = self.store.list_semantic_entity_groups(scope_id)
+        events = self.store.list_events(12, scope_id=scope_id)
+        return {
+            "family_members": [{"id": item["id"], "name": item.get("canonical_name"), "role": item.get("family_role")} for item in people[:16]],
+            "family_profiles": [item for item in profiles if item][:12],
+            "places_and_things": [{"name": item["canonical_name"], "type": item["entity_type"], "labels": item["source_labels"][:5]} for item in groups[:40]],
+            "recent_shared_memories": [{"id": item["id"], "title": item.get("title"), "summary": item.get("summary"), "time": item.get("time_start"), "place": item.get("place")} for item in events[:12]],
+        }
+
+    def _normal_chat_answer(self, message, conversation_context="", scope_id=None):
+        value = str(message or "").strip()
+        if not hasattr(self.gamma, "chat"):
+            return "我在听。"
+        prompt = """你是 Sentrix，一个中性、自然的家庭数字助手。你长期记得这个家庭已经整理出的成员、共同经历、地点和物件，但不模仿任何家庭成员。
+请像一个熟悉家庭生活的助手一样自然交谈，不要把回答写成检索结果，不要主动讲工具、数据库、证据或置信度。可以共情、讨论和提出有帮助的下一步；只有在下方长期记忆中存在时，才把具体家庭往事当作事实说出。对不在记忆中的细节保持自然的不确定性，不要编造。
+家庭长期记忆：""" + json.dumps(self._household_memory_identity(scope_id), ensure_ascii=False) + "\n最近对话：" + str(conversation_context or "")[-1200:] + "\n用户：" + value + "\n请直接自然回答，不要使用 Markdown 列表。"
+        try:
+            answer = str(self.gamma.chat(prompt) or "").strip()
+            return answer or "我在听。"
+        except Exception:
+            return "我在听。"
+
+    def _fallback_plan(self, message, feedback=None):
+        intent = self.classify_intent(message, feedback)
+        if intent == "feedback":
+            return {"mode": "feedback", "tools": ["record_feedback"], "show_images": False, "reason": "用户正在纠正或确认记忆"}
+        if intent == "clarification":
+            return {"mode": "clarify", "tools": ["resolve_constraints", "request_clarification"], "show_images": False, "reason": "用户在补充或修正上文指代"}
+        if not self._looks_like_memory_question(message):
+            return {"mode": "chat", "tools": [], "show_images": False, "reason": "没有明确的家庭记忆请求"}
+        tools = ["resolve_constraints", "find_events"]
+        if self._is_recall_recommendation_query(message):
+            tools.append("suggest_recall")
+        elif self._is_timeline_query(message):
+            tools.append("trace_timeline")
+        elif self._is_evidence_request(message):
+            tools.append("open_evidence")
+        return {"mode": "memory", "tools": tools, "show_images": self._is_evidence_request(message), "reason": "问题要求家庭记忆或可验证事实"}
+
+    def _plan_turn(self, message, conversation_context="", feedback=None):
+        """Ask the model for a bounded plan, then validate every capability.
+
+        The local deterministic planner remains available when the model is
+        unavailable or returns malformed JSON.  The model receives no database
+        evidence at this stage, so it cannot fabricate a result.
+        """
+        fallback = self._fallback_plan(message, feedback)
+        if feedback or not hasattr(self.gamma, "chat"):
+            return fallback | {"planner": "deterministic"}
+        prompt = "你是 Sentrix 家庭数字助手的行动规划器。你的长期记忆来自家庭成员、共同经历、地点、物件与关系；只判断本轮是否需要读取更具体的家庭记忆，不回答事实，也不要调用工具。\n"
+        prompt += "可选 mode: chat, memory, feedback, clarify。可选工具: resolve_constraints, describe_entity, find_events, trace_timeline, compare_memories, suggest_recall, open_evidence, request_clarification, record_feedback。\n"
+        prompt += "普通聊天、情感支持、建议和延续对话可以是 chat；只有需要准确回忆具体家庭经历、人物、地点、时间、关系或用户要求依据时才 memory。图片只在问题确实需要视觉依据时展示。\n"
+        prompt += f"用户消息：{message}\n最近对话：{conversation_context[-800:]}\n"
+        prompt += '只返回 JSON：{"mode":"chat|memory|feedback|clarify","tools":["..."],"show_images":false,"reason":"..."}'
+        try:
+            raw = self.gamma.chat(prompt)
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            return fallback | {"planner": "deterministic"}
+        if not isinstance(parsed, dict):
+            return fallback | {"planner": "deterministic"}
+        allowed_modes = {"chat", "memory", "feedback", "clarify"}
+        allowed_tools = {"resolve_constraints", "describe_entity", "find_events", "trace_timeline", "compare_memories", "suggest_recall", "open_evidence", "request_clarification", "record_feedback"}
+        mode = parsed.get("mode") if parsed.get("mode") in allowed_modes else fallback["mode"]
+        # A model may choose a narrower memory tool, but it cannot discard an
+        # explicit memory/feedback request as casual chat.
+        if fallback["mode"] in {"memory", "feedback", "clarify"} and mode == "chat":
+            mode = fallback["mode"]
+        tools = [item for item in parsed.get("tools", []) if item in allowed_tools]
+        if mode == "chat":
+            tools = []
+        elif mode == "memory":
+            tools = list(dict.fromkeys(["resolve_constraints", *tools]))
+            if len(tools) == 1:
+                tools.append("find_events")
+        elif mode == "feedback":
+            tools = ["record_feedback"]
+        else:
+            tools = list(dict.fromkeys(["resolve_constraints", *tools, "request_clarification"]))
+        return {
+            "mode": mode, "tools": tools,
+            "show_images": bool(parsed.get("show_images")) and mode == "memory",
+            "reason": str(parsed.get("reason") or fallback["reason"])[:240], "planner": "model",
+        }
+
+    @staticmethod
+    def _query_terms(query):
+        value = str(query or "").lower()
+        words = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", value)
+        terms = set(words)
+        for word in words:
+            if re.fullmatch(r"[\u4e00-\u9fff]+", word):
+                terms.update(word[index:index + size] for size in range(2, min(5, len(word)) + 1) for index in range(len(word) - size + 1))
+        return terms
+
+    def _evidence_relevance(self, query, item, focused_entity_ids=()):
+        terms = self._query_terms(query)
+        text = json.dumps(item, ensure_ascii=False).lower()
+        lexical = sum(term in text for term in terms) / max(1, len(terms))
+        confidence = float(item.get("confidence", 0.62) or 0.62)
+        entity_bonus = 0.18 if item.get("person_id") in set(focused_entity_ids or ()) else 0.0
+        direct_bonus = 0.28 if item.get("kind") == "observation" and lexical >= 0.25 else 0.0
+        return round(min(1.0, 0.15 + 0.52 * lexical + 0.18 * confidence + entity_bonus + direct_bonus), 4)
+
+    def _rank_evidence_for_turn(self, query, result, plan, focused_entity_ids=()):
+        ranked = []
+        for item in result.get("evidence", []):
+            value = dict(item)
+            value["relevance"] = self._evidence_relevance(query, value, focused_entity_ids)
+            ranked.append(value)
+        ranked.sort(key=lambda item: (-item["relevance"], -float(item.get("confidence", 0) or 0), item.get("id", "")))
+        result["evidence"] = ranked
+        image_candidates = [item for item in ranked if item.get("kind") == "observation" and item.get("media_type") == "image" and item.get("asset_id") and item["relevance"] >= 0.42]
+        result["image_results"] = self._image_results(image_candidates[:3]) if plan.get("show_images") else []
+        result["evidence_presentation"] = {
+            "image_limit": 3 if plan.get("show_images") else 0,
+            "minimum_relevance": 0.42,
+            "shown_image_count": len(result["image_results"]),
+            "ranked_evidence_count": len(ranked),
+        }
+        result["evidence_layers"] = {
+            "answers": result.get("evidence_layers", {}).get("answers", []),
+            "people": [item for item in ranked if item["kind"] in {"person", "semantic_claim"}],
+            "events": [item for item in ranked if item["kind"] == "event"],
+            "claims": [item for item in ranked if item["kind"] in {"fact", "semantic_claim"}],
+            "appearance": [item for item in ranked if item["kind"] == "person_appearance"],
+            "observations": [item for item in ranked if item["kind"] == "observation"],
+            "assets": [{"kind": "asset", "id": item["asset_id"]} for item in ranked if item.get("asset_id")],
+            "gaps": result.get("evidence_layers", {}).get("gaps", []),
+        }
+        return result
+
+    @staticmethod
     def _query_date(query):
         value = str(query or "")
         match = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})", value)
@@ -873,6 +1017,9 @@ class MemoryAgent:
     def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None, selected_entity_id=None):
         conversation_id = conversation_id or f"conversation_{uuid.uuid4().hex[:12]}"
         intent = self.classify_intent(message, feedback)
+        previous = self._conversation_text(conversation_id)
+        turn_plan = self._plan_turn(message, previous, feedback)
+        persisted_state = self._dialogue_states.get(conversation_id) or self.store.get_dialogue_state(conversation_id, scope_id) or {}
         if intent == "feedback":
             feedback = feedback or {}
             gap_id = feedback.get("query_gap_id")
@@ -894,11 +1041,25 @@ class MemoryAgent:
                 "evidence": [], "image_results": [], "retrieval_trace": [{"stage": "feedback", "status": "complete", "counts": {"persisted": 1 if persisted else 0}}],
                 "model": "sentrix-feedback", "feedback": persisted,
             }
+            result["agent_plan"] = turn_plan
+            result["tool_trace"] = [{"tool": "plan_turn", "permission": "read", "status": "complete", "mode": turn_plan["mode"], "reason": turn_plan["reason"]}, {"tool": "record_feedback", "permission": "explicit_user_action", "status": "complete" if persisted else "requires_target"}]
             self._remember_turn(conversation_id, "user", message)
             self._remember_turn(conversation_id, "assistant", result["answer"])
             return result
-        previous = self._conversation_text(conversation_id)
-        prior_state = self._dialogue_states.get(conversation_id) or self.store.get_dialogue_state(conversation_id, scope_id) or {}
+        if turn_plan["mode"] == "chat" and not selected_entity_id and not ((previous or persisted_state.get("active_event_ids")) and self._is_contextual_follow_up(message)):
+            result = {
+                "intent": "chat", "conversation_id": conversation_id,
+                "answer": self._normal_chat_answer(message, previous, scope_id), "confidence": 1.0,
+                "insufficient_evidence": False, "evidence": [], "image_results": [],
+                "retrieval_trace": [{"stage": "agent_plan", "status": "chat", "counts": {"memory_tools": 0, "evidence": 0}}],
+                "evidence_layers": {"answers": [{"id": None, "text": "自然对话未引用家庭记忆"}], "people": [], "events": [], "claims": [], "appearance": [], "observations": [], "assets": [], "gaps": []},
+                "tool_trace": [{"tool": "plan_turn", "permission": "read", "status": "complete", "mode": "chat", "reason": turn_plan["reason"]}],
+                "agent_plan": turn_plan,
+            }
+            self._remember_turn(conversation_id, "user", message)
+            self._remember_turn(conversation_id, "assistant", result["answer"])
+            return result
+        prior_state = persisted_state
         query = str(message or "").strip()
         selected_entity = self.store.get_entity(selected_entity_id) if selected_entity_id else None
         if selected_entity and selected_entity.get("scope_id") != (scope_id or "home-default"):
@@ -938,7 +1099,8 @@ class MemoryAgent:
             dialogue_mode = "planned_query"
         result["intent"] = intent
         result["conversation_id"] = conversation_id
-        result["image_results"] = self._image_results(result.get("evidence", []))
+        focused_entity_ids = [item.get("person_id") for item in result.get("evidence", []) if item.get("person_id")]
+        result = self._rank_evidence_for_turn(query, result, turn_plan, focused_entity_ids)
         result["evidence_order"] = self._evidence_order(result.get("evidence", []))
         active_event_ids = list(dict.fromkeys(
             item.get("event_id") or item.get("id")
@@ -957,10 +1119,22 @@ class MemoryAgent:
         }
         self._dialogue_states[conversation_id] = dialogue_state
         self.store.save_dialogue_state(conversation_id, scope_id or "home-default", dialogue_state)
+        result["agent_plan"] = turn_plan
         result["dialogue_plan"] = {
             "mode": dialogue_mode, "style": self._dialogue_style(message, result),
             "layers": ["semantic", "episodic", "original_evidence"],
         }
+        execution = list(result.get("tool_trace", []))
+        existing = {item.get("tool"): item for item in execution}
+        for tool in turn_plan["tools"]:
+            if tool in existing:
+                continue
+            item = dict(existing.get(tool) or {"tool": tool, "permission": "read", "status": "complete"})
+            if tool == "open_evidence":
+                item["status"] = "complete" if result.get("image_results") or result.get("evidence") else "empty"
+                item["evidence_count"] = len(result.get("evidence", []))
+            execution.append(item)
+        result["tool_trace"] = [*execution, {"tool": "plan_turn", "permission": "read", "status": "complete", "mode": turn_plan["mode"], "reason": turn_plan["reason"], "planner": turn_plan["planner"]}]
         if result["dialogue_plan"]["style"] == "narrative":
             result = self._narrative_answer(message, result)
             result["evidence_layers"]["answers"] = [{"id": result.get("query"), "text": result.get("answer", "")}]
@@ -983,6 +1157,7 @@ class MemoryAgent:
             results.append({
                 "asset_id": asset_id, "observation_id": item.get("observation_id"),
                 "file_name": item.get("file_name"), "caption": item.get("caption"),
-                "captured_at": item.get("captured_at"), "media_url": f"/api/assets/{asset_id}/file",
+                "captured_at": item.get("captured_at"), "relevance": item.get("relevance", 0),
+                "media_url": f"/api/assets/{asset_id}/file",
             })
-        return results[:24]
+        return results[:3]

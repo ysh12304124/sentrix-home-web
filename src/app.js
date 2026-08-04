@@ -19,6 +19,7 @@
     assets: [],
     persons: [],
     entities: [],
+    entityGroups: [],
     knowledge: { profiles: [], claims: [] },
     clusters: [],
     relationships: [],
@@ -180,7 +181,7 @@
   function imageResults(result) {
     const images = result?.image_results || [];
     if (!images.length) return "";
-    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">原始图片</p><h3>${images.length} 张可回看的证据</h3></div></div><div class="image-result-grid">${images.map((item) => `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(item.file_name || "原始图片")}" loading="lazy" /><span><strong>${escapeHtml(item.file_name || item.asset_id)}</strong><small>${escapeHtml(item.captured_at || item.caption || "图片证据")}</small></span></button>`).join("")}</div></section>`;
+    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关原始图片</p><h3>${images.length} 张已通过相关度门槛的证据</h3></div></div><div class="image-result-grid">${images.map((item) => `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(item.file_name || "原始图片")}" loading="lazy" /><span><strong>${escapeHtml(item.file_name || item.asset_id)}</strong><small>问题相关度 ${Math.round((item.relevance || 0) * 100)}% · ${escapeHtml(item.captured_at || item.caption || "图片证据")}</small></span></button>`).join("")}</div></section>`;
   }
 
   function traceLabel(item) {
@@ -203,18 +204,19 @@
   function toolTrace(result) {
     const trace = result.toolTrace || result.tool_trace || [];
     if (!trace.length) return "";
-    return `<details class="algorithm-evidence"><summary>工具调用</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}</dd></div>`).join("")}</dl></div></details>`;
+    return `<details class="algorithm-evidence"><summary>本轮判断与工具</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}${item.reason ? ` · ${escapeHtml(item.reason)}` : ""}</dd></div>`).join("")}</dl></div></details>`;
   }
 
   function assistantEvidence(result) {
     const layers = result.evidence_layers || {};
-    const primary = [...(layers.events || []), ...(layers.observations || []), ...(layers.claims || [])];
+    const primary = [...(layers.events || []), ...(layers.observations || []), ...(layers.claims || [])].sort((left, right) => (right.relevance || 0) - (left.relevance || 0));
     const candidates = result.clarification_candidates || [];
-    const evidence = primary.length ? evidenceLayer("本次依据", primary) : "";
+    const evidence = primary.length ? evidenceLayer("本次依据（按相关度）", primary.slice(0, 6)) : "";
     const followups = candidates.length ? `<div class="assistant-followups"><p>你可以继续说明：</p>${candidates.map((item) => `<button data-action="continue-assistant" data-query="${escapeHtml(item.name)}" data-entity-id="${escapeHtml(item.id)}">${escapeHtml(item.name)} <small>${escapeHtml(item.entity_type)} · ${item.evidence_count || 0} 条证据</small></button>`).join("")}</div>` : "";
     const ordered = result.evidence_order || [];
     const order = ordered.length ? `<details class="algorithm-evidence"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
-    return `${followups}${imageResults(result)}${evidence}${order}${toolTrace(result)}${algorithmEvidence(result)}`;
+    const basis = result.intent === "chat" ? "" : `<details class="assistant-basis"><summary>查看这次回答的依据</summary><div class="assistant-basis-body">${imageResults(result)}${evidence}${order}${toolTrace(result)}${algorithmEvidence(result)}</div></details>`;
+    return `${followups}${basis}`;
   }
 
   function assistantMessage(message) {
@@ -222,15 +224,16 @@
     const result = message.result || {};
     const status = result.insufficient_evidence ? "需要补充线索" : `${Math.round((result.confidence || 0) * 100)}% 证据置信度`;
     const plan = result.dialogue_plan || {};
+    const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭记忆助手</span><small>${escapeHtml(status)} · ${escapeHtml(mode)}</small></div><div class="assistant-bubble"><p>${escapeHtml(result.answer || "当前没有可回答的本地证据。").replace(/\n/g, "<br />")}</p>${assistantEvidence(result)}</div></article>`;
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span><small>${escapeHtml(status)}</small></div><div class="assistant-bubble"><p>${escapeHtml(result.answer || "我在。") .replace(/\n/g, "<br />")}</p>${assistantEvidence(result)}</div></article>`;
   }
 
   function searchView() {
     const messages = state.assistantMessages;
-    const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">LOCAL MEMORY STEWARD</p><h2>家庭记忆助手</h2><p>我会根据当前相册中的语义、事件与原始资料回答。没有足够依据时，我会说明需要补充的线索。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(state.spaces.find((item) => item.id === state.scopeId)?.name || state.scopeId)}</strong></div></section>`;
+    const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(state.spaces.find((item) => item.id === state.scopeId)?.name || state.scopeId)}</strong></div></section>`;
     const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    return `${pageHeader("家庭记忆 / 对话", "家庭记忆助手", "一个中性的本地记忆管家。它只依据可回溯的家庭资料回答，不会主动推送或把推测当作事实。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>从一个人物、地点、时间或事件开始。</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭记忆助手</span></div><div class="assistant-bubble"><p>正在从本地事件和原始证据中查找。</p></div></article>` : ""}</section>${searchBar()}`;
+    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想一想，也在整理这段家庭记忆。</p></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
   }
 
   function timelineView() {
@@ -280,20 +283,21 @@
     const groups = [["place", "地点", "地点总结"], ["object", "物件", "物件记忆"], ["time", "时间", "时间坐标"], ["emotion", "情感氛围", "情绪与氛围"]];
     const personCards = people.map((person) => "<article class=\"entity-card\"><div class=\"entity-card-head\">" + faceAvatar(person.avatar_face_instance_id, person.display_name, "green") + "<span class=\"confirmed\">已确认</span></div><h2>" + escapeHtml(person.display_name) + "</h2><p>" + escapeHtml(person.profile?.summary_zh || person.summary || "正在从事件和证据形成画像。") + "</p><div class=\"entity-stats\"><span><strong>" + (person.event_memory || []).length + "</strong> 个事件</span><span><strong>" + claims.filter((claim) => claim.person_id === person.id).length + "</strong> 条当前声明</span></div><button class=\"button small ghost\" data-action=\"open-person-profile\" data-person-id=\"" + escapeHtml(person.id) + "\">查看画像和证据</button></article>").join("");
     const entitySection = ([type, label, description]) => {
-      const entities = state.entities.filter((entity) => entity.entity_type === type && entity.evidence_count > 0);
+      const entities = state.entityGroups.filter((entity) => entity.entity_type === type && entity.evidence_count > 0);
       const expanded = Boolean(state.expandedEntityTypes[type]);
       const visible = expanded ? entities : entities.slice(0, 6);
       const card = (entity) => {
         const preview = entity.preview_asset_id && entity.preview_media_type === "image"
           ? `<img class="entity-thumb" src="/api/assets/${encodeURIComponent(entity.preview_asset_id)}/file" alt="${escapeHtml(entity.preview_file_name || entity.canonical_name)}的证据缩略图" loading="lazy" />`
           : `<div class="entity-thumb fallback">${escapeHtml(entity.canonical_name.slice(0, 1))}</div>`;
-        return `<button class="entity-card entity-media-card" data-action="open-entity" data-entity-id="${escapeHtml(entity.id)}">${preview}<div class="entity-card-copy"><div class="entity-card-head"><span class="needs-label">证据 ${entity.evidence_count}</span></div><h2>${escapeHtml(entity.canonical_name)}</h2><p>${escapeHtml(entity.summary || "由本地观察维护")}</p><div class="entity-stats"><span><strong>${entity.relationship_count || 0}</strong> 条关系</span><span><strong>${Math.round((entity.confidence || 0) * 100)}%</strong> 置信度</span></div></div></button>`;
+        const labels = (entity.source_labels || []).slice(0, 4).join("、");
+        const members = (entity.members || []).length;
+        return `<button class="entity-card entity-media-card" data-action="open-entity-group" data-entity-group-id="${escapeHtml(entity.id)}">${preview}<div class="entity-card-copy"><div class="entity-card-head"><span class="needs-label">${members > 1 ? `${members} 个相似描述` : "单一描述"}</span><span class="needs-label">证据 ${entity.evidence_count}</span></div><h2>${escapeHtml(entity.canonical_name)}</h2><p>${escapeHtml(members > 1 ? `已按语义归并：${labels}` : labels || "由本地观察维护")}</p><div class="entity-stats"><span><strong>${entity.relationship_count || 0}</strong> 条关系</span><span><strong>${Math.round((entity.confidence || 0) * 100)}%</strong> 置信度</span></div></div></button>`;
       };
       return `<section class="content-section"><div class="section-head"><div><p class="section-kicker">${label}</p><h2>${description}</h2></div><span class="result-count">${entities.length} 项</span></div><div class="entity-grid entity-grid-collapsed">${entities.length ? visible.map(card).join("") : emptyState(`尚未形成${label}实体`, "等待带有可回溯观察证据的资料。")}</div>${entities.length > 6 ? `<div class="entity-expand"><button class="button small ghost" data-action="toggle-entity-type" data-entity-type="${type}">${expanded ? "收起" : `查看全部 ${entities.length} 项`}</button></div>` : ""}</section>`;
     };
     const tripCards = state.trips.map((trip) => `<article class="trip-candidate"><span class="needs-label">${escapeHtml(trip.status)}</span><h3>${escapeHtml(trip.name)}</h3><p>${escapeHtml(formatDate(trip.time_start))} 至 ${escapeHtml(formatDate(trip.time_end))}</p><small>${(trip.place_names_json || []).map(escapeHtml).join("、") || "地点待补充"} · ${(trip.event_ids_json || []).length} 个事件 · ${(trip.evidence_ids_json || []).length} 条证据</small>${trip.status === "pending" ? `<div class="person-actions"><button class="button small primary" data-action="confirm-trip" data-trip-id="${escapeHtml(trip.id)}">命名并确认</button><button class="button small ghost" data-action="reject-trip" data-trip-id="${escapeHtml(trip.id)}">不是行程</button></div>` : `<small>类型 · ${escapeHtml(trip.trip_type || "未分类")} · revision ${trip.revision || 1}</small>`}</article>`).join("");
-    const mergeCards = state.entityMergeCandidates.map((candidate) => `<article class="trip-candidate"><span class="needs-label">待审核</span><h3>${escapeHtml(candidate.suggested_name)}</h3><p>${escapeHtml(candidate.entity_type)} · ${escapeHtml((candidate.rationale?.source_labels || []).join("、"))}</p><small>${(candidate.evidence_ids || []).length} 条原始证据 · 置信度 ${Math.round((candidate.confidence || 0) * 100)}%</small><div class="person-actions"><button class="button small primary" data-action="review-entity-merge-candidate" data-candidate-id="${escapeHtml(candidate.id)}">查看并确认</button><button class="button small ghost" data-action="reject-entity-merge-candidate" data-candidate-id="${escapeHtml(candidate.id)}">不合并</button></div></article>`).join("");
-    return pageHeader("语义记忆 / 实体目录", "人物、地点与细节共同组成回忆。", "每个实体都来自本地 Observation，可打开查看关联事件、原图、置信度和算法证据。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>当前人物声明</span></article><article><strong>" + state.entities.length + "</strong><span>非人物实体</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>待维护事实</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物总结</p><h2>跨事件形成的熟人档案</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">语义归并候选</p><h2>相近描述，等待你的确认</h2></div><button class=\"button small ghost\" data-action=\"derive-entity-merge-candidates\">生成候选</button></div><div class=\"trip-grid\">" + (mergeCards || emptyState("暂无可审核候选", "只会在当前相册内比较地点、物件和情感；不会自动合并。")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">行程候选</p><h2>跨事件的长线回忆</h2></div><span class=\"result-count\">" + state.trips.length + " 项</span></div><div class=\"trip-grid\">" + (tripCards || emptyState("暂无行程候选", "只有跨日或跨地点的连续事件才会成为待确认行程。")) + "</div></section>" + groups.map(entitySection).join("");
+    return pageHeader("语义记忆 / 实体目录", "人物、地点与细节共同组成回忆。", "相近描述会自动归到同一语义实体组；成员实体、事件和照片始终保留为可追溯的组成部分。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>当前人物声明</span></article><article><strong>" + state.entityGroups.length + "</strong><span>语义实体组</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>待维护事实</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物总结</p><h2>跨事件形成的熟人档案</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">行程候选</p><h2>跨事件的长线回忆</h2></div><span class=\"result-count\">" + state.trips.length + " 项</span></div><div class=\"trip-grid\">" + (tripCards || emptyState("暂无行程候选", "只有跨日或跨地点的连续事件才会成为待确认行程。")) + "</div></section>" + groups.map(entitySection).join("");
   }
 
   function renderView() {
@@ -399,6 +403,12 @@
       const privateFlag = Boolean(properties.get("private_flag")?.value);
       const evidenceOptions = (detail.observations || []).map((observation) => `<label class="property-evidence-option"><input type="checkbox" name="evidence_ids" value="${escapeHtml(observation.id)}" />${escapeHtml(observation.asset?.file_name || observation.asset_id)}</label>`).join("");
       body = `<form id="modal-form"><div class="modal-kicker">PLACE PROPERTY EDIT</div><h2>修正地点属性</h2><p class="modal-lead">保存后以你的值为准；后续模型推断只会形成待审核版本，不能覆盖此设置。</p><label>自定义别名<input name="alias" value="${escapeHtml(alias)}" placeholder="例如：我们的老地方" /></label><label class="property-toggle"><input type="checkbox" name="private_flag" ${privateFlag ? "checked" : ""} />在普通页面和问答中隐藏精确地点</label><div class="property-evidence"><strong>支撑本次修正的原始证据（可选）</strong>${evidenceOptions || "<small>当前没有可选 Observation。</small>"}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="open-entity" data-entity-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存地点属性</button></div></form>`;
+    } else if (modal.type === "entity-group") {
+      const detail = modal.detail;
+      const group = detail.group || {};
+      const memberRows = (group.members || []).map((member) => `<button class="fact-review-row" data-action="open-entity" data-entity-id="${escapeHtml(member.id)}"><div><strong>${escapeHtml(member.canonical_name)}</strong><small>${escapeHtml(member.entity_type)} · ${member.evidence_count || 0} 条原始证据 · ${Math.round((member.confidence || 0) * 100)}%</small></div></button>`).join("");
+      const evidenceRows = (detail.observations || []).slice(0, 12).map((observation) => `<button class="evidence-main entity-observation" data-action="open-asset" data-asset-id="${escapeHtml(observation.asset_id)}"><strong>${escapeHtml(observation.asset?.file_name || observation.asset_id)}</strong><p>${escapeHtml(observation.caption || observation.transcript || "原始观察证据")}</p><small>${escapeHtml(formatDateTime(observation.captured_at))} · 置信度 ${Math.round((observation.confidence || 0) * 100)}%</small></button>`).join("");
+      body = `<div class="modal-kicker">SEMANTIC ENTITY GROUP</div><div class="profile-heading"><div><h2>${escapeHtml(group.canonical_name || "语义实体组")}</h2><p class="modal-lead">相近描述按语义归并为一个浏览与召回入口。成员实体、原始事件和照片没有被合并或删除。</p></div></div><div class="detail-facts"><span>相似描述 · ${(group.members || []).length}</span><span>原始证据 · ${group.evidence_count || 0}</span><span>关联事件 · ${(detail.events || []).length}</span><span>最高置信度 · ${Math.round((group.confidence || 0) * 100)}%</span></div><div class="section-head"><div><p class="section-kicker">组内描述</p><h3>保留独立实体与修订历史</h3></div></div><div class="fact-review-list">${memberRows}</div><div class="section-head"><div><p class="section-kicker">原始证据</p><h3>按成员汇总的可查看资料</h3></div></div><div class="evidence-list">${evidenceRows || emptyState("暂无原始证据", "该组尚未关联可查看的 Observation。")}</div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
     } else if (modal.type === "story-create" || modal.type === "story-edit") {
       const story = modal.story || {};
       body = `<form id="modal-form"><div class="modal-kicker">STORY ${modal.type === "story-create" ? "DRAFT" : "EDITOR"}</div><h2>${modal.type === "story-create" ? "创建故事草稿" : "编辑故事"}</h2><label>标题<input name="title" value="${escapeHtml(story.title || "")}" required /></label><label>故事内容<textarea name="content" rows="5">${escapeHtml(story.content || "")}</textarea></label><div class="story-event-select"><strong>选择事件证据</strong>${state.events.map((event) => `<label><input type="checkbox" name="event_ids" value="${escapeHtml(event.id)}" ${(story.event_ids || []).includes(event.id) ? "checked" : ""} />${escapeHtml(event.title)}</label>`).join("") || `<small>当前没有事件，请先导入资料。</small>`}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">保存故事</button></div></form>`;
@@ -467,7 +477,7 @@
     }
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
-          window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId),
+          window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId), window.sentrixApi.entityGroups(scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -481,6 +491,7 @@
         state.knowledge = calls[9].status === "fulfilled" ? calls[9].value : { profiles: [], claims: [] };
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
         state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
+        state.entityGroups = calls[12].status === "fulfilled" ? calls[12].value.groups || [] : [];
     const failed = calls.find((call) => call.status === "rejected");
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
@@ -560,6 +571,11 @@
     try { const detail = await window.sentrixApi.entity(entityId); openModal({ type: "entity", detail }); } catch { state.toast = "无法读取实体记忆"; state.modal = null; renderShellNavigation(); }
   }
 
+  async function openEntityGroup(groupId) {
+    openModal({ type: "loading" });
+    try { const detail = await window.sentrixApi.entityGroup(groupId, state.scopeId); openModal({ type: "entity-group", detail }); } catch { state.toast = "无法读取语义实体组"; state.modal = null; renderShellNavigation(); }
+  }
+
   async function handleModalSubmit(event) {
     event.preventDefault();
     if (state.saving) return;
@@ -631,6 +647,7 @@
     if (action === "edit-event") return openEvent(element.dataset.eventId, true);
     if (action === "open-asset") return openAsset(element.dataset.assetId);
     if (action === "open-entity") return openEntity(element.dataset.entityId);
+    if (action === "open-entity-group") return openEntityGroup(element.dataset.entityGroupId);
     if (action === "edit-entity-properties") return openModal({ type: "entity-property-edit", detail: state.modal.detail });
     if (action === "open-observation") { const observation = await window.sentrixApi.observation(element.dataset.observationId); return openAsset(observation.asset_id); }
     if (action === "create-event") return openModal({ type: "event-create", event: {} });
