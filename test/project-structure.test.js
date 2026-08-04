@@ -176,3 +176,11 @@ test("semantic directory is semantic-first and evidence-backed", () => {
   assert.match(source, /technical-evidence/);
   assert.match(source, /data-action="open-asset"/);
 });
+
+test("default evidence tiles do not expose filenames or internal identifiers", () => {
+  const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  const imageResults = source.slice(source.indexOf("function imageResults"), source.indexOf("function traceLabel"));
+  assert.doesNotMatch(imageResults, /item\.file_name/);
+  assert.match(source, /技术信息/);
+  assert.match(source, /technical-evidence/);
+});

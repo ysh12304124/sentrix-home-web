@@ -51,6 +51,24 @@ class SemanticTaxonomyTests(unittest.TestCase):
         self.assertEqual(result["raw_labels"]["place"], "")
         self.assertIn("某个神秘地点", result["raw_labels"]["semantic_place"])
 
+    def test_legacy_object_labels_are_projected_to_primary_and_details(self):
+        result = normalize_semantic_analysis({
+            "place": "室内厨房",
+            "scene_type": "餐饮空间",
+            "objects": ["芒果蛋糕", "手机"],
+            "emotions": ["平静"],
+        })
+
+        self.assertEqual(result["semantic"]["place"]["details"], ["室内", "厨房"])
+        self.assertEqual(
+            result["semantic"]["objects"],
+            [
+                {"primary": "食品与饮品", "label": "芒果蛋糕", "details": ["蛋糕", "水果"]},
+                {"primary": "电子设备", "label": "手机", "details": ["手机"]},
+            ],
+        )
+        self.assertEqual(result["semantic"]["atmosphere"]["labels"], ["平静"])
+
 
 if __name__ == "__main__":
     unittest.main()

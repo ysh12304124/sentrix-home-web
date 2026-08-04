@@ -376,6 +376,20 @@ class NativeEntityMemoryTests(unittest.TestCase):
         cover_revision = next(item for item in detail["event_revisions"] if item["field_name"] == "cover_asset_id")
         self.assertEqual(cover_revision["new_value"], "a2")
 
+    def test_event_merge_rehomes_all_foreign_key_projections_before_delete(self):
+        target = self.store.create_event({"id": "merge-target", "title": "目标事件"})
+        source = self.store.create_event({"id": "merge-source", "title": "来源事件"})
+        entity = self.store.create_entity("餐饮空间", "place", confidence=0.8)
+        self.store.upsert_event_entity(source["id"], entity["id"], "地点", [self.obs1["id"]], 0.8)
+        self.store.update_event(source["id"], {"summary": "来源修订"})
+
+        merged = self.store._merge_events(target["id"], source["id"])
+
+        self.assertEqual(merged["id"], target["id"])
+        self.assertIsNone(self.store.get_event(source["id"]))
+        self.assertTrue(any(item["canonical_name"] == "餐饮空间" for item in self.store.list_event_entities(target["id"])))
+        self.assertFalse(self.store._rows("SELECT 1 FROM event_revisions WHERE event_id = ?", (source["id"],)))
+
     def test_event_cover_must_be_evidence_asset_from_that_event(self):
         event = self.store.create_event({"id": "editable_event", "title": "待修正事件"})
         self.store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], self.obs1["id"]))
@@ -626,6 +640,19 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(properties["atmosphere_label"]["value"], "温馨")
         self.assertEqual(properties["semantic_details"]["value"], ["暖色光线"])
         self.assertEqual(properties["semantic_details"]["evidence_ids"], [self.obs1["id"]])
+
+    def test_legacy_emotion_is_exposed_as_atmosphere_group(self):
+        legacy = self.store.create_entity("平静", "emotion", confidence=0.6)
+        self.store.connection.execute(
+            "INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at) VALUES (?, ?, ?, ?, ?)",
+            (legacy["id"], self.obs1["id"], 0.6, "observation_extraction", "2026-08-03T00:00:00+00:00"),
+        )
+        self.store.connection.commit()
+
+        groups = self.store.list_semantic_entity_groups("home-default")
+
+        self.assertTrue(any(group["entity_type"] == "atmosphere" and group["canonical_name"] == "平静" for group in groups))
+        self.assertFalse(any(group["entity_type"] == "emotion" for group in groups))
 
     def test_reindex_migrates_legacy_raw_mood_entity_to_normalized_entity(self):
         legacy = self.store.create_entity("面带微笑", "emotion", confidence=0.7)

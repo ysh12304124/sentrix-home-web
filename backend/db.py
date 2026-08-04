@@ -2510,7 +2510,11 @@ class MemoryStore:
             object_names = [str(item).strip() for item in (observation.get("objects") or []) if str(item).strip()]
         atmosphere_names = [str(item).strip() for item in (semantic_atmosphere.get("labels") or []) if str(item).strip()]
         if not atmosphere_names:
-            atmosphere_names = [normalize_mood(value) for value in (extracted.get("emotions") or raw.get("emotions") or []) if normalize_mood(value)]
+            atmosphere_names = [
+                normalize_mood(value)
+                for value in (extracted.get("emotions") or raw.get("emotions") or [])
+                if normalize_mood(value) in ATMOSPHERE_PRIMARY_TYPES
+            ]
         raw_atmosphere_labels = [
             str(item).strip() for item in (normalized.get("raw_labels") or {}).get("atmosphere", []) if str(item).strip()
         ]
@@ -2682,21 +2686,17 @@ class MemoryStore:
         retired_count = 0
         for legacy in legacy_entities:
             normalized_name = normalize_mood(legacy["canonical_name"])
-            if normalized_name == legacy["canonical_name"]:
-                continue
             if self._row("SELECT 1 FROM entity_properties WHERE entity_id = ? AND source = 'user' LIMIT 1", (legacy["id"],)):
-                continue
-            if not normalized_name:
-                self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (legacy["id"],))
-                self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
-                self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (legacy["id"], legacy["id"]))
-                self.connection.execute("UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ?", ("原始模型标签未进入受控情感词表，保留在观察证据中", now_iso(), legacy["id"]))
-                self.connection.commit()
-                retired_count += 1
                 continue
             atmosphere_name = ATMOSPHERE_PRIMARY_ALIASES.get(normalized_name, normalized_name)
             if atmosphere_name not in ATMOSPHERE_PRIMARY_TYPES:
-                atmosphere_name = OTHER
+                self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (legacy["id"],))
+                self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+                self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (legacy["id"], legacy["id"]))
+                self.connection.execute("UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ?", ("原始模型标签未进入受控氛围词表，保留在观察证据中", now_iso(), legacy["id"]))
+                self.connection.commit()
+                retired_count += 1
+                continue
             target = self._find_or_create_entity(
                 atmosphere_name, "atmosphere", legacy.get("scope_id"), legacy.get("confidence", 0), "由图片观察到的画面氛围",
             )
@@ -2847,10 +2847,11 @@ class MemoryStore:
         """
         grouped = {}
         for entity in self.list_entities(scope_id=scope_id, public=False):
-            entity_type = entity.get("entity_type")
-            if entity_type == "person" or entity.get("status") in {"rejected", "superseded"}:
+            source_entity_type = entity.get("entity_type")
+            entity_type = "atmosphere" if source_entity_type == "emotion" else source_entity_type
+            if source_entity_type == "person" or entity.get("status") in {"rejected", "superseded"}:
                 continue
-            label, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"), entity)
+            label, rationale = self._semantic_entity_key(source_entity_type, entity.get("canonical_name"), entity)
             key = (entity.get("scope_id") or "home-default", entity_type, label)
             group = grouped.setdefault(key, {
                 "id": "semantic_group:" + ":".join((entity.get("scope_id") or "home-default", entity_type, label)),
@@ -3838,8 +3839,23 @@ class MemoryStore:
             vector_metadata = json.loads(vector["metadata_json"] or "{}") if vector else {}
             vector_metadata["event_id"] = target_event_id
             self.connection.execute("UPDATE memory_vectors SET metadata_json = ?, updated_at = ? WHERE source_type = 'observation' AND source_id = ?", (json_value(vector_metadata, {}), now_iso(), observation_id))
+        # Re-home every event-backed projection before deleting the source.
+        # SQLite correctly rejects deleting an event that still has audit,
+        # entity, participant-memory, or feedback rows pointing at it.
+        for entity_row in self._rows("SELECT entity_id, relation, evidence_ids_json, confidence FROM event_entities WHERE event_id = ?", (source_event_id,)):
+            self.upsert_event_entity(
+                target_event_id,
+                entity_row["entity_id"],
+                entity_row["relation"],
+                json.loads(entity_row["evidence_ids_json"] or "[]"),
+                entity_row["confidence"],
+            )
         self.connection.execute("DELETE FROM event_observations WHERE event_id = ?", (source_event_id,))
         self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("DELETE FROM event_entities WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("UPDATE event_revisions SET event_id = ? WHERE event_id = ?", (target_event_id, source_event_id))
+        self.connection.execute("DELETE FROM person_event_memory WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("UPDATE memory_feedback SET target_event_id = ? WHERE target_event_id = ?", (target_event_id, source_event_id))
         self.connection.execute("DELETE FROM memory_vectors WHERE source_type = 'event' AND source_id = ?", (source_event_id,))
         self.connection.execute("DELETE FROM events WHERE id = ?", (source_event_id,))
         self.connection.commit()
