@@ -207,6 +207,43 @@
     return `<details class="algorithm-evidence"><summary>本轮判断与工具</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}${item.reason ? ` · ${escapeHtml(item.reason)}` : ""}</dd></div>`).join("")}</dl></div></details>`;
   }
 
+  function assistantAnswer(result) {
+    const segments = result.segments || [{ type: "text", text: result.answer || "" }];
+    return segments.map((segment) => {
+      const text = escapeHtml(segment.text || "").replace(/\n/g, "<br />");
+      if (segment.type !== "claim") return text;
+      return `<span class="assistant-claim assistant-claim-${escapeHtml(segment.status || "unverified")}" data-claim-id="${escapeHtml(segment.claim_id || "")}">${text}</span>`;
+    }).join("");
+  }
+
+  function claimEvidence(result) {
+    const claims = result.claims || [];
+    const index = result.claim_evidence_index || result.claimEvidenceIndex || {};
+    const evidenceById = new Map((result.evidence || []).map((item) => [item.id, item]));
+    const bundles = new Map((result.evidence_bundles || result.evidenceBundles || []).map((item) => [item.claim_id, item]));
+    if (!claims.length) return "";
+    const rows = claims.map((claim) => {
+      const link = index[claim.claim_id] || {};
+      const bundle = bundles.get(claim.claim_id) || {};
+      const evidence = (link.evidence_ids || []).map((id) => {
+        const original = evidenceById.get(id);
+        if (original) return original;
+        const canonical = (bundle.canonical_evidence || []).find((item) => item.evidence_id === id);
+        if (!canonical) return null;
+        return { id, kind: canonical.type, event_id: canonical.type === "event" ? id : undefined, observation_id: canonical.type === "observation" ? id : undefined, asset_id: canonical.asset_id, summary: canonical.source_text, caption: canonical.source_text, time_start: canonical.time };
+      }).filter(Boolean);
+      const verification = (result.claim_verifications || result.claimVerifications || []).find((item) => item.claim_id === claim.claim_id) || {};
+      return `<article class="claim-evidence-row" data-claim-id="${escapeHtml(claim.claim_id)}"><div class="claim-evidence-head"><strong>${escapeHtml(claim.text || "")}</strong><small>${escapeHtml(verification.status || link.status || "未校验")}</small></div>${evidence.length ? `<div class="claim-evidence-list">${evidence.slice(0, 8).map(evidenceCard).join("")}</div>` : `<p class="claim-evidence-empty">这条表述没有绑定到可展示的依据。</p>`}</article>`;
+    }).join("");
+    return `<details class="claim-evidence"><summary>逐句查看依据</summary><div class="claim-evidence-body">${rows}</div></details>`;
+  }
+
+  function proactiveRecall(result) {
+    const recall = result.proactive_recall;
+    if (!recall || !result.proactivity_candidate_found) return "";
+    return `<section class="proactive-recall"><p>${escapeHtml(recall.entry_text || "我想到一段相关回忆。")}</p><div class="proactive-actions"><button class="text-button" data-action="accept-proactive" data-scene-key="${escapeHtml(recall.scene_key)}">看看这段回忆 ${icon("→")}</button><button class="text-button" data-action="dismiss-proactive" data-scene-key="${escapeHtml(recall.scene_key)}">暂不查看</button><button class="text-button muted" data-action="disable-proactive" data-scene-key="${escapeHtml(recall.scene_key)}">关闭主动回忆</button></div></section>`;
+  }
+
   function assistantEvidence(result) {
     const layers = result.evidence_layers || {};
     const presentation = result.evidence_presentation || {};
@@ -222,8 +259,8 @@
     const requiresEvidence = result.intent !== "chat" && result.memory_used !== false && presentation.required !== false;
     const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
     const optionalImages = directEvidence ? "" : imageResults(result);
-    const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看这次回答的依据</summary><div class="assistant-basis-body">${optionalImages}${evidence}${gapContent}${order}${toolTrace(result)}${algorithmEvidence(result)}</div></details>` : "";
-    return `${followups}${directOriginal}${basis}`;
+    const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看这次回答的依据</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${toolTrace(result)}${algorithmEvidence(result)}</div></details>` : "";
+    return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
 
   function assistantMessage(message) {
@@ -233,7 +270,7 @@
     const plan = result.dialogue_plan || {};
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span><small>${escapeHtml(status)}</small></div><div class="assistant-bubble"><p>${escapeHtml(result.answer || "我在。") .replace(/\n/g, "<br />")}</p>${assistantEvidence(result)}</div></article>`;
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span><small>${escapeHtml(status)}</small></div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${assistantEvidence(result)}</div></article>`;
   }
 
   function searchView() {
@@ -564,20 +601,35 @@
     renderShellNavigation();
   }
 
+  async function submitProactiveOutcome(element, outcome) {
+    const sceneKey = element.dataset.sceneKey || "";
+    const message = outcome === "accepted" ? "看看这段回忆" : "好的";
+    state.assistantMessages.push({ role: "user", text: message });
+    state.searchLoading = true;
+    renderShellNavigation();
+    try {
+      const result = await window.sentrixApi.assistantTurn(
+        message, state.conversationId,
+        { proactivity_outcome: outcome, proactivity_scene_key: sceneKey },
+        state.scopeId, "", "owner",
+      );
+      state.searchResult = result;
+      state.conversationId = result.conversation_id || state.conversationId;
+      state.assistantMessages.push({ role: "steward", result });
+    } catch (error) {
+      state.toast = `主动回忆状态未更新：${error.message}`;
+    }
+    state.searchLoading = false;
+    renderShellNavigation();
+  }
+
   async function handleFiles(event) {
     const files = Array.from(event.target.files || []);
-    const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    let completionFailed = false;
-    try {
-      for (const file of files) {
-        state.queue.unshift({ fileName: file.name, status: "uploading" });
-        try { const result = await window.sentrixApi.importAsset(file, undefined, batchId); state.queue[0].assetId = result.assetId; state.queue[0].status = result.status; } catch { state.queue[0].status = "failed"; }
-      }
-      if (files.length) await window.sentrixApi.completeImportBatch(batchId);
-    } catch {
-      completionFailed = true;
+    for (const file of files) {
+      state.queue.unshift({ fileName: file.name, status: "uploading" });
+      try { const result = await window.sentrixApi.importAsset(file); state.queue[0].assetId = result.assetId; state.queue[0].status = result.status; } catch { state.queue[0].status = "failed"; }
     }
-    state.toast = completionFailed ? "批次完成信号提交失败，请稍后刷新状态" : `${files.length} 个资料已进入本地处理队列`;
+    state.toast = `${files.length} 个资料已进入本地处理队列`;
     await refreshData();
     state.view = "imports";
     renderShellNavigation();
@@ -705,6 +757,9 @@
     if (action === "toggle-sort") { state.assetSort = state.assetSort === "newest" ? "oldest" : "newest"; renderView(); return; }
     if (action === "toggle-entity-type") { const type = element.dataset.entityType; state.expandedEntityTypes[type] = !state.expandedEntityTypes[type]; renderView(); return; }
     if (action === "continue-assistant") { state.query = element.dataset.query || ""; return submitSearch(null, element.dataset.entityId || ""); }
+    if (action === "accept-proactive") return submitProactiveOutcome(element, "accepted");
+    if (action === "dismiss-proactive") return submitProactiveOutcome(element, "dismissed");
+    if (action === "disable-proactive") return submitProactiveOutcome(element, "disabled");
     if (action === "derive-entity-merge-candidates") { await window.sentrixApi.deriveEntityMergeCandidates(state.scopeId); state.toast = "已生成待审核的语义归并候选，实体尚未合并"; return refreshData(); }
     if (action === "review-entity-merge-candidate") { const candidate = state.entityMergeCandidates.find((item) => item.id === element.dataset.candidateId); return candidate && openModal({ type: "entity-merge-confirm", candidate }); }
     if (action === "reject-entity-merge-candidate") { await window.sentrixApi.rejectEntityMergeCandidate(element.dataset.candidateId); state.toast = "已保留原有实体，不会再次显示同一归并候选"; return refreshData(); }

@@ -51,7 +51,7 @@
     createRelationship: (payload) => request("/api/relationships", { method: "POST", body: JSON.stringify(payload) }),
     confirmRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/confirm`, { method: "POST" }),
     confirmPerson: (id, name, familyRole = "") => request(`/api/persons/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify({ name, family_role: familyRole }) }),
-    assistantTurn: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null }) }),
+    assistantTurn: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, viewer_id: viewerId || "owner" }) }),
     rejectPerson: (id) => request(`/api/persons/${encodeURIComponent(id)}/reject`, { method: "POST" }),
     stories: () => request("/api/stories"),
     createStory: (payload) => request("/api/stories", { method: "POST", body: JSON.stringify(payload) }),
@@ -63,13 +63,11 @@
     search: (query) => request("/api/search", { method: "POST", body: JSON.stringify({ query }) }),
     queryGaps: () => request("/api/query-gaps"),
     queryGapFeedback: (id, payload) => request("/api/query-gaps/" + encodeURIComponent(id) + "/feedback", { method: "POST", body: JSON.stringify(payload) }),
-    importAsset: (file, mediaType, batchId) => {
+    importAsset: (file, mediaType) => {
       if (typeof file === "string") return request("/api/import", { method: "POST", body: JSON.stringify({ fileName: file, mediaType }) });
       const form = new FormData();
       form.append("file", file, file.name);
-      if (batchId) form.append("batchId", batchId);
       return request("/api/ingest", { method: "POST", body: form });
     },
-    completeImportBatch: (batchId) => request(`/api/ingest-batches/${encodeURIComponent(batchId)}/complete`, { method: "POST" }),
   };
 })();

@@ -12,6 +12,56 @@
 
 Python `unittest`、FastAPI 现有 assistant 路由、Node test runner、原生浏览器 JavaScript。正式后端提交只在 153 `psh`。
 
+## 执行拆解与检查点
+
+任务按 `C0 → B → A → C1 → D` 推进；每个任务必须先有失败测试或可复现基线，再实现、验证，并在 153 `psh` 复跑。以下台账是本计划的交付门，不是实现建议。
+
+### C0：真实旧记忆前置基线
+
+- [x] 只读复制旧备份，确认已确认人物、semantic claims、person patterns、事件、观察、资产和三条人物证据链均可读取。
+- [x] 固化 `scripts/benchmarks/evaluate_agent_replay.py`，缺表、缺列、无已确认人物时阻断回放。
+- [x] 检查点：原始数据库字节不变化；“明哥”已确认且不是 pending cluster；报告可 JSON 序列化。
+
+### B0：Agent-owned Annotation Store
+
+- [x] 增加版本迁移、checksum、单事务初始化、关闭开关、幂等 assertion、orphaned 引用、preference 和 cooldown upsert。
+- [x] 检查点：只新增 Agent 表，不写 canonical 表；迁移失败不阻断 Memory Kernel；`test_agent_annotations.py` 全部通过。
+
+### B1：内部契约与读取强度
+
+- [x] 独立 `ClaimExtractor` 扫描完整回答和 follow-up；Writer claim 仅为候选。
+- [x] 建立 `NarrativeContextPacket`、`Canonical Evidence Bundle`、逐 claim `ClaimVerification`、一次局部 Repair 和 fallback。
+- [x] 固化 `none / probe / ambient / targeted / forensic` 关系；普通聊天不注入家庭事实。
+- [x] 检查点：模型不能降级 memory 计划、不能引入未知工具、Scene narrative 不能单独证明事实。
+
+### A1-A2：自然叙事、Scene 与 Focus Stack
+
+- [x] 人物介绍通过 Context Packet 归纳身份、关系、重复活动、外观和未知边界；已确认人物不退化为 cluster 澄清。
+- [x] Scene 使用时间范围、观察、资产、参与者、source revision 和 confidence，并限制 12 observations、6 assets、8 participants。
+- [x] Focus Stack 限制人物/Event/topic 数量，每轮衰减 `0.75`，低于 `0.2` 删除，切换 scope 清空。
+- [x] 检查点：真实“明哥”人物介绍不再只是事件列表；Writer、Extractor、Verifier、Repairer 路径有单测。
+
+### A3：API 与 claim-level evidence
+
+- [x] API 稳定返回 `claims`、`claim_verifications`、`claim_verification_status`、`repair_count`、`evidence_bundles`、`claim_evidence_index` 和 `segments`，保留旧字段。
+- [x] 前端用 `segments + claim_id` 渲染，不使用跨 Python/JavaScript 的 offset；依据区默认折叠，逐句映射到 Event/Observation/Asset。
+- [x] 明确原始证据请求直接展示媒体；普通聊天不展示记忆证据区。
+- [x] 检查点：Python Agent/API、Node、`node --check`、`compileall`、`git diff --check` 通过。
+
+### C1：真实问题集与回放
+
+- [x] 固化人物介绍、衣着、性格边界、关系边界、偏好边界、追问、原始照片、角色歧义、无证据和 scope 切换问题集。
+- [x] `evaluate_agent_c1.py` 每次复制数据库，记录回答、claims、evidence bundles、逐 claim verification、repair 次数、图片数量和耗时；关键 deterministic 基线重复 3 次。
+- [x] 检查点：153 旧备份 `3 repeats × 10 cases`，`failures = 0`；人物维度问题不再被路由为闲聊或无关事件列表。
+- [ ] 实际 Gamma Writer 的 3 次自然回答回放仍需在可接受的模型运行配置下完成；当前 12B 本机单次调用过慢，未将未完成结果计入通过。
+
+### D：适度主动回忆
+
+- [x] `SENTRIX_PROACTIVE_MEMORY` 默认关闭；开启后普通聊天只读轻量 Event index，返回 `probe`，不读取具体 Observation/Asset。
+- [x] 实现硬敏感门、viewer 级开关、归一化主动评分、单入口、Scene cooldown、重复惩罚、连续忽略降级和接受后具体证据回放。
+- [x] 反馈通过 Agent-owned Annotation Store 持久化，不修改 canonical facts；前端支持查看、暂不查看和关闭主动回忆。
+- [x] 检查点：fixture 覆盖 flag、probe、敏感内容、cooldown、ignore streak、acceptance、viewer 隔离；D 默认关闭，未通过独立灰度前不对生产用户主动开放。
+
 ## B：Agent 核心契约
 
 1. 在 `backend/tests/test_agent.py` 增加失败测试：记忆回答必须返回 `memory_used`、非空证据或明确 `query_gap`。

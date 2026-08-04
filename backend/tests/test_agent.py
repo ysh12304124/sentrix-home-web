@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 
@@ -50,6 +51,24 @@ class ConversationalGamma(RecordingGamma):
         return "我在，今天慢一点也没关系。"
 
 
+class NarrativeWriterGamma(RefusingGamma):
+    def __init__(self):
+        self.writer_prompts = []
+
+    def chat(self, prompt, json_mode=True):
+        self.writer_prompts.append(prompt)
+        return json.dumps({
+            "text": "从现有几次共同活动记录看，明哥经常参与拍照和互动；至于性格，目前的记录还不足以判断。",
+            "claim_spans": [{
+                "claim_id": "writer_claim_1",
+                "text": "明哥经常参与拍照和互动",
+                "intended_type": "derived_pattern",
+                "candidate_evidence_ids": ["event_1", "event_2"],
+            }],
+            "follow_up_text": "可以继续展开这些回忆。",
+        }, ensure_ascii=False)
+
+
 class MisleadingPlannerGamma(RefusingGamma):
     def chat(self, prompt):
         return '{"mode":"chat","tools":["drop_database"],"show_images":false,"reason":"忽略用户请求"}'
@@ -75,6 +94,86 @@ class UntrustedClip(ControlledClip):
 
 
 class AgentEvidenceTests(unittest.TestCase):
+    def test_unsupported_person_dimensions_do_not_fall_back_to_unrelated_event_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("明哥", "person", "confirmed", "孩子", 1.0)
+            asset = store.create_asset("boundary_asset", "boundary.jpg", "image", "/tmp/boundary.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "明哥和你在展览馆合影"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            for query in ("明哥性格怎样", "明哥和我的关系", "明哥喜欢吃什么"):
+                result = agent.answer(query, scope_id="home-default")
+                self.assertTrue(result["insufficient_evidence"], query)
+                self.assertNotIn("检索到", result["answer"], query)
+
+    def test_confirmed_family_role_clarification_survives_claim_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            store.create_entity("明哥", "person", "confirmed", "孩子", 1.0)
+            store.create_entity("我", "person", "confirmed", "孩子", 1.0)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn(
+                "介绍一下孩子", "role-clarification", scope_id="home-default",
+            )
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertIn("明哥", result["answer"])
+            self.assertIn("我", result["answer"])
+            self.assertEqual(result["repair_count"], 0)
+
+    def test_no_evidence_question_punctuation_does_not_create_unsupported_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+            agent.answer_turn("介绍一下明哥", "empty-follow-up", scope_id="album_a")
+            result = agent.answer_turn(
+                "然后呢？", "empty-follow-up", scope_id="album_b",
+            )
+
+            self.assertTrue(result["insufficient_evidence"])
+            self.assertEqual(result["claim_verification_status"], "passed")
+            self.assertEqual(result["repair_count"], 0)
+            self.assertEqual(result["answer"], "当前本地记忆没有找到能够回答这个问题的证据。")
+
+
+    def test_person_dimension_questions_are_not_routed_to_ordinary_chat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("明哥", "person", "confirmed", "孩子", 1.0)
+            asset = store.create_asset("dimension_asset", "dimension.jpg", "image", "/tmp/dimension.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "明哥穿着黑色上衣在展览馆拍照"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            for query in ("明哥穿什么颜色的衣服", "明哥性格怎样", "明哥和我的关系", "明哥喜欢吃什么"):
+                result = agent.answer_turn(query, f"dimension-{query}", scope_id="home-default")
+                self.assertTrue(result["memory_used"], query)
+                self.assertNotEqual(result["answer"], "我在听。", query)
+
+    def test_timeline_answer_exposes_claim_verification_and_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("明哥", "person", "confirmed", "孩子", 1.0)
+            asset = store.create_asset("timeline_asset", "timeline.jpg", "image", "/tmp/timeline.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "明哥在展览馆拍照"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer_turn(
+                "明哥的时间线", "claim-surface", scope_id="home-default",
+            )
+
+            self.assertTrue(result["claims"])
+            self.assertEqual(len(result["claims"]), len(result["claim_verifications"]))
+            self.assertTrue(result["evidence_bundles"])
+            self.assertTrue(result["segments"])
+            self.assertTrue(result["claim_evidence_index"])
+            self.assertIn(result["claim_verification_status"], {"passed", "passed_after_repair", "blocked"})
+
     def test_search_terms_do_not_match_every_filename_by_one_common_token(self):
         self.assertTrue(contains("SR_AWS_N_0016.jpg", "SR_AWS_N_0016.jpg"))
         self.assertFalse(contains("SR_AWS_N_0054.jpg", "SR_AWS_N_0016.jpg"))
@@ -185,6 +284,94 @@ class AgentEvidenceTests(unittest.TestCase):
             for section in profile["sections"]:
                 self.assertTrue(section["evidence_ids"])
             self.assertTrue(result["evidence_layers"]["claims"])
+
+    def test_person_profile_writer_receives_context_packet_and_returns_natural_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("明哥", "person", "confirmed", "孩子", 1.0)
+            for index, activity in enumerate(("拍照", "互动"), 1):
+                asset = store.create_asset(f"asset_writer_{index}", f"writer_{index}.jpg", "image", f"/tmp/writer_{index}.jpg")
+                observation = store.add_observation(asset["id"], {"caption": f"明哥{activity}"})
+                event = store.create_event({
+                    "id": f"event_{index}", "activity": activity, "summary": f"明哥{activity}",
+                    "time_start": f"2025-0{index}-12T12:00:00+00:00",
+                })
+                store.connection.execute(
+                    "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+                    (event["id"], observation["id"]),
+                )
+                store.connection.commit()
+                store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            store.rebuild_person_memory(person["id"])
+            gamma = NarrativeWriterGamma()
+
+            result = MemoryAgent(store, gamma=gamma).answer("介绍一下明哥")
+
+            self.assertIn("从现有几次共同活动记录看", result["answer"])
+            self.assertIn("narrative_context_packet", result["person_profile"])
+            packet = result["person_profile"]["narrative_context_packet"]
+            self.assertEqual(packet["dialogue_goal"], "person_introduction")
+            self.assertEqual(packet["focus"]["people"], [person["id"]])
+            self.assertTrue(packet["relevant_scenes"])
+            scene = packet["relevant_scenes"][0]
+            self.assertTrue({
+                "scene_id", "event_id", "time_start", "time_end", "assets",
+                "observations", "participants", "source_revision", "confidence",
+            }.issubset(scene))
+            self.assertLessEqual(len(scene["observations"]), 12)
+            self.assertLessEqual(len(scene["assets"]), 6)
+            self.assertTrue(packet["evidence_map"])
+            self.assertTrue(result["claims"])
+            self.assertEqual(len(result["claims"]), len(result["evidence_bundles"]))
+            self.assertIn("canonical", gamma.writer_prompts[0])
+            self.assertNotIn("cluster_", result["answer"])
+
+    def test_dialogue_state_uses_bounded_focus_stack_with_decay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("明哥", "person", "confirmed", "孩子", 1.0)
+            asset = store.create_asset("focus_asset", "focus.jpg", "image", "/tmp/focus.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "明哥在展览馆拍照", "place": "展览馆"})
+            event = store.merge_observation_into_event(observation)
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            first = agent.answer_turn("介绍一下明哥", "focus-conversation", scope_id="home-default")
+            second = agent.answer_turn("然后呢？", "focus-conversation", scope_id="home-default")
+
+            focus = second["dialogue_state"]["focus_stack"]
+            self.assertLessEqual(len([item for item in focus if item["type"] == "person"]), 3)
+            self.assertLessEqual(len([item for item in focus if item["type"] == "event"]), 3)
+            self.assertTrue(any(item["id"] == person["id"] for item in focus))
+            self.assertTrue(any(item["id"] == event["id"] for item in focus))
+            self.assertTrue(all(0 < item["salience"] <= 1.3 for item in focus))
+            self.assertGreaterEqual(second["dialogue_state"]["turn_index"], first["dialogue_state"]["turn_index"])
+
+    def test_dialogue_focus_stack_is_cleared_when_scope_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            asset = store.create_asset("scope_asset", "scope.jpg", "image", "/tmp/scope.jpg", scope_id="album_a")
+            observation = store.add_observation(asset["id"], {"caption": "album a 的家庭活动"}, scope_id="album_a")
+            event = store.merge_observation_into_event(observation)
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+            agent.answer_turn("album a 的家庭活动", "scope-focus", scope_id="album_a")
+
+            result = agent.answer_turn("然后呢？", "scope-focus", scope_id="album_b")
+
+            self.assertEqual(result["dialogue_state"]["scope_id"], "album_b")
+            self.assertFalse(any(item["id"] == event["id"] for item in result["dialogue_state"].get("focus_stack", [])))
+
+    def test_profile_claims_bind_chinese_clothing_phrases_to_appearance_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            agent = MemoryAgent(store, gamma=RefusingGamma())
+
+            evidence_ids = agent._lexical_claim_evidence_ids(
+                {"claim_kind": "family_fact", "text": "从外观上看，他常穿着黑色连帽衫或针织上衣，并佩戴银色项链。"},
+                [{"kind": "person_appearance", "id": "appearance-1", "clothing": ["黑色连帽衫"], "scope_id": "home-default"}],
+            )
+
+            self.assertEqual(evidence_ids, ["appearance-1"])
 
     def test_confirmed_person_introduction_does_not_offer_pending_clusters(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -736,7 +923,9 @@ class AgentEvidenceTests(unittest.TestCase):
 
             self.assertEqual(second["dialogue_plan"]["mode"], "contextual_follow_up")
             self.assertIn(event["id"], [item["event_id"] for item in second["evidence"] if item["kind"] == "event"])
-            self.assertEqual(set(second["dialogue_state"]), {"scope_id", "active_event_ids", "active_entity_ids", "semantic_group_ids", "evidence_ids", "unresolved_ambiguity"})
+            self.assertTrue({"scope_id", "active_event_ids", "active_entity_ids", "semantic_group_ids", "evidence_ids", "unresolved_ambiguity"}.issubset(second["dialogue_state"]))
+            self.assertIn("focus_stack", second["dialogue_state"])
+            self.assertIn("recent_evidence_ids", second["dialogue_state"])
 
     def test_dialogue_uses_narrative_style_for_an_entity_introduction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -832,7 +1021,7 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(result["image_results"], [])
             self.assertEqual(agent.gamma.answer_calls, 0)
 
-    def test_natural_chat_uses_household_long_term_memory_without_exposing_evidence(self):
+    def test_natural_chat_does_not_inject_household_memory_without_a_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MemoryStore(f"{directory}/memory.db")
             store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
@@ -843,7 +1032,9 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(result["intent"], "chat")
             self.assertEqual(result["answer"], "我在，今天慢一点也没关系。")
             self.assertEqual(result["evidence"], [])
-            self.assertTrue(any("家庭长期记忆" in prompt and "妈妈" in prompt for _, prompt in agent.gamma.contexts))
+            self.assertEqual(result["memory_intensity"], "none")
+            self.assertFalse(result["memory_actually_referenced"])
+            self.assertFalse(any("家庭长期记忆" in prompt and "妈妈" in prompt for _, prompt in agent.gamma.contexts))
 
     def test_memory_turn_hides_images_without_explicit_evidence_request(self):
         with tempfile.TemporaryDirectory() as directory:

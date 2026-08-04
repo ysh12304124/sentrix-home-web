@@ -90,6 +90,34 @@ test("memory answers always expose evidence state and direct original media", ()
   assert.match(appSource, /直接查看原始证据/);
 });
 
+test("assistant renders claim-level evidence through stable ids and segments", () => {
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
+  assert.match(appSource, /assistantAnswer/);
+  assert.match(appSource, /claimEvidence/);
+  assert.match(appSource, /claim_evidence_index/);
+  assert.match(appSource, /data-claim-id/);
+  assert.match(appSource, /逐句查看依据/);
+  assert.match(backendSource, /claimVerifications/);
+  assert.match(backendSource, /claimEvidenceIndex/);
+  assert.match(backendSource, /segments/);
+});
+
+test("proactive recall is gated, viewer-scoped, and user-dismissible", () => {
+  const agentSource = fs.readFileSync(path.join(root, "backend", "agent.py"), "utf8");
+  const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
+  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(agentSource, /SENTRIX_PROACTIVE_MEMORY/);
+  assert.match(agentSource, /proactivity_sensitive/);
+  assert.match(agentSource, /record_proactivity_outcome/);
+  assert.match(agentSource, /memory_intensity=\"probe\"/);
+  assert.match(backendSource, /viewer_id/);
+  assert.match(apiSource, /viewer_id/);
+  assert.match(appSource, /accept-proactive/);
+  assert.match(appSource, /disable-proactive/);
+});
+
 test("entity property corrections are exposed with evidence-aware UI controls", () => {
   const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
   const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
@@ -185,12 +213,7 @@ test("default evidence tiles do not expose filenames or internal identifiers", (
   assert.match(source, /technical-evidence/);
 });
 
-test("image imports defer event summarization until the upload batch is complete", () => {
+test("image imports automatically schedule event summarization after semantic enrichment", () => {
   const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
-  const browserSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
-  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
-  assert.match(backendSource, /enrich_fast_image\(asset_id, summarize_event=not batch_id\)/);
-  assert.match(backendSource, /\/api\/ingest-batches\/\{batch_id\}\/complete/);
-  assert.match(browserSource, /completeImportBatch\(batchId\)/);
-  assert.match(apiSource, /batchId/);
+  assert.match(backendSource, /enrich_fast_image\(asset_id, summarize_event=True\)/);
 });

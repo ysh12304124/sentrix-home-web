@@ -52,30 +52,16 @@ def process_asset(asset_id):
     task_pipeline = IngestionPipeline(
         task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
-    batch_id = None
     try:
         asset = task_store.get_asset(asset_id) or {}
-        batch_id = asset.get("batch_id")
         if asset.get("media_type") != "image":
-            task_pipeline.process(asset_id, summarize_event=not batch_id)
-        else:
-            fast = task_pipeline.process_fast_image(asset_id)
-            if fast.get("status") == "semantic_enriching":
-                # Batch imports defer event summaries until every member asset is terminal.
-                task_pipeline.enrich_fast_image(asset_id, summarize_event=not batch_id)
-    finally:
-        if batch_id:
-            finalize_import_batch(batch_id)
-        task_store.close()
-
-
-def finalize_import_batch(batch_id):
-    task_store = MemoryStore(store.path)
-    task_pipeline = IngestionPipeline(
-        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
-    )
-    try:
-        return task_pipeline.finalize_ingest_batch(batch_id)
+            task_pipeline.process(asset_id)
+            return
+        fast = task_pipeline.process_fast_image(asset_id)
+        if fast.get("status") == "semantic_enriching":
+            # Finish the semantic observation and summarize its event in the
+            # same background pipeline; imports must not require maintenance UI.
+            task_pipeline.enrich_fast_image(asset_id, summarize_event=True)
     finally:
         task_store.close()
 
@@ -653,6 +639,13 @@ def create_invite(payload: dict):
 
 def assistant_response(result):
     """Expose stable browser names while retaining the internal contract."""
+    result.setdefault("claims", [])
+    result.setdefault("claim_verifications", [])
+    result.setdefault("claim_verification_status", "not_required")
+    result.setdefault("repair_count", 0)
+    result.setdefault("evidence_bundles", [])
+    result.setdefault("claim_evidence_index", {})
+    result.setdefault("segments", [{"type": "text", "text": result.get("answer", "")}])
     result["retrievalTrace"] = result.get("retrieval_trace", [])
     result["toolTrace"] = result.get("tool_trace", [])
     result["evidencePresentation"] = result.get("evidence_presentation", {})
@@ -660,6 +653,11 @@ def assistant_response(result):
     result["evidenceRequired"] = result.get("evidence_required", False)
     result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
     result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
+    result["claimVerifications"] = result["claim_verifications"]
+    result["claimVerificationStatus"] = result["claim_verification_status"]
+    result["repairCount"] = result["repair_count"]
+    result["evidenceBundles"] = result["evidence_bundles"]
+    result["claimEvidenceIndex"] = result["claim_evidence_index"]
     return result
 
 
@@ -676,6 +674,7 @@ class AssistantTurnRequest(BaseModel):
     feedback: dict | None = None
     scope_id: str = "home-default"
     selected_entity_id: str | None = None
+    viewer_id: str = "owner"
 
 
 @app.post("/api/assistant/turn")
@@ -684,7 +683,7 @@ def assistant_turn(request: AssistantTurnRequest):
         raise HTTPException(status_code=400, detail="message is required")
     result = agent.answer_turn(
         request.message.strip(), request.conversation_id, request.feedback, request.scope_id,
-        request.selected_entity_id,
+        request.selected_entity_id, request.viewer_id,
     )
     return assistant_response(result)
 
@@ -698,11 +697,7 @@ async def ingest(
     sourceAlbumId: str | None = Form(None),
     capturedAt: str | None = Form(None),
     capturedLocation: str | None = Form(None),
-    batchId: str | None = Form(None),
 ):
-    batch_id = str(batchId or "").strip() or None
-    if batch_id:
-        store.create_ingest_batch(batch_id)
     safe_name = Path(file.filename or "upload.bin").name
     asset_id = make_id("asset")
     destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
@@ -718,7 +713,6 @@ async def ingest(
         "source_confidence": 1.0 if sourceOwnerId else 0.0,
         "captured_at": capturedAt,
         "captured_location": capturedLocation,
-        "batch_id": batch_id,
         "content_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
         "exif": pipeline._extract_exif(destination) if media_type == "image" else {},
     }
@@ -727,7 +721,7 @@ async def ingest(
     existing = store.find_asset_by_hash(metadata["content_sha256"])
     if existing:
         destination.unlink(missing_ok=True)
-        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "batchId": batch_id, "deduplicated": True}
+        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "deduplicated": True}
     created = store.create_asset(
         asset_id,
         safe_name,
@@ -738,16 +732,7 @@ async def ingest(
         metadata,
     )
     background_tasks.add_task(process_asset, asset_id)
-    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type, "batchId": batch_id}
-
-
-@app.post("/api/ingest-batches/{batch_id}/complete", status_code=202)
-def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
-    batch = store.complete_ingest_batch(batch_id)
-    if not batch:
-        raise HTTPException(status_code=404, detail="ingest batch not found")
-    background_tasks.add_task(finalize_import_batch, batch_id)
-    return {"accepted": True, "batchId": batch_id, "status": batch["status"]}
+    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type}
 
 
 @app.post("/api/import", status_code=202)
