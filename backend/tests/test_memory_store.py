@@ -42,6 +42,22 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(self.store.count("events"), 1)
         self.assertEqual(self.store.count("event_observations"), 2)
 
+    def test_event_place_never_uses_asset_gps_when_observation_has_semantic_place(self):
+        asset = self.store.create_asset(
+            "gps_asset", "meal.jpg", "image", "/tmp/meal.jpg",
+            metadata={"captured_at": "2026-07-01T18:00:00+08:00", "captured_location": "30.2458,120.2989"},
+        )
+        observation = self.store.add_observation(asset["id"], {
+            "captured_at": "2026-07-01T18:00:00+08:00", "place": "餐厅", "activity": "用餐",
+            "event_type": "餐饮", "caption": "桌上有蛋糕",
+            "canonical": {"semantic": {"available": True, "place": {"primary": "餐饮空间", "details": []}}},
+        })
+
+        event = self.store.merge_observation_into_event(observation)
+
+        self.assertEqual(event["place"], "餐厅")
+        self.assertNotIn("30.2458", event["place"])
+
     def test_naive_capture_time_is_normalized_before_event_comparison(self):
         naive = parse_time("2018-06-28T12:16:02")
         aware = parse_time("2018-06-28T12:16:02+00:00")

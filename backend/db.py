@@ -74,6 +74,9 @@ OBJECT_CATEGORIES = {
 }
 
 TRIP_MIN_GPS_DISPLACEMENT_KM = 50.0
+DISPLAY_COORDINATE_RE = re.compile(
+    r"(?:GPS(?:坐标)?|坐标|经纬度)?\s*[+-]?\d{1,3}(?:\.\d+)?\s*[,，]\s*[+-]?\d{1,3}(?:\.\d+)?"
+)
 
 MOOD_NORMALIZATION = {
     "平静": "平静",
@@ -1467,6 +1470,19 @@ class MemoryStore:
             "visual_event_type": (observation.get("event_type") or "").strip().lower(),
         }
 
+    @staticmethod
+    def _event_display_place(observation):
+        """Return a semantic place label, keeping GPS only on the asset."""
+        observation = observation or {}
+        visual_place = str(observation.get("place") or "").strip()
+        if visual_place and not DISPLAY_COORDINATE_RE.fullmatch(visual_place):
+            return visual_place
+        canonical = observation.get("canonical") if isinstance(observation.get("canonical"), dict) else {}
+        semantic = canonical.get("semantic") if isinstance(canonical.get("semantic"), dict) else {}
+        semantic_place = semantic.get("place") if isinstance(semantic.get("place"), dict) else {}
+        primary = str(semantic_place.get("primary") or "").strip()
+        return primary if primary and primary != OTHER else ""
+
     def merge_observation_into_event(self, observation):
         candidates = self._event_candidates(observation)
         event = candidates[0] if candidates else None
@@ -1478,7 +1494,7 @@ class MemoryStore:
         ]
         people = dedupe_json_values((json.loads(event["participants_json"]) if event else []) + confirmed_people)
         captured_at = anchor["captured_at"]
-        event_place = anchor["location"] or observation.get("place")
+        event_place = self._event_display_place(observation) or "其他或不确定"
         event_type = "待判断"
         if event:
             start = min(filter(None, [event.get("time_start"), captured_at])) if any([event.get("time_start"), captured_at]) else None
@@ -1489,7 +1505,7 @@ class MemoryStore:
             self.connection.execute(
                 """UPDATE events SET time_start = ?, time_end = ?, place = ?, activity = ?, summary = ?,
                 participants_json = ?, confidence = MAX(confidence, ?), revision = revision + 1, updated_at = ? WHERE id = ?""",
-                (start, end, event.get("place") or event_place, event.get("activity") or observation.get("activity"), summary, json_value(people, []), float(observation.get("confidence", 0) or 0), now_iso(), event["id"]),
+                (start, end, event_place, event.get("activity") or observation.get("activity"), summary, json_value(people, []), float(observation.get("confidence", 0) or 0), now_iso(), event["id"]),
             )
             event_id = event["id"]
         else:

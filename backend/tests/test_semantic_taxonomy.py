@@ -69,6 +69,34 @@ class SemanticTaxonomyTests(unittest.TestCase):
         )
         self.assertEqual(result["semantic"]["atmosphere"]["labels"], ["平静"])
 
+    def test_raw_place_and_object_labels_recover_when_model_selected_other(self):
+        result = normalize_semantic_analysis({
+            "place": "博物馆展厅",
+            "semantic": {
+                "place": {"primary": "其他或不确定", "details": []},
+                "objects": [
+                    {"primary": "其他或不确定", "label": "叉子", "details": []},
+                    {"primary": "其他或不确定", "label": "手机", "details": []},
+                ],
+            },
+        })
+
+        self.assertEqual(result["semantic"]["place"]["primary"], "文化与展览")
+        self.assertEqual(result["semantic"]["objects"][0]["primary"], "餐具与容器")
+        self.assertEqual(result["semantic"]["objects"][1]["primary"], "电子设备")
+
+    def test_common_scene_and_natural_object_labels_have_controlled_categories(self):
+        result = normalize_semantic_analysis({
+            "place": "户外公共广场",
+            "objects": ["起重机", "大海", "艺术品", "麦克风"],
+        })
+
+        self.assertEqual(result["semantic"]["place"]["primary"], "街道与广场")
+        self.assertEqual(
+            [item["primary"] for item in result["semantic"]["objects"]],
+            ["工业设备与设施", "自然景观与地貌", "艺术与展品", "演出与活动用品"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

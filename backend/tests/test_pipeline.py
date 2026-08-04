@@ -48,6 +48,11 @@ class BrokenClip(FakeClip):
         raise RuntimeError("embedding failed")
 
 
+class BrokenSummaryGamma(FakeGamma):
+    def summarize_event(self, event, observations):
+        raise RuntimeError("summary model unavailable")
+
+
 class SequencedClip(FakeClip):
     def __init__(self, image_embeddings):
         self.image_embeddings = list(image_embeddings)
@@ -87,6 +92,21 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(store.get_asset(asset["id"])["metadata_json"]["processing_seconds"], 0)
             self.assertIn("analysis_wall_seconds", store.get_asset(asset["id"])["metadata_json"]["processing_timings"])
             self.assertTrue(store.get_asset(asset["id"])["metadata_json"]["processing_timings"]["parallel"])
+
+    def test_summary_failure_is_completed_by_a_semantic_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "meal.jpg"
+            image.write_bytes(b"test")
+            store = MemoryStore(f"{directory}/memory.db")
+            pipeline = IngestionPipeline(store, gamma=BrokenSummaryGamma(), face=FakeFace(), clip=FakeClip())
+            asset = pipeline.create_asset(image, metadata={"captured_location": "30.2458,120.2989"})
+
+            pipeline.process(asset["id"])
+            event = store.list_events()[0]
+
+            self.assertNotEqual(event["title"], "待总结事件")
+            self.assertNotIn("30.2458", event["place"])
+            self.assertNotEqual(event["summary"], "一张带文字的家庭照片")
 
     def test_source_member_builds_semantic_profile_without_being_visible_in_photo(self):
         with tempfile.TemporaryDirectory() as directory:

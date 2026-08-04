@@ -40,7 +40,12 @@ try:
 except ImportError:  # Keep pure parsing and SQLite tests runnable without optional runtime deps.
     httpx = None
 
-from .semantic_taxonomy import PLACE_PRIMARY_TYPES, normalize_semantic_analysis
+from .semantic_taxonomy import (
+    ATMOSPHERE_PRIMARY_TYPES,
+    OBJECT_PRIMARY_TYPES,
+    PLACE_PRIMARY_TYPES,
+    normalize_semantic_analysis,
+)
 
 
 class ModelError(RuntimeError):
@@ -83,6 +88,36 @@ def as_text(value):
     if isinstance(value, list):
         return "、".join(as_text(item) for item in value)
     return json.dumps(value, ensure_ascii=False)
+
+
+COORDINATE_PHRASE_RE = re.compile(
+    r"(?:GPS(?:坐标)?|坐标|经纬度)?\s*[+-]?\d{1,3}(?:\.\d+)?\s*[,，]\s*[+-]?\d{1,3}(?:\.\d+)?"
+)
+
+
+def _event_place(event, observations):
+    """Choose a semantic place label; asset GPS is never a display place."""
+    for item in observations:
+        place = as_text(item.get("place")).strip()
+        if place and not COORDINATE_PHRASE_RE.fullmatch(place):
+            return place
+        canonical = item.get("canonical") if isinstance(item.get("canonical"), dict) else {}
+        semantic = canonical.get("semantic") if isinstance(canonical.get("semantic"), dict) else {}
+        semantic_place = semantic.get("place") if isinstance(semantic.get("place"), dict) else {}
+        primary = as_text(semantic_place.get("primary")).strip()
+        if primary and primary != "其他或不确定":
+            return primary
+    place = as_text(event.get("place")).strip()
+    return place if place and not COORDINATE_PHRASE_RE.fullmatch(place) else "某处"
+
+
+def _strip_event_coordinates(value, place):
+    text = as_text(value).strip()
+    if not text:
+        return ""
+    text = COORDINATE_PHRASE_RE.sub(place, text)
+    text = re.sub(r"(?:GPS|坐标|经纬度)(?:位置)?", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def normalize_confidence(value, default=0.5):
@@ -211,8 +246,13 @@ class GammaClient:
         encoded, mime_type = self._encode_core_image(file_path)
         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
 严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；确实看不清才用空数组或空字符串。
-字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。"""
-        prompt += "、".join(SCENE_TYPE_OPTIONS)
+字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
+地点主类只能从："""
+        prompt += "、".join(PLACE_PRIMARY_TYPES)
+        prompt += "；物品主类只能从："
+        prompt += "、".join(OBJECT_PRIMARY_TYPES)
+        prompt += "；氛围主类只能从："
+        prompt += "、".join(ATMOSPHERE_PRIMARY_TYPES)
         prompt += "。facts 项仅含 subject、predicate、object、confidence。\n不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。\nmetadata: "
         prompt += json.dumps(metadata or {}, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
@@ -299,10 +339,13 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         return parsed
 
     def summarize_event(self, event, observations):
+        semantic_place = _event_place(event, observations)
         evidence = [{
             "observation_id": item.get("id"),
             "caption": item.get("caption"),
             "activity": item.get("activity"),
+            "place": item.get("place"),
+            "semantic": (item.get("canonical") or {}).get("semantic", {}) if isinstance(item.get("canonical"), dict) else {},
             "people": item.get("people", []),
             "objects": item.get("objects", []),
             "ocr_text": item.get("ocr_text"),
@@ -311,16 +354,18 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         } for item in observations]
         prompt = """你是家庭事件总结器。下面是一组已经按拍摄时间和地点聚类的图片观察。
 只能使用给定观察，不得把元数据地点以外的信息当作事实，不得猜测未确认人物姓名；如果观察彼此不足以支持具体事件，使用保守、描述性的标题。
-严格返回简体中文 JSON：title（不超过20字）、event_type、activity、summary（包含时间地点范围和可验证活动）、confidence。
+地点必须使用观察中的语义地点（例如餐厅、家中厨房、湖边、商场或语义主类），禁止输出 GPS 坐标、经纬度、文件名或路径。事件总结必须综合全部 observations，不能只依据其中一张图片。
+严格返回简体中文 JSON：title（不超过20字）、event_type、activity、summary（包含时间范围、语义地点和可验证活动）、confidence。
 事件：""" + json.dumps({
-            "time_start": event.get("time_start"), "time_end": event.get("time_end"), "place": event.get("place"), "observations": evidence,
+            "time_start": event.get("time_start"), "time_end": event.get("time_end"), "place": semantic_place, "observations": evidence,
         }, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt))
+        fallback_place = semantic_place
         return {
-            "title": as_text(parsed.get("title")) or "待确认的家庭记录",
-            "event_type": as_text(parsed.get("event_type")) or "家庭记录",
-            "activity": as_text(parsed.get("activity")) or "家庭活动",
-            "summary": as_text(parsed.get("summary")) or "该事件的图片证据尚不足以生成更具体的总结。",
+            "title": _strip_event_coordinates(as_text(parsed.get("title")) or "家庭图片记录", fallback_place),
+            "event_type": _strip_event_coordinates(as_text(parsed.get("event_type")) or "家庭记录", fallback_place),
+            "activity": _strip_event_coordinates(as_text(parsed.get("activity")) or "家庭活动", fallback_place),
+            "summary": _strip_event_coordinates(as_text(parsed.get("summary")) or "该事件的图片证据尚不足以生成更具体的总结。", fallback_place),
             "confidence": normalize_confidence(parsed.get("confidence"), 0.5),
             "model": self.model,
         }

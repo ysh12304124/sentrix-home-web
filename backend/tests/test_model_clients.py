@@ -157,6 +157,26 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(result["confidence"], 0.88)
         self.assertIn("目标人物", chat.call_args.args[0])
 
+    def test_event_summary_uses_semantic_places_and_removes_coordinates(self):
+        client = GammaClient()
+        response = {
+            "title": "在坐标30.2458,120.2989吃饭",
+            "event_type": "餐饮",
+            "activity": "在30.2458,120.2989用餐",
+            "summary": "在坐标30.2458,120.2989处拍摄了多张餐厅照片。",
+            "confidence": 0.8,
+        }
+        with patch.object(client, "chat", return_value=json.dumps(response)) as chat:
+            result = client.summarize_event(
+                {"time_start": "2026-07-01T18:00:00+08:00", "time_end": "2026-07-01T18:30:00+08:00", "place": "30.2458,120.2989"},
+                [{"id": "obs_1", "place": "餐厅", "caption": "桌上有蛋糕", "activity": "用餐", "objects": ["蛋糕"], "canonical": {"semantic": {"place": {"primary": "餐饮空间"}}}}],
+            )
+
+        prompt = chat.call_args.args[0]
+        self.assertIn("餐厅", prompt)
+        self.assertNotRegex(result["summary"], r"30\.2458|120\.2989|坐标")
+        self.assertIn("餐厅", result["summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,13 +6,13 @@ OTHER = "其他或不确定"
 PLACE_PRIMARY_TYPES = (
     "居住空间", "餐饮空间", "商业空间", "公园与花园", "滨水空间", "山地与自然景观",
     "街道与广场", "交通空间", "文化与展览", "运动与休闲", "演出与活动", "办公与学习",
-    "医疗与公共服务", "宗教与纪念", "工业与工程", "住宿空间", "农场与乡村", OTHER,
+    "医疗与公共服务", "宗教与纪念", "工业与工程", "住宿空间", "农场与乡村", "室内空间", OTHER,
 )
 
 OBJECT_PRIMARY_TYPES = (
     "食品与饮品", "餐具与容器", "电子设备", "家具与家居", "服饰与配件", "植物与花卉",
     "动物与宠物", "交通工具", "建筑与公共设施", "文字与标识", "玩具与娱乐", "书籍与文具",
-    "礼物与纪念物", OTHER,
+    "自然景观与地貌", "艺术与展品", "工业设备与设施", "演出与活动用品", "礼物与纪念物", OTHER,
 )
 
 ATMOSPHERE_PRIMARY_TYPES = (
@@ -37,6 +37,10 @@ ATMOSPHERE_DETAIL_TYPES = frozenset({
 
 PLACE_PRIMARY_ALIASES = {
     "居住室内": "居住空间",
+    "家中": "居住空间",
+    "家里": "居住空间",
+    "室内": "室内空间",
+    "家庭空间": "居住空间",
     "餐厅": "餐饮空间",
     "餐馆": "餐饮空间",
     "咖啡馆": "餐饮空间",
@@ -44,12 +48,15 @@ PLACE_PRIMARY_ALIASES = {
     "园林公园": "公园与花园",
     "山地与自然": "山地与自然景观",
     "户外公共空间": "街道与广场",
+    "学校": "办公与学习",
+    "校园": "办公与学习",
     "交通出行空间": "交通空间",
     "文化展览": "文化与展览",
     "展览空间": "文化与展览",
     "演出活动空间": "演出与活动",
     "办公学习空间": "办公与学习",
     "工业与工程空间": "工业与工程",
+    "工业区域": "工业与工程",
 }
 
 OBJECT_PRIMARY_ALIASES = {
@@ -97,18 +104,22 @@ _PLACE_DETAIL_HINTS = (
 )
 
 _OBJECT_PRIMARY_HINTS = (
-    ("食品与饮品", ("蛋糕", "水果", "饮料", "咖啡", "茶", "食物", "甜点", "菜", "饭")),
-    ("餐具与容器", ("碗", "杯", "盘", "勺", "叉", "筷", "锅", "餐具", "容器", "托盘")),
+    ("食品与饮品", ("蛋糕", "水果", "饮料", "咖啡", "茶", "食物", "甜点", "菜", "饭", "面条", "烤肉", "大饼", "蘸酱", "酱汁", "香料")),
+    ("餐具与容器", ("碗", "杯", "盘", "勺", "叉", "筷", "锅", "餐具", "容器", "托盘", "炉灶", "灶具", "抽油烟机", "水槽", "水龙头", "砧板", "器皿")),
     ("电子设备", ("手机", "相机", "电脑", "平板", "耳机")),
     ("家具与家居", ("桌", "椅", "沙发", "床", "柜", "灯")),
-    ("服饰与配件", ("衣服", "外套", "裤", "鞋", "帽", "眼镜", "手链", "项链", "背包")),
+    ("服饰与配件", ("衣服", "外套", "裤", "鞋", "帽", "眼镜", "手链", "项链", "戒指", "手表", "项圈", "衬衫", "和服", "耳环", "背包", "挎包", "挂绳")),
     ("植物与花卉", ("花", "树", "草", "绿植", "植物", "盆栽")),
     ("动物与宠物", ("猫", "狗", "宠物", "动物")),
     ("交通工具", ("汽车", "车辆", "自行车", "飞机", "船", "公交")),
-    ("建筑与公共设施", ("建筑", "房屋", "桥", "道路", "围栏", "路灯")),
-    ("文字与标识", ("海报", "标牌", "路标", "菜单", "文字", "告示")),
+    ("建筑与公共设施", ("建筑", "房屋", "桥", "道路", "路面", "围栏", "护栏", "栏杆", "路灯", "墙", "窗", "门", "地板", "地砖", "台阶", "屋檐", "屋顶", "排水沟", "跑道")),
+    ("文字与标识", ("海报", "标牌", "路标", "菜单", "文字", "告示", "信息牌", "指示牌", "宣传", "广告牌", "招牌", "展板", "说明", "标签", "牌匾", "标记")),
     ("玩具与娱乐", ("玩具", "玩偶", "气球")),
     ("书籍与文具", ("书", "本子", "文具", "笔")),
+    ("自然景观与地貌", ("大海", "海水", "湖", "河流", "水面", "水池", "沙滩", "天空", "云", "山", "岩石", "石头", "地貌", "喷泉", "倒影")),
+    ("艺术与展品", ("艺术品", "展品", "文物", "陶瓷", "陶罐", "雕塑", "模型", "照片", "画作")),
+    ("工业设备与设施", ("集装箱", "起重机", "电线杆", "电线塔", "钢结构", "水处理", "工业设备", "机器")),
+    ("演出与活动用品", ("幕布", "麦克风", "舞台灯", "演出服", "戏服")),
 )
 
 _OBJECT_DETAIL_HINTS = (
@@ -164,6 +175,21 @@ def _hinted_primary(value, choices, aliases, hints):
     return OTHER
 
 
+def _best_primary(values, choices, aliases, hints):
+    """Prefer a controlled choice, then recover from raw model labels."""
+    candidates = [_text(value) for value in values]
+    for value in candidates:
+        normalized = aliases.get(value, value)
+        if normalized in choices and normalized != OTHER:
+            return normalized
+    for value in candidates:
+        if value:
+            primary = _hinted_primary(value, choices, aliases, hints)
+            if primary != OTHER:
+                return primary
+    return OTHER
+
+
 def _hinted_details(value, hints):
     text = _text(value)
     return [detail for detail, terms in hints if any(term in text for term in terms)]
@@ -198,15 +224,23 @@ def normalize_semantic_analysis(analysis):
 
     place_source = semantic.get("place") if isinstance(semantic.get("place"), dict) else {}
     place_value = place_source.get("primary") or source.get("scene_type") or source.get("place")
-    place_primary = _hinted_primary(place_value, PLACE_PRIMARY_TYPES, PLACE_PRIMARY_ALIASES, (
-        ("滨水空间", ("湖", "河", "海", "水边", "水域")),
+    place_primary = _best_primary((
+        place_source.get("primary"), source.get("place"), source.get("scene_type"),
+    ), PLACE_PRIMARY_TYPES, PLACE_PRIMARY_ALIASES, (
+        ("滨水空间", ("湖", "河", "海", "水边", "水域", "滨水")),
         ("文化与展览", ("博物馆", "展厅", "展览", "美术馆")),
         ("餐饮空间", ("餐厅", "餐馆", "咖啡", "烘焙", "茶室")),
-        ("商业空间", ("商场", "商店", "超市", "市场")),
+        ("商业空间", ("商场", "商店", "超市", "市场", "购物中心", "服装店", "礼品店", "商业街")),
         ("公园与花园", ("公园", "花园", "园林")),
-        ("交通空间", ("机场", "地铁", "车站", "车厢", "公路")),
+        ("交通空间", ("机场", "地铁", "车站", "车厢", "公路", "汽车", "车内", "交通枢纽")),
         ("演出与活动", ("剧场", "舞台", "演出", "活动现场")),
         ("居住空间", ("客厅", "卧室", "厨房", "家中", "住宅", "房间")),
+        ("室内空间", ("室内", "走廊", "门厅", "工作室", "室内场景")),
+        ("街道与广场", ("街道", "广场", "人行道", "城市街", "商业街", "公共场所", "道路边缘", "城市景观", "室外场地")),
+        ("工业与工程", ("码头", "港口", "工业", "工厂", "水处理", "水利工程")),
+        ("山地与自然景观", ("溶洞", "洞穴", "山地", "风景区", "景点", "观景台", "郊外")),
+        ("运动与休闲", ("体育场", "看台", "运动场")),
+        ("农场与乡村", ("乡村", "乡间", "农村", "果园", "农场")),
     ))
     if _text(place_value) and _text(place_value) != place_primary:
         raw_labels["semantic_place"].append(_text(place_value))
@@ -229,8 +263,8 @@ def normalize_semantic_analysis(analysis):
             continue
         detail_raw = []
         label = _text(item.get("label"))
-        primary = _hinted_primary(item.get("primary") or label, OBJECT_PRIMARY_TYPES, OBJECT_PRIMARY_ALIASES, _OBJECT_PRIMARY_HINTS)
-        if _text(item.get("primary")) and _text(item.get("primary")) != primary:
+        primary = _best_primary((item.get("primary"), label), OBJECT_PRIMARY_TYPES, OBJECT_PRIMARY_ALIASES, _OBJECT_PRIMARY_HINTS)
+        if _text(item.get("primary")) and _text(item.get("primary")) not in (primary, OTHER):
             raw_labels["objects"].append(_text(item.get("primary")))
         details = _details(item.get("details"), OBJECT_DETAIL_TYPES, detail_raw)
         if not details and not item.get("details"):

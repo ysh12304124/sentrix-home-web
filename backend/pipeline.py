@@ -245,8 +245,32 @@ class IngestionPipeline:
         detail = self.store.get_event_detail(event_id)
         if not detail or not detail["observations"] or not hasattr(self.gamma, "summarize_event"):
             return self.store.get_event(event_id)
+
+        def fallback_projection():
+            event = detail["event"]
+            observations = detail["observations"]
+            place = str(event.get("place") or "其他或不确定").strip()
+            activities = []
+            captions = []
+            event_types = []
+            for observation in observations:
+                for value, target in ((observation.get("activity"), activities), (observation.get("caption"), captions), (observation.get("event_type"), event_types)):
+                    value = str(value or "").strip()
+                    if value and value not in target and value not in {"待判断", "未识别", "未知"}:
+                        target.append(value)
+            activity = "、".join(activities[:3]) or "图片记录"
+            event_type = event_types[0] if event_types else "家庭活动"
+            title = f"{place}{activity}" if place != "其他或不确定" else activity
+            summary = f"{place}记录了" + "；".join(captions[:4] or activities[:4])
+            return {
+                "title": title[:20], "event_type": event_type[:20], "activity": activity[:20],
+                "summary": summary[:240], "confidence": 0.45, "model": "deterministic_event_fallback",
+            }
+
         try:
             result = self.gamma.summarize_event(detail["event"], detail["observations"])
+            if str(result.get("title") or "").strip() in {"待总结事件", "待确认的家庭记录", "待判断"}:
+                result = fallback_projection()
             updated = self.store.update_event(event_id, {
                 "title": result.get("title"),
                 "event_type": result.get("event_type"),
@@ -258,7 +282,15 @@ class IngestionPipeline:
             self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result.get("model"), "event_summary": True})
             return updated
         except Exception:
-            return self.store.get_event(event_id)
+            result = fallback_projection()
+            updated = self.store.update_event(event_id, {
+                "title": result["title"], "event_type": result["event_type"],
+                "activity": result["activity"], "summary": result["summary"],
+            })
+            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
+            vector = self.clip.embed_text(event_text)
+            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result["model"], "event_summary": True})
+            return updated
 
     def summarize_events(self, scope_id=None):
         return [self.summarize_event(event["id"]) for event in self.store.list_events(1000, scope_id)]
