@@ -121,6 +121,7 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(result["caption"], "孩子在客厅玩耍")
         self.assertEqual(result["activity"], "玩耍")
         self.assertEqual(result["place"], "家中客厅")
+        self.assertEqual(result["semantic"]["objects"][0]["label"], "玩具")
         self.assertEqual(chat.call_count, 2)
 
     def test_clip_uses_project_checkpoint_when_environment_is_unset(self):

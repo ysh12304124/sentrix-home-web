@@ -217,7 +217,10 @@ def normalize_semantic_analysis(analysis):
     raw_labels["semantic_place"].extend(place_details_raw)
 
     objects = []
-    object_source = semantic.get("objects") if isinstance(semantic.get("objects"), list) else source.get("objects") if isinstance(source.get("objects"), list) else []
+    semantic_objects = semantic.get("objects")
+    object_source = semantic_objects if semantic_objects else (
+        source.get("objects") if isinstance(source.get("objects"), list) else []
+    )
     for item in object_source:
         if isinstance(item, str):
             item = {"label": item}
