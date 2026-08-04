@@ -2,7 +2,13 @@ import tempfile
 import unittest
 
 from backend.agent import MemoryAgent, contains
+from backend.agent_contracts import PydanticAIPlanner, validate_turn_plan
 from backend.db import MemoryStore
+
+try:
+    from pydantic_ai.models.test import TestModel
+except ImportError:
+    TestModel = None
 
 
 class FakeGamma:
@@ -137,6 +143,103 @@ class AgentEvidenceTests(unittest.TestCase):
             self.assertEqual(tools[:2], ["resolve_constraints", "describe_entity"])
             self.assertTrue(all(item["permission"] == "read" for item in result["tool_trace"]))
             self.assertIn("event_1", [item["event_id"] for item in result["evidence"] if item["kind"] == "event"])
+
+    def test_person_introduction_builds_profile_summary_instead_of_event_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("明哥", "person", "confirmed", "哥哥", 1.0)
+            myself = store.create_entity("我", "person", "confirmed", "本人", 1.0)
+            evidence = []
+            for index, (activity, place) in enumerate((("拍照", "室内剧场"), ("参观展示", "展览馆")), 1):
+                asset = store.create_asset(f"asset_{index}", f"memory_{index}.jpg", "image", f"/tmp/memory_{index}.jpg")
+                observation = store.add_observation(asset["id"], {"caption": f"明哥在{place}{activity}"})
+                event = store.create_event({
+                    "id": f"event_{index}", "title": activity, "activity": activity,
+                    "place": place, "summary": f"明哥在{place}{activity}",
+                    "time_start": f"2025-0{index}-12T12:00:00+00:00",
+                })
+                store.connection.execute(
+                    "INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+                    (event["id"], observation["id"]),
+                )
+                store.connection.commit()
+                store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+                store.upsert_event_participant(event["id"], myself["id"], "visible_subject", [observation["id"]], 0.9)
+                evidence.append((observation, event))
+            store.maintain_semantic_claim(
+                person["id"], "clothing", "穿着", "深色外套",
+                [evidence[0][0]["id"]], [evidence[0][1]["id"]], 0.85,
+            )
+            store.rebuild_person_memory(person["id"])
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("介绍一下明哥")
+
+            profile = result["person_profile"]
+            self.assertEqual(profile["entity_id"], person["id"])
+            self.assertIn("哥哥", result["answer"])
+            self.assertIn("拍照", result["answer"])
+            self.assertIn("参观展示", result["answer"])
+            self.assertNotIn("2025-01-12 12:00 · 室内剧场", result["answer"])
+            self.assertNotIn("；2025-", result["answer"])
+            self.assertGreaterEqual(len(profile["sections"]), 2)
+            for section in profile["sections"]:
+                self.assertTrue(section["evidence_ids"])
+            self.assertTrue(result["evidence_layers"]["claims"])
+
+    def test_confirmed_person_introduction_does_not_offer_pending_clusters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("妈妈", "person", "confirmed", "母亲", 1.0)
+            pending = store.create_entity("待确认人物簇 · cluster_test", "person", "pending", confidence=0.8)
+            asset = store.create_asset("asset_1", "mother.jpg", "image", "/tmp/mother.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "妈妈在客厅阅读"})
+            event = store.create_event({"id": "event_1", "activity": "阅读", "place": "客厅", "summary": "妈妈在客厅阅读"})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            store.rebuild_person_memory(person["id"])
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("介绍一下妈妈")
+
+            self.assertEqual(result["person_profile"]["entity_id"], person["id"])
+            self.assertEqual(result["clarification_candidates"], [])
+            self.assertNotIn(pending["id"], result["answer"])
+            self.assertNotIn("cluster_test", result["answer"])
+
+    def test_family_role_resolves_confirmed_person_when_canonical_name_is_internal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            person = store.create_entity("person_confirmed_1", "person", "confirmed", "母亲", 1.0)
+            pending = store.create_entity("待确认人物簇 · cluster_role", "person", "pending", confidence=0.9)
+            asset = store.create_asset("asset_role", "role.jpg", "image", "/tmp/role.jpg")
+            observation = store.add_observation(asset["id"], {"caption": "已确认的母亲在客厅"})
+            event = store.create_event({"id": "event_role", "activity": "阅读", "place": "客厅", "summary": "已确认的母亲在客厅阅读"})
+            store.connection.execute("INSERT INTO event_observations(event_id, observation_id) VALUES (?, ?)", (event["id"], observation["id"]))
+            store.connection.commit()
+            store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+            store.rebuild_person_memory(person["id"])
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("介绍一下妈妈")
+
+            self.assertEqual(result["identity_resolution"]["status"], "resolved")
+            self.assertEqual(result["person_profile"]["entity_id"], person["id"])
+            self.assertEqual(result["clarification_candidates"], [])
+            self.assertNotIn("cluster_role", result["answer"])
+
+    def test_ambiguous_confirmed_people_have_human_readable_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(f"{directory}/memory.db")
+            first = store.create_entity("妈妈（北方）", "person", "confirmed", "母亲", 0.9)
+            second = store.create_entity("妈妈（南方）", "person", "confirmed", "母亲", 0.9)
+            store.create_entity("待确认人物簇 · cluster_ignored", "person", "pending", confidence=0.99)
+
+            result = MemoryAgent(store, gamma=RefusingGamma()).answer("介绍一下妈妈")
+
+            self.assertEqual(result["identity_resolution"]["status"], "ambiguous")
+            names = {item["name"] for item in result["clarification_candidates"]}
+            self.assertEqual(names, {first["canonical_name"], second["canonical_name"]})
+            self.assertTrue(all(item["family_role"] == "母亲" for item in result["clarification_candidates"]))
+            self.assertNotIn("cluster_ignored", result["answer"])
 
     def test_steward_uses_event_timeline_tools_for_timeline_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -928,6 +1031,32 @@ class AgentEvidenceContractTests(unittest.TestCase):
         self.assertEqual(follow_up["dialogue_plan"]["mode"], "contextual_follow_up")
         self.assertTrue(original["original_evidence_requested"])
         self.assertTrue(original["image_results"])
+
+
+class AgentOrchestrationTests(unittest.TestCase):
+    def test_typed_plan_validator_cannot_downgrade_memory_or_execute_unknown_tools(self):
+        validated = validate_turn_plan(
+            {"mode": "chat", "tools": ["drop_database", "find_events"], "show_images": False},
+            {"mode": "memory", "tools": ["resolve_constraints"], "show_images": True, "reason": "memory request"},
+        )
+
+        self.assertEqual(validated.mode, "memory")
+        self.assertEqual(validated.tools, ("resolve_constraints", "find_events"))
+        self.assertTrue(validated.show_images)
+        self.assertNotIn("drop_database", validated.tools)
+
+    def test_pydantic_ai_planner_degrades_to_disabled_without_framework_model(self):
+        planner = PydanticAIPlanner(model=None)
+
+        self.assertFalse(planner.available)
+        self.assertIsNone(planner.plan("只返回行动计划"))
+
+    @unittest.skipIf(TestModel is None, "pydantic-ai-slim is optional in the local test environment")
+    def test_pydantic_ai_planner_returns_structured_plan_when_enabled(self):
+        planner = PydanticAIPlanner(model=TestModel())
+
+        self.assertTrue(planner.available)
+        self.assertEqual(planner.plan("只返回行动计划")["mode"], "chat")
 
 
 if __name__ == "__main__":

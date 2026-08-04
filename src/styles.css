@@ -302,3 +302,8 @@ button { cursor: pointer; }
 .event-cover span { padding: 10px 14px 2px; }
 .event-cover b { padding: 0 14px 12px; }
 @media (max-width: 780px) { .face-evidence-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.assistant-identity-choice { display: inline-flex; align-items: center; gap: 8px; min-width: 180px; }
+.assistant-identity-choice img, .assistant-choice-placeholder { width: 30px; height: 30px; flex: 0 0 30px; border-radius: 6px; object-fit: cover; background: var(--soft); }
+.assistant-choice-placeholder { display: inline-grid; place-items: center; color: var(--muted); font-size: 12px; }
+.assistant-identity-choice > span:last-child { min-width: 0; }
+.assistant-identity-choice strong { display: block; overflow-wrap: anywhere; }

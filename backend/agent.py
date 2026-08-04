@@ -3,6 +3,7 @@ import re
 import uuid
 
 from .model_clients import ClipAdapter, GammaClient
+from .agent_contracts import PydanticAIPlanner, validate_turn_plan
 
 VECTOR_EVIDENCE_MIN_SCORE = 0.35
 
@@ -42,6 +43,7 @@ class MemoryAgent:
         self.store = store
         self.gamma = gamma or GammaClient()
         self.clip = clip or ClipAdapter()
+        self.framework_planner = PydanticAIPlanner()
         self._conversations = {}
         self._dialogue_states = {}
         self._conversation_limit = 8
@@ -127,41 +129,16 @@ class MemoryAgent:
         prompt += "普通聊天、情感支持、建议和延续对话可以是 chat；只有需要准确回忆具体家庭经历、人物、地点、时间、关系或用户要求依据时才 memory。图片只在问题确实需要视觉依据时展示。\n"
         prompt += f"用户消息：{message}\n最近对话：{conversation_context[-800:]}\n"
         prompt += '只返回 JSON：{"mode":"chat|memory|feedback|clarify","tools":["..."],"show_images":false,"reason":"..."}'
-        try:
-            raw = self.gamma.chat(prompt)
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
-            return fallback | {"planner": "deterministic"}
-        if not isinstance(parsed, dict):
-            return fallback | {"planner": "deterministic"}
-        allowed_modes = {"chat", "memory", "feedback", "clarify"}
-        allowed_tools = {"resolve_constraints", "describe_entity", "find_events", "trace_timeline", "compare_memories", "suggest_recall", "open_evidence", "request_clarification", "record_feedback"}
-        mode = parsed.get("mode") if parsed.get("mode") in allowed_modes else fallback["mode"]
-        # A model may choose a narrower memory tool, but it cannot discard an
-        # explicit memory/feedback request as casual chat.
-        if fallback["mode"] in {"memory", "feedback", "clarify"} and mode == "chat":
-            mode = fallback["mode"]
-        tools = [item for item in parsed.get("tools", []) if item in allowed_tools]
-        if mode == "chat":
-            tools = []
-        elif mode == "memory":
-            tools = list(dict.fromkeys(["resolve_constraints", *tools]))
-            if len(tools) == 1:
-                tools.append("find_events")
-        elif mode == "feedback":
-            tools = ["record_feedback"]
-        else:
-            tools = list(dict.fromkeys(["resolve_constraints", *tools, "request_clarification"]))
-        show_images = bool(parsed.get("show_images")) and mode == "memory"
-        if fallback.get("show_images"):
-            # An explicit request for original evidence cannot be suppressed
-            # by a model plan that otherwise passed schema validation.
-            show_images = True
-        return {
-            "mode": mode, "tools": tools,
-            "show_images": show_images,
-            "reason": str(parsed.get("reason") or fallback["reason"])[:240], "planner": "model",
-        }
+        parsed = self.framework_planner.plan(prompt) if self.framework_planner.available else None
+        planner = "pydantic-ai" if parsed is not None else "model"
+        if parsed is None:
+            try:
+                raw = self.gamma.chat(prompt)
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                return fallback | {"planner": "deterministic"}
+        validated = validate_turn_plan(parsed, fallback)
+        return validated.as_dict(planner)
 
     @staticmethod
     def _query_terms(query):
@@ -292,12 +269,177 @@ class MemoryAgent:
         return False
 
     @staticmethod
+    def _role_aliases(role):
+        role = str(role or "").strip()
+        aliases = {
+            "母亲": {"母亲", "妈妈", "妈", "母妈"},
+            "父亲": {"父亲", "爸爸", "爸"},
+            "哥哥": {"哥哥", "哥"},
+            "姐姐": {"姐姐", "姐"},
+            "弟弟": {"弟弟", "弟"},
+            "妹妹": {"妹妹", "妹"},
+            "儿子": {"儿子"},
+            "女儿": {"女儿"},
+            "配偶": {"配偶", "丈夫", "妻子", "老公", "老婆"},
+            "本人": {"本人", "我"},
+        }
+        return aliases.get(role, {role} if role else set())
+
+    def _identity_candidate(self, entity):
+        """Return a user-selectable identity projection without internal cluster labels."""
+        return {
+            "id": entity["id"],
+            "name": entity.get("canonical_name") or "未命名成员",
+            "entity_type": entity.get("entity_type"),
+            "status": entity.get("status"),
+            "family_role": entity.get("family_role"),
+            "evidence_count": int(entity.get("evidence_count", 0) or 0),
+            "confidence": float(entity.get("confidence", 0) or 0),
+            "preview_asset_id": entity.get("preview_asset_id"),
+            "preview_file_name": entity.get("preview_file_name"),
+            "avatar_face_instance_id": entity.get("avatar_face_instance_id"),
+        }
+
+    def _resolve_person_entities(self, query, scope_id=None):
+        """Resolve only confirmed people for ordinary identity questions.
+
+        Pending face clusters are review objects, not identities. They never
+        compete with a confirmed person or family role in normal conversation.
+        """
+        value = str(query or "")
+        people = [
+            entity for entity in self.store.list_entities(scope_id=scope_id, public=False)
+            if entity.get("entity_type") == "person" and entity.get("status") == "confirmed"
+        ]
+        exact = [entity for entity in people if entity.get("canonical_name") and entity["canonical_name"] in value]
+        if exact:
+            matches = exact
+            strategy = "confirmed_name"
+        else:
+            matches = [
+                entity for entity in people
+                if self._role_aliases(entity.get("family_role")) & set(re.findall(r"[\u4e00-\u9fff]{1,4}", value))
+            ]
+            strategy = "confirmed_family_role"
+        candidates = sorted(
+            (self._identity_candidate(entity) for entity in matches),
+            key=lambda item: (-item["evidence_count"], -item["confidence"], item["name"]),
+        )
+        multi_subject = any(token in value for token in ("比较", "对比", "共同", "分别", "和", "与"))
+        if len(matches) == 1 or (len(matches) > 1 and multi_subject):
+            return {"status": "resolved", "strategy": strategy, "entity_ids": [entity["id"] for entity in matches], "candidates": candidates}
+        if len(matches) > 1:
+            return {"status": "ambiguous", "strategy": strategy, "entity_ids": [], "candidates": candidates[:6]}
+        return {"status": "unresolved", "strategy": "none", "entity_ids": [], "candidates": []}
+
+    @staticmethod
     def _dialogue_style(query, result):
         if result.get("insufficient_evidence"):
             return "clarifying"
         if any(token in str(query or "") for token in ("介绍", "时间线", "回顾", "比较", "经历", "然后", "后来", "继续")):
             return "narrative"
         return "concise"
+
+    @staticmethod
+    def _is_person_introduction_query(query):
+        value = str(query or "")
+        return any(token in value for token in ("介绍", "了解一下", "说说", "是什么样的人"))
+
+    def _build_person_profile(self, query, person, retrieved, evidence):
+        """Build a natural person summary from existing read-only projections."""
+        person_id = person["id"]
+        profile = self.store.get_semantic_profile(person_id) or {}
+        claims = [item for item in retrieved.get("semantic_claims", []) if item.get("person_id") == person_id]
+        patterns = self.store.list_person_patterns(person_id, retrieved.get("scope_id"))
+        relationships = [
+            item for item in retrieved.get("relationships", [])
+            if item.get("subject_entity_id") == person_id or item.get("object_entity_id") == person_id
+        ]
+        person_evidence_id = f"person:{person_id}"
+        person_evidence = {
+            "kind": "person", "id": person_evidence_id, "person_id": person_id,
+            "name": person.get("canonical_name"), "family_role": person.get("family_role"),
+            "status": person.get("status"), "evidence_count": person.get("evidence_count", 0),
+            "profile_evidence_ids": list(dict.fromkeys(profile.get("evidence_ids_json", []) or [])),
+        }
+        sections = [{
+            "kind": "identity", "text": (
+                f"{person['canonical_name']}是家里的{person['family_role']}。"
+                if person.get("family_role") else f"{person['canonical_name']}是已确认的家庭成员。"
+            ),
+            "evidence_ids": [person_evidence_id], "confidence": 1.0,
+        }]
+
+        def add_section(kind, prefix, values, fallback_evidence=None):
+            values = list(dict.fromkeys(str(value).strip() for value in values if str(value or "").strip()))
+            if not values:
+                return
+            support = []
+            for item in claims:
+                if item.get("dimension") == kind:
+                    support.extend(item.get("evidence_ids", []) or [])
+                    support.extend(item.get("supporting_event_ids", []) or [])
+            for item in patterns:
+                if item.get("pattern_type") == kind and item.get("value_text") in values:
+                    support.extend(item.get("evidence_ids_json", []) or [])
+                    support.extend(item.get("supporting_event_ids_json", []) or [])
+            evidence_ids = list(dict.fromkeys(support or fallback_evidence or []))
+            if not evidence_ids:
+                return
+            sections.append({
+                "kind": kind, "text": prefix + "、".join(values) + "。",
+                "values": values, "evidence_ids": evidence_ids, "confidence": max(
+                    [float(item.get("confidence", 0) or 0) for item in claims if item.get("dimension") == kind] or [0.62]
+                ),
+            })
+
+        add_section(
+            "activity", f"从已有记录看，{person['canonical_name']}经常参与", [
+                item.get("value_text") for item in claims if item.get("dimension") == "activity"
+            ] + [item.get("value_text") for item in patterns if item.get("pattern_type") == "activity"],
+        )
+        add_section(
+            "place", f"这些共同经历主要出现在", [
+                item.get("value_text") for item in claims if item.get("dimension") == "place"
+            ] + [item.get("value_text") for item in patterns if item.get("pattern_type") == "place"],
+        )
+        add_section(
+            "clothing", f"能确认的外观记录包括", [
+                item.get("value_text") for item in claims if item.get("dimension") == "clothing"
+            ] + [item.get("value_text") for item in patterns if item.get("pattern_type") == "clothing"],
+        )
+        add_section(
+            "co_person", f"记录中他还经常和", [
+                item.get("value_text") for item in patterns if item.get("pattern_type") == "co_person"
+            ],
+        )
+        add_section(
+            "behavior", f"从重复出现的行为看，{person['canonical_name']}表现出", [
+                item.get("value_text") for item in claims if item.get("dimension") in {"behavior", "emotion", "preference"}
+            ] + [item.get("value_text") for item in patterns if item.get("pattern_type") in {"behavior", "emotion", "preference"}],
+        )
+        event_evidence = [item for item in evidence if item.get("kind") == "event" and item.get("event_id") in set(self.store.entity_event_ids(person_id))]
+        if len(sections) == 1:
+            sections.append({
+                "kind": "unknown", "text": f"目前关于{person['canonical_name']}的可归纳资料还不多，性格等方面我不作确定判断。",
+                "evidence_ids": [item["id"] for item in event_evidence[:3]] or [person_evidence_id],
+                "confidence": 0.0,
+            })
+        else:
+            behavior_kinds = {"behavior", "emotion", "preference"}
+            if not any(item["kind"] in behavior_kinds for item in sections):
+                sections.append({
+                    "kind": "unknown", "text": "至于性格，目前记录还不足以作出确定判断。",
+                    "evidence_ids": [person_evidence_id], "confidence": 0.0,
+                })
+        answer = "".join(section["text"] for section in sections)
+        return {
+            "entity_id": person_id, "name": person.get("canonical_name"),
+            "family_role": person.get("family_role"), "summary": profile.get("summary_zh", ""),
+            "sections": sections, "relationships": relationships,
+            "event_memory": self.store.list_person_event_memory(person_id, retrieved.get("scope_id")),
+            "answer": answer,
+        }, [person_evidence]
 
     @staticmethod
     def _narrative_answer(query, result):
@@ -400,18 +542,22 @@ class MemoryAgent:
 
     def _clarification_candidates(self, query, scope_id=None):
         value = str(query or "")
+        identity = self._resolve_person_entities(value, scope_id)
+        if identity.get("status") == "ambiguous":
+            return identity.get("candidates", [])
         candidates_by_type = {}
-        for entity in self.store.list_entities(scope_id=scope_id):
+        for entity in self.store.list_entities(scope_id=scope_id, public=False):
             name = str(entity.get("canonical_name") or "")
             if not name:
+                continue
+            # Pending people are review objects. They cannot be offered as an
+            # answer to a normal identity question.
+            if entity.get("entity_type") == "person" and entity.get("status") != "confirmed":
                 continue
             clues = {name[index:index + size] for size in range(2, min(4, len(name)) + 1) for index in range(len(name) - size + 1)}
             if not any(clue in value for clue in clues):
                 continue
-            candidates_by_type.setdefault(entity["entity_type"], []).append({
-                "id": entity["id"], "name": name, "entity_type": entity["entity_type"],
-                "evidence_count": entity.get("evidence_count", 0), "confidence": entity.get("confidence", 0),
-            })
+            candidates_by_type.setdefault(entity["entity_type"], []).append(self._identity_candidate(entity))
         eligible = [
             (entity_type, values)
             for entity_type, values in candidates_by_type.items()
@@ -508,12 +654,10 @@ class MemoryAgent:
         semantic_group_entity_ids = {
             entity_id for group in semantic_groups for entity_id in group.get("member_entity_ids", [])
         }
+        identity_resolution = self._resolve_person_entities(query, scope_id)
         focused_people = [
             entity for entity in entities
-            if entity.get("entity_type") == "person"
-            and entity.get("status") != "rejected"
-            and entity.get("canonical_name")
-            and entity["canonical_name"] in str(query or "")
+            if entity.get("id") in set(identity_resolution.get("entity_ids", []))
         ]
         focused_ids = {entity["id"] for entity in focused_people}
         focused_event_ids = {
@@ -623,6 +767,7 @@ class MemoryAgent:
             "appearance_evidence": appearance_evidence,
             "profiles": profiles,
             "focused_people": focused_people,
+            "identity_resolution": identity_resolution,
             "persons": persons[:50],
             "entities": entities[:100],
             "semantic_groups": semantic_groups,
@@ -918,6 +1063,13 @@ class MemoryAgent:
                     "crop_bbox": appearance.get("crop_bbox_json", []), "clothing": appearance.get("clothing_json", []),
                     "confidence": appearance.get("confidence", 0), "model": appearance.get("model_name"),
                 })
+        person_profile = None
+        identity_resolution = public_retrieved.get("identity_resolution") or {}
+        if self._is_person_introduction_query(query) and len(public_retrieved.get("focused_people", [])) == 1:
+            person_profile, profile_evidence = self._build_person_profile(
+                query, public_retrieved["focused_people"][0], public_retrieved, evidence,
+            )
+            evidence.extend(profile_evidence)
         if not evidence:
             if recall_recommendation:
                 result = {
@@ -937,7 +1089,7 @@ class MemoryAgent:
                 result["query"] = query
                 result["tool_trace"] = self._tool_trace(query, public_retrieved, insufficient=True)
                 return result
-            candidates = self._clarification_candidates(query, scope_id)
+            candidates = identity_resolution.get("candidates", []) if identity_resolution.get("status") == "ambiguous" else self._clarification_candidates(query, scope_id)
             candidate_asset_ids = list(dict.fromkeys(
                 item.get("metadata", {}).get("asset_id") for item in public_retrieved.get("vectors", [])
                 if item.get("metadata", {}).get("asset_id")
@@ -956,6 +1108,7 @@ class MemoryAgent:
                 "evidence": [],
                 "query_gap_id": gap["id"],
                 "clarification_candidates": candidates if len(candidates) >= 2 else [],
+                "identity_resolution": identity_resolution,
             }
             result["retrieval_trace"] = [
                 {"stage": "lexical", "status": "complete", "counts": {"events": 0, "observations": 0, "facts": 0}},
@@ -1017,6 +1170,14 @@ class MemoryAgent:
                 result.update(semantic_answer)
         result["answer"] = self._redact_private_places(result.get("answer", ""), private_places)
         result["evidence"] = evidence
+        if person_profile or identity_resolution.get("status") == "ambiguous":
+            result.setdefault("clarification_candidates", [])
+        result["identity_resolution"] = identity_resolution
+        if person_profile:
+            result["person_profile"] = person_profile
+            result["answer"] = person_profile["answer"]
+            result["model"] = "sentrix-person-profile"
+            result["insufficient_evidence"] = False
         result["retrieval_trace"] = [
             {"stage": "lexical", "status": "complete", "counts": {"events": len(public_retrieved.get("events", [])), "observations": len(public_retrieved.get("observations", [])), "facts": len(public_retrieved.get("facts", []))}},
             {"stage": "semantic", "status": "complete", "counts": {"claims": len(public_retrieved.get("semantic_claims", [])), "entities": len(public_retrieved.get("entities", [])), "relationships": len(public_retrieved.get("relationships", []))}},
