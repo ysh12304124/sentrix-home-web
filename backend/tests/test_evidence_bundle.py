@@ -6,8 +6,83 @@ from backend.evidence_retrieval import (
     EvidencePacket,
     EvidenceRetrievalKernel,
     build_verifier_evidence_bundle,
+    _contains,
 )
 from backend.query_contracts import Constraint, HARD, SEMANTIC, QuerySpec
+
+
+class ContainsSemanticsTests(unittest.TestCase):
+    """Phase R P0-6: containment is full-substring only, never tokenized."""
+
+    def test_full_substring_matches(self):
+        self.assertTrue(_contains("卧室睡衣自拍", "睡衣"))
+
+    def test_partial_word_tokens_do_not_match(self):
+        # The album1-01 failure mode: a whole visual description must not match
+        # a caption that shares only some characters.
+        self.assertFalse(_contains("卧室睡衣自拍", "浅黄色拼接毛绒睡衣自拍"))
+        self.assertFalse(_contains("厨房", "色"))
+
+    def test_empty_needle_never_matches(self):
+        self.assertFalse(_contains("anything", ""))
+
+    def test_case_insensitive(self):
+        self.assertTrue(_contains("NEW YEAR", "new"))
+
+
+class MatchedSourceWhitelistTests(unittest.TestCase):
+    """Phase R P1-2: matched only from direct-proof source types."""
+
+    def _kernel(self):
+        return EvidenceRetrievalKernel(InMemoryStore([], []))
+
+    def test_generic_observation_source_downgraded_to_possible(self):
+        kernel = self._kernel()
+        asset = {"id": "asset-1", "scope_id": "home", "file_name": "a.jpg",
+                 "media_type": "image", "captured_at": "2024-05-12T10:00:00"}
+        observation = {"id": "obs-1", "asset_id": "asset-1", "scope_id": "home",
+                       "captured_at": "2024-05-12T10:00:00", "caption": "x", "confidence": 0.9}
+        spec = QuerySpec(query_id="q", scope_mode="single", scope_ids=["home"], viewer_id="owner",
+                         conversation_id="c", intent="answer", answer_target="general",
+                         constraints=[Constraint("clothing", "X", SEMANTIC, "direct_or_possible")])
+        # Monkeypatch a hypothetical evaluator that (wrongly) claims matched
+        # with the weak "observation" source — the whitelist must downgrade it.
+        def fake_condition(asset, observation, constraint):
+            return ("matched", "observation", observation.get("id"), 0.9)
+        kernel._condition = fake_condition
+        result = kernel._evaluate(asset, observation, spec)
+        status = result["item"]["condition_results"]["clothing:X"]["status"]
+        self.assertEqual(status, "possible", "weak source must be downgraded to possible")
+
+    def test_direct_proof_source_stays_matched(self):
+        kernel = self._kernel()
+        asset = {"id": "asset-1", "scope_id": "home", "file_name": "a.jpg",
+                 "media_type": "image", "captured_at": "2024-05-12T10:00:00"}
+        observation = {"id": "obs-1", "asset_id": "asset-1", "scope_id": "home",
+                       "captured_at": "2024-05-12T10:00:00", "caption": "x", "confidence": 0.9}
+        spec = QuerySpec(query_id="q", scope_mode="single", scope_ids=["home"], viewer_id="owner",
+                         conversation_id="c", intent="answer", answer_target="general",
+                         constraints=[Constraint("media", "image", HARD, "asset_metadata")])
+        result = kernel._evaluate(asset, observation, spec)
+        status = result["item"]["condition_results"]["media:image"]["status"]
+        self.assertEqual(status, "matched")
+        self.assertEqual(result["item"]["condition_results"]["media:image"]["source_type"], "asset_metadata")
+
+    def test_single_value_place_exact_is_matched(self):
+        assets = [{"id": "asset-1", "scope_id": "home", "file_name": "a.jpg",
+                   "media_type": "image", "captured_at": "2024-05-12T10:00:00"}]
+        observations = [{
+            "id": "obs-1", "asset_id": "asset-1", "scope_id": "home",
+            "captured_at": "2024-05-12T10:00:00", "caption": "x",
+            "place": "厨房", "activity": None, "people": [], "clothing": [], "objects": [],
+            "confidence": 0.9,
+        }]
+        spec = QuerySpec(query_id="q", scope_mode="single", scope_ids=["home"], viewer_id="owner",
+                         conversation_id="c", intent="answer", answer_target="place",
+                         constraints=[Constraint("place", "厨房", SEMANTIC, "direct_or_possible")])
+        packet = EvidenceRetrievalKernel(InMemoryStore(assets, observations)).retrieve(spec)
+        self.assertEqual(packet.assets[0]["condition_results"]["place:厨房"]["status"], "matched")
+        self.assertEqual(packet.assets[0]["condition_results"]["place:厨房"]["source_type"], "observation_field_exact")
 
 
 class EvidenceBundleTests(unittest.TestCase):

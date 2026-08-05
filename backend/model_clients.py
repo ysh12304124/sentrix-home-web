@@ -38,7 +38,18 @@ def align_face_crop(image, bbox, landmarks=None):
 try:
     import httpx
 except ImportError:  # Keep pure parsing and SQLite tests runnable without optional runtime deps.
-    httpx = None
+    class _HttpxUnavailable:
+        class HTTPError(Exception):
+            pass
+
+        @staticmethod
+        def post(*args, **kwargs):
+            raise _HttpxUnavailable.HTTPError("httpx is not installed")
+
+    # Keep a patchable module-shaped object.  The production dependency is
+    # still declared in requirements; this fallback preserves model-client
+    # contract tests and produces a normal ModelError at runtime.
+    httpx = _HttpxUnavailable()
 
 from .semantic_taxonomy import (
     ATMOSPHERE_PRIMARY_TYPES,
@@ -178,23 +189,62 @@ def contains_latin_text(value):
 
 
 class GammaClient:
-    def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None):
+    def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
+                 parse_model=None, answer_model=None, verify_model=None,
+                 parse_backend=None, parse_base_url=None):
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+        # Phase R R5: per-role model separation, gated by SENTRIX_MODEL_SPLIT_V1.
+        # Until the flag is on, every role uses the main model so behaviour is
+        # fully backward-compatible.  The parser role may point at a 153-side
+        # 2B backend (D6) via parse_backend / parse_base_url without touching
+        # the e2b_server implementation.
+        model_split = os.getenv("SENTRIX_MODEL_SPLIT_V1", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if model_split or any((parse_model, answer_model, verify_model, parse_backend)):
+            self.parse_model = parse_model or os.getenv("SENTRIX_PARSE_MODEL", self.model)
+            self.answer_model = answer_model or os.getenv("SENTRIX_ANSWER_MODEL", self.model)
+            self.verify_model = verify_model or os.getenv("SENTRIX_VERIFY_MODEL", self.model)
+            self.parse_backend = parse_backend or os.getenv("SENTRIX_PARSE_BACKEND", "ollama_local")
+            self.parse_base_url = (parse_base_url or os.getenv("SENTRIX_PARSE_BASE_URL", "")).rstrip("/")
+        else:
+            self.parse_model = self.answer_model = self.verify_model = self.model
+            self.parse_backend = "ollama_local"
+            self.parse_base_url = ""
         self.timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
         configured_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
         # Ollama expects numeric -1 for indefinite residency; the string "-1"
         # is rejected by its request schema.
         self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
 
-    def chat(self, prompt, images=None, vision_options=None, json_mode=True):
+    def _endpoint_for(self, role):
+        """Resolve (base_url, model) for a model role.
+
+        The parser role can be split to a separate backend (153 e2b 2B, D6).
+        When ``parse_backend=e2b`` but no e2b base_url is configured, we fall
+        back to the main endpoint rather than hard-failing — the 153 wiring
+        sets SENTRIX_PARSE_BASE_URL.
+        """
+        if role == "parser" and self.parse_backend in {"e2b", "e2b_lora"}:
+            if self.parse_base_url:
+                return self.parse_base_url, self.parse_model
+            return self.base_url, self.parse_model
+        if role == "parser":
+            return self.base_url, self.parse_model
+        if role == "answer":
+            return self.base_url, self.answer_model
+        if role == "verify":
+            return self.base_url, self.verify_model
+        return self.base_url, self.model
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
         if httpx is None:
             raise ModelError("httpx is not installed")
         message = {"role": "user", "content": prompt}
         if images:
             message["images"] = [image["base64"] for image in images]
+        endpoint_base, model = self._endpoint_for(role)
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": [message],
             "stream": False,
             "keep_alive": self.keep_alive,
@@ -209,7 +259,7 @@ class GammaClient:
                 "num_predict": vision_options["num_predict"],
             })
         try:
-            response = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
+            response = httpx.post(f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
             return data.get("message", {}).get("content", "")

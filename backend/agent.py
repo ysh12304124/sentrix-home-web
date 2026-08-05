@@ -53,12 +53,17 @@ def contains(value, query):
 
 
 class MemoryAgent:
-    def __init__(self, store, gamma=None, clip=None):
+    def __init__(self, store, gamma=None, clip=None, embedding_router=None, retrieval_config=None):
         self.store = store
         self.gamma = gamma or GammaClient()
         self.clip = clip or ClipAdapter()
         self.annotation_store = AnnotationStore(store.connection)
-        self.thin_runtime = ThinAgentRuntime(store, gamma=self.gamma)
+        if embedding_router is None and clip is not None:
+            from .embeddings import EmbeddingRouter
+            embedding_router = EmbeddingRouter.from_clip(self.clip)
+        self.thin_runtime = ThinAgentRuntime(store, gamma=self.gamma,
+                                             embedding_router=embedding_router,
+                                             retrieval_config=retrieval_config)
         self.framework_planner = PydanticAIPlanner()
         self._conversations = {}
         self._dialogue_states = {}

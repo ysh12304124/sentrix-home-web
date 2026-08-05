@@ -89,7 +89,7 @@ class LLMClaimExtractor:
             json.dumps([{"text": item.get("text"), "candidate_evidence_ids": list(item.get("candidate_evidence_ids") or [])} for item in candidates], ensure_ascii=False),
         )
         try:
-            raw = self.gamma.chat(prompt, json_mode=True)
+            raw = self.gamma.chat(prompt, json_mode=True, role="verify")
         except Exception:
             return []
         parsed = parse_json_response(raw)

@@ -90,9 +90,10 @@ class QueryParser:
     safe fallback returns ``mode="none"`` with no keyword contamination.
     """
 
-    def __init__(self, gamma=None, framework_planner=None):
+    def __init__(self, gamma=None, framework_planner=None, router=None):
         self.gamma = gamma
         self.framework_planner = framework_planner
+        self.router = router
 
     def parse(self, message, recent_turns="", now=None):
         raw = self._call_parser(message, recent_turns, now)
@@ -123,12 +124,18 @@ class QueryParser:
         return self._invoke_gamma(prompt)
 
     def _invoke_gamma(self, prompt):
-        if not self.gamma or not hasattr(self.gamma, "chat"):
-            return None
-        try:
-            text = self.gamma.chat(prompt, json_mode=True)
-        except Exception:
-            return None
+        if self.router is not None:
+            try:
+                text = self.router.chat("parser", prompt, json_mode=True)
+            except Exception:
+                text = None
+        elif self.gamma and hasattr(self.gamma, "chat"):
+            try:
+                text = self.gamma.chat(prompt, json_mode=True, role="parser")
+            except Exception:
+                text = None
+        else:
+            text = None
         if not text:
             return None
         result = parse_json_response(text)
@@ -151,6 +158,11 @@ class QueryParser:
         errors = []
         if draft.mode not in {"none", "contextual", "evidence"}:
             errors.append("mode missing or invalid")
+        # Phase R P0-6: an evidence mode with no action is structurally
+        # inconsistent — the model claims a household query but forgot the
+        # goal.  Trigger a repair instead of silently treating it as evidence.
+        if draft.mode == "evidence" and not draft.actions:
+            errors.append("evidence mode requires at least one action")
         return draft, errors
 
     @staticmethod

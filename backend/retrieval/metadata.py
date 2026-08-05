@@ -1,0 +1,71 @@
+"""MetadataRetriever — structured recall over asset metadata.
+
+Scope, media type and time bounds are the only things this retriever filters
+on.  It is the "structured only" channel in the ablation matrix and doubles as
+the hard-prefilter candidate universe before the Kernel's own hard pass.
+
+Pre-R2 the Kernel walked every asset anyway; this retriever makes that walk
+explicit and cheap by applying the same scope/time/media constraints up front.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from .base import CandidateHit, HardFilterContext, RetrievalQuery
+
+
+@dataclass
+class MetadataRetriever:
+    name: str = "metadata"
+    kind: str = "primary"
+
+    def __init__(self, store):
+        self.store = store
+
+    def retrieve(self, query: RetrievalQuery, filters: HardFilterContext, limit: int) -> list[CandidateHit]:
+        # Metadata only produces a recall signal when there is a positive
+        # structured condition (time window / media type) to match.  Without
+        # one it returns nothing, so a pure-semantic query does not get polluted
+        # by "every asset in scope" becoming an anchor.
+        if not filters.time_bounds and not filters.media_types:
+            return []
+        hits = []
+        assets = self.store.list_assets(limit=100_000)
+        for asset in assets:
+            asset_scope = asset.get("scope_id") or "home-default"
+            if not filters.all_authorized and filters.scope_ids and asset_scope not in filters.scope_ids:
+                continue
+            media_type = asset.get("media_type")
+            if filters.media_types and media_type not in filters.media_types:
+                continue
+            if media_type in filters.negated_media:
+                continue
+            if filters.time_bounds:
+                captured = _parse_datetime(asset.get("captured_at"))
+                if captured is not None and not (filters.time_bounds[0] <= captured < filters.time_bounds[1]):
+                    continue
+            hits.append(CandidateHit(
+                asset_id=asset["id"],
+                retriever=self.name,
+                raw_score=0.0,
+                score_kind="discrete",
+                higher_is_better=True,
+                rank=len(hits) + 1,
+                source_id=asset["id"],
+                source_revision=asset.get("revision"),
+                metadata={"scope_id": asset_scope, "media_type": media_type,
+                          "captured_at": asset.get("captured_at")},
+            ))
+            if len(hits) >= limit:
+                break
+        return hits
+
+
+def _parse_datetime(value):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None

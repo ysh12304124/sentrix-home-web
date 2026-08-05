@@ -10,18 +10,33 @@ from .answer_composer import compose_answer
 from .claim_extractor import ClaimExtractor
 from .complex_answer import ComplexAnswerBuilder
 from .evidence_retrieval import EvidenceRetrievalKernel
-from .memory_gate import MemoryGate
-from .query_contracts import build_query_spec
+from .memory_gate import MemoryGate, GateDecision
+from .query_contracts import QueryAction, build_query_spec
 from .query_parser import QueryParser
 
 
 class ThinAgentRuntime:
-    def __init__(self, store, gamma=None):
+    def __init__(self, store, gamma=None, embedding_router=None, retrieval_config=None):
         self.store = store
         self.gamma = gamma
         self.gate = MemoryGate()
-        self.kernel = EvidenceRetrievalKernel(store)
-        self.parser = QueryParser(gamma=gamma)
+        self.embedding_router = embedding_router
+        if embedding_router is not None:
+            from .retrieval import RetrievalConfig, build_default_retrievers
+            config = retrieval_config or RetrievalConfig()
+            if config.multi_retriever:
+                retrievers = build_default_retrievers(store, embedding_router=embedding_router, config=config)
+                self.kernel = EvidenceRetrievalKernel(store, retrievers=retrievers,
+                                                      embedding_router=embedding_router, config=config)
+            else:
+                self.kernel = EvidenceRetrievalKernel(store)
+        else:
+            self.kernel = EvidenceRetrievalKernel(store)
+        self.router = None
+        if gamma is not None:
+            from .model_routing import ModelRouter
+            self.router = ModelRouter(gamma=gamma)
+        self.parser = QueryParser(gamma=gamma, router=self.router)
         self.complex_builder = ComplexAnswerBuilder(gamma=gamma)
 
     def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None, viewer_id=None, recent_turns="", selected_entity_id=None):
@@ -41,6 +56,8 @@ class ThinAgentRuntime:
             return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft)
         if decision.mode == "contextual":
             return self._contextual(message, conversation_id, scope_id, viewer_id, decision, draft)
+        if decision.mode == "ambiguous":
+            return self._ambiguous_path(message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft)
         spec = build_query_spec(
             draft,
             scope_id=scope_id,
@@ -58,6 +75,53 @@ class ThinAgentRuntime:
             packet.gaps = [{"condition": "confirmed_person", "reason": "没有找到当前 scope 内已确认的人物"}]
         return self._evidence_answer(message, conversation_id, scope_id, viewer_id, decision, spec, packet, draft)
 
+    def _ambiguous_path(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
+        """Gate said ambiguous (parser none without an explicit general task).
+
+        Run the Neutral Probe on raw text.  A strong candidate upgrades to a
+        formal retrieval; a weak/conflicting one clarifies instead of
+        fabricating a generic description (R4).
+        """
+        probe = self._run_probe(message, scope_id, viewer_id)
+        if probe.decision == "upgrade":
+            if not draft.semantic_conditions:
+                draft.semantic_conditions.append(
+                    {"dimension": "semantic", "value": message, "source_text": message}
+                )
+            if not draft.actions:
+                draft.actions = [QueryAction(type="answer_question", target="general")]
+            spec = build_query_spec(
+                draft,
+                scope_id=scope_id,
+                viewer_id=viewer_id,
+                conversation_id=conversation_id,
+                entity_resolver=lambda name: self._resolve_person(name, scope_id),
+                query_id=f"query_{uuid.uuid4().hex[:12]}",
+            )
+            packet = self.kernel.retrieve(spec)
+            upgraded = GateDecision(
+                "evidence", f"probe_upgrade:{probe.reason}",
+                answer_target=decision.answer_target, concrete_memory_reads=1,
+                evidence_search_calls=1, query_parse_calls=decision.query_parse_calls,
+                allow_probe=False,
+            )
+            return self._evidence_answer(message, conversation_id, scope_id, viewer_id,
+                                         upgraded, spec, packet, draft)
+        if probe.decision == "clarify":
+            answer = "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
+            trace = [{"stage": "gate", "status": "ambiguous",
+                      "counts": {"query_parse": decision.query_parse_calls,
+                                 "probe": probe.channel_counts, "probe_decision": probe.reason}}]
+            return self._envelope(answer, conversation_id, scope_id, viewer_id, decision,
+                                  [], [], "clarify", trace, draft=draft)
+        return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft)
+
+    def _run_probe(self, message, scope_id, viewer_id):
+        from .retrieval import NeutralProbe, RetrievalConfig
+        channel_hits = self.kernel.probe(message, scope_id, viewer_id)
+        return NeutralProbe(RetrievalConfig()).run(message, channel_hits,
+                                                   scope_id=scope_id, viewer_id=viewer_id)
+
     def _normal_chat(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
         answer = "我在听。"
         if self.gamma and hasattr(self.gamma, "chat"):
@@ -67,7 +131,10 @@ class ThinAgentRuntime:
                 f"最近对话：{str(recent_turns or '')[-1200:]}\n用户：{message}"
             )
             try:
-                text = self.gamma.chat(prompt, json_mode=False)
+                if self.router is not None:
+                    text = self.router.chat("answer", prompt, json_mode=False)
+                else:
+                    text = self.gamma.chat(prompt, json_mode=False, role="answer")
                 answer = str(text or "").strip() or answer
             except Exception:
                 pass
@@ -129,7 +196,15 @@ class ThinAgentRuntime:
                 "captured_at": item.get("captured_at"),
                 "condition_results": item.get("condition_results", {}),
                 "level": item.get("level"), "evidence_ids": item.get("evidence_ids", []),
+                "near_duplicate_group": item.get("near_duplicate_group"),
+                "near_duplicate_size": item.get("near_duplicate_size", 1),
             })
+        if packet.assets:
+            try:
+                from .retrieval.near_duplicate import NearDuplicateGrouper
+                NearDuplicateGrouper(self.store).annotate(evidence)
+            except Exception:
+                pass
         person_summary = spec.answer_target == "person" and bool(spec.entity_ids)
         clothing_gap = spec.answer_target == "clothing" and bool(spec.entity_ids) and not self._has_subject_clothing(packet)
         if spec.answer_target == "person" and not spec.entity_ids:
@@ -141,7 +216,10 @@ class ThinAgentRuntime:
             answer = f"现有记录没有把衣物字段可靠绑定到{name}，无法确认这件衣服属于他。"
             statements = []
         elif not evidence:
-            answer, statements = ("没有找到满足这些条件的可靠家庭证据。", [])
+            # Phase R R6: a household evidence query with no matched evidence
+            # must refuse explicitly — never fall back to normal chat with a
+            # fabricated general description.
+            answer, statements = ("当前记忆中没有找到足够匹配的原始证据。", [])
         else:
             answer, statements = self._simple_answer(packet)
         allowed = self._allowed_facts(packet)
@@ -169,6 +247,8 @@ class ThinAgentRuntime:
              "counts": {"assets": len(packet.assets), "excluded": packet.excluded_count,
                         "exact": len(packet.exact_results), "approximate": len(packet.approximate_results)}},
         ]
+        if getattr(packet, "channel_trace", None):
+            trace.append({"stage": "channels", "status": "complete", "channels": packet.channel_trace})
         result = self._envelope(answer, conversation_id, scope_id, viewer_id, decision, evidence, packet.gaps,
                                  "anchored" if evidence else "gap", trace, spec=spec, packet=packet, draft=draft)
         return_assets_requested = any(action.type == "return_assets" for action in spec.actions) or bool(spec.result_requirement.get("return_original_assets"))
@@ -247,13 +327,42 @@ class ThinAgentRuntime:
         return "".join(item["text"] for item in statements), statements
 
     @staticmethod
+    def _human_condition_text(key, status):
+        """User-facing text for a condition — never exposes the internal key
+        (e.g. ``clothing:浅黄``), the ANN score, the trace or table names."""
+        value = key.split(":", 1)[1] if ":" in key else key
+        if status == "matched":
+            return f"记录中有「{value}」"
+        if status == "possible":
+            return f"记录中可能有「{value}」，但无法完全确认"
+        return "目前无法确认其中的关键活动或视觉细节。"
+
+    @staticmethod
     def _allowed_facts(packet):
+        # Phase R R6: one fact per condition_key regardless of how many Assets
+        # hit it; evidence_ids are the union across assets.  Prevents the
+        # album1-01 "记录支持X" ten-times-repeat failure mode.
         facts, possibilities, unknowns = [], [], []
+        facts_by_key: dict[str, dict] = {}
+        possible_by_key: dict[str, dict] = {}
         for item in packet.assets:
             for key, condition in item.get("condition_results", {}).items():
-                text = f"记录支持{key.split(':', 1)[1]}"
-                target = facts if condition.get("status") == "matched" else possibilities if condition.get("status") == "possible" else unknowns
-                target.append({"text": text, "status": condition.get("status"), "condition_key": key, "evidence_ids": item.get("evidence_ids", [])})
+                status = condition.get("status")
+                bucket = facts_by_key if status == "matched" else possible_by_key if status == "possible" else None
+                if bucket is None:
+                    continue
+                entry = bucket.get(key)
+                if entry is None:
+                    entry = {
+                        "text": ThinAgentRuntime._human_condition_text(key, status),
+                        "status": status, "condition_key": key, "evidence_ids": [],
+                    }
+                    bucket[key] = entry
+                for evidence_id in item.get("evidence_ids", []):
+                    if evidence_id not in entry["evidence_ids"]:
+                        entry["evidence_ids"].append(evidence_id)
+        facts.extend(facts_by_key.values())
+        possibilities.extend(possible_by_key.values())
         unknowns.extend({"text": "目前无法确认其中的关键活动或视觉细节。", "evidence_ids": []} for _ in packet.gaps)
         return {"allowed_answer_facts": facts, "allowed_possibilities": possibilities, "required_unknowns": unknowns}
 

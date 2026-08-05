@@ -113,7 +113,7 @@ class ComplexAnswerBuilder:
             "{{context_packet}}", json.dumps(context, ensure_ascii=False),
         )
         try:
-            raw = self.gamma.chat(prompt, json_mode=True)
+            raw = self.gamma.chat(prompt, json_mode=True, role="answer")
         except Exception:
             return None
         parsed = parse_json_response(raw)

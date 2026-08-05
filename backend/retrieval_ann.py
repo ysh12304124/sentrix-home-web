@@ -9,6 +9,7 @@ the same protocol and switch via ``SENTRIX_ANN_INDEX_V1``.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 import math
 
@@ -84,6 +85,12 @@ class HnswlibIndex:
     hnswlib requires integer labels; a string-id map preserves the AnnIndex
     contract while translating our IDs.  scope filtering stays code-side:
     the index returns candidates, ``EvidenceRetrievalKernel`` re-filters.
+
+    Phase R P0-4: every persisted index carries a Manifest (model_id,
+    checkpoint_hash, dimension, normalized, id_map_checksum ...).  Loading
+    an index whose manifest is incompatible with the query embedder is a hard
+    error for that channel — the retriever records ``index_incompatible`` and
+    skips instead of silently searching a mismatched vector space.
     """
 
     _DEFAULT_MAX_ELEMENTS = 200_000
@@ -91,7 +98,7 @@ class HnswlibIndex:
     _DEFAULT_M = 16
     _DEFAULT_EF_SEARCH = 50
 
-    def __init__(self, *, dim=None, max_elements=None, ef_construction=None, M=None, ef_search=None, space="cosine"):
+    def __init__(self, *, dim=None, max_elements=None, ef_construction=None, M=None, ef_search=None, space="cosine", manifest_extra=None):
         import hnswlib
 
         self._hnswlib = hnswlib
@@ -107,6 +114,42 @@ class HnswlibIndex:
         self._label_to_meta = {}
         self._next_label = 0
         self._deleted_labels = set()
+        self._manifest = {}
+        self._manifest_extra = dict(manifest_extra or {})
+        self._loaded_path = None
+        self._incompatible_reason = None
+
+    def set_manifest_extra(self, **extra):
+        self._manifest_extra.update(extra)
+
+    def manifest(self) -> dict:
+        """Current index manifest (empty when never saved/loaded)."""
+        return dict(self._manifest)
+
+    @property
+    def incompatible_reason(self) -> str | None:
+        return self._incompatible_reason
+
+    def validate(self, *, expected_model_id=None, expected_dim=None, expected_space="cosine") -> bool:
+        """Check the loaded index matches the query embedder contract.
+
+        Incompatible -> records a reason and returns False; the retriever must
+        skip this channel (never search a mismatched space).
+        """
+        self._incompatible_reason = None
+        if not self._manifest:
+            self._incompatible_reason = "no_manifest"
+            return False
+        if expected_dim is not None and self._manifest.get("dimension") != expected_dim:
+            self._incompatible_reason = f"dimension_mismatch:{self._manifest.get('dimension')}vs{expected_dim}"
+            return False
+        if expected_model_id and self._manifest.get("model_id") != expected_model_id:
+            self._incompatible_reason = f"model_mismatch:{self._manifest.get('model_id')}vs{expected_model_id}"
+            return False
+        if self._manifest.get("space") != expected_space:
+            self._incompatible_reason = f"space_mismatch:{self._manifest.get('space')}"
+            return False
+        return True
 
     def _ensure_index(self, dim):
         if self._index is None:
@@ -200,8 +243,17 @@ class HnswlibIndex:
                 break
         return results
 
+    @staticmethod
+    def _id_map_checksum(id_to_label):
+        import hashlib
+        digest = hashlib.sha256()
+        for key in sorted(id_to_label):
+            digest.update(f"{key}:{id_to_label[key]}".encode("utf-8"))
+        return digest.hexdigest()[:16]
+
     def save(self, path):
         import json
+        from datetime import datetime, timezone
         if self._index is None:
             return
         self._index.save_index(f"{path}.hnsw")
@@ -219,9 +271,34 @@ class HnswlibIndex:
         }
         with open(f"{path}.meta.json", "w", encoding="utf-8") as handle:
             json.dump(sidecar, handle, ensure_ascii=False)
+        manifest = {
+            "index_version": 1,
+            "space": self._space,
+            "dimension": self._dim,
+            "normalized": self._manifest_extra.get("normalized", True),
+            "distance": "cosine",
+            "model_id": self._manifest_extra.get("model_id"),
+            "checkpoint_hash": self._manifest_extra.get("checkpoint_hash"),
+            "source_type": self._manifest_extra.get("source_type"),
+            "source_count": self._next_label - len(self._deleted_labels),
+            "source_revision": self._manifest_extra.get("source_revision"),
+            "id_map_checksum": self._id_map_checksum(self._id_to_label),
+            "built_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._manifest = manifest
+        with open(f"{path}.manifest.json", "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)
 
     def load(self, path):
         import json
+        self._loaded_path = path
+        self._incompatible_reason = None
+        manifest_path = f"{path}.manifest.json"
+        if Path(manifest_path).is_file():
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                self._manifest = json.load(handle)
+        else:
+            self._manifest = {}
         with open(f"{path}.meta.json", "r", encoding="utf-8") as handle:
             sidecar = json.load(handle)
         self._space = sidecar["space"]

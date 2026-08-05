@@ -2,9 +2,8 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-import re
 
-from .query_contracts import HARD, SEMANTIC, QuerySpec, parse_time_expression
+from .query_contracts import HARD, SEMANTIC, QueryFacet, QuerySpec, parse_time_expression
 
 
 def build_verifier_evidence_bundle(packet, claim_id):
@@ -38,6 +37,9 @@ class EvidencePacket:
     approximate_results: list[dict] = field(default_factory=list)
     gaps: list[dict] = field(default_factory=list)
     excluded_count: int = 0
+    # Phase R R2: per-channel recall trace so API/benchmark can prove each
+    # retriever was invoked (or give an explicit unavailable reason).
+    channel_trace: dict = field(default_factory=dict)
 
     def as_dict(self):
         return {
@@ -67,20 +69,40 @@ def _parse_datetime(value):
 
 
 def _contains(haystack, needle):
+    """Full-substring containment only (Phase R P0-6).
+
+    Tokenized all-match produced the album1-01 false-positive storm (single
+    colour/material characters matching unrelated captions).  A condition is
+    only "supported" by a field when the full normalized value is present.
+    Candidate recall has its own channel (LexicalRetriever); this function is
+    the evidence check, not a recall path.
+    """
     haystack, needle = str(haystack or "").lower(), str(needle or "").lower()
     if not needle:
         return False
-    if needle in haystack:
-        return True
-    terms = [term for term in re.findall(r"[\w\u4e00-\u9fff]+", needle) if len(term) > 1]
-    return bool(terms) and all(term in haystack for term in terms)
+    return needle in haystack
 
 
 class EvidenceRetrievalKernel:
-    def __init__(self, store):
+    def __init__(self, store, *, retrievers=None, embedding_router=None, config=None, trace=None):
         self.store = store
+        self.retrievers = list(retrievers or [])
+        self.embedding_router = embedding_router
+        self.config = config
+        self._trace_sink = trace
 
     def retrieve(self, spec: QuerySpec):
+        if self.retrievers and self._multi_retriever_enabled():
+            return self._retrieve_multi(spec)
+        return self._retrieve_single(spec)
+
+    def _multi_retriever_enabled(self) -> bool:
+        if self.config is not None:
+            return self.config.multi_retriever
+        import os
+        return os.getenv("SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1", "0").lower() in {"1", "true", "yes", "on"}
+
+    def _retrieve_single(self, spec: QuerySpec):
         all_authorized = spec.scope_mode == "all_authorized"
         scope_id = spec.scope_id or (spec.scope_ids[0] if spec.scope_ids else "all_authorized")
         query_scope = None if all_authorized else scope_id
@@ -121,11 +143,170 @@ class EvidenceRetrievalKernel:
         packet.approximate_results = [item for item in packet.approximate_results if item in packet.assets]
         return packet
 
+    def _retrieve_multi(self, spec: QuerySpec):
+        """Phase R R2 path: prefilter -> multi-channel recall -> merge -> seed
+        gate/adjacency -> condition evidence -> hard postfilter -> fusion.
+
+        Only candidate Assets recalled by at least one enabled retriever are
+        evaluated, which is the semantic-difference this phase introduces.
+        """
+        from .retrieval import HardFilterContext, RetrievalQuery, fuse
+        from .retrieval.config import RetrievalConfig
+
+        config = self.config or RetrievalConfig()
+        filters = HardFilterContext.from_spec(spec)
+        query = RetrievalQuery.from_spec(spec, embedding_router=self.embedding_router)
+        recall_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
+
+        channel_hits = {}
+        channel_trace = {}
+        expanders = []
+        for retriever in self.retrievers:
+            if retriever.kind == "expander":
+                expanders.append(retriever)
+                continue
+            try:
+                hits = retriever.retrieve(query, filters, limit=recall_limit)
+                channel_hits[retriever.name] = hits
+                channel_trace[retriever.name] = {
+                    "invoked": True, "candidate_count": len(hits), "status": getattr(retriever, "status", "ok"),
+                }
+            except Exception as error:
+                channel_hits[retriever.name] = []
+                channel_trace[retriever.name] = {"invoked": True, "candidate_count": 0,
+                                                 "status": "error", "reason": str(error)}
+
+        scope_id = spec.scope_id or (spec.scope_ids[0] if spec.scope_ids else "all_authorized")
+        all_authorized = spec.scope_mode == "all_authorized"
+        packet = EvidencePacket(spec.query_id, scope_id, spec.answer_target)
+        packet.channel_trace = channel_trace
+
+        primary_items = self._evaluate_fused(fuse(channel_hits), spec, packet,
+                                             filters, all_authorized, scope_id,
+                                             skip_assets=set())
+
+        # R3B: seed-quality gate — only exact/strong primary results are seeds.
+        seeds = [item["asset_id"] for item in primary_items if item.get("level") in {"exact", "strong"}]
+        adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "no_seeds"}
+        for expander in expanders:
+            try:
+                adjacency_hits = expander.expand(seeds, filters, limit=recall_limit)
+                adjacency_trace = {"invoked": True, "candidate_count": len(adjacency_hits),
+                                   "status": "ok", "seeds": len(seeds)}
+            except Exception as error:
+                adjacency_hits = []
+                adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "error", "reason": str(error)}
+            channel_hits[expander.name] = adjacency_hits
+            channel_trace[expander.name] = adjacency_trace
+
+        already = {item["asset_id"] for item in primary_items}
+        if expanders:
+            adjacency_items = self._evaluate_fused(fuse({expander.name: channel_hits[expander.name]
+                                                         for expander in expanders}),
+                                                   spec, packet, filters, all_authorized, scope_id,
+                                                   skip_assets=already)
+        else:
+            adjacency_items = []
+
+        packet.assets = primary_items + [item for item in adjacency_items if item["asset_id"] not in already]
+        for item in packet.assets:
+            if item["level"] == "exact":
+                packet.exact_results.append(item)
+            elif item["level"] == "strong":
+                packet.strong_results.append(item)
+            else:
+                packet.approximate_results.append(item)
+
+        packet.assets.sort(key=lambda item: ({"exact": 0, "strong": 1, "approximate": 2}[item["level"]], -item["score"]))
+        for constraint in spec.constraints:
+            if constraint.strictness == SEMANTIC and not any(item["condition_results"].get(constraint.key, {}).get("status") == "matched" for item in packet.assets):
+                packet.gaps.append({"condition": constraint.key, "reason": "no_direct_support"})
+        if spec.result_requirement.get("mode") != "all_relevant":
+            packet.assets = packet.assets[:recall_limit]
+        packet.exact_results = [item for item in packet.exact_results if item in packet.assets]
+        packet.strong_results = [item for item in packet.strong_results if item in packet.assets]
+        packet.approximate_results = [item for item in packet.approximate_results if item in packet.assets]
+        return packet
+
+    def _evaluate_fused(self, fused, spec, packet, filters, all_authorized, scope_id, *, skip_assets):
+        """Run the condition pass over fused candidates; return non-excluded items."""
+        items = []
+        for candidate in fused:
+            if candidate.asset_id in skip_assets:
+                continue
+            asset = self.store.get_asset(candidate.asset_id)
+            if asset is None:
+                continue
+            if not all_authorized and (asset.get("scope_id") or "home-default") != scope_id:
+                continue
+            observations = self._observations_for_asset(candidate.asset_id)
+            best = None
+            for observation in observations or [{}]:
+                result = self._evaluate(asset, observation, spec)
+                if best is None or result["rank"] > best["rank"]:
+                    best = result
+            if best["excluded"]:
+                packet.excluded_count += 1
+                continue
+            item = best["item"]
+            item["attributions"] = [
+                {"retriever": hit.retriever, "rank": hit.rank, "score": hit.raw_score,
+                 "score_kind": hit.score_kind}
+                for hit in candidate.retriever_hits
+            ]
+            item["fusion_score"] = round(candidate.rrf, 4)
+            items.append(item)
+        return items
+
+    def _observations_for_asset(self, asset_id):
+        return [item for item in self.store.list_observations(limit=100_000) if item.get("asset_id") == asset_id]
+
+    def probe(self, raw_text: str, scope_id: str | None, viewer_id: str = "owner"):
+        """Neutral probe: run the shared retrievers under probe budgets (R4).
+
+        Returns per-channel CandidateHits for the NeutralProbe to aggregate.
+        Scope / media come from the request context; no unconfirmed hard
+        semantic constraints are fabricated (P0-7).
+        """
+        if not self.retrievers:
+            return {}
+        from .retrieval import HardFilterContext, RetrievalQuery
+        from .retrieval.config import RetrievalConfig
+        config = self.config or RetrievalConfig()
+        filters = HardFilterContext(
+            scope_ids=(scope_id,) if scope_id else (),
+            viewer_id=viewer_id,
+        )
+        query = RetrievalQuery(
+            whole_query=raw_text or "",
+            facets=[QueryFacet("semantic", raw_text or "")],
+        )
+        channel_hits = {}
+        for retriever in self.retrievers:
+            if retriever.kind != "primary":
+                continue
+            try:
+                channel_hits[retriever.name] = retriever.retrieve(query, filters, limit=config.probe_top_k)
+            except Exception:
+                channel_hits[retriever.name] = []
+        return channel_hits
+
+    # Phase R P1-2: a ``matched`` status is only allowed from evidence sources
+    # that directly prove the condition.  Vector / FTS / generic pool hits can
+    # only produce ``possible`` — a high cosine or a token overlap never proves
+    # a household fact.
+    _MATCHED_SOURCE_TYPES = frozenset({
+        "asset_metadata", "observation_field_exact", "confirmed_bridge",
+        "entity_bridge_confirmed", "subject_binding",
+    })
+
     def _evaluate(self, asset, observation, spec):
         results = {}
         excluded = False
         for constraint in spec.constraints:
             status, source_type, source_id, confidence = self._condition(asset, observation, constraint)
+            if status == "matched" and source_type not in self._MATCHED_SOURCE_TYPES:
+                status = "possible"
             results[constraint.key] = {"status": status, "source_type": source_type, "source_id": source_id, "confidence": confidence}
             if constraint.strictness == HARD and (status != "matched" if not constraint.negated else status == "matched"):
                 excluded = True
@@ -219,10 +400,10 @@ class EvidenceRetrievalKernel:
         raw = observation.get(field) or ""
         text = " ".join(str(item) for item in raw) if isinstance(raw, list) else str(raw)
         if _contains(text, constraint.value):
-            return ("matched", "observation", observation.get("id"),
+            return ("matched", "observation_field_exact", observation.get("id"),
                     float(observation.get("confidence", 0) or 0))
         if text:
-            return ("contradicted", "observation", observation.get("id"),
+            return ("contradicted", "observation_field_exact", observation.get("id"),
                     float(observation.get("confidence", 0) or 0))
         return ("unknown", None, None, 0.0)
 
@@ -233,7 +414,7 @@ class EvidenceRetrievalKernel:
         raw = observation.get("activity") or ""
         text = " ".join(str(item) for item in raw) if isinstance(raw, list) else str(raw)
         if _contains(text, constraint.value):
-            return ("matched", "observation", observation.get("id"),
+            return ("matched", "observation_field_exact", observation.get("id"),
                     float(observation.get("confidence", 0) or 0))
         return ("unknown", None, None, 0.0)
 
