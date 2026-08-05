@@ -76,13 +76,30 @@ class ThinAgentRuntime:
 
     def _contextual(self, message, conversation_id, scope_id, viewer_id, decision, draft):
         cards = []
-        try:
-            people = self.store.list_entities(status="confirmed", scope_id=scope_id)
-            cards = [{"subject_id": item.get("id"), "display_name": item.get("canonical_name"),
-                      "epistemic_type": "confirmed_fact",
-                      "text": item.get("summary") or "已确认人物"} for item in people[:5]]
-        except Exception:
-            cards = []
+        # Prefer Core Memory Cards when SENTRIX_CORE_MEMORY_V1 is on; otherwise
+        # fall back to the confirmed-entity placeholder from Phase 2R.
+        import os
+        core_flag = os.getenv("SENTRIX_CORE_MEMORY_V1", "0").lower() in {"1", "true", "on"}
+        if core_flag:
+            try:
+                from .core_memory import CoreMemoryStore
+                cms = CoreMemoryStore(self.store)
+                cms_cards = cms.list_cards(scope_id=scope_id, limit=5)
+                for card in cms_cards:
+                    cms.record_access(card_id=card["card_id"], conversation_id=conversation_id, viewer_id=viewer_id)
+                    for item in card.get("items", [])[:1]:
+                        cards.append({"subject_id": card["subject_id"], "display_name": card["display_name"],
+                                      "epistemic_type": item["epistemic_type"], "text": item["text"]})
+            except Exception:
+                cards = []
+        if not cards:
+            try:
+                people = self.store.list_entities(status="confirmed", scope_id=scope_id)
+                cards = [{"subject_id": item.get("id"), "display_name": item.get("canonical_name"),
+                          "epistemic_type": "confirmed_fact",
+                          "text": item.get("summary") or "已确认人物"} for item in people[:5]]
+            except Exception:
+                cards = []
         answer = "我明白，这种时候会特别想起熟悉的人。"
         if cards:
             answer += "我只保留了关于已确认人物的轻量记忆，不展开具体照片。"
