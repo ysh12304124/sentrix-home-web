@@ -30,6 +30,24 @@ def rrf_score(ranks: dict[str, int], k: int = RRF_K) -> float:
     return sum(1.0 / (k + rank) for rank in ranks.values())
 
 
+# Per-channel strength (R7 ablation: Chinese-CLIP visual r10=0.887, lexical
+# 0.373, text 0.158).  A flat RRF lets weak channels dilute strong visual hits,
+# so hybrid fell below visual-only.  Weighting keeps the strong channel's
+# recalled GT near the top while weaker channels still add diversity.
+DEFAULT_CHANNEL_WEIGHTS = {
+    "visual_ann": 2.5,
+    "lexical": 1.0,
+    "text_ann": 0.5,
+    "metadata": 1.0,
+    "entity": 1.0,
+    "adjacency": 0.5,
+}
+
+
+def weighted_rrf_score(ranks: dict[str, int], weights: dict[str, float], k: int = RRF_K) -> float:
+    return sum(weights.get(channel, 1.0) / (k + rank) for channel, rank in ranks.items())
+
+
 @dataclass
 class FusedCandidate:
     asset_id: str
@@ -54,12 +72,17 @@ def fuse(
     k: int = RRF_K,
     anchor_boost: float = ANCHOR_BOOST,
     include_classes: bool = True,
+    channel_weights: dict[str, float] | None = None,
 ) -> list[FusedCandidate]:
     """Merge per-channel ranked hits into fusion-ranked candidates.
 
     ``channel_hits`` maps retriever name -> its ranked CandidateHits.  Returns
     candidates sorted by final score descending.
+
+    Weights scale each channel's RRF contribution (weak channels must not
+    dilute a strong channel's recalled Ground Truth — R7 ablation).
     """
+    weights = channel_weights if channel_weights is not None else DEFAULT_CHANNEL_WEIGHTS
     candidates: dict[str, FusedCandidate] = {}
     for retriever, hits in channel_hits.items():
         for rank, hit in enumerate(hits):
@@ -70,7 +93,7 @@ def fuse(
                                raw_scores={}, retriever_hits=[]),
             )
             candidate.channels[retriever] = rank + 1
-            candidate.rrf = rrf_score(candidate.channels, k=k)
+            candidate.rrf = weighted_rrf_score(candidate.channels, weights, k=k)
             candidate.raw_scores[retriever] = hit.raw_score
             candidate.retriever_hits.append(hit)
             # An asset that appears across multiple channels naturally gains

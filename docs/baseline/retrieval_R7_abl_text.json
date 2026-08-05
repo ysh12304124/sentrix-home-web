@@ -1,0 +1,1687 @@
+{
+  "summary": {
+    "total": 44,
+    "recall_at_1": 0.0189,
+    "recall_at_5": 0.0533,
+    "recall_at_10": 0.1581,
+    "recall_at_20": 0.1952,
+    "mrr": 0.1193,
+    "precision_at_5": 0.0455,
+    "all_relevant_count": 3,
+    "empty_gt_fp_count": 6,
+    "hard_violation_count": 0,
+    "avg_latency_s": 0.5062
+  },
+  "channel_note": "R2+: channels param selects real retriever subsets; pre-R2 all modes collapsed to the single Kernel.",
+  "channels": "text",
+  "exclude_hidden": "docs/baseline/hidden_set_manifest.json",
+  "cases": [
+    {
+      "key": "album1-01",
+      "query": "浅黄色拼接毛绒睡衣自拍",
+      "gt_count": 1,
+      "returned_count": 17,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fbc7c2d06164",
+        "asset_f6bfd9799213",
+        "asset_f8fc72554946",
+        "asset_f52a47e76baf",
+        "asset_b16f571ed2a7",
+        "asset_af2c1909fc79",
+        "asset_25d7da4d33fd",
+        "asset_894f67c7faba",
+        "asset_1d077c5aa758",
+        "asset_5b83c11fa098",
+        "asset_67e552b26148",
+        "asset_f4959e80368b",
+        "asset_2bf27802df7f",
+        "asset_b3196de17907",
+        "asset_61df592f6dc9",
+        "asset_cf5f1f61dc89",
+        "asset_476aa7cf184d"
+      ],
+      "latency_s": 2.6314
+    },
+    {
+      "key": "album1-02",
+      "query": "厨房里做晚饭",
+      "gt_count": 6,
+      "returned_count": 13,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 2,
+        "20": 3
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.16666666666666666,
+        "10": 0.3333333333333333,
+        "20": 0.5
+      },
+      "mrr": 0.3333,
+      "precision_at_5": 0.2,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fbc7c2d06164",
+        "asset_856b080d4121",
+        "asset_25d7da4d33fd",
+        "asset_f8fc72554946",
+        "asset_2c5bfb2f94bf",
+        "asset_f6bfd9799213",
+        "asset_9b4225db7dde",
+        "asset_5b83c11fa098",
+        "asset_af2c1909fc79",
+        "asset_c20fb0b3f4ea",
+        "asset_b16f571ed2a7",
+        "asset_b3196de17907",
+        "asset_c9c1c47989b6"
+      ],
+      "latency_s": 0.4476
+    },
+    {
+      "key": "album1-03",
+      "query": "手拿固体杨枝甘露",
+      "gt_count": 1,
+      "returned_count": 19,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_5b83c11fa098",
+        "asset_fbc7c2d06164",
+        "asset_af2c1909fc79",
+        "asset_f52a47e76baf",
+        "asset_f6bfd9799213",
+        "asset_25d7da4d33fd",
+        "asset_67e552b26148",
+        "asset_2aa4ba0ed619",
+        "asset_36e5a6463c64",
+        "asset_804a6c2c357b",
+        "asset_b16f571ed2a7",
+        "asset_6270e398e5ce",
+        "asset_856b080d4121",
+        "asset_f8fc72554946",
+        "asset_b3196de17907",
+        "asset_c20fb0b3f4ea",
+        "asset_c4d2fd8f7d02",
+        "asset_2bf27802df7f",
+        "asset_c9c1c47989b6"
+      ],
+      "latency_s": 0.747
+    },
+    {
+      "key": "album1-05",
+      "query": "快出岩洞时摆拍",
+      "gt_count": 2,
+      "returned_count": 18,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_856b080d4121",
+        "asset_9b4225db7dde",
+        "asset_f6bfd9799213",
+        "asset_fbc7c2d06164",
+        "asset_25d7da4d33fd",
+        "asset_f52a47e76baf",
+        "asset_46ea5d607a1c",
+        "asset_61df592f6dc9",
+        "asset_b3196de17907",
+        "asset_b16f571ed2a7",
+        "asset_a13201210eb3",
+        "asset_476aa7cf184d",
+        "asset_e1d3522a9278",
+        "asset_1edf7531ac2f",
+        "asset_f4959e80368b",
+        "asset_d93632d67dbc",
+        "asset_f8fc72554946",
+        "asset_c20fb0b3f4ea"
+      ],
+      "latency_s": 0.6519
+    },
+    {
+      "key": "album1-07",
+      "query": "贵阳夜晚步行街",
+      "gt_count": 0,
+      "returned_count": 17,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": true,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_af2c1909fc79",
+        "asset_f6bfd9799213",
+        "asset_856b080d4121",
+        "asset_61df592f6dc9",
+        "asset_f52a47e76baf",
+        "asset_a13201210eb3",
+        "asset_5b83c11fa098",
+        "asset_f8fc72554946",
+        "asset_fbc7c2d06164",
+        "asset_2c5bfb2f94bf",
+        "asset_25d7da4d33fd",
+        "asset_2aa4ba0ed619",
+        "asset_36e5a6463c64",
+        "asset_eb2c82f19b6a",
+        "asset_f4959e80368b",
+        "asset_894f67c7faba",
+        "asset_67e552b26148"
+      ],
+      "latency_s": 0.5714
+    },
+    {
+      "key": "album1-08",
+      "query": "趵突泉游览",
+      "gt_count": 5,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 2,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.2,
+        "10": 0.4,
+        "20": 0.4
+      },
+      "mrr": 0.5,
+      "precision_at_5": 0.2,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_f6bfd9799213",
+        "asset_fbc7c2d06164",
+        "asset_61df592f6dc9",
+        "asset_e1d3522a9278",
+        "asset_856b080d4121",
+        "asset_a13201210eb3",
+        "asset_f4959e80368b",
+        "asset_af2c1909fc79",
+        "asset_25d7da4d33fd",
+        "asset_1d077c5aa758",
+        "asset_f8fc72554946",
+        "asset_1edf7531ac2f",
+        "asset_46ea5d607a1c",
+        "asset_e58ebf0338cc",
+        "asset_894f67c7faba",
+        "asset_f52a47e76baf"
+      ],
+      "latency_s": 0.6499
+    },
+    {
+      "key": "album1-09",
+      "query": "25年11月16号下午记录妆容的自拍",
+      "gt_count": 2,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 2,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.5,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.25,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fbc7c2d06164",
+        "asset_f6bfd9799213",
+        "asset_b16f571ed2a7",
+        "asset_f8fc72554946",
+        "asset_65a644393930",
+        "asset_af2c1909fc79",
+        "asset_f52a47e76baf",
+        "asset_1d077c5aa758",
+        "asset_084a408d7931",
+        "asset_6270e398e5ce",
+        "asset_01b730caf869"
+      ],
+      "latency_s": 0.3591
+    },
+    {
+      "key": "album1-10",
+      "query": "在禹城市的照片",
+      "gt_count": 2,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.5,
+        "20": 0.5
+      },
+      "mrr": 0.1111,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fbc7c2d06164",
+        "asset_af2c1909fc79",
+        "asset_2c5bfb2f94bf",
+        "asset_f8fc72554946",
+        "asset_c9c1c47989b6",
+        "asset_b16f571ed2a7",
+        "asset_61df592f6dc9",
+        "asset_f6bfd9799213",
+        "asset_2bf27802df7f",
+        "asset_856b080d4121",
+        "asset_084a408d7931"
+      ],
+      "latency_s": 0.4093
+    },
+    {
+      "key": "album1-12",
+      "query": "山东近代史展览--反侵略主题",
+      "gt_count": 5,
+      "returned_count": 15,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.2,
+        "20": 0.4
+      },
+      "mrr": 0.1667,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_2c5bfb2f94bf",
+        "asset_f6bfd9799213",
+        "asset_af2c1909fc79",
+        "asset_5b83c11fa098",
+        "asset_fbc7c2d06164",
+        "asset_f52a47e76baf",
+        "asset_6d5dc17f338d",
+        "asset_b3196de17907",
+        "asset_856b080d4121",
+        "asset_f8fc72554946",
+        "asset_eb20574be30d",
+        "asset_894f67c7faba",
+        "asset_6270e398e5ce",
+        "asset_1d077c5aa758",
+        "asset_b16f571ed2a7"
+      ],
+      "latency_s": 0.5332
+    },
+    {
+      "key": "album1-13",
+      "query": "黄绿酱汁烤鸡",
+      "gt_count": 3,
+      "returned_count": 15,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fbc7c2d06164",
+        "asset_f52a47e76baf",
+        "asset_af2c1909fc79",
+        "asset_f6bfd9799213",
+        "asset_b16f571ed2a7",
+        "asset_67e552b26148",
+        "asset_61df592f6dc9",
+        "asset_f8fc72554946",
+        "asset_c4d2fd8f7d02",
+        "asset_2bf27802df7f",
+        "asset_077e2f877260",
+        "asset_a13201210eb3",
+        "asset_1edf7531ac2f",
+        "asset_2c5bfb2f94bf",
+        "asset_6fcdcc9d6548"
+      ],
+      "latency_s": 0.5592
+    },
+    {
+      "key": "album1-14",
+      "query": "2024年5月",
+      "gt_count": 1,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.4182
+    },
+    {
+      "key": "album1-15",
+      "query": "深圳机场登机口停机坪",
+      "gt_count": 1,
+      "returned_count": 13,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_856b080d4121",
+        "asset_af2c1909fc79",
+        "asset_fbc7c2d06164",
+        "asset_5b83c11fa098",
+        "asset_2aa4ba0ed619",
+        "asset_36e5a6463c64",
+        "asset_b3196de17907",
+        "asset_9b4225db7dde",
+        "asset_25d7da4d33fd",
+        "asset_2c5bfb2f94bf",
+        "asset_894f67c7faba",
+        "asset_f8fc72554946",
+        "asset_b16f571ed2a7"
+      ],
+      "latency_s": 0.4407
+    },
+    {
+      "key": "album1-16",
+      "query": "香草味可乐倒在键盘上",
+      "gt_count": 0,
+      "returned_count": 13,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": true,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_f52a47e76baf",
+        "asset_fbc7c2d06164",
+        "asset_af2c1909fc79",
+        "asset_f6bfd9799213",
+        "asset_67e552b26148",
+        "asset_2bf27802df7f",
+        "asset_61df592f6dc9",
+        "asset_c4d2fd8f7d02",
+        "asset_077e2f877260",
+        "asset_a13201210eb3",
+        "asset_f8fc72554946",
+        "asset_2c5bfb2f94bf",
+        "asset_1edf7531ac2f"
+      ],
+      "latency_s": 0.5011
+    },
+    {
+      "key": "album1-18",
+      "query": "穿和服的自己",
+      "gt_count": 3,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.3333333333333333,
+        "20": 0.3333333333333333
+      },
+      "mrr": 0.1667,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_856b080d4121",
+        "asset_fbc7c2d06164",
+        "asset_2c5bfb2f94bf",
+        "asset_af2c1909fc79",
+        "asset_f8fc72554946",
+        "asset_f6bfd9799213",
+        "asset_61df592f6dc9",
+        "asset_894f67c7faba",
+        "asset_2bf27802df7f",
+        "asset_f52a47e76baf",
+        "asset_1d077c5aa758"
+      ],
+      "latency_s": 0.3595
+    },
+    {
+      "key": "album1-19",
+      "query": "2023年冬季的照片",
+      "gt_count": 2,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fbc7c2d06164",
+        "asset_b16f571ed2a7",
+        "asset_af2c1909fc79",
+        "asset_f8fc72554946",
+        "asset_f52a47e76baf",
+        "asset_2bf27802df7f",
+        "asset_61df592f6dc9",
+        "asset_c4d2fd8f7d02",
+        "asset_2c5bfb2f94bf",
+        "asset_c9c1c47989b6",
+        "asset_894f67c7faba"
+      ],
+      "latency_s": 0.4431
+    },
+    {
+      "key": "album1-20",
+      "query": "我家猫吃猫粮",
+      "gt_count": 8,
+      "returned_count": 15,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fbc7c2d06164",
+        "asset_b16f571ed2a7",
+        "asset_f52a47e76baf",
+        "asset_894f67c7faba",
+        "asset_203b5b507c95",
+        "asset_2c5bfb2f94bf",
+        "asset_6270e398e5ce",
+        "asset_61df592f6dc9",
+        "asset_b81972caed87",
+        "asset_af2c1909fc79",
+        "asset_baacf7be81e2",
+        "asset_c9c1c47989b6",
+        "asset_804a6c2c357b",
+        "asset_6fcdcc9d6548",
+        "asset_1d79e044c1d0"
+      ],
+      "latency_s": 0.5459
+    },
+    {
+      "key": "album2-01",
+      "query": "2025年4月王明和我的合照",
+      "gt_count": 6,
+      "returned_count": 5,
+      "hits_at": {
+        "1": 1,
+        "5": 3,
+        "10": 3,
+        "20": 3
+      },
+      "recall_at": {
+        "1": 0.16666666666666666,
+        "5": 0.5,
+        "10": 0.5,
+        "20": 0.5
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.6,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_678b9903dc14",
+        "asset_0cfc643b8c63",
+        "asset_3b0e806a630b",
+        "asset_313517152eb4",
+        "asset_149d3f59c753"
+      ],
+      "latency_s": 0.4446
+    },
+    {
+      "key": "album2-06",
+      "query": "夜晚车内的明哥搂着我 江西省",
+      "gt_count": 0,
+      "returned_count": 13,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": true,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_2091b45f036a",
+        "asset_266707a16138",
+        "asset_678b9903dc14",
+        "asset_d9064c559c93",
+        "asset_558db3ce4925",
+        "asset_56237b394f09",
+        "asset_778a21b401ae",
+        "asset_f1287153333e",
+        "asset_fd92eabfcaa0",
+        "asset_225783d8d34a",
+        "asset_0cfc643b8c63",
+        "asset_e2dfd2b284ee",
+        "asset_ea9a79371e76"
+      ],
+      "latency_s": 0.5186
+    },
+    {
+      "key": "album2-07",
+      "query": "墨鱼汁海鲜特写",
+      "gt_count": 1,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_f1287153333e",
+        "asset_558db3ce4925",
+        "asset_266707a16138",
+        "asset_c52303134433",
+        "asset_e2dfd2b284ee",
+        "asset_225783d8d34a",
+        "asset_1be207894603",
+        "asset_e83d305f8bee",
+        "asset_149d3f59c753",
+        "asset_d9064c559c93",
+        "asset_962b07b630d1",
+        "asset_3b0e806a630b",
+        "asset_b2df2a5c6ecc",
+        "asset_ea9a79371e76",
+        "asset_9e3a4c00b753",
+        "asset_0cfc643b8c63"
+      ],
+      "latency_s": 0.5643
+    },
+    {
+      "key": "album2-08",
+      "query": "杭州冬天吃的西式简餐",
+      "gt_count": 2,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 2,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.5,
+        "5": 0.5,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_f1287153333e",
+        "asset_2091b45f036a",
+        "asset_558db3ce4925",
+        "asset_0cfc643b8c63",
+        "asset_225783d8d34a",
+        "asset_c52303134433",
+        "asset_678b9903dc14",
+        "asset_fd92eabfcaa0",
+        "asset_778a21b401ae",
+        "asset_e2dfd2b284ee",
+        "asset_3b0e806a630b"
+      ],
+      "latency_s": 0.4269
+    },
+    {
+      "key": "album2-09",
+      "query": "过2025年元旦",
+      "gt_count": 1,
+      "returned_count": 6,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_266707a16138",
+        "asset_225783d8d34a",
+        "asset_f1287153333e",
+        "asset_558db3ce4925",
+        "asset_0cfc643b8c63",
+        "asset_313517152eb4"
+      ],
+      "latency_s": 0.2159
+    },
+    {
+      "key": "album2-10",
+      "query": "大悦城动漫展卡通立板",
+      "gt_count": 4,
+      "returned_count": 9,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_266707a16138",
+        "asset_558db3ce4925",
+        "asset_e2dfd2b284ee",
+        "asset_f1287153333e",
+        "asset_225783d8d34a",
+        "asset_c52303134433",
+        "asset_46ec95ac4162",
+        "asset_778a21b401ae",
+        "asset_d9064c559c93"
+      ],
+      "latency_s": 0.3331
+    },
+    {
+      "key": "album2-12",
+      "query": "跨年烟花下的垃圾桶",
+      "gt_count": 0,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": true,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_e2dfd2b284ee",
+        "asset_266707a16138",
+        "asset_558db3ce4925",
+        "asset_225783d8d34a",
+        "asset_fd92eabfcaa0",
+        "asset_d9064c559c93",
+        "asset_3b0e806a630b",
+        "asset_9c26c7cfb654",
+        "asset_678b9903dc14",
+        "asset_f1287153333e",
+        "asset_9e3a4c00b753",
+        "asset_149d3f59c753"
+      ],
+      "latency_s": 0.4295
+    },
+    {
+      "key": "album2-14",
+      "query": "在集美区的照片",
+      "gt_count": 4,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.25
+      },
+      "mrr": 0.0769,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_0cfc643b8c63",
+        "asset_225783d8d34a",
+        "asset_678b9903dc14",
+        "asset_149d3f59c753",
+        "asset_266707a16138",
+        "asset_558db3ce4925",
+        "asset_60289354f46f",
+        "asset_3b0e806a630b",
+        "asset_313517152eb4",
+        "asset_f1287153333e",
+        "asset_9c26c7cfb654",
+        "asset_e2dfd2b284ee",
+        "asset_2091b45f036a",
+        "asset_ea9a79371e76"
+      ],
+      "latency_s": 0.4695
+    },
+    {
+      "key": "album2-15",
+      "query": "2025年4月 自己的照片",
+      "gt_count": 19,
+      "returned_count": 3,
+      "hits_at": {
+        "1": 1,
+        "5": 3,
+        "10": 3,
+        "20": 3
+      },
+      "recall_at": {
+        "1": 0.05263157894736842,
+        "5": 0.15789473684210525,
+        "10": 0.15789473684210525,
+        "20": 0.15789473684210525
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.6,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_0cfc643b8c63",
+        "asset_678b9903dc14",
+        "asset_3b0e806a630b"
+      ],
+      "latency_s": 0.4417
+    },
+    {
+      "key": "album2-17",
+      "query": "2024跨年热闹氛围",
+      "gt_count": 3,
+      "returned_count": 9,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_266707a16138",
+        "asset_225783d8d34a",
+        "asset_678b9903dc14",
+        "asset_9c26c7cfb654",
+        "asset_3b0e806a630b",
+        "asset_f1287153333e",
+        "asset_56237b394f09",
+        "asset_558db3ce4925",
+        "asset_0cfc643b8c63"
+      ],
+      "latency_s": 0.334
+    },
+    {
+      "key": "album2-18",
+      "query": "八戒",
+      "gt_count": 2,
+      "returned_count": 13,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_266707a16138",
+        "asset_f1287153333e",
+        "asset_558db3ce4925",
+        "asset_b2df2a5c6ecc",
+        "asset_d9064c559c93",
+        "asset_1ab5e6fe5076",
+        "asset_e2dfd2b284ee",
+        "asset_3b0e806a630b",
+        "asset_c52303134433",
+        "asset_fd92eabfcaa0",
+        "asset_778a21b401ae",
+        "asset_225783d8d34a",
+        "asset_2091b45f036a"
+      ],
+      "latency_s": 0.5082
+    },
+    {
+      "key": "album2-19",
+      "query": "径山镇绿道散步",
+      "gt_count": 2,
+      "returned_count": 9,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_225783d8d34a",
+        "asset_f1287153333e",
+        "asset_266707a16138",
+        "asset_e2dfd2b284ee",
+        "asset_558db3ce4925",
+        "asset_678b9903dc14",
+        "asset_0cfc643b8c63",
+        "asset_3b0e806a630b",
+        "asset_d9064c559c93"
+      ],
+      "latency_s": 0.3326
+    },
+    {
+      "key": "album3-02",
+      "query": "闵行区拍的",
+      "gt_count": 6,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 2,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.3333333333333333,
+        "20": 0.3333333333333333
+      },
+      "mrr": 0.1429,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_7c00744b9d68",
+        "asset_1eb0467831a5",
+        "asset_4b4dc3d4739a",
+        "asset_e9fa2b08525f",
+        "asset_495456506662",
+        "asset_67bdd0d11303",
+        "asset_2791a7b22e91",
+        "asset_fca67a7b8518",
+        "asset_69f78356ea2f",
+        "asset_71e22de9fd57"
+      ],
+      "latency_s": 0.3853
+    },
+    {
+      "key": "album3-03",
+      "query": "2022年劳动节拍的",
+      "gt_count": 2,
+      "returned_count": 6,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_1eb0467831a5",
+        "asset_7c00744b9d68",
+        "asset_67bdd0d11303",
+        "asset_e9fa2b08525f",
+        "asset_7888757e4924"
+      ],
+      "latency_s": 0.2408
+    },
+    {
+      "key": "album3-04",
+      "query": "烘焙面糊搅拌过程",
+      "gt_count": 3,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_7888757e4924",
+        "asset_1eb0467831a5",
+        "asset_e9fa2b08525f",
+        "asset_efd4bd5ac9e7",
+        "asset_7c00744b9d68",
+        "asset_4b4dc3d4739a",
+        "asset_8119b53b7304",
+        "asset_0f39906a4054",
+        "asset_880a0624dca0",
+        "asset_d9072be25301",
+        "asset_6eb7d62b0998"
+      ],
+      "latency_s": 0.415
+    },
+    {
+      "key": "album3-06",
+      "query": "2018葆婴高峰会嘟嘟车宣传",
+      "gt_count": 1,
+      "returned_count": 13,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_1eb0467831a5",
+        "asset_7c00744b9d68",
+        "asset_efd4bd5ac9e7",
+        "asset_67bdd0d11303",
+        "asset_4b4dc3d4739a",
+        "asset_d9072be25301",
+        "asset_71e22de9fd57",
+        "asset_498d1710bed0",
+        "asset_bc55b4db2da7",
+        "asset_d55c35368bda",
+        "asset_6b759d4d8796",
+        "asset_e9fa2b08525f",
+        "asset_7888757e4924"
+      ],
+      "latency_s": 0.5004
+    },
+    {
+      "key": "album3-07",
+      "query": "春天花开",
+      "gt_count": 8,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 2,
+        "20": 3
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.25,
+        "20": 0.375
+      },
+      "mrr": 0.1667,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_7c00744b9d68",
+        "asset_aae2b3bb7534",
+        "asset_1eb0467831a5",
+        "asset_817a08b4b204",
+        "asset_485de35d2801",
+        "asset_388079be0d48",
+        "asset_d55c35368bda",
+        "asset_495456506662",
+        "asset_6b759d4d8796",
+        "asset_bc55b4db2da7",
+        "asset_67bdd0d11303",
+        "asset_4b4dc3d4739a",
+        "asset_f58f42e8b23d"
+      ],
+      "latency_s": 0.4653
+    },
+    {
+      "key": "album3-08",
+      "query": "确认车钥匙细节",
+      "gt_count": 3,
+      "returned_count": 10,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_0f39906a4054",
+        "asset_1eb0467831a5",
+        "asset_e9fa2b08525f",
+        "asset_7c00744b9d68",
+        "asset_6eb7d62b0998",
+        "asset_fcf251a641c7",
+        "asset_67bdd0d11303",
+        "asset_7888757e4924",
+        "asset_4b4dc3d4739a"
+      ],
+      "latency_s": 0.4147
+    },
+    {
+      "key": "album3-09",
+      "query": "燕园",
+      "gt_count": 1,
+      "returned_count": 10,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.1667,
+      "precision_at_5": 0.0,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_880a0624dca0",
+        "asset_7888757e4924",
+        "asset_d55c35368bda",
+        "asset_efd4bd5ac9e7",
+        "asset_b5efc0d8e0db",
+        "asset_8119b53b7304",
+        "asset_e9fa2b08525f",
+        "asset_1eb0467831a5",
+        "asset_67bdd0d11303",
+        "asset_4b4dc3d4739a"
+      ],
+      "latency_s": 0.3473
+    },
+    {
+      "key": "album3-11",
+      "query": "氹仔酒店楼道",
+      "gt_count": 1,
+      "returned_count": 9,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_7c00744b9d68",
+        "asset_69f78356ea2f",
+        "asset_e9fa2b08525f",
+        "asset_233d9e19b465",
+        "asset_b5efc0d8e0db",
+        "asset_1eb0467831a5",
+        "asset_71e22de9fd57",
+        "asset_67bdd0d11303"
+      ],
+      "latency_s": 0.3369
+    },
+    {
+      "key": "album3-12",
+      "query": "乘客与幼鹿近距离接触",
+      "gt_count": 3,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.3333333333333333
+      },
+      "mrr": 0.0769,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_1eb0467831a5",
+        "asset_efd4bd5ac9e7",
+        "asset_e9fa2b08525f",
+        "asset_d55c35368bda",
+        "asset_0f39906a4054",
+        "asset_7888757e4924",
+        "asset_1088c9de1217",
+        "asset_f58f42e8b23d",
+        "asset_4b4dc3d4739a",
+        "asset_134d71820229",
+        "asset_67bdd0d11303",
+        "asset_d9072be25301",
+        "asset_d593d4fb68be",
+        "asset_0713f4fbfd2c"
+      ],
+      "latency_s": 0.5256
+    },
+    {
+      "key": "album3-13",
+      "query": "采摘番茄",
+      "gt_count": 2,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_1eb0467831a5",
+        "asset_67bdd0d11303",
+        "asset_6b759d4d8796",
+        "asset_495456506662",
+        "asset_d55c35368bda",
+        "asset_4b4dc3d4739a",
+        "asset_f58f42e8b23d",
+        "asset_880a0624dca0",
+        "asset_8119b53b7304",
+        "asset_e398744eeb11",
+        "asset_efd4bd5ac9e7"
+      ],
+      "latency_s": 0.427
+    },
+    {
+      "key": "album3-14",
+      "query": "水族馆海豚跃出水面",
+      "gt_count": 0,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": true,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_1eb0467831a5",
+        "asset_79795eeb3532",
+        "asset_0f39906a4054",
+        "asset_e9fa2b08525f",
+        "asset_4b572191b278",
+        "asset_d9072be25301",
+        "asset_e398744eeb11",
+        "asset_6eb7d62b0998",
+        "asset_69be63077cd8",
+        "asset_f58f42e8b23d",
+        "asset_817a08b4b204",
+        "asset_4b4dc3d4739a",
+        "asset_6a38541bc058"
+      ],
+      "latency_s": 0.4635
+    },
+    {
+      "key": "album3-15",
+      "query": "牛春花门脸样式参考",
+      "gt_count": 1,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_7c00744b9d68",
+        "asset_67bdd0d11303",
+        "asset_e9fa2b08525f",
+        "asset_1eb0467831a5",
+        "asset_495456506662",
+        "asset_817a08b4b204",
+        "asset_d9072be25301",
+        "asset_69f78356ea2f",
+        "asset_6eb7d62b0998",
+        "asset_71e22de9fd57",
+        "asset_f58f42e8b23d"
+      ],
+      "latency_s": 0.4539
+    },
+    {
+      "key": "album3-16",
+      "query": "一床的娃娃",
+      "gt_count": 3,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.3333333333333333
+      },
+      "mrr": 0.0909,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_7c00744b9d68",
+        "asset_e9fa2b08525f",
+        "asset_0f39906a4054",
+        "asset_388079be0d48",
+        "asset_6eb7d62b0998",
+        "asset_7888757e4924",
+        "asset_cc0ab48087d6",
+        "asset_79795eeb3532",
+        "asset_d55c35368bda",
+        "asset_69be63077cd8",
+        "asset_b5efc0d8e0db",
+        "asset_4b4dc3d4739a",
+        "asset_efd4bd5ac9e7",
+        "asset_1088c9de1217"
+      ],
+      "latency_s": 0.5401
+    },
+    {
+      "key": "album3-17",
+      "query": "厨房三兄弟切洋葱比赛",
+      "gt_count": 0,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": true,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_7c00744b9d68",
+        "asset_efd4bd5ac9e7",
+        "asset_e9fa2b08525f",
+        "asset_388079be0d48",
+        "asset_1eb0467831a5",
+        "asset_495456506662",
+        "asset_79795eeb3532",
+        "asset_7888757e4924",
+        "asset_817a08b4b204",
+        "asset_4b4dc3d4739a",
+        "asset_d55c35368bda",
+        "asset_2791a7b22e91",
+        "asset_67bdd0d11303",
+        "asset_69f78356ea2f"
+      ],
+      "latency_s": 0.5327
+    },
+    {
+      "key": "album3-18",
+      "query": "自己在上海店铺内的邋遢打扮",
+      "gt_count": 1,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_cc0ab48087d6",
+        "asset_7c00744b9d68",
+        "asset_aae2b3bb7534",
+        "asset_e9fa2b08525f",
+        "asset_7888757e4924",
+        "asset_4b4dc3d4739a",
+        "asset_1eb0467831a5",
+        "asset_495456506662",
+        "asset_67bdd0d11303",
+        "asset_388079be0d48",
+        "asset_0f39906a4054"
+      ],
+      "latency_s": 0.4448
+    },
+    {
+      "key": "album3-19",
+      "query": "三峡大坝北岸纪念碑",
+      "gt_count": 2,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_efd4bd5ac9e7",
+        "asset_e9fa2b08525f",
+        "asset_0f39906a4054",
+        "asset_7c00744b9d68",
+        "asset_6eb7d62b0998",
+        "asset_67bdd0d11303",
+        "asset_1eb0467831a5",
+        "asset_7888757e4924",
+        "asset_cc0ab48087d6",
+        "asset_495456506662",
+        "asset_d55c35368bda",
+        "asset_388079be0d48",
+        "asset_f58f42e8b23d",
+        "asset_4b4dc3d4739a"
+      ],
+      "latency_s": 0.49
+    }
+  ]
+}
