@@ -90,6 +90,21 @@ def _separation_auc(outcomes):
     return (wins + 0.5 * ties) / len(negative)
 
 
+def _embed_text(embedder, text):
+    """VisualQueryEmbedder (embed_query) or ClipAdapter (embed_text) both work."""
+    if hasattr(embedder, "embed_query"):
+        return embedder.embed_query(text) or []
+    if hasattr(embedder, "embed_text"):
+        return embedder.embed_text(text) or []
+    return []
+
+
+def _embed_image(embedder, source):
+    if hasattr(embedder, "embed_image"):
+        return embedder.embed_image(source) or []
+    return []
+
+
 def visual_crossmodal(images, queries, embedder=None):
     """Query text -> text embed; candidate = image embedding.
 
@@ -101,12 +116,12 @@ def visual_crossmodal(images, queries, embedder=None):
     image_embeds = {}
     for image in images:
         source = image.get("path") or image.get("text") or ""
-        vec = embedder.embed_image(source)
+        vec = _embed_image(embedder, source)
         if vec:
             image_embeds[image["id"]] = vec
     query_embeds = {}
     for query in queries:
-        vec = embedder.embed_text(query.get("query") or "")
+        vec = _embed_text(embedder, query.get("query") or "")
         if vec:
             query_embeds[query["id"]] = vec
     embeddings = {"query": query_embeds, "candidate": image_embeds}
@@ -119,12 +134,12 @@ def text_retrieval(corpus, queries, embedder=None):
         embedder = _make_embedder("clip")
     record_embeds = {}
     for record in corpus:
-        vec = embedder.embed_text(record.get("text") or "")
+        vec = _embed_text(embedder, record.get("text") or "")
         if vec:
             record_embeds[record["id"]] = vec
     query_embeds = {}
     for query in queries:
-        vec = embedder.embed_text(query.get("query") or "")
+        vec = _embed_text(embedder, query.get("query") or "")
         if vec:
             query_embeds[query["id"]] = vec
     embeddings = {"query": query_embeds, "candidate": record_embeds}

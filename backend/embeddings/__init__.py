@@ -5,6 +5,7 @@ EmbeddingRouter`` without reaching into internal adapter modules.
 """
 
 from .base import TextQueryEmbedder, VisualQueryEmbedder
+from .chinese_clip_visual import ChineseClipVisualEmbedder
 from .router import EmbeddingRouter
 
-__all__ = ["EmbeddingRouter", "VisualQueryEmbedder", "TextQueryEmbedder"]
+__all__ = ["EmbeddingRouter", "ChineseClipVisualEmbedder", "VisualQueryEmbedder", "TextQueryEmbedder"]

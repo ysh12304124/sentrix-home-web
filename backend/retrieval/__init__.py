@@ -68,9 +68,15 @@ def build_default_retrievers(store, *, embedding_router=None, config=None, ann_d
     (R3B); when disabled it simply contributes nothing.
     """
     config = config or RetrievalConfig()
+    # config keys use short names (visual/text) while the retriever factories
+    # use the concrete names (visual_ann/text_ann) — map them explicitly.
+    retriever_config_key = {
+        "metadata": "metadata", "entity": "entity", "lexical": "lexical",
+        "visual_ann": "visual", "text_ann": "text", "adjacency": "adjacency",
+    }
     retrievers = []
     for name in ("metadata", "entity", "lexical", "visual_ann", "text_ann", "adjacency"):
-        if not config.channel_enabled(name):
+        if not config.channel_enabled(retriever_config_key[name]):
             continue
         factory = _RETRIEVER_FACTORIES[name]
         retrievers.append(factory(store, embedding_router=embedding_router,

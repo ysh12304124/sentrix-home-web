@@ -28,12 +28,14 @@ class EmbeddingRouter:
         image_kind = os.getenv("SENTRIX_IMAGE_EMBEDDER", "clip").strip().lower()
         text_kind = os.getenv("SENTRIX_TEXT_EMBEDDER", "clip").strip().lower()
         visual = None
-        if clip is not None:
-            if image_kind in {"clip", "chinese_clip"}:
-                from .clip_visual import ClipVisualQueryEmbedder
-                visual = ClipVisualQueryEmbedder(clip)
-            else:
-                raise ValueError(f"unknown SENTRIX_IMAGE_EMBEDDER: {image_kind}")
+        if image_kind == "chinese_clip":
+            from .chinese_clip_visual import ChineseClipVisualEmbedder
+            visual = ChineseClipVisualEmbedder()
+        elif clip is not None:
+            from .clip_visual import ClipVisualQueryEmbedder
+            visual = ClipVisualQueryEmbedder(clip)
+        else:
+            raise ValueError(f"unknown SENTRIX_IMAGE_EMBEDDER: {image_kind}")
         text = None
         if text_kind == "bge":
             from .bge_text import BgeM3TextQueryEmbedder
