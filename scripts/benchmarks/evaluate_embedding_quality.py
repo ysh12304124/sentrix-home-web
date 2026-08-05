@@ -166,24 +166,29 @@ def _load_json(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--images-json", default=None, help='[{"id","text"}] canonical text per image')
-    parser.add_argument("--queries-json", required=True, help='[{"id","query","target"}] Development-Set labels')
+    parser.add_argument("--images-json", default=None, help='[{"id","path"|"text"}] candidate images')
     parser.add_argument("--corpus-json", default=None, help='[{"id","text","field"}] text retrieval corpus')
+    parser.add_argument("--queries-json", default=None, help="Development labels used for BOTH when the two are not split")
+    parser.add_argument("--text-queries-json", default=None, help="Development labels for text retrieval")
+    parser.add_argument("--visual-queries-json", default=None, help="Development labels for visual cross-modal")
     parser.add_argument("--embedder", choices=["clip", "stub"], default="clip")
     parser.add_argument("--report", default=None)
     args = parser.parse_args()
 
     embedder = _make_embedder(args.embedder)
-    queries = _load_json(args.queries_json)
     report = {"embedder": args.embedder}
-    if args.corpus_json:
+    text_queries = args.text_queries_json or args.queries_json
+    visual_queries = args.visual_queries_json or args.queries_json
+    if args.corpus_json and text_queries:
         corpus = _load_json(args.corpus_json)
+        queries = _load_json(text_queries)
         report["text_retrieval"] = text_retrieval(corpus, queries, embedder=embedder)
-    if args.images_json:
+    if args.images_json and visual_queries:
         images = _load_json(args.images_json)
+        queries = _load_json(visual_queries)
         report["visual_crossmodal"] = visual_crossmodal(images, queries, embedder=embedder)
-    if not (args.corpus_json or args.images_json):
-        parser.error("need --corpus-json and/or --images-json")
+    if not report.get("text_retrieval") and not report.get("visual_crossmodal"):
+        parser.error("need --corpus-json and/or --images-json with matching query labels")
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.report:
         Path(args.report).write_text(text, encoding="utf-8")

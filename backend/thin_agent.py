@@ -78,18 +78,37 @@ class ThinAgentRuntime:
     def _ambiguous_path(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
         """Gate said ambiguous (parser none without an explicit general task).
 
-        Run the Neutral Probe on raw text.  A strong candidate upgrades to a
-        formal retrieval; a weak/conflicting one clarifies instead of
-        fabricating a generic description (R4).
+        When the parser still produced household facets/conditions, those ARE
+        the evidence query — retrieve directly.  The Neutral Probe is only for
+        the bare-noun case where the parser left nothing (P0-7/P0-8).
         """
-        probe = self._run_probe(message, scope_id, viewer_id)
-        if probe.decision == "upgrade":
-            if not draft.semantic_conditions:
-                draft.semantic_conditions.append(
-                    {"dimension": "semantic", "value": message, "source_text": message}
-                )
+        if draft.semantic_conditions or draft.facets or draft.time_expression or draft.media_expressions:
             if not draft.actions:
                 draft.actions = [QueryAction(type="answer_question", target="general")]
+            spec = build_query_spec(
+                draft,
+                scope_id=scope_id,
+                viewer_id=viewer_id,
+                conversation_id=conversation_id,
+                entity_resolver=lambda name: self._resolve_person(name, scope_id),
+                query_id=f"query_{uuid.uuid4().hex[:12]}",
+            )
+            packet = self.kernel.retrieve(spec)
+            upgraded = GateDecision(
+                "evidence", "ambiguous_with_household_facets",
+                answer_target=decision.answer_target, concrete_memory_reads=1,
+                evidence_search_calls=1, query_parse_calls=decision.query_parse_calls,
+                allow_probe=False,
+            )
+            return self._evidence_answer(message, conversation_id, scope_id, viewer_id,
+                                         upgraded, spec, packet, draft)
+
+        probe = self._run_probe(message, scope_id, viewer_id)
+        if probe.decision == "upgrade":
+            draft.semantic_conditions.append(
+                {"dimension": "semantic", "value": message, "source_text": message}
+            )
+            draft.actions = [QueryAction(type="answer_question", target="general")]
             spec = build_query_spec(
                 draft,
                 scope_id=scope_id,

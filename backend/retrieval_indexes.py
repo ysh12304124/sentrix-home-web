@@ -238,7 +238,7 @@ class RetrievalIndex:
             return []
         scored = []
         for asset_id, count in token_hits.items():
-            exact_boost = 2.0 if count == 1 and whole and _whole_is_exact(asset_id, whole, scope_id) else 0.0
+            exact_boost = 2.0 if count == 1 and whole and self._whole_is_exact(asset_id, whole, scope_id) else 0.0
             scored.append({"asset_id": asset_id, "score": count + exact_boost, "token_hits": count})
         scored.sort(key=lambda item: item["score"], reverse=True)
         return scored[:limit]

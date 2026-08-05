@@ -1,0 +1,95 @@
+{
+  "summary": {
+    "total": 3,
+    "recall_at_1": 0.0,
+    "recall_at_5": 0.0,
+    "recall_at_10": 0.0,
+    "recall_at_20": 0.0,
+    "mrr": 0.0,
+    "precision_at_5": 0.0,
+    "all_relevant_count": 0,
+    "empty_gt_fp_count": 0,
+    "hard_violation_count": 0,
+    "avg_latency_s": 0.0003
+  },
+  "channel_note": "R2+: channels param selects real retriever subsets; pre-R2 all modes collapsed to the single Kernel.",
+  "channels": "full_hybrid",
+  "exclude_hidden": "docs/baseline/hidden_set_manifest.json",
+  "cases": [
+    {
+      "key": "album1-01",
+      "query": "浅黄色拼接毛绒睡衣自拍",
+      "gt_count": 1,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.0005
+    },
+    {
+      "key": "album1-07",
+      "query": "贵阳夜晚步行街",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.0002
+    },
+    {
+      "key": "album3-14",
+      "query": "水族馆海豚跃出水面",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.0001
+    }
+  ]
+}

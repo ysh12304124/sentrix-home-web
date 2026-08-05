@@ -39,7 +39,9 @@ def main():
     if args.images_json:
         images = []
         for asset in store.list_assets(media_type="image", limit=100_000):
-            path = asset.get("file_path") or str(media_root / (asset.get("file_name") or ""))
+            # The canonical path lives on the assets.path column (benchmark
+            # sources live under data/household-benchmark-source, not media/).
+            path = asset.get("path") or asset.get("file_path") or str(media_root / (asset.get("file_name") or ""))
             if not Path(path).is_file():
                 path = str(media_root / (asset.get("file_name") or ""))
             images.append({"id": asset["id"], "path": str(path)})
