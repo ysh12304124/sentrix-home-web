@@ -45,6 +45,22 @@ class MemoryCorrectionsTests(unittest.TestCase):
             self.corrections.apply(proposal_id=proposal["proposal_id"],
                                     confirmation_token="wrong-token", actor="owner")
 
+    def test_store_apply_authorized_revision_matches_service(self):
+        """The MemoryStore wrapper must be equivalent to calling the service."""
+        proposal = self.store.propose_memory_correction(
+            scope_id="home", actor="owner",
+            target_type="entity", target_id=self.entity["id"],
+            changed_fields={"canonical_name": "明先生"},
+        )
+        result = self.store.apply_authorized_revision(
+            proposal_id=proposal["proposal_id"],
+            confirmation_token=proposal["confirmation_token"],
+            actor="owner",
+        )
+        self.assertEqual(result["new_revision"], 2)
+        # Canonical row still untouched.
+        self.assertEqual(self.store.get_entity(self.entity["id"])["canonical_name"], "明哥")
+
     def test_apply_bumps_revision_and_preserves_canonical(self):
         entity_before = self.store.get_entity(self.entity["id"])
         proposal = self._propose()

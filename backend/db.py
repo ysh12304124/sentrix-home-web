@@ -225,6 +225,33 @@ class MemoryStore:
     def close(self):
         self.connection.close()
 
+    def apply_authorized_revision(self, *, proposal_id, confirmation_token, actor):
+        """Plan §6 Memory Kernel entry point.
+
+        Thin wrapper over :class:`MemoryCorrections.apply` so the plan-facing
+        API surface lives on ``MemoryStore``.  The correction service still
+        owns audit + revision log semantics.  Imported lazily to avoid a
+        circular dependency between ``db.py`` and ``memory_corrections.py``.
+        """
+        from .memory_corrections import MemoryCorrections
+
+        service = MemoryCorrections(self)
+        return service.apply(proposal_id=proposal_id,
+                              confirmation_token=confirmation_token,
+                              actor=actor)
+
+    def propose_memory_correction(self, *, scope_id, actor, target_type, target_id,
+                                   changed_fields, evidence_ids=None, request_id=None):
+        """Plan §6 propose entry — mirror of ``apply_authorized_revision``."""
+        from .memory_corrections import MemoryCorrections
+
+        service = MemoryCorrections(self)
+        return service.propose(scope_id=scope_id, actor=actor,
+                                target_type=target_type, target_id=target_id,
+                                changed_fields=changed_fields,
+                                evidence_ids=evidence_ids,
+                                request_id=request_id)
+
     def _create_schema(self):
         self.connection.executescript(
             """
