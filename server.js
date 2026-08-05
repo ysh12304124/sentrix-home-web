@@ -5,7 +5,9 @@ const { URL } = require("node:url");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 4173);
-const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:8090").replace(/\/$/, "");
+// The web portal uses the Agent-capable API as its single authority. That
+// process must point at the production Sentrix database at runtime.
+const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:8091").replace(/\/$/, "");
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",

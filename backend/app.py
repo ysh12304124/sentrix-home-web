@@ -2,6 +2,7 @@ import os
 import shutil
 import hashlib
 import tempfile
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -30,6 +31,7 @@ agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
 
 app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+maintenance_lock = threading.Lock()
 
 
 class SearchRequest(BaseModel):
@@ -57,9 +59,9 @@ def process_asset(asset_id):
             return
         fast = task_pipeline.process_fast_image(asset_id)
         if fast.get("status") == "semantic_enriching":
-            # Event summaries are a separate semantic projection. The event and
-            # observation evidence are already queryable after core enrichment.
-            task_pipeline.enrich_fast_image(asset_id, summarize_event=False)
+            # Finish the semantic observation and summarize its event in the
+            # same background pipeline; imports must not require maintenance UI.
+            task_pipeline.enrich_fast_image(asset_id, summarize_event=True)
     finally:
         task_store.close()
 
@@ -82,7 +84,7 @@ def health():
                 "error": pipeline.face.error,
                 "identityError": pipeline.face.identity_runtime_error or pipeline.face.identity_error,
             },
-            "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.error is None, "error": pipeline.clip.error},
+            "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.evidence_ready, "evidenceReady": pipeline.clip.evidence_ready, "error": pipeline.clip.error},
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
         "videoExtraction": "reserved",
@@ -120,6 +122,39 @@ def dashboard(scope_id: str | None = None):
 @app.get("/api/events")
 def events(scope_id: str | None = None):
     return {"events": store.list_events(100, scope_id=scope_id)}
+
+
+@app.get("/api/trips")
+def trips(scope_id: str | None = None, status: str | None = None):
+    return {"trips": store.list_trips(scope_id, status)}
+
+
+@app.get("/api/trips/{trip_id}")
+def trip_detail(trip_id: str):
+    value = store.get_trip_detail(trip_id)
+    if not value:
+        raise HTTPException(status_code=404, detail="trip not found")
+    return value
+
+
+@app.post("/api/trips/{trip_id}/confirm")
+def confirm_trip(trip_id: str, payload: dict):
+    try:
+        return store.confirm_trip(trip_id, payload.get("name"), payload.get("trip_type"))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="trip not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.post("/api/trips/{trip_id}/reject")
+def reject_trip(trip_id: str):
+    try:
+        return store.reject_trip(trip_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="trip not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @app.get("/api/events/{event_id}")
@@ -223,6 +258,56 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
     return {"entities": values}
 
 
+@app.get("/api/entity-groups")
+def entity_groups(scope_id: str | None = None):
+    return {"groups": store.list_semantic_entity_groups(scope_id)}
+
+
+@app.get("/api/entity-groups/{group_id}")
+def entity_group(group_id: str, scope_id: str | None = None):
+    value = store.get_semantic_entity_group(group_id, scope_id)
+    if not value:
+        raise HTTPException(status_code=404, detail="semantic entity group not found")
+    return value
+
+
+@app.get("/api/entity-merge-candidates")
+def entity_merge_candidates(scope_id: str | None = None, status: str | None = "pending"):
+    return {"candidates": store.list_entity_merge_candidates(scope_id, status)}
+
+
+@app.post("/api/maintenance/entity-merge-candidates")
+def derive_entity_merge_candidates(scope_id: str | None = None):
+    if not maintenance_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="entity merge candidate generation is already running")
+    maintenance_store = MemoryStore(store.path)
+    try:
+        return {"candidates": maintenance_store.derive_entity_merge_candidates(scope_id)}
+    finally:
+        maintenance_store.close()
+        maintenance_lock.release()
+
+
+@app.post("/api/entity-merge-candidates/{candidate_id}/confirm")
+def confirm_entity_merge_candidate(candidate_id: str, payload: dict):
+    try:
+        return store.confirm_entity_merge_candidate(candidate_id, payload.get("target_entity_id"))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="entity merge candidate not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.post("/api/entity-merge-candidates/{candidate_id}/reject")
+def reject_entity_merge_candidate(candidate_id: str):
+    try:
+        return store.reject_entity_merge_candidate(candidate_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="entity merge candidate not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.get("/api/knowledge")
 def knowledge(person_id: str | None = None, scope_id: str | None = None):
     claims = store.list_semantic_claims(person_id, 1000)
@@ -240,7 +325,14 @@ def knowledge(person_id: str | None = None, scope_id: str | None = None):
 
 @app.post("/api/maintenance/reindex-entities")
 def reindex_entities(scope_id: str | None = None):
-    return store.reindex_observation_entities(scope_id)
+    if not maintenance_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="entity reindex is already running")
+    maintenance_store = MemoryStore(store.path)
+    try:
+        return maintenance_store.reindex_observation_entities(scope_id)
+    finally:
+        maintenance_store.close()
+        maintenance_lock.release()
 
 
 @app.get("/api/entities/{entity_id}")
@@ -545,13 +637,35 @@ def create_invite(payload: dict):
     return {**invite, "invite_url": f"sentrix://join/{invite['token']}"}
 
 
+def assistant_response(result):
+    """Expose stable browser names while retaining the internal contract."""
+    result.setdefault("claims", [])
+    result.setdefault("claim_verifications", [])
+    result.setdefault("claim_verification_status", "not_required")
+    result.setdefault("repair_count", 0)
+    result.setdefault("evidence_bundles", [])
+    result.setdefault("claim_evidence_index", {})
+    result.setdefault("segments", [{"type": "text", "text": result.get("answer", "")}])
+    result["retrievalTrace"] = result.get("retrieval_trace", [])
+    result["toolTrace"] = result.get("tool_trace", [])
+    result["evidencePresentation"] = result.get("evidence_presentation", {})
+    result["memoryUsed"] = result.get("memory_used", False)
+    result["evidenceRequired"] = result.get("evidence_required", False)
+    result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
+    result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
+    result["claimVerifications"] = result["claim_verifications"]
+    result["claimVerificationStatus"] = result["claim_verification_status"]
+    result["repairCount"] = result["repair_count"]
+    result["evidenceBundles"] = result["evidence_bundles"]
+    result["claimEvidenceIndex"] = result["claim_evidence_index"]
+    return result
+
+
 @app.post("/api/search")
 def search(request: SearchRequest):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
-    result = agent.answer_turn(request.query.strip(), scope_id=request.spaceId)
-    result["retrievalTrace"] = result.get("retrieval_trace", [])
-    return result
+    return assistant_response(agent.answer_turn(request.query.strip(), scope_id=request.spaceId))
 
 
 class AssistantTurnRequest(BaseModel):
@@ -559,15 +673,19 @@ class AssistantTurnRequest(BaseModel):
     conversation_id: str | None = None
     feedback: dict | None = None
     scope_id: str = "home-default"
+    selected_entity_id: str | None = None
+    viewer_id: str = "owner"
 
 
 @app.post("/api/assistant/turn")
 def assistant_turn(request: AssistantTurnRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
-    result = agent.answer_turn(request.message.strip(), request.conversation_id, request.feedback, request.scope_id)
-    result["retrievalTrace"] = result.get("retrieval_trace", [])
-    return result
+    result = agent.answer_turn(
+        request.message.strip(), request.conversation_id, request.feedback, request.scope_id,
+        request.selected_entity_id, request.viewer_id,
+    )
+    return assistant_response(result)
 
 
 @app.post("/api/ingest", status_code=202)
@@ -655,6 +773,9 @@ def query_gap_feedback(gap_id: str, payload: dict):
         payload.get("accepted_answer"),
         payload.get("correction"),
         payload.get("target_claim_id"),
+        payload.get("target_entity_id"),
+        payload.get("target_event_id"),
+        payload.get("target_property_key"),
     )
 
 

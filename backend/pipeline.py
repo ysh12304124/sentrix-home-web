@@ -9,12 +9,13 @@ from pathlib import Path
 
 from .db import MemoryStore, make_id
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, ModelError, normalize_confidence
+from .semantic_taxonomy import normalize_semantic_analysis
 
 
 IMPORT_METADATA_KEYS = {
     "content_sha256", "sha256", "exif", "captured_at", "captured_location",
     "source_owner_id", "source_owner_label", "source_device_id", "source_album_id",
-    "source_confidence", "scope_id",
+    "source_confidence", "scope_id", "batch_id",
 }
 
 
@@ -224,7 +225,8 @@ class IngestionPipeline:
             "file_name": asset["file_name"], "captured_at": asset.get("captured_at") or file_time(asset["path"]),
             "captured_location": asset.get("captured_location") or "", "source_owner_id": asset.get("source_owner_id"),
         })
-        analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
+        analysis = normalize_semantic_analysis(analysis)
+        analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
         analysis["raw"] = {"gamma": analysis.copy(), "semantic_status": "complete"}
         observation = self.store.enrich_observation(observation_id, analysis, source="deferred_vision_enrichment")
         event_id = metadata.get("event_id")
@@ -243,8 +245,32 @@ class IngestionPipeline:
         detail = self.store.get_event_detail(event_id)
         if not detail or not detail["observations"] or not hasattr(self.gamma, "summarize_event"):
             return self.store.get_event(event_id)
+
+        def fallback_projection():
+            event = detail["event"]
+            observations = detail["observations"]
+            place = str(event.get("place") or "其他或不确定").strip()
+            activities = []
+            captions = []
+            event_types = []
+            for observation in observations:
+                for value, target in ((observation.get("activity"), activities), (observation.get("caption"), captions), (observation.get("event_type"), event_types)):
+                    value = str(value or "").strip()
+                    if value and value not in target and value not in {"待判断", "未识别", "未知"}:
+                        target.append(value)
+            activity = "、".join(activities[:3]) or "图片记录"
+            event_type = event_types[0] if event_types else "家庭活动"
+            title = f"{place}{activity}" if place != "其他或不确定" else activity
+            summary = f"{place}记录了" + "；".join(captions[:4] or activities[:4])
+            return {
+                "title": title[:20], "event_type": event_type[:20], "activity": activity[:20],
+                "summary": summary[:240], "confidence": 0.45, "model": "deterministic_event_fallback",
+            }
+
         try:
             result = self.gamma.summarize_event(detail["event"], detail["observations"])
+            if str(result.get("title") or "").strip() in {"待总结事件", "待确认的家庭记录", "待判断"}:
+                result = fallback_projection()
             updated = self.store.update_event(event_id, {
                 "title": result.get("title"),
                 "event_type": result.get("event_type"),
@@ -256,7 +282,15 @@ class IngestionPipeline:
             self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result.get("model"), "event_summary": True})
             return updated
         except Exception:
-            return self.store.get_event(event_id)
+            result = fallback_projection()
+            updated = self.store.update_event(event_id, {
+                "title": result["title"], "event_type": result["event_type"],
+                "activity": result["activity"], "summary": result["summary"],
+            })
+            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
+            vector = self.clip.embed_text(event_text)
+            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result["model"], "event_summary": True})
+            return updated
 
     def summarize_events(self, scope_id=None):
         return [self.summarize_event(event["id"]) for event in self.store.list_events(1000, scope_id)]
@@ -268,6 +302,25 @@ class IngestionPipeline:
             if event.get("title") == "待总结事件"
         ]
         return [self.summarize_event(event["id"]) for event in pending]
+
+    def finalize_ingest_batch(self, batch_id):
+        """Summarize only events touched by a completed import batch."""
+        batch = self.store.get_ingest_batch(batch_id)
+        if not batch:
+            raise KeyError(batch_id)
+        if batch["status"] == "open":
+            return batch
+        if batch["status"] == "complete":
+            if not self.store.claim_ingest_batch_summary(batch_id):
+                return self.store.get_ingest_batch(batch_id)
+            batch = self.store.get_ingest_batch(batch_id)
+        elif batch["status"] == "summarizing":
+            return batch
+        else:
+            return batch
+        for event_id in self.store.batch_event_ids(batch_id):
+            self.summarize_event(event_id)
+        return self.store.finish_ingest_batch(batch_id)
 
     def _image_observation(self, asset):
         path = asset["path"]
@@ -299,6 +352,7 @@ class IngestionPipeline:
             analysis, vision_seconds = timed(lambda: self.gamma.analyze_image(path, metadata))
             faces, face_seconds = timed(lambda: self.face.detect(path))
             clip_embedding, clip_seconds = timed(lambda: self.clip.embed_image(path))
+        analysis = normalize_semantic_analysis(analysis)
         analysis["clip_embedding"] = clip_embedding
         analysis["processing_timings"] = {
             "vision_seconds": round(vision_seconds, 4),
@@ -311,7 +365,7 @@ class IngestionPipeline:
         analysis["source_owner_id"] = asset.get("source_owner_id")
         analysis["canonical"] = {
             key: analysis.get(key)
-            for key in ("caption", "activity", "place", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
+            for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
         }
         analysis["source_type"] = "image"
         analysis["face_candidates"] = faces
