@@ -50,13 +50,18 @@ def main():
     parser.add_argument("--queries", type=int, default=100)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--backend", default="sqlite_baseline")
+    parser.add_argument("--backend", default="hnswlib",
+                         help="AnnIndex backend (default hnswlib per Phase 3.5.1 selection)")
     parser.add_argument("--report", default=None)
     args = parser.parse_args()
     print(f"generating {args.count} synthetic vectors (dim={args.dim})…")
     vectors = _generate_vectors(args.count, args.dim, args.seed)
     print(f"building {args.backend} index…")
-    index = create_index(args.backend)
+    index_kwargs = {}
+    if args.backend == "hnswlib":
+        # Pre-size to avoid mid-build resizes; matches the plan target of 100k.
+        index_kwargs["max_elements"] = max(args.count, 100_000)
+    index = create_index(args.backend, **index_kwargs)
     build_start = time.perf_counter()
     index.build(vectors)
     build_ms = (time.perf_counter() - build_start) * 1000
