@@ -45,6 +45,17 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   const source = fs.readFileSync(path.join(root, "server.js"), "utf8");
   assert.doesNotMatch(source, /COGNEE_BASE_URL|mockSearch|function handleApi/);
   assert.match(source, /return proxyBackend\(req, res, url\);/);
+  assert.match(source, /127\.0\.0\.1:8091/, "web must use the Agent-capable API by default");
+});
+
+test("portal exposes all optimized album scopes and labels their evidence", () => {
+  const source = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  assert.match(source, /全部相册/);
+  assert.match(source, /visibleSpaces/);
+  assert.match(source, /albumLabel/);
+  assert.match(source, /album-badge/);
+  assert.match(source, /source_album_id/);
+  assert.match(source, /assistant-scope.*albumLabel\(state\.scopeId\)/s);
 });
 
 test("virtual fixture keeps evaluation labels outside imported metadata", () => {

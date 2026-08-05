@@ -514,3 +514,11 @@ P0 的属性版本、用户覆盖和关系聚合，之后依赖顺序推进地�
 - 语义规范化新增“模型选择其他时从原始地点/物品标签回退”、室内/街道/工业/自然等地点类别，以及自然景观、艺术展品、工业设备、演出用品等物品主类；完整原始标签仍保留在 Observation 证据中。现有数据库已使用新词表重投影，不重新调用视觉模型。
 - 最终验收：SQLite `integrity_check=ok`；资产-观察、观察-事件覆盖无缺失；`raw_json/canonical_json` 全部可解析；向量空间 `episodic=284`、`semantic=189`、`visual=263`，无悬空 source 指针；API `8090`、Web `4174`、FMA `5173` 均正常。
 - 本阶段回归：153 正式 `.venv` 中 `58/58` 语义/模型/数据库/管道测试通过；Agent 相关未提交文件未触碰。重建和重投影备份保留在 `/tmp`，不纳入 Git。
+
+## 2026-08-05 Agent、网页与三相册数据统一
+
+- 运行拓扑固定为 `4174 Web -> 8091 Agent-capable API -> data/sentrix.db`；8090 继续作为直接 Sentrix API 入口，FMA `5173` 未停止、未修改。
+- 8091 与 8090 均使用 `/home/asus/Github/Sentrix-Home-Web/data/sentrix.db`，Agent 的记忆检索、证据回链和网页读取因此使用同一份三相册正式数据；Gemma 使用 `11435` 常驻实例。
+- `/api/memory-spaces` 暴露 `album1`、`album2`、`album3`，网页默认进入“全部相册”合并视图，同时保留单相册切换。当前数据为 `189` 张原始图片、`95` 个事件；分相册为 `62/25`、`58/34`、`69/36`（资产/事件）。事件和原始证据卡均显示来源相册标签。
+- 网页不再默认代理旧的 8091 demo 数据库，也不再把旧 `home-default` 选择当作首屏相册；Agent 助手页在合并视图显示“全部相册”。
+- 统一入口验证：Node 回归 `27/27`、`node --check src/app.js`、`node --check server.js`、`git diff --check` 通过；8090、8091、4174、5173 健康检查均为 `200`，Agent `/api/assistant/turn` 可通过 4174 返回跨相册证据回答。
