@@ -21,7 +21,7 @@ fi
 nohup env \
   OLLAMA_HOST="$host" \
   OLLAMA_MODELS="$models_dir" \
-  OLLAMA_KEEP_ALIVE=0 \
+  OLLAMA_KEEP_ALIVE=-1 \
   /usr/local/bin/ollama serve \
   >"$runtime_dir/logs/ollama.log" 2>&1 < /dev/null &
 pid=$!

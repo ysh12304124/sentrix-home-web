@@ -1,10 +1,13 @@
 import json
 import math
+import re
 import sqlite3
 import threading
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
 
 
 def make_id(prefix):
@@ -70,6 +73,77 @@ OBJECT_CATEGORIES = {
     "服饰": ("衣", "帽", "鞋", "包", "眼镜", "领带"),
 }
 
+TRIP_MIN_GPS_DISPLACEMENT_KM = 50.0
+DISPLAY_COORDINATE_RE = re.compile(
+    r"(?:GPS(?:坐标)?|坐标|经纬度)?\s*[+-]?\d{1,3}(?:\.\d+)?\s*[,，]\s*[+-]?\d{1,3}(?:\.\d+)?"
+)
+
+MOOD_NORMALIZATION = {
+    "平静": "平静",
+    "宁静": "平静",
+    "平和": "平静",
+    "安详": "平静",
+    "淡定": "平静",
+    "表情平淡": "平静",
+    "愉快": "喜悦",
+    "愉悦": "喜悦",
+    "喜悦": "喜悦",
+    "温馨": "温馨",
+    "微笑": "喜悦",
+    "面带微笑": "喜悦",
+    "欢快": "喜悦",
+    "兴奋": "兴奋",
+    "兴奋感": "兴奋",
+    "轻松": "放松",
+    "放松": "放松",
+    "悠闲": "放松",
+    "专注": "专注",
+    "好奇": "好奇",
+    "警觉": "警觉",
+}
+
+SEMANTIC_ENTITY_EQUIVALENTS = {
+    "place": {
+        "湖边": "滨水区域",
+        "水边": "滨水区域",
+        "河边": "滨水区域",
+        "河岸": "滨水区域",
+        "湖畔": "滨水区域",
+        "博物馆": "展览空间",
+        "展厅": "展览空间",
+        "展览厅": "展览空间",
+        "展览馆": "展览空间",
+        "美术馆": "展览空间",
+        "画廊": "展览空间",
+    },
+    "emotion": MOOD_NORMALIZATION,
+}
+
+SEMANTIC_PLACE_CONCEPTS = (
+    ("滨水空间", ("湖", "河", "海", "港", "码头", "水域", "水边", "水池", "滨水")),
+    ("展览空间", ("博物馆", "展厅", "展览", "美术馆", "画廊", "展柜", "科普馆")),
+    ("餐饮空间", ("餐厅", "餐馆", "餐饮", "厨房", "餐桌", "咖啡", "烘焙", "快餐", "茶室")),
+    ("园林与公园", ("园林", "公园", "花园", "植物园", "温室", "果园", "庭院")),
+    ("商业空间", ("商店", "商场", "购物", "店铺", "超市", "摊位")),
+    ("交通出行空间", ("机场", "地铁", "车厢", "停机坪", "登机桥", "车站", "高架", "公路")),
+    ("演出活动空间", ("剧场", "舞台", "演艺", "活动现场")),
+    ("居住室内空间", ("卧室", "客厅", "室内", "房间", "走廊", "门口", "室内环境")),
+    ("户外公共空间", ("广场", "街道", "户外", "室外", "景区", "道路", "观景")),
+)
+
+SEMANTIC_OBJECT_CONCEPTS = (
+    ("手机与移动设备", ("手机", "平板", "相机")),
+    ("展示与标识", ("海报", "横幅", "宣传", "标牌", "展板", "告示", "路标", "灯牌", "菜单")),
+    ("餐具与容器", ("碗", "杯", "盘", "勺", "叉", "筷", "锅", "茶具", "餐具", "容器")),
+    ("食物与饮品", ("蛋糕", "甜点", "饮料", "面条", "沙拉", "肉", "虾", "玉米", "番茄", "薯条", "牛角", "饭", "菜")),
+    ("花卉与植物", ("花", "树", "草", "绿植", "盆栽", "棕榈", "樱花", "梅花")),
+    ("建筑与工程", ("建筑", "房屋", "大坝", "高塔", "电线杆", "厂房", "机械", "起重机", "桥", "围墙")),
+    ("围栏与公共设施", ("围栏", "栏杆", "护栏", "路灯", "扶手", "井盖")),
+    ("交通工具", ("汽车", "车辆", "自行车", "摩托", "飞机", "船", "轮渡", "公交", "三轮车")),
+    ("服饰与配件", ("背包", "项链", "戒指", "眼镜", "手表", "鞋", "钥匙", "项圈")),
+    ("毛绒与玩具", ("毛绒", "玩偶", "气球")),
+)
+
 
 def normalize_clothing(value):
     text = str(value or "").strip()
@@ -100,6 +174,33 @@ def object_category(label):
         if any(term in text for term in terms):
             return category
     return "其他"
+
+
+def normalize_mood(value):
+    return MOOD_NORMALIZATION.get(str(value or "").strip())
+
+
+def parse_gps_place(value):
+    """Parse an EXIF-style latitude,longitude place only when it is usable."""
+    try:
+        latitude, longitude = (float(part.strip()) for part in str(value or "").split(",", 1))
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return None
+    if latitude == 0 and longitude == 0:
+        return None
+    return latitude, longitude
+
+
+def gps_distance_km(first, second):
+    """Return the great-circle distance in kilometres between two GPS points."""
+    latitude_one, longitude_one = map(math.radians, first)
+    latitude_two, longitude_two = map(math.radians, second)
+    delta_latitude = latitude_two - latitude_one
+    delta_longitude = longitude_two - longitude_one
+    a = math.sin(delta_latitude / 2) ** 2 + math.cos(latitude_one) * math.cos(latitude_two) * math.sin(delta_longitude / 2) ** 2
+    return 6371.0088 * 2 * math.asin(math.sqrt(a))
 
 
 class MemoryStore:
@@ -136,9 +237,18 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ingest_batches (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS assets (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
+                batch_id TEXT,
                 file_name TEXT NOT NULL,
                 media_type TEXT NOT NULL,
                 path TEXT NOT NULL,
@@ -201,6 +311,15 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_revisions (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL REFERENCES events(id),
+                field_name TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                source TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS event_observations (
                 event_id TEXT NOT NULL REFERENCES events(id),
                 observation_id TEXT NOT NULL REFERENCES observations(id),
@@ -237,6 +356,32 @@ class MemoryStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(event_id, entity_id, relation)
             );
+            CREATE TABLE IF NOT EXISTS trips (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                time_start TEXT,
+                time_end TEXT,
+                event_ids_json TEXT NOT NULL DEFAULT '[]',
+                place_names_json TEXT NOT NULL DEFAULT '[]',
+                companion_ids_json TEXT NOT NULL DEFAULT '[]',
+                trip_type TEXT,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS trip_revisions (
+                id TEXT PRIMARY KEY,
+                trip_id TEXT NOT NULL REFERENCES trips(id),
+                action TEXT NOT NULL,
+                old_value_json TEXT NOT NULL DEFAULT '{}',
+                new_value_json TEXT NOT NULL DEFAULT '{}',
+                source TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS entities (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -272,6 +417,22 @@ class MemoryStore:
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_merge_candidates (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                entity_type TEXT NOT NULL,
+                entity_ids_json TEXT NOT NULL DEFAULT '[]',
+                suggested_name TEXT NOT NULL,
+                rationale_json TEXT NOT NULL DEFAULT '{}',
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                target_entity_id TEXT REFERENCES entities(id),
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(scope_id, entity_type, entity_ids_json, suggested_name)
             );
             CREATE TABLE IF NOT EXISTS face_clusters (
                 id TEXT PRIMARY KEY,
@@ -470,6 +631,7 @@ class MemoryStore:
             );
             CREATE TABLE IF NOT EXISTS query_gaps (
                 id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
                 query TEXT NOT NULL,
                 missing_dimension TEXT NOT NULL,
                 candidate_asset_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -486,7 +648,16 @@ class MemoryStore:
                 accepted_answer TEXT,
                 correction TEXT,
                 target_claim_id TEXT REFERENCES semantic_claims(id),
+                target_entity_id TEXT REFERENCES entities(id),
+                target_event_id TEXT REFERENCES events(id),
+                target_property_key TEXT,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dialogue_states (
+                conversation_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS rebuild_runs (
                 id TEXT PRIMARY KEY,
@@ -521,6 +692,7 @@ class MemoryStore:
         self._migrate_face_instances_cluster_nullable()
         self._ensure_columns("assets", {
             "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
+            "batch_id": "TEXT",
             "source_owner_id": "TEXT", "source_owner_label": "TEXT", "source_device_id": "TEXT", "source_album_id": "TEXT",
             "source_confidence": "REAL NOT NULL DEFAULT 0", "content_sha256": "TEXT", "captured_at": "TEXT", "captured_location": "TEXT",
         })
@@ -548,9 +720,16 @@ class MemoryStore:
             "aggregation_score": "REAL NOT NULL DEFAULT 0",
             "aggregation_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
             "merged_into_event_id": "TEXT", "merge_reason": "TEXT",
+            "cover_asset_id": "TEXT", "cover_selection_json": "TEXT NOT NULL DEFAULT '{}'",
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("query_gaps", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("memory_feedback", {
+            "target_entity_id": "TEXT REFERENCES entities(id)", "target_event_id": "TEXT REFERENCES events(id)",
+            "target_property_key": "TEXT",
+        })
+        self._ensure_columns("entity_merge_candidates", {"target_entity_id": "TEXT REFERENCES entities(id)"})
         self._ensure_columns("face_clusters", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("relationships", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("facts", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
@@ -572,8 +751,10 @@ class MemoryStore:
             INSERT OR IGNORE INTO memory_spaces(id, name, kind, created_at, updated_at)
             VALUES ('home-default', '默认家庭', 'household', datetime('now'), datetime('now'));
             CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(asset_id);
+            CREATE INDEX IF NOT EXISTS idx_assets_batch ON assets(batch_id);
             CREATE INDEX IF NOT EXISTS idx_assets_content_sha256 ON assets(content_sha256);
             CREATE INDEX IF NOT EXISTS idx_events_time ON events(time_start);
+            CREATE INDEX IF NOT EXISTS idx_event_revisions_event ON event_revisions(event_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_facts_subject_predicate ON facts(subject, predicate);
             CREATE INDEX IF NOT EXISTS idx_face_instances_cluster ON face_instances(cluster_id);
             CREATE INDEX IF NOT EXISTS idx_face_prototypes_cluster ON face_prototypes(cluster_id);
@@ -591,6 +772,8 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id);
             CREATE INDEX IF NOT EXISTS idx_event_entities_event ON event_entities(event_id);
             CREATE INDEX IF NOT EXISTS idx_event_entities_entity ON event_entities(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_trips_scope_status ON trips(scope_id, status, time_start);
+            CREATE INDEX IF NOT EXISTS idx_trip_revisions_trip ON trip_revisions(trip_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_semantic_claims_person ON semantic_claims(person_id);
             CREATE INDEX IF NOT EXISTS idx_assets_scope ON assets(scope_id);
             CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(scope_id);
@@ -598,6 +781,7 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(scope_id);
             CREATE INDEX IF NOT EXISTS idx_entity_properties_entity_key ON entity_properties(entity_id, property_key, updated_at);
             CREATE INDEX IF NOT EXISTS idx_entity_properties_status ON entity_properties(status);
+            CREATE INDEX IF NOT EXISTS idx_entity_merge_candidates_scope_status ON entity_merge_candidates(scope_id, status, entity_type);
             CREATE INDEX IF NOT EXISTS idx_face_clusters_scope ON face_clusters(scope_id);
             CREATE INDEX IF NOT EXISTS idx_person_event_memory_person ON person_event_memory(person_id, event_id);
             CREATE INDEX IF NOT EXISTS idx_person_event_memory_scope ON person_event_memory(scope_id, event_id);
@@ -686,7 +870,7 @@ class MemoryStore:
         self.connection.commit()
 
     def count(self, table):
-        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "rebuild_runs", "stories", "invites"}:
+        if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "entity_merge_candidates", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "dialogue_states", "rebuild_runs", "stories", "invites", "trips"}:
             raise ValueError("unsupported table")
         return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
@@ -732,12 +916,12 @@ class MemoryStore:
         timestamp = now_iso()
         self.connection.execute(
             """INSERT INTO assets(
-                id, scope_id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
+                id, scope_id, batch_id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
                 source_owner_id, source_owner_label, source_device_id, source_album_id, source_confidence,
                 content_sha256, captured_at, captured_location, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                asset_id, scope_id, file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
+                asset_id, scope_id, metadata.get("batch_id"), file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
                 metadata.get("source_owner_id"), metadata.get("source_owner_label"), metadata.get("source_device_id"), metadata.get("source_album_id"),
                 float(metadata.get("source_confidence", 0) or 0), metadata.get("content_sha256") or metadata.get("sha256"), metadata.get("captured_at"), metadata.get("captured_location"),
                 timestamp, timestamp,
@@ -791,10 +975,10 @@ class MemoryStore:
         current = self.get_asset(asset_id) or {}
         merged_metadata = {**(current.get("metadata_json") or {}), **metadata}
         self.connection.execute(
-            """UPDATE assets SET status = ?, metadata_json = ?, source_owner_id = ?, source_owner_label = ?, source_device_id = ?,
+            """UPDATE assets SET status = ?, batch_id = ?, metadata_json = ?, source_owner_id = ?, source_owner_label = ?, source_device_id = ?,
                 source_album_id = ?, source_confidence = ?, content_sha256 = ?, captured_at = ?, captured_location = ?, updated_at = ? WHERE id = ?""",
             (
-                status, json_value(merged_metadata, {}), metadata.get("source_owner_id", current.get("source_owner_id")),
+                status, metadata.get("batch_id", current.get("batch_id")), json_value(merged_metadata, {}), metadata.get("source_owner_id", current.get("source_owner_id")),
                 metadata.get("source_owner_label", current.get("source_owner_label")), metadata.get("source_device_id", current.get("source_device_id")), metadata.get("source_album_id", current.get("source_album_id")),
                 float(metadata.get("source_confidence", current.get("source_confidence", 0)) or 0),
                 metadata.get("content_sha256", metadata.get("sha256", current.get("content_sha256"))),
@@ -804,6 +988,65 @@ class MemoryStore:
         )
         self.connection.commit()
         return self.get_asset(asset_id)
+
+    def create_ingest_batch(self, batch_id, scope_id="home-default"):
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT OR IGNORE INTO ingest_batches(id, scope_id, status, created_at, updated_at)
+            VALUES (?, ?, 'open', ?, ?)""",
+            (str(batch_id), scope_id or "home-default", timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
+    def get_ingest_batch(self, batch_id):
+        return self._row("SELECT * FROM ingest_batches WHERE id = ?", (str(batch_id),))
+
+    def complete_ingest_batch(self, batch_id):
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'summarizing') THEN status ELSE 'complete' END,
+            updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?""",
+            (timestamp, timestamp, str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
+    def claim_ingest_batch_summary(self, batch_id):
+        batch_id = str(batch_id)
+        batch = self.get_ingest_batch(batch_id)
+        if not batch or batch["status"] != "complete":
+            return False
+        pending = self._row(
+            "SELECT COUNT(*) AS count FROM assets WHERE batch_id = ? AND status IN ('queued', 'processing', 'semantic_enriching')",
+            (batch_id,),
+        )
+        if pending and pending["count"]:
+            return False
+        cursor = self.connection.execute(
+            "UPDATE ingest_batches SET status = 'summarizing', updated_at = ? WHERE id = ? AND status = 'complete'",
+            (now_iso(), batch_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount == 1
+
+    def finish_ingest_batch(self, batch_id):
+        self.connection.execute(
+            "UPDATE ingest_batches SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'summarizing'",
+            (now_iso(), str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
+    def batch_event_ids(self, batch_id):
+        rows = self._rows(
+            """SELECT DISTINCT eo.event_id FROM event_observations eo
+            JOIN observations o ON o.id = eo.observation_id
+            JOIN assets a ON a.id = o.asset_id
+            WHERE a.batch_id = ? ORDER BY eo.event_id""",
+            (str(batch_id),),
+        )
+        return [row["event_id"] for row in rows]
 
     def cleanup_asset_derivatives(self, asset_id):
         """Remove only derived records owned by one failed asset."""
@@ -839,6 +1082,9 @@ class MemoryStore:
         self.connection.execute(f"DELETE FROM observations WHERE id IN ({placeholders})", observation_ids)
         for event_id in event_ids:
             if self.connection.execute("SELECT COUNT(*) FROM event_observations WHERE event_id = ?", (event_id,)).fetchone()[0] == 0:
+                self.connection.execute("DELETE FROM event_entities WHERE event_id = ?", (event_id,))
+                self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (event_id,))
+                self.connection.execute("DELETE FROM event_revisions WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.commit()
 
@@ -1224,6 +1470,19 @@ class MemoryStore:
             "visual_event_type": (observation.get("event_type") or "").strip().lower(),
         }
 
+    @staticmethod
+    def _event_display_place(observation):
+        """Return a semantic place label, keeping GPS only on the asset."""
+        observation = observation or {}
+        visual_place = str(observation.get("place") or "").strip()
+        if visual_place and not DISPLAY_COORDINATE_RE.fullmatch(visual_place):
+            return visual_place
+        canonical = observation.get("canonical") if isinstance(observation.get("canonical"), dict) else {}
+        semantic = canonical.get("semantic") if isinstance(canonical.get("semantic"), dict) else {}
+        semantic_place = semantic.get("place") if isinstance(semantic.get("place"), dict) else {}
+        primary = str(semantic_place.get("primary") or "").strip()
+        return primary if primary and primary != OTHER else ""
+
     def merge_observation_into_event(self, observation):
         candidates = self._event_candidates(observation)
         event = candidates[0] if candidates else None
@@ -1235,7 +1494,7 @@ class MemoryStore:
         ]
         people = dedupe_json_values((json.loads(event["participants_json"]) if event else []) + confirmed_people)
         captured_at = anchor["captured_at"]
-        event_place = anchor["location"] or observation.get("place")
+        event_place = self._event_display_place(observation) or "其他或不确定"
         event_type = "待判断"
         if event:
             start = min(filter(None, [event.get("time_start"), captured_at])) if any([event.get("time_start"), captured_at]) else None
@@ -1246,7 +1505,7 @@ class MemoryStore:
             self.connection.execute(
                 """UPDATE events SET time_start = ?, time_end = ?, place = ?, activity = ?, summary = ?,
                 participants_json = ?, confidence = MAX(confidence, ?), revision = revision + 1, updated_at = ? WHERE id = ?""",
-                (start, end, event.get("place") or event_place, event.get("activity") or observation.get("activity"), summary, json_value(people, []), float(observation.get("confidence", 0) or 0), now_iso(), event["id"]),
+                (start, end, event_place, event.get("activity") or observation.get("activity"), summary, json_value(people, []), float(observation.get("confidence", 0) or 0), now_iso(), event["id"]),
             )
             event_id = event["id"]
         else:
@@ -1264,11 +1523,12 @@ class MemoryStore:
                 (float(event.get("aggregation_score", 0) or 0), json_value(event.get("aggregation_breakdown", {}), {}), event_id),
             )
         self.connection.commit()
+        self.select_event_cover(event_id)
         self._refresh_event_participants([observation["id"]])
         return self.get_event(event_id)
 
     def get_event(self, event_id):
-        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json", "aggregation_breakdown_json"])
+        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json", "aggregation_breakdown_json", "cover_selection_json"])
         if row:
             row["participants"] = row.get("participants_json", [])
             row["aggregation_breakdown"] = row.get("aggregation_breakdown_json", {})
@@ -1278,9 +1538,46 @@ class MemoryStore:
                     self.get_observation(observation_id) or {} for observation_id in row["observation_ids"]
                 ) if item.get("asset_id")
             ]
-            row["cover_asset_id"] = row["asset_ids"][0] if row["asset_ids"] else None
+            row["cover_asset_id"] = row.get("cover_asset_id") if row.get("cover_asset_id") in row["asset_ids"] else (row["asset_ids"][0] if row["asset_ids"] else None)
+            row["cover_selection"] = row.get("cover_selection_json", {})
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
+
+    def select_event_cover(self, event_id):
+        """Choose an event cover from its own image evidence, without replacing user choice."""
+        event = self.get_event(event_id)
+        if not event:
+            return None
+        selection = event.get("cover_selection") or {}
+        if event.get("cover_asset_id") and selection.get("source") == "user":
+            return event
+        candidates = []
+        for observation_id in event.get("observation_ids", []):
+            observation = self.get_observation(observation_id) or {}
+            asset = self.get_asset(observation.get("asset_id")) or {}
+            if asset.get("media_type") != "image":
+                continue
+            candidates.append((
+                float(observation.get("confidence", 0) or 0),
+                str(observation.get("captured_at") or asset.get("captured_at") or ""),
+                str(asset.get("id") or ""), observation, asset,
+            ))
+        if not candidates:
+            return event
+        _, _, _, observation, asset = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+        selection = {
+            "source": "derived", "asset_id": asset["id"], "evidence_observation_id": observation["id"],
+            "criteria": {
+                "media_type": "image", "observation_confidence": float(observation.get("confidence", 0) or 0),
+                "captured_at": observation.get("captured_at") or asset.get("captured_at"), "candidate_count": len(candidates),
+            },
+        }
+        self.connection.execute(
+            "UPDATE events SET cover_asset_id = ?, cover_selection_json = ?, updated_at = ? WHERE id = ?",
+            (asset["id"], json_value(selection, {}), now_iso(), event_id),
+        )
+        self.connection.commit()
+        return self.get_event(event_id)
 
     def upsert_event_participant(self, event_id, person_id, role, evidence_ids=None, confidence=0.5):
         if not self.get_entity(person_id):
@@ -1302,7 +1599,27 @@ class MemoryStore:
                 (make_id("event_person"), event_id, person_id, role, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
             )
         self.connection.commit()
+        self._maintain_event_cooccurrence_candidates(event_id)
         return self.list_event_participants(event_id)
+
+    def _maintain_event_cooccurrence_candidates(self, event_id):
+        """Suggest co-occurrence only; users decide whether it represents a real relationship."""
+        participants = [
+            item for item in self.list_event_participants(event_id)
+            if item.get("role") == "visible_subject" and item.get("person_status") == "confirmed"
+        ]
+        for index, left in enumerate(participants):
+            for right in participants[index + 1:]:
+                subject_id, object_id = sorted((left["person_id"], right["person_id"]))
+                evidence_ids = list(dict.fromkeys((left.get("evidence_ids_json") or []) + (right.get("evidence_ids_json") or [])))
+                support_rows = self._rows(
+                    """SELECT DISTINCT ep.event_id FROM event_participants ep
+                    JOIN event_participants other ON other.event_id = ep.event_id
+                    WHERE ep.person_id = ? AND other.person_id = ? AND ep.role = 'visible_subject' AND other.role = 'visible_subject'""",
+                    (subject_id, object_id),
+                )
+                confidence = min(0.9, 0.45 + 0.1 * len(support_rows))
+                self.create_relationship(subject_id, "共同出现", object_id, evidence_ids, confidence, "pending")
 
     def list_event_participants(self, event_id=None):
         clauses = []
@@ -1460,13 +1777,13 @@ class MemoryStore:
     def get_rebuild(self, run_id):
         return self._decode(self._row("SELECT * FROM rebuild_runs WHERE id = ?", (run_id,)), ["stats_json"])
 
-    def create_query_gap(self, query, missing_dimension, candidate_asset_ids=None, evidence_ids=None):
+    def create_query_gap(self, query, missing_dimension, candidate_asset_ids=None, evidence_ids=None, scope_id=None):
         gap_id = make_id("gap")
         timestamp = now_iso()
         self.connection.execute(
-            """INSERT INTO query_gaps(id, query, missing_dimension, candidate_asset_ids_json, evidence_ids_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (gap_id, query, missing_dimension, json_value(candidate_asset_ids, []), json_value(evidence_ids, []), timestamp, timestamp),
+            """INSERT INTO query_gaps(id, scope_id, query, missing_dimension, candidate_asset_ids_json, evidence_ids_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (gap_id, scope_id or "home-default", query, missing_dimension, json_value(candidate_asset_ids, []), json_value(evidence_ids, []), timestamp, timestamp),
         )
         self.connection.commit()
         return self.get_query_gap(gap_id)
@@ -1474,23 +1791,62 @@ class MemoryStore:
     def get_query_gap(self, gap_id):
         return self._decode(self._row("SELECT * FROM query_gaps WHERE id = ?", (gap_id,)), ["candidate_asset_ids_json", "evidence_ids_json"])
 
-    def list_query_gaps(self, status=None, limit=200):
+    def list_query_gaps(self, status=None, limit=200, scope_id=None):
+        clauses, params = [], []
         if status:
-            rows = self._rows("SELECT * FROM query_gaps WHERE status = ? ORDER BY updated_at DESC LIMIT ?", (status, limit))
-        else:
-            rows = self._rows("SELECT * FROM query_gaps ORDER BY updated_at DESC LIMIT ?", (limit,))
+            clauses.append("status = ?")
+            params.append(status)
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        rows = self._rows(f"SELECT * FROM query_gaps{where} ORDER BY updated_at DESC LIMIT ?", params)
         return [self._decode(row, ["candidate_asset_ids_json", "evidence_ids_json"]) for row in rows]
 
-    def add_memory_feedback(self, gap_id, user_id=None, accepted_answer=None, correction=None, target_claim_id=None):
+    def add_memory_feedback(self, gap_id=None, user_id=None, accepted_answer=None, correction=None, target_claim_id=None,
+                            target_entity_id=None, target_event_id=None, target_property_key=None):
+        if not gap_id and not any((target_claim_id, target_entity_id, target_event_id)):
+            raise ValueError("feedback requires a query gap or an explicit memory target")
+        if target_entity_id and not self.get_entity(target_entity_id):
+            raise KeyError(target_entity_id)
+        if target_event_id and not self.get_event(target_event_id):
+            raise KeyError(target_event_id)
+        if target_property_key and not target_entity_id:
+            raise ValueError("a property feedback target requires an entity")
         feedback_id = make_id("feedback")
         self.connection.execute(
-            """INSERT INTO memory_feedback(id, query_gap_id, user_id, accepted_answer, correction, target_claim_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (feedback_id, gap_id, user_id, accepted_answer, correction, target_claim_id, now_iso()),
+            """INSERT INTO memory_feedback(id, query_gap_id, user_id, accepted_answer, correction, target_claim_id,
+            target_entity_id, target_event_id, target_property_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (feedback_id, gap_id, user_id, accepted_answer, correction, target_claim_id, target_entity_id,
+             target_event_id, target_property_key, now_iso()),
         )
-        self.connection.execute("UPDATE query_gaps SET status = 'resolved', resolution = ?, updated_at = ? WHERE id = ?", (correction or accepted_answer or "confirmed", now_iso(), gap_id))
+        if gap_id:
+            self.connection.execute("UPDATE query_gaps SET status = 'resolved', resolution = ?, updated_at = ? WHERE id = ?", (correction or accepted_answer or "confirmed", now_iso(), gap_id))
         self.connection.commit()
         return self._row("SELECT * FROM memory_feedback WHERE id = ?", (feedback_id,))
+
+    def get_dialogue_state(self, conversation_id, scope_id=None):
+        row = self._row("SELECT * FROM dialogue_states WHERE conversation_id = ?", (conversation_id,))
+        if not row or (scope_id and row.get("scope_id") != scope_id):
+            return None
+        try:
+            return json.loads(row.get("state_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def save_dialogue_state(self, conversation_id, scope_id, state):
+        allowed = {"scope_id", "active_event_ids", "active_entity_ids", "evidence_ids", "unresolved_ambiguity"}
+        value = {key: state.get(key) for key in allowed if key in state}
+        self.connection.execute(
+            """INSERT INTO dialogue_states(conversation_id, scope_id, state_json, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET scope_id = excluded.scope_id,
+            state_json = excluded.state_json, updated_at = excluded.updated_at""",
+            (conversation_id, scope_id or "home-default", json_value(value, {}), now_iso()),
+        )
+        self.connection.commit()
+        return self.get_dialogue_state(conversation_id, scope_id)
 
     def list_person_event_memory(self, person_id, scope_id=None):
         clauses = ["person_id = ?", "status = 'active'"]
@@ -1755,6 +2111,146 @@ class MemoryStore:
             rows = self._rows("SELECT * FROM events WHERE status = 'active' ORDER BY time_start DESC LIMIT ?", (limit,))
         return [self.get_event(row["id"]) for row in rows]
 
+    def list_trips(self, scope_id=None, status=None):
+        clauses = []
+        params = []
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._rows("SELECT * FROM trips" + where + " ORDER BY time_start DESC, updated_at DESC", params)
+        return [self._decode(row, ["event_ids_json", "place_names_json", "companion_ids_json", "evidence_ids_json"]) for row in rows]
+
+    def get_trip(self, trip_id):
+        return self._decode(self._row("SELECT * FROM trips WHERE id = ?", (trip_id,)), ["event_ids_json", "place_names_json", "companion_ids_json", "evidence_ids_json"])
+
+    def list_trip_revisions(self, trip_id):
+        return [self._decode(row, ["old_value_json", "new_value_json"]) for row in self._rows(
+            "SELECT * FROM trip_revisions WHERE trip_id = ? ORDER BY created_at DESC", (trip_id,),
+        )]
+
+    def get_trip_detail(self, trip_id):
+        trip = self.get_trip(trip_id)
+        if not trip:
+            return None
+        return {
+            "trip": trip,
+            "events": [event for event_id in trip["event_ids_json"] if (event := self.get_event(event_id))],
+            "revisions": self.list_trip_revisions(trip_id),
+        }
+
+    def _record_trip_revision(self, trip_id, action, old_value, new_value, source="user"):
+        self.connection.execute(
+            """INSERT INTO trip_revisions(id, trip_id, action, old_value_json, new_value_json, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (make_id("trip_revision"), trip_id, action, json_value(old_value, {}), json_value(new_value, {}), source, now_iso()),
+        )
+
+    def confirm_trip(self, trip_id, name, trip_type=None):
+        trip = self.get_trip(trip_id)
+        if not trip:
+            raise KeyError(trip_id)
+        if trip["status"] != "pending":
+            raise ValueError("only pending trip candidates can be confirmed")
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("trip name is required")
+        old_value = {"status": trip["status"], "name": trip["name"], "trip_type": trip.get("trip_type")}
+        new_value = {"status": "active", "name": name, "trip_type": str(trip_type or "").strip() or None}
+        self.connection.execute(
+            "UPDATE trips SET status = 'active', name = ?, trip_type = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+            (new_value["name"], new_value["trip_type"], now_iso(), trip_id),
+        )
+        self._record_trip_revision(trip_id, "confirmed", old_value, new_value)
+        self.connection.commit()
+        return self.get_trip(trip_id)
+
+    def reject_trip(self, trip_id):
+        trip = self.get_trip(trip_id)
+        if not trip:
+            raise KeyError(trip_id)
+        if trip["status"] != "pending":
+            raise ValueError("only pending trip candidates can be rejected")
+        self.connection.execute("UPDATE trips SET status = 'rejected', revision = revision + 1, updated_at = ? WHERE id = ?", (now_iso(), trip_id))
+        self._record_trip_revision(trip_id, "rejected", {"status": "pending"}, {"status": "rejected"})
+        self.connection.commit()
+        return self.get_trip(trip_id)
+
+    def _upsert_trip_candidate(self, scope_id, events):
+        event_ids = [event["id"] for event in events]
+        places = list(dict.fromkeys(str(event.get("place") or "").strip() for event in events if str(event.get("place") or "").strip()))
+        evidence_ids = []
+        companion_ids = []
+        for event in events:
+            evidence_ids.extend(event.get("observation_ids") or [])
+            companion_ids.extend(item["person_id"] for item in self.list_event_participants(event["id"]) if item.get("person_status") == "confirmed")
+        evidence_ids = list(dict.fromkeys(evidence_ids))
+        companion_ids = list(dict.fromkeys(companion_ids))
+        start, end = events[0].get("time_start"), events[-1].get("time_start")
+        name = f"{str(start or '')[:10]} 至 {str(end or '')[:10]} 的行程候选"
+        confidence = min(0.9, 0.45 + 0.08 * len(events) + 0.04 * len(places))
+        existing = self._row("SELECT * FROM trips WHERE scope_id = ? AND event_ids_json = ? AND status IN ('pending', 'active', 'rejected')", (scope_id, json_value(event_ids, [])))
+        timestamp = now_iso()
+        if existing and existing["status"] == "pending":
+            self.connection.execute(
+                "UPDATE trips SET name = ?, time_start = ?, time_end = ?, place_names_json = ?, companion_ids_json = ?, evidence_ids_json = ?, confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
+                (name, start, end, json_value(places, []), json_value(companion_ids, []), json_value(evidence_ids, []), confidence, timestamp, existing["id"]),
+            )
+            self.connection.commit()
+            return next(item for item in self.list_trips(scope_id, "pending") if item["id"] == existing["id"])
+        if existing:
+            return None
+        trip_id = make_id("trip")
+        self.connection.execute(
+            """INSERT INTO trips(id, scope_id, name, status, time_start, time_end, event_ids_json, place_names_json,
+            companion_ids_json, evidence_ids_json, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trip_id, scope_id, name, start, end, json_value(event_ids, []), json_value(places, []), json_value(companion_ids, []), json_value(evidence_ids, []), confidence, timestamp, timestamp),
+        )
+        self.connection.commit()
+        return next(item for item in self.list_trips(scope_id, "pending") if item["id"] == trip_id)
+
+    def derive_trip_candidates(self, scope_id=None):
+        events = self.list_events(100000, scope_id)
+        by_scope = {}
+        for event in events:
+            captured = parse_time(event.get("time_start"))
+            if captured:
+                by_scope.setdefault(event.get("scope_id") or "home-default", []).append((captured, event))
+        candidates = []
+        for current_scope, rows in by_scope.items():
+            sequence = []
+            for captured, event in sorted(rows, key=lambda item: item[0]):
+                if sequence and captured - sequence[-1][0] > timedelta(days=3):
+                    candidates.extend(self._derive_trip_candidates_for_sequence(current_scope, [item[1] for item in sequence]))
+                    sequence = []
+                sequence.append((captured, event))
+            candidates.extend(self._derive_trip_candidates_for_sequence(current_scope, [item[1] for item in sequence]))
+        return candidates
+
+    def _derive_trip_candidates_for_sequence(self, scope_id, events):
+        if len(events) < 2:
+            return []
+        start = parse_time(events[0].get("time_start"))
+        end = parse_time(events[-1].get("time_start"))
+        places = {str(event.get("place") or "").strip() for event in events if str(event.get("place") or "").strip()}
+        gps_places = [parse_gps_place(event.get("place")) for event in events]
+        gps_places = [place for place in gps_places if place]
+        material_displacement = any(
+            gps_distance_km(first, second) >= TRIP_MIN_GPS_DISPLACEMENT_KM
+            for index, first in enumerate(gps_places)
+            for second in gps_places[index + 1:]
+        )
+        cross_day = bool(start and end and start.date() != end.date())
+        within_duration = bool(start and end and end - start <= timedelta(days=10))
+        if not (cross_day and within_duration and len(places) >= 2 and material_displacement):
+            return []
+        candidate = self._upsert_trip_candidate(scope_id, events)
+        return [candidate] if candidate else []
+
     def get_event_detail(self, event_id):
         event = self.get_event(event_id)
         if not event:
@@ -1766,7 +2262,8 @@ class MemoryStore:
                 observation["asset"] = self.get_asset(observation["asset_id"])
                 observations.append(observation)
         facts = [fact for fact in self.list_facts(500) if any(item["id"] in fact["evidence_ids_json"] for item in observations)]
-        return {"event": event, "observations": observations, "facts": facts, "entities": self.list_event_entities(event_id)}
+        revisions = self._rows("SELECT * FROM event_revisions WHERE event_id = ? ORDER BY created_at DESC", (event_id,))
+        return {"event": event, "observations": observations, "facts": facts, "entities": self.list_event_entities(event_id), "event_revisions": revisions}
 
     def upsert_event_entity(self, event_id, entity_id, relation, evidence_ids=None, confidence=0.0):
         evidence_ids = list(dict.fromkeys(evidence_ids or []))
@@ -1829,13 +2326,28 @@ class MemoryStore:
         event = self.get_event(event_id)
         if not event:
             return None
-        allowed = {"title", "event_type", "time_start", "time_end", "place", "activity", "summary", "status"}
+        allowed = {"title", "event_type", "time_start", "time_end", "place", "activity", "summary", "status", "cover_asset_id"}
         values = {key: value for key, value in fields.items() if key in allowed}
         if not values:
             return event
+        cover_asset_id = values.get("cover_asset_id")
+        if cover_asset_id and cover_asset_id not in event["asset_ids"]:
+            raise ValueError("event cover must be an asset already linked to this event")
         assignments = ", ".join(f"{key} = ?" for key in values)
         params = list(values.values()) + [now_iso(), event_id]
         self.connection.execute(f"UPDATE events SET {assignments}, revision = revision + 1, updated_at = ? WHERE id = ?", params)
+        if cover_asset_id:
+            selection = {"source": "user", "asset_id": cover_asset_id, "criteria": {"reason": "user_selected"}}
+            self.connection.execute(
+                "UPDATE events SET cover_selection_json = ? WHERE id = ?",
+                (json_value(selection, {}), event_id),
+            )
+        for key, value in values.items():
+            if event.get(key) != value:
+                self.connection.execute(
+                    "INSERT INTO event_revisions(id, event_id, field_name, old_value, new_value, source, created_at) VALUES (?, ?, ?, ?, ?, 'user', ?)",
+                    (make_id("event_revision"), event_id, key, str(event.get(key) or ""), str(value or ""), now_iso()),
+                )
         self.connection.commit()
         return self.get_event(event_id)
 
@@ -2058,12 +2570,44 @@ class MemoryStore:
         scope_id = observation.get("scope_id") or asset.get("scope_id") or "home-default"
         raw = observation.get("raw") or {}
         extracted = raw.get("gamma") if isinstance(raw.get("gamma"), dict) else raw
+        canonical = observation.get("canonical") or {}
+        analysis = {**extracted, **canonical}
+        normalized = normalize_semantic_analysis(analysis)
+        semantic = normalized.get("semantic") or {}
+        semantic_place = semantic.get("place") if isinstance(semantic.get("place"), dict) else {}
+        semantic_objects = semantic.get("objects") if isinstance(semantic.get("objects"), list) else []
+        semantic_atmosphere = semantic.get("atmosphere") if isinstance(semantic.get("atmosphere"), dict) else {}
         captured_at = parse_time(observation.get("captured_at") or asset.get("captured_at"))
         captured_day = captured_at.date().isoformat() if captured_at else ""
+        gps_place = parse_gps_place(asset.get("captured_location"))
+        visual_place = str(observation.get("place") or "").strip()
+        has_semantic_place = bool(semantic.get("available"))
+        selected_scene = str(semantic_place.get("primary") or "").strip() if has_semantic_place else ""
+        # GPS remains a location anchor only. A semantic primary is the stable
+        # place entity; free text is retained as evidence, never as a GPS name.
+        place_name = selected_scene or visual_place or "其他或不确定"
+        scene_type = selected_scene or (visual_place if not has_semantic_place else "")
+        object_specs = [
+            item for item in semantic_objects
+            if isinstance(item, dict) and (item.get("label") or item.get("primary"))
+        ]
+        object_names = [str(item.get("label") or item.get("primary")).strip() for item in object_specs]
+        if not object_names:
+            object_names = [str(item).strip() for item in (observation.get("objects") or []) if str(item).strip()]
+        atmosphere_names = [str(item).strip() for item in (semantic_atmosphere.get("labels") or []) if str(item).strip()]
+        if not atmosphere_names:
+            atmosphere_names = [
+                normalize_mood(value)
+                for value in (extracted.get("emotions") or raw.get("emotions") or [])
+                if normalize_mood(value) in ATMOSPHERE_PRIMARY_TYPES
+            ]
+        raw_atmosphere_labels = [
+            str(item).strip() for item in (normalized.get("raw_labels") or {}).get("atmosphere", []) if str(item).strip()
+        ]
         values = [
-            ("place", observation.get("place") or asset.get("captured_location"), "由图片观察或采集地点维护"),
-            ("object", observation.get("objects") or [], "由图片观察到的物体"),
-            ("emotion", extracted.get("emotions") or raw.get("emotions") or [], "由图片观察到的情感"),
+            ("place", place_name, "由图片观察或采集地点维护"),
+            ("object", object_names, "由图片观察到的物体"),
+            ("atmosphere", atmosphere_names, "由图片观察到的画面氛围"),
             ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
         ]
         entities = []
@@ -2087,20 +2631,93 @@ class MemoryStore:
                 entities.append(entity)
         evidence_ids = [observation_id, event_id] if event_id else [observation_id]
         if place_entity:
-            self.maintain_entity_property(
-                place_entity["id"], "scene_type", place_entity["canonical_name"],
-                observation.get("confidence", 0), evidence_ids, "observation_extraction",
+            if gps_place:
+                self.maintain_entity_property(
+                    place_entity["id"], "geo", {"latitude": gps_place[0], "longitude": gps_place[1]},
+                    observation.get("confidence", 0), evidence_ids, "asset_gps",
+                )
+            if scene_type:
+                self.maintain_entity_property(
+                    place_entity["id"], "scene_type", scene_type,
+                    observation.get("confidence", 0), evidence_ids, "observation_extraction",
+                )
+            if has_semantic_place:
+                self.maintain_entity_property(
+                    place_entity["id"], "semantic_primary", selected_scene or "其他或不确定",
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
+                self.maintain_entity_property_values(
+                    place_entity["id"], "semantic_details", semantic_place.get("details") or [],
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
+            if visual_place and (visual_place != scene_type or has_semantic_place):
+                self.maintain_entity_property_values(
+                    place_entity["id"], "visual_place_descriptions", [visual_place],
+                    observation.get("confidence", 0), evidence_ids, "observation_extraction",
+                )
+            # A scene-type backfill must replace the former free-text place
+            # projection for this observation. The original text remains on
+            # the selected scene entity, while stale place cards and event
+            # links no longer remain visible beside it.
+            stale_places = self._rows(
+                """SELECT eob.entity_id FROM entity_observations eob JOIN entities e ON e.id = eob.entity_id
+                WHERE eob.observation_id = ? AND e.entity_type = 'place' AND eob.entity_id != ?
+                AND eob.source = 'observation_extraction'""",
+                (observation_id, place_entity["id"]),
             )
+            for stale in stale_places:
+                stale_id = stale["entity_id"]
+                self.connection.execute(
+                    "DELETE FROM entity_observations WHERE entity_id = ? AND observation_id = ? AND source = 'observation_extraction'",
+                    (stale_id, observation_id),
+                )
+                if event_id:
+                    link = self._row("SELECT * FROM event_entities WHERE event_id = ? AND entity_id = ?", (event_id, stale_id))
+                    if link:
+                        linked_evidence = [item for item in json.loads(link["evidence_ids_json"] or "[]") if item != observation_id]
+                        if linked_evidence:
+                            self.connection.execute(
+                                "UPDATE event_entities SET evidence_ids_json = ?, updated_at = ? WHERE event_id = ? AND entity_id = ?",
+                                (json_value(linked_evidence, []), now_iso(), event_id, stale_id),
+                            )
+                        else:
+                            self.connection.execute("DELETE FROM event_entities WHERE event_id = ? AND entity_id = ?", (event_id, stale_id))
         for entity in entities:
             if entity["entity_type"] != "object":
                 continue
             self.maintain_entity_property(
                 entity["id"], "label", entity["canonical_name"], observation.get("confidence", 0), evidence_ids,
-                "observation_extraction",
-            )
+                    "observation_extraction",
+                )
             self.maintain_entity_property(
                 entity["id"], "category", object_category(entity["canonical_name"]), observation.get("confidence", 0), evidence_ids,
                 "object_taxonomy_v1",
+            )
+            spec = next((item for item in object_specs if str(item.get("label") or item.get("primary")).strip() == entity["canonical_name"]), None)
+            if spec:
+                self.maintain_entity_property(
+                    entity["id"], "semantic_primary", spec.get("primary") or "其他或不确定",
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
+                self.maintain_entity_property_values(
+                    entity["id"], "semantic_details", spec.get("details") or [],
+                    observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1",
+                )
+        for entity in entities:
+            if entity["entity_type"] not in {"emotion", "atmosphere"}:
+                continue
+            raw_moods = [
+                str(value).strip()
+                for value in (extracted.get("emotions") or raw.get("emotions") or [])
+                if normalize_mood(value) == entity["canonical_name"] and str(value).strip()
+            ]
+            property_key = "atmosphere_label" if entity["entity_type"] == "atmosphere" else "mood_label"
+            self.maintain_entity_property(entity["id"], property_key, entity["canonical_name"], observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1" if entity["entity_type"] == "atmosphere" else "mood_normalization_v1")
+            if entity["entity_type"] == "atmosphere":
+                self.maintain_entity_property_values(entity["id"], "semantic_details", semantic_atmosphere.get("details") or [], observation.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1")
+            self.maintain_entity_property_values(
+                entity["id"], "raw_atmosphere_labels" if entity["entity_type"] == "atmosphere" else "raw_mood_labels", raw_atmosphere_labels if entity["entity_type"] == "atmosphere" else raw_moods, observation.get("confidence", 0), evidence_ids,
+                "semantic_taxonomy_v1" if entity["entity_type"] == "atmosphere" else "mood_normalization_v1",
             )
         if time_entity and captured_at:
             semantics = time_semantics(captured_at)
@@ -2115,7 +2732,7 @@ class MemoryStore:
             )
         for entity in entities:
             if event_id:
-                relation = {"place": "地点", "time": "时间", "object": "包含物件", "emotion": "情感氛围"}.get(entity["entity_type"], "关联实体")
+                relation = {"place": "地点", "time": "时间", "object": "包含物件", "emotion": "情感氛围", "atmosphere": "画面氛围"}.get(entity["entity_type"], "关联实体")
                 self.upsert_event_entity(event_id, entity["id"], relation, [observation_id], observation.get("confidence", 0))
             if place_entity and entity["id"] != place_entity["id"]:
                 self.create_relationship(
@@ -2140,11 +2757,85 @@ class MemoryStore:
         for row in rows:
             event_row = self._row("SELECT event_id FROM event_observations WHERE observation_id = ? LIMIT 1", (row["id"],))
             total += len(self.maintain_observation_entities(row["id"], event_row["event_id"] if event_row else None))
-        return {"observations": len(rows), "entity_links": total, "scope_id": scope_id}
+        mood_cleanup = self.normalize_legacy_mood_entities(scope_id)
+        return {"observations": len(rows), "entity_links": total, "normalized_moods": mood_cleanup["normalized"], "retired_unclassified_moods": mood_cleanup["retired"], "scope_id": scope_id}
+
+    def normalize_legacy_mood_entities(self, scope_id=None):
+        """Retire prior model-only mood labels after moving every evidence edge."""
+        clauses = ["entity_type = 'emotion'", "status != 'rejected'"]
+        params = []
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        legacy_entities = self._rows("SELECT * FROM entities WHERE " + " AND ".join(clauses), params)
+        normalized_count = 0
+        retired_count = 0
+        for legacy in legacy_entities:
+            normalized_name = normalize_mood(legacy["canonical_name"])
+            if self._row("SELECT 1 FROM entity_properties WHERE entity_id = ? AND source = 'user' LIMIT 1", (legacy["id"],)):
+                continue
+            atmosphere_name = ATMOSPHERE_PRIMARY_ALIASES.get(normalized_name, normalized_name)
+            if atmosphere_name not in ATMOSPHERE_PRIMARY_TYPES:
+                self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (legacy["id"],))
+                self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+                self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (legacy["id"], legacy["id"]))
+                self.connection.execute("UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ?", ("原始模型标签未进入受控氛围词表，保留在观察证据中", now_iso(), legacy["id"]))
+                self.connection.commit()
+                retired_count += 1
+                continue
+            target = self._find_or_create_entity(
+                atmosphere_name, "atmosphere", legacy.get("scope_id"), legacy.get("confidence", 0), "由图片观察到的画面氛围",
+            )
+            evidence_rows = self._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+            if not evidence_rows:
+                for observation in self._rows("SELECT id, raw_json FROM observations"):
+                    try:
+                        payload = json.loads(observation.get("raw_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    gamma = payload.get("gamma") if isinstance(payload.get("gamma"), dict) else payload
+                    labels = gamma.get("emotions") if isinstance(gamma, dict) else []
+                    if legacy["canonical_name"] in (labels or []):
+                        evidence_rows.append({
+                            "observation_id": observation["id"],
+                            "confidence": legacy.get("confidence", 0),
+                            "source": "legacy_mood_migration",
+                            "created_at": now_iso(),
+                        })
+            evidence_ids = [row["observation_id"] for row in evidence_rows]
+            for evidence in evidence_rows:
+                self.connection.execute(
+                    """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_id, observation_id)
+                    DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
+                    (target["id"], evidence["observation_id"], evidence["confidence"], evidence["source"], evidence["created_at"]),
+                )
+            for link in self._rows("SELECT * FROM event_entities WHERE entity_id = ?", (legacy["id"],)):
+                self.upsert_event_entity(link["event_id"], target["id"], link["relation"], json.loads(link["evidence_ids_json"] or "[]"), link["confidence"])
+            for relationship in self._rows(
+                "SELECT * FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'",
+                (legacy["id"], legacy["id"]),
+            ):
+                subject_id = target["id"] if relationship["subject_entity_id"] == legacy["id"] else relationship["subject_entity_id"]
+                object_id = target["id"] if relationship["object_entity_id"] == legacy["id"] else relationship["object_entity_id"]
+                self.create_relationship(
+                    subject_id, relationship["predicate"], object_id, json.loads(relationship["evidence_ids_json"] or "[]"),
+                    relationship["confidence"], relationship["status"],
+                )
+            self.maintain_entity_property(target["id"], "atmosphere_label", atmosphere_name, legacy.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1")
+            self.maintain_entity_property_values(target["id"], "raw_atmosphere_labels", [legacy["canonical_name"]], legacy.get("confidence", 0), evidence_ids, "semantic_taxonomy_v1")
+            self._record_entity_revision(target["id"], "atmosphere_normalization", legacy["canonical_name"], atmosphere_name, "semantic_taxonomy_v1", evidence_ids)
+            self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (legacy["id"],))
+            self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (legacy["id"],))
+            self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (legacy["id"], legacy["id"]))
+            self.connection.execute("UPDATE entities SET status = 'rejected', updated_at = ? WHERE id = ?", (now_iso(), legacy["id"]))
+            self.connection.commit()
+            normalized_count += 1
+        return {"normalized": normalized_count, "retired": retired_count}
 
     def list_entities(self, status=None, scope_id=None, public=True):
         params = [status] if status else []
-        where = "WHERE status = ?" if status else "WHERE status != 'rejected'"
+        where = "WHERE status = ?" if status else "WHERE status NOT IN ('rejected', 'superseded')"
         if scope_id:
             where += " AND scope_id = ?"
             params.append(scope_id)
@@ -2182,6 +2873,258 @@ class MemoryStore:
             entity["preview_file_name"] = preview["file_name"] if preview else None
             entity["preview_media_type"] = preview["media_type"] if preview else None
         return [self.public_entity(entity) for entity in entities] if public else entities
+
+    def _semantic_entity_key(self, entity_type, name, entity=None):
+        """Return an explainable semantic concept for automatic grouping."""
+        label = re.sub(r"\s+", "", str(name or "").strip())
+        properties = {
+            item["property_key"]: item
+            for item in self.list_entity_properties((entity or {}).get("id"))
+        } if (entity or {}).get("id") else {}
+        primary = properties.get("semantic_primary", {}).get("value")
+        if primary and entity_type in {"place", "object", "atmosphere"}:
+            return str(primary), {"strategy": "semantic_primary", "matched_label": str(primary)}
+        if entity_type == "emotion":
+            entity_type = "atmosphere"
+        equivalents = SEMANTIC_ENTITY_EQUIVALENTS.get(entity_type, {})
+        if label in equivalents:
+            return equivalents[label], {"strategy": "controlled_equivalence", "matched_label": label}
+        for term, normalized in equivalents.items():
+            if term in label:
+                return normalized, {"strategy": "controlled_equivalence", "matched_label": term}
+        concepts = SEMANTIC_PLACE_CONCEPTS if entity_type == "place" else SEMANTIC_OBJECT_CONCEPTS if entity_type == "object" else ()
+        for normalized, terms in concepts:
+            matched = [term for term in terms if term in label]
+            if matched:
+                return normalized, {"strategy": "semantic_concept", "matched_label": matched[0]}
+        return label, {"strategy": "exact_label", "matched_label": label}
+
+    @staticmethod
+    def _merge_candidate_row(row):
+        value = dict(row)
+        for key, fallback in (("entity_ids_json", []), ("rationale_json", {}), ("evidence_ids_json", [])):
+            try:
+                value[key.replace("_json", "")] = json.loads(value.pop(key) or json_value(fallback, fallback))
+            except (TypeError, json.JSONDecodeError):
+                value[key.replace("_json", "")] = fallback
+        return value
+
+    def list_entity_merge_candidates(self, scope_id=None, status="pending"):
+        clauses, params = [], []
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._rows(
+            "SELECT * FROM entity_merge_candidates" + where + " ORDER BY confidence DESC, created_at DESC",
+            params,
+        )
+        return [self._merge_candidate_row(row) for row in rows]
+
+    def list_semantic_entity_groups(self, scope_id=None):
+        """Return a read-only semantic projection for browsing and recall.
+
+        A group never replaces its members.  This keeps original labels,
+        user-maintained IDs and Observation links stable while avoiding a UI
+        made of many cards that describe the same concept.
+        """
+        grouped = {}
+        for entity in self.list_entities(scope_id=scope_id, public=False):
+            source_entity_type = entity.get("entity_type")
+            entity_type = "atmosphere" if source_entity_type == "emotion" else source_entity_type
+            if source_entity_type == "person" or entity.get("status") in {"rejected", "superseded"}:
+                continue
+            label, rationale = self._semantic_entity_key(source_entity_type, entity.get("canonical_name"), entity)
+            key = (entity.get("scope_id") or "home-default", entity_type, label)
+            group = grouped.setdefault(key, {
+                "id": "semantic_group:" + ":".join((entity.get("scope_id") or "home-default", entity_type, label)),
+                "scope_id": entity.get("scope_id") or "home-default",
+                "entity_type": entity_type,
+                "canonical_name": label,
+                "members": [],
+                "member_entity_ids": [],
+                "source_labels": [],
+                "semantic_details": [],
+                "evidence_count": 0,
+                "relationship_count": 0,
+                "confidence": 0.0,
+                "preview_asset_id": None,
+                "preview_file_name": None,
+                "preview_media_type": None,
+                "rationale": {"strategy": rationale["strategy"], "normalized_key": label},
+            })
+            group["members"].append(self.public_entity(entity))
+            group["member_entity_ids"].append(entity["id"])
+            group["source_labels"].append(entity["canonical_name"])
+            properties = {item["property_key"]: item for item in self.list_entity_properties(entity["id"])}
+            details = properties.get("semantic_details", {}).get("value") or []
+            if not isinstance(details, list):
+                details = [details]
+            group["semantic_details"] = list(dict.fromkeys(group["semantic_details"] + [str(item) for item in details if str(item).strip()]))
+            group["evidence_count"] += int(entity.get("evidence_count", 0) or 0)
+            group["relationship_count"] += int(entity.get("relationship_count", 0) or 0)
+            group["confidence"] = max(group["confidence"], float(entity.get("confidence", 0) or 0))
+            if not group["preview_asset_id"] and entity.get("preview_asset_id"):
+                group["preview_asset_id"] = entity["preview_asset_id"]
+                group["preview_file_name"] = entity.get("preview_file_name")
+                group["preview_media_type"] = entity.get("preview_media_type")
+        values = list(grouped.values())
+        for group in values:
+            group["members"].sort(key=lambda item: (-int(item.get("evidence_count", 0) or 0), item.get("canonical_name", "")))
+            group["member_entity_ids"].sort()
+            group["source_labels"] = [item["canonical_name"] for item in group["members"]]
+            group["is_semantic_cluster"] = len(group["members"]) > 1
+        return sorted(values, key=lambda item: (item["entity_type"], -item["evidence_count"], item["canonical_name"]))
+
+    def get_semantic_entity_group(self, group_id, scope_id=None):
+        for group in self.list_semantic_entity_groups(scope_id):
+            if group["id"] != group_id:
+                continue
+            details = [self.get_entity_detail(entity_id) for entity_id in group["member_entity_ids"]]
+            observations, events, relationships = [], [], []
+            seen_observations, seen_events, seen_relationships = set(), set(), set()
+            for detail in details:
+                for observation in detail.get("observations", []):
+                    if observation["id"] not in seen_observations:
+                        observations.append(observation); seen_observations.add(observation["id"])
+                for event in detail.get("events", []):
+                    if event["id"] not in seen_events:
+                        events.append(event); seen_events.add(event["id"])
+                for relationship in detail.get("relationships", []):
+                    if relationship["id"] not in seen_relationships:
+                        relationships.append(relationship); seen_relationships.add(relationship["id"])
+            return {"group": group, "members": details, "observations": observations, "events": events, "relationships": relationships}
+        return None
+
+    def derive_entity_merge_candidates(self, scope_id=None):
+        """Create review-only semantic merge candidates within a MemorySpace.
+
+        This never mutates entities, their links, or their names.  A user must
+        explicitly accept a candidate before any stable identity can change.
+        """
+        allowed_types = {"place", "object", "emotion"}
+        entities = self.list_entities(scope_id=scope_id, public=False)
+        groups = {}
+        for entity in entities:
+            entity_type = entity.get("entity_type")
+            if entity_type not in allowed_types or entity.get("status") == "rejected":
+                continue
+            key, rationale = self._semantic_entity_key(entity_type, entity.get("canonical_name"), entity)
+            if rationale["strategy"] == "exact_label":
+                continue
+            groups.setdefault((entity.get("scope_id") or "home-default", entity_type, key), []).append((entity, rationale))
+        candidates = []
+        for (candidate_scope, entity_type, suggested_name), members in groups.items():
+            if len(members) < 2:
+                continue
+            entity_ids = sorted(member[0]["id"] for member in members)
+            evidence_ids = []
+            source_labels = []
+            for entity, _ in members:
+                source_labels.append(entity["canonical_name"])
+                evidence_ids.extend(row["observation_id"] for row in self._rows(
+                    "SELECT observation_id FROM entity_observations WHERE entity_id = ? ORDER BY observation_id", (entity["id"],)
+                ))
+            evidence_ids = list(dict.fromkeys(evidence_ids))
+            rationale = {
+                "strategy": "controlled_equivalence",
+                "source_labels": source_labels,
+                "normalized_key": suggested_name,
+                "automatic_merge": False,
+            }
+            encoded_ids = json_value(entity_ids, [])
+            existing = self._row(
+                "SELECT * FROM entity_merge_candidates WHERE scope_id = ? AND entity_type = ? AND entity_ids_json = ? AND suggested_name = ?",
+                (candidate_scope, entity_type, encoded_ids, suggested_name),
+            )
+            timestamp = now_iso()
+            if existing:
+                if existing["status"] == "rejected":
+                    continue
+                self.connection.execute(
+                    "UPDATE entity_merge_candidates SET evidence_ids_json = ?, confidence = MAX(confidence, ?), rationale_json = ?, updated_at = ? WHERE id = ?",
+                    (json_value(evidence_ids, []), 0.8, json_value(rationale, {}), timestamp, existing["id"]),
+                )
+                candidate_id = existing["id"]
+            else:
+                candidate_id = make_id("entity_merge")
+                self.connection.execute(
+                    """INSERT INTO entity_merge_candidates(id, scope_id, entity_type, entity_ids_json, suggested_name,
+                    rationale_json, confidence, evidence_ids_json, status, revision, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)""",
+                    (candidate_id, candidate_scope, entity_type, encoded_ids, suggested_name, json_value(rationale, {}), 0.8,
+                     json_value(evidence_ids, []), timestamp, timestamp),
+                )
+            candidates.append(self._merge_candidate_row(self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,))))
+        self.connection.commit()
+        return candidates
+
+    def confirm_entity_merge_candidate(self, candidate_id, target_entity_id):
+        """Apply an explicit user-approved non-person semantic entity merge."""
+        candidate = self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,))
+        target = self.get_entity(target_entity_id)
+        if not candidate:
+            raise KeyError(candidate_id)
+        if candidate["status"] != "pending":
+            raise ValueError("only pending entity merge candidates can be confirmed")
+        entity_ids = json.loads(candidate["entity_ids_json"] or "[]")
+        if target_entity_id not in entity_ids or not target:
+            raise ValueError("target entity must belong to this merge candidate")
+        if target["entity_type"] == "person" or target["entity_type"] != candidate["entity_type"]:
+            raise ValueError("person entities and mismatched entity types cannot be semantically merged")
+        if target.get("scope_id") != candidate.get("scope_id"):
+            raise ValueError("entity merge must remain within one memory space")
+        timestamp = now_iso()
+        sources = [self.get_entity(entity_id) for entity_id in entity_ids if entity_id != target_entity_id]
+        sources = [entity for entity in sources if entity and entity.get("status") != "superseded"]
+        for source in sources:
+            if source["entity_type"] != target["entity_type"] or source.get("scope_id") != target.get("scope_id"):
+                raise ValueError("candidate contains an incompatible source entity")
+            for evidence in self._rows("SELECT * FROM entity_observations WHERE entity_id = ?", (source["id"],)):
+                self.connection.execute(
+                    """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_id, observation_id)
+                    DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
+                    (target_entity_id, evidence["observation_id"], evidence["confidence"], "user_semantic_merge", timestamp),
+                )
+            for link in self._rows("SELECT * FROM event_entities WHERE entity_id = ?", (source["id"],)):
+                self.upsert_event_entity(link["event_id"], target_entity_id, link["relation"], json.loads(link["evidence_ids_json"] or "[]"), link["confidence"])
+            for relationship in self._rows(
+                "SELECT * FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'",
+                (source["id"], source["id"]),
+            ):
+                subject_id = target_entity_id if relationship["subject_entity_id"] == source["id"] else relationship["subject_entity_id"]
+                object_id = target_entity_id if relationship["object_entity_id"] == source["id"] else relationship["object_entity_id"]
+                if subject_id != object_id:
+                    self.create_relationship(subject_id, relationship["predicate"], object_id, json.loads(relationship["evidence_ids_json"] or "[]"), relationship["confidence"], relationship["status"])
+            self._record_entity_revision(source["id"], "semantic_merge_target", source["canonical_name"], target_entity_id, "user_semantic_merge", json.loads(candidate["evidence_ids_json"] or "[]"))
+            self.connection.execute("DELETE FROM event_entities WHERE entity_id = ?", (source["id"],))
+            self.connection.execute("DELETE FROM entity_observations WHERE entity_id = ?", (source["id"],))
+            self.connection.execute("DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?", (source["id"], source["id"]))
+            self.connection.execute("UPDATE entities SET status = 'superseded', updated_at = ? WHERE id = ?", (timestamp, source["id"]))
+        self._record_entity_revision(target_entity_id, "semantic_merge_sources", None, json_value([item["id"] for item in sources], []), "user_semantic_merge", json.loads(candidate["evidence_ids_json"] or "[]"))
+        self.connection.execute(
+            "UPDATE entity_merge_candidates SET status = 'confirmed', target_entity_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+            (target_entity_id, timestamp, candidate_id),
+        )
+        self.connection.commit()
+        return self._merge_candidate_row(self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,)))
+
+    def reject_entity_merge_candidate(self, candidate_id):
+        candidate = self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,))
+        if not candidate:
+            raise KeyError(candidate_id)
+        if candidate["status"] != "pending":
+            raise ValueError("only pending entity merge candidates can be rejected")
+        self.connection.execute(
+            "UPDATE entity_merge_candidates SET status = 'rejected', revision = revision + 1, updated_at = ? WHERE id = ?",
+            (now_iso(), candidate_id),
+        )
+        self.connection.commit()
+        return self._merge_candidate_row(self._row("SELECT * FROM entity_merge_candidates WHERE id = ?", (candidate_id,)))
 
     def get_entity(self, entity_id):
         return self._row("SELECT * FROM entities WHERE id = ?", (entity_id,))
@@ -2982,8 +3925,23 @@ class MemoryStore:
             vector_metadata = json.loads(vector["metadata_json"] or "{}") if vector else {}
             vector_metadata["event_id"] = target_event_id
             self.connection.execute("UPDATE memory_vectors SET metadata_json = ?, updated_at = ? WHERE source_type = 'observation' AND source_id = ?", (json_value(vector_metadata, {}), now_iso(), observation_id))
+        # Re-home every event-backed projection before deleting the source.
+        # SQLite correctly rejects deleting an event that still has audit,
+        # entity, participant-memory, or feedback rows pointing at it.
+        for entity_row in self._rows("SELECT entity_id, relation, evidence_ids_json, confidence FROM event_entities WHERE event_id = ?", (source_event_id,)):
+            self.upsert_event_entity(
+                target_event_id,
+                entity_row["entity_id"],
+                entity_row["relation"],
+                json.loads(entity_row["evidence_ids_json"] or "[]"),
+                entity_row["confidence"],
+            )
         self.connection.execute("DELETE FROM event_observations WHERE event_id = ?", (source_event_id,))
         self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("DELETE FROM event_entities WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("UPDATE event_revisions SET event_id = ? WHERE event_id = ?", (target_event_id, source_event_id))
+        self.connection.execute("DELETE FROM person_event_memory WHERE event_id = ?", (source_event_id,))
+        self.connection.execute("UPDATE memory_feedback SET target_event_id = ? WHERE target_event_id = ?", (target_event_id, source_event_id))
         self.connection.execute("DELETE FROM memory_vectors WHERE source_type = 'event' AND source_id = ?", (source_event_id,))
         self.connection.execute("DELETE FROM events WHERE id = ?", (source_event_id,))
         self.connection.commit()

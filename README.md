@@ -33,7 +33,7 @@ ADAFACE_MODEL_PATH=/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt
 ADAFACE_REPO_ROOT=/home/asus/models/AdaFace \
 OLLAMA_BASE_URL=http://127.0.0.1:11435 \
 OLLAMA_MODEL=gemma4:12b \
-OLLAMA_KEEP_ALIVE=0 \
+OLLAMA_KEEP_ALIVE=-1 \
 .venv/bin/python -m uvicorn backend.app:app --host 0.0.0.0 --port 8090
 ```
 
