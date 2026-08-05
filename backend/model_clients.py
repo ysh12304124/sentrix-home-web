@@ -468,7 +468,9 @@ class ClipAdapter:
 
     def _device(self, torch):
         requested = str(self.device or "auto").strip().lower()
-        return "cuda:0" if requested == "auto" and torch.cuda.is_available() else requested
+        if requested == "auto":
+            return "cuda:0" if torch.cuda.is_available() else "cpu"
+        return requested
 
     def _load(self):
         if self._model is not None:
