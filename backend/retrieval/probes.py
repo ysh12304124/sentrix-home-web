@@ -52,9 +52,12 @@ class NeutralProbe:
             "lexical_exact": lexical_exact,
             "top_signals": top_signals,
         }
-        if agreement >= min_channels and shared:
+        if agreement >= min_channels:
+            # Two or more independent channels found candidates — the message
+            # has household relevance even if they don't agree on the same
+            # asset yet.  The formal retrieval then reconciles them.
             return ProbeOutcome("upgrade", counts, signals,
-                                f"{len(shared)} asset(s) hit by {agreement} channels")
+                                f"{agreement} channels produced candidates")
         if lexical_exact:
             return ProbeOutcome("upgrade", counts, signals, "exact lexical phrase hit")
         above_min = [name for name, top in top_signals.items() if top is not None and top >= self._per_space_minimum(name)]
