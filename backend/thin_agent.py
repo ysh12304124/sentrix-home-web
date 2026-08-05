@@ -8,6 +8,7 @@ import uuid
 
 from .answer_composer import compose_answer
 from .claim_extractor import ClaimExtractor
+from .complex_answer import ComplexAnswerBuilder
 from .evidence_retrieval import EvidenceRetrievalKernel
 from .memory_gate import MemoryGate
 from .query_contracts import build_query_spec
@@ -21,6 +22,7 @@ class ThinAgentRuntime:
         self.gate = MemoryGate()
         self.kernel = EvidenceRetrievalKernel(store)
         self.parser = QueryParser(gamma=gamma)
+        self.complex_builder = ComplexAnswerBuilder(gamma=gamma)
 
     def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None, viewer_id=None, recent_turns="", selected_entity_id=None):
         conversation_id = conversation_id or f"conversation_{uuid.uuid4().hex[:12]}"
@@ -116,7 +118,7 @@ class ThinAgentRuntime:
         if spec.answer_target == "person" and not spec.entity_ids:
             answer, statements = ("目前没有找到当前范围内已确认的人物，不能把待确认人物簇直接当作人物介绍。", [])
         elif person_summary:
-            answer, statements = self._person_summary(spec, packet)
+            answer, statements = self._person_summary_via_complex_or_fallback(message, spec, packet)
         elif clothing_gap:
             name = next((item.value for item in spec.constraints if item.dimension == "person"), "这个人")
             answer = f"现有记录没有把衣物字段可靠绑定到{name}，无法确认这件衣服属于他。"
@@ -168,6 +170,15 @@ class ThinAgentRuntime:
             result["tool_trace"].append({"tool": "summarize_person", "permission": "read",
                                           "status": "complete" if evidence else "requires_anchor"})
         return result
+
+    def _person_summary_via_complex_or_fallback(self, message, spec, packet):
+        """Try Phase 4 Writer/Verifier chain; fall back to inline summary."""
+        import os
+        if os.getenv("SENTRIX_LLM_CLAIM_EXTRACTOR_V1", "0").lower() in {"1", "true", "on"}:
+            result = self.complex_builder.build(message, spec, packet)
+            if not result.get("fallback"):
+                return result["answer"], result["statements"]
+        return self._person_summary(spec, packet)
 
     def _person_summary(self, spec, packet):
         name = next((item.value for item in spec.constraints if item.dimension == "person"), "这个人")
