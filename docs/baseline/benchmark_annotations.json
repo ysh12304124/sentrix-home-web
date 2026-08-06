@@ -1,0 +1,1523 @@
+{
+  "schema_version": 2,
+  "summary": {
+    "total": 60,
+    "strict_empty": 30,
+    "allow_approximate": 30,
+    "empty_gt": 7,
+    "gt_conflicts": 2
+  },
+  "cases": [
+    {
+      "key": "album1-01",
+      "query_cn": "浅黄色拼接毛绒睡衣自拍",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_203b5b507c95"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-02",
+      "query_cn": "厨房里做晚饭",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_cf5f1f61dc89",
+        "asset_5b83c11fa098",
+        "asset_b3196de17907",
+        "asset_476aa7cf184d",
+        "asset_25d7da4d33fd",
+        "asset_fb8df7ff0ca8"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-03",
+      "query_cn": "手拿固体杨枝甘露",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_1d79e044c1d0"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-04",
+      "query_cn": "水杯做的圣诞树",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_856b080d4121"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-05",
+      "query_cn": "快出岩洞时摆拍",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_e0b7d4cd5f61",
+        "asset_eb2c82f19b6a"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-06",
+      "query_cn": "记录下博物馆买的纪念品",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_f4959e80368b",
+        "asset_46ea5d607a1c",
+        "asset_30dfa9f20d3f",
+        "asset_6fcdcc9d6548",
+        "asset_d93632d67dbc",
+        "asset_a13201210eb3",
+        "asset_61df592f6dc9",
+        "asset_1edf7531ac2f",
+        "asset_084a408d7931",
+        "asset_e1d3522a9278"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-07",
+      "query_cn": "贵阳夜晚步行街",
+      "album": "album1",
+      "exact_asset_ids": [],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": false,
+        "confirmed_entity": false,
+        "lexical_observation": false,
+        "visual_semantic": false,
+        "text_semantic": false,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": true
+    },
+    {
+      "key": "album1-08",
+      "query_cn": "趵突泉游览",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_2c5bfb2f94bf",
+        "asset_fbc7c2d06164",
+        "asset_00284e98f700",
+        "asset_af2c1909fc79",
+        "asset_e1361356090c"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-09",
+      "query_cn": "25年11月16号下午记录妆容的自拍",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_f8fc72554946",
+        "asset_1d077c5aa758"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-10",
+      "query_cn": "在禹城市的照片",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_2bf27802df7f",
+        "asset_a63e138c3264"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-11",
+      "query_cn": "在盐田区的照片",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_65a644393930",
+        "asset_01b730caf869",
+        "asset_2aa4ba0ed619",
+        "asset_baacf7be81e2",
+        "asset_894f67c7faba",
+        "asset_36e5a6463c64"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-12",
+      "query_cn": "山东近代史展览--反侵略主题",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_f52a47e76baf",
+        "asset_67e552b26148",
+        "asset_b16f571ed2a7",
+        "asset_077e2f877260",
+        "asset_c4d2fd8f7d02"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-13",
+      "query_cn": "黄绿酱汁烤鸡",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_804a6c2c357b",
+        "asset_c20fb0b3f4ea",
+        "asset_3b83fb7c5157"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-14",
+      "query_cn": "2024年5月",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_2e94aefba878"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-15",
+      "query_cn": "深圳机场登机口停机坪",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_441ed04ebd96"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-16",
+      "query_cn": "香草味可乐倒在键盘上",
+      "album": "album1",
+      "exact_asset_ids": [],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": false,
+        "confirmed_entity": false,
+        "lexical_observation": false,
+        "visual_semantic": false,
+        "text_semantic": false,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": true
+    },
+    {
+      "key": "album1-17",
+      "query_cn": "校园街中间躺着的猫猫",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_c9c1c47989b6",
+        "asset_077429aaf364",
+        "asset_eb20574be30d"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-18",
+      "query_cn": "穿和服的自己",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_e58ebf0338cc",
+        "asset_9b4225db7dde",
+        "asset_f6bfd9799213"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-19",
+      "query_cn": "2023年冬季的照片",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_b81972caed87",
+        "asset_6270e398e5ce"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album1-20",
+      "query_cn": "我家猫吃猫粮",
+      "album": "album1",
+      "exact_asset_ids": [
+        "asset_1e9c156f1af6",
+        "asset_6d5dc17f338d",
+        "asset_938be25d96a4",
+        "asset_60e98426b908",
+        "asset_925a73c7f7df",
+        "asset_9c6f3057da6b",
+        "asset_c5495ad0a50c",
+        "asset_a56884849be6"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-01",
+      "query_cn": "2025年4月王明和我的合照",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_1ac48ff42634",
+        "asset_1be207894603",
+        "asset_0cfc643b8c63",
+        "asset_313517152eb4",
+        "asset_ff50afdcd6c1",
+        "asset_678b9903dc14"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-02",
+      "query_cn": "电影院明哥比V",
+      "album": "album2",
+      "exact_asset_ids": [],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": false,
+        "confirmed_entity": false,
+        "lexical_observation": false,
+        "visual_semantic": false,
+        "text_semantic": false,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": true
+    },
+    {
+      "key": "album2-03",
+      "query_cn": "可可粉可颂",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_e83d305f8bee"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-04",
+      "query_cn": "西湖木船上看水道风光",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_18baae2b0c6b",
+        "asset_425131bc1e67",
+        "asset_c2580db3d352",
+        "asset_4ff8a88412d4",
+        "asset_225783d8d34a"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-05",
+      "query_cn": "在上海市拍的自己和王明的照片",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_ee8292697136"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-06",
+      "query_cn": "夜晚车内的明哥搂着我 江西省",
+      "album": "album2",
+      "exact_asset_ids": [],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": false,
+        "confirmed_entity": false,
+        "lexical_observation": false,
+        "visual_semantic": false,
+        "text_semantic": false,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": true
+    },
+    {
+      "key": "album2-07",
+      "query_cn": "墨鱼汁海鲜特写",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_336f48e644b2"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-08",
+      "query_cn": "杭州冬天吃的西式简餐",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_f1287153333e",
+        "asset_c52303134433"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-09",
+      "query_cn": "过2025年元旦",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_1ab5e6fe5076"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-10",
+      "query_cn": "大悦城动漫展卡通立板",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_56237b394f09",
+        "asset_15b30c3623c2",
+        "asset_9c26c7cfb654",
+        "asset_433f264a133f"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-11",
+      "query_cn": "在陕西省的照片",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_b2df2a5c6ecc",
+        "asset_ff08bcc52a43",
+        "asset_c67a18597f5c",
+        "asset_99e0022864a6",
+        "asset_558db3ce4925",
+        "asset_6ec99134303b"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-12",
+      "query_cn": "跨年烟花下的垃圾桶",
+      "album": "album2",
+      "exact_asset_ids": [],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": false,
+        "confirmed_entity": false,
+        "lexical_observation": false,
+        "visual_semantic": false,
+        "text_semantic": false,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": true
+    },
+    {
+      "key": "album2-13",
+      "query_cn": "夕阳下的电线杆和农田",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_e2dfd2b284ee",
+        "asset_266707a16138"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-14",
+      "query_cn": "在集美区的照片",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_0209440ee553",
+        "asset_fd92eabfcaa0",
+        "asset_2091b45f036a",
+        "asset_d9064c559c93"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-15",
+      "query_cn": "2025年4月 自己的照片",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_1ac48ff42634",
+        "asset_1be207894603",
+        "asset_2be27ebafb63",
+        "asset_313517152eb4",
+        "asset_68d742c59520",
+        "asset_46ec95ac4162",
+        "asset_fbf5f76b3fea",
+        "asset_01333761c4e9",
+        "asset_0cfc643b8c63",
+        "asset_962b07b630d1",
+        "asset_149d3f59c753",
+        "asset_678b9903dc14",
+        "asset_3b0e806a630b",
+        "asset_e992f36f3ea5",
+        "asset_17e7fa30d857",
+        "asset_92dbad788de5",
+        "asset_fc1de6110443",
+        "asset_ff50afdcd6c1",
+        "asset_7a0e31670377"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-16",
+      "query_cn": "鼓浪屿远眺城市天际线",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_18d1f1e7a8ee",
+        "asset_778a21b401ae"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-17",
+      "query_cn": "2024跨年热闹氛围",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_9e3a4c00b753",
+        "asset_264e535a2f20",
+        "asset_9c25940360d0"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-18",
+      "query_cn": "八戒",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_2af08f13de4c",
+        "asset_81739ed97c24"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-19",
+      "query_cn": "径山镇绿道散步",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_d49b8cf1897d",
+        "asset_d88b01a6bf5d"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album2-20",
+      "query_cn": "去听脱口秀",
+      "album": "album2",
+      "exact_asset_ids": [
+        "asset_cb6230ccdb40",
+        "asset_60289354f46f",
+        "asset_ea9a79371e76"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-01",
+      "query_cn": "银色心形手镯",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_4e531d40f7a4"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-02",
+      "query_cn": "闵行区拍的",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_2791a7b22e91",
+        "asset_233d9e19b465",
+        "asset_b4485ccadab2",
+        "asset_67bdd0d11303",
+        "asset_6a4cffb8a952",
+        "asset_aae2b3bb7534"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-03",
+      "query_cn": "2022年劳动节拍的",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_51e83ec2d4ec",
+        "asset_388079be0d48"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-04",
+      "query_cn": "烘焙面糊搅拌过程",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_817a08b4b204",
+        "asset_495456506662",
+        "asset_20bd6c067b4c"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-05",
+      "query_cn": "厚切炒酸奶扫码购买",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_6a4cffb8a952",
+        "asset_f529f454c68e",
+        "asset_1ed5778bae99"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-06",
+      "query_cn": "2018葆婴高峰会嘟嘟车宣传",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_fa3b50b4886f"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-07",
+      "query_cn": "春天花开",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_54644defa8ca",
+        "asset_485de35d2801",
+        "asset_bc55b4db2da7",
+        "asset_6b759d4d8796",
+        "asset_fcf251a641c7",
+        "asset_0f97294e5003",
+        "asset_0280a545f1a5",
+        "asset_4a1511869842"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": true
+      },
+      "gt_conflict_note": "GT 不一致：声明 9，列出 8。以列出文件为准（R8-1 冻结解释规则）。",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-08",
+      "query_cn": "确认车钥匙细节",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_0713f4fbfd2c",
+        "asset_f58f42e8b23d",
+        "asset_cc0ab48087d6"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-09",
+      "query_cn": "燕园",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_8119b53b7304"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-10",
+      "query_cn": "餐厅卤味食材展示",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_fca67a7b8518",
+        "asset_7c00744b9d68",
+        "asset_c80b10e43911"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-11",
+      "query_cn": "氹仔酒店楼道",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_13be7ec29ae6"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-12",
+      "query_cn": "乘客与幼鹿近距离接触",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_d593d4fb68be",
+        "asset_920b269e7f95",
+        "asset_23e4a6c1550d"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-13",
+      "query_cn": "采摘番茄",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_134d71820229",
+        "asset_6d7c38984557"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-14",
+      "query_cn": "水族馆海豚跃出水面",
+      "album": "album3",
+      "exact_asset_ids": [],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": false,
+        "confirmed_entity": false,
+        "lexical_observation": false,
+        "visual_semantic": false,
+        "text_semantic": false,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": true
+    },
+    {
+      "key": "album3-15",
+      "query_cn": "牛春花门脸样式参考",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_e02acf5bf690"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-16",
+      "query_cn": "一床的娃娃",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_71e22de9fd57",
+        "asset_b2a9e3be8ae4",
+        "asset_b5efc0d8e0db"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-17",
+      "query_cn": "厨房三兄弟切洋葱比赛",
+      "album": "album3",
+      "exact_asset_ids": [],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": false,
+        "confirmed_entity": false,
+        "lexical_observation": false,
+        "visual_semantic": false,
+        "text_semantic": false,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": true
+    },
+    {
+      "key": "album3-18",
+      "query_cn": "自己在上海店铺内的邋遢打扮",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_87dfef96cc93"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": true
+      },
+      "gt_conflict_note": "GT 不一致：声明 3，列出 1。以列出文件为准（R8-1 冻结解释规则）。",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-19",
+      "query_cn": "三峡大坝北岸纪念碑",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_69f78356ea2f",
+        "asset_d310e14847e0"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "allow_approximate",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": false,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    },
+    {
+      "key": "album3-20",
+      "query_cn": "在夷陵区的照片",
+      "album": "album3",
+      "exact_asset_ids": [
+        "asset_4b4dc3d4739a",
+        "asset_eb1487022c12",
+        "asset_e9fa2b08525f",
+        "asset_d9072be25301",
+        "asset_a66cad5a641e",
+        "asset_6eb7d62b0998",
+        "asset_10e661faa11c",
+        "asset_d55c35368bda",
+        "asset_1088c9de1217",
+        "asset_efd4bd5ac9e7",
+        "asset_498d1710bed0",
+        "asset_6cabadc68821",
+        "asset_69be63077cd8",
+        "asset_fbed4d3a825c",
+        "asset_4b572191b278",
+        "asset_6a38541bc058",
+        "asset_1fe4bfc075b7",
+        "asset_7888757e4924",
+        "asset_880a0624dca0",
+        "asset_d310e14847e0",
+        "asset_2264dd1196ad",
+        "asset_e398744eeb11",
+        "asset_fb9f2ac848e4",
+        "asset_79795eeb3532",
+        "asset_e7777f8257af",
+        "asset_1eb0467831a5",
+        "asset_69f78356ea2f",
+        "asset_0f39906a4054"
+      ],
+      "acceptable_approximate_asset_ids": [],
+      "forbidden_asset_ids": [],
+      "empty_policy": "strict_empty",
+      "answerability": {
+        "metadata": true,
+        "confirmed_entity": false,
+        "lexical_observation": true,
+        "visual_semantic": true,
+        "text_semantic": true,
+        "external_geo_required": true,
+        "formation_missing": false,
+        "ambiguous_gt": false
+      },
+      "gt_conflict_note": "",
+      "empty_gt": false
+    }
+  ]
+}
