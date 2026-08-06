@@ -61,12 +61,18 @@ class QueryParseDraft:
     semantic_conditions: list[dict[str, Any]] = field(default_factory=list)
     negative_conditions: list[dict[str, Any]] = field(default_factory=list)
     result_requirement: dict[str, Any] = field(default_factory=dict)
-    # Phase 2R-3 composite structure — model produces these, code preserves.
-    mode: str = "none"
+    # R9: proposed_mode is the ONLY writable mode field; it is advisory — the
+    # Router decides the final route.  ``mode`` is a derived compatibility
+    # property for legacy callers and the serialization layer.
+    proposed_mode: str = "none"
     actions: list[QueryAction] = field(default_factory=list)
     facets: list[QueryFacet] = field(default_factory=list)
     ambiguities: list[str] = field(default_factory=list)
     confidence: float = 0.0
+
+    @property
+    def mode(self) -> str:
+        return self.proposed_mode
 
 
 @dataclass
@@ -202,7 +208,9 @@ def sanitize_query_parse(raw: Any, message: str = "") -> QueryParseDraft:
             "top_k": max(1, min(100, int(requirement.get("top_k", 10) or 10))),
             "return_original_assets": bool(requirement.get("return_original_assets", False)) or any(action.type == "return_assets" for action in actions),
         },
-        mode=mode or ("evidence" if actions and any(action.type in {"return_assets", "summarize_person", "summarize_event", "compare", "timeline", "propose_correction"} for action in actions) else "none"),
+        # R9: proposed_mode is advisory only.  No action-derived forcing — the
+        # Router decides whether the message is household.
+        proposed_mode=mode or "none",
         actions=actions,
         facets=facets,
         ambiguities=ambiguities,

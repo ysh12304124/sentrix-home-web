@@ -1,0 +1,8 @@
+# Isolated bge-m3 embedding environment (R9-4).
+# Used only by the text_embedder_sidecar — the main API never imports these.
+# Install into a dedicated venv (.venv-text) with PYTHONNOUSERSITE=1 so the
+# ~/.local transformers 5.11 / torch 2.5.1 conflict is avoided.
+sentence-transformers>=3.0,<4
+transformers>=4.40,<5
+torch>=2.1
+numpy>=1.24

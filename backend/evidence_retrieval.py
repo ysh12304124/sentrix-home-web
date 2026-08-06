@@ -268,15 +268,19 @@ class EvidenceRetrievalKernel:
     def _observations_for_asset(self, asset_id):
         return [item for item in self.store.list_observations(limit=100_000) if item.get("asset_id") == asset_id]
 
-    def probe(self, raw_text: str, scope_id: str | None, viewer_id: str = "owner"):
-        """Neutral probe: run the shared retrievers under probe budgets (R4).
+    def probe(self, raw_text: str, scope_id: str | None, viewer_id: str = "owner",
+              *, focus=None, media_hint=None):
+        """Neutral probe: run the shared retrievers under probe budgets (R4/R9-2).
 
-        Returns per-channel CandidateHits for the NeutralProbe to aggregate.
-        Scope / media come from the request context; no unconfirmed hard
-        semantic constraints are fabricated (P0-7).
+        Returns ``(channel_hits, index_health)`` for the NeutralProbe to
+        aggregate.  Scope / media come from the request context; no unconfirmed
+        hard semantic constraints are fabricated (P0-7).  ``focus`` and
+        ``media_hint`` are forwarded to the probe decision (session follow-up
+        and media-aware weighting).  The confirmed-entity signal is covered by
+        the primary ``entity`` retriever in the shared set.
         """
         if not self.retrievers:
-            return {}
+            return {}, {}
         from .retrieval import HardFilterContext, RetrievalQuery
         from .retrieval.config import RetrievalConfig
         config = self.config or RetrievalConfig()
@@ -289,14 +293,18 @@ class EvidenceRetrievalKernel:
             facets=[QueryFacet("semantic", raw_text or "")],
         )
         channel_hits = {}
+        index_health = {}
         for retriever in self.retrievers:
             if retriever.kind != "primary":
                 continue
             try:
-                channel_hits[retriever.name] = retriever.retrieve(query, filters, limit=config.probe_top_k)
-            except Exception:
+                hits = retriever.retrieve(query, filters, limit=config.probe_top_k)
+                channel_hits[retriever.name] = hits
+                index_health[retriever.name] = {"status": "ok", "hits": len(hits)}
+            except Exception as exc:
                 channel_hits[retriever.name] = []
-        return channel_hits
+                index_health[retriever.name] = {"status": "error", "detail": type(exc).__name__}
+        return channel_hits, index_health
 
     # Phase R P1-2: a ``matched`` status is only allowed from evidence sources
     # that directly prove the condition.  Vector / FTS / generic pool hits can

@@ -68,7 +68,7 @@ class ThinAgentContractTests(unittest.TestCase):
 
     def test_gate_uses_contextual_mode_from_draft(self):
         from backend.query_contracts import QueryParseDraft
-        draft = QueryParseDraft(mode="contextual", intent="answer", answer_target="general")
+        draft = QueryParseDraft(proposed_mode="contextual", intent="answer", answer_target="general")
         decision = MemoryGate().classify("今天很累，突然有点想小黑", draft=draft)
         self.assertEqual(decision.mode, "contextual")
         self.assertEqual(decision.concrete_memory_reads, 0)
@@ -76,7 +76,7 @@ class ThinAgentContractTests(unittest.TestCase):
 
     def test_gate_routes_person_introduction_via_draft(self):
         from backend.query_contracts import QueryAction, QueryParseDraft
-        draft = QueryParseDraft(mode="evidence", intent="answer", answer_target="person",
+        draft = QueryParseDraft(proposed_mode="evidence", intent="answer", answer_target="person",
                                  actions=[QueryAction("answer_question", "person")])
         decision = MemoryGate().classify("介绍一下明哥", draft=draft)
         self.assertEqual(decision.mode, "evidence")

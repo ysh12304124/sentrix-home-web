@@ -4,23 +4,20 @@ This module deliberately keeps model use at the language boundary.  Query
 identity, evidence selection and the final evidence envelope remain code-owned.
 """
 
-import re
+import os
+import threading
+import time
 import uuid
+from contextlib import nullcontext
 
 from .answer_composer import compose_answer
 from .claim_extractor import ClaimExtractor
 from .complex_answer import ComplexAnswerBuilder
 from .evidence_retrieval import EvidenceRetrievalKernel
-from .memory_gate import MemoryGate, GateDecision
-from .query_contracts import QueryAction, build_query_spec
+from .query_contracts import HARD, Constraint, QueryAction, build_query_spec
 from .query_parser import QueryParser
-
-_ANCHOR_GEO_RE = re.compile(r"(市|区|省|县|镇|湾|湖|山|路|街|城|岛)")
-_ANCHOR_DATE_RE = re.compile(r"(年|月|日|节|跨年|元旦|春节)")
-# Generic person/relationship signals only — specific family names are never
-# hard-coded (they are benchmark/family data and the runtime guard forbids it).
-_ANCHOR_PERSON_TOKENS = ("自己", "我们", "合照", "家人", "全家")
-_ANCHOR_RELATION_RE = re.compile(r"(搂着|抱着|牵着|靠着|合影|一起|全家福)")
+from .router import ExplicitOperationDetector, Router
+from .routing_rules import message_anchored
 
 
 def _query_anchored(message, spec):
@@ -29,17 +26,66 @@ def _query_anchored(message, spec):
     the raw message when the parser hallucinated an empty draft."""
     if any(c.dimension in {"person", "time", "place"} for c in spec.constraints):
         return True
-    value = str(message or "")
-    return bool(_ANCHOR_GEO_RE.search(value) or _ANCHOR_DATE_RE.search(value)
-                or _ANCHOR_RELATION_RE.search(value)
-                or any(token in value for token in _ANCHOR_PERSON_TOKENS))
+    return message_anchored(message)
+
+
+class _StageTimer:
+    def __init__(self, data, name):
+        self.data = data
+        self.name = name
+
+    def __enter__(self):
+        self._started = time.monotonic()
+        return self
+
+    def __exit__(self, *_exc):
+        self.data.setdefault(self.name, 0.0)
+        self.data[self.name] += time.monotonic() - self._started
+        return False
+
+
+class _Perf:
+    """Thread-local stage trace collector (SENTRIX_AGENT_STAGE_TRACE).
+
+    Benchmark-only: begin()/end() wrap one request and measure() records stage
+    durations and call counters into the request's perf dict.  A request without
+    the flag active gets a no-op context manager, so production overhead is a
+    single attribute lookup.
+    """
+
+    _local = threading.local()
+
+    @staticmethod
+    def begin():
+        _Perf._local.data = {}
+
+    @staticmethod
+    def end():
+        data = getattr(_Perf._local, "data", None) or {}
+        _Perf._local.data = None
+        return data
+
+    @staticmethod
+    def measure(name):
+        data = getattr(_Perf._local, "data", None)
+        if data is None:
+            return nullcontext()
+        return _StageTimer(data, name)
+
+    @staticmethod
+    def count(name):
+        data = getattr(_Perf._local, "data", None)
+        if data is None:
+            return
+        data[name] = data.get(name, 0) + 1
 
 
 class ThinAgentRuntime:
     def __init__(self, store, gamma=None, embedding_router=None, retrieval_config=None):
         self.store = store
         self.gamma = gamma
-        self.gate = MemoryGate()
+        self._detector = ExplicitOperationDetector()
+        self._router = Router()
         self.embedding_router = embedding_router
         if embedding_router is not None:
             from .retrieval import RetrievalConfig, build_default_retrievers
@@ -60,106 +106,167 @@ class ThinAgentRuntime:
         self.complex_builder = ComplexAnswerBuilder(gamma=gamma)
 
     def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None, viewer_id=None, recent_turns="", selected_entity_id=None):
+        trace_on = os.getenv("SENTRIX_AGENT_STAGE_TRACE", "0").lower() in {"1", "true", "on"}
+        if trace_on:
+            _Perf.begin()
+        try:
+            result = self._answer_turn_inner(message, conversation_id, feedback, scope_id,
+                                             viewer_id, recent_turns, selected_entity_id)
+        except Exception:
+            if trace_on:
+                _Perf.end()
+            raise
+        if trace_on:
+            perf = _Perf.end()
+            counts = dict(getattr(self.parser, "call_counts", {}) or {}) if self.parser else {}
+            counts["answer"] = perf.get("answer_calls", 0)
+            counts["claim"] = perf.get("claim_calls", 0)
+            perf["model_calls"] = counts
+            result["perf"] = perf
+        return result
+
+    def _answer_turn_inner(self, message, conversation_id=None, feedback=None, scope_id=None, viewer_id=None, recent_turns="", selected_entity_id=None):
         conversation_id = conversation_id or f"conversation_{uuid.uuid4().hex[:12]}"
         viewer_id = viewer_id or "owner"
         scope_id = scope_id if scope_id is not None else "home-default"
         api_signals = {"feedback": feedback, "selected_entity_id": selected_entity_id}
-        # Fast-path first — writing prompts and explicit API signals never call
-        # the parser (plan §2.5: normal chat QuerySpec/Gate calls = 0).
-        fast_decision = self.gate.fast_path(message, api_signals=api_signals)
-        if fast_decision is not None and fast_decision.mode == "none":
+        # High-precision protocol fast path (writing / no-lookup) — no model call.
+        with _Perf.measure("explicit_detector"):
+            fast = self._detector.detect(message, api_signals=api_signals)
+        if fast is not None and fast.mode == "none":
             empty_draft = self.parser._safe_fallback()  # deterministic empty draft, no LLM call
-            return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id, fast_decision, empty_draft)
-        draft = self.parser.parse(message, recent_turns=recent_turns)
-        decision = fast_decision or self.gate.classify(message, recent_turns, draft=draft, api_signals=api_signals)
+            return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id, fast, empty_draft)
+        with _Perf.measure("parser"):
+            draft = self.parser.parse(message, recent_turns=recent_turns)
+        focus = self._load_focus(conversation_id, scope_id)
+        with _Perf.measure("router"):
+            decision = self._router.route(
+                message, draft, api_signals=api_signals, conversation=recent_turns,
+                focus=focus, entity_resolver=lambda name: self._resolve_person(name, scope_id),
+                message_entity_resolver=lambda msg: self._message_entity_ids(msg, scope_id),
+            )
         if decision.mode == "none":
-            return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft)
+            return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id,
+                                     decision.as_gate_decision(), draft)
         if decision.mode == "contextual":
-            return self._contextual(message, conversation_id, scope_id, viewer_id, decision, draft)
+            return self._contextual(message, conversation_id, scope_id, viewer_id,
+                                    decision.as_gate_decision(), draft)
         if decision.mode == "ambiguous":
-            return self._ambiguous_path(message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft)
-        spec = build_query_spec(
-            draft,
-            scope_id=scope_id,
-            viewer_id=viewer_id,
-            conversation_id=conversation_id,
-            entity_resolver=lambda name: self._resolve_person(name, scope_id),
-            query_id=f"query_{uuid.uuid4().hex[:12]}",
-        )
-        packet = self.kernel.retrieve(spec)
+            return self._ambiguous_path(message, recent_turns, conversation_id, scope_id, viewer_id,
+                                        decision, draft)
+        return self._evidence_path(message, recent_turns, conversation_id, scope_id, viewer_id,
+                                   decision, draft)
+
+    def _evidence_path(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
+        with _Perf.measure("query_spec"):
+            spec = build_query_spec(
+                draft,
+                scope_id=scope_id,
+                viewer_id=viewer_id,
+                conversation_id=conversation_id,
+                entity_resolver=lambda name: self._resolve_person(name, scope_id),
+                query_id=f"query_{uuid.uuid4().hex[:12]}",
+            )
+            if decision.focus_ids:
+                spec = self._merge_focus(spec, decision.focus_ids, scope_id)
+        with _Perf.measure("retrieval"):
+            packet = self.kernel.retrieve(spec)
         if spec.answer_target == "person" and not spec.entity_ids:
             packet.assets = []
             packet.exact_results = []
             packet.strong_results = []
             packet.approximate_results = []
             packet.gaps = [{"condition": "confirmed_person", "reason": "没有找到当前 scope 内已确认的人物"}]
-        return self._evidence_answer(message, conversation_id, scope_id, viewer_id, decision, spec, packet, draft)
+        result = self._evidence_answer(message, conversation_id, scope_id, viewer_id,
+                                       decision.as_gate_decision(), spec, packet, draft)
+        self._save_focus(conversation_id, scope_id, spec, packet)
+        return result
 
     def _ambiguous_path(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
-        """Gate said ambiguous (parser none without an explicit general task).
+        """Ambiguous (weak parser signal / bare noun) — the NeutralProbe decides.
 
-        When the parser still produced household facets/conditions, those ARE
-        the evidence query — retrieve directly.  The Neutral Probe is only for
-        the bare-noun case where the parser left nothing (P0-7/P0-8).
+        The Router finalizes after the probe: upgrade -> evidence, clarify ->
+        clarify envelope, no_household_match -> clear-general none / else clarify
+        (never fabricated chat).
         """
-        if draft.semantic_conditions or draft.facets or draft.time_expression or draft.media_expressions:
+        media_hint = None
+        if getattr(draft, "media_expressions", None):
+            media_hint = "image" if any("照片" in item or "图片" in item or "图" == item for item in draft.media_expressions) else "media"
+        with _Perf.measure("probe"):
+            probe = self._run_probe(message, scope_id, viewer_id,
+                                    conversation_id=conversation_id, media_hint=media_hint)
+        final = self._router.resolve_after_probe(probe, message, decision, draft)
+        if final.mode == "evidence":
             if not draft.actions:
                 draft.actions = [QueryAction(type="answer_question", target="general")]
-            spec = build_query_spec(
-                draft,
-                scope_id=scope_id,
-                viewer_id=viewer_id,
-                conversation_id=conversation_id,
-                entity_resolver=lambda name: self._resolve_person(name, scope_id),
-                query_id=f"query_{uuid.uuid4().hex[:12]}",
-            )
-            packet = self.kernel.retrieve(spec)
-            upgraded = GateDecision(
-                "evidence", "ambiguous_with_household_facets",
-                answer_target=decision.answer_target, concrete_memory_reads=1,
-                evidence_search_calls=1, query_parse_calls=decision.query_parse_calls,
-                allow_probe=False,
-            )
-            return self._evidence_answer(message, conversation_id, scope_id, viewer_id,
-                                         upgraded, spec, packet, draft)
+            if probe.decision == "upgrade":
+                draft.semantic_conditions.append(
+                    {"dimension": "semantic", "value": message, "source_text": message}
+                )
+            return self._evidence_path(message, recent_turns, conversation_id, scope_id,
+                                       viewer_id, final, draft)
+        if final.mode == "clarify":
+            return self._clarify_envelope(message, conversation_id, scope_id, viewer_id,
+                                          decision, probe, draft)
+        return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id,
+                                 final.as_gate_decision(), draft)
 
-        probe = self._run_probe(message, scope_id, viewer_id)
-        if probe.decision == "upgrade":
-            draft.semantic_conditions.append(
-                {"dimension": "semantic", "value": message, "source_text": message}
-            )
-            draft.actions = [QueryAction(type="answer_question", target="general")]
-            spec = build_query_spec(
-                draft,
-                scope_id=scope_id,
-                viewer_id=viewer_id,
-                conversation_id=conversation_id,
-                entity_resolver=lambda name: self._resolve_person(name, scope_id),
-                query_id=f"query_{uuid.uuid4().hex[:12]}",
-            )
-            packet = self.kernel.retrieve(spec)
-            upgraded = GateDecision(
-                "evidence", f"probe_upgrade:{probe.reason}",
-                answer_target=decision.answer_target, concrete_memory_reads=1,
-                evidence_search_calls=1, query_parse_calls=decision.query_parse_calls,
-                allow_probe=False,
-            )
-            return self._evidence_answer(message, conversation_id, scope_id, viewer_id,
-                                         upgraded, spec, packet, draft)
-        if probe.decision == "clarify":
-            answer = "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
-            trace = [{"stage": "gate", "status": "ambiguous",
-                      "counts": {"query_parse": decision.query_parse_calls,
-                                 "probe": probe.channel_counts, "probe_decision": probe.reason}}]
-            return self._envelope(answer, conversation_id, scope_id, viewer_id, decision,
-                                  [], [], "clarify", trace, draft=draft)
-        return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft)
+    def _clarify_envelope(self, message, conversation_id, scope_id, viewer_id, decision, probe, draft):
+        answer = "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
+        trace = [{"stage": "gate", "status": "ambiguous",
+                  "counts": {"query_parse": decision.query_parse_calls,
+                             "probe": probe.channel_counts, "probe_decision": probe.reason}}]
+        return self._envelope(answer, conversation_id, scope_id, viewer_id,
+                              decision.as_gate_decision(), [], [], "clarify", trace, draft=draft)
 
-    def _run_probe(self, message, scope_id, viewer_id):
+    def _run_probe(self, message, scope_id, viewer_id, conversation_id=None, media_hint=None):
         from .retrieval import NeutralProbe, RetrievalConfig
-        channel_hits = self.kernel.probe(message, scope_id, viewer_id)
+        channel_hits, index_health = self.kernel.probe(message, scope_id, viewer_id)
+        focus = self._load_focus(conversation_id, scope_id) if conversation_id else {}
         return NeutralProbe(RetrievalConfig()).run(message, channel_hits,
-                                                   scope_id=scope_id, viewer_id=viewer_id)
+                                                   scope_id=scope_id, viewer_id=viewer_id,
+                                                   focus=focus, media_hint=media_hint,
+                                                   index_health=index_health)
+
+    def _load_focus(self, conversation_id, scope_id):
+        try:
+            return self.store.get_dialogue_state(conversation_id, scope_id) or {}
+        except Exception:
+            return {}
+
+    def _save_focus(self, conversation_id, scope_id, spec, packet):
+        try:
+            entity_ids = list(dict.fromkeys(spec.entity_ids or []))
+            state = {
+                "scope_id": scope_id or "home-default",
+                "active_entity_ids": entity_ids[:8],
+                "active_event_ids": [],
+                "evidence_ids": [item["asset_id"] for item in (packet.assets or [])][:40],
+                "unresolved_ambiguity": not bool(packet.assets),
+            }
+            self.store.save_dialogue_state(conversation_id, scope_id or "home-default", state)
+        except Exception:
+            pass
+
+    def _merge_focus(self, spec, focus_ids, scope_id):
+        for entity_id in focus_ids:
+            if entity_id in spec.entity_ids:
+                continue
+            name = self._entity_name(entity_id, scope_id)
+            spec.entity_ids.append(entity_id)
+            if name:
+                spec.constraints.append(Constraint("person", name, HARD, "session_focus",
+                                                   source_text=name))
+        return spec
+
+    def _entity_name(self, entity_id, scope_id):
+        try:
+            for entity in self.store.list_entities(status="confirmed", scope_id=scope_id):
+                if entity.get("id") == entity_id:
+                    return entity.get("canonical_name") or entity_id
+        except Exception:
+            pass
+        return entity_id
 
     def _normal_chat(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
         answer = "我在听。"
@@ -170,10 +277,12 @@ class ThinAgentRuntime:
                 f"最近对话：{str(recent_turns or '')[-1200:]}\n用户：{message}"
             )
             try:
-                if self.router is not None:
-                    text = self.router.chat("answer", prompt, json_mode=False)
-                else:
-                    text = self.gamma.chat(prompt, json_mode=False, role="answer")
+                with _Perf.measure("answer"):
+                    if self.router is not None:
+                        text = self.router.chat("answer", prompt, json_mode=False)
+                    else:
+                        text = self.gamma.chat(prompt, json_mode=False, role="answer")
+                _Perf.count("answer_calls")
                 answer = str(text or "").strip() or answer
             except Exception:
                 pass
@@ -302,6 +411,19 @@ class ThinAgentRuntime:
             pass
         return None
 
+    def _message_entity_ids(self, message, scope_id):
+        """Confirmed entities whose canonical name appears in the raw message."""
+        value = str(message or "")
+        ids = []
+        try:
+            for entity in self.store.list_entities(status="confirmed", scope_id=scope_id):
+                name = str(entity.get("canonical_name") or "").strip()
+                if name and name in value:
+                    ids.append(entity["id"])
+        except Exception:
+            pass
+        return ids
+
     def _evidence_answer(self, message, conversation_id, scope_id, viewer_id, decision, spec, packet, draft):
         # R8-5: gate approximate evidence by recall strength before display —
         # weak approximate candidates must not surface as user-visible images.
@@ -329,21 +451,22 @@ class ThinAgentRuntime:
                 pass
         person_summary = spec.answer_target == "person" and bool(spec.entity_ids)
         clothing_gap = spec.answer_target == "clothing" and bool(spec.entity_ids) and not self._has_subject_clothing(packet)
-        if spec.answer_target == "person" and not spec.entity_ids:
-            answer, statements = ("目前没有找到当前范围内已确认的人物，不能把待确认人物簇直接当作人物介绍。", [])
-        elif person_summary:
-            answer, statements = self._person_summary_via_complex_or_fallback(message, spec, packet)
-        elif clothing_gap:
-            name = next((item.value for item in spec.constraints if item.dimension == "person"), "这个人")
-            answer = f"现有记录没有把衣物字段可靠绑定到{name}，无法确认这件衣服属于他。"
-            statements = []
-        elif not evidence:
-            # Phase R R6: a household evidence query with no matched evidence
-            # must refuse explicitly — never fall back to normal chat with a
-            # fabricated general description.
-            answer, statements = ("当前记忆中没有找到足够匹配的原始证据。", [])
-        else:
-            answer, statements = self._simple_answer(packet)
+        with _Perf.measure("answer"):
+            if spec.answer_target == "person" and not spec.entity_ids:
+                answer, statements = ("目前没有找到当前范围内已确认的人物，不能把待确认人物簇直接当作人物介绍。", [])
+            elif person_summary:
+                answer, statements = self._person_summary_via_complex_or_fallback(message, spec, packet)
+            elif clothing_gap:
+                name = next((item.value for item in spec.constraints if item.dimension == "person"), "这个人")
+                answer = f"现有记录没有把衣物字段可靠绑定到{name}，无法确认这件衣服属于他。"
+                statements = []
+            elif not evidence:
+                # Phase R R6: a household evidence query with no matched evidence
+                # must refuse explicitly — never fall back to normal chat with a
+                # fabricated general description.
+                answer, statements = ("当前记忆中没有找到足够匹配的原始证据。", [])
+            else:
+                answer, statements = self._simple_answer(packet)
         allowed = self._allowed_facts(packet)
         composed = (
             {"answer": answer, "statements": statements, "valid": True}
@@ -354,7 +477,9 @@ class ThinAgentRuntime:
         )
         answer = composed["answer"]
         claims, index = [], {}
-        extracted_claims = ClaimExtractor().scan(composed["answer"], composed.get("statements", []))
+        with _Perf.measure("claim"):
+            extracted_claims = ClaimExtractor().scan(composed["answer"], composed.get("statements", []))
+        _Perf.count("claim_calls")
         for number, claim in enumerate(extracted_claims, 1):
             claim_id = f"claim_{number}"
             claim["claim_id"] = claim_id
@@ -392,9 +517,10 @@ class ThinAgentRuntime:
 
     def _person_summary_via_complex_or_fallback(self, message, spec, packet):
         """Try Phase 4 Writer/Verifier chain; fall back to inline summary."""
-        import os
         if os.getenv("SENTRIX_LLM_CLAIM_EXTRACTOR_V1", "0").lower() in {"1", "true", "on"}:
-            result = self.complex_builder.build(message, spec, packet)
+            with _Perf.measure("complex_chain"):
+                result = self.complex_builder.build(message, spec, packet)
+            _Perf.count("answer_calls")
             if not result.get("fallback"):
                 return result["answer"], result["statements"]
         return self._person_summary(spec, packet)

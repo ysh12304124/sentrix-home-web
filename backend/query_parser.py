@@ -16,6 +16,7 @@ import re
 
 from .model_clients import parse_json_response
 from .query_contracts import QueryParseDraft, sanitize_query_parse
+from .routing_rules import has_household_signal
 
 
 _PARSER_MARKER = "查询解析器"
@@ -106,6 +107,8 @@ class QueryParser:
         self.gamma = gamma
         self.framework_planner = framework_planner
         self.router = router
+        # R9-6: per-parse model call accounting for the latency report.
+        self.call_counts = {"parser": 0, "repair": 0}
 
     def parse(self, message, recent_turns="", now=None):
         raw = self._call_parser(message, recent_turns, now)
@@ -119,6 +122,7 @@ class QueryParser:
         return self._apply_deterministic_overlay(draft, message)
 
     def _call_parser(self, message, recent_turns, now):
+        self.call_counts["parser"] += 1
         prompt = self._render_parser_prompt(message, recent_turns, now)
         if self.framework_planner is not None and getattr(self.framework_planner, "available", False):
             try:
@@ -130,6 +134,7 @@ class QueryParser:
         return self._invoke_gamma(prompt)
 
     def _call_repair(self, message, raw_json, errors):
+        self.call_counts["repair"] += 1
         prompt = _REPAIR_PROMPT.replace("{{message}}", str(message or "")).replace(
             "{{raw_json}}", json.dumps(raw_json, ensure_ascii=False, default=str)
         ).replace("{{validation_errors}}", "; ".join(errors))
@@ -170,16 +175,17 @@ class QueryParser:
         errors = []
         if draft.mode not in {"none", "contextual", "evidence"}:
             errors.append("mode missing or invalid")
-        # Phase R P0-6: an evidence mode with no action is structurally
-        # inconsistent — the model claims a household query but forgot the
-        # goal.  Trigger a repair instead of silently treating it as evidence.
-        if draft.mode == "evidence" and not draft.actions:
-            errors.append("evidence mode requires at least one action")
+        # R9: proposed_mode is advisory.  A draft that still carries household
+        # structure yet dropped every action is structurally inconsistent — the
+        # model forgot the goal.  Repair once to restore it (mode-independent).
+        if has_household_signal(draft) and not draft.actions:
+            errors.append("household signal without any action")
         return draft, errors
 
     @staticmethod
     def _safe_fallback():
-        return QueryParseDraft(intent="answer", answer_target="general", mode="none")
+        return QueryParseDraft(intent="answer", answer_target="general",
+                               proposed_mode="none")
 
     @staticmethod
     def _apply_deterministic_overlay(draft, message):

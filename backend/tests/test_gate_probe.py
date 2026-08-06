@@ -10,7 +10,7 @@ from backend.retrieval.probes import ProbeOutcome
 
 
 def _draft(mode, **kwargs):
-    draft = QueryParseDraft(intent="answer", answer_target="general", mode=mode)
+    draft = QueryParseDraft(intent="answer", answer_target="general", proposed_mode=mode)
     for key, value in kwargs.items():
         setattr(draft, key, value)
     return draft
@@ -86,9 +86,24 @@ class NeutralProbeTests(unittest.TestCase):
         outcome = self._probe().run("今天的晚饭", channel_hits, scope_id="album1")
         self.assertEqual(outcome.decision, "clarify")
 
-    def test_no_hits_clarifies(self):
+    def test_no_hits_is_no_household_match(self):
+        # R9-2: no channel candidates -> no_household_match; the Router decides
+        # clarify vs none (never fabricated chat).
         outcome = self._probe().run("随机词", {}, scope_id="album1")
-        self.assertEqual(outcome.decision, "clarify")
+        self.assertEqual(outcome.decision, "no_household_match")
+        self.assertEqual(outcome.channel_agreement, 0)
+        self.assertEqual(outcome.top_candidates, [])
+
+    def test_outcome_reports_agreement_candidates_and_health(self):
+        hits = self._hits(["asset_1", "asset_2"])
+        health = {"visual_ann": {"status": "ok", "hits": 1}}
+        outcome = self._probe().run("银色心形手镯",
+                                    {"lexical": hits, "visual_ann": self._hits(["asset_1"])},
+                                    scope_id="album1", index_health=health)
+        self.assertEqual(outcome.decision, "upgrade")
+        self.assertGreaterEqual(outcome.channel_agreement, 2)
+        self.assertIn("asset_1", outcome.top_candidates)
+        self.assertEqual(outcome.index_health, health)
 
     def test_exact_lexical_phrase_upgrades(self):
         hit = CandidateHit(asset_id="asset_1", retriever="lexical", raw_score=3.0,

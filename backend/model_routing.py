@@ -23,7 +23,9 @@ from typing import Callable
 PARSER = "parser"
 ANSWER = "answer"
 VERIFY = "verify"
-ROLES = (PARSER, ANSWER, VERIFY)
+CLAIM = "claim"
+REPAIR = "repair"
+ROLES = (PARSER, ANSWER, VERIFY, CLAIM, REPAIR)
 
 DEFAULT_PHASE_BUDGETS = {PARSER: 4.0, "retrieval": 5.0, ANSWER: 7.0, "overhead": 2.0}
 
@@ -42,15 +44,28 @@ def _env(env, key, default):
 
 def resolve_specs(env=None) -> dict[str, ModelSpec]:
     main = _env(env, "OLLAMA_MODEL", "gemma4:12b")
-    parse_model = _env(env, "SENTRIX_PARSE_MODEL", main)
+    profile = _env(env, "SENTRIX_AGENT_MODEL_PROFILE", "quality_12b").strip().lower()
+    parse_model = _env(env, "SENTRIX_PARSE_MODEL", None)
+    parse_backend = _env(env, "SENTRIX_PARSE_BACKEND", None)
+    parse_base = _env(env, "SENTRIX_PARSE_BASE_URL", "")
+    if parse_model is None and profile == "experimental_2b":
+        parse_model = "gemma-4-e2b-it+lora-v2"
+    if parse_backend is None and profile == "experimental_2b":
+        parse_backend = "e2b"
+    if not parse_base and profile == "experimental_2b":
+        parse_base = "http://127.0.0.1:8100"
+    parse_model = parse_model or main
+    parse_backend = parse_backend or "ollama_local"
     answer_model = _env(env, "SENTRIX_ANSWER_MODEL", main)
     verify_model = _env(env, "SENTRIX_VERIFY_MODEL", main)
-    parse_backend = _env(env, "SENTRIX_PARSE_BACKEND", "ollama_local")
-    parse_base = _env(env, "SENTRIX_PARSE_BASE_URL", "")
+    claim_model = _env(env, "SENTRIX_CLAIM_MODEL", verify_model)
+    repair_model = _env(env, "SENTRIX_REPAIR_MODEL", parse_model)
     return {
         PARSER: ModelSpec(PARSER, parse_model, parse_backend, parse_base),
         ANSWER: ModelSpec(ANSWER, answer_model, "ollama_local", ""),
         VERIFY: ModelSpec(VERIFY, verify_model, "ollama_local", ""),
+        CLAIM: ModelSpec(CLAIM, claim_model, "ollama_local", ""),
+        REPAIR: ModelSpec(REPAIR, repair_model, parse_backend, parse_base),
     }
 
 
