@@ -1,33 +1,292 @@
 {
   "api": "http://127.0.0.1:8091",
-  "repeats": 6,
+  "repeats": 2,
+  "deadline_s": 20.0,
   "paths": {
     "normal_chat": {
-      "message": "帮我写一段生日祝福",
-      "p50_s": 0.001,
-      "p95_s": 0.002,
-      "avg_s": 0.001,
-      "model_calls_p50": 1,
+      "message": "今天感觉怎么样",
+      "cold_total_s": 0.6831,
+      "warm_p50_s": 0.4567,
+      "warm_p95_s": 0.4567,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0001,
+        "probe": 0.0437,
+        "query_spec": 0.0,
+        "retrieval": 0.5104,
+        "answer": 0.0,
+        "claim": 0.0
+      },
       "timeout_or_error_count": 0,
-      "sample_errors": []
+      "route_mismatch_count": 2,
+      "sample_issues": [
+        {
+          "run": 0,
+          "reason": "route=anchored expected={'none', 'not_applicable'}"
+        },
+        {
+          "run": 1,
+          "reason": "route=anchored expected={'none', 'not_applicable'}"
+        }
+      ],
+      "real_http_model_calls": true,
+      "real_http_check": "FAIL: normal_chat missing answer model call"
+    },
+    "writing": {
+      "message": "帮我写一段生日祝福",
+      "cold_total_s": 0.0015,
+      "warm_p50_s": 0.0012,
+      "warm_p95_s": 0.0012,
+      "model_calls_p50": {
+        "parser": 0.0,
+        "repair": 0.0,
+        "answer": 1.0,
+        "claim": 0.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "answer": 0.0
+      },
+      "timeout_or_error_count": 0,
+      "route_mismatch_count": 0,
+      "sample_issues": [],
+      "real_http_model_calls": true
+    },
+    "short_visual": {
+      "message": "银色心形手镯",
+      "cold_total_s": 0.5443,
+      "warm_p50_s": 0.8701,
+      "warm_p95_s": 0.8701,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0001,
+        "probe": 0.0677,
+        "query_spec": 0.0,
+        "retrieval": 0.6269,
+        "answer": 0.0,
+        "claim": 0.0
+      },
+      "timeout_or_error_count": 0,
+      "route_mismatch_count": 0,
+      "sample_issues": [],
+      "real_http_model_calls": true
     },
     "simple_evidence": {
-      "message": "厨房里做晚饭",
-      "p50_s": 0.468,
-      "p95_s": 0.547,
-      "avg_s": 0.479,
-      "model_calls_p50": 2,
+      "message": "2024年5月厨房里做晚饭",
+      "cold_total_s": 0.3978,
+      "warm_p50_s": 0.3219,
+      "warm_p95_s": 0.3219,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0,
+        "query_spec": 0.0,
+        "retrieval": 0.3501,
+        "answer": 0.0,
+        "claim": 0.0
+      },
       "timeout_or_error_count": 0,
-      "sample_errors": []
+      "route_mismatch_count": 0,
+      "sample_issues": [],
+      "real_http_model_calls": true
     },
-    "complex_person": {
-      "message": "介绍一下明哥",
-      "p50_s": 0.001,
-      "p95_s": 0.001,
-      "avg_s": 0.001,
-      "model_calls_p50": 2,
+    "strict_empty": {
+      "message": "贵阳夜晚步行街",
+      "cold_total_s": 0.4559,
+      "warm_p50_s": 0.4599,
+      "warm_p95_s": 0.4599,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0001,
+        "probe": 0.0339,
+        "query_spec": 0.0,
+        "retrieval": 0.4119,
+        "answer": 0.0,
+        "claim": 0.0
+      },
       "timeout_or_error_count": 0,
-      "sample_errors": []
+      "route_mismatch_count": 0,
+      "sample_issues": [],
+      "real_http_model_calls": true
+    },
+    "allow_approximate": {
+      "message": "水族馆海豚跃出水面",
+      "cold_total_s": 0.4574,
+      "warm_p50_s": 0.472,
+      "warm_p95_s": 0.472,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0001,
+        "probe": 0.0348,
+        "query_spec": 0.0,
+        "retrieval": 0.4165,
+        "answer": 0.0,
+        "claim": 0.0
+      },
+      "timeout_or_error_count": 0,
+      "route_mismatch_count": 0,
+      "sample_issues": [],
+      "real_http_model_calls": true
+    },
+    "person_intro": {
+      "message": "介绍一下明哥",
+      "cold_total_s": 0.0014,
+      "warm_p50_s": 0.0014,
+      "warm_p95_s": 0.0014,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 0.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0001
+      },
+      "timeout_or_error_count": 0,
+      "route_mismatch_count": 2,
+      "sample_issues": [
+        {
+          "run": 0,
+          "reason": "route=clarify expected={'anchored', 'evidence', 'gap'}"
+        },
+        {
+          "run": 1,
+          "reason": "route=clarify expected={'anchored', 'evidence', 'gap'}"
+        }
+      ],
+      "real_http_model_calls": true
+    },
+    "composite_assets": {
+      "message": "把去年拍的照片给我",
+      "cold_total_s": 0.4406,
+      "warm_p50_s": 0.4385,
+      "warm_p95_s": 0.4385,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0,
+        "router": 0.0,
+        "probe": 0.0333,
+        "query_spec": 0.0,
+        "retrieval": 0.3944,
+        "answer": 0.0,
+        "claim": 0.0
+      },
+      "timeout_or_error_count": 0,
+      "route_mismatch_count": 2,
+      "sample_issues": [
+        {
+          "run": 0,
+          "reason": "route=gap expected={'anchored', 'evidence'}"
+        },
+        {
+          "run": 1,
+          "reason": "route=gap expected={'anchored', 'evidence'}"
+        }
+      ],
+      "real_http_model_calls": true
+    },
+    "parser_timeout": {
+      "message": "把我所有关于做饭、厨房、年夜饭、出行的照片和视频都找出来整理成时间线，再比较明哥和小黑在厨房出现的次数",
+      "cold_total_s": 0.4477,
+      "warm_p50_s": 0.4567,
+      "warm_p95_s": 0.4567,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0001,
+        "probe": 0.0327,
+        "query_spec": 0.0,
+        "retrieval": 0.4097,
+        "answer": 0.0,
+        "claim": 0.0
+      },
+      "timeout_or_error_count": 0,
+      "route_mismatch_count": 0,
+      "sample_issues": [],
+      "real_http_model_calls": true
+    },
+    "answer_timeout": {
+      "message": "聊聊家里最近发生的事，随便展开讲讲",
+      "cold_total_s": 0.4602,
+      "warm_p50_s": 0.4509,
+      "warm_p95_s": 0.4509,
+      "model_calls_p50": {
+        "parser": 1.0,
+        "repair": 0.0,
+        "answer": 0.0,
+        "claim": 1.0
+      },
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 0.0001,
+        "router": 0.0001,
+        "probe": 0.0324,
+        "query_spec": 0.0,
+        "retrieval": 0.4101,
+        "answer": 0.0,
+        "claim": 0.0
+      },
+      "timeout_or_error_count": 0,
+      "route_mismatch_count": 2,
+      "sample_issues": [
+        {
+          "run": 0,
+          "reason": "route=anchored expected={'none', 'not_applicable'}"
+        },
+        {
+          "run": 1,
+          "reason": "route=anchored expected={'none', 'not_applicable'}"
+        }
+      ],
+      "real_http_model_calls": true
     }
   }
 }
