@@ -202,13 +202,38 @@ ROLE_INFERENCE = {
 }
 
 
+def build_image_prompt(metadata=None):
+    prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
+严格返回简体中文 JSON 对象。place 和 semantic.place.primary 必须只依据图片视觉证据，不能用 GPS 或地点上下文覆盖；地点上下文只能作为候选背景。
+地点主类只能从："""
+    prompt += "、".join(PLACE_PRIMARY_TYPES)
+    prompt += "；物品主类只能从："
+    prompt += "、".join(OBJECT_PRIMARY_TYPES)
+    prompt += "；氛围主类只能从："
+    prompt += "、".join(ATMOSPHERE_PRIMARY_TYPES)
+    prompt += "\nmetadata: " + json.dumps(metadata or {}, ensure_ascii=False)
+    return prompt
+
+
 class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
-                 repair_model=None):
-        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
-        self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+                 repair_model=None, backend=None, api_key=None):
+        self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
+        if self.backend == "openai":
+            self.base_url = self._normalize_openai_base_url(
+                base_url
+                or os.getenv("SENTRIX_VLLM_BASE_URL")
+                or os.getenv("VLLM_BASE_URL")
+                or os.getenv("OPENAI_BASE_URL")
+                or "http://127.0.0.1:8100/v1"
+            )
+            self.model = model or os.getenv("SENTRIX_VLLM_MODEL") or os.getenv("VLLM_MODEL") or os.getenv("OPENAI_MODEL") or "gemma4-12b-it"
+        else:
+            self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+            self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+        self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
         # Phase R R5 + R9-3: per-role model separation.  Explicit per-role env
         # wins; otherwise SENTRIX_AGENT_MODEL_PROFILE decides the default —
         # quality_12b (all roles on the 12B main endpoint) or experimental_2b
@@ -218,7 +243,13 @@ class GammaClient:
         profile = os.getenv("SENTRIX_AGENT_MODEL_PROFILE", "quality_12b").strip().lower()
         explicit_any = any((parse_model, answer_model, verify_model, parse_backend,
                             os.getenv("SENTRIX_PARSE_MODEL"), os.getenv("SENTRIX_PARSE_BACKEND")))
-        if model_split or explicit_any:
+        if self.backend == "openai":
+            self.parse_model = parse_model or os.getenv("SENTRIX_PARSE_MODEL", self.model)
+            self.answer_model = answer_model or os.getenv("SENTRIX_ANSWER_MODEL", self.model)
+            self.verify_model = verify_model or os.getenv("SENTRIX_VERIFY_MODEL", self.model)
+            self.parse_backend = parse_backend or os.getenv("SENTRIX_PARSE_BACKEND", self.backend)
+            self.parse_base_url = self._normalize_openai_base_url(parse_base_url or os.getenv("SENTRIX_PARSE_BASE_URL", self.base_url))
+        elif model_split or explicit_any:
             self.parse_model = parse_model or os.getenv("SENTRIX_PARSE_MODEL", self.model)
             self.answer_model = answer_model or os.getenv("SENTRIX_ANSWER_MODEL", self.model)
             self.verify_model = verify_model or os.getenv("SENTRIX_VERIFY_MODEL", self.model)
@@ -241,6 +272,20 @@ class GammaClient:
         # Ollama expects numeric -1 for indefinite residency; the string "-1"
         # is rejected by its request schema.
         self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
+
+    @staticmethod
+    def _normalize_backend(value):
+        value = str(value or "vllm").strip().lower()
+        if value in {"vllm", "openai", "openai_compatible", "openai-compatible"}:
+            return "openai"
+        if value in {"ollama", "ollama_local"}:
+            return "ollama"
+        raise ModelError(f"unsupported llm backend: {value}")
+
+    @staticmethod
+    def _normalize_openai_base_url(value):
+        value = str(value or "http://127.0.0.1:8100/v1").rstrip("/")
+        return value if value.endswith("/v1") else f"{value}/v1"
 
     def _endpoint_for(self, role):
         """Resolve (base_url, model) for a model role.
@@ -269,10 +314,15 @@ class GammaClient:
     def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
         if httpx is None:
             raise ModelError("httpx is not installed")
+        endpoint_base, model = self._endpoint_for(role)
+        if self.backend == "openai":
+            return self._chat_openai(endpoint_base, model, prompt, images, vision_options, json_mode, role)
+        return self._chat_ollama(endpoint_base, model, prompt, images, vision_options, json_mode, role)
+
+    def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
         if images:
             message["images"] = [image["base64"] for image in images]
-        endpoint_base, model = self._endpoint_for(role)
         payload = {
             "model": model,
             "messages": [message],
@@ -306,6 +356,47 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError) as error:
+            raise ModelError(f"gamma request failed: {error}") from error
+
+    def _chat_openai(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        if images:
+            content = [{"type": "text", "text": prompt}]
+            for image in images:
+                mime_type = image.get("mime_type") or "image/jpeg"
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image['base64']}"},
+                })
+            message = {"role": "user", "content": content}
+        else:
+            message = {"role": "user", "content": prompt}
+        payload = {
+            "model": model,
+            "messages": [message],
+            "stream": False,
+            "temperature": 0,
+        }
+        if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            payload["response_format"] = {"type": "json_object"}
+        params = ROLE_INFERENCE.get(role)
+        if params is not None:
+            payload["temperature"] = params["temperature"]
+            payload["max_tokens"] = params["num_predict"]
+        if vision_options:
+            payload["max_tokens"] = int(vision_options["num_predict"])
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            response = httpx.post(f"{endpoint_base}/chat/completions", json=payload, headers=headers, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            if isinstance(text, list):
+                text = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in text)
+            self._record_validation_call(role, endpoint_base, model, json_mode, text)
+            return text
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             raise ModelError(f"gamma request failed: {error}") from error
 
     def _record_validation_call(self, role, endpoint_base, model, json_mode, text):

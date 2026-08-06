@@ -4,7 +4,7 @@ from unittest.mock import patch
 from pathlib import Path
 import tempfile
 
-from backend.model_clients import GammaClient, as_text, normalize_confidence, parse_json_response
+from backend.model_clients import GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
 
 
 class ModelClientTests(unittest.TestCase):
@@ -25,12 +25,50 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(normalize_confidence("80%", 0.5), 0.8)
         self.assertEqual(normalize_confidence("无效值", 0.65), 0.65)
 
+    def test_image_prompt_keeps_reverse_geocode_out_of_visual_place_classification(self):
+        prompt = build_image_prompt({"location_context": {"label": "测试省测试市测试区"}})
+
+        self.assertIn("测试省测试市测试区", prompt)
+        self.assertIn("place 和 semantic.place.primary 必须只依据图片视觉证据", prompt)
+        self.assertIn("不能用 GPS 或地点上下文覆盖", prompt)
+
+    @patch("backend.model_clients.httpx.post")
+    def test_gamma_default_uses_vllm_openai_chat_completions(self, post):
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {"choices": [{"message": {"content": "{}"}}]}
+
+        GammaClient(base_url="http://sentrix-vllm", model="gemma4-12b-it").chat("测试", role="parser")
+
+        self.assertEqual(post.call_args.args[0], "http://sentrix-vllm/v1/chat/completions")
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], "gemma4-12b-it")
+        self.assertEqual(payload["max_tokens"], 512)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertNotIn("keep_alive", payload)
+
+    @patch("backend.model_clients.httpx.post")
+    def test_gamma_vllm_multimodal_request_uses_openai_image_content(self, post):
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {"choices": [{"message": {"content": "{}"}}]}
+
+        GammaClient(base_url="http://sentrix-vllm/v1", model="gemma4-e2b-it").chat(
+            "看图", [{"base64": "image", "mime_type": "image/jpeg"}],
+            {"think": False, "num_ctx": 4096, "num_predict": 320},
+        )
+
+        payload = post.call_args.kwargs["json"]
+        content = payload["messages"][0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "看图"})
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertEqual(content[1]["image_url"]["url"], "data:image/jpeg;base64,image")
+        self.assertEqual(payload["max_tokens"], 320)
+
     @patch("backend.model_clients.httpx.post")
     def test_gamma_request_uses_configured_model_keep_alive(self, post):
         post.return_value.raise_for_status.return_value = None
         post.return_value.json.return_value = {"message": {"content": "{}"}}
 
-        GammaClient(base_url="http://sentrix-ollama", model="gemma4:12b").chat("测试")
+        GammaClient(base_url="http://sentrix-ollama", model="gemma4:12b", backend="ollama").chat("测试")
 
         self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], "0")
 
@@ -39,7 +77,7 @@ class ModelClientTests(unittest.TestCase):
         post.return_value.raise_for_status.return_value = None
         post.return_value.json.return_value = {"message": {"content": "{}"}}
 
-        GammaClient(base_url="http://sentrix-ollama", keep_alive="15m").chat("测试")
+        GammaClient(base_url="http://sentrix-ollama", keep_alive="15m", backend="ollama").chat("测试")
 
         self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], "15m")
 
@@ -49,7 +87,7 @@ class ModelClientTests(unittest.TestCase):
         post.return_value.raise_for_status.return_value = None
         post.return_value.json.return_value = {"message": {"content": "{}"}}
 
-        GammaClient(base_url="http://sentrix-ollama").chat("测试")
+        GammaClient(base_url="http://sentrix-ollama", backend="ollama").chat("测试")
 
         self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], -1)
 
@@ -58,7 +96,7 @@ class ModelClientTests(unittest.TestCase):
         post.return_value.raise_for_status.return_value = None
         post.return_value.json.return_value = {"message": {"content": "{}"}}
 
-        GammaClient(base_url="http://sentrix-ollama").chat(
+        GammaClient(base_url="http://sentrix-ollama", backend="ollama").chat(
             "测试", [{"base64": "image", "mime_type": "image/jpeg"}],
             {"think": False, "num_ctx": 4096, "num_predict": 320},
         )

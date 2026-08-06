@@ -22,6 +22,10 @@ if ((${#runtime_dirs[@]})); then
 fi
 
 export FACE_PROVIDERS="${FACE_PROVIDERS:-CUDAExecutionProvider,CPUExecutionProvider}"
+export SENTRIX_LLM_BACKEND="${SENTRIX_LLM_BACKEND:-vllm}"
+export SENTRIX_VLLM_BASE_URL="${SENTRIX_VLLM_BASE_URL:-http://127.0.0.1:8100/v1}"
+export SENTRIX_VLLM_MODEL="${SENTRIX_VLLM_MODEL:-gemma4-12b-it}"
+# Legacy Ollama settings are kept only for explicit SENTRIX_LLM_BACKEND=ollama fallback.
 export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11435}"
 export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:12b}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
@@ -29,6 +33,10 @@ export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8100}"
 # 153 GPU driver/library NVML mismatch breaks the CUDA caching allocator; run
 # CLIP embedding on CPU so visual/text recall stays available.
 export CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
+# R1B proved ViT-B-32 text-to-image is random for Chinese (AUC 0.51); switch the
+# visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
+export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"
+export SENTRIX_TEXT_EMBEDDER="${SENTRIX_TEXT_EMBEDDER:-clip}"
 export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-adaface}"
 export ADAFACE_MODEL_PATH="${ADAFACE_MODEL_PATH:-/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt}"
 export ADAFACE_REPO_ROOT="${ADAFACE_REPO_ROOT:-/home/asus/models/AdaFace}"
@@ -54,10 +62,10 @@ export SENTRIX_RETRIEVER_TEXT_ANN="${SENTRIX_RETRIEVER_TEXT_ANN:-1}"
 export SENTRIX_RETRIEVER_ADJACENCY="${SENTRIX_RETRIEVER_ADJACENCY:-1}"
 export SENTRIX_RETRIEVER_FUSION="${SENTRIX_RETRIEVER_FUSION:-rrf}"
 export SENTRIX_GATE_PROBE_V1="${SENTRIX_GATE_PROBE_V1:-1}"
-export SENTRIX_MODEL_SPLIT_V1="${SENTRIX_MODEL_SPLIT_V1:-1}"
-export SENTRIX_PARSE_BACKEND="${SENTRIX_PARSE_BACKEND:-e2b}"
-export SENTRIX_PARSE_BASE_URL="${SENTRIX_PARSE_BASE_URL:-http://127.0.0.1:8100}"
-export SENTRIX_PARSE_MODEL="${SENTRIX_PARSE_MODEL:-gemma-4-e2b-it+lora-v2}"
+export SENTRIX_MODEL_SPLIT_V1="${SENTRIX_MODEL_SPLIT_V1:-0}"
+export SENTRIX_PARSE_BACKEND="${SENTRIX_PARSE_BACKEND:-openai}"
+export SENTRIX_PARSE_BASE_URL="${SENTRIX_PARSE_BASE_URL:-$SENTRIX_VLLM_BASE_URL}"
+export SENTRIX_PARSE_MODEL="${SENTRIX_PARSE_MODEL:-$SENTRIX_VLLM_MODEL}"
 
 if [[ "$FACE_EMBEDDING_MODE" == "adaface" ]]; then
   if [[ ! -f "$ADAFACE_MODEL_PATH" ]]; then
