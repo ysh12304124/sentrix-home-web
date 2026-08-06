@@ -69,6 +69,10 @@ class QueryParseDraft:
     facets: list[QueryFacet] = field(default_factory=list)
     ambiguities: list[str] = field(default_factory=list)
     confidence: float = 0.0
+    # R9-6: set when the parser produced NO model output (timeout / failure /
+    # safe fallback).  The Router must then not trust a "none" proposal for
+    # intro verbs — a parser-down family query must not fall into normal chat.
+    parser_failed: bool = False
 
     @property
     def mode(self) -> str:

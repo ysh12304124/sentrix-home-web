@@ -50,6 +50,12 @@ def _message_entity_ids(store, scope_id):
 
 
 def main():
+    # Match the production start script so the blind run uses the same retrieval
+    # stack (Chinese-CLIP visual, CLIP text, multi-retriever kernel).
+    os.environ.setdefault("SENTRIX_IMAGE_EMBEDDER", "chinese_clip")
+    os.environ.setdefault("SENTRIX_TEXT_EMBEDDER", "clip")
+    os.environ.setdefault("SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1", "1")
+    os.environ.setdefault("CLIP_DEVICE", "cpu")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=os.getenv("SENTRIX_DB_PATH", "data/sentrix.db"))
     parser.add_argument("--manifest", default="docs/baseline/hidden_set_manifest.json")

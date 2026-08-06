@@ -109,6 +109,7 @@ class ThinAgentRuntime:
         trace_on = os.getenv("SENTRIX_AGENT_STAGE_TRACE", "0").lower() in {"1", "true", "on"}
         if trace_on:
             _Perf.begin()
+            start_counts = dict(getattr(self.parser, "call_counts", {}) or {}) if self.parser else {}
         try:
             result = self._answer_turn_inner(message, conversation_id, feedback, scope_id,
                                              viewer_id, recent_turns, selected_entity_id)
@@ -118,7 +119,12 @@ class ThinAgentRuntime:
             raise
         if trace_on:
             perf = _Perf.end()
-            counts = dict(getattr(self.parser, "call_counts", {}) or {}) if self.parser else {}
+            if self.parser is not None:
+                current = self.parser.call_counts or {}
+                counts = {key: int(current.get(key, 0) - start_counts.get(key, 0))
+                          for key in set(current) | set(start_counts)}
+            else:
+                counts = {}
             counts["answer"] = perf.get("answer_calls", 0)
             counts["claim"] = perf.get("claim_calls", 0)
             perf["model_calls"] = counts

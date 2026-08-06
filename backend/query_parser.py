@@ -112,6 +112,7 @@ class QueryParser:
 
     def parse(self, message, recent_turns="", now=None):
         raw = self._call_parser(message, recent_turns, now)
+        failed = raw is None
         draft, errors = self._draft_and_validate(raw)
         if errors and raw:
             repaired = self._call_repair(message, raw, errors)
@@ -119,6 +120,8 @@ class QueryParser:
                 draft, errors = self._draft_and_validate(repaired)
         if errors:
             draft = self._safe_fallback()
+            failed = True
+        draft.parser_failed = failed
         return self._apply_deterministic_overlay(draft, message)
 
     def _call_parser(self, message, recent_turns, now):

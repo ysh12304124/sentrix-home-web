@@ -68,6 +68,20 @@ class RouterRouteTests(unittest.TestCase):
         decision = router.route("介绍一下明哥", _draft("none"))
         self.assertEqual(decision.mode, "none")
 
+    def test_parser_failure_intro_verb_routes_to_probe_then_clarify(self):
+        # R9-6: when the parser TIMES OUT (parser_failed), an intro verb must
+        # not decide "none" — the family query is rescued to clarify.
+        router = Router()
+        failed = _draft("none", parser_failed=True)
+        decision = router.route("介绍一下明哥", failed)
+        self.assertNotEqual(decision.mode, "none")
+        self.assertEqual(decision.mode, "ambiguous")
+        final = router.resolve_after_probe(
+            ProbeOutcome("no_household_match", {}, {}, "no hit"),
+            "介绍一下明哥", decision, failed,
+        )
+        self.assertEqual(final.mode, "clarify")
+
     def test_concept_question_is_none(self):
         decision = self.router.route("请解释一下量子纠缠为什么不等于超光速", _draft("none"))
         self.assertEqual(decision.mode, "none")

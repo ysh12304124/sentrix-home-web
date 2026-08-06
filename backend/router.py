@@ -177,7 +177,10 @@ class Router:
         # 6. Clear general question (family context already excluded: no facets /
         #    anchors / focus, and confirmed-entity failed above).  A parser that
         #    proposed evidence is contradictory — route to the probe, not none.
-        if getattr(draft, "proposed_mode", "none") != "evidence" \
+        #    A parser FAILURE (timeout) must not let intro verbs decide none:
+        #    "介绍一下明哥" with the parser down falls to the probe/clarify.
+        if not getattr(draft, "parser_failed", False) \
+                and getattr(draft, "proposed_mode", "none") != "evidence" \
                 and has_general_verb(value) and not has_household_signal(draft) \
                 and not message_anchored(value):
             return RouteDecision("none", "general_concept_question",
@@ -204,8 +207,11 @@ class Router:
             return RouteDecision("clarify", "weak_or_conflicting_probe",
                                  query_parse_calls=decision.query_parse_calls)
         # no_household_match: only a clear general intent may go to chat; an
-        # ambiguous phrase goes to clarify instead of fabricating a reply.
-        if has_general_verb(value) and not has_household_signal(draft) \
+        # ambiguous phrase goes to clarify instead of fabricating a reply.  A
+        # parser failure (timeout) suppresses the general fallback too — the
+        # message stays ambiguous and clarifies rather than risking chat.
+        if not getattr(draft, "parser_failed", False) \
+                and has_general_verb(value) and not has_household_signal(draft) \
                 and not message_anchored(value):
             return RouteDecision("none", "general_concept_after_probe",
                                  query_parse_calls=decision.query_parse_calls)
