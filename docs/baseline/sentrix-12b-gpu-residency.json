@@ -1,0 +1,41 @@
+{
+  "base_url": "http://127.0.0.1:11434",
+  "nvidia_smi_before": {
+    "ok": true,
+    "raw": "NVIDIA GeForce RTX 3090, 595.84, 24576 MiB, 10557 MiB, 13571 MiB, 0 %",
+    "error": null
+  },
+  "ollama_ps_before": {
+    "ok": true,
+    "models": [
+      {
+        "name": "gemma4:12b",
+        "size_vram": 8064094698,
+        "size_total": 8064094698,
+        "expires_at": "2026-08-06T12:50:21.999477012+08:00",
+        "context_length": 4096
+      }
+    ]
+  },
+  "inference": {
+    "ok": true,
+    "actual_model": "gemma4:12b"
+  },
+  "nvidia_smi_after": {
+    "ok": true,
+    "raw": "NVIDIA GeForce RTX 3090, 595.84, 24576 MiB, 11343 MiB, 12785 MiB, 0 %",
+    "error": null
+  },
+  "ollama_ps_after": {
+    "ok": true,
+    "models": [
+      {
+        "name": "gemma4:12b",
+        "size_vram": 8424301526,
+        "size_total": 8424301526,
+        "expires_at": "2026-08-06T12:50:34.354483548+08:00",
+        "context_length": 32768
+      }
+    ]
+  }
+}
