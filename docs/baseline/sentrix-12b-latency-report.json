@@ -1,0 +1,111 @@
+{
+  "api": "http://127.0.0.1:8092",
+  "paths": {
+    "chat": {
+      "message": "今天感觉怎么样",
+      "cold_s": 7.17,
+      "warm_p50_s": 6.97,
+      "warm_p95_s": 7.01,
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 3.52,
+        "router": 0.001,
+        "retrieval": 0.407,
+        "answer": 6.058,
+        "claim": 0.0
+      },
+      "model_calls_p50": 3,
+      "runs_used": 3,
+      "excluded_degraded": 0
+    },
+    "writing": {
+      "message": "帮我写一段生日祝福",
+      "cold_s": 5.81,
+      "warm_p50_s": 5.345,
+      "warm_p95_s": 5.4,
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": null,
+        "router": null,
+        "retrieval": null,
+        "answer": 5.401,
+        "claim": null
+      },
+      "model_calls_p50": 1,
+      "runs_used": 3,
+      "excluded_degraded": 0
+    },
+    "simple_evidence": {
+      "message": "去年十月爬山拍的合影",
+      "cold_s": 7.13,
+      "warm_p50_s": 7.62,
+      "warm_p95_s": 8.11,
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 3.657,
+        "router": 0.0,
+        "retrieval": 0.31,
+        "answer": 6.313,
+        "claim": 0.0
+      },
+      "model_calls_p50": 3,
+      "runs_used": 3,
+      "excluded_degraded": 0
+    },
+    "strict_empty": {
+      "message": "贵阳夜晚步行街",
+      "cold_s": 3.59,
+      "warm_p50_s": 6.695,
+      "warm_p95_s": 6.96,
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 3.582,
+        "router": 0.0,
+        "retrieval": 0.363,
+        "answer": 5.405,
+        "claim": 0.0
+      },
+      "model_calls_p50": 3,
+      "runs_used": 3,
+      "excluded_degraded": 0
+    },
+    "allow_approximate": {
+      "message": "水族馆海豚跃出水面",
+      "cold_s": 7.22,
+      "warm_p50_s": 8.03,
+      "warm_p95_s": 8.82,
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 3.515,
+        "router": 0.0,
+        "retrieval": 0.426,
+        "answer": 6.485,
+        "claim": 0.0
+      },
+      "model_calls_p50": 3,
+      "runs_used": 3,
+      "excluded_degraded": 0
+    },
+    "person_chain": {
+      "message": "介绍一下明哥",
+      "cold_s": 17.78,
+      "warm_p50_s": 16.99,
+      "warm_p95_s": 17.53,
+      "stage_p50_s": {
+        "explicit_detector": 0.0,
+        "parser": 4.024,
+        "router": 0.0,
+        "retrieval": 0.434,
+        "answer": 13.079,
+        "claim": 0.0
+      },
+      "model_calls_p50": 3,
+      "runs_used": 3,
+      "excluded_degraded": 0
+    }
+  },
+  "product_gates": {
+    "simple_evidence_p95_le_12s": true,
+    "api_le_20s": true
+  }
+}
