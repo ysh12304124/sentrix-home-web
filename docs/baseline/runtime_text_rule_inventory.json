@@ -1,0 +1,343 @@
+{
+  "generated_at": "2026-08-06",
+  "summary": {
+    "total": 21,
+    "by_category": {
+      "semantic_routing": 2,
+      "normalization": 14,
+      "protocol": 4,
+      "prompt": 1
+    },
+    "runtime_semantic_routing": 0,
+    "runtime_semantic_extraction": 0,
+    "review_pending": 0
+  },
+  "rules": [
+    {
+      "file": "agent.py",
+      "symbol": "_is_comparison_query",
+      "kind": "method_tokens",
+      "scope": "legacy",
+      "content": "len(focused_people)>=2 and any(token in query for token in (\"比较\",\"区别\",\"不同\",\"共同\",\"对比\"))",
+      "category": "semantic_routing",
+      "decision": "remove_or_retire",
+      "tests": [],
+      "note": "Legacy comparison-intent word-list; thin path does not use it."
+    },
+    {
+      "file": "agent.py",
+      "symbol": "_is_entity_introduction_query",
+      "kind": "method_tokens",
+      "scope": "legacy",
+      "content": "any(token in query for token in (\"介绍\",\"是谁\",\"了解\",\"档案\",\"画像\"))",
+      "category": "semantic_routing",
+      "decision": "remove_or_retire",
+      "tests": [],
+      "note": "Legacy non-Thin dialogue path (SENTRIX_THIN_AGENT_V1 off). Thin path must not adopt; flag for cutover removal."
+    },
+    {
+      "file": "backend/query_parser.py",
+      "symbol": "_DATE_RE",
+      "kind": "regex",
+      "content": "20\\d{2}\\s*(?:年|[-/.])\\s*\\d{1,2}\\s*(?:月|[-/.])?(?:\\s*\\d{1,2}\\s*日?)?",
+      "line": 94,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_query_parser"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/retrieval_indexes.py",
+      "symbol": "_FIELD_TYPES",
+      "kind": "wordlist",
+      "content": [
+        "place",
+        "activity",
+        "object",
+        "clothing",
+        "ocr",
+        "person_bridge",
+        "caption"
+      ],
+      "line": 20,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_retrieval_indexes"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/router.py",
+      "symbol": "_EVIDENCE_ACTIONS",
+      "kind": "wordlist",
+      "content": [
+        "return_assets",
+        "summarize_person",
+        "summarize_event",
+        "timeline",
+        "compare",
+        "propose_correction"
+      ],
+      "line": 56,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_router_decision"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/router.py",
+      "symbol": "_STRONG_TARGETS",
+      "kind": "wordlist",
+      "content": [
+        "person",
+        "event",
+        "relationship"
+      ],
+      "line": 59,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_router_decision"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_WRITING_PREFIX_RE",
+      "kind": "regex",
+      "content": "^\\s*(帮我写|请写|写一段|写一篇|生成一段|翻译|帮我起草|拟一份|写个|写篇)",
+      "line": 19,
+      "scope": "runtime",
+      "category": "protocol",
+      "decision": "keep",
+      "tests": [
+        "test_router_decision",
+        "test_semantic_routing"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_NO_LOOKUP_RE",
+      "kind": "regex",
+      "content": "^\\s*(不用查|别查|别找|不用找|不需要查|不用看|不用搜|不看我的)",
+      "line": 20,
+      "scope": "runtime",
+      "category": "protocol",
+      "decision": "keep",
+      "tests": [
+        "test_router_decision"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_ANCHOR_GEO_RE",
+      "kind": "regex",
+      "content": "(市|区|省|县|镇|湾|湖|山|路|街|城|岛)",
+      "line": 26,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_gate_probe"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_ANCHOR_DATE_RE",
+      "kind": "regex",
+      "content": "(年|月|日|节|跨年|元旦|春节)",
+      "line": 27,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_gate_probe"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_ANCHOR_RELATION_RE",
+      "kind": "regex",
+      "content": "(搂着|抱着|牵着|靠着|合影|一起|全家福)",
+      "line": 28,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_gate_probe"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_ANCHOR_PERSON_TOKENS",
+      "kind": "wordlist",
+      "content": [
+        "自己",
+        "我们",
+        "合照"
+      ],
+      "line": 29,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_gate_probe"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_CONCEPT_VERB_RE",
+      "kind": "regex",
+      "content": "^(请)?(介绍一下|介绍下|解释|解释一下|为什么|什么是|什么叫|假设|假如|编个|编一段|讲讲你怎么看|说明一下|说说|讲讲)",
+      "line": 35,
+      "scope": "runtime",
+      "category": "protocol",
+      "decision": "keep",
+      "tests": [
+        "test_router_decision"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_WRITING_COMPOSE_RE",
+      "kind": "regex",
+      "content": "(写一篇|写一段|写个|写篇|写一首|写一封|写一个|写两句|写作文|写个故事|写一封信|写一段话|起草|拟一份|拟个|生成一段|生成一篇|编个|编一段|编一个)",
+      "line": 40,
+      "scope": "runtime",
+      "category": "protocol",
+      "decision": "keep",
+      "tests": [
+        "test_router_decision"
+      ],
+      "note": ""
+    },
+    {
+      "file": "backend/routing_rules.py",
+      "symbol": "_FOLLOW_UP_TOKENS",
+      "kind": "wordlist",
+      "content": [
+        "然后",
+        "后来",
+        "接着",
+        "继续",
+        "为什么",
+        "具体",
+        "详细",
+        "还有呢",
+        "那呢",
+        "他呢",
+        "她呢",
+        "它呢",
+        "这里呢",
+        "那里呢",
+        "这段呢",
+        "那个呢",
+        "那次",
+        "那段",
+        "这次"
+      ],
+      "line": 47,
+      "scope": "runtime",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_router_decision"
+      ],
+      "note": ""
+    },
+    {
+      "file": "memory_gate.py",
+      "symbol": "household_dimensions",
+      "kind": "schema_whitelist",
+      "scope": "runtime",
+      "content": "{person, place, activity, clothing, object, visual, time, relationship, ocr}",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_gate_probe"
+      ],
+      "note": "Facet dimension schema whitelist, not topic vocabulary."
+    },
+    {
+      "file": "query_contracts.py",
+      "symbol": "_media_type",
+      "kind": "enum_map",
+      "scope": "runtime",
+      "content": "视频/video/录像->video; 音频/audio/录音->audio; 文本/text/文字->text; 照片/图片/原图/image->image",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_query_parser"
+      ],
+      "note": "Media type -> enum normalization."
+    },
+    {
+      "file": "query_contracts.py",
+      "symbol": "semantic_dimensions",
+      "kind": "schema_whitelist",
+      "scope": "runtime",
+      "content": "{place, activity, object, clothing, visual, ocr, person, relationship, time, other, semantic}",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_query_parser"
+      ],
+      "note": "Semantic condition dimension whitelist."
+    },
+    {
+      "file": "query_parser.py",
+      "symbol": "_PARSER_PROMPT",
+      "kind": "prompt",
+      "scope": "runtime",
+      "content": "Rules/examples include open semantic categories (做饭/晚饭/自拍/颜色/材质) and schema",
+      "category": "prompt",
+      "decision": "keep",
+      "tests": [
+        "test_query_parser"
+      ],
+      "note": "Prompt Instruction; examples must never contain benchmark sentences (guard test enforces)."
+    },
+    {
+      "file": "query_parser.py",
+      "symbol": "_apply_deterministic_overlay negation/media tokens",
+      "kind": "inline_tokens",
+      "scope": "runtime",
+      "content": "(\"不要\",\"排除\",\"不是\") + media window (\"视频\",\"照片\")",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_query_parser"
+      ],
+      "note": "Explicit negation structure recovery; window is positional, not topic-based."
+    },
+    {
+      "file": "retrieval/probes.py",
+      "symbol": "_per_space_minimum mapping",
+      "kind": "dict_map",
+      "scope": "runtime",
+      "content": "{\"visual_ann\":\"visual\",\"text_ann\":\"text\",\"lexical\":\"lexical\"}",
+      "category": "normalization",
+      "decision": "keep",
+      "tests": [
+        "test_gate_probe"
+      ],
+      "note": "Retriever name -> probe-space threshold key."
+    }
+  ]
+}

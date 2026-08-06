@@ -1,0 +1,19 @@
+{
+  "embedder": "clip",
+  "paraphrase_queries": {
+    "count": 54,
+    "recall@1": 0.0397,
+    "recall@5": 0.1199,
+    "recall@10": 0.2156
+  },
+  "cross_retrieval": {
+    "count": 43,
+    "recall@1": 0.0911,
+    "recall@5": 0.2068,
+    "recall@10": 0.2924
+  },
+  "decision": "disable_text_ann_or_switch_embedder",
+  "bge_m3_status": "blocked",
+  "bge_m3_blocker": "torch 2.5.1 too old for sentence-transformers>=4.2 + user-level ~/.local transformers 5.11 import precedence; needs venv/deps cleanup or torch upgrade (R8-6 infra)",
+  "text_channel_policy": "keep CLIP Text as low-weight append-only experimental channel (visual_backbone ranking: cannot displace visual top-K); bge-m3 switch pending infra fix"
+}

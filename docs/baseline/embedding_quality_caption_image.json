@@ -1,0 +1,11 @@
+{
+  "embedder": "clip",
+  "visual_crossmodal": {
+    "count": 200,
+    "recall@1": 0.01,
+    "recall@5": 0.03,
+    "recall@10": 0.04,
+    "mrr": 0.0273,
+    "auc": 0.5146
+  }
+}

@@ -34,6 +34,15 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
 
 ## 当前基线
 
+### 2026-08-05 Thin Agent 执行状态
+
+- 执行依据为 `/Users/rm001/Downloads/Sentrix_Thin_Agent与证据检索内核_完整执行计划表.md`；原始规格不覆盖。
+- 本地实现副本为 `psh` 分支的 `/Users/rm001/Sentrix-Thin-Agent-work-20260805`，基线提交为 `fa4e583`，开始实现前工作树干净。
+- 阶段 0 已确认本地 Git 基线和代码边界；153 SSH 短名当前解析到不可达地址，远端 schema、服务健康和真实回放必须在网络恢复后重新核验。
+- 当前任务只改 Agent、证据检索、查询解析、回答约束、测试和相关文档；不修改图片记忆生成语义，不操作 FMA `5173`。
+- 计划中的后续接口替换可能与本任务并行；合并前必须以实际 diff 为准，不能覆盖未提交改动。
+- 计划使用的 Project Memory MCP 在本会话工具列表中不可用，因此本文件作为仓库内交接记录；恢复 MCP 后需补写同一阶段的结构化记忆。
+
 - 153 仓库：`/home/asus/Github/Sentrix-Home-Web`
 - 正式后端提交分支：`psh`
 - 当前提交：`d588c53` (`perf: accelerate core image semantics`，2026-08-03)。

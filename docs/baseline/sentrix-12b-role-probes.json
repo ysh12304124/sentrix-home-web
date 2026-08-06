@@ -1,0 +1,391 @@
+{
+  "model": "gemma4:12b",
+  "endpoint": "http://127.0.0.1:11434",
+  "warm_runs": 3,
+  "roles": {
+    "parser": {
+      "json_mode": true,
+      "success_rate": 1.0,
+      "all_models_match": true,
+      "json_legal_rate": true,
+      "warm_p50_s": 2.23,
+      "runs": [
+        {
+          "run": 0,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 4.81,
+          "json_valid": true,
+          "input_size": 111,
+          "output_size": 312,
+          "response_sha256": "1ebdda4af4d07bf2",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\n  \"mode\": \"search\",\n  \"actions\": [\n    \"search\"\n  ],\n  \"facets\": [\n    {\n      \"field\": \"location\",\n      \"value\": \"厨房"
+        },
+        {
+          "run": 1,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 2.23,
+          "json_valid": true,
+          "input_size": 111,
+          "output_size": 312,
+          "response_sha256": "d0e2106c4e650b19",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\n  \"mode\": \"search\",\n  \"actions\": [\n    \"search\"\n  ],\n  \"facets\": [\n    {\n      \"field\": \"location\",\n      \"value\": \"厨房"
+        },
+        {
+          "run": 2,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 2.23,
+          "json_valid": true,
+          "input_size": 111,
+          "output_size": 312,
+          "response_sha256": "d0e2106c4e650b19",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\n  \"mode\": \"search\",\n  \"actions\": [\n    \"search\"\n  ],\n  \"facets\": [\n    {\n      \"field\": \"location\",\n      \"value\": \"厨房"
+        }
+      ]
+    },
+    "answer": {
+      "json_mode": false,
+      "success_rate": 1.0,
+      "all_models_match": true,
+      "json_legal_rate": true,
+      "warm_p50_s": 0.43,
+      "runs": [
+        {
+          "run": 0,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.45,
+          "json_valid": null,
+          "input_size": 59,
+          "output_size": 24,
+          "response_sha256": "85c98dd8016b5a36",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "我很好，谢谢你的关心。今天有什么我可以帮你的吗？"
+        },
+        {
+          "run": 1,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.43,
+          "json_valid": null,
+          "input_size": 59,
+          "output_size": 24,
+          "response_sha256": "85c98dd8016b5a36",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "我很好，谢谢你的关心。今天有什么我可以帮你的吗？"
+        },
+        {
+          "run": 2,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.43,
+          "json_valid": null,
+          "input_size": 59,
+          "output_size": 24,
+          "response_sha256": "85c98dd8016b5a36",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "我很好，谢谢你的关心。今天有什么我可以帮你的吗？"
+        }
+      ]
+    },
+    "evidence_answer": {
+      "json_mode": false,
+      "success_rate": 1.0,
+      "all_models_match": true,
+      "json_legal_rate": true,
+      "warm_p50_s": 0.65,
+      "runs": [
+        {
+          "run": 0,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.59,
+          "json_valid": null,
+          "input_size": 102,
+          "output_size": 32,
+          "response_sha256": "739757c7d6218263",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "在2024年5月的厨房里，我做了晚饭（确定）。衣物颜色无法确认。"
+        },
+        {
+          "run": 1,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.65,
+          "json_valid": null,
+          "input_size": 102,
+          "output_size": 51,
+          "response_sha256": "52a9e2f4fe73da2e",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "根据记忆中的证据：\n\n*   **确定项**：在厨房做了晚饭。\n*   **无法确认项**：衣物颜色。"
+        },
+        {
+          "run": 2,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.65,
+          "json_valid": null,
+          "input_size": 102,
+          "output_size": 51,
+          "response_sha256": "52a9e2f4fe73da2e",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "根据记忆中的证据：\n\n*   **确定项**：在厨房做了晚饭。\n*   **无法确认项**：衣物颜色。"
+        }
+      ]
+    },
+    "writer": {
+      "json_mode": false,
+      "success_rate": 1.0,
+      "all_models_match": true,
+      "json_legal_rate": true,
+      "warm_p50_s": 1.0,
+      "runs": [
+        {
+          "run": 0,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 1.02,
+          "json_valid": null,
+          "input_size": 85,
+          "output_size": 88,
+          "response_sha256": "869f96f8cc1297c3",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "以下是为您生成的角色介绍：\n\n**【人物档案：明哥】**\n\n在日常生活的片段中，明哥常出现在厨房里忙碌于烹饪。此外，他也有去公园散步的习惯。关于他的性格特征，目前尚无明确定论。"
+        },
+        {
+          "run": 1,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 1.0,
+          "json_valid": null,
+          "input_size": 85,
+          "output_size": 90,
+          "response_sha256": "aa5db1aac6a85085",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "以下是为您生成的角色介绍：\n\n**【人物档案：明哥】**\n\n在日常生活的片段中，明哥常出现在厨房里忙碌于烹饪。此外，他也有去公园散步的习惯。关于他的性格是否外向，目前尚无明确信息。"
+        },
+        {
+          "run": 2,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 1.0,
+          "json_valid": null,
+          "input_size": 85,
+          "output_size": 90,
+          "response_sha256": "aa5db1aac6a85085",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "以下是为您生成的角色介绍：\n\n**【人物档案：明哥】**\n\n在日常生活的片段中，明哥常出现在厨房里忙碌于烹饪。此外，他也有去公园散步的习惯。关于他的性格是否外向，目前尚无明确信息。"
+        }
+      ]
+    },
+    "claim": {
+      "json_mode": true,
+      "success_rate": 1.0,
+      "all_models_match": true,
+      "json_legal_rate": true,
+      "warm_p50_s": 1.17,
+      "runs": [
+        {
+          "run": 0,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 1.21,
+          "json_valid": true,
+          "input_size": 111,
+          "output_size": 180,
+          "response_sha256": "2a20c4ad692155b1",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"claims\": [\n  {\"text\": \"明哥去年在厨房做过晚饭\", \"intended_type\": \"affirmative\"},\n  {\"text\": \"他不确定他是否喜欢做饭\", \"intended_type\": \"unkn"
+        },
+        {
+          "run": 1,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 1.17,
+          "json_valid": true,
+          "input_size": 111,
+          "output_size": 180,
+          "response_sha256": "2a20c4ad692155b1",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"claims\": [\n  {\"text\": \"明哥去年在厨房做过晚饭\", \"intended_type\": \"affirmative\"},\n  {\"text\": \"他不确定他是否喜欢做饭\", \"intended_type\": \"unkn"
+        },
+        {
+          "run": 2,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 1.17,
+          "json_valid": true,
+          "input_size": 111,
+          "output_size": 180,
+          "response_sha256": "2a20c4ad692155b1",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"claims\": [\n  {\"text\": \"明哥去年在厨房做过晚饭\", \"intended_type\": \"affirmative\"},\n  {\"text\": \"他不确定他是否喜欢做饭\", \"intended_type\": \"unkn"
+        }
+      ]
+    },
+    "verifier": {
+      "json_mode": true,
+      "success_rate": 1.0,
+      "all_models_match": true,
+      "json_legal_rate": true,
+      "warm_p50_s": 0.91,
+      "runs": [
+        {
+          "run": 0,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 1.0,
+          "json_valid": true,
+          "input_size": 173,
+          "output_size": 120,
+          "response_sha256": "da0ac0a4a1f4cda4",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"results\": [{\"claim_id\": \"c1\", \"status\": \"supported\", \"reason\": \"证据 e1 明确记录了在 2024 年 5 月有‘厨房做晚饭’的活动，与 claim 中的描述一致。\"}]}"
+        },
+        {
+          "run": 1,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.91,
+          "json_valid": true,
+          "input_size": 173,
+          "output_size": 113,
+          "response_sha256": "e7109eb4557e6b68",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"results\": [{\"claim_id\": \"c1\", \"status\": \"supported\", \"reason\": \"证据 e1 明确记录了在 2024 年 5 月有厨房做晚饭的记录，支持该 claim。\"}]}"
+        },
+        {
+          "run": 2,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.91,
+          "json_valid": true,
+          "input_size": 173,
+          "output_size": 113,
+          "response_sha256": "e7109eb4557e6b68",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"results\": [{\"claim_id\": \"c1\", \"status\": \"supported\", \"reason\": \"证据 e1 明确记录了在 2024 年 5 月有厨房做晚饭的记录，支持该 claim。\"}]}"
+        }
+      ]
+    },
+    "repairer": {
+      "json_mode": true,
+      "success_rate": 1.0,
+      "all_models_match": true,
+      "json_legal_rate": true,
+      "warm_p50_s": 0.85,
+      "runs": [
+        {
+          "run": 0,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.87,
+          "json_valid": true,
+          "input_size": 96,
+          "output_size": 81,
+          "response_sha256": "a0bb7a6e53e268f7",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"revised_text\": \"明哥经常做饭。\", \"reason\": \"将“每天”改为“经常”，以符合证据仅支持其“做过几次”的局部事实，降低断言强度。\"}"
+        },
+        {
+          "run": 1,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.84,
+          "json_valid": true,
+          "input_size": 96,
+          "output_size": 81,
+          "response_sha256": "a0bb7a6e53e268f7",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"revised_text\": \"明哥经常做饭。\", \"reason\": \"将“每天”改为“经常”，以符合证据仅支持其“做过几次”的局部事实，降低断言强度。\"}"
+        },
+        {
+          "run": 2,
+          "status": 200,
+          "actual_model": "gemma4:12b",
+          "latency_s": 0.85,
+          "json_valid": true,
+          "input_size": 96,
+          "output_size": 81,
+          "response_sha256": "a0bb7a6e53e268f7",
+          "fallback_used": false,
+          "cache_hit": false,
+          "circuit_breaker_state": "closed",
+          "error": null,
+          "sample": "{\"revised_text\": \"明哥经常做饭。\", \"reason\": \"将“每天”改为“经常”，以符合证据仅支持其“做过几次”的局部事实，降低断言强度。\"}"
+        }
+      ]
+    }
+  },
+  "overall": {
+    "all_roles_success": true,
+    "all_roles_model_match": true,
+    "all_json_roles_legal": true,
+    "fallback_used_anywhere": false
+  }
+}

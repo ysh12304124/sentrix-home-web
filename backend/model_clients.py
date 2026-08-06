@@ -38,7 +38,18 @@ def align_face_crop(image, bbox, landmarks=None):
 try:
     import httpx
 except ImportError:  # Keep pure parsing and SQLite tests runnable without optional runtime deps.
-    httpx = None
+    class _HttpxUnavailable:
+        class HTTPError(Exception):
+            pass
+
+        @staticmethod
+        def post(*args, **kwargs):
+            raise _HttpxUnavailable.HTTPError("httpx is not installed")
+
+    # Keep a patchable module-shaped object.  The production dependency is
+    # still declared in requirements; this fallback preserves model-client
+    # contract tests and produces a normal ModelError at runtime.
+    httpx = _HttpxUnavailable()
 
 from .semantic_taxonomy import (
     ATMOSPHERE_PRIMARY_TYPES,
@@ -177,24 +188,93 @@ def contains_latin_text(value):
     return letters > 8 and letters > chinese
 
 
+# R9-3: per-role inference parameters for the same 12B model.  Each role gets a
+# distinct temperature / think / generation bound so behaviour stays testable and
+# isolated.  ``writer`` / ``claim`` / ``repair`` are aliases used by the complex
+# answer and repair paths.
+ROLE_INFERENCE = {
+    "parser": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
+    "answer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
+    "writer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
+    "verify": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
+    "claim": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
+    "repair": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
+}
+
+
 class GammaClient:
-    def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None):
+    def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
+                 parse_model=None, answer_model=None, verify_model=None,
+                 parse_backend=None, parse_base_url=None, claim_model=None,
+                 repair_model=None):
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+        # Phase R R5 + R9-3: per-role model separation.  Explicit per-role env
+        # wins; otherwise SENTRIX_AGENT_MODEL_PROFILE decides the default —
+        # quality_12b (all roles on the 12B main endpoint) or experimental_2b
+        # (2B parser via the e2b backend, answer/verify stay 12B).  Without
+        # either, every role uses the main model (backward compatible).
+        model_split = os.getenv("SENTRIX_MODEL_SPLIT_V1", "0").strip().lower() in {"1", "true", "yes", "on"}
+        profile = os.getenv("SENTRIX_AGENT_MODEL_PROFILE", "quality_12b").strip().lower()
+        explicit_any = any((parse_model, answer_model, verify_model, parse_backend,
+                            os.getenv("SENTRIX_PARSE_MODEL"), os.getenv("SENTRIX_PARSE_BACKEND")))
+        if model_split or explicit_any:
+            self.parse_model = parse_model or os.getenv("SENTRIX_PARSE_MODEL", self.model)
+            self.answer_model = answer_model or os.getenv("SENTRIX_ANSWER_MODEL", self.model)
+            self.verify_model = verify_model or os.getenv("SENTRIX_VERIFY_MODEL", self.model)
+            self.parse_backend = parse_backend or os.getenv("SENTRIX_PARSE_BACKEND", "ollama_local")
+            self.parse_base_url = (parse_base_url or os.getenv("SENTRIX_PARSE_BASE_URL", "")).rstrip("/")
+        elif profile == "experimental_2b":
+            self.parse_model = os.getenv("SENTRIX_PARSE_MODEL", "gemma-4-e2b-it+lora-v2")
+            self.answer_model = os.getenv("SENTRIX_ANSWER_MODEL", self.model)
+            self.verify_model = os.getenv("SENTRIX_VERIFY_MODEL", self.model)
+            self.parse_backend = os.getenv("SENTRIX_PARSE_BACKEND", "e2b")
+            self.parse_base_url = os.getenv("SENTRIX_PARSE_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
+        else:  # quality_12b (default)
+            self.parse_model = self.answer_model = self.verify_model = self.model
+            self.parse_backend = "ollama_local"
+            self.parse_base_url = ""
+        self.claim_model = claim_model or os.getenv("SENTRIX_CLAIM_MODEL", self.verify_model)
+        self.repair_model = repair_model or os.getenv("SENTRIX_REPAIR_MODEL", self.parse_model)
         self.timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
         configured_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
         # Ollama expects numeric -1 for indefinite residency; the string "-1"
         # is rejected by its request schema.
         self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
 
-    def chat(self, prompt, images=None, vision_options=None, json_mode=True):
+    def _endpoint_for(self, role):
+        """Resolve (base_url, model) for a model role.
+
+        The parser role can be split to a separate backend (153 e2b 2B, D6).
+        When ``parse_backend=e2b`` but no e2b base_url is configured, we fall
+        back to the main endpoint rather than hard-failing — the 153 wiring
+        sets SENTRIX_PARSE_BASE_URL.
+        """
+        if role == "parser" and self.parse_backend in {"e2b", "e2b_lora"}:
+            if self.parse_base_url:
+                return self.parse_base_url, self.parse_model
+            return self.base_url, self.parse_model
+        if role == "parser":
+            return self.base_url, self.parse_model
+        if role == "answer":
+            return self.base_url, self.answer_model
+        if role == "verify":
+            return self.base_url, self.verify_model
+        if role == "claim":
+            return self.base_url, self.claim_model
+        if role == "repair":
+            return self.base_url, self.repair_model
+        return self.base_url, self.model
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
         if httpx is None:
             raise ModelError("httpx is not installed")
         message = {"role": "user", "content": prompt}
         if images:
             message["images"] = [image["base64"] for image in images]
+        endpoint_base, model = self._endpoint_for(role)
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": [message],
             "stream": False,
             "keep_alive": self.keep_alive,
@@ -202,6 +282,16 @@ class GammaClient:
         }
         if json_mode:
             payload["format"] = "json"
+        # R9-3: apply per-role inference parameters (temperature / context /
+        # generation bound / think).  role=None keeps the legacy bare options.
+        params = ROLE_INFERENCE.get(role)
+        if params is not None:
+            payload["options"].update({
+                "temperature": params["temperature"],
+                "num_ctx": params["num_ctx"],
+                "num_predict": params["num_predict"],
+            })
+            payload["think"] = bool(params.get("think", False))
         if vision_options:
             payload["think"] = vision_options.get("think", False)
             payload["options"].update({
@@ -209,12 +299,36 @@ class GammaClient:
                 "num_predict": vision_options["num_predict"],
             })
         try:
-            response = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
+            response = httpx.post(f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
-            return data.get("message", {}).get("content", "")
+            text = data.get("message", {}).get("content", "")
+            self._record_validation_call(role, endpoint_base, model, json_mode, text)
+            return text
         except (httpx.HTTPError, ValueError) as error:
             raise ModelError(f"gamma request failed: {error}") from error
+
+    def _record_validation_call(self, role, endpoint_base, model, json_mode, text):
+        """Write the actual model into the ModelCallLedger (12B-FC V2).
+
+        Handles both ModelRouter-mediated calls (a record already exists) and
+        direct gamma.chat calls (writer/claim/verify) by creating the record.
+        """
+        from .validation import full_chain_profile as _prof
+        from .validation import model_call_ledger as _ledger
+        if not (_prof.validation_active() and _prof.require_model_trace()):
+            return
+        expected = {
+            "parser": self.parse_model, "answer": self.answer_model,
+            "verify": self.verify_model, "claim": self.claim_model,
+            "repair": self.repair_model,
+        }.get(role, self.model)
+        record = _ledger.active_record()
+        if record is None:
+            record = _ledger.new_call(role or "unknown", expected, endpoint_base)
+            record["input_size"] = 0
+        _ledger.record_response(text, actual_model=model, endpoint=endpoint_base,
+                                json_mode=json_mode)
 
     def _core_vision_options(self):
         return {

@@ -1,0 +1,210 @@
+{
+  "summary": {
+    "api": "http://127.0.0.1:8091",
+    "cases": 10,
+    "passed": 10,
+    "failed": 0
+  },
+  "cases": [
+    {
+      "name": "person_intro",
+      "message": "介绍一下明哥",
+      "evidence_status": "clarify",
+      "evidence_count": 0,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 0
+      },
+      "answer": "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？",
+      "checks": [
+        {
+          "pass": true,
+          "message": "not dropped to normal chat",
+          "detail": "status=clarify"
+        }
+      ]
+    },
+    {
+      "name": "writing",
+      "message": "帮我写一段生日祝福",
+      "evidence_status": "not_applicable",
+      "evidence_count": 0,
+      "model_calls": {
+        "parser": 0,
+        "repair": 0,
+        "answer": 1,
+        "claim": 0
+      },
+      "answer": "我在听。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "writing has no memory",
+          "detail": "status=not_applicable"
+        }
+      ]
+    },
+    {
+      "name": "short_visual_phrase",
+      "message": "银色心形手镯",
+      "evidence_status": "anchored",
+      "evidence_count": 3,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 1
+      },
+      "answer": "目前无法确认其中的关键活动或视觉细节。；目前无法确认这部分是否成立。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "ambiguous phrase -> clarify/refusal, no product talk",
+          "detail": "status=anchored ans=目前无法确认其中的关键活动或视觉细节。；目前无法确认这部分是否成立。"
+        }
+      ]
+    },
+    {
+      "name": "photo_reads",
+      "message": "照片里写着什么？",
+      "evidence_status": "anchored",
+      "evidence_count": 10,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 1
+      },
+      "answer": "目前无法确认其中的关键活动或视觉细节。；目前无法确认这部分是否成立。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "photo-reads query uses memory",
+          "detail": "status=anchored"
+        }
+      ]
+    },
+    {
+      "name": "simple_evidence",
+      "message": "2024年5月厨房里做晚饭",
+      "evidence_status": "anchored",
+      "evidence_count": 1,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 1
+      },
+      "answer": "找到 1 条完全符合确定条件的照片记录。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "simple evidence skips writer",
+          "detail": "calls={'parser': 1, 'repair': 0, 'answer': 0, 'claim': 1}"
+        }
+      ]
+    },
+    {
+      "name": "general_verb_household",
+      "message": "为什么去年春节没有小黑的照片",
+      "evidence_status": "gap",
+      "evidence_count": 0,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 1
+      },
+      "answer": "当前记忆中没有找到足够匹配的原始证据。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "why+date+person stays household",
+          "detail": "status=gap"
+        }
+      ]
+    },
+    {
+      "name": "allow_approximate",
+      "message": "水族馆海豚跃出水面",
+      "evidence_status": "anchored",
+      "evidence_count": 10,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 1
+      },
+      "answer": "目前无法确认其中的关键活动或视觉细节。；目前无法确认这部分是否成立。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "approximate disclosed or refused",
+          "detail": "status=anchored ans=目前无法确认其中的关键活动或视觉细节。；目前无法确认这部分是否成立。"
+        }
+      ]
+    },
+    {
+      "name": "strict_empty",
+      "message": "贵阳夜晚步行街",
+      "evidence_status": "gap",
+      "evidence_count": 0,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 1
+      },
+      "answer": "当前记忆中没有找到足够匹配的原始证据。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "strict_empty refusal",
+          "detail": "status=gap ans=当前记忆中没有找到足够匹配的原始证据。"
+        }
+      ]
+    },
+    {
+      "name": "session_followup",
+      "message": "上次说的那件黄色的",
+      "evidence_status": "anchored",
+      "evidence_count": 10,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 1
+      },
+      "answer": "目前无法确认其中的关键活动或视觉细节。；目前无法确认这部分是否成立。",
+      "checks": [
+        {
+          "pass": true,
+          "message": "session follow-up is not chat",
+          "detail": "status=anchored"
+        }
+      ]
+    },
+    {
+      "name": "concept_question",
+      "message": "解释一下量子纠缠",
+      "evidence_status": "clarify",
+      "evidence_count": 0,
+      "model_calls": {
+        "parser": 1,
+        "repair": 0,
+        "answer": 0,
+        "claim": 0
+      },
+      "answer": "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？",
+      "checks": [
+        {
+          "pass": true,
+          "message": "concept question is chat or clarify, no evidence",
+          "detail": "status=clarify"
+        }
+      ]
+    }
+  ]
+}
