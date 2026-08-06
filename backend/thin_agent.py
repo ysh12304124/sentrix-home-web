@@ -14,6 +14,7 @@ from .answer_composer import compose_answer
 from .claim_extractor import ClaimExtractor
 from .complex_answer import ComplexAnswerBuilder
 from .evidence_retrieval import EvidenceRetrievalKernel
+from .model_routing import RequestDeadline
 from .query_contracts import HARD, Constraint, QueryAction, build_query_spec
 from .query_parser import QueryParser
 from .router import ExplicitOperationDetector, Router
@@ -106,6 +107,14 @@ class ThinAgentRuntime:
         self.complex_builder = ComplexAnswerBuilder(gamma=gamma)
 
     def answer_turn(self, message, conversation_id=None, feedback=None, scope_id=None, viewer_id=None, recent_turns="", selected_entity_id=None):
+        # 12B-FC fix: RequestDeadline is per-REQUEST, not per-process.  The
+        # shared ModelRouter's deadline is reset at the start of every turn so
+        # model calls after the first ~20s of process life still have budget
+        # (otherwise every call short-circuits to fallback and the model never
+        # participates).  Concurrent resets are safe: they can only extend a
+        # request's budget, never shrink it.
+        if self.router is not None:
+            self.router.deadline = RequestDeadline()
         trace_on = os.getenv("SENTRIX_AGENT_STAGE_TRACE", "0").lower() in {"1", "true", "on"}
         if trace_on:
             _Perf.begin()

@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.db import MemoryStore
+from backend.model_routing import RequestDeadline
 from backend.thin_agent import ThinAgentRuntime, _Perf
 
 
@@ -71,6 +72,18 @@ class AgentPerfAttachmentTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             result = self.runtime.answer_turn("帮我写一段生日祝福", scope_id="home")
         self.assertNotIn("perf", result)
+
+    def test_deadline_reset_per_request_so_model_is_called(self):
+        # A stale (exhausted) process-scoped deadline must be replaced at the
+        # start of each turn, otherwise the parser short-circuits to fallback
+        # and the 12B model never participates (12B-FC blocker).
+        stale = RequestDeadline(deadline_seconds=0.001)
+        time.sleep(0.01)
+        self.runtime.router.deadline = stale
+        calls_before = len(self.gamma.calls)
+        self.runtime.answer_turn("介绍一下明哥", scope_id="home")
+        # The parser role must have been called through the model, not skipped.
+        self.assertGreater(len(self.gamma.calls), calls_before)
 
 
 if __name__ == "__main__":
