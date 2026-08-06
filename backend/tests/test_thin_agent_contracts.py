@@ -59,6 +59,23 @@ class ThinAgentContractTests(unittest.TestCase):
         self.assertEqual(spec.scope_mode, "all_authorized")
         self.assertEqual(spec.scope_ids, [])
 
+    def test_summarize_person_derives_person_answer_target(self):
+        # 12B-FC regression: a summarize_person(action,target=person) intent
+        # must derive answer_target=person, otherwise the person summary chain
+        # never runs (it stayed "general").
+        parsed = sanitize_query_parse(
+            {"mode": "evidence",
+             "actions": [{"type": "summarize_person", "target": "person", "coverage": "best"}],
+             "entity_names": ["明哥"]},
+            message="介绍一下明哥",
+        )
+        self.assertEqual(parsed.answer_target, "person")
+        spec = build_query_spec(parsed, scope_id="album2_e2b", viewer_id="owner",
+                                conversation_id="c",
+                                entity_resolver=lambda name: "ent-mg" if name == "明哥" else None)
+        self.assertEqual(spec.answer_target, "person")
+        self.assertEqual(spec.entity_ids, ["ent-mg"])
+
     def test_gate_fast_path_writing_prompt_returns_none_without_parser(self):
         decision = MemoryGate().fast_path("帮我写一段生日祝福")
         self.assertIsNotNone(decision)

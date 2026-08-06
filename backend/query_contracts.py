@@ -191,8 +191,12 @@ def sanitize_query_parse(raw: Any, message: str = "") -> QueryParseDraft:
             "propose_correction": "correction",
         }.get(primary_type, primary_type)
     if not answer_target:
+        # Derive the answer target from ANY action that carries a concrete
+        # target (summarize_person -> person, return_assets -> general, ...).
+        # Previously only answer_question was consulted, so a summarize_person
+        # intent kept answer_target="general" and the person summary never ran.
         for action in actions:
-            if action.type == "answer_question":
+            if action.target and action.target != "general":
                 answer_target = action.target
                 break
     try:
