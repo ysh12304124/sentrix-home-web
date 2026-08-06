@@ -599,8 +599,14 @@ class ThinAgentRuntime:
 
     @staticmethod
     def _validation_active_evidence():
+        # The 12B Evidence Answer is the production default (SENTRIX_EVIDENCE_
+        # ANSWER_12B=1) and also active under the validation profile.  It turns
+        # the deterministic evidence template into a natural 12B-generated
+        # answer that distinguishes matched / possible / unknown.
         from .validation import full_chain_profile as _prof
-        return _prof.validation_active()
+        if _prof.validation_active():
+            return True
+        return os.getenv("SENTRIX_EVIDENCE_ANSWER_12B", "0").strip().lower() in {"1", "true", "on"}
 
     def _validation_evidence_answer(self, message, packet):
         """12B Evidence Answer (Phase 12B-FC V4).
