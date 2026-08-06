@@ -1,0 +1,3140 @@
+{
+  "summary": {
+    "total": 45,
+    "recall_at_1": 0.4594,
+    "recall_at_5": 0.563,
+    "recall_at_10": 0.6448,
+    "recall_at_20": 0.6943,
+    "mrr": 0.5033,
+    "precision_at_5": 0.12,
+    "all_relevant_count": 25,
+    "empty_gt_fp_count": 0,
+    "strict_empty_fp_count": 0,
+    "hard_violation_count": 0,
+    "avg_latency_s": 0.6398
+  },
+  "dataset": "development",
+  "channels": "full_hybrid",
+  "ranking": "late_fusion",
+  "cases": [
+    {
+      "key": "dev_a00",
+      "query": "搅拌的照片",
+      "gt_count": 1,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.3333,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_78204b19e4e3",
+        "asset_fa1119a247e7",
+        "asset_f40c92e1fdbf",
+        "asset_1e19a1d549d4",
+        "asset_32e246662d1c",
+        "asset_95eefdd66c56",
+        "asset_5cd5f4558e73",
+        "asset_d10210e9c194",
+        "asset_53308fb67ea8",
+        "asset_63fc55938f89",
+        "asset_29ddcc449225",
+        "asset_d0123a03ab20"
+      ],
+      "latency_s": 4.2158,
+      "empty_policy": "strict_empty",
+      "category": "activity",
+      "gt_channel_ranks": {
+        "asset_f40c92e1fdbf": {
+          "final_rank": 3,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 3,
+            "visual_ann": 3,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_a01",
+      "query": "春日的照片",
+      "gt_count": 1,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_0871198e179f",
+        "asset_368e1000670b",
+        "asset_8455772e595c",
+        "asset_9bcad70dda3c",
+        "asset_29ddcc449225",
+        "asset_ff9391237222",
+        "asset_227e62579bc5",
+        "asset_95eefdd66c56",
+        "asset_8b43a4b39524",
+        "asset_d05267995367",
+        "asset_1fb791766f77",
+        "asset_45ac6e8af9ce",
+        "asset_2320e45b7320",
+        "asset_d10210e9c194",
+        "asset_32e246662d1c",
+        "asset_53308fb67ea8"
+      ],
+      "latency_s": 0.6502,
+      "empty_policy": "strict_empty",
+      "category": "activity",
+      "gt_channel_ranks": {
+        "asset_0871198e179f": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 1,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_a02",
+      "query": "正在的照片",
+      "gt_count": 1,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 1.0
+      },
+      "mrr": 0.0909,
+      "precision_at_5": 0.0,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_8455772e595c",
+        "asset_29ddcc449225",
+        "asset_0871198e179f",
+        "asset_ff9391237222",
+        "asset_d5e4ab0f4eef",
+        "asset_53308fb67ea8",
+        "asset_1fb791766f77",
+        "asset_95eefdd66c56",
+        "asset_9bcad70dda3c",
+        "asset_fdac94414110",
+        "asset_fa1119a247e7",
+        "asset_d0123a03ab20"
+      ],
+      "latency_s": 0.4648,
+      "empty_policy": "strict_empty",
+      "category": "activity",
+      "gt_channel_ranks": {
+        "asset_fa1119a247e7": {
+          "final_rank": 11,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_a03",
+      "query": "烹饪的照片",
+      "gt_count": 1,
+      "returned_count": 14,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_63fc55938f89",
+        "asset_d0123a03ab20",
+        "asset_fa1119a247e7",
+        "asset_f40c92e1fdbf",
+        "asset_c47ac4e666da",
+        "asset_9bcad70dda3c",
+        "asset_78204b19e4e3",
+        "asset_d05267995367",
+        "asset_431171af141b",
+        "asset_5cd5f4558e73",
+        "asset_48a7426edc06",
+        "asset_29ddcc449225",
+        "asset_8455772e595c",
+        "asset_4e70ed4b2e5d"
+      ],
+      "latency_s": 0.4893,
+      "empty_policy": "strict_empty",
+      "category": "activity",
+      "gt_channel_ranks": {
+        "asset_63fc55938f89": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 1,
+            "text_ann": 5
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_a04",
+      "query": "室内的照片",
+      "gt_count": 2,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 2,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.5,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.2,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_35ee5f073328",
+        "asset_369740223507",
+        "asset_8455772e595c",
+        "asset_29ddcc449225",
+        "asset_df6d770b3097",
+        "asset_368e1000670b",
+        "asset_14ee6f6b0012",
+        "asset_8b43a4b39524",
+        "asset_fee31ca1ea99",
+        "asset_b983cee1a399",
+        "asset_431171af141b",
+        "asset_37eab94ee3c1",
+        "asset_3404e945a46d",
+        "asset_c47ac4e666da",
+        "asset_45ac6e8af9ce",
+        "asset_ff9391237222"
+      ],
+      "latency_s": 0.66,
+      "empty_policy": "strict_empty",
+      "category": "activity",
+      "gt_channel_ranks": {
+        "asset_14ee6f6b0012": {
+          "final_rank": 7,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 3,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_df6d770b3097": {
+          "final_rank": 5,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_a05",
+      "query": "佩戴的照片",
+      "gt_count": 1,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_b983cee1a399",
+        "asset_3404e945a46d",
+        "asset_35ee5f073328",
+        "asset_37eab94ee3c1",
+        "asset_53308fb67ea8",
+        "asset_1698bbedd9a0",
+        "asset_afdeda2c041c",
+        "asset_ff9391237222",
+        "asset_de6d76e799bf",
+        "asset_f40c92e1fdbf",
+        "asset_4e70ed4b2e5d",
+        "asset_d0123a03ab20",
+        "asset_63fc55938f89",
+        "asset_45ac6e8af9ce",
+        "asset_8455772e595c",
+        "asset_1e19a1d549d4"
+      ],
+      "latency_s": 0.5898,
+      "empty_policy": "strict_empty",
+      "category": "activity",
+      "gt_channel_ranks": {
+        "asset_b983cee1a399": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 1,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_p06",
+      "query": "在厨房台面的照片",
+      "gt_count": 3,
+      "returned_count": 20,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.3333333333333333,
+        "20": 0.3333333333333333
+      },
+      "mrr": 0.1111,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_9f92c68c963c",
+        "asset_75048683f645",
+        "asset_81faec0aa56e",
+        "asset_403404ae6d32",
+        "asset_e4f85536d639",
+        "asset_8e2c1b32b639",
+        "asset_205f3101cebb",
+        "asset_e36bacc1e31f",
+        "asset_dcd4bb960cfa",
+        "asset_479c56e50e76",
+        "asset_755e3f1cc18a",
+        "asset_e2229e61d425",
+        "asset_f6fd1e296f37",
+        "asset_772e532ce372",
+        "asset_242302c737cf",
+        "asset_4ac4f612fe5e",
+        "asset_32b0035e288b",
+        "asset_0b95264f6e5f",
+        "asset_2b8e1dd1a896",
+        "asset_00963470eaa1"
+      ],
+      "latency_s": 0.7807,
+      "empty_policy": "strict_empty",
+      "category": "place",
+      "gt_channel_ranks": {
+        "asset_dcd4bb960cfa": {
+          "final_rank": 9,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 5,
+            "visual_ann": 3,
+            "text_ann": null
+          }
+        },
+        "asset_f40c92e1fdbf": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_fa1119a247e7": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_p07",
+      "query": "在户外树林的照片",
+      "gt_count": 1,
+      "returned_count": 19,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_0871198e179f",
+        "asset_aa0718db0b37",
+        "asset_8455772e595c",
+        "asset_29ddcc449225",
+        "asset_d5e4ab0f4eef",
+        "asset_95eefdd66c56",
+        "asset_1fb791766f77",
+        "asset_45ac6e8af9ce",
+        "asset_6497455a7ac9",
+        "asset_35ee5f073328",
+        "asset_431171af141b",
+        "asset_a50ebac0ea31",
+        "asset_d05267995367",
+        "asset_32e246662d1c",
+        "asset_63fc55938f89",
+        "asset_677e4a1301ce",
+        "asset_a6ecab493722",
+        "asset_53308fb67ea8",
+        "asset_9bcad70dda3c"
+      ],
+      "latency_s": 0.696,
+      "empty_policy": "strict_empty",
+      "category": "place",
+      "gt_channel_ranks": {
+        "asset_0871198e179f": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 2,
+            "visual_ann": 1,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_p08",
+      "query": "在餐饮空间的照片",
+      "gt_count": 8,
+      "returned_count": 19,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 1,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.125,
+        "10": 0.125,
+        "20": 0.25
+      },
+      "mrr": 0.5,
+      "precision_at_5": 0.2,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_75048683f645",
+        "asset_a4db5be65f11",
+        "asset_b71f6d205533",
+        "asset_4ac4f612fe5e",
+        "asset_00963470eaa1",
+        "asset_540eccf9da76",
+        "asset_dcd4bb960cfa",
+        "asset_242302c737cf",
+        "asset_9f92c68c963c",
+        "asset_403404ae6d32",
+        "asset_b7f8339419aa",
+        "asset_81faec0aa56e",
+        "asset_0b95264f6e5f",
+        "asset_479c56e50e76",
+        "asset_58b2cc9717a1",
+        "asset_21cfcd1ca2a2",
+        "asset_9d0cb3d7dcd2",
+        "asset_cec2d6f656b0",
+        "asset_3adfafc4a8e0"
+      ],
+      "latency_s": 0.7057,
+      "empty_policy": "strict_empty",
+      "category": "place",
+      "gt_channel_ranks": {
+        "asset_3adfafc4a8e0": {
+          "final_rank": 19,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 3,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_4e70ed4b2e5d": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_5cd5f4558e73": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_63fc55938f89": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_78204b19e4e3": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_7d7bc0063285": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_a4db5be65f11": {
+          "final_rank": 2,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 2,
+            "visual_ann": 7,
+            "text_ann": null
+          }
+        },
+        "asset_e77f1da54265": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_p09",
+      "query": "在室内空间的照片",
+      "gt_count": 12,
+      "returned_count": 19,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 2,
+        "20": 2
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.08333333333333333,
+        "10": 0.16666666666666666,
+        "20": 0.16666666666666666
+      },
+      "mrr": 0.25,
+      "precision_at_5": 0.2,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_81faec0aa56e",
+        "asset_9f92c68c963c",
+        "asset_8e2c1b32b639",
+        "asset_00963470eaa1",
+        "asset_4ac4f612fe5e",
+        "asset_75048683f645",
+        "asset_32b0035e288b",
+        "asset_0b95264f6e5f",
+        "asset_242302c737cf",
+        "asset_c904ed998301",
+        "asset_13a564ed5f7b",
+        "asset_205f3101cebb",
+        "asset_2b8e1dd1a896",
+        "asset_807c490af842",
+        "asset_413a50f97c5b",
+        "asset_4800d7986be7",
+        "asset_e4f85536d639",
+        "asset_b45525577a2d",
+        "asset_363fb2a021c3"
+      ],
+      "latency_s": 0.7612,
+      "empty_policy": "strict_empty",
+      "category": "place",
+      "gt_channel_ranks": {
+        "asset_00963470eaa1": {
+          "final_rank": 4,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 2,
+            "visual_ann": 2,
+            "text_ann": null
+          }
+        },
+        "asset_133f82661920": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_357a22e6f33e": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_368e1000670b": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_3d8e2b22f9a5": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_4e71714f6a53": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_75048683f645": {
+          "final_rank": 6,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 3,
+            "visual_ann": 17,
+            "text_ann": null
+          }
+        },
+        "asset_75519cc4dede": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_83dd8ba08c43": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_9a6b5f394085": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_c47ac4e666da": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_df6d770b3097": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_p10",
+      "query": "在室内环境的照片",
+      "gt_count": 27,
+      "returned_count": 20,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 2,
+        "20": 8
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.07407407407407407,
+        "20": 0.2962962962962963
+      },
+      "mrr": 0.1111,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_51dacb37c9ee",
+        "asset_83dd8ba08c43",
+        "asset_9dbeef16897e",
+        "asset_133f82661920",
+        "asset_f0142740a95d",
+        "asset_6ac2152d095a",
+        "asset_50baf906963e",
+        "asset_ecb726b59f87",
+        "asset_10ab2f9fffa5",
+        "asset_108131712e3b",
+        "asset_db038bfce9a2",
+        "asset_9bd6488150d1",
+        "asset_e6bd038704bf",
+        "asset_c6ed3c7d6c14",
+        "asset_a7623f3817e6",
+        "asset_dc46bfea43af",
+        "asset_44a083bfa547",
+        "asset_4f9bc4757608",
+        "asset_4e71714f6a53",
+        "asset_f9cad525b49c"
+      ],
+      "latency_s": 0.7267,
+      "empty_policy": "strict_empty",
+      "category": "place",
+      "gt_channel_ranks": {
+        "asset_108131712e3b": {
+          "final_rank": 10,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 2,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_10ab2f9fffa5": {
+          "final_rank": 9,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_1ac48ff42634": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_1d077c5aa758": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_203b5b507c95": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_21cfcd1ca2a2": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_30dfa9f20d3f": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_3404e945a46d": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_44a083bfa547": {
+          "final_rank": 17,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 10,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_4e531d40f7a4": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_520b43d8062d": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_60e98426b908": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_66720cd4c0cc": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 11,
+            "visual_ann": null,
+            "text_ann": 15
+          }
+        },
+        "asset_6fcdcc9d6548": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_76b5db160523": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_9bd6488150d1": {
+          "final_rank": 12,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 4,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_9c6f3057da6b": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_a7623f3817e6": {
+          "final_rank": 15,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 8,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_b983cee1a399": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_c6ed3c7d6c14": {
+          "final_rank": 14,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 7,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_db038bfce9a2": {
+          "final_rank": 11,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 3,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_dc46bfea43af": {
+          "final_rank": 16,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 9,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_f485a192f03d": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_f58f42e8b23d": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_f6fd1e296f37": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_f8fc72554946": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_fee31ca1ea99": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_p11",
+      "query": "在室内的照片",
+      "gt_count": 5,
+      "returned_count": 20,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.2,
+        "20": 0.2
+      },
+      "mrr": 0.1111,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_9f92c68c963c",
+        "asset_81faec0aa56e",
+        "asset_0b95264f6e5f",
+        "asset_242302c737cf",
+        "asset_75048683f645",
+        "asset_f485a192f03d",
+        "asset_00963470eaa1",
+        "asset_4ac4f612fe5e",
+        "asset_5bff077897c4",
+        "asset_403404ae6d32",
+        "asset_520b43d8062d",
+        "asset_3908a5c66448",
+        "asset_0dcde962f59f",
+        "asset_76b5db160523",
+        "asset_58b2cc9717a1",
+        "asset_479c56e50e76",
+        "asset_dcd4bb960cfa",
+        "asset_84eb89a37401",
+        "asset_746c1cb74256",
+        "asset_42df00051c4b"
+      ],
+      "latency_s": 0.7873,
+      "empty_policy": "strict_empty",
+      "category": "place",
+      "gt_channel_ranks": {
+        "asset_011f95533150": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 13,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_35ee5f073328": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_4800d7986be7": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_5bff077897c4": {
+          "final_rank": 9,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 4,
+            "visual_ann": 8,
+            "text_ann": null
+          }
+        },
+        "asset_ff34f10b39c3": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_m12",
+      "query": "一只手的照片",
+      "gt_count": 4,
+      "returned_count": 20,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.25,
+        "5": 0.25,
+        "10": 0.25,
+        "20": 0.25
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_32b0035e288b",
+        "asset_f485a192f03d",
+        "asset_4800d7986be7",
+        "asset_00963470eaa1",
+        "asset_42df00051c4b",
+        "asset_4ac4f612fe5e",
+        "asset_e36bacc1e31f",
+        "asset_13a564ed5f7b",
+        "asset_dcd4bb960cfa",
+        "asset_8e2c1b32b639",
+        "asset_e4f85536d639",
+        "asset_413a50f97c5b",
+        "asset_81faec0aa56e",
+        "asset_03f593789518",
+        "asset_479c56e50e76",
+        "asset_22f590223c39",
+        "asset_8e70796f5edd",
+        "asset_205f3101cebb",
+        "asset_b45525577a2d",
+        "asset_9d0cb3d7dcd2"
+      ],
+      "latency_s": 0.7907,
+      "empty_policy": "strict_empty",
+      "category": "person",
+      "gt_channel_ranks": {
+        "asset_32b0035e288b": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 2,
+            "visual_ann": 4,
+            "text_ann": null
+          }
+        },
+        "asset_7ed0e3f34a4c": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_e0f63cc382f4": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_fa1119a247e7": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_m13",
+      "query": "人手的照片",
+      "gt_count": 3,
+      "returned_count": 20,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.3333333333333333,
+        "5": 0.3333333333333333,
+        "10": 0.3333333333333333,
+        "20": 0.3333333333333333
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_4800d7986be7",
+        "asset_00963470eaa1",
+        "asset_4ac4f612fe5e",
+        "asset_13a564ed5f7b",
+        "asset_205f3101cebb",
+        "asset_32b0035e288b",
+        "asset_f485a192f03d",
+        "asset_e36bacc1e31f",
+        "asset_dcd4bb960cfa",
+        "asset_e4f85536d639",
+        "asset_413a50f97c5b",
+        "asset_22f590223c39",
+        "asset_84eb89a37401",
+        "asset_746c1cb74256",
+        "asset_8e70796f5edd",
+        "asset_807c490af842",
+        "asset_8e2c1b32b639",
+        "asset_b45525577a2d",
+        "asset_9d0cb3d7dcd2",
+        "asset_6c4347510a62"
+      ],
+      "latency_s": 0.7255,
+      "empty_policy": "strict_empty",
+      "category": "person",
+      "gt_channel_ranks": {
+        "asset_4800d7986be7": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 2,
+            "visual_ann": 3,
+            "text_ann": null
+          }
+        },
+        "asset_6fcdcc9d6548": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_b983cee1a399": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_m14",
+      "query": "人的照片",
+      "gt_count": 2,
+      "returned_count": 19,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_1fb791766f77",
+        "asset_5eb6a39c77a1",
+        "asset_16f95e870d31",
+        "asset_a6ecab493722",
+        "asset_8455772e595c",
+        "asset_63fc55938f89",
+        "asset_53308fb67ea8",
+        "asset_a50ebac0ea31",
+        "asset_d0123a03ab20",
+        "asset_9f165807ff5b",
+        "asset_a5d6c8217ab2",
+        "asset_2845321913ea",
+        "asset_2320e45b7320",
+        "asset_d10210e9c194",
+        "asset_fdac94414110",
+        "asset_73ca1d70b8ae",
+        "asset_bc6534d23cb2",
+        "asset_29ddcc449225",
+        "asset_02606b34ecdb"
+      ],
+      "latency_s": 0.7101,
+      "empty_policy": "strict_empty",
+      "category": "person",
+      "gt_channel_ranks": {
+        "asset_35ee5f073328": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_d05267995367": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_m15",
+      "query": "摊贩的照片",
+      "gt_count": 1,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.25,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_5cd5f4558e73",
+        "asset_d0123a03ab20",
+        "asset_63fc55938f89",
+        "asset_8191471874fe",
+        "asset_9f165807ff5b",
+        "asset_d10210e9c194",
+        "asset_37eab94ee3c1",
+        "asset_32e246662d1c",
+        "asset_369740223507",
+        "asset_4e70ed4b2e5d",
+        "asset_c47ac4e666da",
+        "asset_227e62579bc5",
+        "asset_d5e4ab0f4eef",
+        "asset_2e68806be41d",
+        "asset_ff9391237222",
+        "asset_2320e45b7320"
+      ],
+      "latency_s": 0.6782,
+      "empty_policy": "strict_empty",
+      "category": "person",
+      "gt_channel_ranks": {
+        "asset_8191471874fe": {
+          "final_rank": 4,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 2,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_m16",
+      "query": "顾客的照片",
+      "gt_count": 3,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 1,
+        "5": 2,
+        "10": 2,
+        "20": 3
+      },
+      "recall_at": {
+        "1": 0.3333333333333333,
+        "5": 0.6666666666666666,
+        "10": 0.6666666666666666,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.4,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_32e246662d1c",
+        "asset_2e68806be41d",
+        "asset_d0123a03ab20",
+        "asset_d05267995367",
+        "asset_4e70ed4b2e5d",
+        "asset_368e1000670b",
+        "asset_37eab94ee3c1",
+        "asset_5cd5f4558e73",
+        "asset_8191471874fe",
+        "asset_369740223507",
+        "asset_a50ebac0ea31",
+        "asset_afdeda2c041c"
+      ],
+      "latency_s": 0.4697,
+      "empty_policy": "strict_empty",
+      "category": "person",
+      "gt_channel_ranks": {
+        "asset_2e68806be41d": {
+          "final_rank": 2,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 3,
+            "visual_ann": 10,
+            "text_ann": null
+          }
+        },
+        "asset_32e246662d1c": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 1,
+            "text_ann": null
+          }
+        },
+        "asset_afdeda2c041c": {
+          "final_rank": 12,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 2,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_o17",
+      "query": "找碗的照片",
+      "gt_count": 1,
+      "returned_count": 11,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_d0123a03ab20",
+        "asset_5cd5f4558e73",
+        "asset_431171af141b",
+        "asset_37eab94ee3c1",
+        "asset_9bcad70dda3c",
+        "asset_c47ac4e666da",
+        "asset_369740223507",
+        "asset_a29de9f71a1e",
+        "asset_ff9391237222",
+        "asset_b983cee1a399",
+        "asset_32e246662d1c"
+      ],
+      "latency_s": 0.4611,
+      "empty_policy": "allow_approximate",
+      "category": "visual_object",
+      "gt_channel_ranks": {
+        "asset_f40c92e1fdbf": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_o18",
+      "query": "找樱花的照片",
+      "gt_count": 1,
+      "returned_count": 17,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_0871198e179f",
+        "asset_8455772e595c",
+        "asset_227e62579bc5",
+        "asset_45ac6e8af9ce",
+        "asset_9bcad70dda3c",
+        "asset_368e1000670b",
+        "asset_48a7426edc06",
+        "asset_ff9391237222",
+        "asset_14ee6f6b0012",
+        "asset_d05267995367",
+        "asset_1e19a1d549d4",
+        "asset_d0123a03ab20",
+        "asset_afdeda2c041c",
+        "asset_32e246662d1c",
+        "asset_2e68806be41d",
+        "asset_4e70ed4b2e5d",
+        "asset_f40c92e1fdbf"
+      ],
+      "latency_s": 0.6181,
+      "empty_policy": "allow_approximate",
+      "category": "visual_object",
+      "gt_channel_ranks": {
+        "asset_0871198e179f": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 1,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_o19",
+      "query": "找搅拌碗的照片",
+      "gt_count": 1,
+      "returned_count": 15,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.1429,
+      "precision_at_5": 0.0,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_d0123a03ab20",
+        "asset_4e70ed4b2e5d",
+        "asset_388435ede3ce",
+        "asset_afdeda2c041c",
+        "asset_63fc55938f89",
+        "asset_369740223507",
+        "asset_fa1119a247e7",
+        "asset_78204b19e4e3",
+        "asset_f40c92e1fdbf",
+        "asset_1e19a1d549d4",
+        "asset_431171af141b",
+        "asset_5cd5f4558e73",
+        "asset_32e246662d1c",
+        "asset_8191471874fe",
+        "asset_2e68806be41d"
+      ],
+      "latency_s": 0.5864,
+      "empty_policy": "allow_approximate",
+      "category": "visual_object",
+      "gt_channel_ranks": {
+        "asset_fa1119a247e7": {
+          "final_rank": 7,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 3,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_o20",
+      "query": "找肉丸的照片",
+      "gt_count": 1,
+      "returned_count": 15,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_63fc55938f89",
+        "asset_37eab94ee3c1",
+        "asset_5cd5f4558e73",
+        "asset_4e70ed4b2e5d",
+        "asset_afdeda2c041c",
+        "asset_c47ac4e666da",
+        "asset_9bcad70dda3c",
+        "asset_d0123a03ab20",
+        "asset_a29de9f71a1e",
+        "asset_1e19a1d549d4",
+        "asset_369740223507",
+        "asset_2320e45b7320",
+        "asset_f40c92e1fdbf",
+        "asset_2e68806be41d",
+        "asset_fdac94414110"
+      ],
+      "latency_s": 0.5783,
+      "empty_policy": "allow_approximate",
+      "category": "visual_object",
+      "gt_channel_ranks": {
+        "asset_63fc55938f89": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 1,
+            "text_ann": 4
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_o21",
+      "query": "找吊灯的照片",
+      "gt_count": 1,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_df6d770b3097",
+        "asset_368e1000670b",
+        "asset_29ddcc449225",
+        "asset_45ac6e8af9ce",
+        "asset_26baf4258d87",
+        "asset_14ee6f6b0012",
+        "asset_1e19a1d549d4",
+        "asset_53308fb67ea8",
+        "asset_32e246662d1c",
+        "asset_369740223507",
+        "asset_d0123a03ab20",
+        "asset_ff9391237222"
+      ],
+      "latency_s": 0.4694,
+      "empty_policy": "allow_approximate",
+      "category": "visual_object",
+      "gt_channel_ranks": {
+        "asset_df6d770b3097": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 1,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_c22",
+      "query": "黄色液体的物件",
+      "gt_count": 1,
+      "returned_count": 18,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fa1119a247e7",
+        "asset_78204b19e4e3",
+        "asset_f40c92e1fdbf",
+        "asset_26baf4258d87",
+        "asset_431171af141b",
+        "asset_df6d770b3097",
+        "asset_c47ac4e666da",
+        "asset_56101ddb3492",
+        "asset_334b8fa0b860",
+        "asset_6bdf1880d535",
+        "asset_95eefdd66c56",
+        "asset_2320e45b7320",
+        "asset_53308fb67ea8",
+        "asset_d10210e9c194",
+        "asset_63fc55938f89",
+        "asset_388435ede3ce",
+        "asset_aa0718db0b37",
+        "asset_9f165807ff5b"
+      ],
+      "latency_s": 0.6895,
+      "empty_policy": "allow_approximate",
+      "category": "color_material",
+      "gt_channel_ranks": {
+        "asset_fa1119a247e7": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 5,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_c23",
+      "query": "白色表面的物件",
+      "gt_count": 1,
+      "returned_count": 20,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_431171af141b",
+        "asset_35ee5f073328",
+        "asset_c47ac4e666da",
+        "asset_29ddcc449225",
+        "asset_53308fb67ea8",
+        "asset_26baf4258d87",
+        "asset_368e1000670b",
+        "asset_48a7426edc06",
+        "asset_0871198e179f",
+        "asset_45ac6e8af9ce",
+        "asset_de6d76e799bf",
+        "asset_8455772e595c",
+        "asset_6bdf1880d535",
+        "asset_1698bbedd9a0",
+        "asset_8b43a4b39524",
+        "asset_df6d770b3097",
+        "asset_95eefdd66c56",
+        "asset_1e19a1d549d4",
+        "asset_a6ecab493722",
+        "asset_1fb791766f77"
+      ],
+      "latency_s": 0.7868,
+      "empty_policy": "allow_approximate",
+      "category": "color_material",
+      "gt_channel_ranks": {
+        "asset_431171af141b": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 2,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_c24",
+      "query": "毛绒玩具的物件",
+      "gt_count": 1,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_48a7426edc06",
+        "asset_53308fb67ea8",
+        "asset_de6d76e799bf",
+        "asset_368e1000670b",
+        "asset_35ee5f073328",
+        "asset_45ac6e8af9ce",
+        "asset_14ee6f6b0012",
+        "asset_df6d770b3097",
+        "asset_c47ac4e666da",
+        "asset_a6ecab493722",
+        "asset_9f165807ff5b",
+        "asset_02606b34ecdb",
+        "asset_16f95e870d31",
+        "asset_2320e45b7320",
+        "asset_d0123a03ab20",
+        "asset_29ddcc449225"
+      ],
+      "latency_s": 0.5927,
+      "empty_policy": "allow_approximate",
+      "category": "color_material",
+      "gt_channel_ranks": {
+        "asset_48a7426edc06": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 2,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_c25",
+      "query": "绿色叶子的物件",
+      "gt_count": 1,
+      "returned_count": 17,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_ff9391237222",
+        "asset_8b43a4b39524",
+        "asset_368e1000670b",
+        "asset_431171af141b",
+        "asset_45ac6e8af9ce",
+        "asset_c47ac4e666da",
+        "asset_95eefdd66c56",
+        "asset_35ee5f073328",
+        "asset_29ddcc449225",
+        "asset_14ee6f6b0012",
+        "asset_9bcad70dda3c",
+        "asset_d05267995367",
+        "asset_26baf4258d87",
+        "asset_0871198e179f",
+        "asset_1fb791766f77",
+        "asset_8455772e595c",
+        "asset_d10210e9c194"
+      ],
+      "latency_s": 0.6713,
+      "empty_policy": "allow_approximate",
+      "category": "color_material",
+      "gt_channel_ranks": {
+        "asset_ff9391237222": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 5,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_s26",
+      "query": "街道场景的照片",
+      "gt_count": 1,
+      "returned_count": 18,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_227e62579bc5",
+        "asset_26baf4258d87",
+        "asset_5eb6a39c77a1",
+        "asset_29ddcc449225",
+        "asset_0871198e179f",
+        "asset_95eefdd66c56",
+        "asset_6bdf1880d535",
+        "asset_d5e4ab0f4eef",
+        "asset_9f165807ff5b",
+        "asset_bc6534d23cb2",
+        "asset_6497455a7ac9",
+        "asset_fdac94414110",
+        "asset_0626efb77c5f",
+        "asset_1fb791766f77",
+        "asset_29db78869e78",
+        "asset_f40c92e1fdbf",
+        "asset_afdeda2c041c",
+        "asset_2e68806be41d"
+      ],
+      "latency_s": 0.6976,
+      "empty_policy": "allow_approximate",
+      "category": "scene",
+      "gt_channel_ranks": {
+        "asset_227e62579bc5": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 9,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_s27",
+      "query": "海边场景的照片",
+      "gt_count": 1,
+      "returned_count": 20,
+      "hits_at": {
+        "1": 0,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.3333,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_29ddcc449225",
+        "asset_fdac94414110",
+        "asset_73ca1d70b8ae",
+        "asset_2320e45b7320",
+        "asset_5eb6a39c77a1",
+        "asset_388435ede3ce",
+        "asset_95eefdd66c56",
+        "asset_a5d6c8217ab2",
+        "asset_1fb791766f77",
+        "asset_7f9335349fd2",
+        "asset_bc6534d23cb2",
+        "asset_16f95e870d31",
+        "asset_677e4a1301ce",
+        "asset_9f165807ff5b",
+        "asset_26baf4258d87",
+        "asset_334b8fa0b860",
+        "asset_32e246662d1c",
+        "asset_f40c92e1fdbf",
+        "asset_2e68806be41d",
+        "asset_2845321913ea"
+      ],
+      "latency_s": 0.7791,
+      "empty_policy": "allow_approximate",
+      "category": "scene",
+      "gt_channel_ranks": {
+        "asset_73ca1d70b8ae": {
+          "final_rank": 3,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 8,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_s28",
+      "query": "山顶场景的照片",
+      "gt_count": 1,
+      "returned_count": 15,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 0.125,
+      "precision_at_5": 0.0,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_a5d6c8217ab2",
+        "asset_95eefdd66c56",
+        "asset_d5e4ab0f4eef",
+        "asset_53308fb67ea8",
+        "asset_a6ecab493722",
+        "asset_5cd5f4558e73",
+        "asset_2e68806be41d",
+        "asset_0626efb77c5f",
+        "asset_a50ebac0ea31",
+        "asset_5eb6a39c77a1",
+        "asset_1fb791766f77",
+        "asset_bc6534d23cb2",
+        "asset_9f165807ff5b",
+        "asset_16f95e870d31",
+        "asset_29ddcc449225"
+      ],
+      "latency_s": 0.5688,
+      "empty_policy": "allow_approximate",
+      "category": "scene",
+      "gt_channel_ranks": {
+        "asset_0626efb77c5f": {
+          "final_rank": 8,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 12,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_t29",
+      "query": "2020 年 2 月的照片",
+      "gt_count": 2,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_227e62579bc5",
+        "asset_ff9391237222",
+        "asset_2320e45b7320",
+        "asset_3404e945a46d",
+        "asset_9bcad70dda3c",
+        "asset_368e1000670b",
+        "asset_c47ac4e666da",
+        "asset_0871198e179f",
+        "asset_8b43a4b39524",
+        "asset_14ee6f6b0012",
+        "asset_d10210e9c194",
+        "asset_2e68806be41d",
+        "asset_4e70ed4b2e5d",
+        "asset_8455772e595c",
+        "asset_32e246662d1c",
+        "asset_29ddcc449225"
+      ],
+      "latency_s": 0.6004,
+      "empty_policy": "strict_empty",
+      "category": "time",
+      "gt_channel_ranks": {
+        "asset_f40c92e1fdbf": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_20bd6c067b4c": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_t30",
+      "query": "2019 年 3 月的照片",
+      "gt_count": 4,
+      "returned_count": 17,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.25
+      },
+      "mrr": 0.0909,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_ff9391237222",
+        "asset_29ddcc449225",
+        "asset_227e62579bc5",
+        "asset_368e1000670b",
+        "asset_9bcad70dda3c",
+        "asset_8455772e595c",
+        "asset_d05267995367",
+        "asset_3404e945a46d",
+        "asset_8b43a4b39524",
+        "asset_2320e45b7320",
+        "asset_0871198e179f",
+        "asset_14ee6f6b0012",
+        "asset_45ac6e8af9ce",
+        "asset_d10210e9c194",
+        "asset_afdeda2c041c",
+        "asset_2e68806be41d",
+        "asset_32e246662d1c"
+      ],
+      "latency_s": 0.693,
+      "empty_policy": "strict_empty",
+      "category": "time",
+      "gt_channel_ranks": {
+        "asset_0871198e179f": {
+          "final_rank": 11,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": 10,
+            "text_ann": null
+          }
+        },
+        "asset_fa1119a247e7": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_4a1511869842": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_495456506662": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_t31",
+      "query": "2026 年 7 月的照片",
+      "gt_count": 6,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_3404e945a46d",
+        "asset_37eab94ee3c1",
+        "asset_c47ac4e666da",
+        "asset_d10210e9c194",
+        "asset_4e70ed4b2e5d",
+        "asset_2845321913ea",
+        "asset_a6ecab493722",
+        "asset_ff9391237222",
+        "asset_2320e45b7320",
+        "asset_227e62579bc5",
+        "asset_d0123a03ab20",
+        "asset_29ddcc449225"
+      ],
+      "latency_s": 0.4694,
+      "empty_policy": "strict_empty",
+      "category": "time",
+      "gt_channel_ranks": {
+        "asset_63fc55938f89": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_de6d76e799bf": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_ae96c182b4cc": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_c80b10e43911": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_71e22de9fd57": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_0713f4fbfd2c": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_t32",
+      "query": "2018 年 11 月的照片",
+      "gt_count": 2,
+      "returned_count": 19,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_2320e45b7320",
+        "asset_d05267995367",
+        "asset_ff9391237222",
+        "asset_29ddcc449225",
+        "asset_0871198e179f",
+        "asset_aa0718db0b37",
+        "asset_32e246662d1c",
+        "asset_de6d76e799bf",
+        "asset_53308fb67ea8",
+        "asset_2845321913ea",
+        "asset_8455772e595c",
+        "asset_45ac6e8af9ce",
+        "asset_f40c92e1fdbf",
+        "asset_368e1000670b",
+        "asset_3404e945a46d",
+        "asset_37eab94ee3c1",
+        "asset_a50ebac0ea31",
+        "asset_6bdf1880d535",
+        "asset_14ee6f6b0012"
+      ],
+      "latency_s": 0.721,
+      "empty_policy": "strict_empty",
+      "category": "time",
+      "gt_channel_ranks": {
+        "asset_df6d770b3097": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": 15,
+            "text_ann": null
+          }
+        },
+        "asset_13be7ec29ae6": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_t33",
+      "query": "2018 年 10 月的照片",
+      "gt_count": 2,
+      "returned_count": 18,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": 0.0,
+        "5": 0.0,
+        "10": 0.0,
+        "20": 0.0
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_2320e45b7320",
+        "asset_d05267995367",
+        "asset_29ddcc449225",
+        "asset_ff9391237222",
+        "asset_d10210e9c194",
+        "asset_53308fb67ea8",
+        "asset_32e246662d1c",
+        "asset_0871198e179f",
+        "asset_de6d76e799bf",
+        "asset_f40c92e1fdbf",
+        "asset_2845321913ea",
+        "asset_8455772e595c",
+        "asset_45ac6e8af9ce",
+        "asset_a50ebac0ea31",
+        "asset_3404e945a46d",
+        "asset_37eab94ee3c1",
+        "asset_6bdf1880d535",
+        "asset_368e1000670b"
+      ],
+      "latency_s": 0.6914,
+      "empty_policy": "strict_empty",
+      "category": "time",
+      "gt_channel_ranks": {
+        "asset_b983cee1a399": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        },
+        "asset_4e531d40f7a4": {
+          "final_rank": null,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": null,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_b34",
+      "query": "碗",
+      "gt_count": 1,
+      "returned_count": 13,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_f40c92e1fdbf",
+        "asset_fa1119a247e7",
+        "asset_5cd5f4558e73",
+        "asset_431171af141b",
+        "asset_369740223507",
+        "asset_d0123a03ab20",
+        "asset_2845321913ea",
+        "asset_a5d6c8217ab2",
+        "asset_8455772e595c",
+        "asset_d05267995367",
+        "asset_45ac6e8af9ce",
+        "asset_677e4a1301ce",
+        "asset_afdeda2c041c"
+      ],
+      "latency_s": 0.5529,
+      "empty_policy": "allow_approximate",
+      "category": "bare_phrase",
+      "gt_channel_ranks": {
+        "asset_f40c92e1fdbf": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": null,
+            "visual_ann": 2,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_b35",
+      "query": "樱花",
+      "gt_count": 1,
+      "returned_count": 17,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_0871198e179f",
+        "asset_1fb791766f77",
+        "asset_8455772e595c",
+        "asset_227e62579bc5",
+        "asset_02606b34ecdb",
+        "asset_53308fb67ea8",
+        "asset_2320e45b7320",
+        "asset_45ac6e8af9ce",
+        "asset_16f95e870d31",
+        "asset_d0123a03ab20",
+        "asset_368e1000670b",
+        "asset_bc6534d23cb2",
+        "asset_26baf4258d87",
+        "asset_73ca1d70b8ae",
+        "asset_14ee6f6b0012",
+        "asset_9f165807ff5b",
+        "asset_6497455a7ac9"
+      ],
+      "latency_s": 0.6168,
+      "empty_policy": "allow_approximate",
+      "category": "bare_phrase",
+      "gt_channel_ranks": {
+        "asset_0871198e179f": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 2,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_x36",
+      "query": "无在厨房台面搅拌面糊的照片",
+      "gt_count": 1,
+      "returned_count": 12,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_f40c92e1fdbf",
+        "asset_fa1119a247e7",
+        "asset_78204b19e4e3",
+        "asset_431171af141b",
+        "asset_c47ac4e666da",
+        "asset_1698bbedd9a0",
+        "asset_32e246662d1c",
+        "asset_afdeda2c041c",
+        "asset_d05267995367",
+        "asset_29ddcc449225",
+        "asset_aa0718db0b37",
+        "asset_d0123a03ab20"
+      ],
+      "latency_s": 0.4665,
+      "empty_policy": "strict_empty",
+      "category": "composite",
+      "gt_channel_ranks": {
+        "asset_f40c92e1fdbf": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 3,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_x37",
+      "query": "一只手在厨房台面正在搅拌混合物的照片",
+      "gt_count": 1,
+      "returned_count": 16,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_fa1119a247e7",
+        "asset_d0123a03ab20",
+        "asset_f40c92e1fdbf",
+        "asset_78204b19e4e3",
+        "asset_a50ebac0ea31",
+        "asset_afdeda2c041c",
+        "asset_02606b34ecdb",
+        "asset_2320e45b7320",
+        "asset_c47ac4e666da",
+        "asset_1fb791766f77",
+        "asset_5cd5f4558e73",
+        "asset_431171af141b",
+        "asset_aa0718db0b37",
+        "asset_9f165807ff5b",
+        "asset_53308fb67ea8",
+        "asset_16f95e870d31"
+      ],
+      "latency_s": 0.6821,
+      "empty_policy": "strict_empty",
+      "category": "composite",
+      "gt_channel_ranks": {
+        "asset_fa1119a247e7": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 2,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_e38",
+      "query": "找红色直升机",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.0342,
+      "empty_policy": "strict_empty",
+      "category": "strict_empty",
+      "gt_channel_ranks": {},
+      "acceptable_hits": [],
+      "strict_empty_fp": 0
+    },
+    {
+      "key": "dev_e39",
+      "query": "找蓝色钢琴",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.0328,
+      "empty_policy": "strict_empty",
+      "category": "strict_empty",
+      "gt_channel_ranks": {},
+      "acceptable_hits": [],
+      "strict_empty_fp": 0
+    },
+    {
+      "key": "dev_e40",
+      "query": "找紫色长颈鹿",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.0331,
+      "empty_policy": "strict_empty",
+      "category": "strict_empty",
+      "gt_channel_ranks": {},
+      "acceptable_hits": [],
+      "strict_empty_fp": 0
+    },
+    {
+      "key": "dev_e41",
+      "query": "找金色雪橇",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.033,
+      "empty_policy": "strict_empty",
+      "category": "strict_empty",
+      "gt_channel_ranks": {},
+      "acceptable_hits": [],
+      "strict_empty_fp": 0
+    },
+    {
+      "key": "dev_q42",
+      "query": "搅拌面糊的场景",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.033,
+      "empty_policy": "allow_approximate",
+      "category": "allow_approximate",
+      "gt_channel_ranks": {},
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_q43",
+      "query": "春日花朵盛开的场景",
+      "gt_count": 0,
+      "returned_count": 0,
+      "hits_at": {
+        "1": 0,
+        "5": 0,
+        "10": 0,
+        "20": 0
+      },
+      "recall_at": {
+        "1": null,
+        "5": null,
+        "10": null,
+        "20": null
+      },
+      "mrr": 0.0,
+      "precision_at_5": 0.0,
+      "all_relevant": false,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [],
+      "latency_s": 0.0332,
+      "empty_policy": "allow_approximate",
+      "category": "allow_approximate",
+      "gt_channel_ranks": {},
+      "acceptable_hits": []
+    },
+    {
+      "key": "dev_r44",
+      "query": "所有搅拌面糊的照片",
+      "gt_count": 1,
+      "returned_count": 18,
+      "hits_at": {
+        "1": 1,
+        "5": 1,
+        "10": 1,
+        "20": 1
+      },
+      "recall_at": {
+        "1": 1.0,
+        "5": 1.0,
+        "10": 1.0,
+        "20": 1.0
+      },
+      "mrr": 1.0,
+      "precision_at_5": 0.2,
+      "all_relevant": true,
+      "empty_gt_fp": false,
+      "hard_violation": 0,
+      "ranked_ids": [
+        "asset_f40c92e1fdbf",
+        "asset_78204b19e4e3",
+        "asset_fa1119a247e7",
+        "asset_c47ac4e666da",
+        "asset_5cd5f4558e73",
+        "asset_d0123a03ab20",
+        "asset_48a7426edc06",
+        "asset_32e246662d1c",
+        "asset_431171af141b",
+        "asset_2e68806be41d",
+        "asset_1e19a1d549d4",
+        "asset_29ddcc449225",
+        "asset_afdeda2c041c",
+        "asset_369740223507",
+        "asset_388435ede3ce",
+        "asset_b983cee1a399",
+        "asset_63fc55938f89",
+        "asset_ff9391237222"
+      ],
+      "latency_s": 0.6995,
+      "empty_policy": "strict_empty",
+      "category": "all_relevant",
+      "gt_channel_ranks": {
+        "asset_f40c92e1fdbf": {
+          "final_rank": 1,
+          "channels": {
+            "metadata": null,
+            "entity": null,
+            "lexical": 1,
+            "visual_ann": 3,
+            "text_ann": null
+          }
+        }
+      },
+      "acceptable_hits": []
+    }
+  ]
+}

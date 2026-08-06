@@ -152,11 +152,15 @@ class EvidenceRetrievalKernel:
         """
         from .retrieval import HardFilterContext, RetrievalQuery, fuse
         from .retrieval.config import RetrievalConfig
+        from .retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS
+        from .retrieval.ranking import VISUAL_ONLY, rank
 
         config = self.config or RetrievalConfig()
         filters = HardFilterContext.from_spec(spec)
         query = RetrievalQuery.from_spec(spec, embedding_router=self.embedding_router)
         recall_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
+        strategy = config.ranking_strategy
+        all_relevant = spec.result_requirement.get("mode") == "all_relevant"
 
         channel_hits = {}
         channel_trace = {}
@@ -180,33 +184,36 @@ class EvidenceRetrievalKernel:
         all_authorized = spec.scope_mode == "all_authorized"
         packet = EvidencePacket(spec.query_id, scope_id, spec.answer_target)
         packet.channel_trace = channel_trace
+        # R8-3: expose per-channel asset order so the benchmark can trace each
+        # GT's rank per channel (which channel moved it up or down).
+        packet.channel_hits = {name: [hit.asset_id for hit in hits] for name, hits in channel_hits.items()}
 
-        primary_items = self._evaluate_fused(fuse(channel_hits), spec, packet,
-                                             filters, all_authorized, scope_id,
-                                             skip_assets=set())
+        primary_items = self._evaluate_fused(
+            rank(channel_hits, strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+            spec, packet, filters, all_authorized, scope_id, skip_assets=set())
 
-        # R3B: seed-quality gate — only exact/strong primary results are seeds.
-        seeds = [item["asset_id"] for item in primary_items if item.get("level") in {"exact", "strong"}]
-        adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "no_seeds"}
-        for expander in expanders:
-            try:
-                adjacency_hits = expander.expand(seeds, filters, limit=recall_limit)
-                adjacency_trace = {"invoked": True, "candidate_count": len(adjacency_hits),
-                                   "status": "ok", "seeds": len(seeds)}
-            except Exception as error:
-                adjacency_hits = []
-                adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "error", "reason": str(error)}
-            channel_hits[expander.name] = adjacency_hits
-            channel_trace[expander.name] = adjacency_trace
-
+        # R3B seed-gated adjacency — R8-3: only expands when the strategy is
+        # not visual_only, and only for all_relevant or reliable seeds.
         already = {item["asset_id"] for item in primary_items}
-        if expanders:
-            adjacency_items = self._evaluate_fused(fuse({expander.name: channel_hits[expander.name]
-                                                         for expander in expanders}),
-                                                   spec, packet, filters, all_authorized, scope_id,
-                                                   skip_assets=already)
-        else:
-            adjacency_items = []
+        adjacency_items = []
+        if expanders and (strategy != VISUAL_ONLY or all_relevant):
+            seeds = [item["asset_id"] for item in primary_items if item.get("level") in {"exact", "strong"}]
+            adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "no_seeds"}
+            for expander in expanders:
+                try:
+                    adjacency_hits = expander.expand(seeds, filters, limit=recall_limit)
+                    adjacency_trace = {"invoked": True, "candidate_count": len(adjacency_hits),
+                                       "status": "ok", "seeds": len(seeds)}
+                except Exception as error:
+                    adjacency_hits = []
+                    adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "error", "reason": str(error)}
+                channel_hits[expander.name] = adjacency_hits
+                channel_trace[expander.name] = adjacency_trace
+            packet.channel_hits[expander.name] = [hit.asset_id for hit in channel_hits.get(expander.name, [])]
+            adjacency_items = self._evaluate_fused(
+                rank({expander.name: channel_hits[expander.name] for expander in expanders},
+                     strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+                spec, packet, filters, all_authorized, scope_id, skip_assets=already)
 
         packet.assets = primary_items + [item for item in adjacency_items if item["asset_id"] not in already]
         for item in packet.assets:

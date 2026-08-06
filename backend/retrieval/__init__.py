@@ -12,6 +12,7 @@ from .config import RetrievalConfig
 from .fusion import fuse
 from .near_duplicate import NearDuplicateGrouper
 from .probes import NeutralProbe
+from .ranking import rank
 
 _RETRIEVER_FACTORIES = {}
 
@@ -86,6 +87,6 @@ def build_default_retrievers(store, *, embedding_router=None, config=None, ann_d
 
 __all__ = [
     "CandidateHit", "HardFilterContext", "Retriever", "RetrievalQuery",
-    "RetrievalConfig", "fuse", "NeutralProbe", "NearDuplicateGrouper",
+    "RetrievalConfig", "fuse", "NeutralProbe", "NearDuplicateGrouper", "rank",
     "build_default_retrievers",
 ]

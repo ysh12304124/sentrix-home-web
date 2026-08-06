@@ -25,7 +25,9 @@ def _flag(name: str, default: bool = False) -> bool:
 
 class RetrievalConfig:
     def __init__(self, defaults_path=None, local_path=None, env=None):
-        self.env = env or os.environ
+        # Snapshot the environment so a caller's env mutation after construction
+        # cannot change what this config resolves (e.g. tests toggling ranking).
+        self.env = dict(env) if env is not None else dict(os.environ)
         self._data = self._load(defaults_path or DEFAULTS_PATH, local_path)
 
     @staticmethod
@@ -52,6 +54,12 @@ class RetrievalConfig:
     @property
     def fusion(self) -> str:
         return self.env.get("SENTRIX_RETRIEVER_FUSION", self._data.get("fusion", "rrf"))
+
+    @property
+    def ranking_strategy(self) -> str:
+        from .ranking import VISUAL_ONLY
+        return self.env.get("SENTRIX_RETRIEVER_RANKING",
+                            self._data.get("ranking_strategy", VISUAL_ONLY))
 
     @property
     def top_k(self) -> int:

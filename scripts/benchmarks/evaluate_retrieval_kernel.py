@@ -161,9 +161,27 @@ def _make_embedding_router():
         return None
 
 
-def _build_kernel(store, channels, embedding_router):
+def _channel_ranks_for_gt(packet, truth_ids):
+    """Per-GT rank in each channel + final rank, for R8-3 trace."""
+    channel_hits = getattr(packet, "channel_hits", {}) or {}
+    final_rank = {aid: i + 1 for i, aid in enumerate(_ranked_asset_ids(packet))}
+    ranks = {}
+    for aid in truth_ids:
+        row = {"final_rank": final_rank.get(aid), "channels": {}}
+        for name, order in channel_hits.items():
+            try:
+                row["channels"][name] = order.index(aid) + 1
+            except ValueError:
+                row["channels"][name] = None
+        ranks[aid] = row
+    return ranks
+
+
+def _build_kernel(store, channels, embedding_router, ranking=None):
     import os
     os.environ.setdefault("SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1", "1")
+    if ranking:
+        os.environ["SENTRIX_RETRIEVER_RANKING"] = ranking
     from backend.evidence_retrieval import EvidenceRetrievalKernel
     from backend.retrieval import RetrievalConfig, build_default_retrievers
     config = RetrievalConfig()
@@ -177,9 +195,9 @@ def _build_kernel(store, channels, embedding_router):
 
 
 def run(store, cases, spec_source, parser=None, top_k=20, include=None, limit=None,
-        exclude_hidden=None, channels="full_hybrid"):
+        exclude_hidden=None, channels="full_hybrid", ranking=None):
     embedding_router = _make_embedding_router()
-    kernel = _build_kernel(store, channels, embedding_router)
+    kernel = _build_kernel(store, channels, embedding_router, ranking=ranking)
     include_set = set(item.strip() for item in include.split(",")) if include else None
     exclude_set = set()
     if exclude_hidden:
@@ -202,12 +220,13 @@ def run(store, cases, spec_source, parser=None, top_k=20, include=None, limit=No
         elapsed = time.perf_counter() - start
         ranked = _ranked_asset_ids(packet)
         grade = _grade(case, ranked, truth_ids, packet)
+        grade["gt_channel_ranks"] = _channel_ranks_for_gt(packet, truth_ids)
         grade["latency_s"] = round(elapsed, 4)
         results.append(grade)
     return results
 
 
-def run_dev(store, dev_cases, *, channels="full_hybrid", top_k=20):
+def run_dev(store, dev_cases, *, channels="full_hybrid", top_k=20, ranking=None):
     """Grade the independent Development Set (Phase R8-2).
 
     Dev cases carry ``query_cn``, ``exact`` (asset ids already resolved) and
@@ -215,7 +234,7 @@ def run_dev(store, dev_cases, *, channels="full_hybrid", top_k=20):
     benchmark-file resolution is involved.
     """
     embedding_router = _make_embedding_router()
-    kernel = _build_kernel(store, channels, embedding_router)
+    kernel = _build_kernel(store, channels, embedding_router, ranking=ranking)
     results = []
     for index, case in enumerate(dev_cases):
         query = case.get("query_cn") or ""
@@ -238,6 +257,7 @@ def run_dev(store, dev_cases, *, channels="full_hybrid", top_k=20):
         grade["latency_s"] = round(time.perf_counter() - start, 4)
         grade["empty_policy"] = case.get("empty_policy", "allow_approximate")
         grade["category"] = case.get("category")
+        grade["gt_channel_ranks"] = _channel_ranks_for_gt(packet, truth_ids)
         grade["acceptable_hits"] = sorted(acceptable & set(ranked))
         # strict-empty: any returned asset that is NOT an acceptable approximate is an FP.
         if case.get("empty_policy") == "strict_empty" and not truth_ids:
@@ -292,6 +312,8 @@ def main():
     parser.add_argument("--include", default=None, help="comma-separated keys e.g. album1-01,album3-14")
     parser.add_argument("--channels", default="full_hybrid",
                         help="lexical|visual|text|structured|hybrid_no_adjacency|full_hybrid (pre-R2 all map to current kernel)")
+    parser.add_argument("--ranking", choices=["visual_only", "visual_backbone", "late_fusion"], default=None,
+                        help="R8-3 ranking strategy (default: config, which is visual_only)")
     parser.add_argument("--exclude-hidden", default=None, help="path to hidden_set_manifest.json to exclude hidden keys from grading")
     parser.add_argument("--dev-set", default=None, help="path to development_set.json to grade the independent Dev Set")
     parser.add_argument("--report", default=None, help="write JSON report to this path")
@@ -303,11 +325,12 @@ def main():
     store = MemoryStore(args.db)
     if args.dev_set:
         dev_cases = json.loads(Path(args.dev_set).read_text(encoding="utf-8"))["cases"]
-        print(f"[eval] Dev Set: {len(dev_cases)} cases, channels={args.channels}")
-        results = run_dev(store, dev_cases, channels=args.channels, top_k=args.top_k)
+        print(f"[eval] Dev Set: {len(dev_cases)} cases, channels={args.channels}, ranking={args.ranking or 'config'}")
+        results = run_dev(store, dev_cases, channels=args.channels, top_k=args.top_k, ranking=args.ranking)
         store.close()
         summary = _aggregate(results)
-        payload = {"summary": summary, "dataset": "development", "channels": args.channels, "cases": results}
+        payload = {"summary": summary, "dataset": "development", "channels": args.channels,
+                   "ranking": args.ranking, "cases": results}
         text = json.dumps(payload, ensure_ascii=False, indent=2)
         if args.report:
             Path(args.report).write_text(text, encoding="utf-8")
@@ -326,13 +349,14 @@ def main():
         parser_obj = QueryParser(gamma=GammaClient())
     results = run(store, cases, args.spec_source, parser=parser_obj, top_k=args.top_k,
                   include=args.include, limit=args.limit, exclude_hidden=args.exclude_hidden,
-                  channels=args.channels)
+                  channels=args.channels, ranking=args.ranking)
     store.close()
     summary = _aggregate(results)
     payload = {"summary": summary,
                "channel_note": ("R2+: channels param selects real retriever subsets; "
                                 "pre-R2 all modes collapsed to the single Kernel."),
                "channels": args.channels,
+               "ranking": args.ranking,
                "exclude_hidden": args.exclude_hidden or None,
                "cases": results}
     text = json.dumps(payload, ensure_ascii=False, indent=2)

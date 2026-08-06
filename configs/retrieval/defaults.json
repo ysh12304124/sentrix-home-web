@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "multi_retriever": true,
   "channels": {
     "metadata": true,
@@ -9,6 +9,7 @@
     "text": true,
     "adjacency": false
   },
+  "ranking_strategy": "visual_backbone",
   "fusion": "rrf",
   "recall": {
     "top_k": 20,
