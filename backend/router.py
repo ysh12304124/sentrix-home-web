@@ -174,13 +174,20 @@ class Router:
             return RouteDecision("evidence", "session_follow_up", query_parse_calls=1,
                                  focus_ids=followup_ids)
 
+        # 5.5 Parser-down (timeout/failure) + general-intro verb: route to
+        #     clarify, never to chat and never to a probe that may upgrade on
+        #     visual noise.  With a healthy parser this branch is unreachable —
+        #     "介绍一下明哥" then carries a person facet (evidence) and
+        #     "解释一下量子纠缠" carries a clean none (step 6).
+        if getattr(draft, "parser_failed", False) and has_general_verb(value) \
+                and not has_household_signal(draft) and not message_anchored(value):
+            return RouteDecision("clarify", "parser_down_general_ambiguous",
+                                 query_parse_calls=1)
+
         # 6. Clear general question (family context already excluded: no facets /
         #    anchors / focus, and confirmed-entity failed above).  A parser that
         #    proposed evidence is contradictory — route to the probe, not none.
-        #    A parser FAILURE (timeout) must not let intro verbs decide none:
-        #    "介绍一下明哥" with the parser down falls to the probe/clarify.
-        if not getattr(draft, "parser_failed", False) \
-                and getattr(draft, "proposed_mode", "none") != "evidence" \
+        if getattr(draft, "proposed_mode", "none") != "evidence" \
                 and has_general_verb(value) and not has_household_signal(draft) \
                 and not message_anchored(value):
             return RouteDecision("none", "general_concept_question",
