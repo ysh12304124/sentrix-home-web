@@ -365,8 +365,20 @@ class EvidenceRetrievalKernel:
         if constraint.dimension == "media":
             return ("matched", "asset_metadata", asset.get("id"), 1.0) if asset.get("media_type") == value else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
         if constraint.dimension == "person":
-            people = observation.get("people") or []
-            return ("matched", "confirmed_bridge", observation.get("id"), 1.0) if value in people else ("unknown", None, None, 0.0)
+            # people entries may be plain names OR confirmed-entity dicts
+            # ({entity_id, name, status}).  A confirmed bridge must match both.
+            names, entity_ids = set(), set()
+            for entry in observation.get("people") or []:
+                if isinstance(entry, dict):
+                    if entry.get("name"):
+                        names.add(str(entry["name"]))
+                    if entry.get("entity_id"):
+                        entity_ids.add(str(entry["entity_id"]))
+                else:
+                    names.add(str(entry))
+            if value in names or value in entity_ids:
+                return ("matched", "confirmed_bridge", observation.get("id"), 1.0)
+            return ("unknown", None, None, 0.0)
         if constraint.dimension in self._OPEN_WORLD_LIST_DIMENSIONS:
             return self._evaluate_open_world(observation, constraint)
         if constraint.dimension in self._SINGLE_VALUE_DIMENSIONS:

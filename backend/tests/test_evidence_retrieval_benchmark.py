@@ -152,3 +152,39 @@ class Phase1BenchmarkStructureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PersonDictPeopleMatchingTests(unittest.TestCase):
+    """12B-FC: person constraint must match confirmed-entity dict entries in
+    observation.people ({entity_id, name, status}), not just plain strings."""
+
+    def _kernel(self):
+        from backend.evidence_retrieval import EvidenceRetrievalKernel
+        return EvidenceRetrievalKernel(store=None)
+
+    def test_confirmed_bridge_dict_entry_matches(self):
+        from backend.query_contracts import Constraint, HARD
+        kernel = self._kernel()
+        constraint = Constraint("person", "明哥", HARD, "confirmed_bridge")
+        obs = {"people": ["一个短发的年轻女性",
+                          {"entity_id": "entity_ba91871b4d17", "name": "明哥", "status": "confirmed"}],
+               "id": "obs_x"}
+        status, source, source_id, conf = kernel._condition({}, obs, constraint)
+        self.assertEqual(status, "matched")
+        self.assertEqual(source, "confirmed_bridge")
+
+    def test_plain_string_name_matches(self):
+        from backend.query_contracts import Constraint, HARD
+        kernel = self._kernel()
+        constraint = Constraint("person", "明哥", HARD, "confirmed_bridge")
+        obs = {"people": ["明哥", "另一个"], "id": "obs_y"}
+        status, *_ = kernel._condition({}, obs, constraint)
+        self.assertEqual(status, "matched")
+
+    def test_absent_person_unknown_not_contradicted(self):
+        from backend.query_contracts import Constraint, HARD
+        kernel = self._kernel()
+        constraint = Constraint("person", "小黑", HARD, "confirmed_bridge")
+        obs = {"people": ["明哥"], "id": "obs_z"}
+        status, *_ = kernel._condition({}, obs, constraint)
+        self.assertEqual(status, "unknown")
