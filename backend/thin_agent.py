@@ -160,6 +160,9 @@ class ThinAgentRuntime:
         if decision.mode == "ambiguous":
             return self._ambiguous_path(message, recent_turns, conversation_id, scope_id, viewer_id,
                                         decision, draft)
+        if decision.mode == "clarify":
+            return self._clarify_envelope(message, conversation_id, scope_id, viewer_id,
+                                          decision, None, draft)
         return self._evidence_path(message, recent_turns, conversation_id, scope_id, viewer_id,
                                    decision, draft)
 
@@ -219,9 +222,11 @@ class ThinAgentRuntime:
 
     def _clarify_envelope(self, message, conversation_id, scope_id, viewer_id, decision, probe, draft):
         answer = "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
+        counts = probe.channel_counts if probe is not None else {}
+        reason = probe.reason if probe is not None else decision.reason
         trace = [{"stage": "gate", "status": "ambiguous",
                   "counts": {"query_parse": decision.query_parse_calls,
-                             "probe": probe.channel_counts, "probe_decision": probe.reason}}]
+                             "probe": counts, "probe_decision": reason}}]
         return self._envelope(answer, conversation_id, scope_id, viewer_id,
                               decision.as_gate_decision(), [], [], "clarify", trace, draft=draft)
 
