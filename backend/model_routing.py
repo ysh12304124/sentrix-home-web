@@ -27,10 +27,13 @@ CLAIM = "claim"
 REPAIR = "repair"
 ROLES = (PARSER, ANSWER, VERIFY, CLAIM, REPAIR)
 
-# 12B-FC: the parser budget is raised for the 12B parser (GPU warm ~4s through
-# the full prompt; the old 4s cap made it time out and trip the breaker).  Still
-# inside the 20s API deadline.  Overridable via SENTRIX_PARSER_BUDGET.
-DEFAULT_PHASE_BUDGETS = {PARSER: 8.0, "retrieval": 5.0, ANSWER: 7.0, "overhead": 2.0}
+# 12B-FC: per-role phase budgets for the 12B model set.  Every model role must
+# have an explicit budget or ModelRouter falls back to the 2s overhead budget
+# and a 12B writer/claim/verify call (~5s on GPU) times out -> the complex
+# person chain silently fell back to the deterministic summary.  The global
+# RequestDeadline (20s) still caps the whole turn.
+DEFAULT_PHASE_BUDGETS = {PARSER: 8.0, "retrieval": 5.0, ANSWER: 7.0, "overhead": 2.0,
+                         "writer": 8.0, "claim": 8.0, "verify": 8.0, "repair": 8.0}
 
 
 def _parser_budget():
