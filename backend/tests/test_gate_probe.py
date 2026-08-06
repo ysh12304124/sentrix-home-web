@@ -50,6 +50,18 @@ class GateDecisionTests(unittest.TestCase):
         # Both route to probe regardless of self-reported confidence.
         self.assertEqual(low.mode, high.mode)
 
+    def test_anchored_parser_none_routes_to_probe(self):
+        # R8-Parser: weak parser returns none, but a geo anchor in the raw
+        # message must still route to the probe, not to normal chat.
+        decision = MemoryGate().classify("夜晚车内的明哥搂着我 江西省", draft=_draft("none"))
+        self.assertEqual(decision.mode, "ambiguous")
+        self.assertTrue(decision.allow_probe)
+
+    def test_anchored_parser_none_beats_writing_prefix_only_when_writing(self):
+        # A writing prompt with an embedded family word is still none.
+        decision = MemoryGate().classify("假设一家人在厨房做饭，写个故事", draft=_draft("none"))
+        self.assertEqual(decision.mode, "none")
+
 
 class NeutralProbeTests(unittest.TestCase):
     def _hits(self, asset_ids, retriever="lexical"):

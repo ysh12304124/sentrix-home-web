@@ -1,0 +1,681 @@
+{
+  "summary": {
+    "mode_accuracy": 0.2857,
+    "action_facet_retention": 0.2333,
+    "hard_condition_loss": {
+      "date": 0.0833,
+      "person": 0.1167,
+      "media": 0.05
+    },
+    "general_false_trigger": 0.0,
+    "probe_rescue_rate": 0.3,
+    "repair_rate": 0.05,
+    "json_first_pass_valid": 0.95,
+    "counts": {
+      "evidence": 60,
+      "general": 10,
+      "repair": 3,
+      "json_first_valid": 57,
+      "first_total": 60
+    }
+  },
+  "cases": [
+    {
+      "key": "album1-01",
+      "query": "浅黄色拼接毛绒睡衣自拍",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "album1-02",
+      "query": "厨房里做晚饭",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-03",
+      "query": "手拿固体杨枝甘露",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-04",
+      "query": "水杯做的圣诞树",
+      "mode": "none",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-05",
+      "query": "快出岩洞时摆拍",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-06",
+      "query": "记录下博物馆买的纪念品",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-07",
+      "query": "贵阳夜晚步行街",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-08",
+      "query": "趵突泉游览",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-09",
+      "query": "25年11月16号下午记录妆容的自拍",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 2,
+      "hard_loss": [
+        "date"
+      ],
+      "correct": true
+    },
+    {
+      "key": "album1-10",
+      "query": "在禹城市的照片",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "album1-11",
+      "query": "在盐田区的照片",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "album1-12",
+      "query": "山东近代史展览--反侵略主题",
+      "mode": "none",
+      "actions": 0,
+      "facets": 2,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-13",
+      "query": "黄绿酱汁烤鸡",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-14",
+      "query": "2024年5月",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-15",
+      "query": "深圳机场登机口停机坪",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-16",
+      "query": "香草味可乐倒在键盘上",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-17",
+      "query": "校园街中间躺着的猫猫",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album1-18",
+      "query": "穿和服的自己",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [
+        "person"
+      ],
+      "correct": true
+    },
+    {
+      "key": "album1-19",
+      "query": "2023年冬季的照片",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [
+        "date",
+        "media"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album1-20",
+      "query": "我家猫吃猫粮",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-01",
+      "query": "2025年4月王明和我的合照",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 2,
+      "hard_loss": [
+        "person"
+      ],
+      "correct": true
+    },
+    {
+      "key": "album2-02",
+      "query": "电影院明哥比V",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 2,
+      "hard_loss": [
+        "person"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album2-03",
+      "query": "可可粉可颂",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-04",
+      "query": "西湖木船上看水道风光",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-05",
+      "query": "在上海市拍的自己和王明的照片",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [
+        "person",
+        "media"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album2-06",
+      "query": "夜晚车内的明哥搂着我 江西省",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 3,
+      "hard_loss": [
+        "person"
+      ],
+      "correct": true
+    },
+    {
+      "key": "album2-07",
+      "query": "墨鱼汁海鲜特写",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-08",
+      "query": "杭州冬天吃的西式简餐",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-09",
+      "query": "过2025年元旦",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [
+        "date"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album2-10",
+      "query": "大悦城动漫展卡通立板",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-11",
+      "query": "在陕西省的照片",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "album2-12",
+      "query": "跨年烟花下的垃圾桶",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [
+        "date"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album2-13",
+      "query": "夕阳下的电线杆和农田",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-14",
+      "query": "在集美区的照片",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-15",
+      "query": "2025年4月 自己的照片",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [
+        "person",
+        "media"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album2-16",
+      "query": "鼓浪屿远眺城市天际线",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-17",
+      "query": "2024跨年热闹氛围",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [
+        "date"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album2-18",
+      "query": "八戒",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-19",
+      "query": "径山镇绿道散步",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album2-20",
+      "query": "去听脱口秀",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-01",
+      "query": "银色心形手镯",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "album3-02",
+      "query": "闵行区拍的",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-03",
+      "query": "2022年劳动节拍的",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-04",
+      "query": "烘焙面糊搅拌过程",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-05",
+      "query": "厚切炒酸奶扫码购买",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-06",
+      "query": "2018葆婴高峰会嘟嘟车宣传",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-07",
+      "query": "春天花开",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-08",
+      "query": "确认车钥匙细节",
+      "mode": "none",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-09",
+      "query": "燕园",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-10",
+      "query": "餐厅卤味食材展示",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-11",
+      "query": "氹仔酒店楼道",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-12",
+      "query": "乘客与幼鹿近距离接触",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-13",
+      "query": "采摘番茄",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-14",
+      "query": "水族馆海豚跃出水面",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-15",
+      "query": "牛春花门脸样式参考",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-16",
+      "query": "一床的娃娃",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-17",
+      "query": "厨房三兄弟切洋葱比赛",
+      "mode": "none",
+      "actions": 0,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-18",
+      "query": "自己在上海店铺内的邋遢打扮",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [
+        "person"
+      ],
+      "correct": false
+    },
+    {
+      "key": "album3-19",
+      "query": "三峡大坝北岸纪念碑",
+      "mode": "contextual",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": false
+    },
+    {
+      "key": "album3-20",
+      "query": "在夷陵区的照片",
+      "mode": "evidence",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_60",
+      "query": "帮我写一段生日祝福",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_61",
+      "query": "请写一篇关于春天的短文",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_62",
+      "query": "翻译成英文：今天天气很好",
+      "mode": "none",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_63",
+      "query": "解释一下量子纠缠",
+      "mode": "none",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_64",
+      "query": "为什么天空是蓝色的",
+      "mode": "none",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_65",
+      "query": "假设你是一台相机，拍个故事",
+      "mode": "none",
+      "actions": 1,
+      "facets": 1,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_66",
+      "query": "帮我起草一份给房东的信",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_67",
+      "query": "生成一段欢迎语",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_68",
+      "query": "写个推荐语",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": true
+    },
+    {
+      "key": "gen_69",
+      "query": "讲讲你怎么看人工智能",
+      "mode": "none",
+      "actions": 0,
+      "facets": 0,
+      "hard_loss": [],
+      "correct": true
+    }
+  ]
+}

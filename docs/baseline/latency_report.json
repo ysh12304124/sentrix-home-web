@@ -1,0 +1,33 @@
+{
+  "api": "http://127.0.0.1:8091",
+  "repeats": 6,
+  "paths": {
+    "normal_chat": {
+      "message": "帮我写一段生日祝福",
+      "p50_s": 0.001,
+      "p95_s": 0.002,
+      "avg_s": 0.001,
+      "model_calls_p50": 1,
+      "timeout_or_error_count": 0,
+      "sample_errors": []
+    },
+    "simple_evidence": {
+      "message": "厨房里做晚饭",
+      "p50_s": 0.468,
+      "p95_s": 0.547,
+      "avg_s": 0.479,
+      "model_calls_p50": 2,
+      "timeout_or_error_count": 0,
+      "sample_errors": []
+    },
+    "complex_person": {
+      "message": "介绍一下明哥",
+      "p50_s": 0.001,
+      "p95_s": 0.001,
+      "avg_s": 0.001,
+      "model_calls_p50": 2,
+      "timeout_or_error_count": 0,
+      "sample_errors": []
+    }
+  }
+}

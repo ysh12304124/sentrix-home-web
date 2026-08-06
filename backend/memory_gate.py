@@ -52,6 +52,21 @@ _WRITING_PREFIX_RE = re.compile(r"^\s*(帮我写|请写|写一段|写一篇|生�
 # the prompt does not start with the prefix.
 _WRITING_ANYWHERE_RE = re.compile(r"(写一篇|写一段|写个|写篇|拟一份|起草|生成一段|帮我写|请写)")
 _NO_LOOKUP_RE = re.compile(r"^\s*(不用查|别查|别找|不用找|不需要查|不用看|不用搜|不看我的)")
+# R8-Parser structural compensation: the e2b 2B parser has low mode accuracy,
+# so a parser-none message that still carries a concrete person / date / geo /
+# relationship anchor must be routed to the probe, not dismissed as chat.
+# This is structural anchor detection, NOT a keyword classifier (no topic list).
+_ANCHOR_GEO_RE = re.compile(r"(市|区|省|县|镇|湾|湖|山|路|街|城|岛)")
+_ANCHOR_DATE_RE = re.compile(r"(年|月|日|节|跨年|元旦|春节)")
+_ANCHOR_RELATION_RE = re.compile(r"(搂着|抱着|牵着|靠着|合影|一起|全家福)")
+_ANCHOR_PERSON_TOKENS = ("自己", "我们", "合照")
+
+
+def _message_anchored(message):
+    value = str(message or "")
+    return bool(_ANCHOR_GEO_RE.search(value) or _ANCHOR_DATE_RE.search(value)
+                or _ANCHOR_RELATION_RE.search(value)
+                or any(token in value for token in _ANCHOR_PERSON_TOKENS))
 
 
 class MemoryGate:
@@ -116,11 +131,18 @@ class MemoryGate:
                 )
             # mode == none.  If the parser still surfaced household facets or
             # conditions, the message is ambiguous -> probe (P0-6: parser none
-            # must not be a permanent dead end).  Otherwise an explicit
-            # general-task structure is trusted as none.
+            # must not be a permanent dead end).  R8-Parser: even an empty
+            # draft is rescued when the raw message carries a concrete anchor
+            # (person/date/geo/relation) — the weak 2B parser often drops them.
             if self._has_household_signal(draft):
                 return GateDecision(
                     "ambiguous", "parser_none_with_household_signal",
+                    answer_target=answer_target,
+                    query_parse_calls=1, allow_probe=True,
+                )
+            if _message_anchored(message):
+                return GateDecision(
+                    "ambiguous", "parser_none_with_anchor",
                     answer_target=answer_target,
                     query_parse_calls=1, allow_probe=True,
                 )

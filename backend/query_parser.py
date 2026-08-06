@@ -59,6 +59,18 @@ _PARSER_PROMPT = """你是 Sentrix 的查询解析器，不负责回答用户问
 10. facets 保留用户提到的所有维度，surface_text 用原文片段。
 11. 只输出 JSON，不要输出 scope_id/scope_mode/viewer_id/conversation_id/entity_ids，不要 Markdown。
 
+示例（结构参考，人物/地点为占位）：
+1. 用户：帮我写一首关于春天的诗
+   → {"mode":"none","actions":[],"facets":[],"semantic_conditions":[]}
+2. 用户：找一下去年春节我们拍的全家福照片
+   → {"mode":"evidence","actions":[{"type":"return_assets","target":"general","coverage":"best"}],"facets":[{"dimension":"time","surface_text":"去年春节"}],"time_expression":"去年春节","media_expressions":["照片"],"semantic_conditions":[{"dimension":"activity","value":"拍全家福"}]}
+3. 用户：一个银色手镯
+   → {"mode":"evidence","actions":[{"type":"answer_question","target":"object"}],"facets":[{"dimension":"object","surface_text":"银色手镯"}],"semantic_conditions":[{"dimension":"object","value":"银色手镯"}]}
+4. 用户：今天有点累
+   → {"mode":"none","actions":[],"facets":[],"semantic_conditions":[]}
+5. 用户：介绍一下我们小区附近那个公园
+   → {"mode":"evidence","actions":[{"type":"answer_question","target":"place"}],"facets":[{"dimension":"place","surface_text":"公园"}],"semantic_conditions":[{"dimension":"place","value":"公园"}]}
+
 当前时间：{{now}}
 最近对话：{{conversation}}
 用户消息：{{message}}
