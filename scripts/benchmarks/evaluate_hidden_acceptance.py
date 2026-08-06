@@ -51,11 +51,14 @@ def _message_entity_ids(store, scope_id):
 
 def main():
     # Match the production start script so the blind run uses the same retrieval
-    # stack (Chinese-CLIP visual, CLIP text, multi-retriever kernel).
+    # stack (Chinese-CLIP visual, CLIP text, multi-retriever kernel).  The parser
+    # budget mirrors the production ModelRouter phase budget (4s) so a GPU-blocked
+    # 12B parser falls back exactly as it does in the live API.
     os.environ.setdefault("SENTRIX_IMAGE_EMBEDDER", "chinese_clip")
     os.environ.setdefault("SENTRIX_TEXT_EMBEDDER", "clip")
     os.environ.setdefault("SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1", "1")
     os.environ.setdefault("CLIP_DEVICE", "cpu")
+    os.environ.setdefault("OLLAMA_TIMEOUT_SECONDS", "4")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=os.getenv("SENTRIX_DB_PATH", "data/sentrix.db"))
     parser.add_argument("--manifest", default="docs/baseline/hidden_set_manifest.json")
@@ -106,6 +109,15 @@ def main():
             final_decision = router.resolve_after_probe(outcome, query, decision, draft)
             route = final_decision.mode
 
+        # Mirror thin_agent._ambiguous_path: on a probe upgrade the raw query
+        # becomes a semantic condition so the formal retrieval has something to
+        # evaluate (an empty parser-failed draft otherwise retrieves nothing).
+        if route == "evidence" and getattr(final_decision, "reason", "").startswith("probe_upgrade"):
+            if not draft.actions:
+                draft.actions = [QueryAction(type="answer_question", target="general")]
+            draft.semantic_conditions.append(
+                {"dimension": "semantic", "value": query, "source_text": query}
+            )
         spec = build_query_spec(
             draft, scope_id=scope_id, viewer_id="owner", conversation_id="hidden",
             entity_resolver=resolver, query_id=f"hidden_{key}",
@@ -113,8 +125,6 @@ def main():
         if final_decision.focus_ids:
             spec.entity_ids = list(dict.fromkeys(list(spec.entity_ids) + list(final_decision.focus_ids)))
         if route == "evidence":
-            if not draft.actions:
-                draft.actions = [QueryAction(type="answer_question", target="general")]
             packet = kernel.retrieve(spec)
             retrieved = [item["asset_id"] for item in packet.assets]
             levels = [item["level"] for item in packet.assets]

@@ -1,0 +1,1000 @@
+{
+  "generated_at": "2026-08-06",
+  "note": "predictions only; full GT held by the user. Grade with score_hidden.py --gt <gt.json>",
+  "count": 16,
+  "cases": [
+    {
+      "key": "album1-04",
+      "query": "水杯做的圣诞树",
+      "scope_id": "album1",
+      "category": "time",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:2 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_856b080d4121",
+        "asset_6fcdcc9d6548",
+        "asset_30dfa9f20d3f",
+        "asset_084a408d7931",
+        "asset_6d5dc17f338d",
+        "asset_203b5b507c95",
+        "asset_fbc7c2d06164",
+        "asset_f52a47e76baf",
+        "asset_c5495ad0a50c",
+        "asset_e58ebf0338cc"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:水杯做的圣诞树",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 8.2252
+    },
+    {
+      "key": "album1-06",
+      "query": "记录下博物馆买的纪念品",
+      "scope_id": "album1",
+      "category": "location",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_61df592f6dc9",
+        "asset_d93632d67dbc",
+        "asset_a13201210eb3",
+        "asset_46ea5d607a1c",
+        "asset_e1d3522a9278",
+        "asset_f4959e80368b",
+        "asset_1edf7531ac2f",
+        "asset_30dfa9f20d3f",
+        "asset_6fcdcc9d6548",
+        "asset_f52a47e76baf"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:记录下博物馆买的纪念品",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.496
+    },
+    {
+      "key": "album1-11",
+      "query": "在盐田区的照片",
+      "scope_id": "album1",
+      "category": "location",
+      "route": "evidence",
+      "reason": "raw_message_anchor",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_baacf7be81e2",
+        "asset_894f67c7faba",
+        "asset_2aa4ba0ed619",
+        "asset_36e5a6463c64",
+        "asset_b81972caed87",
+        "asset_077e2f877260",
+        "asset_67e552b26148",
+        "asset_6d5dc17f338d",
+        "asset_1e9c156f1af6",
+        "asset_2e94aefba878"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:在盐田区的照片",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4294
+    },
+    {
+      "key": "album1-17",
+      "query": "校园街中间躺着的猫猫",
+      "scope_id": "album1",
+      "category": "location",
+      "route": "evidence",
+      "reason": "raw_message_anchor",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_077429aaf364",
+        "asset_c9c1c47989b6",
+        "asset_938be25d96a4",
+        "asset_b81972caed87",
+        "asset_2e94aefba878",
+        "asset_9c6f3057da6b",
+        "asset_eb20574be30d",
+        "asset_c5495ad0a50c",
+        "asset_6270e398e5ce",
+        "asset_925a73c7f7df"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:校园街中间躺着的猫猫",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.5074
+    },
+    {
+      "key": "album2-02",
+      "query": "电影院明哥比V",
+      "scope_id": "album2",
+      "category": "empty_gt",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_0cfc643b8c63",
+        "asset_3b0e806a630b",
+        "asset_678b9903dc14",
+        "asset_1ac48ff42634",
+        "asset_2af08f13de4c",
+        "asset_c52303134433",
+        "asset_81739ed97c24",
+        "asset_15b30c3623c2",
+        "asset_9c26c7cfb654",
+        "asset_e83d305f8bee"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:电影院明哥比V",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4332
+    },
+    {
+      "key": "album2-03",
+      "query": "可可粉可颂",
+      "scope_id": "album2",
+      "category": "object",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:2 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_e83d305f8bee",
+        "asset_46ec95ac4162",
+        "asset_1ab5e6fe5076",
+        "asset_3b0e806a630b",
+        "asset_0209440ee553",
+        "asset_7a0e31670377",
+        "asset_4ff8a88412d4",
+        "asset_fc1de6110443",
+        "asset_264e535a2f20"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:可可粉可颂",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4214
+    },
+    {
+      "key": "album2-04",
+      "query": "西湖木船上看水道风光",
+      "scope_id": "album2",
+      "category": "location",
+      "route": "evidence",
+      "reason": "raw_message_anchor",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_425131bc1e67",
+        "asset_225783d8d34a",
+        "asset_18baae2b0c6b",
+        "asset_c2580db3d352",
+        "asset_4ff8a88412d4",
+        "asset_d49b8cf1897d",
+        "asset_d88b01a6bf5d",
+        "asset_46ec95ac4162",
+        "asset_7a0e31670377",
+        "asset_fd92eabfcaa0"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:西湖木船上看水道风光",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4325
+    },
+    {
+      "key": "album2-05",
+      "query": "在上海市拍的自己和王明的照片",
+      "scope_id": "album2",
+      "category": "person",
+      "route": "evidence",
+      "reason": "raw_message_anchor",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_ff50afdcd6c1",
+        "asset_962b07b630d1",
+        "asset_1ac48ff42634",
+        "asset_01333761c4e9",
+        "asset_92dbad788de5",
+        "asset_313517152eb4",
+        "asset_1be207894603",
+        "asset_0cfc643b8c63",
+        "asset_678b9903dc14",
+        "asset_ee8292697136"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:在上海市拍的自己和王明的照片",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.514
+    },
+    {
+      "key": "album2-11",
+      "query": "在陕西省的照片",
+      "scope_id": "album2",
+      "category": "location",
+      "route": "evidence",
+      "reason": "raw_message_anchor",
+      "final_reason": "probe_upgrade:2 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_558db3ce4925",
+        "asset_99e0022864a6",
+        "asset_ff08bcc52a43",
+        "asset_264e535a2f20",
+        "asset_266707a16138",
+        "asset_17e7fa30d857",
+        "asset_60289354f46f",
+        "asset_9e3a4c00b753"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:在陕西省的照片",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.3414
+    },
+    {
+      "key": "album2-13",
+      "query": "夕阳下的电线杆和农田",
+      "scope_id": "album2",
+      "category": "time",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_e2dfd2b284ee",
+        "asset_266707a16138",
+        "asset_558db3ce4925",
+        "asset_225783d8d34a",
+        "asset_fd92eabfcaa0",
+        "asset_2091b45f036a",
+        "asset_d88b01a6bf5d",
+        "asset_0209440ee553"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:夕阳下的电线杆和农田",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4165
+    },
+    {
+      "key": "album2-16",
+      "query": "鼓浪屿远眺城市天际线",
+      "scope_id": "album2",
+      "category": "location",
+      "route": "evidence",
+      "reason": "raw_message_anchor",
+      "final_reason": "probe_upgrade:2 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_778a21b401ae",
+        "asset_18d1f1e7a8ee",
+        "asset_2091b45f036a",
+        "asset_d9064c559c93",
+        "asset_fd92eabfcaa0",
+        "asset_9c25940360d0",
+        "asset_264e535a2f20",
+        "asset_558db3ce4925",
+        "asset_17e7fa30d857",
+        "asset_962b07b630d1"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:鼓浪屿远眺城市天际线",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4386
+    },
+    {
+      "key": "album2-20",
+      "query": "去听脱口秀",
+      "scope_id": "album2",
+      "category": "object",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_60289354f46f",
+        "asset_ea9a79371e76",
+        "asset_cb6230ccdb40",
+        "asset_962b07b630d1",
+        "asset_3b0e806a630b",
+        "asset_b2df2a5c6ecc",
+        "asset_1ac48ff42634",
+        "asset_313517152eb4",
+        "asset_e992f36f3ea5",
+        "asset_ee8292697136"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:去听脱口秀",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.5054
+    },
+    {
+      "key": "album3-01",
+      "query": "银色心形手镯",
+      "scope_id": "album3",
+      "category": "object",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_4e531d40f7a4",
+        "asset_f58f42e8b23d",
+        "asset_67bdd0d11303",
+        "asset_485de35d2801",
+        "asset_0280a545f1a5",
+        "asset_b4485ccadab2",
+        "asset_d310e14847e0",
+        "asset_51e83ec2d4ec",
+        "asset_1fe4bfc075b7",
+        "asset_0713f4fbfd2c"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:银色心形手镯",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4312
+    },
+    {
+      "key": "album3-05",
+      "query": "厚切炒酸奶扫码购买",
+      "scope_id": "album3",
+      "category": "object",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_1ed5778bae99",
+        "asset_f529f454c68e",
+        "asset_6a4cffb8a952",
+        "asset_aae2b3bb7534",
+        "asset_2791a7b22e91",
+        "asset_fca67a7b8518",
+        "asset_b4485ccadab2",
+        "asset_7c00744b9d68",
+        "asset_495456506662",
+        "asset_817a08b4b204"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:厚切炒酸奶扫码购买",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.439
+    },
+    {
+      "key": "album3-10",
+      "query": "餐厅卤味食材展示",
+      "scope_id": "album3",
+      "category": "location",
+      "route": "evidence",
+      "reason": "bare_noun_phrase",
+      "final_reason": "probe_upgrade:3 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_fca67a7b8518",
+        "asset_7c00744b9d68",
+        "asset_c80b10e43911",
+        "asset_388079be0d48",
+        "asset_2791a7b22e91",
+        "asset_87dfef96cc93",
+        "asset_6a4cffb8a952",
+        "asset_b4485ccadab2",
+        "asset_0f97294e5003",
+        "asset_e02acf5bf690"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:餐厅卤味食材展示",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.4404
+    },
+    {
+      "key": "album3-20",
+      "query": "在夷陵区的照片",
+      "scope_id": "album3",
+      "category": "location",
+      "route": "evidence",
+      "reason": "raw_message_anchor",
+      "final_reason": "probe_upgrade:2 channels produced candidates",
+      "parser": {
+        "mode": "none",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [],
+        "time": false,
+        "media": false,
+        "negative": false
+      },
+      "retrieved_asset_ids": [
+        "asset_0f39906a4054",
+        "asset_4b572191b278",
+        "asset_7888757e4924",
+        "asset_d9072be25301",
+        "asset_1088c9de1217",
+        "asset_69be63077cd8",
+        "asset_a66cad5a641e",
+        "asset_e398744eeb11",
+        "asset_efd4bd5ac9e7",
+        "asset_fb9f2ac848e4"
+      ],
+      "evidence_levels": [
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate",
+        "approximate"
+      ],
+      "recall_strengths": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "gaps": [
+        {
+          "condition": "semantic:在夷陵区的照片",
+          "reason": "no_direct_support"
+        }
+      ],
+      "excluded_count": 0,
+      "elapsed_s": 4.5031
+    }
+  ]
+}

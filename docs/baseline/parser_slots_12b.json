@@ -1,0 +1,434 @@
+{
+  "candidate": "12b",
+  "action_recall": 0.5455,
+  "facet_recall": 0.5,
+  "semantic_condition_recall": null,
+  "negative_recall": 1.0,
+  "date_recall": 1.0,
+  "media_recall": 0.6,
+  "invented_hard_zero": 0.9333,
+  "json_first_pass_valid": 1.0,
+  "repair_rate": 0.0,
+  "avg_parse_seconds": 62.444,
+  "mode_accuracy": 1.0,
+  "counts": {
+    "cases": 15,
+    "first_total": 15,
+    "json_first_valid": 15,
+    "repair": 0,
+    "latency_sum": 936.6599841825664
+  },
+  "cases": [
+    {
+      "query": "找一下去年春节我们拍的全家福照片",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "time"
+      ],
+      "semantic_dims": [
+        "activity"
+      ],
+      "date": true,
+      "media": true,
+      "negative": false,
+      "expected": {
+        "query": "找一下去年春节我们拍的全家福照片",
+        "mode": "evidence",
+        "actions": [
+          "return_assets"
+        ],
+        "facets": [
+          "time"
+        ],
+        "date": true,
+        "media": true,
+        "negative": false,
+        "hard": [
+          "time",
+          "media"
+        ]
+      }
+    },
+    {
+      "query": "介绍一下明哥",
+      "mode": "evidence",
+      "actions": [
+        "summarize_person"
+      ],
+      "facets": [
+        "person"
+      ],
+      "semantic_dims": [],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "介绍一下明哥",
+        "mode": "evidence",
+        "actions": [
+          "answer_question",
+          "summarize_person"
+        ],
+        "facets": [
+          "person"
+        ],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "不要视频，只要那天的照片",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "media"
+      ],
+      "semantic_dims": [],
+      "date": false,
+      "media": false,
+      "negative": true,
+      "expected": {
+        "query": "不要视频，只要那天的照片",
+        "mode": "evidence",
+        "actions": [
+          "return_assets"
+        ],
+        "facets": [],
+        "date": false,
+        "media": true,
+        "negative": true
+      }
+    },
+    {
+      "query": "2024年5月我们在厨房做晚饭的照片",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "place",
+        "time"
+      ],
+      "semantic_dims": [
+        "activity"
+      ],
+      "date": true,
+      "media": true,
+      "negative": false,
+      "expected": {
+        "query": "2024年5月我们在厨房做晚饭的照片",
+        "mode": "evidence",
+        "actions": [
+          "return_assets"
+        ],
+        "facets": [
+          "time",
+          "place",
+          "activity"
+        ],
+        "date": true,
+        "media": true,
+        "negative": false
+      }
+    },
+    {
+      "query": "那次郊游大家都穿什么",
+      "mode": "evidence",
+      "actions": [
+        "answer_question"
+      ],
+      "facets": [
+        "activity",
+        "clothing"
+      ],
+      "semantic_dims": [
+        "activity",
+        "clothing"
+      ],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "那次郊游大家都穿什么",
+        "mode": "evidence",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [
+          "activity",
+          "clothing"
+        ],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "帮我写一首关于春天的诗",
+      "mode": "none",
+      "actions": [],
+      "facets": [],
+      "semantic_dims": [],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "帮我写一首关于春天的诗",
+        "mode": "none",
+        "actions": [],
+        "facets": [],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "今天有点累",
+      "mode": "none",
+      "actions": [],
+      "facets": [],
+      "semantic_dims": [],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "今天有点累",
+        "mode": "none",
+        "actions": [],
+        "facets": [],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "解释一下量子纠缠",
+      "mode": "none",
+      "actions": [
+        "answer_question"
+      ],
+      "facets": [],
+      "semantic_dims": [],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "解释一下量子纠缠",
+        "mode": "none",
+        "actions": [],
+        "facets": [],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "把去年拍的照片都给我，不要视频",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "media",
+        "time"
+      ],
+      "semantic_dims": [],
+      "date": true,
+      "media": true,
+      "negative": true,
+      "expected": {
+        "query": "把去年拍的照片都给我，不要视频",
+        "mode": "evidence",
+        "actions": [
+          "return_assets"
+        ],
+        "facets": [
+          "time"
+        ],
+        "date": true,
+        "media": true,
+        "negative": true
+      }
+    },
+    {
+      "query": "泳池里那个孩子拍水花的画面",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "activity",
+        "visual"
+      ],
+      "semantic_dims": [
+        "activity"
+      ],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "泳池里那个孩子拍水花的画面",
+        "mode": "evidence",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [
+          "place",
+          "object",
+          "visual"
+        ],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "比较一下明哥和小黑去年谁去的公园多",
+      "mode": "evidence",
+      "actions": [
+        "answer_question",
+        "compare"
+      ],
+      "facets": [
+        "person",
+        "place",
+        "time"
+      ],
+      "semantic_dims": [
+        "activity"
+      ],
+      "date": true,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "比较一下明哥和小黑去年谁去的公园多",
+        "mode": "evidence",
+        "actions": [
+          "compare"
+        ],
+        "facets": [
+          "person",
+          "place"
+        ],
+        "date": true,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "这家人有没有养狗的照片",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "activity",
+        "media"
+      ],
+      "semantic_dims": [
+        "activity"
+      ],
+      "date": false,
+      "media": true,
+      "negative": false,
+      "expected": {
+        "query": "这家人有没有养狗的照片",
+        "mode": "evidence",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [
+          "object"
+        ],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "上次说的那件黄色的外套在哪张照片里",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "clothing"
+      ],
+      "semantic_dims": [
+        "clothing"
+      ],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "上次说的那件黄色的外套在哪张照片里",
+        "mode": "evidence",
+        "actions": [
+          "answer_question",
+          "return_assets"
+        ],
+        "facets": [
+          "clothing",
+          "time"
+        ],
+        "date": false,
+        "media": true,
+        "negative": false
+      }
+    },
+    {
+      "query": "不用查我的记忆，随便聊聊",
+      "mode": "none",
+      "actions": [],
+      "facets": [],
+      "semantic_dims": [],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "不用查我的记忆，随便聊聊",
+        "mode": "none",
+        "actions": [],
+        "facets": [],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    },
+    {
+      "query": "把所有关于厨房的记录都列出来",
+      "mode": "evidence",
+      "actions": [
+        "return_assets"
+      ],
+      "facets": [
+        "semantic"
+      ],
+      "semantic_dims": [
+        "place"
+      ],
+      "date": false,
+      "media": false,
+      "negative": false,
+      "expected": {
+        "query": "把所有关于厨房的记录都列出来",
+        "mode": "evidence",
+        "actions": [
+          "answer_question"
+        ],
+        "facets": [
+          "place"
+        ],
+        "date": false,
+        "media": false,
+        "negative": false
+      }
+    }
+  ]
+}
