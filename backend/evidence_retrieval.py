@@ -366,7 +366,10 @@ class EvidenceRetrievalKernel:
             return ("matched", "asset_metadata", asset.get("id"), 1.0) if asset.get("media_type") == value else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
         if constraint.dimension == "person":
             # people entries may be plain names OR confirmed-entity dicts
-            # ({entity_id, name, status}).  A confirmed bridge must match both.
+            # ({entity_id, name, status}).  A confirmed bridge must match both,
+            # and also observations linked to the confirmed person via
+            # entity_mentions (the benchmark observations carry the person only
+            # as a mention, not in the people text field).
             names, entity_ids = set(), set()
             for entry in observation.get("people") or []:
                 if isinstance(entry, dict):
@@ -377,6 +380,8 @@ class EvidenceRetrievalKernel:
                 else:
                     names.add(str(entry))
             if value in names or value in entity_ids:
+                return ("matched", "confirmed_bridge", observation.get("id"), 1.0)
+            if self._observation_has_confirmed_person(observation.get("id"), value):
                 return ("matched", "confirmed_bridge", observation.get("id"), 1.0)
             return ("unknown", None, None, 0.0)
         if constraint.dimension in self._OPEN_WORLD_LIST_DIMENSIONS:
@@ -389,6 +394,22 @@ class EvidenceRetrievalKernel:
         # caption + labels.  A miss is unknown; we never contradict from a
         # generic keyword pool.
         return self._evaluate_semantic_pool(observation, constraint)
+
+    def _observation_has_confirmed_person(self, observation_id, name):
+        """True when an observation carries an entity_mention to a confirmed
+        person whose canonical name matches (benchmark person linkage lives in
+        entity_mentions, not the people text field)."""
+        if not observation_id or self.store is None:
+            return False
+        try:
+            for mention in self.store.entity_mentions_for_observation(observation_id):
+                entity = self.store.get_entity(mention["entity_id"])
+                if entity and entity.get("status") == "confirmed" \
+                        and entity.get("canonical_name") == name:
+                    return True
+        except Exception:
+            return False
+        return False
 
     @staticmethod
     def _evaluate_open_world(observation, constraint):

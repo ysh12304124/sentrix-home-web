@@ -1190,6 +1190,11 @@ class MemoryStore:
             self.rebuild_person_memory(item["entity_id"])
         return self.get_observation(observation_id)
 
+    def entity_mentions_for_observation(self, observation_id):
+        """Entity mentions for an observation (Phase 12B-FC person bridging)."""
+        return self._rows("SELECT entity_id, confidence FROM entity_mentions WHERE observation_id = ?",
+                          (observation_id,))
+
     def list_observations(self, limit=100, scope_id=None):
         if scope_id:
             rows = self._rows("SELECT * FROM observations WHERE scope_id = ? ORDER BY created_at DESC LIMIT ?", (scope_id, limit))
