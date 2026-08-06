@@ -179,7 +179,7 @@ def main():
         hits["invented"] += int(invented == 0)
 
         rows.append({
-            "query": query, "mode": draft.mode, "actions": got_actions,
+            "query": query, "mode": draft.mode, "actions": sorted(got_actions),
             "facets": sorted(_facet_dims(draft)), "semantic_dims": sorted(_semantic_dims(draft)),
             "date": _draft_has_date(draft), "media": _draft_has_media(draft),
             "negative": _draft_has_negative(draft), "expected": case,
