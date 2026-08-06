@@ -115,6 +115,12 @@ class ThinAgentRuntime:
         # request's budget, never shrink it.
         if self.router is not None:
             self.router.deadline = RequestDeadline()
+        from .validation import full_chain_profile as _prof
+        from .validation import model_call_ledger as _ledger
+        from .validation import assertions as _assert
+        v_active = _prof.validation_active()
+        if v_active:
+            _ledger.begin_turn()
         trace_on = os.getenv("SENTRIX_AGENT_STAGE_TRACE", "0").lower() in {"1", "true", "on"}
         if trace_on:
             _Perf.begin()
@@ -125,6 +131,8 @@ class ThinAgentRuntime:
         except Exception:
             if trace_on:
                 _Perf.end()
+            if v_active:
+                _ledger.end_turn()
             raise
         if trace_on:
             perf = _Perf.end()
@@ -138,6 +146,13 @@ class ThinAgentRuntime:
             counts["claim"] = perf.get("claim_calls", 0)
             perf["model_calls"] = counts
             result["perf"] = perf
+        if v_active:
+            records = _ledger.end_turn()
+            required = os.getenv("SENTRIX_PARSE_MODEL", "") or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+            parser_failed = (result.get("perf") or {}).get("degraded", 0) > 0
+            result["validation"] = _assert.validate_turn(
+                records, [], required_model=required, parser_failed=parser_failed)
+            result["model_call_ledger"] = records
         return result
 
     def _answer_turn_inner(self, message, conversation_id=None, feedback=None, scope_id=None, viewer_id=None, recent_turns="", selected_entity_id=None):
@@ -153,6 +168,10 @@ class ThinAgentRuntime:
             return self._normal_chat(message, recent_turns, conversation_id, scope_id, viewer_id, fast, empty_draft)
         with _Perf.measure("parser"):
             draft = self.parser.parse(message, recent_turns=recent_turns)
+        if getattr(draft, "parser_failed", False):
+            # 12B-FC: a parser failure (timeout/degradation) is recorded so the
+            # validation block can mark the case failed_due_to_degradation.
+            _Perf.count("degraded")
         focus = self._load_focus(conversation_id, scope_id)
         with _Perf.measure("router"):
             decision = self._router.route(

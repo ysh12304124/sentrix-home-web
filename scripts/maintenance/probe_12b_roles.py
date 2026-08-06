@@ -30,12 +30,12 @@ MODEL = os.getenv("SENTRIX_PARSE_MODEL", "gemma4:12b")
 # Role -> (json_mode, prompt).  These are structural sentrix-role probes, not
 # the full production prompts — they verify the 12B can PERFORM each role.
 ROLE_PROBES = {
-    "parser": (True, "你是 Sentrix 查询解析器。把用户消息解析为 QueryParseDraft JSON（含 mode/actions/facets/time/media），只输出 JSON。用户消息：2024年5月厨房里做晚饭的照片"),
+    "parser": (True, "你是 Sentrix 查询解析器。把用户消息解析为 QueryParseDraft JSON（含 mode/actions/facets/time/media），只输出 JSON。用户消息：去年十月全家去爬山时拍的那张合影"),
     "answer": (False, "你是 Sentrix，一个自然、克制的家庭数字助手。用户：今天感觉怎么样？请直接自然回答，不要提到数据库、检索或工具。"),
-    "evidence_answer": (False, "你是 Sentrix。以下是你记忆里的证据：有一条照片记录，地点厨房，时间2024年5月，活动做晚饭（确定）；衣物颜色无法确认。用户问：2024年5月厨房里做了什么？只用证据回答，明确确定项和无法确认项。"),
+    "evidence_answer": (False, "你是 Sentrix。以下是你记忆里的证据：有一条照片记录，地点厨房，时间去年五月，活动做晚饭（确定）；衣物颜色无法确认。用户问：去年五月厨房里做了什么？只用证据回答，明确确定项和无法确认项。"),
     "writer": (False, "你是 Sentrix 人物总结 Writer。人物：明哥。记录：多次出现在厨房做饭（确定）、去过公园（确定）、性格是否外向（未知）。写一段自然的人物介绍，不新增任何事实。"),
     "claim": (True, "你是 Claim 提取器。从下面文本提取所有家庭主张（含否定和未知），输出 JSON claims 数组（每项 text/intended_type）。文本：明哥去年在厨房做过晚饭，但不确定他是否喜欢做饭；他没有去过北京。"),
-    "verifier": (True, "你是 Verifier。对每条 claim 根据 canonical evidence 判断 supported/unsupported，输出 JSON（claim_id/status/reason）。claims:[{id:c1,text:明哥在厨房做过晚饭}],evidence:[{id:e1,text:2024年5月厨房做晚饭照片记录}]"),
+    "verifier": (True, "你是 Verifier。对每条 claim 根据 canonical evidence 判断 supported/unsupported，输出 JSON（claim_id/status/reason）。claims:[{id:c1,text:明哥在厨房做过晚饭}],evidence:[{id:e1,text:去年五月厨房做晚饭照片记录}]"),
     "repairer": (True, "你是 Repairer。下面 claim 过度断言，只局部降低断言强度，不整段重写，输出 JSON（revised_text/reason）。claim：明哥每天都做饭。证据只支持他做过几次。"),
 }
 

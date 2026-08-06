@@ -143,15 +143,32 @@ class ModelRouter:
         """Call the role's model with deadline + breaker.
 
         ``fallback`` is a zero-arg callable returning the deterministic result
-        when the role is tripped or the phase budget is exhausted.
+        when the role is tripped or the phase budget is exhausted.  Under the
+        12B full-chain validation profile, fallback is forbidden and every call
+        emits a ModelCallRecord proving the actual model.
         """
+        from .validation import full_chain_profile as _prof
+        from .validation import model_call_ledger as _ledger
+        v_active = _prof.validation_active()
+        trace_req = _prof.require_model_trace()
+        no_fb = _prof.no_fallback()
+
         if not self.gamma or not hasattr(self.gamma, "chat"):
-            return fallback() if fallback else None
-        if self.breaker.is_tripped(role):
-            return fallback() if fallback else None
+            return fallback() if (fallback and not no_fb) else None
+        # Validation: the breaker is treated as closed (no skipping 12B calls).
+        tripped = False if (v_active and trace_req) else self.breaker.is_tripped(role)
+        if tripped:
+            return fallback() if (fallback and not no_fb) else None
         available = self.deadline.phase_available(role)
         if available <= 0:
-            return fallback() if fallback else None
+            return fallback() if (fallback and not no_fb) else None
+
+        record = None
+        if v_active and trace_req:
+            spec = self.specs.get(role)
+            record = _ledger.new_call(role, spec.model if spec else "",
+                                      getattr(self.gamma, "base_url", ""))
+            record["input_size"] = len(prompt)
         original_timeout = getattr(self.gamma, "timeout", None)
         if original_timeout:
             self.gamma.timeout = max(0.1, available)
@@ -159,9 +176,15 @@ class ModelRouter:
             result = self.gamma.chat(prompt, json_mode=json_mode, role=role)
             self.breaker.record_success(role)
             return result
-        except Exception:
+        except Exception as exc:
             self.breaker.record_failure(role)
-            return fallback() if fallback else None
+            if record is not None:
+                record["fallback_used"] = bool(fallback and not no_fb)
+                record["circuit_breaker_state"] = "tripped" if self.breaker.is_tripped(role) else "closed"
+                record["error"] = str(exc)[:200]
+            return fallback() if (fallback and not no_fb) else None
         finally:
+            if record is not None:
+                _ledger.finish_call()
             if original_timeout:
                 self.gamma.timeout = original_timeout

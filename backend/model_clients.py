@@ -302,9 +302,33 @@ class GammaClient:
             response = httpx.post(f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
-            return data.get("message", {}).get("content", "")
+            text = data.get("message", {}).get("content", "")
+            self._record_validation_call(role, endpoint_base, model, json_mode, text)
+            return text
         except (httpx.HTTPError, ValueError) as error:
             raise ModelError(f"gamma request failed: {error}") from error
+
+    def _record_validation_call(self, role, endpoint_base, model, json_mode, text):
+        """Write the actual model into the ModelCallLedger (12B-FC V2).
+
+        Handles both ModelRouter-mediated calls (a record already exists) and
+        direct gamma.chat calls (writer/claim/verify) by creating the record.
+        """
+        from .validation import full_chain_profile as _prof
+        from .validation import model_call_ledger as _ledger
+        if not (_prof.validation_active() and _prof.require_model_trace()):
+            return
+        expected = {
+            "parser": self.parse_model, "answer": self.answer_model,
+            "verify": self.verify_model, "claim": self.claim_model,
+            "repair": self.repair_model,
+        }.get(role, self.model)
+        record = _ledger.active_record()
+        if record is None:
+            record = _ledger.new_call(role or "unknown", expected, endpoint_base)
+            record["input_size"] = 0
+        _ledger.record_response(text, actual_model=model, endpoint=endpoint_base,
+                                json_mode=json_mode)
 
     def _core_vision_options(self):
         return {
