@@ -207,6 +207,49 @@ def run(store, cases, spec_source, parser=None, top_k=20, include=None, limit=No
     return results
 
 
+def run_dev(store, dev_cases, *, channels="full_hybrid", top_k=20):
+    """Grade the independent Development Set (Phase R8-2).
+
+    Dev cases carry ``query_cn``, ``exact`` (asset ids already resolved) and
+    ``empty_policy``; scope is derived from the first exact asset so no
+    benchmark-file resolution is involved.
+    """
+    embedding_router = _make_embedding_router()
+    kernel = _build_kernel(store, channels, embedding_router)
+    results = []
+    for index, case in enumerate(dev_cases):
+        query = case.get("query_cn") or ""
+        truth_ids = [str(item) for item in (case.get("exact") or [])]
+        acceptable = {str(item) for item in (case.get("acceptable_approximate") or [])}
+        scope_id = case.get("scope_id")
+        if not scope_id and truth_ids:
+            asset = store.get_asset(truth_ids[0])
+            if asset:
+                scope_id = asset.get("scope_id")
+        from backend.query_contracts import QueryParseDraft, build_query_spec
+        draft = QueryParseDraft(intent="answer", answer_target="general")
+        draft.semantic_conditions.append({"dimension": "semantic", "value": query, "source_text": query})
+        spec = build_query_spec(draft, scope_id=scope_id or "home-default", viewer_id="owner",
+                                conversation_id=f"dev_{index}", query_id=f"dev_{index}")
+        start = time.perf_counter()
+        packet = kernel.retrieve(spec)
+        ranked = _ranked_asset_ids(packet)
+        grade = _grade(_dev_case_shell(case), ranked, truth_ids, packet)
+        grade["latency_s"] = round(time.perf_counter() - start, 4)
+        grade["empty_policy"] = case.get("empty_policy", "allow_approximate")
+        grade["category"] = case.get("category")
+        grade["acceptable_hits"] = sorted(acceptable & set(ranked))
+        # strict-empty: any returned asset that is NOT an acceptable approximate is an FP.
+        if case.get("empty_policy") == "strict_empty" and not truth_ids:
+            grade["strict_empty_fp"] = len([aid for aid in ranked if aid not in acceptable])
+        results.append(grade)
+    return results
+
+
+def _dev_case_shell(case):
+    return {"key": case.get("key", "dev"), "query_cn": case.get("query_cn") or ""}
+
+
 def _aggregate(results):
     if not results:
         return {"total": 0}
@@ -224,6 +267,7 @@ def _aggregate(results):
         "precision_at_5": _avg("precision_at_5"),
         "all_relevant_count": sum(1 for item in results if item["all_relevant"]),
         "empty_gt_fp_count": sum(1 for item in results if item["empty_gt_fp"]),
+        "strict_empty_fp_count": sum(item.get("strict_empty_fp", 0) for item in results),
         "hard_violation_count": sum(item["hard_violation"] for item in results),
         "avg_latency_s": round(sum(item["latency_s"] for item in results) / n, 4),
     }
@@ -249,6 +293,7 @@ def main():
     parser.add_argument("--channels", default="full_hybrid",
                         help="lexical|visual|text|structured|hybrid_no_adjacency|full_hybrid (pre-R2 all map to current kernel)")
     parser.add_argument("--exclude-hidden", default=None, help="path to hidden_set_manifest.json to exclude hidden keys from grading")
+    parser.add_argument("--dev-set", default=None, help="path to development_set.json to grade the independent Dev Set")
     parser.add_argument("--report", default=None, help="write JSON report to this path")
     args = parser.parse_args()
 
@@ -256,6 +301,22 @@ def main():
     from backend.db import MemoryStore
 
     store = MemoryStore(args.db)
+    if args.dev_set:
+        dev_cases = json.loads(Path(args.dev_set).read_text(encoding="utf-8"))["cases"]
+        print(f"[eval] Dev Set: {len(dev_cases)} cases, channels={args.channels}")
+        results = run_dev(store, dev_cases, channels=args.channels, top_k=args.top_k)
+        store.close()
+        summary = _aggregate(results)
+        payload = {"summary": summary, "dataset": "development", "channels": args.channels, "cases": results}
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        if args.report:
+            Path(args.report).write_text(text, encoding="utf-8")
+            print(f"wrote {args.report}")
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+        else:
+            print(text)
+        return
+
     cases = _load_cases(args.samples_root)
     print(f"[eval] {len(cases)} cases, spec-source={args.spec_source}, channels={args.channels}")
     parser_obj = None
