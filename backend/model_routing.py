@@ -27,7 +27,17 @@ CLAIM = "claim"
 REPAIR = "repair"
 ROLES = (PARSER, ANSWER, VERIFY, CLAIM, REPAIR)
 
-DEFAULT_PHASE_BUDGETS = {PARSER: 4.0, "retrieval": 5.0, ANSWER: 7.0, "overhead": 2.0}
+# 12B-FC: the parser budget is raised for the 12B parser (GPU warm ~4s through
+# the full prompt; the old 4s cap made it time out and trip the breaker).  Still
+# inside the 20s API deadline.  Overridable via SENTRIX_PARSER_BUDGET.
+DEFAULT_PHASE_BUDGETS = {PARSER: 8.0, "retrieval": 5.0, ANSWER: 7.0, "overhead": 2.0}
+
+
+def _parser_budget():
+    try:
+        return float(os.environ.get("SENTRIX_PARSER_BUDGET", str(DEFAULT_PHASE_BUDGETS[PARSER])))
+    except (TypeError, ValueError):
+        return DEFAULT_PHASE_BUDGETS[PARSER]
 
 
 @dataclass(frozen=True)
@@ -75,6 +85,7 @@ class RequestDeadline:
     phase_budgets: dict = field(default_factory=lambda: dict(DEFAULT_PHASE_BUDGETS))
 
     def __post_init__(self):
+        self.phase_budgets[PARSER] = _parser_budget()
         self._started = time.monotonic()
 
     def remaining(self) -> float:
