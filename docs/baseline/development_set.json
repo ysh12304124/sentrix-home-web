@@ -1,0 +1,536 @@
+{
+  "schema_version": 1,
+  "seed": 20260806,
+  "total": 45,
+  "category_counts": {
+    "activity": 6,
+    "place": 6,
+    "person": 5,
+    "visual_object": 5,
+    "color_material": 4,
+    "scene": 3,
+    "time": 5,
+    "bare_phrase": 2,
+    "composite": 2,
+    "strict_empty": 4,
+    "allow_approximate": 2,
+    "all_relevant": 1
+  },
+  "cases": [
+    {
+      "key": "dev_a00",
+      "category": "activity",
+      "query_cn": "搅拌的照片",
+      "exact": [
+        "asset_f40c92e1fdbf"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "activity paraphrase 搅拌面糊->搅拌"
+    },
+    {
+      "key": "dev_a01",
+      "category": "activity",
+      "query_cn": "春日的照片",
+      "exact": [
+        "asset_0871198e179f"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "activity paraphrase 春日花朵盛开->春日"
+    },
+    {
+      "key": "dev_a02",
+      "category": "activity",
+      "query_cn": "正在的照片",
+      "exact": [
+        "asset_fa1119a247e7"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "activity paraphrase 正在搅拌混合物->正在"
+    },
+    {
+      "key": "dev_a03",
+      "category": "activity",
+      "query_cn": "烹饪的照片",
+      "exact": [
+        "asset_63fc55938f89"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "activity paraphrase 烹饪食物->烹饪"
+    },
+    {
+      "key": "dev_a04",
+      "category": "activity",
+      "query_cn": "室内的照片",
+      "exact": [
+        "asset_14ee6f6b0012",
+        "asset_df6d770b3097"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "activity paraphrase 室内陈设展示->室内"
+    },
+    {
+      "key": "dev_a05",
+      "category": "activity",
+      "query_cn": "佩戴的照片",
+      "exact": [
+        "asset_b983cee1a399"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "activity paraphrase 佩戴手部饰品->佩戴"
+    },
+    {
+      "key": "dev_p06",
+      "category": "place",
+      "query_cn": "在厨房台面的照片",
+      "exact": [
+        "asset_dcd4bb960cfa",
+        "asset_f40c92e1fdbf",
+        "asset_fa1119a247e7"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "place 厨房台面"
+    },
+    {
+      "key": "dev_p07",
+      "category": "place",
+      "query_cn": "在户外树林的照片",
+      "exact": [
+        "asset_0871198e179f"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "place 户外树林"
+    },
+    {
+      "key": "dev_p08",
+      "category": "place",
+      "query_cn": "在餐饮空间的照片",
+      "exact": [
+        "asset_3adfafc4a8e0",
+        "asset_4e70ed4b2e5d",
+        "asset_5cd5f4558e73",
+        "asset_63fc55938f89",
+        "asset_78204b19e4e3",
+        "asset_7d7bc0063285",
+        "asset_a4db5be65f11",
+        "asset_e77f1da54265"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "place 餐饮空间"
+    },
+    {
+      "key": "dev_p09",
+      "category": "place",
+      "query_cn": "在室内空间的照片",
+      "exact": [
+        "asset_00963470eaa1",
+        "asset_133f82661920",
+        "asset_357a22e6f33e",
+        "asset_368e1000670b",
+        "asset_3d8e2b22f9a5",
+        "asset_4e71714f6a53",
+        "asset_75048683f645",
+        "asset_75519cc4dede",
+        "asset_83dd8ba08c43",
+        "asset_9a6b5f394085",
+        "asset_c47ac4e666da",
+        "asset_df6d770b3097"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "place 室内空间"
+    },
+    {
+      "key": "dev_p10",
+      "category": "place",
+      "query_cn": "在室内环境的照片",
+      "exact": [
+        "asset_108131712e3b",
+        "asset_10ab2f9fffa5",
+        "asset_1ac48ff42634",
+        "asset_1d077c5aa758",
+        "asset_203b5b507c95",
+        "asset_21cfcd1ca2a2",
+        "asset_30dfa9f20d3f",
+        "asset_3404e945a46d",
+        "asset_44a083bfa547",
+        "asset_4e531d40f7a4",
+        "asset_520b43d8062d",
+        "asset_60e98426b908",
+        "asset_66720cd4c0cc",
+        "asset_6fcdcc9d6548",
+        "asset_76b5db160523",
+        "asset_9bd6488150d1",
+        "asset_9c6f3057da6b",
+        "asset_a7623f3817e6",
+        "asset_b983cee1a399",
+        "asset_c6ed3c7d6c14",
+        "asset_db038bfce9a2",
+        "asset_dc46bfea43af",
+        "asset_f485a192f03d",
+        "asset_f58f42e8b23d",
+        "asset_f6fd1e296f37",
+        "asset_f8fc72554946",
+        "asset_fee31ca1ea99"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "place 室内环境"
+    },
+    {
+      "key": "dev_p11",
+      "category": "place",
+      "query_cn": "在室内的照片",
+      "exact": [
+        "asset_011f95533150",
+        "asset_35ee5f073328",
+        "asset_4800d7986be7",
+        "asset_5bff077897c4",
+        "asset_ff34f10b39c3"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "place 室内"
+    },
+    {
+      "key": "dev_m12",
+      "category": "person",
+      "query_cn": "一只手的照片",
+      "exact": [
+        "asset_32b0035e288b",
+        "asset_7ed0e3f34a4c",
+        "asset_e0f63cc382f4",
+        "asset_fa1119a247e7"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "person 一只手"
+    },
+    {
+      "key": "dev_m13",
+      "category": "person",
+      "query_cn": "人手的照片",
+      "exact": [
+        "asset_4800d7986be7",
+        "asset_6fcdcc9d6548",
+        "asset_b983cee1a399"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "person 人手"
+    },
+    {
+      "key": "dev_m14",
+      "category": "person",
+      "query_cn": "人的照片",
+      "exact": [
+        "asset_35ee5f073328",
+        "asset_d05267995367"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "person 人"
+    },
+    {
+      "key": "dev_m15",
+      "category": "person",
+      "query_cn": "摊贩的照片",
+      "exact": [
+        "asset_8191471874fe"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "person 摊贩"
+    },
+    {
+      "key": "dev_m16",
+      "category": "person",
+      "query_cn": "顾客的照片",
+      "exact": [
+        "asset_2e68806be41d",
+        "asset_32e246662d1c",
+        "asset_afdeda2c041c"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "person 顾客"
+    },
+    {
+      "key": "dev_o17",
+      "category": "visual_object",
+      "query_cn": "找碗的照片",
+      "exact": [
+        "asset_f40c92e1fdbf"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "object 碗"
+    },
+    {
+      "key": "dev_o18",
+      "category": "visual_object",
+      "query_cn": "找樱花的照片",
+      "exact": [
+        "asset_0871198e179f"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "object 樱花"
+    },
+    {
+      "key": "dev_o19",
+      "category": "visual_object",
+      "query_cn": "找搅拌碗的照片",
+      "exact": [
+        "asset_fa1119a247e7"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "object 搅拌碗"
+    },
+    {
+      "key": "dev_o20",
+      "category": "visual_object",
+      "query_cn": "找肉丸的照片",
+      "exact": [
+        "asset_63fc55938f89"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "object 肉丸"
+    },
+    {
+      "key": "dev_o21",
+      "category": "visual_object",
+      "query_cn": "找吊灯的照片",
+      "exact": [
+        "asset_df6d770b3097"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "object 吊灯"
+    },
+    {
+      "key": "dev_c22",
+      "category": "color_material",
+      "query_cn": "黄色液体的物件",
+      "exact": [
+        "asset_fa1119a247e7"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "color 黄色液体"
+    },
+    {
+      "key": "dev_c23",
+      "category": "color_material",
+      "query_cn": "白色表面的物件",
+      "exact": [
+        "asset_431171af141b"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "color 白色表面"
+    },
+    {
+      "key": "dev_c24",
+      "category": "color_material",
+      "query_cn": "毛绒玩具的物件",
+      "exact": [
+        "asset_48a7426edc06"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "color 毛绒玩具"
+    },
+    {
+      "key": "dev_c25",
+      "category": "color_material",
+      "query_cn": "绿色叶子的物件",
+      "exact": [
+        "asset_ff9391237222"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "color 绿色叶子"
+    },
+    {
+      "key": "dev_s26",
+      "category": "scene",
+      "query_cn": "街道场景的照片",
+      "exact": [
+        "asset_227e62579bc5"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "scene 街道"
+    },
+    {
+      "key": "dev_s27",
+      "category": "scene",
+      "query_cn": "海边场景的照片",
+      "exact": [
+        "asset_73ca1d70b8ae"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "scene 海边"
+    },
+    {
+      "key": "dev_s28",
+      "category": "scene",
+      "query_cn": "山顶场景的照片",
+      "exact": [
+        "asset_0626efb77c5f"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "scene 山顶"
+    },
+    {
+      "key": "dev_t29",
+      "category": "time",
+      "query_cn": "2020 年 2 月的照片",
+      "exact": [
+        "asset_f40c92e1fdbf",
+        "asset_20bd6c067b4c"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "2020-2"
+    },
+    {
+      "key": "dev_t30",
+      "category": "time",
+      "query_cn": "2019 年 3 月的照片",
+      "exact": [
+        "asset_0871198e179f",
+        "asset_fa1119a247e7",
+        "asset_4a1511869842",
+        "asset_495456506662"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "2019-3"
+    },
+    {
+      "key": "dev_t31",
+      "category": "time",
+      "query_cn": "2026 年 7 月的照片",
+      "exact": [
+        "asset_63fc55938f89",
+        "asset_de6d76e799bf",
+        "asset_ae96c182b4cc",
+        "asset_c80b10e43911",
+        "asset_71e22de9fd57",
+        "asset_0713f4fbfd2c"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "2026-7"
+    },
+    {
+      "key": "dev_t32",
+      "category": "time",
+      "query_cn": "2018 年 11 月的照片",
+      "exact": [
+        "asset_df6d770b3097",
+        "asset_13be7ec29ae6"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "2018-11"
+    },
+    {
+      "key": "dev_t33",
+      "category": "time",
+      "query_cn": "2018 年 10 月的照片",
+      "exact": [
+        "asset_b983cee1a399",
+        "asset_4e531d40f7a4"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "2018-10"
+    },
+    {
+      "key": "dev_b34",
+      "category": "bare_phrase",
+      "query_cn": "碗",
+      "exact": [
+        "asset_f40c92e1fdbf"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "bare 碗"
+    },
+    {
+      "key": "dev_b35",
+      "category": "bare_phrase",
+      "query_cn": "樱花",
+      "exact": [
+        "asset_0871198e179f"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "bare 樱花"
+    },
+    {
+      "key": "dev_x36",
+      "category": "composite",
+      "query_cn": "无在厨房台面搅拌面糊的照片",
+      "exact": [
+        "asset_f40c92e1fdbf"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "person+place+activity"
+    },
+    {
+      "key": "dev_x37",
+      "category": "composite",
+      "query_cn": "一只手在厨房台面正在搅拌混合物的照片",
+      "exact": [
+        "asset_fa1119a247e7"
+      ],
+      "empty_policy": "strict_empty",
+      "note": "person+place+activity"
+    },
+    {
+      "key": "dev_e38",
+      "category": "strict_empty",
+      "query_cn": "找红色直升机",
+      "exact": [],
+      "empty_policy": "strict_empty",
+      "note": "synthetic absent 红色直升机"
+    },
+    {
+      "key": "dev_e39",
+      "category": "strict_empty",
+      "query_cn": "找蓝色钢琴",
+      "exact": [],
+      "empty_policy": "strict_empty",
+      "note": "synthetic absent 蓝色钢琴"
+    },
+    {
+      "key": "dev_e40",
+      "category": "strict_empty",
+      "query_cn": "找紫色长颈鹿",
+      "exact": [],
+      "empty_policy": "strict_empty",
+      "note": "synthetic absent 紫色长颈鹿"
+    },
+    {
+      "key": "dev_e41",
+      "category": "strict_empty",
+      "query_cn": "找金色雪橇",
+      "exact": [],
+      "empty_policy": "strict_empty",
+      "note": "synthetic absent 金色雪橇"
+    },
+    {
+      "key": "dev_q42",
+      "category": "allow_approximate",
+      "query_cn": "搅拌面糊的场景",
+      "exact": [],
+      "acceptable_approximate": [
+        "asset_f40c92e1fdbf"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "near activity"
+    },
+    {
+      "key": "dev_q43",
+      "category": "allow_approximate",
+      "query_cn": "春日花朵盛开的场景",
+      "exact": [],
+      "acceptable_approximate": [
+        "asset_0871198e179f"
+      ],
+      "empty_policy": "allow_approximate",
+      "note": "near activity"
+    },
+    {
+      "key": "dev_r44",
+      "category": "all_relevant",
+      "query_cn": "所有搅拌面糊的照片",
+      "exact": [
+        "asset_f40c92e1fdbf"
+      ],
+      "all_relevant": true,
+      "empty_policy": "strict_empty",
+      "note": "all 搅拌面糊"
+    }
+  ]
+}

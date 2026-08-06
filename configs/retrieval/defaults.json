@@ -1,0 +1,52 @@
+{
+  "schema_version": 2,
+  "multi_retriever": true,
+  "channels": {
+    "metadata": true,
+    "entity": true,
+    "lexical": true,
+    "visual": true,
+    "text": true,
+    "adjacency": false
+  },
+  "ranking_strategy": "visual_backbone",
+  "fusion": "rrf",
+  "recall": {
+    "top_k": 20,
+    "probe_top_k": 5,
+    "oversample_factor": 4
+  },
+  "adjacency": {
+    "max_seeds": 8,
+    "per_seed_budget": 6,
+    "event": 4,
+    "batch": 2,
+    "time_window_minutes": 120
+  },
+  "matched_source_types": [
+    "asset_metadata",
+    "observation_field_exact",
+    "entity_bridge_confirmed",
+    "ocr_exact",
+    "subject_binding"
+  ],
+  "near_duplicate": {
+    "method": "sha256_first",
+    "clip_cosine_threshold": 0.98
+  },
+  "probe": {
+    "minimum_channels_agreement": 2,
+    "per_space": {
+      "visual": {"minimum": 0.0, "margin": 0.0},
+      "text": {"minimum": 0.0, "margin": 0.0},
+      "lexical": {"minimum_rank_score": 0.0}
+    }
+  },
+  "approximate": {
+    "min_score": 0.15,
+    "anchor_multiplier": 1.5,
+    "max_count": 20,
+    "difference_explanation_required": true
+  },
+  "deadline_seconds": 20
+}

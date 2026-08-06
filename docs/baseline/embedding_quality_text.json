@@ -1,0 +1,11 @@
+{
+  "embedder": "clip",
+  "text_retrieval": {
+    "count": 600,
+    "recall@1": 0.67,
+    "recall@5": 0.85,
+    "recall@10": 0.9217,
+    "mrr": 0.7501,
+    "auc": 0.9956
+  }
+}

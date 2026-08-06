@@ -1,0 +1,32 @@
+{
+  "phase": "V3",
+  "generated_at": "2026-08-06",
+  "confirmed_persons": [
+    {"canonical_name": "明哥", "entity_id": "entity_ba91871b4d17", "scope_id": "album2",
+     "event_count": 5, "shared_with": ["我"]},
+    {"canonical_name": "我", "entity_id": "entity_c40fedf84246", "scope_id": "album2",
+     "event_count": 9, "shared_with": ["明哥"]}
+  ],
+  "observation_scopes": {
+    "album2_e2b": 31,
+    "album3_e2b": 69,
+    "album1/album2/album3": 0
+  },
+  "key_finding": "Observations live in albumN_e2b scopes, NOT album1/2/3. Confirmed entities are in album2. Person-chain queries must target album2_e2b (or albumN_e2b) to retrieve evidence; scope album2 has 0 observations -> gap.",
+  "ming_e_events": [
+    {"event_id": "evt_3012242d373d", "summary": "我、明哥在户外或室内地面参与侧卧合影"},
+    {"event_id": "evt_450cd5fa7109", "summary": "我、明哥在剧院或体育场内参与两人面对镜头微笑、在看演出或活动、在看台"},
+    {"event_id": "evt_5cba4fe53855", "summary": "我、明哥在室内公共场所参与面对镜头微笑拍照"},
+    {"event_id": "evt_66ff14abc338", "summary": "我、明哥在户外公园或草地参与展示在展柜中、正在喝奶茶、两人面对镜头微"},
+    {"event_id": "evt_c3ecdfdd3236", "summary": "我、明哥在地铁或公交车内参与正在自拍、在地铁上乘车"}
+  ],
+  "shared_appearances": "明哥与我在全部 5 个事件中同框（合影/剧院/拍照/公园喝奶茶/地铁自拍）——满足 §6.2 关系/共同出现要求。",
+  "time_ranges": "多事件分布于不同 captured_at（未逐一核对）；V4 前确认至少 2 个时间段。",
+  "person_chain_prerequisites_for_v4": [
+    "scope 必须用 album2_e2b（观察数据所在），非 album2",
+    "8092 验证实例需设 SENTRIX_LLM_CLAIM_EXTRACTOR_V1=1 以启用 ComplexAnswerBuilder（当前未设 → 复杂链未触发，实际 roles 只有 parser）",
+    "需确认 12B parser 对'介绍一下明哥'产出 entity_names（当前只看到 person facet；若只产 facets，build_query_spec 的 entity_ids 为空 → person_summary 不触发）",
+    "答案当前走确定性路径（'无法确认'），V4 需让 writer/claim/verify 真实调用（validation actual_roles 应含这些角色）"
+  ],
+  "test_session_plan": "每 case 独立 conversation_id；scope 用 albumN_e2b；禁缓存（validation 实例已 DISABLE_CACHE）；记录 scope/viewer/expected_roles。"
+}

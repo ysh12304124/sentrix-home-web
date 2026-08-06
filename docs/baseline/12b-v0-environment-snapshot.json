@@ -1,0 +1,44 @@
+{
+  "phase": "V0",
+  "generated_at": "2026-08-06T12:28:00+08:00",
+  "backup": {
+    "path": "/home/asus/sentrix-backups/20260806-122813",
+    "size": "1.1G",
+    "db_method": "SQLite backup API",
+    "manifest": "/home/asus/sentrix-backups/20260806-122813/MANIFEST.sha256"
+  },
+  "git": {
+    "head": "af192ad",
+    "dirty_file_count": 21,
+    "dirty_sample": ["backend/model_clients.py", "backend/pipeline.py", "backend/requirements.txt",
+                     "backend/tests/test_model_clients.py", "backend/tests/test_pipeline.py"]
+  },
+  "db": {
+    "path": "/home/asus/Github/Sentrix-Home-Web/data/sentrix.db",
+    "assets": 200,
+    "observations": 100,
+    "events": 100,
+    "entities": 1136,
+    "confirmed_entities": {"album2": ["明哥", "我"]}
+  },
+  "services": {
+    "api_8091": {"listener": "0.0.0.0:8091", "health": "ok", "profile": "quality_12b"},
+    "e2b_8100": {"listener": "127.0.0.1:8100", "model": "gemma-4-e2b-it+lora-v2"},
+    "ollama_11434": {"listener": "127.0.0.1:11434", "models": ["gemma4:12b"], "resident": []}
+  },
+  "gpu": {
+    "status": "FAILED: NVML Driver/library version mismatch",
+    "kernel_module": "NVRM 595.71.05",
+    "userspace_nvml": "595.84",
+    "nvcc": "CUDA 12.4 (V12.4.131)",
+    "kernel": "6.8.0-124-generic",
+    "dkms_build_dir": true,
+    "action_needed": "V0.5 GPU driver fix (reboot/modprobe or driver reinstall)"
+  },
+  "disk": {
+    "path": "/home/asus/Github",
+    "free": "1.5T",
+    "used_pct": 15
+  },
+  "env_snapshot_note": "Production API 8091 runs SENTRIX_AGENT_MODEL_PROFILE=quality_12b + SENTRIX_AGENT_STAGE_TRACE=1; parser is GPU-blocked (62s/case) and currently circuit-breaker tripped in production."
+}

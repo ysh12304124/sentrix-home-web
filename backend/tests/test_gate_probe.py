@@ -1,0 +1,124 @@
+"""Phase R R4 — Gate decision + Neutral Probe (P0-6/P0-7/P0-8)."""
+
+import unittest
+
+from backend.memory_gate import MemoryGate
+from backend.query_contracts import QueryFacet, QueryParseDraft, QueryAction
+from backend.retrieval import NeutralProbe, RetrievalConfig
+from backend.retrieval.base import CandidateHit
+from backend.retrieval.probes import ProbeOutcome
+
+
+def _draft(mode, **kwargs):
+    draft = QueryParseDraft(intent="answer", answer_target="general", proposed_mode=mode)
+    for key, value in kwargs.items():
+        setattr(draft, key, value)
+    return draft
+
+
+class GateDecisionTests(unittest.TestCase):
+    def test_writing_prefix_none_no_probe(self):
+        decision = MemoryGate().classify("帮我写一段生日祝福", draft=_draft("none"))
+        self.assertEqual(decision.mode, "none")
+        self.assertFalse(decision.allow_probe)
+
+    def test_no_length_heuristic(self):
+        # Long message that is a general task -> none (no length>6 repair rule).
+        decision = MemoryGate().classify("请解释一下量子纠缠为什么不等于超光速通信", draft=_draft("none"))
+        self.assertEqual(decision.mode, "none")
+
+    def test_parser_none_bare_noun_routes_to_probe(self):
+        decision = MemoryGate().classify("银色心形手镯", draft=_draft("none"))
+        self.assertEqual(decision.mode, "ambiguous")
+        self.assertTrue(decision.allow_probe)
+
+    def test_parser_none_with_household_facet_routes_to_probe(self):
+        draft = _draft("none", facets=[QueryFacet("person", "明哥")])
+        decision = MemoryGate().classify("介绍一下明哥", draft=draft)
+        self.assertEqual(decision.mode, "ambiguous")
+        self.assertTrue(decision.allow_probe)
+
+    def test_parser_evidence_stays_evidence(self):
+        draft = _draft("evidence", actions=[QueryAction("answer_question", "person")])
+        decision = MemoryGate().classify("介绍一下明哥", draft=draft)
+        self.assertEqual(decision.mode, "evidence")
+        self.assertFalse(decision.allow_probe)
+
+    def test_confidence_not_a_single_point_routing_input(self):
+        low = MemoryGate().classify("银色心形手镯", draft=_draft("none", confidence=0.91))
+        high = MemoryGate().classify("银色心形手镯", draft=_draft("none", confidence=0.1))
+        # Both route to probe regardless of self-reported confidence.
+        self.assertEqual(low.mode, high.mode)
+
+    def test_anchored_parser_none_routes_to_probe(self):
+        # R8-Parser: weak parser returns none, but a geo anchor in the raw
+        # message must still route to the probe, not to normal chat.
+        decision = MemoryGate().classify("夜晚车内的明哥搂着我 江西省", draft=_draft("none"))
+        self.assertEqual(decision.mode, "ambiguous")
+        self.assertTrue(decision.allow_probe)
+
+    def test_anchored_parser_none_beats_writing_prefix_only_when_writing(self):
+        # A writing prompt with an embedded family word is still none.
+        decision = MemoryGate().classify("假设一家人在厨房做饭，写个故事", draft=_draft("none"))
+        self.assertEqual(decision.mode, "none")
+
+
+class NeutralProbeTests(unittest.TestCase):
+    def _hits(self, asset_ids, retriever="lexical"):
+        return [CandidateHit(asset_id=asset_id, retriever=retriever, raw_score=float(i + 1),
+                             score_kind="discrete", higher_is_better=True, rank=i + 1)
+                for i, asset_id in enumerate(asset_ids)]
+
+    def _probe(self):
+        return NeutralProbe(RetrievalConfig())
+
+    def test_multi_channel_agreement_upgrades(self):
+        channel_hits = {
+            "lexical": self._hits(["asset_1", "asset_2"]),
+            "visual_ann": self._hits(["asset_1"]),
+        }
+        outcome = self._probe().run("银色心形手镯", channel_hits, scope_id="album1")
+        self.assertEqual(outcome.decision, "upgrade")
+        self.assertIn("asset_1", outcome.signals["shared_assets"])
+
+    def test_single_weak_channel_clarifies(self):
+        channel_hits = {"lexical": self._hits(["asset_1"])}
+        outcome = self._probe().run("今天的晚饭", channel_hits, scope_id="album1")
+        self.assertEqual(outcome.decision, "clarify")
+
+    def test_no_hits_is_no_household_match(self):
+        # R9-2: no channel candidates -> no_household_match; the Router decides
+        # clarify vs none (never fabricated chat).
+        outcome = self._probe().run("随机词", {}, scope_id="album1")
+        self.assertEqual(outcome.decision, "no_household_match")
+        self.assertEqual(outcome.channel_agreement, 0)
+        self.assertEqual(outcome.top_candidates, [])
+
+    def test_outcome_reports_agreement_candidates_and_health(self):
+        hits = self._hits(["asset_1", "asset_2"])
+        health = {"visual_ann": {"status": "ok", "hits": 1}}
+        outcome = self._probe().run("银色心形手镯",
+                                    {"lexical": hits, "visual_ann": self._hits(["asset_1"])},
+                                    scope_id="album1", index_health=health)
+        self.assertEqual(outcome.decision, "upgrade")
+        self.assertGreaterEqual(outcome.channel_agreement, 2)
+        self.assertIn("asset_1", outcome.top_candidates)
+        self.assertEqual(outcome.index_health, health)
+
+    def test_exact_lexical_phrase_upgrades(self):
+        hit = CandidateHit(asset_id="asset_1", retriever="lexical", raw_score=3.0,
+                           score_kind="token_hits", higher_is_better=True, rank=1,
+                           matched_text="银色心形手镯")
+        outcome = self._probe().run("银色心形手镯", {"lexical": [hit]}, scope_id="album1")
+        self.assertEqual(outcome.decision, "upgrade")
+
+    def test_probe_never_emits_household_facts(self):
+        # A ProbeOutcome is a routing signal only — no answer text, no evidence.
+        outcome = ProbeOutcome(decision="upgrade", reason="test")
+        self.assertEqual(outcome.decision, "upgrade")
+        self.assertFalse(hasattr(outcome, "answer"))
+        self.assertFalse(hasattr(outcome, "evidence"))
+
+
+if __name__ == "__main__":
+    unittest.main()

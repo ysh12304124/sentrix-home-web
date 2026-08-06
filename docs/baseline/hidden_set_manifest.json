@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "seed": 20260806,
+  "hidden_count": 16,
+  "regression_count": 44,
+  "category_counts": {
+    "empty_gt": 7,
+    "location": 25,
+    "object": 8,
+    "person": 10,
+    "time": 10
+  },
+  "hidden_keys": [
+    {
+      "key": "album1-04",
+      "category": "time",
+      "query_cn": "水杯做的圣诞树"
+    },
+    {
+      "key": "album1-06",
+      "category": "location",
+      "query_cn": "记录下博物馆买的纪念品"
+    },
+    {
+      "key": "album1-11",
+      "category": "location",
+      "query_cn": "在盐田区的照片"
+    },
+    {
+      "key": "album1-17",
+      "category": "location",
+      "query_cn": "校园街中间躺着的猫猫"
+    },
+    {
+      "key": "album2-02",
+      "category": "empty_gt",
+      "query_cn": "电影院明哥比V"
+    },
+    {
+      "key": "album2-03",
+      "category": "object",
+      "query_cn": "可可粉可颂"
+    },
+    {
+      "key": "album2-04",
+      "category": "location",
+      "query_cn": "西湖木船上看水道风光"
+    },
+    {
+      "key": "album2-05",
+      "category": "person",
+      "query_cn": "在上海市拍的自己和王明的照片"
+    },
+    {
+      "key": "album2-11",
+      "category": "location",
+      "query_cn": "在陕西省的照片"
+    },
+    {
+      "key": "album2-13",
+      "category": "time",
+      "query_cn": "夕阳下的电线杆和农田"
+    },
+    {
+      "key": "album2-16",
+      "category": "location",
+      "query_cn": "鼓浪屿远眺城市天际线"
+    },
+    {
+      "key": "album2-20",
+      "category": "object",
+      "query_cn": "去听脱口秀"
+    },
+    {
+      "key": "album3-01",
+      "category": "object",
+      "query_cn": "银色心形手镯"
+    },
+    {
+      "key": "album3-05",
+      "category": "object",
+      "query_cn": "厚切炒酸奶扫码购买"
+    },
+    {
+      "key": "album3-10",
+      "category": "location",
+      "query_cn": "餐厅卤味食材展示"
+    },
+    {
+      "key": "album3-20",
+      "category": "location",
+      "query_cn": "在夷陵区的照片"
+    }
+  ],
+  "regression_keys": [
+    "album1-01",
+    "album1-02",
+    "album1-03",
+    "album1-05",
+    "album1-07",
+    "album1-08",
+    "album1-09",
+    "album1-10",
+    "album1-12",
+    "album1-13",
+    "album1-14",
+    "album1-15",
+    "album1-16",
+    "album1-18",
+    "album1-19",
+    "album1-20",
+    "album2-01",
+    "album2-06",
+    "album2-07",
+    "album2-08",
+    "album2-09",
+    "album2-10",
+    "album2-12",
+    "album2-14",
+    "album2-15",
+    "album2-17",
+    "album2-18",
+    "album2-19",
+    "album3-02",
+    "album3-03",
+    "album3-04",
+    "album3-06",
+    "album3-07",
+    "album3-08",
+    "album3-09",
+    "album3-11",
+    "album3-12",
+    "album3-13",
+    "album3-14",
+    "album3-15",
+    "album3-16",
+    "album3-17",
+    "album3-18",
+    "album3-19"
+  ],
+  "note": "GT file names / asset IDs intentionally absent — grade hidden keys via a separate script holding query.json.",
+  "created_at": ""
+}
