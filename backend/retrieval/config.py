@@ -84,6 +84,9 @@ class RetrievalConfig:
         per_space = (self._data.get("probe") or {}).get("per_space", {})
         return float((per_space.get(space) or {}).get("minimum", 0.0) or 0.0)
 
+    def approximate(self, key: str, default=None):
+        return (self._data.get("approximate") or {}).get(key, default)
+
     @property
     def deadline_seconds(self) -> int:
         return int(self._data.get("deadline_seconds", 20))

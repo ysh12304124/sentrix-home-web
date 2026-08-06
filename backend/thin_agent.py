@@ -4,6 +4,7 @@ This module deliberately keeps model use at the language boundary.  Query
 identity, evidence selection and the final evidence envelope remain code-owned.
 """
 
+import re
 import uuid
 
 from .answer_composer import compose_answer
@@ -13,6 +14,25 @@ from .evidence_retrieval import EvidenceRetrievalKernel
 from .memory_gate import MemoryGate, GateDecision
 from .query_contracts import QueryAction, build_query_spec
 from .query_parser import QueryParser
+
+_ANCHOR_GEO_RE = re.compile(r"(市|区|省|县|镇|湾|湖|山|路|街|城|岛)")
+_ANCHOR_DATE_RE = re.compile(r"(年|月|日|节|跨年|元旦|春节)")
+# Generic person/relationship signals only — specific family names are never
+# hard-coded (they are benchmark/family data and the runtime guard forbids it).
+_ANCHOR_PERSON_TOKENS = ("自己", "我们", "合照", "家人", "全家")
+_ANCHOR_RELATION_RE = re.compile(r"(搂着|抱着|牵着|靠着|合影|一起|全家福)")
+
+
+def _query_anchored(message, spec):
+    """A query is anchored (strict-empty style) when it carries a concrete
+    person / time / place signal — either parsed into the spec or present in
+    the raw message when the parser hallucinated an empty draft."""
+    if any(c.dimension in {"person", "time", "place"} for c in spec.constraints):
+        return True
+    value = str(message or "")
+    return bool(_ANCHOR_GEO_RE.search(value) or _ANCHOR_DATE_RE.search(value)
+                or _ANCHOR_RELATION_RE.search(value)
+                or any(token in value for token in _ANCHOR_PERSON_TOKENS))
 
 
 class ThinAgentRuntime:
@@ -194,6 +214,85 @@ class ThinAgentRuntime:
                              "query_parse": decision.query_parse_calls}}]
         return self._envelope(answer, conversation_id, scope_id, viewer_id, decision, [], [], "not_applicable", trace, core_cards=cards, draft=draft)
 
+    @staticmethod
+    def _has_matched_condition(item):
+        return any(cond.get("status") == "matched" for cond in (item.get("condition_results") or {}).values())
+
+    @staticmethod
+    def _recall_strength(item):
+        """Normalized retrieval strength of an evidence item, from attributions.
+
+        cosine_similarity is already [0,1]; token_hits count is capped;
+        discrete/adjacency get a fixed low weight.  Returns None when the item
+        carries no attributions (single-kernel path) — the gate then keeps it
+        instead of guessing.
+        """
+        attributions = item.get("attributions") or []
+        if not attributions:
+            return None
+        best = 0.0
+        for attr in attributions:
+            score = attr.get("score") or 0.0
+            kind = attr.get("score_kind") or ""
+            if kind == "cosine_similarity":
+                best = max(best, float(score))
+            elif kind == "token_hits":
+                best = max(best, min(1.0, float(score) / 4.0))
+            elif kind == "discrete":
+                best = max(best, 1.0)
+            elif kind == "adjacency":
+                best = max(best, 0.1)
+        return round(best, 4)
+
+    @staticmethod
+    def _gate_packet_approximate(packet, spec, anchored=False):
+        """Drop weak approximate assets from the packet (R8-5).
+
+        exact/strong always stay.  Approximate assets are kept only when their
+        recall strength clears a config threshold; anchored queries (person /
+        time / place) that find no directly-supported candidate must not surface
+        weak approximate images (strict-empty style).
+        """
+        try:
+            from .retrieval import RetrievalConfig
+            config = RetrievalConfig()
+            min_score = float(config.approximate("min_score", 0.15))
+            max_count = int(config.approximate("max_count", 20))
+            if anchored:
+                min_score *= float(config.approximate("anchor_multiplier", 1.5))
+        except Exception:
+            return
+        keep = []
+        dropped = 0
+        has_exact_strong = any(item["level"] in {"exact", "strong"} for item in packet.assets)
+        for item in packet.assets:
+            if item["level"] in {"exact", "strong"}:
+                keep.append(item)
+                continue
+            if anchored and not has_exact_strong and not ThinAgentRuntime._has_matched_condition(item):
+                # strict-empty: an anchored query whose candidates support NO
+                # condition must not surface weak approximate images.  A
+                # partially-supported candidate (e.g. time matched, activity
+                # unknown) is still shown with disclosure.
+                dropped += 1
+                continue
+            strength = ThinAgentRuntime._recall_strength(item)
+            if strength is None or strength >= min_score:
+                keep.append(item)
+            else:
+                dropped += 1
+        if dropped:
+            packet.excluded_count += dropped
+        # Cap approximate count (best/top_k mode) — exact/strong stay.
+        approximate_keep = [item for item in keep if item["level"] == "approximate"]
+        if len(approximate_keep) > max_count:
+            approximate_keep.sort(key=lambda item: ThinAgentRuntime._recall_strength(item) or 0.0, reverse=True)
+            keep = [item for item in keep if item["level"] != "approximate"] + approximate_keep[:max_count]
+        packet.assets = keep
+        packet.exact_results = [item for item in packet.exact_results if item in keep]
+        packet.strong_results = [item for item in packet.strong_results if item in keep]
+        packet.approximate_results = [item for item in packet.approximate_results if item in keep]
+
     def _resolve_person(self, name, scope_id):
         try:
             for entity in self.store.list_entities(status="confirmed", scope_id=scope_id):
@@ -204,6 +303,9 @@ class ThinAgentRuntime:
         return None
 
     def _evidence_answer(self, message, conversation_id, scope_id, viewer_id, decision, spec, packet, draft):
+        # R8-5: gate approximate evidence by recall strength before display —
+        # weak approximate candidates must not surface as user-visible images.
+        self._gate_packet_approximate(packet, spec, anchored=_query_anchored(message, spec))
         evidence = []
         for item in packet.assets:
             evidence.append({
@@ -215,6 +317,7 @@ class ThinAgentRuntime:
                 "captured_at": item.get("captured_at"),
                 "condition_results": item.get("condition_results", {}),
                 "level": item.get("level"), "evidence_ids": item.get("evidence_ids", []),
+                "recall_strength": self._recall_strength(item),
                 "near_duplicate_group": item.get("near_duplicate_group"),
                 "near_duplicate_size": item.get("near_duplicate_size", 1),
             })

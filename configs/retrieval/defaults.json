@@ -42,5 +42,11 @@
       "lexical": {"minimum_rank_score": 0.0}
     }
   },
+  "approximate": {
+    "min_score": 0.15,
+    "anchor_multiplier": 1.5,
+    "max_count": 20,
+    "difference_explanation_required": true
+  },
   "deadline_seconds": 20
 }
