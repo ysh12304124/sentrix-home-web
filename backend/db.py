@@ -1234,7 +1234,12 @@ class MemoryStore:
             time_score = 0.25
         locations = {item["location"] for item in event_anchors if item["location"]}
         visual_places = {item["visual_place"] for item in event_anchors if item["visual_place"]}
-        location_score = 1.0 if anchor["location"] and anchor["location"] in locations else 0.0
+        if anchor["location"] and locations:
+            _location_distances = [self._geo_distance_meters(anchor["location"], loc) for loc in locations]
+            _location_distances = [d for d in _location_distances if d is not None]
+            location_score = max((max(0.0, 1.0 - min(d, 1000.0) / 1000.0) for d in _location_distances), default=0.0)
+        else:
+            location_score = 0.0
         visual_place_score = 1.0 if anchor["visual_place"] and anchor["visual_place"] in visual_places else 0.0
         event_type = anchor["visual_event_type"]
         event_types = {item["visual_event_type"] for item in event_anchors if item["visual_event_type"]}
