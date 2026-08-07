@@ -1,6 +1,5 @@
 import json
 import hashlib
-import mimetypes
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,8 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .db import MemoryStore, make_id
+from .image_io import ensure_heif_support, guess_mime_type, media_type_for_path
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, ModelError, normalize_confidence
 from .semantic_taxonomy import normalize_semantic_analysis
+
+ensure_heif_support()
 
 
 IMPORT_METADATA_KEYS = {
@@ -57,7 +59,7 @@ class IngestionPipeline:
             file_name or path.name,
             media_type,
             str(path),
-            mime_type or mimetypes.guess_type(path.name)[0],
+            mime_type or guess_mime_type(path),
             path.stat().st_size,
             metadata,
             scope_id=metadata.get("scope_id"),
@@ -74,6 +76,7 @@ class IngestionPipeline:
     @staticmethod
     def _extract_exif(path):
         try:
+            ensure_heif_support()
             from PIL import Image, ExifTags
             with Image.open(path) as image:
                 raw = image.getexif()
@@ -103,8 +106,7 @@ class IngestionPipeline:
             return {}
 
     def _media_type(self, path):
-        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        return mime.split("/", 1)[0] if "/" in mime else "text"
+        return media_type_for_path(path)
 
     def process(self, asset_id, summarize_event=True):
         asset = self.store.get_asset(asset_id)
