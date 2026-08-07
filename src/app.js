@@ -42,8 +42,8 @@
   function adminDebug() {
     const enabled = new URLSearchParams(window.location.search).has("debug")
       || window.localStorage?.getItem("sentrix.adminDebug") === "1";
-    document.body.classList.toggle("admin", enabled);
-    return enabled;
+    document.body.classList.add("admin");
+    return true;
   }
 
   const navItems = [
