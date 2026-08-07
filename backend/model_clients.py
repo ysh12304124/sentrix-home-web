@@ -740,8 +740,49 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         parsed["model"] = self.model
         return parsed
 
+    def _event_gps_prefix(self, event, observations):
+        """Extract GPS-derived location from observation assets via the store.
+        Returns a location string like "\u676d\u5dde\u5e02\u897f\u6e56\u533a" or ""."""
+        districts = set()
+        cities = set()
+        observation_ids = [item.get("id") for item in observations if item.get("id")]
+        if not observation_ids or not self._store:
+            return ""
+        # Look up assets via observations -> asset_id -> reverse_geocode
+        placeholders = ",".join("?" for _ in observation_ids)
+        try:
+            rows = self._store._rows(
+                f"""SELECT DISTINCT json_extract(a.metadata_json, '$.reverse_geocode') as geo
+                    FROM observations o JOIN assets a ON a.id = o.asset_id
+                    WHERE o.id IN ({placeholders})""",
+                observation_ids,
+            )
+        except Exception:
+            return ""
+        for row in rows:
+            try:
+                geo = json.loads(row["geo"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(geo, dict):
+                continue
+            city = str(geo.get("city") or "").strip()
+            district = str(geo.get("district") or "").strip()
+            if city:
+                cities.add(city)
+            if district:
+                districts.add(district)
+        parts = []
+        if cities:
+            parts.extend(sorted(cities))
+        if districts:
+            parts.extend(d for d in sorted(districts) if d not in cities)
+        return "".join(parts[:2])
+
     def summarize_event(self, event, observations):
         semantic_place = _event_place(event, observations)
+        # Extract GPS location BEFORE model call as factual context (not model input)
+        gps_prefix = self._event_gps_prefix(event, observations)
         evidence = [{
             "observation_id": item.get("id"),
             "caption": item.get("caption"),
@@ -763,11 +804,18 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         }, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt))
         fallback_place = semantic_place
+        title = _strip_event_coordinates(as_text(parsed.get("title")) or "家庭图片记录", fallback_place)
+        summary = _strip_event_coordinates(as_text(parsed.get("summary")) or "该事件的图片证据尚不足以生成更具体的总结。", fallback_place)
+        # Inject GPS location as factual prefix into summary (post-model, never in prompt)
+        if gps_prefix:
+            summary = f"在{gps_prefix}，{summary}"
+            if not any(gps_prefix in t for t in [title, fallback_place]):
+                pass  # Title stays visual to avoid model confusion
         return {
-            "title": _strip_event_coordinates(as_text(parsed.get("title")) or "家庭图片记录", fallback_place),
+            "title": title,
             "event_type": _strip_event_coordinates(as_text(parsed.get("event_type")) or "家庭记录", fallback_place),
             "activity": _strip_event_coordinates(as_text(parsed.get("activity")) or "家庭活动", fallback_place),
-            "summary": _strip_event_coordinates(as_text(parsed.get("summary")) or "该事件的图片证据尚不足以生成更具体的总结。", fallback_place),
+            "summary": summary,
             "confidence": normalize_confidence(parsed.get("confidence"), 0.5),
             "model": self.model,
         }

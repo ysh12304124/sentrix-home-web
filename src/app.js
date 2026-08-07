@@ -50,6 +50,8 @@
     persons: [],
     entities: [],
     entityGroups: [],
+    geoPlaces: [],
+    geoBreadcrumb: [],
     knowledge: { profiles: [], claims: [] },
     clusters: [],
     relationships: [],
@@ -379,7 +381,7 @@
   function peopleView() {
     const people = state.persons.filter((person) => state.personFilter === "all" || !person.confirmed);
     const pending = state.persons.filter((person) => !person.confirmed);
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会明确标注，仍可查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person, index) => { const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`; const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : ""; return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${caution}<div class="person-stats"><span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>${person.cluster_count || 0}</strong> 个人物簇</span></div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="split-person" data-person-id="${escapeHtml(person.id)}">驳回候选</button>`}</div></article>`; }).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
+    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会明确标注，仍可查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person, index) => { const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`; const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : ""; return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${caution}<div class="person-stats"><span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>${person.cluster_count || 0}</strong> 个人物簇</span></div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`}</div></article>`; }).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
   }
 
   function knowledgeView() {
@@ -388,7 +390,7 @@
     const confirmed = visibleEntities.filter((entity) => entity.status === "confirmed");
     const pending = visibleEntities.filter((entity) => entity.status === "pending");
     const entityCard = (entity) => `<button class="entity-card" data-action="open-entity" data-entity-id="${escapeHtml(entity.id)}"><div class="entity-card-head">${faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, entity.status === "confirmed" ? "green" : "gray")}<span class="needs-label">${escapeHtml(entity.status)}</span></div><h2>${escapeHtml(entity.canonical_name)}</h2><p>${escapeHtml(entity.family_role || "未确认家庭角色")}</p><div class="entity-stats"><span><strong>${entity.mention_count || 0}</strong> 次出现</span><span><strong>${entity.cluster_count || 0}</strong> 个人物簇</span><span><strong>${entity.relationship_count || 0}</strong> 条关系</span></div></button>`;
-    const clusterCard = (cluster) => `<article class="cluster-card"><div class="cluster-head"><div><span class="section-kicker">人物识别</span><strong>候选人物簇</strong></div><span class="needs-label">${cluster.member_count || cluster.samples?.length || 0} 张样本</span></div><div class="cluster-samples">${(cluster.samples || []).slice(0, 6).map((sample) => `<div class="cluster-sample"><button data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">${faceAvatar(sample.id, "人脸样本")}</button><button class="sample-split" data-action="split-face" data-cluster-id="${escapeHtml(cluster.id)}" data-face-instance-id="${escapeHtml(sample.id)}" aria-label="从人物簇拆出样本">×</button></div>`).join("")}</div><p>聚类置信度 ${Math.round((cluster.confidence || 0) * 100)}% · ${cluster.entity_status === "confirmed" ? "已绑定人物" : "待确认身份"}</p><div class="person-actions"><button class="button small primary" data-action="confirm-cluster" data-cluster-id="${escapeHtml(cluster.id)}">确认实体</button><button class="button small ghost" data-action="merge-cluster" data-cluster-id="${escapeHtml(cluster.id)}">合并到其他簇</button><button class="button small ghost" data-action="reject-cluster" data-cluster-id="${escapeHtml(cluster.id)}">驳回簇</button></div></article>`;
+    const clusterCard = (cluster) => `<article class="cluster-card"><div class="cluster-head"><div><span class="section-kicker">人物识别</span><strong>候选人物簇</strong></div><span class="needs-label">${cluster.member_count || cluster.samples?.length || 0} 张样本</span></div><div class="cluster-samples">${(cluster.samples || []).slice(0, 6).map((sample) => `<div class="cluster-sample"><button data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">${faceAvatar(sample.id, "人脸样本")}</button><button class="sample-split" data-action="split-face" data-cluster-id="${escapeHtml(cluster.id)}" data-face-instance-id="${escapeHtml(sample.id)}" aria-label="从人物簇拆出样本">×</button></div>`).join("")}</div><p>聚类置信度 ${Math.round((cluster.confidence || 0) * 100)}% · ${cluster.entity_status === "confirmed" ? "已绑定人物" : "待确认身份"}</p><div class="person-actions"><button class="button small primary" data-action="confirm-cluster" data-cluster-id="${escapeHtml(cluster.id)}">确认实体</button><button class="button small ghost" data-action="merge-cluster" data-cluster-id="${escapeHtml(cluster.id)}">合并到其他簇</button><button class="button small ghost" data-action="delete-cluster" data-cluster-id="${escapeHtml(cluster.id)}">不是人物</button></div></article>`;
     return `${pageHeader("语义记忆 / 实体治理", "看见家庭记忆里稳定存在的实体。", "人物簇先由 buffalo_l 聚类，再由你确认名称和角色；确认结果会回写观察、事件、人物画像和关系图。", `<button class="button ghost" data-action="reload">${icon("↻")}刷新状态</button>`)}<section class="knowledge-summary"><article><strong>${confirmed.length}</strong><span>已确认实体</span></article><article><strong>${pending.length + pendingClusters.length}</strong><span>待维护候选</span></article><article><strong>${state.relationships.filter((item) => item.status === "active").length}</strong><span>已确认关系</span></article><article><strong>${state.relationships.filter((item) => item.status === "pending").length}</strong><span>待确认关系</span></article></section><section class="content-section"><div class="section-head"><div><p class="section-kicker">实体总览</p><h2>跨事件维护的家庭实体</h2></div><button class="text-button" data-action="relationship-graph">查看关系图 ${icon("→")}</button></div><div class="entity-grid">${visibleEntities.length ? visibleEntities.map(entityCard).join("") : emptyState("还没有实体", "完成一轮图片导入和人脸聚类后，实体会出现在这里。")}</div></section><section class="content-section"><div class="section-head"><div><p class="section-kicker">人物聚类 / 待确认</p><h2>先确认身份，再进入长期记忆</h2></div><span class="result-count">${pendingClusters.length} 簇</span></div><div class="cluster-grid">${pendingClusters.length ? pendingClusters.map(clusterCard).join("") : emptyState("没有待确认人物簇", "新的图片出现人物后，系统会把相似人脸合并为簇并保留样本证据。")}</div></section>`;
   }
 
@@ -403,9 +405,31 @@
     return `${pageHeader("家庭表达 / 故事工作室", "把真实事件整理成家人愿意一起看的故事。", "故事只引用你选择的事件和证据；标题、章节和内容保存为本地草稿。", `<button class="button primary" data-action="create-story">${icon("＋")}新建故事</button>`)}<section class="story-layout">${state.stories.length ? `<div class="story-canvas"><div class="story-canvas-label">选择一个故事查看</div><div class="story-title">${escapeHtml(state.stories[0].title)}</div><div class="story-caption">${escapeHtml(state.stories[0].content || "这个故事还没有内容。")}</div></div><aside class="story-editor"><div class="panel-title"><span>STORY DRAFTS</span><span class="draft-badge">${state.stories.length} 个</span></div>${state.stories.map((story) => `<div class="chapter"><button class="chapter-open" data-action="edit-story" data-story-id="${escapeHtml(story.id)}"><span>●</span><strong>${escapeHtml(story.title)}</strong>${icon("→", "muted")}</button><button class="icon-button bordered" data-action="delete-story" data-story-id="${escapeHtml(story.id)}" aria-label="删除故事">×</button></div>`).join("")}<button class="button primary full" data-action="create-story">新建本地草稿 ${icon("→")}</button></aside></section>` : `<section class="empty-search"><div class="empty-symbol">▤</div><h2>还没有故事草稿</h2><p>先导入并形成事件，再选择真实事件生成故事草稿。</p><button class="button primary" data-action="create-story">${icon("＋")}创建空白故事</button></section>`}`;
   }
 
+  function renderUploadQueue() {
+    if (!state.queue.length) return "";
+    const failedStatuses = new Set(["metadata-failed", "upload-failed", "failed", "rejected"]);
+    const uploaded = state.queue.filter((item) => !["reading-metadata", "ready", ...failedStatuses].includes(item.status)).length;
+    const failed = state.queue.filter((item) => failedStatuses.has(item.status)).length;
+    const active = state.queue.length - uploaded - failed;
+    const progress = Math.round(((uploaded + failed) / state.queue.length) * 100);
+    const statusLabel = (status) => ({
+      "reading-metadata": "读取元数据",
+      ready: "等待上传",
+      "metadata-failed": "元数据失败",
+      "upload-failed": "上传失败",
+      queued: "已进入队列",
+      processing: "处理中",
+      processed: "已完成",
+      failed: "处理失败",
+      rejected: "已拒绝",
+    }[status] || status || "等待处理");
+    const rows = state.queue.slice(0, 20).map((item) => `<div class="queue-row"><span class="queue-type image">图</span><div><strong>${escapeHtml(item.fileName)}</strong><small>${escapeHtml(item.error || statusLabel(item.status))}</small></div><span class="queue-status ${failedStatuses.has(item.status) ? "reserved" : "queued"}">${escapeHtml(statusLabel(item.status))}</span></div>`).join("");
+    return `<section class="content-section upload-progress"><div class="section-head"><div><p class="section-kicker">本次上传</p><h2>${state.queue.length} 张图片</h2></div><span class="result-count">${uploaded} 已上传 · ${active} 进行中 · ${failed} 失败</span></div><div class="health-bar"><i style="width:${progress}%"></i></div><div class="queue-list">${rows}</div>${state.queue.length > 20 ? `<p class="upload-more">仅展示最近20条，完整状态会同步到下方处理任务。</p>` : ""}</section>`;
+  }
+
   function importsView() {
     const assets = state.assets.filter((asset) => ["queued", "processing", "semantic_enriching", "failed", "video-extraction-reserved"].includes(asset.status));
-      return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "上传后会创建稳定 Asset ID，并在后台生成 Observation、Event 和 Fact；视频只建立原始资产。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入资料，或点击选择文件</strong><small>可选择文件，或选择图片文件夹（自动导入 JPG/JPEG/PNG/HEIC）</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始证据不会被覆盖</strong><p>每个 Asset 都可以追溯到 Observation 和模型原始 JSON。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>LOCAL PIPELINE</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${[["接收与去重", `${state.assets.length} 个 Asset`, "done"], ["图片理解", `${state.assets.filter((a) => a.media_type === "image" && a.status === "processed").length} 个已完成 · ${state.assets.filter((a) => a.status === "semantic_enriching").length} 个语义整理中`, "done"], ["音频转写", `${state.assets.filter((a) => a.media_type === "audio").length} 个音频`, "active"], ["事件与事实", `${stats().events} 个事件 · ${stats().facts} 条事实`, "active"], ["视频编码", `${state.assets.filter((a) => a.media_type === "video").length} 个视频`, "reserved"]].map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : row[2] === "active" ? "•" : "—"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : row[2] === "active" ? "运行中" : "预留"}</em></div>`).join("")}</aside></section><section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}证据</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status === "video-extraction-reserved" ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的 Asset 会显示在这里。")}</div></section>`;
+      return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "上传后会创建稳定 Asset ID，并在后台生成 Observation、Event 和 Fact；视频只建立原始资产。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入资料，或点击选择文件</strong><small>可选择文件，或选择图片文件夹（自动导入 JPG/JPEG/PNG/HEIC）</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始证据不会被覆盖</strong><p>每个 Asset 都可以追溯到 Observation 和模型原始 JSON。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>LOCAL PIPELINE</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${[["接收与去重", `${state.assets.length} 个 Asset`, "done"], ["图片理解", `${state.assets.filter((a) => a.media_type === "image" && a.status === "processed").length} 个已完成 · ${state.assets.filter((a) => a.status === "semantic_enriching").length} 个语义整理中`, "done"], ["音频转写", `${state.assets.filter((a) => a.media_type === "audio").length} 个音频`, "active"], ["事件与事实", `${stats().events} 个事件 · ${stats().facts} 条事实`, "active"], ["视频编码", `${state.assets.filter((a) => a.media_type === "video").length} 个视频`, "reserved"]].map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : row[2] === "active" ? "•" : "—"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : row[2] === "active" ? "运行中" : "预留"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}证据</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status === "video-extraction-reserved" ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的 Asset 会显示在这里。")}</div></section>`;
   }
 
   function settingsView() {
@@ -442,10 +466,84 @@
     return `<button class="entity-card entity-media-card semantic-group-card" data-action="open-entity-group" data-entity-group-id="${escapeHtml(group.id)}">${semanticGroupPreview(group)}<div class="entity-card-copy"><div class="entity-card-head"><span class="semantic-type-label">${group.members?.length > 1 ? "相近场景" : "语义场景"}</span><span class="semantic-evidence-label">原始证据</span></div><h2>${escapeHtml(group.canonical_name)}</h2><div class="semantic-detail-tags">${(details.length ? details : ["由图片观察维护"]).map((detail) => `<span>${escapeHtml(detail)}</span>`).join("")}</div><p>${escapeHtml(semanticSummary(group))}</p><span class="semantic-open-link">查看相关证据 ${icon("→")}</span></div></button>`;
   }
 
+
+  function geoPlaceSection() {
+    const places = state.geoPlaces || [];
+    if (!places.length) return emptyState("没有地点数据", "导入带GPS的照片后，系统会自动按城市和区县整理。");
+
+    const breadcrumb = state.geoBreadcrumb || [];
+    const selectedCity = breadcrumb[0] || null;
+    const selectedDistrict = breadcrumb[1] || null;
+
+    const breadcrumbHtml = breadcrumb.length
+      ? `<nav class="geo-breadcrumb"><button class="text-button" data-action="geo-breadcrumb" data-geo-level="root">${icon("&#127968;")} 地点总览</button>${breadcrumb.map((item, idx) => `<span class="geo-sep">></span><button class="text-button" data-action="geo-breadcrumb" data-geo-level="${idx}">${escapeHtml(item === "unknown" ? "无法判断地点" : item)}</button>`).join("")}</nav>`
+      : "";
+
+    if (!selectedCity) {
+      // City level
+      const cards = places.map((city) => {
+        if (city.level === "unknown") {
+          return `<button class="geo-card geo-card-unknown" data-action="geo-select-city" data-geo-city="unknown"><strong>${escapeHtml(city.name)}</strong><span>${city.count} 张照片</span></button>`;
+        }
+        const districtCount = (city.children || []).length;
+        return `<button class="geo-card" data-action="geo-select-city" data-geo-city="${escapeHtml(city.name)}" data-geo-province="${escapeHtml(city.province || "")}"><strong>${escapeHtml(city.province || "")} ${escapeHtml(city.name)}</strong><span>${city.count} 张照片 · ${districtCount} 个区县</span></button>`;
+      }).join("");
+      return `<section class="content-section"><div class="section-head"><div><p class="section-kicker">GPS 地理位置</p><h2>按拍摄地点整理的回忆</h2></div><span class="result-count">${places.length} 处</span></div><div class="geo-grid">${cards || emptyState("没有地点数据", "导入带GPS的照片后，系统会按城市整理。")}</div></section>`;
+    }
+
+    // Handle "unknown" location directly — it has photos, not districts
+    if (selectedCity === "unknown") {
+      const unknown = places.find((c) => c.level === "unknown") || null;
+      if (!unknown || !unknown.photos || !unknown.photos.length) {
+        return `<section class="content-section">${breadcrumbHtml}<div class="geo-photo-wall">${emptyState("没有无法判断地点的照片", "")}</div></section>`;
+      }
+      const photoGrid = unknown.photos.map((p) => {
+        return `<button class="geo-photo-card" data-action="open-asset" data-asset-id="${escapeHtml(p.asset_id)}">
+          <img src="/api/assets/${encodeURIComponent(p.asset_id)}/file" alt="${escapeHtml(p.caption || p.file_name)}" loading="lazy" />
+          <div class="geo-photo-overlay">
+            <span class="geo-photo-caption">${escapeHtml(p.caption || p.observation_place || "无描述")}</span>
+            ${p.semantic_place ? `<span class="geo-photo-semantic">${escapeHtml(p.semantic_place)}</span>` : ""}
+          </div>
+        </button>`;
+      }).join("");
+      return `<section class="content-section">${breadcrumbHtml}<div class="section-head"><div><p class="section-kicker">无法判断地点</p><h2>照片墙</h2></div><span class="result-count">${unknown.count} 张</span></div><div class="geo-photo-wall">${photoGrid}</div></section>`;
+    }
+
+    const city = places.find((c) => c.name === selectedCity && c.level !== "unknown") || null;
+
+    if (!selectedDistrict) {
+      // District level
+      if (!city || !city.children || !city.children.length) {
+        return `<section class="content-section">${breadcrumbHtml}<div class="section-head"><div><p class="section-kicker">${escapeHtml(selectedCity)}</p></div></div><div class="geo-photo-wall">${emptyState("该地区暂无照片", "")}</div></section>`;
+      }
+      const districtCards = city.children.map((d) => {
+        const previews = (d.photos || []).slice(0, 4).map((p) => `<div class="geo-district-thumb"><img src="/api/assets/${encodeURIComponent(p.asset_id)}/file" alt="${escapeHtml(p.caption || p.file_name)}" loading="lazy" /></div>`).join("");
+        return `<button class="geo-card geo-card-district" data-action="geo-select-district" data-geo-district="${escapeHtml(d.name)}">${previews ? `<div class="geo-district-previews">${previews}</div>` : ""}<strong>${escapeHtml(d.name)}</strong><span>${d.count} 张照片</span></button>`;
+      }).join("");
+      return `<section class="content-section">${breadcrumbHtml}<div class="section-head"><div><p class="section-kicker">${escapeHtml(selectedCity)}</p><h2>各区县分布</h2></div></div><div class="geo-grid">${districtCards}</div></section>`;
+    }
+
+    // Photo wall level
+    const district = (city && city.children || []).find((d) => d.name === selectedDistrict) || null;
+    if (!district || !district.photos || !district.photos.length) {
+      return `<section class="content-section">${breadcrumbHtml}<div class="geo-photo-wall">${emptyState("该区暂无照片", "")}</div></section>`;
+    }
+    const photoGrid = district.photos.map((p) => {
+      return `<button class="geo-photo-card" data-action="open-asset" data-asset-id="${escapeHtml(p.asset_id)}">
+        <img src="/api/assets/${encodeURIComponent(p.asset_id)}/file" alt="${escapeHtml(p.caption || p.file_name)}" loading="lazy" />
+        <div class="geo-photo-overlay">
+          <span class="geo-photo-caption">${escapeHtml(p.caption || p.observation_place || "无描述")}</span>
+          ${p.semantic_place ? `<span class="geo-photo-semantic">${escapeHtml(p.semantic_place)}</span>` : ""}
+        </div>
+      </button>`;
+    }).join("");
+    return `<section class="content-section">${breadcrumbHtml}<div class="section-head"><div><p class="section-kicker">${escapeHtml(selectedDistrict)}</p><h2>照片墙</h2></div><span class="result-count">${district.count} 张</span></div><div class="geo-photo-wall">${photoGrid || emptyState("暂无照片", "")}</div></section>`;
+  }
+
   function semanticKnowledgeView() {
     const people = state.persons.filter((person) => person.confirmed);
     const claims = (state.knowledge.claims || people.flatMap((person) => person.claims || [])).filter((claim) => claim.status !== "superseded");
-    const groups = [["place", "地点", "地点语义"], ["object", "物品", "物品语义"], ["atmosphere", "氛围", "画面氛围"]];
+    const groups = [["object", "物品", "物品语义"], ["atmosphere", "氛围", "画面氛围"]];
     const personCards = people.map((person) => "<article class=\"entity-card\"><div class=\"entity-card-head\">" + faceAvatar(person.avatar_face_instance_id, person.display_name, "green") + "<span class=\"confirmed\">已确认</span></div><h2>" + escapeHtml(person.display_name) + "</h2><p>" + escapeHtml(person.profile?.summary_zh || person.summary || "正在从事件和证据形成画像。") + "</p><div class=\"entity-stats\"><span><strong>" + (person.event_memory || []).length + "</strong> 个事件</span><span><strong>" + claims.filter((claim) => claim.person_id === person.id).length + "</strong> 条当前声明</span></div><button class=\"button small ghost\" data-action=\"open-person-profile\" data-person-id=\"" + escapeHtml(person.id) + "\">查看画像和证据</button></article>").join("");
     const entitySection = ([type, label, description]) => {
       const entities = state.entityGroups.filter((entity) => entity.entity_type === type && entity.evidence_count > 0);
@@ -454,7 +552,7 @@
       return `<section class="content-section"><div class="section-head"><div><p class="section-kicker">${label}</p><h2>${description}</h2></div><span class="result-count">${entities.length} 项</span></div><div class="entity-grid entity-grid-collapsed">${entities.length ? visible.map(semanticGroupCard).join("") : emptyState(`尚未形成${label}实体`, "等待带有可回溯观察证据的资料。")}</div>${entities.length > 6 ? `<div class="entity-expand"><button class="button small ghost" data-action="toggle-entity-type" data-entity-type="${type}">${expanded ? "收起" : `查看全部 ${entities.length} 项`}</button></div>` : ""}</section>`;
     };
     const tripCards = state.trips.map((trip) => `<article class="trip-candidate"><span class="needs-label">${escapeHtml(trip.status)}</span><h3>${escapeHtml(trip.name)}</h3><p>${escapeHtml(formatDate(trip.time_start))} 至 ${escapeHtml(formatDate(trip.time_end))}</p><small>${(trip.place_names_json || []).map(escapeHtml).join("、") || "地点待补充"} · ${(trip.event_ids_json || []).length} 个事件 · ${(trip.evidence_ids_json || []).length} 条证据</small>${trip.status === "pending" ? `<div class="person-actions"><button class="button small primary" data-action="confirm-trip" data-trip-id="${escapeHtml(trip.id)}">命名并确认</button><button class="button small ghost" data-action="reject-trip" data-trip-id="${escapeHtml(trip.id)}">不是行程</button></div>` : `<small>类型 · ${escapeHtml(trip.trip_type || "未分类")} · revision ${trip.revision || 1}</small>`}</article>`).join("");
-    return pageHeader("语义记忆 / 实体目录", "人物、地点与细节共同组成回忆。", "相近描述会自动归到同一语义实体组；成员实体、事件和照片始终保留为可追溯的组成部分。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>当前人物声明</span></article><article><strong>" + state.entityGroups.length + "</strong><span>语义实体组</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>待维护事实</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物总结</p><h2>跨事件形成的熟人档案</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">行程候选</p><h2>跨事件的长线回忆</h2></div><span class=\"result-count\">" + state.trips.length + " 项</span></div><div class=\"trip-grid\">" + (tripCards || emptyState("暂无行程候选", "只有跨日或跨地点的连续事件才会成为待确认行程。")) + "</div></section>" + groups.map(entitySection).join("");
+    return pageHeader("语义记忆 / 实体目录", "人物、地点与细节共同组成回忆。", "相近描述会自动归到同一语义实体组；成员实体、事件和照片始终保留为可追溯的组成部分。", "<button class=\"button ghost\" data-action=\"reload\">" + icon("↻") + "刷新知识</button>") + "<section class=\"knowledge-summary\"><article><strong>" + people.length + "</strong><span>已确认人物</span></article><article><strong>" + claims.length + "</strong><span>当前人物声明</span></article><article><strong>" + state.entityGroups.length + "</strong><span>语义实体组</span></article><article><strong>" + (state.dashboard?.pendingFacts || 0) + "</strong><span>待维护事实</span></article></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">人物总结</p><h2>跨事件形成的熟人档案</h2></div><span class=\"result-count\">" + people.length + " 人</span></div><div class=\"entity-grid\">" + (personCards || emptyState("还没有已确认人物", "先在人物页面确认人脸簇，语义知识才会有稳定的中心。", "<button class=\"button small primary\" data-view=\"people\">打开人物</button>")) + "</div></section><section class=\"content-section\"><div class=\"section-head\"><div><p class=\"section-kicker\">行程候选</p><h2>跨事件的长线回忆</h2></div><span class=\"result-count\">" + state.trips.length + " 项</span></div><div class=\"trip-grid\">" + (tripCards || emptyState("暂无行程候选", "只有跨日或跨地点的连续事件才会成为待确认行程。")) + "</div></section>" + [geoPlaceSection(), entitySection(["object", "物品", "物品语义"]), entitySection(["atmosphere", "氛围", "画面氛围"])].join("");
   }
 
   function renderView() {
@@ -528,7 +626,9 @@
         const value = typeof item.value === "boolean" ? (item.value ? "是" : "否") : Array.isArray(item.value) ? item.value.join("、") : String(item.value ?? "未设置");
         return `<div class="property-row"><strong>${escapeHtml(item.property_key)} · ${escapeHtml(value)}</strong><small>${escapeHtml(item.source)} · v${item.revision}</small></div>`;
       }).join("");
-      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(detail.profile?.summary_zh || entity.summary || "暂无人物画像") + "</p></div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div><div class=\"section-head\"><div><p class=\"section-kicker\">用户维护档案</p><h3>身份、关系与圈子</h3></div><button class=\"button small ghost\" data-action=\"edit-person-properties\">修正档案</button></div><div class=\"property-list\">" + (identityRows || emptyState("尚未维护身份属性", "这些字段只由你维护，模型不会覆盖。")) + "</div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
+      const aliases = Array.isArray(entity.aliases) ? entity.aliases : [];
+      const aliasLine = aliases.length ? `<div class="person-aliases"><strong>其他称呼</strong><span>${aliases.map(escapeHtml).join("、")}</span></div>` : "";
+      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(detail.profile?.summary_zh || entity.summary || "暂无人物画像") + "</p>" + aliasLine + "</div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div><div class=\"section-head\"><div><p class=\"section-kicker\">用户维护档案</p><h3>身份、关系与圈子</h3></div><button class=\"button small ghost\" data-action=\"edit-person-name\">编辑名字</button><button class=\"button small ghost\" data-action=\"edit-person-properties\">修正档案</button></div><div class=\"property-list\">" + (identityRows || emptyState("尚未维护身份属性", "这些字段只由你维护，模型不会覆盖。")) + "</div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
     } else if (modal.type === "person-property-edit") {
       const detail = modal.detail;
       const properties = new Map((detail.properties || []).map((item) => [item.property_key, item]));
@@ -536,6 +636,11 @@
       const relation = properties.get("relation_to_user")?.value || "";
       const groups = Array.isArray(properties.get("groups")?.value) ? properties.get("groups").value.join("、") : "";
       body = `<form id="modal-form"><div class="modal-kicker">PERSON PROPERTY EDIT</div><h2>修正人物档案</h2><p class="modal-lead">这些是用户维护字段，会保留版本且不会被模型推断覆盖。</p><label class="property-toggle"><input type="checkbox" name="is_self" ${isSelf ? "checked" : ""} />这是相册主人</label><label>与相册主人的关系<input name="relation_to_user" value="${escapeHtml(relation)}" placeholder="例如：本人、母亲、同事" /></label><label>所属圈子<input name="groups" value="${escapeHtml(groups)}" placeholder="例如：家人、大学同学" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-person-profile" data-person-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存人物档案</button></div></form>`;
+    } else if (modal.type === "person-name-edit") {
+      const detail = modal.detail;
+      const entity = detail.entity;
+      const aliases = Array.isArray(entity.aliases) ? entity.aliases : [];
+      body = `<form id="modal-form"><div class="modal-kicker">PERSON NAME</div><h2>编辑人物名字</h2><p class="modal-lead">主名是家人通常的称呼；别名用于检索和确认时自动归类为同一人。改名后所有历史记忆会同步使用新名字。</p><label>主名<input name="name" value="${escapeHtml(entity.canonical_name)}" placeholder="例如：明哥" required /></label><label>其他称呼（别名，用顿号或逗号分隔）<input name="aliases" value="${escapeHtml(aliases.join("、"))}" placeholder="例如：小明、阿明" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-person-profile" data-person-id="${escapeHtml(entity.id)}">取消</button><button type="submit" class="button primary">保存名字</button></div></form>`;
     } else if (modal.type === "entity") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -710,6 +815,7 @@
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
           window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId), window.sentrixApi.entityGroups(scopeId),
+          window.sentrixApi.geoPlaces(scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -730,6 +836,7 @@
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
         state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
         state.entityGroups = calls[12].status === "fulfilled" ? calls[12].value.groups || [] : [];
+        state.geoPlaces = calls[13].status === "fulfilled" ? calls[13].value.places || [] : [];
     const failed = calls.find((call) => call.status === "rejected");
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
@@ -851,26 +958,51 @@
   async function handleFiles(event) {
     let files = Array.from(event.target.files || []);
     if (event.target.id === "folder-input") files = files.filter((file) => /\.(jpe?g|png)$/i.test(file.name || ""));
-    if (!files.length) return;
+    if (!files.length) { state.toast = "所选目录中没有 JPG/JPEG/PNG 图片"; renderShellNavigation(); return; }
     const queueEntries = files.map((file) => ({ fileName: file.name, status: "reading-metadata" }));
     state.queue.unshift(...queueEntries);
-    const items = await Promise.all(files.map(async (file, index) => {
-      const metadata = await window.sentrixImageMetadata.extract(file);
-      queueEntries[index].status = "uploading";
-      queueEntries[index].metadata = metadata;
-      return { file, metadata };
-    }));
-    try {
-      const result = await window.sentrixApi.importAssets(items, { scopeId: state.scopeId });
-      (result.items || []).forEach((item, index) => {
-        if (!queueEntries[index]) return;
-        queueEntries[index].assetId = item.assetId || item.asset_id;
-        queueEntries[index].status = item.status || "failed";
-      });
-    } catch {
-      queueEntries.forEach((item) => { item.status = "failed"; });
+    state.toast = `已读取 ${files.length} 张图片，正在解析元数据...`;
+    renderShellNavigation();
+    const items = [];
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        const metadata = await window.sentrixImageMetadata.extract(file);
+        queueEntries[index].metadata = metadata;
+        queueEntries[index].status = "ready";
+        items.push({ file, metadata });
+      } catch (error) {
+        queueEntries[index].status = "metadata-failed";
+        queueEntries[index].error = error.message || String(error);
+      }
+      if ((index + 1) % 10 === 0 || index === files.length - 1) {
+        state.toast = `正在解析图片元数据：${index + 1}/${files.length}`;
+        renderShellNavigation();
+      }
     }
-    state.toast = `${files.length} 个资料已进入本地处理队列`;
+    const chunkSize = 20;
+    let accepted = 0;
+    try {
+      for (let offset = 0; offset < items.length; offset += chunkSize) {
+        const chunk = items.slice(offset, offset + chunkSize);
+        const result = await window.sentrixApi.importAssets(chunk, { scopeId: state.scopeId });
+        (result.items || []).forEach((item, index) => {
+          const entry = queueEntries.find((candidate) => candidate.fileName === chunk[index].file.name && candidate.status === "ready");
+          if (!entry) return;
+          entry.assetId = item.assetId || item.asset_id;
+          entry.status = item.status || (item.accepted ? "queued" : "failed");
+          entry.error = item.error || "";
+          if (item.accepted) accepted += 1;
+        });
+        state.toast = `正在上传图片：${Math.min(offset + chunk.length, items.length)}/${items.length}`;
+        renderShellNavigation();
+      }
+    } catch (error) {
+      queueEntries.filter((entry) => entry.status === "ready").forEach((entry) => { entry.status = "upload-failed"; entry.error = error.message || String(error); });
+      state.toast = `上传失败：${error.message || error}`;
+      renderShellNavigation();
+    }
+    state.toast = `上传完成：${accepted}/${files.length} 张进入本地处理队列`;
     await refreshData();
     state.view = "imports";
     renderShellNavigation();
@@ -935,18 +1067,35 @@
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "groups", String(form.get("groups") || "").split(/[、,，]/).map((item) => item.trim()).filter(Boolean));
         state.toast = "人物档案已按你的修正保存";
       }
+      if (modal.type === "person-name-edit") {
+        const renamed = await window.sentrixApi.renamePerson(modal.detail.entity.id, { name: form.get("name"), aliases: String(form.get("aliases") || "").split(/[、,，]/).map((item) => item.trim()).filter(Boolean) });
+        state.toast = `已更新名字，历史记忆已同步`;
+        if (renamed?.entity) {
+          state.modal = null;
+          const detail = await window.sentrixApi.personProfile(renamed.entity.id);
+          return openModal({ type: "person-profile", detail });
+        }
+      }
       if (modal.type === "person") {
         const confirmed = await window.sentrixApi.confirmPerson(modal.person.id, form.get("name"), form.get("family_role"));
-        const counts = confirmed.refresh_counts || {};
-        state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
+        if (confirmed.merged_into) {
+          state.toast = `「${form.get("name")}」已合并到 ${confirmed.canonical_name || "已有成员"}，人脸证据已归并`;
+        } else {
+          const counts = confirmed.refresh_counts || {};
+          state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
+        }
       }
       if (modal.type === "cluster-confirm") {
         const confirmed = await window.sentrixApi.confirmFaceCluster(modal.cluster.id, { name: form.get("name"), family_role: form.get("family_role") });
         const target = String(form.get("relation_target") || "");
         const predicate = String(form.get("relation_predicate") || "").trim();
         if (target && predicate && confirmed.entity?.id) await window.sentrixApi.createRelationship({ subject_entity_id: confirmed.entity.id, predicate, object_entity_id: target, evidence_ids: (modal.cluster.samples || []).map((sample) => sample.observation_id), confidence: 1, status: "active" });
-        const counts = confirmed.refresh_counts || {};
-        state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
+        if (confirmed.merged_into) {
+          state.toast = `「${form.get("name")}」已合并到 ${confirmed.canonical_name || "已有成员"}，人脸证据已归并`;
+        } else {
+          const counts = confirmed.refresh_counts || {};
+          state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
+        }
       }
       if (modal.type === "cluster-merge") {
         await window.sentrixApi.mergeFaceClusters(form.get("target_cluster_id"), modal.cluster.id);
@@ -1016,6 +1165,9 @@
     if (action === "open-asset") return openAsset(element.dataset.assetId);
     if (action === "open-entity") return openEntity(element.dataset.entityId);
     if (action === "open-entity-group") return openEntityGroup(element.dataset.entityGroupId);
+    if (action === "geo-select-city") { state.geoBreadcrumb = [element.dataset.geoCity]; renderView(); return; }
+    if (action === "geo-select-district") { state.geoBreadcrumb = [state.geoBreadcrumb[0], element.dataset.geoDistrict]; renderView(); return; }
+    if (action === "geo-breadcrumb") { const level = element.dataset.geoLevel; state.geoBreadcrumb = level === "root" ? [] : state.geoBreadcrumb.slice(0, parseInt(level) + 1); renderView(); return; }
     if (action === "edit-entity-properties") return openModal({ type: "entity-property-edit", detail: state.modal.detail });
     if (action === "open-observation") { const observation = await window.sentrixApi.observation(element.dataset.observationId); return openAsset(observation.asset_id); }
     if (action === "create-event") return openModal({ type: "event-create", event: {} });
@@ -1027,12 +1179,15 @@
     if (action === "open-person") { openModal({ type: "loading" }, { push: true }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
     if (action === "open-person-profile") { openModal({ type: "loading" }, { push: true }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
+    if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
     if (action === "confirm-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-confirm", cluster }); }
     if (action === "merge-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-merge", cluster }); }
     if (action === "split-face") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); const sample = cluster?.samples?.find((item) => item.id === element.dataset.faceInstanceId); return openModal({ type: "cluster-split", cluster, sample }); }
-    if (action === "reject-cluster") { try { await window.sentrixApi.rejectFaceCluster(element.dataset.clusterId); state.toast = "人物候选已驳回，原始人脸证据仍保留"; return refreshData(); } catch (error) { state.toast = `驳回失败：${error.message}`; renderShellNavigation(); return; } }
-    if (action === "split-person") { try { await window.sentrixApi.rejectPerson(element.dataset.personId); state.toast = "候选人物已驳回，原始人脸证据仍保留"; return refreshData(); } catch (error) { state.toast = `驳回失败：${error.message}`; renderShellNavigation(); return; } }
+    if (action === "reject-cluster") { try { await window.sentrixApi.rejectFaceCluster(element.dataset.clusterId); state.toast = "已删除该候选簇，原始图片保留"; return refreshData(); } catch (error) { state.toast = `删除失败：${error.message}`; renderShellNavigation(); return; } }
+    if (action === "split-person") { try { await window.sentrixApi.rejectPerson(element.dataset.personId); state.toast = "已删除该候选，原始图片保留"; return refreshData(); } catch (error) { state.toast = `删除失败：${error.message}`; renderShellNavigation(); return; } }
+    if (action === "delete-person") { try { await window.sentrixApi.rejectPerson(element.dataset.personId); state.toast = "已删除「不是人物」的候选，原始图片保留"; return refreshData(); } catch (error) { state.toast = `删除失败：${error.message}`; renderShellNavigation(); return; } }
+    if (action === "delete-cluster") { try { await window.sentrixApi.rejectFaceCluster(element.dataset.clusterId); state.toast = "已删除「不是人物」的簇，原始图片保留"; return refreshData(); } catch (error) { state.toast = `删除失败：${error.message}`; renderShellNavigation(); return; } }
     if (action === "confirm-fact") { await window.sentrixApi.confirmFact(element.dataset.fact); state.toast = "事实已确认并生成修订记录"; return refreshData(); }
     if (action === "reject-fact") { await window.sentrixApi.rejectFact(element.dataset.fact); state.toast = "事实已驳回并保留证据记录"; return refreshData(); }
     if (action === "confirm-relationship") { await window.sentrixApi.confirmRelationship(element.dataset.relationshipId); state.toast = "关系已确认并进入语义记忆"; return refreshData(); }

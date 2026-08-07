@@ -14,4 +14,4 @@ pytorch-lightning>=2.5,<3
 torchmetrics>=1.7,<2
 lightning-utilities>=0.12,<1
 open-clip-torch==3.3.0
-reverse_geocoder>=1.5.1,<2
+pygeo-cn>=0.1.5

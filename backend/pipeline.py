@@ -64,8 +64,8 @@ class IngestionPipeline:
                 # Keep the database's human-readable location useful to the
                 # retrieval layer while retaining the complete GPS result in
                 # metadata_json for provenance.
-                if not metadata.get("captured_location") and location_context.get("label"):
-                    metadata["captured_location"] = location_context["label"]
+                # GPS stored in reverse_geocode; do NOT populate captured_location
+                # from geocoding — it breaks event clustering.
         return self.store.create_asset(
             asset_id,
             file_name or path.name,
