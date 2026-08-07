@@ -643,9 +643,9 @@ def create_story(payload: dict):
         for event_id in event_ids:
             detail = store.get_event_detail(event_id)
             if detail:
-                evidence.append({"event": detail["event"], "observations": [{"id": item["id"], "caption": item.get("caption"), "transcript": item.get("transcript"), "asset_id": item.get("asset_id")} for item in detail["observations"]]})
+                evidence.append({"event": detail["event"], "observations": [{"id": item["id"], "caption": item.get("caption"), "transcript": item.get("transcript"), "asset_id": item.get("asset_id"), "people": [{"name": p.get("name"), "is_self": bool(store._row("SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'", (p.get("entity_id"),)))} for p in (item.get("people") or []) if p.get("entity_id")]} for item in detail["observations"]]})
         if evidence:
-            prompt = """根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。严格返回 JSON：title、content、outline（数组）。使用中文，content 至少 100 字、上不封顶（照片多则内容长），在叙事中自然融入时间跨度、场景数量、记录时长、本周新场景、物件总数、陪伴人物等统计维度，以出现最多的人和"我"为主语主角。证据：""" + str(evidence)
+            prompt = """根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。严格返回 JSON：title、content、outline（数组）。使用中文，content 至少 100 字、上不封顶（照片多则内容长），在叙事中自然融入时间跨度、场景数量、记录时长、本周新场景、物件总数、陪伴人物等统计维度，以出现最多的人和"我"为主语主角。注意：证据中 is_self=true 的人物是相册主人"我"本人，请用第一人称"我"指代，绝不把自己描述成"我与自己相伴"之类的陪伴对象。证据：""" + str(evidence)
             try:
                 generated = parse_json_response(gamma.chat(prompt))
                 payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}

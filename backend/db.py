@@ -3485,7 +3485,7 @@ class MemoryStore:
             if property_key == "canonical_name" and value:
                 new_name = str(value)
                 for cluster in self._rows("SELECT id FROM face_clusters WHERE entity_id = ?", (entity_id,)):
-                    short_id = (cluster.get("id") or "")[:8]
+                    short_id = (cluster.get("id") or "").replace("cluster_", "")[:8]
                     if not short_id:
                         continue
                     old_placeholder = f"待命名成员#{short_id}"
@@ -3513,7 +3513,7 @@ class MemoryStore:
             raise ValueError("face clusters must belong to the same memory space")
         target_entity = self.get_entity(target["entity_id"]) if target.get("entity_id") else None
         source_entity = self.get_entity(other["entity_id"]) if other.get("entity_id") else None
-        if target_entity and source_entity and target_entity["id"] != source_entity["id"] and target_entity["status"] == "confirmed" and source_entity["status"] == "confirmed":
+        if target_entity and source_entity and target_entity["id"] != source_entity["id"] and target_entity["status"] == "confirmed" and source_entity["status"] == "confirmed" and source != "user_merge":
             raise ValueError("two confirmed people cannot be merged automatically")
         self.connection.execute("UPDATE face_instances SET cluster_id = ? WHERE cluster_id = ?", (target_cluster_id, source_cluster_id))
         self.connection.execute("UPDATE face_clusters SET status = 'rejected', member_count = 0, updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), source_cluster_id))
