@@ -751,6 +751,7 @@ class MemoryStore:
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
+        self._ensure_columns("stories", {"tags_json": "TEXT NOT NULL DEFAULT '[]'"})
         self._ensure_columns("query_gaps", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("memory_feedback", {
             "target_entity_id": "TEXT REFERENCES entities(id)", "target_event_id": "TEXT REFERENCES events(id)",
@@ -4103,18 +4104,19 @@ class MemoryStore:
         story_id = data.get("id") or make_id("story")
         timestamp = now_iso()
         self.connection.execute(
-            """INSERT INTO stories(id, title, status, outline_json, event_ids_json, content, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (story_id, data.get("title") or "未命名故事", data.get("status", "draft"), json_value(data.get("outline"), []), json_value(data.get("event_ids"), []), data.get("content", ""), timestamp, timestamp),
+            """INSERT INTO stories(id, title, status, outline_json, event_ids_json, tags_json, content, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (story_id, data.get("title") or "未命名故事", data.get("status", "draft"), json_value(data.get("outline"), []), json_value(data.get("event_ids"), []), json_value(data.get("tags"), []), data.get("content", ""), timestamp, timestamp),
         )
         self.connection.commit()
         return self.get_story(story_id)
 
     def get_story(self, story_id):
-        story = self._decode(self._row("SELECT * FROM stories WHERE id = ?", (story_id,)), ["outline_json", "event_ids_json"])
+        story = self._decode(self._row("SELECT * FROM stories WHERE id = ?", (story_id,)), ["outline_json", "event_ids_json", "tags_json"])
         if story:
             story["outline"] = story.pop("outline_json")
             story["event_ids"] = story.pop("event_ids_json")
+            story["tags"] = story.pop("tags_json", [])
         return story
 
     def list_stories(self):
@@ -4133,6 +4135,8 @@ class MemoryStore:
             values["outline_json"] = json_value(fields["outline"], [])
         if "event_ids" in fields:
             values["event_ids_json"] = json_value(fields["event_ids"], [])
+        if "tags" in fields:
+            values["tags_json"] = json_value(fields["tags"], [])
         if not values:
             return story
         assignments = ", ".join(f"{key} = ?" for key in values)
