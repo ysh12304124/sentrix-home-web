@@ -650,6 +650,7 @@
     document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action, element)));
     const fileInput = document.getElementById("file-input");
     if (fileInput) fileInput.addEventListener("change", handleFiles);
+    if (state.view === "imports") document.querySelector('.page-heading [data-action="open-folder"]')?.remove();
     const folderInput = document.getElementById("folder-input");
     if (folderInput) folderInput.addEventListener("change", handleFiles);
     const dropzone = fileInput?.closest(".dropzone");
