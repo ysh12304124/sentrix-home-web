@@ -608,7 +608,7 @@ def create_story(payload: dict):
             if detail:
                 evidence.append({"event": detail["event"], "observations": [{"id": item["id"], "caption": item.get("caption"), "transcript": item.get("transcript"), "asset_id": item.get("asset_id")} for item in detail["observations"]]})
         if evidence:
-            prompt = """根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。严格返回 JSON：title、content、outline（数组）。使用中文，content 300 字以内。证据：""" + str(evidence)
+            prompt = """根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。严格返回 JSON：title、content、outline（数组）。使用中文，content 至少 100 字、上不封顶（照片多则内容长，融入时间跨度、场景、陪伴人物等细节，以出现最多的人和"我"为主语主角）。证据：""" + str(evidence)
             try:
                 generated = parse_json_response(gamma.chat(prompt))
                 payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
