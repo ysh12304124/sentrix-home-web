@@ -313,3 +313,7 @@ button { cursor: pointer; }
 .assistant-choice-placeholder { display: inline-grid; place-items: center; color: var(--muted); font-size: 12px; }
 .assistant-identity-choice > span:last-child { min-width: 0; }
 .assistant-identity-choice strong { display: block; overflow-wrap: anywhere; }
+.admin-only { display: none; }
+body.admin .admin-only { display: revert; }
+.image-dup { color: var(--lime); font-weight: 650; }
+.assistant-basis > summary { cursor: pointer; color: var(--lime); font-weight: 650; font-size: 11px; margin-top: 14px; }

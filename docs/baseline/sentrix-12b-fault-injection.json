@@ -1,0 +1,53 @@
+{
+  "probe_count": 2,
+  "all_faults_cause_failure": true,
+  "probes": [
+    {
+      "name": "parser_timeout",
+      "api": "http://127.0.0.1:8094",
+      "verdict": "NO_DEGRADATION_OK",
+      "expected_fail": true,
+      "validation": {
+        "passed": false,
+        "degradation_used": true,
+        "actual_roles": [
+          "answer",
+          "parser"
+        ],
+        "issues": [
+          "degradation_used:parser_failed"
+        ]
+      },
+      "ledger_roles": [
+        "parser",
+        "answer"
+      ],
+      "evidence_status": "gap",
+      "answer": "目前没有关于“明哥”的相关信息。"
+    },
+    {
+      "name": "model_mismatch",
+      "api": "http://127.0.0.1:8095",
+      "verdict": "NO_DEGRADATION_OK",
+      "expected_fail": true,
+      "validation": {
+        "passed": false,
+        "degradation_used": true,
+        "actual_roles": [
+          "answer",
+          "parser"
+        ],
+        "issues": [
+          "model_mismatch=['answer']",
+          "degradation_used:parser_failed"
+        ]
+      },
+      "ledger_roles": [
+        "parser",
+        "answer"
+      ],
+      "evidence_status": "gap",
+      "answer": "确定：无相关信息。\n可能：无相关信息。\n无法确认：no_direct_support"
+    }
+  ]
+}

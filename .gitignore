@@ -7,3 +7,6 @@ logs/
 .ollama-sentrix/
 __pycache__/
 *.py[cod]
+
+# macOS AppleDouble resource forks (created by scp from macOS)
+._*

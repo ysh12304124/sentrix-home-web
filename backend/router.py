@@ -19,6 +19,7 @@ from typing import Any, Callable
 from .routing_rules import (
     has_general_verb,
     has_household_signal,
+    is_casual_chat,
     is_contextual_follow_up,
     is_no_lookup,
     is_writing_compose,
@@ -143,6 +144,12 @@ class Router:
                 and not has_household_signal(draft):
             return RouteDecision("none", "writing_compose")
 
+        # 2.6 Casual self-inquiry / greeting with no strong household anchor
+        #     routes to chat (D7).  The parser's generic semantic_condition must
+        #     not drag a greeting into the NeutralProbe's visual-noise upgrade.
+        if is_casual_chat(value) and not self._has_strong_household(draft):
+            return RouteDecision("none", "casual_chat", query_parse_calls=1)
+
         # 3. Strong household signal -> evidence.
         strong = self._strong_household(draft)
         if strong["hit"]:
@@ -222,6 +229,14 @@ class Router:
                 and not message_anchored(value):
             return RouteDecision("none", "general_concept_after_probe",
                                  query_parse_calls=decision.query_parse_calls)
+        # RX-0 fix: an anchored query (place/date/relation in the raw message)
+        # that the probe cannot attribute to any household is a strict-empty
+        # lookup, not an ambiguity — route to evidence so it returns a clean
+        # no_result gap instead of a clarifying question.
+        if message_anchored(value) and not getattr(draft, "parser_failed", False):
+            return RouteDecision("evidence", "anchored_strict_empty_after_probe",
+                                 query_parse_calls=decision.query_parse_calls,
+                                 answer_target=decision.answer_target)
         return RouteDecision("clarify", "no_household_match_ambiguous",
                              query_parse_calls=decision.query_parse_calls)
 
@@ -255,6 +270,24 @@ class Router:
         if getattr(draft, "entity_names", None):
             return {"hit": True, "reason": "entity_names", "answer_target": "person", "original": False}
         return {"hit": False, "reason": "", "answer_target": "general", "original": False}
+
+    @staticmethod
+    def _has_strong_household(draft) -> bool:
+        """Strong anchors only — the generic semantic_condition that the parser
+        attaches to casual greetings is deliberately excluded so a greeting
+        cannot be upgraded to evidence by visual noise."""
+        actions = getattr(draft, "actions", []) or []
+        if any(a.type in _EVIDENCE_ACTIONS for a in actions):
+            return True
+        if getattr(draft, "time_expression", None):
+            return True
+        if getattr(draft, "media_expressions", None):
+            return True
+        if getattr(draft, "negative_conditions", None):
+            return True
+        if getattr(draft, "entity_names", None):
+            return True
+        return False
 
     @staticmethod
     def _has_evidence_ask(draft) -> bool:

@@ -44,3 +44,37 @@ def require_12b_roles() -> bool:
 def fail_on_degradation() -> bool:
     """Any fallback / cache / parser_failed / template-answer fails the case."""
     return _on("SENTRIX_AGENT_FAIL_ON_DEGRADATION")
+
+
+# --- RX (Response Experience & Evidence Presentation) flags -----------------
+# Independent of the 12B full-chain validation profile.  Enabled only on the
+# dedicated RX validation instance (8092) via SENTRIX_RX_V1; never on 8091.
+
+def rx_active() -> bool:
+    """Master switch for the RX answer pipeline (AnswerBrief -> Writer -> Validator)."""
+    return os.getenv("SENTRIX_RX_V1", "0").strip().lower() in {"1", "true", "on"}
+
+
+def answer_brief_active() -> bool:
+    return rx_active() and os.getenv("SENTRIX_ANSWER_BRIEF_V1", "0").strip().lower() in {"1", "true", "on"}
+
+
+def response_plan_active() -> bool:
+    return rx_active() and os.getenv("SENTRIX_RESPONSE_PLAN_V1", "0").strip().lower() in {"1", "true", "on"}
+
+
+def visible_evidence_active() -> bool:
+    return rx_active() and os.getenv("SENTRIX_VISIBLE_EVIDENCE_V1", "0").strip().lower() in {"1", "true", "on"}
+
+
+def response_writer_active() -> bool:
+    return rx_active() and os.getenv("SENTRIX_RESPONSE_WRITER_V2", "0").strip().lower() in {"1", "true", "on"}
+
+
+def response_validator_active() -> bool:
+    return rx_active() and os.getenv("SENTRIX_RESPONSE_VALIDATOR_V1", "0").strip().lower() in {"1", "true", "on"}
+
+
+def admin_debug_presentation() -> bool:
+    """Admin/debug presentation switch — also gates the frontend debug layer."""
+    return os.getenv("SENTRIX_ADMIN_DEBUG_PRESENTATION", "0").strip().lower() in {"1", "true", "on"}
