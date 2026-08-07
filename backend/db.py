@@ -929,7 +929,14 @@ class MemoryStore:
         self.connection.execute(
             """INSERT INTO memory_spaces(id, name, kind, source_path, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
+            ON CONFLICT(id) DO UPDATE SET
+            name = CASE
+                WHEN memory_spaces.name IS NULL OR trim(memory_spaces.name) = ''
+                    OR memory_spaces.name = memory_spaces.id
+                THEN excluded.name
+                ELSE memory_spaces.name
+            END,
+            kind = excluded.kind,
             source_path = excluded.source_path, updated_at = excluded.updated_at""",
             (scope_id, name, kind, source_path, timestamp, timestamp),
         )
