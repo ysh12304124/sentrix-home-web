@@ -78,3 +78,21 @@ def response_validator_active() -> bool:
 def admin_debug_presentation() -> bool:
     """Admin/debug presentation switch — also gates the frontend debug layer."""
     return os.getenv("SENTRIX_ADMIN_DEBUG_PRESENTATION", "0").strip().lower() in {"1", "true", "on"}
+
+
+# --- TFPE v2 (Structured Memory) flags --------------------------------------
+# Model-driven strategy judgment (parser answer_type/strategy_hint) + a
+# deterministic structured executor.  All gated behind rx_active() so the
+# structured path reuses the RX AnswerBrief/Writer/Validator boundary.  Default
+# off; enabled on the 8092 validation instance only.
+
+def task_contract_active() -> bool:
+    return structured_memory_active() and os.getenv("SENTRIX_TASK_CONTRACT_V2", "0").strip().lower() in {"1", "true", "on"}
+
+
+def retrieval_strategy_active() -> bool:
+    return structured_memory_active() and os.getenv("SENTRIX_RETRIEVAL_STRATEGY_V1", "0").strip().lower() in {"1", "true", "on"}
+
+
+def structured_memory_active() -> bool:
+    return rx_active() and os.getenv("SENTRIX_STRUCTURED_MEMORY_V1", "0").strip().lower() in {"1", "true", "on"}

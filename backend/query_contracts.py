@@ -10,6 +10,23 @@ HARD = "deterministic_hard"
 SEMANTIC = "semantic_required"
 PREFERENCE = "ranking_preference"
 
+# TFPE v2: model-judged answer shape and retrieval strategy.  These are
+# produced by the 12B parser (open-vocabulary judgment), never by keyword
+# rules.  Code only validates them against the whitelist and executes.
+ANSWER_TYPES = {
+    "boolean", "count", "date", "date_range", "first_occurrence",
+    "last_occurrence", "exists", "list", "grouped_list", "asset_set",
+    "summary", "person_summary",
+}
+STRATEGY_HINTS = {
+    "structured_fact", "aggregation", "entity_fact", "semantic_text",
+    "visual_semantic", "hybrid", "asset_delivery",
+}
+STRUCTURED_ANSWER_TYPES = {
+    "boolean", "count", "date", "date_range", "first_occurrence",
+    "last_occurrence", "exists", "list", "grouped_list",
+}
+
 
 @dataclass(frozen=True)
 class Constraint:
@@ -61,6 +78,14 @@ class QueryParseDraft:
     semantic_conditions: list[dict[str, Any]] = field(default_factory=list)
     negative_conditions: list[dict[str, Any]] = field(default_factory=list)
     result_requirement: dict[str, Any] = field(default_factory=dict)
+    # TFPE v2: the model judges the answer shape and the retrieval strategy.
+    # answer_type defaults to asset_set (find images); strategy_hint is empty
+    # when the model made no call — code then falls back conservatively.
+    answer_type: str = "asset_set"
+    strategy_hint: str = ""
+    structured: dict[str, Any] = field(default_factory=dict)
+    # Debug: the raw model JSON before sanitize (admin layer only, never a writer input).
+    raw_json: Any = None
     # R9: proposed_mode is the ONLY writable mode field; it is advisory — the
     # Router decides the final route.  ``mode`` is a derived compatibility
     # property for legacy callers and the serialization layer.
@@ -111,6 +136,50 @@ def _as_list(value):
 
 def _clean_text(value):
     return str(value or "").strip()
+
+
+def _valid_iso_date(value):
+    value = _clean_text(value)
+    if not value:
+        return False
+    try:
+        datetime.fromisoformat(value[:10])
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _sanitize_structured(raw) -> dict[str, Any]:
+    """Whitelist the model's structured slot — never invent fields."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    time_range = raw.get("time_range")
+    if isinstance(time_range, dict):
+        start = _clean_text(time_range.get("start")) or None
+        end = _clean_text(time_range.get("end")) or None
+        if start and not _valid_iso_date(start):
+            start = None
+        if end and not _valid_iso_date(end):
+            end = None
+        if start or end:
+            out["time_range"] = {"start": start, "end": end}
+    media_type = _clean_text(raw.get("media_type")).lower()
+    if media_type in {"image", "video", "audio", "text"}:
+        out["media_type"] = media_type
+    place = _clean_text(raw.get("place"))
+    if place:
+        out["place"] = place
+    aggregation = raw.get("aggregation")
+    if isinstance(aggregation, dict):
+        op = _clean_text(aggregation.get("op"))
+        if op in {"count", "group_by", "first", "last", "exists", "list"}:
+            group_by = _clean_text(aggregation.get("group_by"))
+            out["aggregation"] = {
+                "op": op,
+                "group_by": group_by if group_by in {"month", "year", "date", "place", "media"} else None,
+            }
+    return out
 
 
 def _coerce_actions(raw):
@@ -171,6 +240,13 @@ def sanitize_query_parse(raw: Any, message: str = "") -> QueryParseDraft:
                 "source_text": _clean_text(item.get("source_text")) or _clean_text(item.get("value")),
             })
     requirement = raw.get("result_requirement") if isinstance(raw.get("result_requirement"), dict) else {}
+    answer_type = _clean_text(raw.get("answer_type"))
+    if answer_type not in ANSWER_TYPES:
+        answer_type = "asset_set"
+    strategy_hint = _clean_text(raw.get("strategy_hint"))
+    if strategy_hint not in STRATEGY_HINTS:
+        strategy_hint = ""
+    structured = _sanitize_structured(raw.get("structured"))
     actions = _coerce_actions(raw.get("actions"))
     facets = _coerce_facets(raw.get("facets"))
     ambiguities = [_clean_text(item) for item in _as_list(raw.get("ambiguities")) if _clean_text(item)]
@@ -216,6 +292,9 @@ def sanitize_query_parse(raw: Any, message: str = "") -> QueryParseDraft:
             "top_k": max(1, min(100, int(requirement.get("top_k", 10) or 10))),
             "return_original_assets": bool(requirement.get("return_original_assets", False)) or any(action.type == "return_assets" for action in actions),
         },
+        answer_type=answer_type,
+        strategy_hint=strategy_hint,
+        structured=structured,
         # R9: proposed_mode is advisory only.  No action-derived forcing — the
         # Router decides whether the message is household.
         proposed_mode=mode or "none",

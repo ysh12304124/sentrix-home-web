@@ -206,6 +206,15 @@ class ThinAgentRuntime:
             )
             if decision.focus_ids:
                 spec = self._merge_focus(spec, decision.focus_ids, scope_id)
+        # TFPE v2: when the model judged a structured answer and no picture-only
+        # dimension is present, answer exactly from the DB — never run visual ANN.
+        from .validation import full_chain_profile as _prof
+        if _prof.structured_memory_active():
+            from .retrieval_strategy import plan_retrieval_strategy
+            strategy = plan_retrieval_strategy(draft, spec)
+            if strategy.strategy in {"structured_fact", "aggregation", "entity_fact"}:
+                return self._structured_answer(message, conversation_id, scope_id, viewer_id,
+                                               decision, spec, draft, strategy)
         with _Perf.measure("retrieval"):
             packet = self.kernel.retrieve(spec)
         if spec.answer_target == "person" and not spec.entity_ids:
@@ -218,6 +227,89 @@ class ThinAgentRuntime:
                                        decision.as_gate_decision(), spec, packet, draft)
         self._save_focus(conversation_id, scope_id, spec, packet)
         return result
+
+    def _structured_answer(self, message, conversation_id, scope_id, viewer_id, decision, spec, draft, strategy):
+        """TFPE v2 structured answer: exact SQL facts -> AnswerBrief -> Writer -> Validator.
+
+        No images, no visual ANN, no fabrication: the facts are the exact SQL
+        values and the validator forbids any quantity outside the facts.
+        """
+        from .structured_memory import StructuredMemoryExecutor
+        from .task_contracts import build_task_contract
+        from .answer_brief import build_structured_brief
+        from .response_plan import plan_response
+        from .response_validator import finalize_answer
+        from .response_writer import safe_fallback, write_response
+
+        result = StructuredMemoryExecutor(self.store).execute(draft, spec, strategy=strategy.strategy)
+        task = build_task_contract(draft, spec)
+        brief = build_structured_brief(message, spec, draft, result, strategy=strategy.strategy)
+        plan = plan_response(brief)
+        mode = brief.response_mode
+
+        answer = None
+        statements: list[dict] = []
+        with _Perf.measure("answer"):
+            answer, statements = write_response(brief, plan, message, router=self.router)
+            _Perf.count("answer_calls")
+        model_unavailable = answer is None
+        if not answer:
+            answer, statements = safe_fallback(brief, plan)
+        final_answer, final_statements, validation = finalize_answer(
+            answer, statements, brief, plan, plan.image_count, lambda: safe_fallback(brief, plan))
+        rx_fallback_used = bool(model_unavailable or validation.get("fallback_used", False))
+
+        fact_map = {f.fact_id: f for f in brief.facts}
+        for statement in final_statements:
+            fact_id = statement.get("fact_id")
+            if fact_id and fact_id in fact_map and not statement.get("evidence_ids"):
+                statement["evidence_ids"] = fact_map[fact_id].evidence_ids
+
+        claims, index = [], {}
+        for number, statement in enumerate(final_statements, 1):
+            claim_id = f"claim_{number}"
+            claims.append({"claim_id": claim_id, "text": statement.get("text", ""),
+                           "status": statement.get("certainty") or "reasonable_summary",
+                           "evidence_ids": statement.get("evidence_ids") or []})
+            index[claim_id] = {"evidence_ids": statement.get("evidence_ids") or [],
+                               "status": statement.get("certainty") or "reasonable_summary"}
+
+        gate = decision.as_gate_decision()
+        status = "anchored" if brief.facts else "gap"
+        trace = [
+            {"stage": "gate", "status": "evidence",
+             "counts": {"query_parse": getattr(gate, "query_parse_calls", 0), "evidence_search": 0}},
+            {"stage": "retrieval_strategy", **strategy.as_dict()},
+            {"stage": "structured", "status": "complete",
+             "counts": {"answer_type": result.answer_type, "total": result.total,
+                        "visual_ann_skipped": "visual_ann" in (strategy.skipped_channels or [])}},
+        ]
+        result_dict = self._envelope(
+            final_answer, conversation_id, scope_id, viewer_id, gate, [], [], status, trace,
+            spec=spec, draft=draft, confidence=0.95 if brief.facts else 0.0,
+            insufficient_evidence=False,
+        )
+        result_dict.update({
+            "claims": claims, "claim_evidence_index": index, "statement_plan": final_statements,
+            "memory_intensity": "targeted", "original_evidence_requested": False,
+            "image_results": [],
+            "response_mode": mode,
+            "answer_brief": brief.as_dict(),
+            "response_plan": plan.as_dict(),
+            "rx_fallback_used": rx_fallback_used,
+            "task_contract": task.as_dict(),
+            "retrieval_strategy": strategy.as_dict(),
+            "structured_result": result.as_dict(),
+        })
+        result_dict["evidence_presentation"] = {
+            "required": True, "available": bool(brief.facts),
+            "default_collapsed": True, "direct_original_evidence": False,
+            "response_mode": mode,
+        }
+        result_dict["tool_trace"] = [{"tool": "structured_memory", "permission": "read",
+                                      "status": "complete", "answer_type": result.answer_type,
+                                      "total": result.total}]
+        return result_dict
 
     def _ambiguous_path(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
         """Ambiguous (weak parser signal / bare noun) — the NeutralProbe decides.
@@ -900,5 +992,8 @@ class ThinAgentRuntime:
             result["facets"] = [{"dimension": facet.dimension, "surface_text": facet.surface_text} for facet in draft.facets]
             result["parser_mode"] = draft.mode
             result["parser_confidence"] = draft.confidence
+            result["answer_type"] = getattr(draft, "answer_type", "asset_set")
+            result["strategy_hint"] = getattr(draft, "strategy_hint", "")
+            result["parser_raw"] = getattr(draft, "raw_json", None)
         result.update(extra)
         return result

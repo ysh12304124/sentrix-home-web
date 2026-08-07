@@ -63,4 +63,12 @@ def plan_response(brief: AnswerBrief) -> ResponsePlan:
     if mode == "clarify":
         return ResponsePlan("clarify", answer_first=True, max_paragraphs=1, image_count=0,
                             include_uncertainty=False, evidence_entry="hidden")
+    if mode == "structured_fact":
+        return ResponsePlan("structured_fact", answer_first=True, max_paragraphs=1,
+                            image_count=0, include_uncertainty=False,
+                            evidence_entry="collapsed" if has_facts else "hidden")
+    if mode == "aggregate_answer":
+        return ResponsePlan("aggregate_answer", answer_first=True, max_paragraphs=2,
+                            image_count=0, include_uncertainty=False,
+                            evidence_entry="collapsed" if has_facts else "hidden")
     return ResponsePlan(mode, image_count=visible)

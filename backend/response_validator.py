@@ -27,6 +27,7 @@ _IMAGE_COUNT_RE = re.compile(r"(\d+)\s*张")
 _FAMILY_PATTERN_RE = re.compile(r"多次出现|常常|经常|总是|喜欢|性格")
 _DISCLOSURE_RE = re.compile(r"接近|不完全匹配|不能确认|不确定|没有完全匹配|无法确认|尚未确认|还不能确认|仅凭")
 _FINDING_CLAIM_RE = re.compile(r"(?:我找到了|已找到|找到了\s*|找到这些|发现(?:了)?\s*(?:照片|图片|记录))")
+_STRUCTURED_COUNT_RE = re.compile(r"(\d+)\s*(?:条|张|段|个)")
 
 
 def scan_internal_leak(text: str) -> list[str]:
@@ -113,6 +114,22 @@ def validate_response(answer, brief: AnswerBrief, plan: ResponsePlan,
             and _FINDING_CLAIM_RE.search(text):
         failures.append({"rule": "finding_claim_without_facts", "detail": "无事实依据却宣称找到"})
         reasons.append("mode_consistency")
+
+    # TFPE v2 structured modes: no images, and every explicit quantity in the
+    # answer must be one of the exact SQL fact numbers (zero-tolerance: a count
+    # must never be estimated or re-worded into a different value).
+    if brief.response_mode in {"structured_fact", "aggregate_answer"}:
+        if image_count != 0:
+            failures.append({"rule": "structured_shows_images",
+                             "detail": f"{brief.response_mode} 不应展示图片"})
+            reasons.append("mode_consistency")
+        allowed = {int(number) for fact in brief.facts for number in re.findall(r"(\d+)", fact.text)}
+        for match in _STRUCTURED_COUNT_RE.findall(text):
+            number = int(match[0])
+            if number not in allowed:
+                failures.append({"rule": "structured_number_mismatch",
+                                 "detail": f"正文出现事实外数量 {number}"})
+                reasons.append("structured_exact")
 
     return {"valid": not failures, "failures": failures,
             "reasons": list(dict.fromkeys(reasons))}

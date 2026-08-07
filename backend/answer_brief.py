@@ -9,15 +9,17 @@ internal IDs never enter the brief's serialized form that reaches the writer.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 
 from .query_contracts import QuerySpec
 
-# response_mode values (D2 / §5.1).
+# response_mode values (D2 / §5.1) + TFPE v2 structured modes.
 RESPONSE_MODES = {
     "chat", "exact_result", "approximate_result", "no_result",
     "asset_delivery", "person_summary", "clarify",
+    "structured_fact", "aggregate_answer",
 }
 
 
@@ -274,6 +276,90 @@ def build_answer_brief(message: str, spec: QuerySpec, packet, *,
     )
 
 
+def _format_group(value) -> str:
+    """Human-facing label for a group key (never an internal id)."""
+    value = str(value or "").strip()
+    if not value or value == "未知":
+        return "未知"
+    if re.fullmatch(r"\d{4}-\d{2}", value):
+        year, month = value.split("-")
+        return f"{year}年{int(month)}月"
+    if re.fullmatch(r"\d{4}", value):
+        return f"{value}年"
+    if value == "image":
+        return "照片"
+    if value == "video":
+        return "视频"
+    if value == "audio":
+        return "音频"
+    return value
+
+
+def _structured_facts(result) -> list[Fact]:
+    """Exact facts from a StructuredResult — never a model estimate."""
+    answer_type = result.answer_type
+    facts: list[Fact] = []
+    if answer_type == "count":
+        facts.append(Fact("fact_1", f"符合条件的记录共 {result.total} 条", "confirmed"))
+    elif answer_type in {"exists", "boolean"}:
+        facts.append(Fact("fact_1", "存在符合条件的记录" if result.value else "没有符合条件的记录", "confirmed"))
+    elif answer_type in {"first_occurrence", "date"}:
+        if result.value:
+            facts.append(Fact("fact_1", f"最早的时间是 {result.value}", "confirmed"))
+        else:
+            facts.append(Fact("fact_1", "没有符合条件的记录", "confirmed"))
+    elif answer_type == "last_occurrence":
+        if result.value:
+            facts.append(Fact("fact_1", f"最晚的时间是 {result.value}", "confirmed"))
+        else:
+            facts.append(Fact("fact_1", "没有符合条件的记录", "confirmed"))
+    elif answer_type == "date_range":
+        if result.value.get("first") or result.value.get("last"):
+            facts.append(Fact("fact_1", "没有符合条件的记录", "confirmed") if not result.value.get("first") else
+                         Fact("fact_1", f"时间从 {result.value['first']} 到 {result.value['last']}", "confirmed"))
+        else:
+            facts.append(Fact("fact_1", "没有符合条件的记录", "confirmed"))
+    elif answer_type == "grouped_list":
+        for index, row in enumerate(result.rows, 1):
+            label = _format_group(row.get("group"))
+            facts.append(Fact(f"fact_{index}", f"{label}有 {row.get('count')} 条", "confirmed"))
+    elif answer_type == "list":
+        for index, row in enumerate(result.rows, 1):
+            label = _format_group(row.get("group"))
+            facts.append(Fact(f"fact_{index}", f"存在{label}", "confirmed"))
+    return facts
+
+
+def build_structured_brief(message: str, spec: QuerySpec, draft, result, strategy: str = "structured_fact") -> AnswerBrief:
+    """AnswerBrief for a structured/aggregate answer — images stay 0 by default.
+
+    ``result`` is a StructuredResult produced by the deterministic executor.
+    Facts carry the exact SQL values; the writer may only restate them.
+    """
+    answer_type = result.answer_type
+    aggregate = answer_type in {"grouped_list", "list", "date_range"}
+    mode = "aggregate_answer" if aggregate else "structured_fact"
+    facts = _structured_facts(result)
+    goal = "aggregate_memory" if aggregate else "answer_fact"
+    presentation = Presentation(
+        show_images=False,
+        auto_expand_images=False,
+        show_evidence_entry=bool(facts),
+    )
+    return AnswerBrief(
+        brief_id=f"brief_{uuid.uuid4().hex[:12]}",
+        user_goal=goal,
+        response_mode=mode,
+        direct_answer=_direct_answer(mode, 0, len(facts)),
+        facts=facts,
+        uncertainties=[],
+        visible_assets=[],
+        hidden_assets_count=0,
+        must_not_say=[],
+        presentation=presentation,
+    )
+
+
 def _direct_answer(mode: str, visible_count: int, fact_count: int) -> str:
     """Internal controlled conclusion used to orient the writer, not user text."""
     if mode == "asset_delivery":
@@ -286,4 +372,8 @@ def _direct_answer(mode: str, visible_count: int, fact_count: int) -> str:
         return "没有找到足够可靠的证据。"
     if mode == "person_summary":
         return f"人物总结：{fact_count} 条可陈述事实，其余保留未知。" if fact_count else "人物证据不足，只给 gap。"
+    if mode == "structured_fact":
+        return f"结构化事实：{fact_count} 条精确结论。"
+    if mode == "aggregate_answer":
+        return f"聚合结果：{fact_count} 条分组结论。"
     return "正常聊天。"

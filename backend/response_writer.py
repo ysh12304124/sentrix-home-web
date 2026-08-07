@@ -48,6 +48,14 @@ _MODE_INSTRUCTIONS = {
     "chat": (
         "正常自然对话，不要提家庭记忆。"
     ),
+    "structured_fact": (
+        "直接陈述给出的精确事实（数量、日期、最早、最晚、是否存在），数字和日期必须与事实完全一致；"
+        "不要扩展、不要编造、不要提内部字段，不需要图片。1-2 句即可。"
+    ),
+    "aggregate_answer": (
+        "先给总量，再按给出的分组逐一陈述（组名与数量），每个数字必须与事实精确一致；"
+        "组名为'未知'的分组说成'另有部分记录没有可靠地点/时间信息'；不要编造额外的分组。"
+    ),
 }
 
 
@@ -142,4 +150,8 @@ def safe_fallback(brief: AnswerBrief, plan: ResponsePlan) -> tuple[str, list]:
         return "我找到了一些符合你描述的照片，下面是其中最相关的几张。", []
     if mode == "clarify":
         return "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？", []
+    if mode in {"structured_fact", "aggregate_answer"}:
+        if brief.facts:
+            return "；".join(fact.text for fact in brief.facts) + "。", []
+        return "没有符合条件的记录。", []
     return "我在听。", []
