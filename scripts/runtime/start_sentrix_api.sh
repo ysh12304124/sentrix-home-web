@@ -6,8 +6,18 @@ set -euo pipefail
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ -f "$root/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$root/.env"
+  set +a
+fi
 python_bin="${SENTRIX_PYTHON:-$root/.venv/bin/python}"
 port="${SENTRIX_API_PORT:-8090}"
+export SENTRIX_DATA_DIR="${SENTRIX_DATA_DIR:-$root/data}"
+export SENTRIX_DB_PATH="${SENTRIX_DB_PATH:-$SENTRIX_DATA_DIR/sentrix.db}"
+export SENTRIX_ANN_DIR="${SENTRIX_ANN_DIR:-$SENTRIX_DATA_DIR/ann}"
+mkdir -p "$SENTRIX_DATA_DIR/media" "$SENTRIX_ANN_DIR"
 
 if [[ ! -x "$python_bin" ]]; then
   echo "Sentrix Python runtime is not executable: $python_bin" >&2
