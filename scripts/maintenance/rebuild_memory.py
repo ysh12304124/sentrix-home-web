@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -10,11 +11,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.db import MemoryStore
+from backend.image_io import HEIF_SUFFIXES, ensure_heif_support
 from backend.model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient
 from backend.pipeline import IngestionPipeline
 
 
-SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".wav", ".mp3", ".m4a", ".flac", ".txt", ".md"}
+SUPPORTED = {
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif",
+    ".wav", ".mp3", ".m4a", ".flac", ".txt", ".md",
+} | HEIF_SUFFIXES
 
 
 def metadata_for_path(metadata, source, path):
@@ -48,23 +53,25 @@ def benchmark_imports(manifest, source_root=None, scope_id=None):
             }
 
 
-def rebuild(root, source=None, benchmark_manifest=None, scope_id=None):
+def rebuild(root, source=None, benchmark_manifest=None, scope_id=None, keep_db=False):
+    ensure_heif_support()
     face = FaceAdapter()
     if face.enabled and face.identity_model in {"adaface", "magface"} and not face.identity_configured:
         raise RuntimeError(
             f"{face.identity_model} identity embedding is not configured: "
             f"{face.identity_error or 'missing model configuration'}"
         )
-    data_dir = root / "data"
-    db_path = data_dir / "sentrix.db"
+    data_dir = Path(os.getenv("SENTRIX_DATA_DIR", root / "data"))
+    db_path = Path(os.getenv("SENTRIX_DB_PATH", data_dir / "sentrix.db"))
     media_dir = data_dir / "media"
-    incremental = bool(benchmark_manifest and scope_id)
+    incremental = bool(benchmark_manifest and scope_id) or keep_db
     if not incremental:
         if db_path.exists():
             db_path.unlink()
         if media_dir.exists():
             shutil.rmtree(media_dir)
     media_dir.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     store = MemoryStore(str(db_path))
     manifest = None
@@ -76,9 +83,29 @@ def rebuild(root, source=None, benchmark_manifest=None, scope_id=None):
             store.create_memory_space(current_scope, current_scope, kind="benchmark", source_path=str(source / current_scope))
         run_scope = scope_id or "benchmark"
     else:
-        source = Path(source)
-        files = [("home-default", path, metadata_for_path(json.loads((source / "sentrix_metadata.json").read_text(encoding="utf-8")) if (source / "sentrix_metadata.json").is_file() else {}, source, path)) for path in sorted(source.rglob("*")) if path.is_file() and path.name != "sentrix_metadata.json" and path.suffix.lower() in SUPPORTED]
-        run_scope = str(source)
+        source = Path(source).expanduser().resolve()
+        if not source.is_dir():
+            raise FileNotFoundError(f"source album directory not found: {source}")
+        current_scope = scope_id or "home-default"
+        store.create_memory_space(
+            current_scope,
+            current_scope,
+            kind="household",
+            source_path=str(source),
+        )
+        metadata_path = source / "sentrix_metadata.json"
+        album_metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+        files = []
+        for path in sorted(source.rglob("*")):
+            if not path.is_file() or path.name == "sentrix_metadata.json":
+                continue
+            if path.suffix.lower() not in SUPPORTED:
+                continue
+            metadata = metadata_for_path(album_metadata, source, path)
+            metadata.setdefault("scope_id", current_scope)
+            metadata.setdefault("source_album_id", current_scope)
+            files.append((current_scope, path, metadata))
+        run_scope = current_scope
     run = store.start_rebuild("sentrix-rebuild-v1", str(run_scope))
     pipeline = IngestionPipeline(store, gamma=GammaClient(), asr=FunASRClient(), face=face, clip=ClipAdapter())
     processed = 0
@@ -109,9 +136,14 @@ def rebuild(root, source=None, benchmark_manifest=None, scope_id=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--source", type=Path, default=None)
+    parser.add_argument("--source", type=Path, default=None, help="Album directory to scan (e.g. data/my-album)")
     parser.add_argument("--benchmark-manifest", type=Path, default=None)
-    parser.add_argument("--scope-id", default=None)
+    parser.add_argument("--scope-id", default=None, help="MemorySpace id for the scanned album")
+    parser.add_argument(
+        "--keep-db",
+        action="store_true",
+        help="Do not delete sentrix.db / data/media before scanning (safe for adding a new album)",
+    )
     args = parser.parse_args()
     source = args.source or (args.root / "data" / "test-albums")
-    rebuild(args.root, source, args.benchmark_manifest, args.scope_id)
+    rebuild(args.root, source, args.benchmark_manifest, args.scope_id, keep_db=args.keep_db)

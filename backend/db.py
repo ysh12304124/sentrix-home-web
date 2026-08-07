@@ -3878,6 +3878,42 @@ class MemoryStore:
             }
         return detail
 
+    def reject_person_entity(self, entity_id):
+        """Reject a native person candidate and its reviewable face clusters.
+
+        Face instances and original assets remain as evidence; only the
+        candidate identity status is retired from review queues.
+        """
+        entity = self.get_entity(entity_id)
+        if not entity or entity.get("entity_type") != "person":
+            return None
+        if entity.get("status") == "confirmed":
+            raise ValueError("confirmed person entities cannot be rejected from the candidate queue")
+        timestamp = now_iso()
+        clusters = self._rows(
+            """SELECT id FROM face_clusters
+            WHERE entity_id = ? AND status IN ('pending', 'confirmed')""",
+            (entity_id,),
+        )
+        for cluster in clusters:
+            self.connection.execute(
+                """UPDATE face_clusters SET status = 'rejected', updated_at = ?, revision = revision + 1
+                WHERE id = ?""",
+                (timestamp, cluster["id"]),
+            )
+        self.connection.execute(
+            """UPDATE entities SET status = 'rejected', summary = ?, updated_at = ?
+            WHERE id = ?""",
+            ("候选人物已驳回，原始人脸证据仍保留", timestamp, entity_id),
+        )
+        self.connection.execute(
+            """UPDATE relationships SET status = 'retracted', updated_at = ?, revision = revision + 1
+            WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status IN ('pending', 'active')""",
+            (timestamp, entity_id, entity_id),
+        )
+        self.connection.commit()
+        return self.get_entity(entity_id)
+
     def get_person_evidence(self, person_id):
         detail = self.get_entity_detail(person_id)
         if not detail:

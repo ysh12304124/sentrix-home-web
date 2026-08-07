@@ -4,10 +4,10 @@ const path = require("node:path");
 const { URL } = require("node:url");
 
 const root = __dirname;
-const port = Number(process.env.PORT || 4173);
-// The web portal uses the Agent-capable API as its single authority. That
-// process must point at the production Sentrix database at runtime.
-const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:8091").replace(/\/$/, "");
+const port = Number(process.env.PORT || 11000);
+// The web portal uses the Agent-capable API as its single authority.
+// Default API is the project-local backend that reads ./data/sentrix.db.
+const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:11001").replace(/\/$/, "");
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -18,6 +18,8 @@ const contentTypes = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
+  ".heic": "image/heic",
+  ".heif": "image/heif",
 };
 
 const json = (res, status, payload) => {

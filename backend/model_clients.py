@@ -342,8 +342,10 @@ class GammaClient:
         file_path = Path(path)
         max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "896"))
         try:
+            from .image_io import ensure_heif_support, guess_mime_type
             from PIL import Image
 
+            ensure_heif_support()
             with Image.open(file_path) as source:
                 image = source.convert("RGB")
                 image.thumbnail((max_dimension, max_dimension))
@@ -352,7 +354,7 @@ class GammaClient:
                 return base64.b64encode(output.getvalue()).decode("ascii"), "image/jpeg"
         except Exception:
             encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
-            mime_type = mimetypes.guess_type(file_path.name)[0] or "image/jpeg"
+            mime_type = guess_mime_type(file_path)
             return encoded, mime_type
 
     def analyze_image(self, path, metadata=None):
@@ -623,6 +625,9 @@ class ClipAdapter:
         try:
             import torch
             from PIL import Image
+            from .image_io import ensure_heif_support
+
+            ensure_heif_support()
             image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 embedding = model.encode_image(image)
@@ -723,7 +728,16 @@ class FaceAdapter:
                         self._app = FaceAnalysis(**kwargs)
                         self._app.prepare(ctx_id=-1, det_size=(640, 640))
             import cv2
+            import numpy as np
             image = cv2.imread(str(path))
+            if image is None:
+                # Apple HEIC/HEIF and some PNGs are unreadable by OpenCV alone.
+                from .image_io import ensure_heif_support
+                from PIL import Image
+
+                ensure_heif_support()
+                with Image.open(path) as pil_image:
+                    image = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
             if image is None:
                 return []
             faces = self._app.get(image)
