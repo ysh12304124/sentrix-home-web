@@ -1282,6 +1282,10 @@ class MemoryStore:
         activity_score = 0.9 if activity and existing_activity and (activity == existing_activity or activity in existing_activity or existing_activity in activity) else 0.0
         if activity and existing_activity and not activity_score and event_type and event_type not in event_types:
             activity_score = -0.8
+        # 同时间(<60s)+同地点(<50m)时,不因activity冲突惩罚
+        same_time_place = time_score >= 0.99 and location_score >= 0.95
+        if same_time_place and activity_score < 0:
+            activity_score = 0.0
         object_sets = [self._tokens(self.get_observation(item["observation_id"]).get("objects")) for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (event["id"],))]
         objects = self._tokens(observation.get("objects"))
         object_score = 0.8 if objects and any(objects.intersection(values) for values in object_sets) else 0.0
@@ -1290,8 +1294,7 @@ class MemoryStore:
         person_score = 0.8 if people and existing_people and people.intersection(existing_people) else 0.0
         visual_similarity, visual_available = self._event_visual_similarity(observation, event["id"])
         semantic_conflict = bool(
-            activity and existing_activity and activity != existing_activity
-            and event_type and event_types and event_type not in event_types
+            event_type and event_types and event_type not in event_types
         )
         corroborated = bool(object_score or person_score)
         split_guard = None
@@ -1299,7 +1302,7 @@ class MemoryStore:
         # group shots, and different camera angles need not look alike. Split
         # only when independent semantic evidence also conflicts and no known
         # person/object bridges the candidate event.
-        if visual_available and semantic_conflict and visual_similarity < 0.45 and not corroborated:
+        if visual_available and semantic_conflict and visual_similarity < 0.45 and not corroborated and not same_time_place:
             split_guard = "semantic_visual_conflict"
         visual_boost = (
             max(0.0, min(1.0, (visual_similarity - 0.70) / 0.30))
@@ -1311,7 +1314,7 @@ class MemoryStore:
             + 0.05 * object_score + 0.20 * person_score + 0.05 * visual_boost
         )
         if split_guard:
-            total = 0.0
+            total *= 0.3
         return {
             "total": max(0.0, min(1.0, total)), "time": time_score, "location": location_score,
             "visual_place": visual_place_score, "event_type": event_type_score,
