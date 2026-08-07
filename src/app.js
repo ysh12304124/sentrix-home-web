@@ -651,6 +651,23 @@
     if (fileInput) fileInput.addEventListener("change", handleFiles);
     const folderInput = document.getElementById("folder-input");
     if (folderInput) folderInput.addEventListener("change", handleFiles);
+    const dropzone = fileInput?.closest(".dropzone");
+    if (dropzone) {
+      const hint = dropzone.querySelector("small");
+      if (hint) hint.textContent = "可选择文件，或使用旁边的按钮导入 JPG/JPEG/PNG 图片文件夹";
+      if (!dropzone.parentElement.querySelector("[data-action='open-folder']")) {
+        const folderButton = document.createElement("button");
+        folderButton.type = "button";
+        folderButton.className = "button ghost folder-import-button";
+        folderButton.dataset.action = "open-folder";
+        folderButton.textContent = "选择图片文件夹";
+        dropzone.parentElement.appendChild(folderButton);
+        folderButton.addEventListener("click", () => handleAction("open-folder", folderButton));
+      }
+    }
+    const topUser = document.querySelector(".top-user");
+    const topUserLabel = topUser?.querySelector("span:not(.avatar)");
+    if (topUserLabel) topUserLabel.textContent = "相册管理";
   const vlmSelect = document.querySelector('[data-action="switch-vlm"]');
   if (vlmSelect) {
     vlmSelect.addEventListener("change", async () => {
@@ -880,7 +897,11 @@
       state.assistantMessages = [];
       return refreshData({ forceRender: true });
     }
-    if (action === "open-folder") { document.getElementById("folder-input")?.click(); return; }
+    if (action === "open-folder") {
+      if (element?.classList.contains("top-user")) return openModal({ type: "space-manager" });
+      document.getElementById("folder-input")?.click();
+      return;
+    }
     if (action === "toggle-sort") { state.assetSort = state.assetSort === "newest" ? "oldest" : "newest"; renderView(); return; }
     if (action === "toggle-entity-type") { const type = element.dataset.entityType; state.expandedEntityTypes[type] = !state.expandedEntityTypes[type]; renderView(); return; }
     if (action === "continue-assistant") { state.query = element.dataset.query || ""; return submitSearch(null, element.dataset.entityId || ""); }
