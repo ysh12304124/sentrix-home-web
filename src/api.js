@@ -80,6 +80,8 @@
       });
       return request("/api/import", { method: "POST", body: form });
     },
+    getVlmBackend: () => request("/api/vlm-backend"),
+    setVlmBackend: (backend) => request("/api/vlm-backend", { method: "POST", body: JSON.stringify({ backend }) }),
     importAsset: (file, metadata = {}, options = {}) => {
       return window.sentrixApi.importAssets([{ file, metadata }], options).then((result) => result.items[0]);
     },

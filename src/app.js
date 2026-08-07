@@ -27,6 +27,7 @@
     stories: [],
     trips: [],
     health: null,
+    vlmBackendOptions: null,
     modal: null,
     eventFilter: "all",
     assetFilter: "all",
@@ -378,7 +379,7 @@
   function settingsView() {
     const facts = state.dashboard?.facts || [];
     const pending = facts.filter((fact) => fact.status === "pending");
-    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label">READY</span></div><div class="model-row"><span>主推理</span><strong>${escapeHtml(state.health.models?.llm?.name || "未知")}</strong><small>${escapeHtml(state.health.models?.llm?.endpoint || "未连接")}</small></div><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${state.health.models?.face?.ready ? "已启用" : "不可用"}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频编码记忆 <b>预留</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}<section class="content-section fact-review"><div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频编码</span><b>接口关闭</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div></div></div></section>`;
+    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label ${state.vlmBackendOptions?.models?.[state.vlmBackendOptions?.backend]?.available === false ? 'warn' : ''}">${state.vlmBackendOptions?.models?.[state.vlmBackendOptions?.backend]?.available === false ? 'OFFLINE' : 'READY'}</span></div><label class="model-switcher"><span>主推理</span><select data-action="switch-vlm">${(state.vlmBackendOptions?.available_backends || []).map(id => { const info = state.vlmBackendOptions?.models?.[id] || {}; return `<option value="${escapeHtml(id)}" ${id === state.vlmBackendOptions?.backend ? 'selected' : ''} ${!info.available ? 'disabled' : ''}>${escapeHtml(info.model || id)}${info.available ? '' : ' · 离线'}${info.loaded ? ' · 已加载' : ''}</option>` }).join('')}</select><small>${escapeHtml(state.vlmBackendOptions?.models?.[state.vlmBackendOptions?.backend]?.url || '未连接')}</small></label><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${state.health.models?.face?.ready ? "已启用" : "不可用"}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频编码记忆 <b>预留</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}<section class="content-section fact-review"><div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频编码</span><b>接口关闭</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div></div></div></section>`;
   }
 
   function semanticDetails(group) {
@@ -604,6 +605,11 @@
     state.persons = calls[3].status === "fulfilled" ? calls[3].value.people || [] : [];
     state.stories = calls[4].status === "fulfilled" ? calls[4].value.stories || [] : [];
     state.health = calls[5].status === "fulfilled" ? calls[5].value : null;
+    try {
+      state.vlmBackendOptions = await window.sentrixApi.getVlmBackend();
+    } catch (err) {
+      state.vlmBackendOptions = null;
+    }
     state.entities = calls[6].status === "fulfilled" ? calls[6].value.entities || [] : [];
     state.clusters = calls[7].status === "fulfilled" ? calls[7].value.clusters || [] : [];
     state.relationships = calls[8].status === "fulfilled" ? calls[8].value.relationships || [] : [];
@@ -638,6 +644,24 @@
     document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action, element)));
     const fileInput = document.getElementById("file-input");
     if (fileInput) fileInput.addEventListener("change", handleFiles);
+  const vlmSelect = document.querySelector('[data-action="switch-vlm"]');
+  if (vlmSelect) {
+    vlmSelect.addEventListener("change", async () => {
+      const target = vlmSelect.value;
+      vlmSelect.disabled = true;
+      try {
+        await window.sentrixApi.setVlmBackend(target);
+        await refreshData({ silent: true });
+        renderView();
+      } catch (err) {
+        vlmSelect.value = state.vlmBackendOptions?.backend || "";
+        state.backendError = `模型切换失败: ${err.message || err}`;
+        renderView();
+      } finally {
+        vlmSelect.disabled = false;
+      }
+    });
+  }
   }
 
   async function submitSearch(event, selectedEntityId = "") {
