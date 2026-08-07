@@ -1,10 +1,12 @@
 (function () {
   const app = document.getElementById("app");
   const benchmarkModelProfiles = [
-    { id: "gemma4-12b-it", label: "Gemma-4-12B" },
+    { id: "gemma4-12b-it", label: "Gemma-4-12B (默认)" },
     { id: "gemma4-e2b-it", label: "Gemma-4-E2B 蒸馏前" },
-    { id: "gemma4-e2b-it-lora-v2", label: "Gemma-4-E2B 蒸馏后（加 LoRA 头）" },
+    { id: "gemma4-e2b-it-lora-v2", label: "Gemma-4-E2B 蒸馏后+LoRA" },
     { id: "qwen3.5-0.8b-it", label: "Qwen-3.5-0.8B" },
+    { id: "qwen3-instruct", label: "Qwen-3-4B Instruct" },
+    { id: "qwen3-8b", label: "Qwen-3-8B" },
   ];
 
   function modelProfileOptions(payload) {
@@ -75,8 +77,8 @@
   function adminDebug() {
     const enabled = new URLSearchParams(window.location.search).has("debug")
       || window.localStorage?.getItem("sentrix.adminDebug") === "1";
-    document.body.classList.add("admin");
-    return true;
+    document.body.classList.toggle("admin", enabled);
+    return enabled;
   }
 
   const navItems = [
