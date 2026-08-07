@@ -57,15 +57,16 @@ class IngestionPipeline:
             if metadata.get(key) is None and metadata["exif"].get(key):
                 metadata[key] = metadata["exif"][key]
         gps = self._gps_from_metadata(metadata)
-        if gps and "reverse_geocode" not in metadata:
-            location_context = self.geocoder.lookup(gps)
-            if location_context:
-                metadata["reverse_geocode"] = location_context
-                # Keep the database's human-readable location useful to the
-                # retrieval layer while retaining the complete GPS result in
-                # metadata_json for provenance.
-                # GPS stored in reverse_geocode; do NOT populate captured_location
-                # from geocoding — it breaks event clustering.
+        if gps:
+            # Keep the raw GPS coordinate as the event-clustering location
+            # anchor (the original logic); reverse_geocode stays a display-only
+            # semantic place and must not overwrite the coordinate.
+            if not metadata.get("captured_location"):
+                metadata["captured_location"] = f"{float(gps['latitude']):.6f},{float(gps['longitude']):.6f}"
+            if "reverse_geocode" not in metadata:
+                location_context = self.geocoder.lookup(gps)
+                if location_context:
+                    metadata["reverse_geocode"] = location_context
         return self.store.create_asset(
             asset_id,
             file_name or path.name,
