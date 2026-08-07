@@ -13,6 +13,13 @@ from pydantic import BaseModel
 
 from .agent import MemoryAgent
 from .db import MemoryStore, make_id
+from .image_io import (
+    encode_jpeg_preview,
+    ensure_heif_support,
+    guess_mime_type,
+    media_type_from_upload,
+    needs_browser_transcode,
+)
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, parse_json_response
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
@@ -21,8 +28,11 @@ from .person_appearance import expanded_person_crop
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("SENTRIX_DATA_DIR", ROOT / "data"))
 MEDIA_DIR = DATA_DIR / "media"
+PREVIEW_DIR = DATA_DIR / "previews"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+ensure_heif_support()
 
 store = MemoryStore(os.getenv("SENTRIX_DB_PATH", str(DATA_DIR / "sentrix.db")))
 gamma = GammaClient()
@@ -617,6 +627,7 @@ def rename_person(person_id: str, payload: dict | None = None):
 
 @app.post("/api/persons/{person_id}/reject")
 def reject_person(person_id: str):
+    # /api/people returns native person entities; reject must follow that path.
     try:
         native = store.reject_person_entity(person_id)
     except ValueError as error:
@@ -660,11 +671,31 @@ def assets(mediaType: str | None = None, status: str | None = None, scope_id: st
 
 
 @app.get("/api/assets/{asset_id}/file")
-def asset_file(asset_id: str):
+def asset_file(asset_id: str, original: bool = False):
     value = store.get_asset(asset_id)
-    if not value or not Path(value["path"]).is_file():
+    path = Path(value["path"]) if value else None
+    if not value or not path or not path.is_file():
         raise HTTPException(status_code=404, detail="asset file not found")
-    return FileResponse(value["path"], media_type=value.get("mime_type") or "application/octet-stream", filename=value.get("file_name"))
+    # Keep an escape hatch for downloading the untouched HEIC source.
+    if original or not needs_browser_transcode(path, value.get("mime_type")):
+        return FileResponse(
+            path,
+            media_type=value.get("mime_type") or "application/octet-stream",
+            filename=value.get("file_name"),
+        )
+    preview = PREVIEW_DIR / f"{asset_id}.jpg"
+    try:
+        source_mtime = path.stat().st_mtime
+        if not preview.is_file() or preview.stat().st_mtime < source_mtime:
+            preview.write_bytes(encode_jpeg_preview(path))
+        return FileResponse(
+            preview,
+            media_type="image/jpeg",
+            filename=f"{Path(value.get('file_name') or asset_id).stem}.jpg",
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
+    except OSError as error:
+        raise HTTPException(status_code=422, detail=f"unable to render preview: {error}") from error
 
 
 @app.get("/api/face-instances/{face_instance_id}/crop")
@@ -826,9 +857,8 @@ async def ingest(
     destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
     with destination.open("wb") as output:
         shutil.copyfileobj(file.file, output)
-    media_type = (file.content_type or "application/octet-stream").split("/", 1)[0]
-    if media_type not in {"image", "audio", "video", "text"}:
-        media_type = "text"
+    media_type = media_type_from_upload(file.content_type, safe_name)
+    mime_type = file.content_type or guess_mime_type(safe_name)
     metadata = {
         "source_owner_id": sourceOwnerId,
         "source_device_id": sourceDeviceId,
@@ -850,7 +880,7 @@ async def ingest(
         safe_name,
         media_type,
         str(destination),
-        file.content_type,
+        mime_type,
         destination.stat().st_size,
         metadata,
     )
