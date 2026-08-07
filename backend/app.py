@@ -271,6 +271,7 @@ def people(status: str | None = None, scope_id: str | None = None):
         else:
             item["display_name"] = item["canonical_name"]
         item["confirmed"] = item["status"] == "confirmed"
+        item["aliases"] = store.person_aliases(item["id"])
         item["profile"] = store.get_semantic_profile(item["id"])
         item["claims"] = store.list_semantic_claims(item["id"], 100)
         item["event_memory"] = store.list_person_event_memory(item["id"], scope_id)
@@ -288,6 +289,8 @@ def person_profile(person_id: str):
     detail["claims"] = store.list_semantic_claims(person_id, 500)
     detail["event_memory"] = store.list_person_event_memory(person_id)
     detail["patterns"] = store.list_person_patterns(person_id)
+    if detail.get("entity"):
+        detail["entity"]["aliases"] = store.person_aliases(person_id)
     entity = detail.get("entity") or {}
     if entity.get("status") == "pending":
         entity["canonical_name"] = "待命名成员"
@@ -442,6 +445,11 @@ def confirm_face_cluster(cluster_id: str, payload: dict):
     value = store.confirm_face_cluster(cluster_id, name, str(payload.get("family_role") or "").strip() or None)
     if not value:
         raise HTTPException(status_code=404, detail="face cluster not found")
+    if value.get("merged_into"):
+        refreshed = _refresh_confirmed_person(value["entity"]["id"], value.get("refresh_counts", {}))
+        refreshed["merged_into"] = value["merged_into"]
+        refreshed["canonical_name"] = value.get("canonical_name") or (refreshed.get("entity") or {}).get("canonical_name")
+        return refreshed
     return _refresh_confirmed_person(value["entity"]["id"], value.get("refresh_counts", {}))
 
 
@@ -465,6 +473,8 @@ def _refresh_confirmed_person(person_id: str, refresh_counts: dict | None = None
         "appearance": len(store.list_person_appearance_evidence(person_id, include_empty=True)),
     })
     refreshed["refresh_counts"] = counts
+    if refreshed.get("entity"):
+        refreshed["entity"]["aliases"] = store.person_aliases(person_id)
     return refreshed
 
 
@@ -509,7 +519,10 @@ def _analyze_confirmed_person_appearance(person_id: str):
 
 @app.post("/api/face-clusters/{cluster_id}/reject")
 def reject_face_cluster(cluster_id: str):
-    value = store.reject_face_cluster(cluster_id)
+    try:
+        value = store.reject_face_cluster(cluster_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     if not value:
         raise HTTPException(status_code=404, detail="face cluster not found")
     return value
@@ -575,6 +588,11 @@ def confirm_person(person_id: str, payload: dict | None = None):
     family_role = str((payload or {}).get("family_role") or "").strip() or None
     native = store.confirm_person_entity(person_id, name, family_role)
     if native:
+        if native.get("merged_into"):
+            refreshed = _refresh_confirmed_person(native["entity"]["id"], native.get("refresh_counts", {}))
+            refreshed["merged_into"] = native["merged_into"]
+            refreshed["canonical_name"] = native.get("canonical_name") or (refreshed.get("entity") or {}).get("canonical_name")
+            return refreshed
         return _refresh_confirmed_person(native["entity"]["id"], native.get("refresh_counts", {}))
     value = store.update_person(person_id, name, "confirmed")
     if not value:
@@ -582,8 +600,29 @@ def confirm_person(person_id: str, payload: dict | None = None):
     return value
 
 
+@app.post("/api/people/{person_id}/rename")
+def rename_person(person_id: str, payload: dict | None = None):
+    new_name = str((payload or {}).get("name") or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="person name is required")
+    detail = store.rename_person(person_id, new_name)
+    if not detail:
+        raise HTTPException(status_code=404, detail="person not found")
+    refreshed = _refresh_confirmed_person(person_id)
+    refreshed["aliases"] = store.person_aliases(person_id)
+    if detail.get("semantic_claims"):
+        refreshed["semantic_claims"] = detail["semantic_claims"]
+    return refreshed
+
+
 @app.post("/api/persons/{person_id}/reject")
 def reject_person(person_id: str):
+    try:
+        native = store.reject_person_entity(person_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if native:
+        return native
     value = store.update_person(person_id, status="rejected")
     if not value:
         raise HTTPException(status_code=404, detail="person not found")
