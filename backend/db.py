@@ -3482,6 +3482,23 @@ class MemoryStore:
                 f"UPDATE entities SET {column} = ?, updated_at = ? WHERE id = ?",
                 (str(value) if value is not None else None, timestamp, entity_id),
             )
+            if property_key == "canonical_name" and value:
+                new_name = str(value)
+                for cluster in self._rows("SELECT id FROM face_clusters WHERE entity_id = ?", (entity_id,)):
+                    short_id = (cluster.get("id") or "")[:8]
+                    if not short_id:
+                        continue
+                    old_placeholder = f"待命名成员#{short_id}"
+                    if old_placeholder == new_name:
+                        continue
+                    self.connection.execute(
+                        "UPDATE observations SET caption = REPLACE(caption, ?, ?) WHERE caption LIKE ?",
+                        (old_placeholder, new_name, f"%{old_placeholder}%"),
+                    )
+                    self.connection.execute(
+                        "UPDATE events SET summary = REPLACE(summary, ?, ?) WHERE summary LIKE ?",
+                        (old_placeholder, new_name, f"%{old_placeholder}%"),
+                    )
         self.connection.commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
 
