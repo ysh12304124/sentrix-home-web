@@ -584,10 +584,10 @@ class NativeEntityMemoryTests(unittest.TestCase):
 
         rejected = self.store.reject_person_entity(entity_id)
 
-        self.assertEqual(rejected["id"], entity_id)
-        self.assertEqual(rejected["status"], "rejected")
-        self.assertEqual(self.store._row("SELECT status FROM face_clusters WHERE id = ?", (face["cluster_id"],))["status"], "rejected")
-        self.assertEqual(self.store._row("SELECT status FROM relationships WHERE id = ?", (relationship["id"],))["status"], "retracted")
+        self.assertTrue(rejected["deleted"])
+        self.assertIsNone(self.store.get_entity(entity_id))
+        self.assertEqual(self.store._rows("SELECT * FROM face_clusters WHERE id = ?", (face["cluster_id"],)), [])
+        self.assertEqual(self.store._rows("SELECT * FROM relationships WHERE id = ?", (relationship["id"],)), [])
         self.assertNotIn(entity_id, {item["id"] for item in self.store.list_entities(scope_id="home-default")})
         with self.assertRaises(ValueError):
             self.store.reject_person_entity(self.store.confirm_person_entity(other_entity, "爸爸", "父亲")["entity"]["id"])

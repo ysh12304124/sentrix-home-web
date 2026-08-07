@@ -1,0 +1,40 @@
+{
+  "phase": "RX-0",
+  "date": "2026-08-06",
+  "note": "用户可见字段 vs 调试字段清单（基于当前代码只读核验）",
+  "api_envelope_fields": {
+    "answer": {"visibility": "user", "rx_plan": "keep_first_layer"},
+    "image_results": {"visibility": "user_debug_mixed", "rx_plan": "user_sees_display_handle_thumbnail; id_only_admin"},
+    "evidence": {"visibility": "user_debug_mixed", "rx_plan": "user_sees_collapsed_entry; condition/scores/ids_only_admin"},
+    "evidence[].asset_id": {"visibility": "debug", "rx_plan": "admin_only"},
+    "evidence[].observation_id": {"visibility": "debug", "rx_plan": "admin_only"},
+    "evidence[].condition_results": {"visibility": "debug", "rx_plan": "to_supported/uncertain_aspects_chinese; raw_admin_only"},
+    "evidence[].level": {"visibility": "debug", "rx_plan": "admin_only"},
+    "evidence[].recall_strength": {"visibility": "debug", "rx_plan": "admin_only"},
+    "evidence[].raw": {"visibility": "debug", "rx_plan": "admin_only"},
+    "claims": {"visibility": "user_debug_mixed", "rx_plan": "user_sees_sentence; id/status_admin_only"},
+    "claim_evidence_index": {"visibility": "debug", "rx_plan": "admin_only"},
+    "retrieval_trace": {"visibility": "debug", "rx_plan": "admin_only"},
+    "tool_trace": {"visibility": "debug", "rx_plan": "admin_only"},
+    "evidence_presentation": {"visibility": "internal", "rx_plan": "keep_as_ui_behavior_contract"},
+    "evidence_layers": {"visibility": "debug", "rx_plan": "admin_only"},
+    "validation": {"visibility": "debug", "rx_plan": "return_but_not_rendered_by_default"},
+    "model_call_ledger": {"visibility": "debug", "rx_plan": "admin_only"},
+    "conversation_id": {"visibility": "protocol", "rx_plan": "keep"},
+    "scope_id": {"visibility": "protocol", "rx_plan": "keep"},
+    "viewer_id": {"visibility": "protocol", "rx_plan": "keep"},
+    "evidence_status": {"visibility": "user", "rx_plan": "friendly_chinese_badge"},
+    "memory_used": {"visibility": "internal", "rx_plan": "keep"},
+    "evidence_required": {"visibility": "internal", "rx_plan": "keep"},
+    "insufficient_evidence": {"visibility": "internal", "rx_plan": "map_to_friendly_status"}
+  },
+  "frontend_renderers": {
+    "assistantAnswer": {"renders": "answer + claim highlight", "leak": "claim status rendered as class only"},
+    "assistantEvidence": {"renders": "evidence cards, gaps, followups, order, toolTrace, algorithmEvidence", "leak": "renders internal traces unconditionally"},
+    "evidenceCard": {"renders": "asset_id, observation_id, condition text, raw JSON", "leak": "asset_id/observation_id/raw exposed"},
+    "imageResults": {"renders": "image_results[] with asset_id + media_url", "leak": "asset_id label"},
+    "algorithmEvidence": {"renders": "retrievalTrace stage/counts", "leak": "internal stage names"},
+    "toolTrace": {"renders": "tool_trace entries", "leak": "internal tool names"},
+    "assistantMessage": {"renders": "status badge 'X% 证据置信度' / '需要补充线索'", "leak": "technical wording"}
+  }
+}

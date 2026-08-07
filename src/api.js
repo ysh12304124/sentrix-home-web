@@ -15,6 +15,8 @@
   window.sentrixApi = {
     health: () => request("/api/health"),
     memorySpaces: () => request("/api/memory-spaces"),
+    createMemorySpace: (name) => request("/api/memory-spaces", { method: "POST", body: JSON.stringify({ name }) }),
+    geoPlaces: (scopeId = "") => request(`/api/geo-places${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     dashboard: (scopeId = "") => request(`/api/dashboard${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     events: (scopeId = "") => request(`/api/events${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     trips: (scopeId = "", status = "") => request(`/api/trips${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(status ? { status } : {}) }).toString().replace(/^/, "?")}`),
@@ -47,10 +49,12 @@
     rejectFaceCluster: (id) => request(`/api/face-clusters/${encodeURIComponent(id)}/reject`, { method: "POST" }),
     mergeFaceClusters: (targetClusterId, sourceClusterId) => request("/api/face-clusters/merge", { method: "POST", body: JSON.stringify({ target_cluster_id: targetClusterId, source_cluster_id: sourceClusterId }) }),
     splitFaceCluster: (clusterId, faceInstanceId) => request(`/api/face-clusters/${encodeURIComponent(clusterId)}/split`, { method: "POST", body: JSON.stringify({ face_instance_id: faceInstanceId }) }),
-    relationships: (scopeId = "") => request(`/api/relationships${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
+    relationships: (scopeId = "", kind = "") => request(`/api/relationships${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(kind ? { kind } : {}) }).toString().replace(/^/, "?")}`),
     createRelationship: (payload) => request("/api/relationships", { method: "POST", body: JSON.stringify(payload) }),
     confirmRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/confirm`, { method: "POST" }),
+    retractRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/retract`, { method: "POST" }),
     confirmPerson: (id, name, familyRole = "") => request(`/api/persons/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify({ name, family_role: familyRole }) }),
+    renamePerson: (id, payload) => request(`/api/people/${encodeURIComponent(id)}/rename`, { method: "POST", body: JSON.stringify(payload) }),
     assistantTurn: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, viewer_id: viewerId || "owner" }) }),
     rejectPerson: (id) => request(`/api/persons/${encodeURIComponent(id)}/reject`, { method: "POST" }),
     stories: () => request("/api/stories"),
@@ -63,11 +67,33 @@
     search: (query) => request("/api/search", { method: "POST", body: JSON.stringify({ query }) }),
     queryGaps: () => request("/api/query-gaps"),
     queryGapFeedback: (id, payload) => request("/api/query-gaps/" + encodeURIComponent(id) + "/feedback", { method: "POST", body: JSON.stringify(payload) }),
-    importAsset: (file, mediaType) => {
-      if (typeof file === "string") return request("/api/import", { method: "POST", body: JSON.stringify({ fileName: file, mediaType }) });
+    importAssets: (items, options = {}) => {
       const form = new FormData();
-      form.append("file", file, file.name);
-      return request("/api/ingest", { method: "POST", body: form });
+      items.forEach((item) => form.append("files", item.file, item.file.name));
+      form.append("metadata", JSON.stringify(items.map((item) => item.metadata || {})));
+      const fields = {
+        scopeId: options.scopeId,
+        batchId: options.batchId,
+        sourceOwnerId: options.sourceOwnerId,
+        sourceOwnerLabel: options.sourceOwnerLabel,
+        sourceDeviceId: options.sourceDeviceId,
+        sourceAlbumId: options.sourceAlbumId,
+      };
+      Object.entries(fields).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && String(value).trim()) form.append(key, value);
+      });
+      return request("/api/import", { method: "POST", body: form });
+    },
+    getVlmBackend: () => request("/api/vlm-backend"),
+    setVlmBackend: (backend) => request("/api/vlm-backend", { method: "POST", body: JSON.stringify({ backend }) }),
+    getModelProfiles: () => request("/api/model-profiles"),
+    getCurrentModelProfile: () => request("/api/model-profiles/current"),
+    switchModelProfile: (profile) => request("/api/model-profiles/switch", {
+      method: "POST",
+      body: JSON.stringify({ profile, wait_ready: true, ready_timeout: 900 }),
+    }),
+    importAsset: (file, metadata = {}, options = {}) => {
+      return window.sentrixApi.importAssets([{ file, metadata }], options).then((result) => result.items[0]);
     },
   };
 })();

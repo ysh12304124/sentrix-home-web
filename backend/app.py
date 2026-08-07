@@ -1,17 +1,18 @@
 from __future__ import annotations
-
+import json
 import os
 import shutil
 import hashlib
 import tempfile
 import threading
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .agent import MemoryAgent
 from .db import MemoryStore, make_id
@@ -38,12 +39,95 @@ ensure_heif_support()
 
 store = MemoryStore(os.getenv("SENTRIX_DB_PATH", str(DATA_DIR / "sentrix.db")))
 gamma = GammaClient()
+gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
 agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
 
 app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 maintenance_lock = threading.Lock()
+runtime_lock = threading.Lock()
+VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
+VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
+VLM_BACKENDS = ("ollama_12b", "e2b_lora")
+SUPPORTED_IMPORT_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
+    ".txt", ".md", ".json",
+}
+MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
+
+
+def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_location=None, latitude=None, longitude=None):
+    payload = payload if isinstance(payload, dict) else {}
+    captured_at = payload.get("capturedAt", payload.get("captured_at", captured_at))
+    captured_location = payload.get("capturedLocation", payload.get("captured_location", captured_location))
+    latitude = payload.get("latitude", payload.get("capturedLatitude", payload.get("captured_latitude", latitude)))
+    longitude = payload.get("longitude", payload.get("capturedLongitude", payload.get("captured_longitude", longitude)))
+    if (latitude is None) != (longitude is None):
+        raise ValueError("latitude and longitude must be provided together")
+    result = {}
+    if captured_at:
+        value = str(captured_at).strip()
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("capturedAt must be an ISO 8601 datetime") from error
+        result["captured_at"] = value
+    if captured_location:
+        result["captured_location"] = str(captured_location).strip()
+    if latitude is not None:
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError) as error:
+            raise ValueError("latitude and longitude must be numbers") from error
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError("latitude or longitude is outside its valid range")
+        result["gps"] = {"latitude": latitude, "longitude": longitude}
+    return result
+
+
+def _check_ollama_health():
+    try:
+        import httpx
+        url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+        response = httpx.get(f"{url}/api/tags", timeout=10)
+        response.raise_for_status()
+        models = response.json().get("models") or []
+        ollama_model = os.getenv("OLLAMA_MODEL", "gemma4:12b")
+        for model in models:
+            if model.get("name", "").startswith(ollama_model.replace(":12b", "")):
+                return {"available": True, "model": ollama_model, "url": url}
+        return {"available": False, "model": ollama_model, "url": url, "error": "model not found in /api/tags"}
+    except Exception as exc:
+        return {"available": False, "model": os.getenv("OLLAMA_MODEL", "gemma4:12b"), "url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"), "error": str(exc)}
+
+
+def _check_e2b_health():
+    try:
+        import httpx
+        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
+        response = httpx.get(f"{url}/api/health", timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return {"available": data.get("status") == "ok", "url": url, "loaded": data.get("loaded", False), "model": data.get("model", ""), "error": data.get("error")}
+    except Exception as exc:
+        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100"), "error": str(exc)}
+
+
+def _fire_and_forget_post(url, payload):
+    try:
+        import httpx
+        httpx.post(url, json=payload, timeout=5)
+    except Exception:
+        pass
+
+
+def _schedule_backend_transition(backend_name):
+    if backend_name == "e2b_lora":
+        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
+        threading.Thread(target=_fire_and_forget_post, args=(f"{e2b_url}/admin/load", {}), daemon=True).start()
 
 
 class SearchRequest(BaseModel):
@@ -52,8 +136,79 @@ class SearchRequest(BaseModel):
 
 
 class ImportRequest(BaseModel):
+    source_path: str
+    scope_id: str = "home-default"
+    batch_id: str | None = None
+    recursive: bool = True
+    glob: str = "*"
+    copy_file: bool = Field(True, alias="copy")
+    max_files: int = 5000
+    source_owner_id: str | None = None
+    source_owner_label: str | None = None
+    source_device_id: str | None = None
+    source_album_id: str | None = None
+    captured_at: str | None = None
+    captured_location: str | None = None
     fileName: str = "unknown"
     mediaType: str = "text"
+
+
+class IngestBatchCreateRequest(BaseModel):
+    scope_id: str = "home-default"
+    batch_id: str | None = None
+    name: str | None = None
+    kind: str = "benchmark"
+    source_path: str | None = None
+
+
+def _allowed_import_roots():
+    configured = os.getenv("SENTRIX_IMPORT_ALLOWED_ROOTS")
+    defaults = [
+        DATA_DIR / "imports",
+        ROOT / "data" / "imports",
+        Path("/home/asus/data"),
+        Path("/home/asus/datasets"),
+        Path("/home/asus/benchmarks"),
+    ]
+    values = configured.split(":") if configured else [str(item) for item in defaults]
+    roots = []
+    for value in values:
+        try:
+            roots.append(Path(value).expanduser().resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def _assert_import_path_allowed(path: Path):
+    roots = _allowed_import_roots()
+    if any(path == root or root in path.parents for root in roots):
+        return
+    raise HTTPException(status_code=403, detail={
+        "message": "source_path is outside allowed import roots",
+        "source_path": str(path),
+        "allowed_roots": [str(root) for root in roots],
+    })
+
+
+def _batch_status(batch_id: str):
+    batch = store.get_ingest_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="ingest batch not found")
+    rows = store._rows("SELECT status, COUNT(*) AS count FROM assets WHERE batch_id = ? GROUP BY status", (batch_id,))
+    counts = {row["status"]: row["count"] for row in rows}
+    total = sum(counts.values())
+    return {
+        "batch": batch,
+        "scope_id": batch.get("scope_id"),
+        "asset_counts": counts,
+        "asset_total": total,
+        "identity_confirmation_required": True,
+        "identity_confirmation": {
+            "list_clusters": f"GET /api/face-clusters?scope_id={batch.get('scope_id')}",
+            "confirm_cluster": "POST /api/face-clusters/{cluster_id}/confirm",
+        },
+    }
 
 
 def process_asset(asset_id):
@@ -78,12 +233,144 @@ def process_asset(asset_id):
         task_store.close()
 
 
+
+class SetVLMBackend(BaseModel):
+    backend: str
+
+
+class ModelSwitchRequest(BaseModel):
+    profile: str
+    wait_ready: bool = True
+    ready_timeout: int = 900
+    dry_run: bool = False
+    max_model_len: int | None = None
+    max_num_seqs: int | None = None
+    max_num_batched_tokens: int | None = None
+    gpu_memory_utilization: float | None = None
+    quantization: str | None = None
+    load_format: str | None = None
+    dtype: str | None = None
+    default_max_tokens: int | None = None
+    cuda_visible_devices: str | None = None
+
+
+def _read_json_file(path: Path, fallback):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+
+
+def _load_vllm_registry():
+    return _read_json_file(VLLM_REGISTRY, {"profiles": {}, "default_port": 8100, "state_file": ""})
+
+
+def _load_vllm_state(registry=None):
+    registry = registry or _load_vllm_registry()
+    state_file = Path(registry.get("state_file") or "/home/asus/sentrix-vllm/state/current.json")
+    return _read_json_file(state_file, None) if state_file.exists() else None
+
+
+def _profile_availability(profile):
+    missing = []
+    model_path = profile.get("model")
+    if model_path and not Path(model_path).exists():
+        missing.append(model_path)
+    for module in profile.get("lora_modules") or []:
+        path = module.get("path")
+        if path and not Path(path).exists():
+            missing.append(path)
+    return {"available": not missing, "missing_paths": missing}
+
+
+def _profile_summary(profile_id, profile):
+    availability = _profile_availability(profile)
+    return {
+        "id": profile_id, "model": profile.get("model"),
+        "served_model_name": profile.get("served_model_name") or profile_id,
+        "dtype": profile.get("dtype"), "quantization": profile.get("quantization"),
+        "load_format": profile.get("load_format"), "max_model_len": profile.get("max_model_len"),
+        "max_num_seqs": profile.get("max_num_seqs"), "gpu_memory_utilization": profile.get("gpu_memory_utilization"),
+        "default_max_tokens": profile.get("default_max_tokens"),
+        "enable_lora": bool(profile.get("enable_lora")),
+        "lora_modules": profile.get("lora_modules") or [],
+        "limit_mm_per_prompt": profile.get("limit_mm_per_prompt") or {},
+        "notes": profile.get("notes", ""), **availability,
+    }
+
+
+def _current_model_runtime():
+    registry = _load_vllm_registry()
+    state = _load_vllm_state(registry)
+    running = bool(state and state.get("pid"))
+    return {
+        "backend": getattr(gamma, "backend", "unknown"),
+        "base_url": gamma.base_url, "model": gamma.model,
+        "profile": (state or {}).get("profile"),
+        "status": "running" if running else "stopped",
+        "state": state,
+    }
+
+
+def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
+    global gamma, pipeline, agent
+    registry = _load_vllm_registry()
+    profile = profile or (registry.get("profiles") or {}).get(profile_id) or {}
+    state = state or _load_vllm_state(registry) or {}
+    port = int(state.get("port") or profile.get("port") or registry.get("default_port") or 8100)
+    served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
+    with runtime_lock:
+        new_gamma = GammaClient(base_url=f"http://127.0.0.1:{port}/v1", model=served_name, backend="openai")
+        gamma = new_gamma
+        pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
+        agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
+    return _current_model_runtime()
+
+
+def _run_vllm_switch(request: ModelSwitchRequest):
+    if not VLLM_MANAGER.exists():
+        raise HTTPException(status_code=503, detail=f"vLLM manager not found: {VLLM_MANAGER}")
+    registry = _load_vllm_registry()
+    profile = (registry.get("profiles") or {}).get(request.profile)
+    if not profile:
+        raise HTTPException(status_code=404, detail="model profile not found")
+    command = [str(VLLM_MANAGER), "switch", request.profile]
+    option_map = {
+        "max_model_len": "--max-model-len", "max_num_seqs": "--max-num-seqs",
+        "max_num_batched_tokens": "--max-num-batched-tokens",
+        "gpu_memory_utilization": "--gpu-memory-utilization",
+        "quantization": "--quantization", "load_format": "--load-format",
+        "dtype": "--dtype", "default_max_tokens": "--default-max-tokens",
+        "cuda_visible_devices": "--cuda-visible-devices",
+    }
+    values = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    for field, flag in option_map.items():
+        value = values.get(field)
+        if value is not None and value != "":
+            command.extend([flag, str(value)])
+    if request.wait_ready:
+        command.extend(["--wait-ready", "--ready-timeout", str(max(30, request.ready_timeout))])
+    if request.dry_run:
+        command.append("--dry-run")
+    import subprocess
+    completed = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True,
+        timeout=max(60, int(request.ready_timeout) + 90 if request.wait_ready else 60))
+    if completed.returncode != 0:
+        raise HTTPException(status_code=502, detail={
+            "message": "vLLM switch failed", "command": command,
+            "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]})
+    runtime = _current_model_runtime() if request.dry_run else _apply_vllm_profile_to_runtime(request.profile, profile)
+    return {"accepted": True, "profile": request.profile, "runtime": runtime,
+        "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]}
+
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
         "mode": "sentrix-local-backend",
         "models": {
+            "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
+            "llm": _current_model_runtime(),
             "gamma4_12B": {"name": gamma.model, "endpoint": gamma.base_url},
             "asr": {"name": pipeline.asr.model_name, "vad": pipeline.asr.vad_model, "punc": pipeline.asr.punc_model, "ready": pipeline.asr.error is None, "error": pipeline.asr.error},
             "face": {
@@ -104,9 +391,117 @@ def health():
     }
 
 
+
+class MemorySpaceCreateRequest(BaseModel):
+    name: str
+    scope_id: str | None = None
+
+
+@app.post("/api/memory-spaces", status_code=201)
+def create_memory_space(request: MemorySpaceCreateRequest):
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name is required")
+    if len(name) > 100:
+        raise HTTPException(status_code=422, detail="name must be at most 100 characters")
+    scope_id = (request.scope_id or make_id("album")).strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="scope_id is invalid")
+    existing = store._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,))
+    if existing:
+        raise HTTPException(status_code=409, detail="scope_id already exists")
+    return store.create_memory_space(scope_id, name, kind="benchmark")
+
 @app.get("/api/memory-spaces")
 def memory_spaces():
     return {"spaces": store.list_memory_spaces()}
+
+
+@app.get("/api/vlm-backend")
+def vlm_backend():
+    runtime = _current_model_runtime()
+    return {
+        "backend": "vllm",
+        "available_backends": ["vllm"],
+        "profile": runtime.get("profile"),
+        "model": runtime.get("model"),
+        "status": runtime.get("status"),
+        "deprecated": True,
+        "replacement": "/api/model-profiles",
+    }
+
+
+@app.post("/api/vlm-backend")
+def set_vlm_backend(payload: SetVLMBackend):
+    raise HTTPException(
+        status_code=410,
+        detail="VLM backend switching is retired; use POST /api/model-profiles/switch",
+    )
+
+@app.get("/api/model-profiles")
+def model_profiles():
+    registry = _load_vllm_registry()
+    profiles = registry.get("profiles") or {}
+    return {
+        "backend": "vllm", "registry": str(VLLM_REGISTRY), "manager": str(VLLM_MANAGER),
+        "current": _current_model_runtime(),
+        "profiles": [_profile_summary(profile_id, profile) for profile_id, profile in profiles.items()],
+    }
+
+
+@app.get("/api/model-profiles/current")
+def current_model_profile():
+    return _current_model_runtime()
+
+
+@app.post("/api/model-profiles/switch")
+def switch_model_profile(request: ModelSwitchRequest):
+    return _run_vllm_switch(request)
+
+
+
+
+@app.get("/api/geo-places")
+def geo_places(scope_id: str | None = None):
+    import json as _json
+    rows = store._rows(
+        """SELECT a.id AS asset_id, a.file_name, a.captured_location,
+                  a.captured_at, a.metadata_json,
+                  o.id AS observation_id, o.caption, o.place
+           FROM assets a
+           LEFT JOIN observations o ON o.asset_id = a.id
+           WHERE a.media_type = 'image'
+           AND (a.scope_id = ? OR ? IS NULL)
+           ORDER BY a.captured_location, a.captured_at""",
+        (scope_id, scope_id),
+    )
+    cities = {}
+    unknown = {"level": "unknown", "name": "无法判断地点", "count": 0, "children": [], "photos": []}
+    for row in rows:
+        metadata = {}
+        try: metadata = _json.loads(row["metadata_json"] or "{}")
+        except (TypeError, _json.JSONDecodeError): pass
+        geo = metadata.get("reverse_geocode") or {}
+        city = geo.get("city") or ""
+        district = geo.get("district") or ""
+        photo = {"asset_id": row["asset_id"], "file_name": row["file_name"], "captured_at": row["captured_at"], "caption": row["caption"] or "", "observation_id": row["observation_id"], "semantic_place": "", "observation_place": row["place"] or ""}
+        if not city or not district:
+            unknown["count"] += 1; unknown["photos"].append(photo); continue
+        province = geo.get("province") or ""
+        city_key = f"{province}{city}"
+        cities.setdefault(city_key, {"level": "city", "name": city, "province": province, "count": 0, "districts": {}})
+        cities[city_key]["count"] += 1
+        districts = cities[city_key]["districts"]
+        districts.setdefault(district, {"level": "district", "name": district, "city": city, "count": 0, "photos": []})
+        districts[district]["count"] += 1
+        districts[district]["photos"].append(photo)
+    result = []
+    for city_data in cities.values():
+        city_data["children"] = sorted(city_data.pop("districts").values(), key=lambda d: -d["count"])
+        result.append(city_data)
+    result.sort(key=lambda c: -c["count"])
+    if unknown["count"] > 0: result.append(unknown)
+    return {"places": result}
 
 
 @app.get("/api/dashboard")
@@ -217,6 +612,7 @@ def people(status: str | None = None, scope_id: str | None = None):
         else:
             item["display_name"] = item["canonical_name"]
         item["confirmed"] = item["status"] == "confirmed"
+        item["aliases"] = store.person_aliases(item["id"])
         item["profile"] = store.get_semantic_profile(item["id"])
         item["claims"] = store.list_semantic_claims(item["id"], 100)
         item["event_memory"] = store.list_person_event_memory(item["id"], scope_id)
@@ -234,6 +630,8 @@ def person_profile(person_id: str):
     detail["claims"] = store.list_semantic_claims(person_id, 500)
     detail["event_memory"] = store.list_person_event_memory(person_id)
     detail["patterns"] = store.list_person_patterns(person_id)
+    if detail.get("entity"):
+        detail["entity"]["aliases"] = store.person_aliases(person_id)
     entity = detail.get("entity") or {}
     if entity.get("status") == "pending":
         entity["canonical_name"] = "待命名成员"
@@ -388,6 +786,11 @@ def confirm_face_cluster(cluster_id: str, payload: dict):
     value = store.confirm_face_cluster(cluster_id, name, str(payload.get("family_role") or "").strip() or None)
     if not value:
         raise HTTPException(status_code=404, detail="face cluster not found")
+    if value.get("merged_into"):
+        refreshed = _refresh_confirmed_person(value["entity"]["id"], value.get("refresh_counts", {}))
+        refreshed["merged_into"] = value["merged_into"]
+        refreshed["canonical_name"] = value.get("canonical_name") or (refreshed.get("entity") or {}).get("canonical_name")
+        return refreshed
     return _refresh_confirmed_person(value["entity"]["id"], value.get("refresh_counts", {}))
 
 
@@ -411,6 +814,8 @@ def _refresh_confirmed_person(person_id: str, refresh_counts: dict | None = None
         "appearance": len(store.list_person_appearance_evidence(person_id, include_empty=True)),
     })
     refreshed["refresh_counts"] = counts
+    if refreshed.get("entity"):
+        refreshed["entity"]["aliases"] = store.person_aliases(person_id)
     return refreshed
 
 
@@ -455,7 +860,10 @@ def _analyze_confirmed_person_appearance(person_id: str):
 
 @app.post("/api/face-clusters/{cluster_id}/reject")
 def reject_face_cluster(cluster_id: str):
-    value = store.reject_face_cluster(cluster_id)
+    try:
+        value = store.reject_face_cluster(cluster_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     if not value:
         raise HTTPException(status_code=404, detail="face cluster not found")
     return value
@@ -488,9 +896,13 @@ def split_face_cluster(cluster_id: str, payload: dict):
 
 
 @app.get("/api/relationships")
-def relationships(scope_id: str | None = None):
-    entities = store.list_entities(scope_id=scope_id)
-    values = store.list_relationships(scope_id=scope_id)
+def relationships(scope_id: str | None = None, kind: str | None = None):
+    if kind == "person":
+        entities = [entity for entity in store.list_entities(scope_id=scope_id) if entity.get("entity_type") == "person"]
+        values = store.list_person_relationships(scope_id=scope_id)
+    else:
+        entities = store.list_entities(scope_id=scope_id)
+        values = store.list_relationships(scope_id=scope_id)
     nodes = [{"id": entity["id"], "label": entity["canonical_name"], "status": entity["status"], "entity_type": entity["entity_type"]} for entity in entities]
     edges = [{"source": item["subject_entity_id"], "target": item["object_entity_id"], "label": item["predicate"], "status": item["status"], "id": item["id"]} for item in values]
     return {"nodes": nodes, "edges": edges, "relationships": values}
@@ -513,6 +925,14 @@ def confirm_relationship(relationship_id: str):
     return value
 
 
+@app.post("/api/relationships/{relationship_id}/retract")
+def retract_relationship(relationship_id: str):
+    value = store.retract_relationship(relationship_id)
+    if not value:
+        raise HTTPException(status_code=404, detail="relationship not found")
+    return value
+
+
 @app.post("/api/persons/{person_id}/confirm")
 def confirm_person(person_id: str, payload: dict | None = None):
     name = (payload or {}).get("name", "").strip()
@@ -521,11 +941,31 @@ def confirm_person(person_id: str, payload: dict | None = None):
     family_role = str((payload or {}).get("family_role") or "").strip() or None
     native = store.confirm_person_entity(person_id, name, family_role)
     if native:
+        if native.get("merged_into"):
+            refreshed = _refresh_confirmed_person(native["entity"]["id"], native.get("refresh_counts", {}))
+            refreshed["merged_into"] = native["merged_into"]
+            refreshed["canonical_name"] = native.get("canonical_name") or (refreshed.get("entity") or {}).get("canonical_name")
+            return refreshed
         return _refresh_confirmed_person(native["entity"]["id"], native.get("refresh_counts", {}))
     value = store.update_person(person_id, name, "confirmed")
     if not value:
         raise HTTPException(status_code=404, detail="person not found")
     return value
+
+
+@app.post("/api/people/{person_id}/rename")
+def rename_person(person_id: str, payload: dict | None = None):
+    new_name = str((payload or {}).get("name") or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="person name is required")
+    detail = store.rename_person(person_id, new_name)
+    if not detail:
+        raise HTTPException(status_code=404, detail="person not found")
+    refreshed = _refresh_confirmed_person(person_id)
+    refreshed["aliases"] = store.person_aliases(person_id)
+    if detail.get("semantic_claims"):
+        refreshed["semantic_claims"] = detail["semantic_claims"]
+    return refreshed
 
 
 @app.post("/api/persons/{person_id}/reject")
@@ -677,7 +1117,15 @@ def create_invite(payload: dict):
 
 
 def assistant_response(result):
-    """Expose stable browser names while retaining the internal contract."""
+    """Expose stable browser names while retaining the internal contract.
+
+    RX-6: retrieval/tool traces, the validation block and the model-call ledger
+    are debug-only.  They stay out of the default API response unless the admin
+    presentation switch is on; the frontend additionally hides them behind its
+    own debug layer.
+    """
+    from .validation import full_chain_profile as _prof
+    admin = _prof.admin_debug_presentation()
     result.setdefault("claims", [])
     result.setdefault("claim_verifications", [])
     result.setdefault("claim_verification_status", "not_required")
@@ -697,6 +1145,16 @@ def assistant_response(result):
     result["repairCount"] = result["repair_count"]
     result["evidenceBundles"] = result["evidence_bundles"]
     result["claimEvidenceIndex"] = result["claim_evidence_index"]
+    if not admin:
+        result["retrievalTrace"] = []
+        result["toolTrace"] = []
+        result.pop("validation", None)
+        result.pop("model_call_ledger", None)
+        # TFPE v2 structured internals are debug-only.
+        result.pop("task_contract", None)
+        result.pop("retrieval_strategy", None)
+        result.pop("structured_result", None)
+        result.pop("parser_raw", None)
     return result
 
 
@@ -774,8 +1232,156 @@ async def ingest(
 
 
 @app.post("/api/import", status_code=202)
-def import_placeholder(request: ImportRequest):
-    return {"accepted": True, "assetId": make_id("asset"), "fileName": request.fileName, "status": "queued", "mediaType": request.mediaType}
+async def import_remote_files(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    metadata: str | None = Form(None),
+    sourceOwnerId: str | None = Form(None),
+    sourceDeviceId: str | None = Form(None),
+    sourceAlbumId: str | None = Form(None),
+    sourceOwnerLabel: str | None = Form(None),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
+    batchId: str | None = Form(None),
+    batch_id: str | None = Form(None),
+):
+    if not files:
+        raise HTTPException(status_code=422, detail="at least one file is required")
+    if len(files) > MAX_REMOTE_IMPORT_FILES:
+        raise HTTPException(status_code=413, detail=f"too many files: {len(files)} > {MAX_REMOTE_IMPORT_FILES}")
+    try:
+        per_file = json.loads(metadata) if metadata else []
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=422, detail="metadata must be a JSON array") from error
+    if not isinstance(per_file, list) or len(per_file) not in {0, len(files)}:
+        raise HTTPException(status_code=422, detail="metadata must contain one object per file")
+    per_file = per_file or [{} for _ in files]
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
+    batch = (batch_id or batchId or make_id("batch")).strip()
+    store.create_memory_space(scope, scope, kind="benchmark")
+    store.create_ingest_batch(batch, scope)
+    items = []
+    for index, upload in enumerate(files):
+        safe_name = Path(upload.filename or f"upload-{index}").name
+        destination = MEDIA_DIR / f"{make_id('upload')}_{safe_name}"
+        try:
+            with destination.open("wb") as output:
+                shutil.copyfileobj(upload.file, output)
+            capture = _normalized_capture_metadata(per_file[index])
+            media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
+            if media_type not in {"image", "audio", "video", "text"}:
+                media_type = "text"
+            created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
+                "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
+                "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
+                "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
+                **capture,
+            })
+            deduplicated = created.get("path") != str(destination)
+            if deduplicated:
+                destination.unlink(missing_ok=True)
+            elif created.get("status") in {"queued", "failed"}:
+                background_tasks.add_task(process_asset, created["id"])
+            items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"], "fileName": created["file_name"], "status": created["status"], "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"), "deduplicated": deduplicated})
+        except ValueError as error:
+            destination.unlink(missing_ok=True)
+            items.append({"accepted": False, "fileName": safe_name, "status": "rejected", "error": str(error)})
+        except Exception as error:
+            destination.unlink(missing_ok=True)
+            items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
+    return {"accepted": any(item["accepted"] for item in items), "batch_id": batch, "scope_id": scope, "items": items, "accepted_count": sum(item["accepted"] for item in items), "rejected_count": sum(not item["accepted"] for item in items)}
+
+
+@app.post("/api/import/server-directory", status_code=202)
+def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
+    source = Path(request.source_path).expanduser().resolve()
+    _assert_import_path_allowed(source)
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="source_path not found")
+    scope = (request.scope_id or "home-default").strip() or "home-default"
+    batch_id = (request.batch_id or make_id("batch")).strip()
+    store.create_memory_space(scope, scope, kind="benchmark", source_path=str(source))
+    store.create_ingest_batch(batch_id, scope)
+    if source.is_file():
+        candidates = [source]
+    else:
+        iterator = source.rglob(request.glob) if request.recursive else source.glob(request.glob)
+        candidates = [path for path in iterator if path.is_file()]
+    candidates = [path for path in candidates if path.suffix.lower() in SUPPORTED_IMPORT_SUFFIXES]
+    if len(candidates) > max(1, request.max_files):
+        raise HTTPException(status_code=413, detail=f"too many files matched: {len(candidates)} > {request.max_files}")
+    imported = []
+    skipped = []
+    for path in candidates:
+        metadata = {
+            "scope_id": scope,
+            "batch_id": batch_id,
+            "source_owner_id": request.source_owner_id,
+            "source_owner_label": request.source_owner_label,
+            "source_device_id": request.source_device_id,
+            "source_album_id": request.source_album_id,
+            "source_confidence": 1.0 if request.source_owner_id else 0.0,
+            "captured_at": request.captured_at,
+            "captured_location": request.captured_location,
+        }
+        target = path
+        if request.copy_file:
+            target = MEDIA_DIR / f"{make_id('import')}_{path.name}"
+            shutil.copy2(path, target)
+        try:
+            created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
+        except Exception as error:
+            if request.copy_file:
+                target.unlink(missing_ok=True)
+            skipped.append({"path": str(path), "reason": str(error)})
+            continue
+        deduplicated = created.get("path") != str(target)
+        if request.copy_file and deduplicated:
+            target.unlink(missing_ok=True)
+        elif created.get("status") in {"queued", "failed"}:
+            background_tasks.add_task(process_asset, created["id"])
+        imported.append({
+            "asset_id": created["id"],
+            "file_name": created["file_name"],
+            "media_type": created["media_type"],
+            "status": created["status"],
+            "deduplicated": deduplicated,
+            "source_path": str(path),
+        })
+    return {
+        "accepted": True,
+        "scope_id": scope,
+        "batch_id": batch_id,
+        "matched": len(candidates),
+        "accepted_count": len(imported),
+        "assets": imported,
+        "skipped": skipped,
+        "batch": _batch_status(batch_id),
+        "identity_confirmation_required": True,
+    }
+
+
+@app.post("/api/ingest-batches", status_code=201)
+def create_ingest_batch(request: IngestBatchCreateRequest):
+    scope = (request.scope_id or "home-default").strip() or "home-default"
+    batch_id = (request.batch_id or make_id("batch")).strip()
+    store.create_memory_space(scope, request.name or scope, kind=request.kind or "benchmark", source_path=request.source_path)
+    store.create_ingest_batch(batch_id, scope)
+    return _batch_status(batch_id)
+
+
+@app.get("/api/ingest-batches/{batch_id}")
+def ingest_batch(batch_id: str):
+    return _batch_status(batch_id)
+
+
+@app.post("/api/ingest-batches/{batch_id}/complete")
+def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
+    if not store.get_ingest_batch(batch_id):
+        raise HTTPException(status_code=404, detail="ingest batch not found")
+    store.complete_ingest_batch(batch_id)
+    background_tasks.add_task(pipeline.finalize_ingest_batch, batch_id)
+    return _batch_status(batch_id)
 
 
 @app.post("/api/maintenance/recheck")

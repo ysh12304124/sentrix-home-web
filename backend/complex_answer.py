@@ -55,6 +55,10 @@ class ComplexAnswerBuilder:
     def __init__(self, gamma=None):
         self.gamma = gamma
         self.claim_extractor = LLMClaimExtractor(gamma=gamma)
+        # RX-2 (U4) diagnostics: the last writer output and the reason the chain
+        # fell back, so tests and the offline audit can see why claim was skipped.
+        self.last_writer_output = None
+        self.last_fallback_reason = None
 
     def build(self, message, spec, packet):
         """Return ``{answer, statements, claims, verification, fallback}``.
@@ -63,15 +67,19 @@ class ComplexAnswerBuilder:
         after one repair, the caller receives a structured safe answer.
         """
         writer_output = self._call_writer(message, spec, packet)
+        self.last_writer_output = writer_output
         if not writer_output:
-            return self._safe_fallback(spec, packet, reason="writer_unavailable")
+            self.last_fallback_reason = "writer_unavailable"
+            return self._safe_fallback(spec, packet, reason=self.last_fallback_reason)
         text = writer_output.get("text") or ""
         candidate_claims = writer_output.get("candidate_claims") or []
         scanned = self.claim_extractor.scan(text, candidate_claims)
+        _propagate_candidate_evidence(scanned, candidate_claims)
         if not scanned:
             # Model did not produce a scannable claim list; keep the safe path
             # rather than surface unverified free text.
-            return self._safe_fallback(spec, packet, reason="claim_extractor_unavailable")
+            self.last_fallback_reason = "claim_extractor_unavailable"
+            return self._safe_fallback(spec, packet, reason=self.last_fallback_reason)
         bundles = [build_verifier_evidence_bundle(packet, claim["claim_id"]) for claim in scanned]
         verifications = verify_claims(scanned, bundles,
                                        scope_id=spec.scope_id, viewer_id=spec.viewer_id)
@@ -88,7 +96,8 @@ class ComplexAnswerBuilder:
             failing_ids = {item.get("claim_id") for item in verifications
                             if item.get("status") in {"unsupported", "overstated", "contradicted", "privacy_blocked"}}
         if failing_ids:
-            return self._safe_fallback(spec, packet, reason="verification_failed")
+            self.last_fallback_reason = "verification_failed"
+            return self._safe_fallback(spec, packet, reason=self.last_fallback_reason)
         statements = [
             {
                 "text": claim.get("text"),
@@ -117,7 +126,18 @@ class ComplexAnswerBuilder:
         except Exception:
             return None
         parsed = parse_json_response(raw)
-        return parsed if isinstance(parsed, dict) else None
+        if isinstance(parsed, dict):
+            return parsed
+        # RX-2 (U4): a writer can return legal JSON that is not an object (e.g. a
+        # bare list or a string).  Prefer the first entry that carries text or
+        # candidate claims so the chain proceeds to the Claim Extractor instead
+        # of silently skipping it.  A genuinely empty object stays falsy and is
+        # reported by the caller.
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and (item.get("text") or item.get("candidate_claims")):
+                    return item
+        return None
 
     @staticmethod
     def _safe_fallback(spec, packet, reason):
@@ -134,6 +154,35 @@ class ComplexAnswerBuilder:
             "fallback": True,
             "fallback_reason": reason,
         }
+
+
+def _propagate_candidate_evidence(claims, writer_candidates):
+    """Attach writer-suggested evidence anchors to extracted claims.
+
+    ``LLMClaimExtractor`` deliberately returns claims with empty candidate
+    evidence ids (it does not trust the Writer's list).  The Writer's anchors
+    are still a legitimate *proposal* for the deterministic Verifier, so we
+    carry them over by text match before verification — otherwise every claim
+    verifies as unsupported and the chain always falls back.
+    """
+    if not writer_candidates:
+        return claims
+    for claim in claims or []:
+        text = str(claim.get("text") or "")
+        if not text:
+            continue
+        for candidate in writer_candidates:
+            candidate_text = str(candidate.get("text") or "").strip()
+            if not candidate_text:
+                continue
+            if candidate_text in text or text in candidate_text:
+                ids = list(claim.get("candidate_evidence_ids") or [])
+                for value in candidate.get("candidate_evidence_ids") or []:
+                    if value not in ids:
+                        ids.append(value)
+                claim["candidate_evidence_ids"] = ids
+                break
+    return claims
 
 
 def verification_map(verifications):

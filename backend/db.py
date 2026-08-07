@@ -222,6 +222,22 @@ class MemoryStore:
             self.connection.execute("PRAGMA journal_mode = WAL")
             self._create_schema()
 
+    def get_setting(self, key, default=None):
+        row = self._row("SELECT value FROM runtime_settings WHERE key = ?", (key,))
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.connection.execute(
+            "INSERT INTO runtime_settings(key,value,updated_at) VALUES (?,?,datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (key, str(value)),
+        )
+        self.connection.commit()
+
+    def list_settings(self):
+        rows = self._rows("SELECT key, value, updated_at FROM runtime_settings ORDER BY key")
+        return [{"key": r["key"], "value": r["value"], "updated_at": r["updated_at"]} for r in rows]
+
     def close(self):
         self.connection.close()
 
@@ -706,6 +722,12 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS invites (
                 id TEXT PRIMARY KEY,
                 label TEXT NOT NULL,
@@ -717,6 +739,7 @@ class MemoryStore:
             """
         )
         self._migrate_face_instances_cluster_nullable()
+        self.connection.execute("INSERT OR IGNORE INTO runtime_settings(key,value) VALUES('vlm_backend','ollama_12b')")
         self._ensure_columns("assets", {
             "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "batch_id": "TEXT",
@@ -907,7 +930,14 @@ class MemoryStore:
         self.connection.execute(
             """INSERT INTO memory_spaces(id, name, kind, source_path, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
+            ON CONFLICT(id) DO UPDATE SET
+            name = CASE
+                WHEN memory_spaces.name IS NULL OR trim(memory_spaces.name) = ''
+                    OR memory_spaces.name = memory_spaces.id
+                THEN excluded.name
+                ELSE memory_spaces.name
+            END,
+            kind = excluded.kind,
             source_path = excluded.source_path, updated_at = excluded.updated_at""",
             (scope_id, name, kind, source_path, timestamp, timestamp),
         )
@@ -3170,6 +3200,74 @@ class MemoryStore:
     def get_entity(self, entity_id):
         return self._row("SELECT * FROM entities WHERE id = ?", (entity_id,))
 
+    def person_aliases(self, entity_id):
+        """Current user-maintained alias list for a person entity, or []."""
+        row = self._current_entity_property(entity_id, "aliases")
+        if not row:
+            return []
+        value = self._property_row(row).get("value")
+        return list(value) if isinstance(value, list) else ([value] if value else [])
+
+    def find_confirmed_person_by_name(self, scope_id, name):
+        """Return the confirmed person entity in scope_id whose canonical name or
+        an alias matches `name`. Returns {entity_id, via_alias} or None."""
+        name = str(name or "").strip()
+        if not name:
+            return None
+        row = self._row(
+            """SELECT * FROM entities WHERE scope_id = ? AND entity_type = 'person' AND status = 'confirmed'
+            AND canonical_name = ? ORDER BY updated_at DESC LIMIT 1""",
+            (scope_id, name),
+        )
+        if row:
+            return {"entity_id": row["id"], "via_alias": False}
+        for candidate in self._rows(
+            """SELECT id FROM entities WHERE scope_id = ? AND entity_type = 'person' AND status = 'confirmed'""",
+            (scope_id,),
+        ):
+            if name in self.person_aliases(candidate["id"]):
+                return {"entity_id": candidate["id"], "via_alias": True}
+        return None
+
+    def set_person_aliases(self, entity_id, aliases):
+        """Replace the user-maintained alias list. Old values keep revision audit."""
+        cleaned = list(dict.fromkeys(str(item or "").strip() for item in (aliases or []) if str(item or "").strip()))
+        if not self.get_entity(entity_id):
+            return []
+        self.set_entity_property(entity_id, "aliases", cleaned)
+        return self.person_aliases(entity_id)
+
+    def rename_person(self, entity_id, new_name):
+        """Rename a confirmed person globally: update canonical_name, fold the old
+        name into aliases, audit the change, and rebuild person projections."""
+        entity = self.get_entity(entity_id)
+        if not entity or entity.get("entity_type") != "person":
+            return None
+        new_name = str(new_name or "").strip()
+        if not new_name:
+            raise ValueError("person name is required")
+        old_name = entity["canonical_name"]
+        timestamp = now_iso()
+        if old_name != new_name:
+            if old_name:
+                aliases = self.person_aliases(entity_id)
+                if old_name not in aliases:
+                    aliases.append(old_name)
+                self.set_entity_property(entity_id, "aliases", aliases)
+            self.connection.execute(
+                "UPDATE entities SET canonical_name = ?, updated_at = ? WHERE id = ?",
+                (new_name, timestamp, entity_id),
+            )
+            self._record_entity_revision(entity_id, "canonical_name", old_name, new_name, "user_rename")
+            self.connection.commit()
+        memory = self.rebuild_person_memory(entity_id)
+        self.connection.commit()
+        detail = {**self.get_entity_detail(entity_id), "semantic_profile": memory["profile"] if memory else None, "semantic_claims": memory["claims"] if memory else []}
+        if memory:
+            detail["event_memory"] = memory["event_memory"]
+            detail["patterns"] = memory["patterns"]
+        return detail
+
     def get_face_instance(self, instance_id):
         result = self._decode(
             self._row(
@@ -3799,9 +3897,13 @@ class MemoryStore:
         cluster = self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
         if not cluster:
             return None
+        scope_id = cluster.get("scope_id") or "home-default"
+        existing = self.find_confirmed_person_by_name(scope_id, name)
+        if existing:
+            return self._merge_cluster_into_person(cluster_id, existing["entity_id"])
         entity = self.get_entity(cluster["entity_id"]) if cluster["entity_id"] else None
         if not entity:
-            entity = self.create_entity(name, "person", "confirmed", family_role, 1.0, "用户确认的人物实体")
+            entity = self.create_entity(name, "person", "confirmed", family_role, 1.0, "用户确认的人物实体", scope_id=scope_id)
         else:
             self.connection.execute("UPDATE entities SET canonical_name = ?, status = 'confirmed', family_role = ?, confidence = MAX(confidence, 1), updated_at = ? WHERE id = ?", (name, family_role, now_iso(), entity["id"]))
             entity = self.get_entity(entity["id"])
@@ -3861,11 +3963,73 @@ class MemoryStore:
                 confirmed.append({"cluster_id": row["id"], "error": str(error)})
         return confirmed
 
+    def _merge_cluster_into_person(self, cluster_id, target_entity_id):
+        """Merge a just-confirmed cluster into an existing confirmed person:
+        move its face instances and mentions to the target, retire the cluster,
+        rebuild the target's memory, and return a merged marker detail."""
+        cluster = self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
+        target = self.get_entity(target_entity_id)
+        if not cluster or not target:
+            return None
+        if (cluster.get("scope_id") or "home-default") != (target.get("scope_id") or "home-default"):
+            raise ValueError("face cluster and person must belong to the same memory space")
+        instances = self._rows("SELECT * FROM face_instances WHERE cluster_id = ?", (cluster_id,))
+        observation_ids = []
+        target_cluster = self._row(
+            """SELECT id FROM face_clusters WHERE entity_id = ? AND status = 'confirmed'
+            ORDER BY member_count DESC, updated_at DESC LIMIT 1""",
+            (target_entity_id,),
+        )
+        for instance in instances:
+            observation_ids.append(instance["observation_id"])
+            if target_cluster:
+                self.connection.execute(
+                    "UPDATE face_instances SET cluster_id = ? WHERE id = ?",
+                    (target_cluster["id"], instance["id"]),
+                )
+            self._link_confirmed_entity_mention(target, instance["observation_id"], instance["id"], instance["detection_confidence"])
+        self.connection.execute(
+            "UPDATE face_clusters SET status = 'rejected', entity_id = ?, member_count = 0, updated_at = ?, revision = revision + 1 WHERE id = ?",
+            (target_entity_id, now_iso(), cluster_id),
+        )
+        if target_cluster:
+            self._refresh_face_prototypes(target_cluster["id"])
+        self._record_entity_revision(target_entity_id, "face_cluster_merge", cluster_id, target_cluster["id"] if target_cluster else None, "user_name_merge", [])
+        self.connection.commit()
+        self._refresh_event_participants(observation_ids)
+        self.resegment_events_for_confirmed_entity(target_entity_id)
+        memory = self.rebuild_person_memory(target_entity_id)
+        self.connection.commit()
+        detail = {**self.get_entity_detail(target_entity_id), "semantic_profile": memory["profile"] if memory else None, "semantic_claims": memory["claims"] if memory else []}
+        if memory:
+            detail["event_memory"] = memory["event_memory"]
+            detail["patterns"] = memory["patterns"]
+            detail["refresh_counts"] = {
+                "observations": len(memory["observation_ids"]),
+                "events": len(memory["event_ids"]),
+                "patterns": len(memory["patterns"]),
+                "claims": len(memory["claims"]),
+                "appearance": len(self.list_person_appearance_evidence(target_entity_id, include_empty=True)),
+            }
+        detail["merged_into"] = target["id"]
+        detail["canonical_name"] = target["canonical_name"]
+        return detail
+
     def confirm_person_entity(self, entity_id, name, family_role=None):
         """Resolve a native person entity to its active face cluster."""
         entity = self.get_entity(entity_id)
         if not entity or entity.get("entity_type") != "person":
             return None
+        scope_id = entity.get("scope_id") or "home-default"
+        existing = self.find_confirmed_person_by_name(scope_id, name)
+        if existing and existing["entity_id"] != entity_id:
+            cluster = self._row(
+                """SELECT id FROM face_clusters WHERE entity_id = ? AND status IN ('pending', 'confirmed') AND member_count > 0
+                ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1""",
+                (entity_id,),
+            )
+            if cluster:
+                return self._merge_cluster_into_person(cluster["id"], existing["entity_id"])
         cluster = self._row(
             """SELECT id FROM face_clusters
             WHERE entity_id = ? AND status IN ('pending', 'confirmed') AND member_count > 0
@@ -3895,41 +4059,62 @@ class MemoryStore:
             }
         return detail
 
-    def reject_person_entity(self, entity_id):
-        """Reject a native person candidate and its reviewable face clusters.
+    def delete_person_candidate(self, entity_id):
+        """Remove a non-person candidate permanently.
 
-        Face instances and original assets remain as evidence; only the
-        candidate identity status is retired from review queues.
+        Deletes the entity and all of its derived associations (face clusters,
+        entity mentions, relationships, semantic claims/profiles, event memory,
+        appearance evidence, properties and revisions). Face instances and the
+        original assets are preserved as evidence. Confirmed people cannot be
+        deleted; use rename/merge instead.
         """
         entity = self.get_entity(entity_id)
         if not entity or entity.get("entity_type") != "person":
             return None
         if entity.get("status") == "confirmed":
-            raise ValueError("confirmed person entities cannot be rejected from the candidate queue")
-        timestamp = now_iso()
-        clusters = self._rows(
-            """SELECT id FROM face_clusters
-            WHERE entity_id = ? AND status IN ('pending', 'confirmed')""",
-            (entity_id,),
-        )
-        for cluster in clusters:
-            self.connection.execute(
-                """UPDATE face_clusters SET status = 'rejected', updated_at = ?, revision = revision + 1
-                WHERE id = ?""",
-                (timestamp, cluster["id"]),
-            )
+            raise ValueError("confirmed person entities cannot be deleted")
+        cluster_ids = [row["id"] for row in self._rows("SELECT id FROM face_clusters WHERE entity_id = ?", (entity_id,))]
+        observation_ids = list(dict.fromkeys(
+            row["observation_id"] for row in self._rows(
+                "SELECT DISTINCT observation_id FROM face_instances WHERE cluster_id IN (%s)" % ",".join("?" * len(cluster_ids)) if cluster_ids else "SELECT NULL",
+                tuple(cluster_ids) if cluster_ids else (),
+            ) if row["observation_id"]
+        ))
+        # Detach face instances (keep them as evidence, unbound from the deleted cluster).
+        for cluster_id in cluster_ids:
+            self.connection.execute("UPDATE face_instances SET cluster_id = NULL WHERE cluster_id = ?", (cluster_id,))
+            self.connection.execute("DELETE FROM face_prototypes WHERE cluster_id = ?", (cluster_id,))
+            self.connection.execute("DELETE FROM face_clusters WHERE id = ?", (cluster_id,))
+        for table in (
+            "entity_mentions", "entity_properties", "entity_revisions",
+        ):
+            self.connection.execute(f"DELETE FROM {table} WHERE entity_id = ?", (entity_id,))
+        for table in (
+            "semantic_claims", "semantic_profiles", "person_event_memory",
+            "person_appearance_evidence",
+        ):
+            self.connection.execute(f"DELETE FROM {table} WHERE person_id = ?", (entity_id,))
         self.connection.execute(
-            """UPDATE entities SET status = 'rejected', summary = ?, updated_at = ?
-            WHERE id = ?""",
-            ("候选人物已驳回，原始人脸证据仍保留", timestamp, entity_id),
+            "DELETE FROM entity_merge_candidates WHERE entity_ids_json LIKE ? OR target_entity_id = ?",
+            (f"%{entity_id}%", entity_id),
         )
         self.connection.execute(
-            """UPDATE relationships SET status = 'retracted', updated_at = ?, revision = revision + 1
-            WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status IN ('pending', 'active')""",
-            (timestamp, entity_id, entity_id),
+            "DELETE FROM relationships WHERE subject_entity_id = ? OR object_entity_id = ?",
+            (entity_id, entity_id),
         )
+        self.connection.execute(
+            "DELETE FROM facts WHERE subject = ? OR object = ?",
+            (entity["canonical_name"], entity["canonical_name"]),
+        )
+        self.connection.execute("DELETE FROM persons WHERE id = ?", (entity_id,))
+        self.connection.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
         self.connection.commit()
-        return self.get_entity(entity_id)
+        self._refresh_event_participants(observation_ids)
+        return {"deleted": True, "entity_id": entity_id}
+
+    def reject_person_entity(self, entity_id):
+        """Delete a candidate that is not a person. Confirmed people are refused."""
+        return self.delete_person_candidate(entity_id)
 
     def get_person_evidence(self, person_id):
         detail = self.get_entity_detail(person_id)
@@ -4101,18 +4286,15 @@ class MemoryStore:
                 self.refresh_event_summary(row["event_id"])
 
     def reject_face_cluster(self, cluster_id):
+        """Delete a face cluster that is not a person. Confirmed clusters refuse."""
         cluster = self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
         if not cluster:
             return None
-        timestamp = now_iso()
-        self.connection.execute("UPDATE face_clusters SET status = 'rejected', updated_at = ?, revision = revision + 1 WHERE id = ?", (timestamp, cluster_id))
         if cluster.get("entity_id"):
-            self.connection.execute(
-                "UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ? AND status != 'confirmed'",
-                ("候选人物簇已驳回，原始人脸证据仍保留", timestamp, cluster["entity_id"]),
-            )
-        self.connection.commit()
-        return self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
+            entity = self.get_entity(cluster["entity_id"])
+            if entity and entity.get("status") == "confirmed":
+                raise ValueError("confirmed person clusters cannot be rejected")
+        return self.delete_person_candidate(cluster.get("entity_id")) if cluster.get("entity_id") else None
 
     def list_relationships(self, entity_id=None, scope_id=None):
         scope_clause = " AND r.scope_id = ?" if scope_id else ""
@@ -4124,6 +4306,42 @@ class MemoryStore:
             rows = self._rows("""SELECT r.*, s.canonical_name AS subject_name, o.canonical_name AS object_name
                 FROM relationships r JOIN entities s ON s.id = r.subject_entity_id JOIN entities o ON o.id = r.object_entity_id""" + (" WHERE r.scope_id = ?" if scope_id else "") + " ORDER BY r.updated_at DESC", (scope_id,) if scope_id else ())
         return [self._decode(row, ["evidence_ids_json"]) for row in rows]
+
+    def list_person_relationships(self, scope_id=None):
+        """Family graph edges: only relationships where both ends are person entities."""
+        scope_clause = " AND r.scope_id = ?" if scope_id else ""
+        rows = self._rows("""SELECT r.*, s.canonical_name AS subject_name, o.canonical_name AS object_name
+            FROM relationships r JOIN entities s ON s.id = r.subject_entity_id JOIN entities o ON o.id = r.object_entity_id
+            WHERE s.entity_type = 'person' AND o.entity_type = 'person' AND r.status != 'retracted'""" + scope_clause + " ORDER BY r.updated_at DESC", (scope_id,) if scope_id else ())
+        return [self._decode(row, ["evidence_ids_json"]) for row in rows]
+
+    def retract_relationship(self, relationship_id):
+        relationship = self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
+        if not relationship:
+            return None
+        self.connection.execute("UPDATE relationships SET status = 'retracted', updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), relationship_id))
+        self.connection.commit()
+        return self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
+
+    def maintain_relationship_claim(self, relationship):
+        """Write a user-confirmed relationship into the subject's semantic claims so
+        person profiles, knowledge and Agent recall can reference it."""
+        subject = self.get_entity(relationship.get("subject_entity_id")) or {}
+        object_entity = self.get_entity(relationship.get("object_entity_id")) or {}
+        predicate = str(relationship.get("predicate") or "").strip()
+        if not predicate or not subject or not object_entity:
+            return None
+        claim = self.maintain_semantic_claim(
+            person_id=subject["id"],
+            dimension="relationship",
+            predicate=predicate,
+            value_text=object_entity.get("canonical_name") or "家人",
+            evidence_ids=relationship.get("evidence_ids_json", []) or [],
+            confidence=float(relationship.get("confidence") or 0.75),
+            confidence_source="user-confirmed",
+        )
+        self.connection.commit()
+        return claim
 
     def create_relationship(self, subject_entity_id, predicate, object_entity_id, evidence_ids=None, confidence=0.5, status="pending"):
         evidence_ids = list(dict.fromkeys(evidence_ids or []))

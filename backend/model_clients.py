@@ -202,13 +202,183 @@ ROLE_INFERENCE = {
 }
 
 
+def build_image_prompt(metadata=None):
+    prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
+严格返回简体中文 JSON 对象。place 和 semantic.place.primary 必须只依据图片视觉证据，不能用 GPS 或地点上下文覆盖；地点上下文只能作为候选背景。
+地点主类只能从："""
+    prompt += "、".join(PLACE_PRIMARY_TYPES)
+    prompt += "；物品主类只能从："
+    prompt += "、".join(OBJECT_PRIMARY_TYPES)
+    prompt += "；氛围主类只能从："
+    prompt += "、".join(ATMOSPHERE_PRIMARY_TYPES)
+    prompt += "\nmetadata: " + json.dumps(metadata or {}, ensure_ascii=False)
+    return prompt
+
+
+class OllamaBackend:
+    """Ollama 12B backend — local GPU via Ollama server."""
+
+    name = "ollama_12b"
+
+    def __init__(self, base_url, model, timeout, keep_alive):
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self.timeout = timeout
+        self.keep_alive = keep_alive
+
+    @property
+    def endpoint(self):
+        return self._base_url
+
+    @property
+    def model_name(self):
+        return self._model
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        message = {"role": "user", "content": prompt}
+        if images:
+            message["images"] = [img["base64"] for img in images]
+        payload = {
+            "model": self._model,
+            "messages": [message],
+            "stream": False,
+            "keep_alive": self.keep_alive,
+            "options": {"temperature": 0},
+        }
+        if json_mode:
+            payload["format"] = "json"
+        params = ROLE_INFERENCE.get(role)
+        if params is not None:
+            payload["options"].update({
+                "temperature": params["temperature"],
+                "num_ctx": params["num_ctx"],
+                "num_predict": params["num_predict"],
+            })
+            payload["think"] = bool(params.get("think", False))
+        if vision_options:
+            payload["think"] = vision_options.get("think", False)
+            payload["options"].update({
+                "num_ctx": vision_options["num_ctx"],
+                "num_predict": vision_options["num_predict"],
+            })
+        try:
+            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("message", {}).get("content", "")
+        except (httpx.HTTPError, ValueError) as error:
+            raise ModelError(f"ollama request failed: {error}") from error
+
+    def embed_text(self, text):
+        """Ollama embedding endpoint."""
+        if not str(text or "").strip():
+            return []
+        model = os.getenv("SENTRIX_TEXT_EMBED_MODEL", self._model)
+        try:
+            response = httpx.post(f"{self._base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+            embeddings = payload.get("embeddings") or []
+            return embeddings[0] if embeddings else []
+        except (httpx.HTTPError, ValueError, KeyError):
+            return []
+
+
+class E2BBackend:
+    """E2B LoRA backend — local 2B model via E2B server on :8100."""
+
+    name = "e2b_lora"
+    model_name = "gemma-4-e2b-it+lora-v2"
+
+    def __init__(self, base_url=None, timeout=None):
+        self._base_url = (base_url or os.getenv("E2B_BASE_URL", "http://127.0.0.1:8101")).rstrip("/")
+        self.timeout = timeout or float(os.getenv("E2B_TIMEOUT_SECONDS", "300"))
+        self.model_name = os.getenv("E2B_MODEL_NAME", "gemma-4-e2b-it+lora-v2")
+
+    @property
+    def endpoint(self):
+        return self._base_url
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        message = {"role": "user", "content": prompt}
+        if images:
+            message["images"] = [img["base64"] for img in images]
+        payload = {
+            "model": self.model_name,
+            "messages": [message],
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+        if json_mode:
+            payload["format"] = "json"
+        params = ROLE_INFERENCE.get(role)
+        if params is not None:
+            payload["options"].update({
+                "temperature": params["temperature"],
+                "num_ctx": params["num_ctx"],
+                "num_predict": params["num_predict"],
+            })
+            payload["think"] = bool(params.get("think", False))
+        if vision_options:
+            payload["think"] = vision_options.get("think", False)
+            payload["options"].update({
+                "num_ctx": vision_options["num_ctx"],
+                "num_predict": vision_options["num_predict"],
+            })
+        try:
+            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("message", {}).get("content", "")
+        except (httpx.HTTPError, ValueError) as error:
+            raise ModelError(f"e2b request failed: {error}") from error
+
+    def embed_text(self, text):
+        """E2B server does not support embeddings. Always raises NotImplementedError."""
+        raise NotImplementedError("E2B backend does not support text embeddings")
+
+    def health(self):
+        try:
+            response = httpx.get(f"{self._base_url}/api/health", timeout=min(10, self.timeout))
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            return {}
+
+
 class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
-                 repair_model=None):
-        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
-        self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+                 repair_model=None, backend=None, api_key=None):
+        self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
+        ollama_fallback_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+        if self.backend == "openai":
+            self._base_url_setting = self._normalize_openai_base_url(
+                base_url
+                or os.getenv("SENTRIX_VLLM_BASE_URL")
+                or os.getenv("VLLM_BASE_URL")
+                or os.getenv("OPENAI_BASE_URL")
+                or "http://127.0.0.1:8100/v1"
+            )
+            self._model_setting = model or os.getenv("SENTRIX_VLLM_MODEL") or os.getenv("VLLM_MODEL") or os.getenv("OPENAI_MODEL") or "gemma4-12b-it"
+        else:
+            self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+            self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+        self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        # --- E2B facade wiring (before per-role setup) ---
+        _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+        _init_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
+        self._ollama = OllamaBackend(
+            base_url=ollama_fallback_url,
+            model=os.getenv("OLLAMA_MODEL", "gemma4:12b"),
+            timeout=_init_timeout,
+            keep_alive=-1 if str(_init_keep_alive).strip() == "-1" else _init_keep_alive,
+        )
+        self._e2b = E2BBackend(os.getenv("E2B_BASE_URL"), _init_timeout)
+        self._store = None
+        self._active_cache = None
+        self._cache_ts = 0.0
         # Phase R R5 + R9-3: per-role model separation.  Explicit per-role env
         # wins; otherwise SENTRIX_AGENT_MODEL_PROFILE decides the default —
         # quality_12b (all roles on the 12B main endpoint) or experimental_2b
@@ -218,7 +388,13 @@ class GammaClient:
         profile = os.getenv("SENTRIX_AGENT_MODEL_PROFILE", "quality_12b").strip().lower()
         explicit_any = any((parse_model, answer_model, verify_model, parse_backend,
                             os.getenv("SENTRIX_PARSE_MODEL"), os.getenv("SENTRIX_PARSE_BACKEND")))
-        if model_split or explicit_any:
+        if self.backend == "openai":
+            self.parse_model = parse_model or os.getenv("SENTRIX_PARSE_MODEL", self.model)
+            self.answer_model = answer_model or os.getenv("SENTRIX_ANSWER_MODEL", self.model)
+            self.verify_model = verify_model or os.getenv("SENTRIX_VERIFY_MODEL", self.model)
+            self.parse_backend = parse_backend or os.getenv("SENTRIX_PARSE_BACKEND", self.backend)
+            self.parse_base_url = self._normalize_openai_base_url(parse_base_url or os.getenv("SENTRIX_PARSE_BASE_URL", self.base_url))
+        elif model_split or explicit_any:
             self.parse_model = parse_model or os.getenv("SENTRIX_PARSE_MODEL", self.model)
             self.answer_model = answer_model or os.getenv("SENTRIX_ANSWER_MODEL", self.model)
             self.verify_model = verify_model or os.getenv("SENTRIX_VERIFY_MODEL", self.model)
@@ -241,6 +417,65 @@ class GammaClient:
         # Ollama expects numeric -1 for indefinite residency; the string "-1"
         # is rejected by its request schema.
         self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
+
+    @staticmethod
+    def _normalize_backend(value):
+        value = str(value or "vllm").strip().lower()
+        if value in {"vllm", "openai", "openai_compatible", "openai-compatible"}:
+            return "openai"
+        if value in {"ollama", "ollama_local"}:
+            return "ollama"
+        raise ModelError(f"unsupported llm backend: {value}")
+
+    @staticmethod
+    def _normalize_openai_base_url(value):
+        value = str(value or "http://127.0.0.1:8100/v1").rstrip("/")
+        return value if value.endswith("/v1") else f"{value}/v1"
+
+    _CACHE_TTL_SECONDS = 5.0
+
+    def bind_store(self, store):
+        self._store = store
+
+    def invalidate_backend_cache(self):
+        self._active_cache = None
+        self._cache_ts = 0.0
+
+    def _read_active_name(self):
+        if self._store is not None:
+            name = self._store.get_setting("vlm_backend")
+            if name in ("ollama_12b", "e2b_lora"):
+                return name
+        return "ollama_12b"
+
+    def _active(self):
+        import time
+        now = time.monotonic()
+        if self._active_cache is not None and (now - self._cache_ts) < self._CACHE_TTL_SECONDS:
+            return self._active_cache
+        name = self._read_active_name()
+        if name == "e2b_lora":
+            self._active_cache = self._e2b
+        else:
+            self._active_cache = getattr(self, '_ollama', None)
+        self._cache_ts = now
+        return self._active_cache
+
+    @property
+    def active_name(self):
+        return self._read_active_name()
+
+    @property
+    def base_url(self):
+        if self.backend == "openai":
+            return self._base_url_setting
+        return self._active().endpoint
+
+    @property
+    def model(self):
+        if self.backend == "openai":
+            return self._model_setting
+        return self._active().model_name
 
     def _endpoint_for(self, role):
         """Resolve (base_url, model) for a model role.
@@ -269,10 +504,20 @@ class GammaClient:
     def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
         if httpx is None:
             raise ModelError("httpx is not installed")
+        if self.backend == "openai":
+            endpoint_base, model = self._endpoint_for(role)
+            return self._chat_openai(endpoint_base, model, prompt, images, vision_options, json_mode, role)
+        backend = self._active()
+        if backend is None:
+            raise ModelError("no active VLM backend")
+        text = backend.chat(prompt, images, vision_options, json_mode, role)
+        self._record_validation_call(role, backend.endpoint, backend.model_name, json_mode, text)
+        return text
+
+    def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
         if images:
             message["images"] = [image["base64"] for image in images]
-        endpoint_base, model = self._endpoint_for(role)
         payload = {
             "model": model,
             "messages": [message],
@@ -306,6 +551,47 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError) as error:
+            raise ModelError(f"gamma request failed: {error}") from error
+
+    def _chat_openai(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        if images:
+            content = [{"type": "text", "text": prompt}]
+            for image in images:
+                mime_type = image.get("mime_type") or "image/jpeg"
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image['base64']}"},
+                })
+            message = {"role": "user", "content": content}
+        else:
+            message = {"role": "user", "content": prompt}
+        payload = {
+            "model": model,
+            "messages": [message],
+            "stream": False,
+            "temperature": 0,
+        }
+        if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            payload["response_format"] = {"type": "json_object"}
+        params = ROLE_INFERENCE.get(role)
+        if params is not None:
+            payload["temperature"] = params["temperature"]
+            payload["max_tokens"] = params["num_predict"]
+        if vision_options:
+            payload["max_tokens"] = int(vision_options["num_predict"])
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            response = httpx.post(f"{endpoint_base}/chat/completions", json=payload, headers=headers, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            if isinstance(text, list):
+                text = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in text)
+            self._record_validation_call(role, endpoint_base, model, json_mode, text)
+            return text
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             raise ModelError(f"gamma request failed: {error}") from error
 
     def _record_validation_call(self, role, endpoint_base, model, json_mode, text):
@@ -454,8 +740,49 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         parsed["model"] = self.model
         return parsed
 
+    def _event_gps_prefix(self, event, observations):
+        """Extract GPS-derived location from observation assets via the store.
+        Returns a location string like "\u676d\u5dde\u5e02\u897f\u6e56\u533a" or ""."""
+        districts = set()
+        cities = set()
+        observation_ids = [item.get("id") for item in observations if item.get("id")]
+        if not observation_ids or not self._store:
+            return ""
+        # Look up assets via observations -> asset_id -> reverse_geocode
+        placeholders = ",".join("?" for _ in observation_ids)
+        try:
+            rows = self._store._rows(
+                f"""SELECT DISTINCT json_extract(a.metadata_json, '$.reverse_geocode') as geo
+                    FROM observations o JOIN assets a ON a.id = o.asset_id
+                    WHERE o.id IN ({placeholders})""",
+                observation_ids,
+            )
+        except Exception:
+            return ""
+        for row in rows:
+            try:
+                geo = json.loads(row["geo"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(geo, dict):
+                continue
+            city = str(geo.get("city") or "").strip()
+            district = str(geo.get("district") or "").strip()
+            if city:
+                cities.add(city)
+            if district:
+                districts.add(district)
+        parts = []
+        if cities:
+            parts.extend(sorted(cities))
+        if districts:
+            parts.extend(d for d in sorted(districts) if d not in cities)
+        return "".join(parts[:2])
+
     def summarize_event(self, event, observations):
         semantic_place = _event_place(event, observations)
+        # Extract GPS location BEFORE model call as factual context (not model input)
+        gps_prefix = self._event_gps_prefix(event, observations)
         evidence = [{
             "observation_id": item.get("id"),
             "caption": item.get("caption"),
@@ -477,28 +804,27 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         }, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt))
         fallback_place = semantic_place
+        title = _strip_event_coordinates(as_text(parsed.get("title")) or "家庭图片记录", fallback_place)
+        summary = _strip_event_coordinates(as_text(parsed.get("summary")) or "该事件的图片证据尚不足以生成更具体的总结。", fallback_place)
+        # Inject GPS location as factual prefix into summary (post-model, never in prompt)
+        if gps_prefix:
+            summary = f"在{gps_prefix}，{summary}"
+            if not any(gps_prefix in t for t in [title, fallback_place]):
+                pass  # Title stays visual to avoid model confusion
         return {
-            "title": _strip_event_coordinates(as_text(parsed.get("title")) or "家庭图片记录", fallback_place),
+            "title": title,
             "event_type": _strip_event_coordinates(as_text(parsed.get("event_type")) or "家庭记录", fallback_place),
             "activity": _strip_event_coordinates(as_text(parsed.get("activity")) or "家庭活动", fallback_place),
-            "summary": _strip_event_coordinates(as_text(parsed.get("summary")) or "该事件的图片证据尚不足以生成更具体的总结。", fallback_place),
+            "summary": summary,
             "confidence": normalize_confidence(parsed.get("confidence"), 0.5),
             "model": self.model,
         }
 
     def embed_text(self, text):
-        """Use the local Ollama embedding endpoint when the configured model supports it."""
-        if httpx is None or not str(text or "").strip():
-            return []
-        model = os.getenv("SENTRIX_TEXT_EMBED_MODEL", self.model)
-        try:
-            response = httpx.post(f"{self.base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout)
-            response.raise_for_status()
-            payload = response.json()
-            embeddings = payload.get("embeddings") or []
-            return embeddings[0] if embeddings else []
-        except (httpx.HTTPError, ValueError, KeyError):
-            return []
+        """Embedding is hard-pinned to Ollama. E2B does not support embeddings."""
+        if getattr(self, '_ollama', None) is not None:
+            return self._ollama.embed_text(text)
+        return []
 
     def answer(self, query, context):
         prompt = f"""你是 Sentrix 家庭记忆 Agent。

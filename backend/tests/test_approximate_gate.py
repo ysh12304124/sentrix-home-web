@@ -52,8 +52,8 @@ class ApproximateGateTests(unittest.TestCase):
         packet = self._packet([
             _item("a1", "approximate", [{"retriever": "visual_ann", "score": 0.20, "score_kind": "cosine_similarity"}]),
         ])
-        # anchor_multiplier 1.5 * min_score 0.15 = 0.225 -> 0.20 dropped
-        ThinAgentRuntime._gate_packet_approximate(packet, _spec(anchored=True))
+        # anchored + no matched condition -> strict drop (no weak approximate)
+        ThinAgentRuntime._gate_packet_approximate(packet, _spec(), anchored=True)
         self.assertEqual(packet.assets, [])
 
     def test_no_attribution_kept(self):

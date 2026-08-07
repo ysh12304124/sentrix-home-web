@@ -335,3 +335,48 @@ class MemoryStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeSettingsTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile, os
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(self.temp_dir.name, "test.db")
+        from backend.db import MemoryStore
+        self.store = MemoryStore(db_path)
+
+    def tearDown(self):
+        self.store.close()
+        self.temp_dir.cleanup()
+
+    def test_default_vlm_backend_is_ollama_12b(self):
+        value = self.store.get_setting("vlm_backend")
+        self.assertEqual(value, "ollama_12b")
+
+    def test_set_and_get_setting(self):
+        self.store.set_setting("test_key", "test_value")
+        self.assertEqual(self.store.get_setting("test_key"), "test_value")
+
+    def test_get_setting_default(self):
+        self.assertEqual(self.store.get_setting("nonexistent"), None)
+        self.assertEqual(self.store.get_setting("nonexistent", "fallback"), "fallback")
+
+    def test_set_setting_overwrites(self):
+        self.store.set_setting("key", "first")
+        self.store.set_setting("key", "second")
+        self.assertEqual(self.store.get_setting("key"), "second")
+
+    def test_list_settings(self):
+        self.store.set_setting("z_key", "z_val")
+        self.store.set_setting("a_key", "a_val")
+        settings = self.store.list_settings()
+        keys = [s["key"] for s in settings]
+        # Should be ordered by key
+        self.assertIn("a_key", keys)
+        self.assertIn("z_key", keys)
+        self.assertIn("vlm_backend", keys)
+        self.assertLess(keys.index("a_key"), keys.index("z_key"))
+
+
+if __name__ == "__main__":
+    unittest.main()
