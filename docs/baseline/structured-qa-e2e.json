@@ -1,0 +1,1117 @@
+{
+  "api": "http://127.0.0.1:8092",
+  "count": 40,
+  "passed": 15,
+  "metrics": {
+    "routed": 0.4,
+    "exact": 0.375,
+    "no_visual": 0.4,
+    "no_images": 1.0,
+    "no_leak": 1.0,
+    "mention": 0.525
+  },
+  "cases": [
+    {
+      "query": "去年拍了多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 45,
+        "total": 45
+      },
+      "actual": {
+        "value": 45,
+        "total": 45
+      },
+      "answer": "符合条件的记录共 45 条。"
+    },
+    {
+      "query": "2024年拍了多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 11,
+        "total": 11
+      },
+      "actual": {
+        "value": 11,
+        "total": 11
+      },
+      "answer": "符合条件的记录共 11 条。"
+    },
+    {
+      "query": "2023年拍了多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 10,
+        "total": 10
+      },
+      "actual": {
+        "value": 10,
+        "total": 10
+      },
+      "answer": "符合条件的记录共 10 条。"
+    },
+    {
+      "query": "最早的照片是什么时候拍的",
+      "answer_type": "first_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": "2023-05-12T19:24:49",
+        "total": 66
+      },
+      "actual": {
+        "value": "2023-05-12T19:24:49",
+        "total": 66
+      },
+      "answer": "最早的照片是 2023-05-12 19:24:49 拍摄的。"
+    },
+    {
+      "query": "最晚的照片是什么时候拍的",
+      "answer_type": "last_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": "2025-10-29T13:37:27",
+        "total": 66
+      },
+      "actual": {
+        "value": "2025-10-29T13:37:27",
+        "total": 66
+      },
+      "answer": "最晚的时间是 2025-10-29 13:37:27。"
+    },
+    {
+      "query": "去年有哪些月份有照片",
+      "answer_type": "grouped_list",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "exact_value"
+      ],
+      "mode": "aggregate_answer",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": [
+          {
+            "group": "2025-04",
+            "count": 28
+          },
+          {
+            "group": "2025-06",
+            "count": 6
+          },
+          {
+            "group": "2025-03",
+            "count": 4
+          },
+          {
+            "group": "2025-05",
+            "count": 3
+          },
+          {
+            "group": "2025-08",
+            "count": 2
+          },
+          {
+            "group": "2025-01",
+            "count": 1
+          },
+          {
+            "group": "2025-10",
+            "count": 1
+          }
+        ],
+        "total": 45
+      },
+      "actual": {
+        "value": [
+          {
+            "group": "2023-05"
+          },
+          {
+            "group": "2023-09"
+          },
+          {
+            "group": "2023-12"
+          },
+          {
+            "group": "2024-08"
+          },
+          {
+            "group": "2024-11"
+          },
+          {
+            "group": "2024-12"
+          },
+          {
+            "group": "2025-01"
+          },
+          {
+            "group": "2025-03"
+          },
+          {
+            "group": "2025-04"
+          },
+          {
+            "group": "2025-05"
+          },
+          {
+            "group": "2025-06"
+          },
+          {
+            "group": "2025-08"
+          },
+          {
+            "group": "2025-10"
+          }
+        ],
+        "total": 13
+      },
+      "answer": "存在2023年5月；存在2023年9月；存在2023年12月；存在2024年8月；存在2024年11月；存在2024年12月；存在2025年1月；存在2025年3月；存在2025年4月；存在2025年5月；存在2025年6月；存在2025年8月；存在2025年10月。"
+    },
+    {
+      "query": "2023年有哪些月份有照片",
+      "answer_type": "grouped_list",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "aggregate_answer",
+      "strategy": "aggregation",
+      "expected": {
+        "value": [
+          {
+            "group": "2023-09",
+            "count": 7
+          },
+          {
+            "group": "2023-12",
+            "count": 2
+          },
+          {
+            "group": "2023-05",
+            "count": 1
+          }
+        ],
+        "total": 10
+      },
+      "actual": {
+        "value": [
+          {
+            "group": "2023-09",
+            "count": 7
+          },
+          {
+            "group": "2023-12",
+            "count": 2
+          },
+          {
+            "group": "2023-05",
+            "count": 1
+          }
+        ],
+        "total": 10
+      },
+      "answer": "一共找到 10 条记录。具体分布如下：2023年9月有 7 条，2023年12月有 2 条，2023年5月有 1 条。"
+    },
+    {
+      "query": "2025年10月拍过照片吗",
+      "answer_type": "exists",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": true,
+        "total": 1
+      },
+      "actual": {
+        "value": true,
+        "total": 1
+      },
+      "answer": "存在符合条件的记录。"
+    },
+    {
+      "query": "这个相册里一共有多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 66,
+        "total": 66
+      },
+      "actual": {
+        "value": 66,
+        "total": 66
+      },
+      "answer": "符合条件的记录共 66 条。"
+    },
+    {
+      "query": "2025年拍的照片有多少张",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 45,
+        "total": 45
+      },
+      "actual": {
+        "value": 45,
+        "total": 45
+      },
+      "answer": "符合条件的记录共 45 条。"
+    },
+    {
+      "query": "2024年拍的照片有多少张",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 11,
+        "total": 11
+      },
+      "actual": {
+        "value": 11,
+        "total": 11
+      },
+      "answer": "符合条件的记录共 11 条。"
+    },
+    {
+      "query": "去年有多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 45,
+        "total": 45
+      },
+      "actual": {
+        "value": 45,
+        "total": 45
+      },
+      "answer": "符合条件的记录共 45 条。"
+    },
+    {
+      "query": "2017年拍了多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 0,
+        "total": 0
+      },
+      "actual": {
+        "value": 0,
+        "total": 0
+      },
+      "answer": "没有找到 2017 年拍摄的照片记录。"
+    },
+    {
+      "query": "2025年10月拍了多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": 1,
+        "total": 1
+      },
+      "actual": {
+        "value": 1,
+        "total": 1
+      },
+      "answer": "2025年10月共有1条符合条件的记录。"
+    },
+    {
+      "query": "2024年拍过照片吗",
+      "answer_type": "exists",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": true,
+        "total": 11
+      },
+      "actual": {
+        "value": true,
+        "total": 11
+      },
+      "answer": "您在2024年有符合条件的记录。"
+    },
+    {
+      "query": "2023年拍过照片吗",
+      "answer_type": "exists",
+      "scope": "album2_e2b",
+      "verdict": "PASS",
+      "reasons": [],
+      "mode": "structured_fact",
+      "strategy": "structured_fact",
+      "expected": {
+        "value": true,
+        "total": 10
+      },
+      "actual": {
+        "value": true,
+        "total": 10
+      },
+      "answer": "存在符合条件的记录。"
+    },
+    {
+      "query": "2030年拍过照片吗",
+      "answer_type": "exists",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": false,
+        "total": 0
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "2017年拍过照片吗",
+      "answer_type": "exists",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": false,
+        "total": 0
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "最早的照片是什么时候拍的",
+      "answer_type": "first_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "approximate_result",
+      "strategy": "",
+      "expected": {
+        "value": "2023-05-12T19:24:49",
+        "total": 66
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "没有完全匹配的照片；下面这几张比较接近，但部分细节还不能确认。"
+    },
+    {
+      "query": "最晚的照片是什么时候拍的",
+      "answer_type": "last_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "approximate_result",
+      "strategy": "",
+      "expected": {
+        "value": "2025-10-29T13:37:27",
+        "total": 66
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "没有完全匹配的照片；下面这几张比较接近，但部分细节还不能确认。"
+    },
+    {
+      "query": "2024年最早的照片是什么时候拍的",
+      "answer_type": "first_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": "2024-08-27T01:57:58",
+        "total": 11
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "2025年最晚的照片是什么时候拍的",
+      "answer_type": "last_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": "2025-10-29T13:37:27",
+        "total": 45
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "明哥第一次出现是什么时候",
+      "answer_type": "first_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": "2025-04-12T19:21:27",
+        "total": 8
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "明哥最后一次出现是什么时候",
+      "answer_type": "last_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": "2025-08-17T11:19:58",
+        "total": 8
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "相册里有多少个视频",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "",
+      "strategy": "",
+      "expected": {
+        "value": 0,
+        "total": 0
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
+    },
+    {
+      "query": "去年有多少个视频",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "",
+      "strategy": "",
+      "expected": {
+        "value": 0,
+        "total": 0
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
+    },
+    {
+      "query": "2024年有多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": 11,
+        "total": 11
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "2025年有多少个视频",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "",
+      "strategy": "",
+      "expected": {
+        "value": 0,
+        "total": 0
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
+    },
+    {
+      "query": "去年主要在哪些地方拍照",
+      "answer_type": "grouped_list",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": [
+          {
+            "group": "室内环境",
+            "count": 10
+          },
+          {
+            "group": "室内空间",
+            "count": 5
+          },
+          {
+            "group": "{\"primary\": \"室内空间\", \"details\": [\"内部环境\"]}",
+            "count": 1
+          },
+          {
+            "group": "体育场内看台",
+            "count": 1
+          },
+          {
+            "group": "体育场或演艺场馆",
+            "count": 1
+          },
+          {
+            "group": "公园与花园",
+            "count": 1
+          },
+          {
+            "group": "剧院或体育场内",
+            "count": 1
+          },
+          {
+            "group": "医院病房内",
+            "count": 1
+          },
+          {
+            "group": "商场或公共场所",
+            "count": 1
+          },
+          {
+            "group": "地铁车厢内",
+            "count": 1
+          },
+          {
+            "group": "地铁隧道内部",
+            "count": 1
+          },
+          {
+            "group": "室内",
+            "count": 1
+          },
+          {
+            "group": "室内公共场所",
+            "count": 1
+          },
+          {
+            "group": "室内墙面展示",
+            "count": 1
+          },
+          {
+            "group": "室内多层空间",
+            "count": 1
+          },
+          {
+            "group": "室内展示空间",
+            "count": 1
+          },
+          {
+            "group": "室内桌子区域",
+            "count": 1
+          },
+          {
+            "group": "室内活动现场",
+            "count": 1
+          },
+          {
+            "group": "室内舞台",
+            "count": 1
+          },
+          {
+            "group": "室内走廊",
+            "count": 1
+          },
+          {
+            "group": "户外休闲区域",
+            "count": 1
+          },
+          {
+            "group": "户外公园",
+            "count": 1
+          },
+          {
+            "group": "户外或室内地面",
+            "count": 1
+          },
+          {
+            "group": "户外的草地或公园",
+            "count": 1
+          },
+          {
+            "group": "户外绿地",
+            "count": 1
+          },
+          {
+            "group": "水边庭院",
+            "count": 1
+          },
+          {
+            "group": "河流/运河",
+            "count": 1
+          },
+          {
+            "group": "湖泊",
+            "count": 1
+          },
+          {
+            "group": "湖泊与树林",
+            "count": 1
+          },
+          {
+            "group": "滨水空间",
+            "count": 1
+          },
+          {
+            "group": "火车车厢内部",
+            "count": 1
+          },
+          {
+            "group": "自然水体环境",
+            "count": 1
+          }
+        ],
+        "total": 45
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "2024年主要在哪些地方拍照",
+      "answer_type": "grouped_list",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": [
+          {
+            "group": "餐饮空间",
+            "count": 2
+          },
+          {
+            "group": "城市夜景",
+            "count": 1
+          },
+          {
+            "group": "城市广场或街道",
+            "count": 1
+          },
+          {
+            "group": "室内空间",
+            "count": 1
+          },
+          {
+            "group": "开阔的河岸",
+            "count": 1
+          },
+          {
+            "group": "户外烧烤架",
+            "count": 1
+          },
+          {
+            "group": "河岸边",
+            "count": 1
+          },
+          {
+            "group": "餐厅",
+            "count": 1
+          },
+          {
+            "group": "餐厅内部",
+            "count": 1
+          },
+          {
+            "group": "餐厅或餐桌",
+            "count": 1
+          }
+        ],
+        "total": 11
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "室内环境的照片有多少张",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "approximate_result",
+      "strategy": "",
+      "expected": {
+        "value": 10,
+        "total": 10
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "没有完全匹配的照片；下面这几张比较接近，但部分细节还不能确认。"
+    },
+    {
+      "query": "去年在室内环境拍过多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": 10,
+        "total": 10
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "海滩的照片有多少张",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "approximate_result",
+      "strategy": "",
+      "expected": {
+        "value": 0,
+        "total": 0
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "没有完全匹配的照片；下面这几张比较接近，但部分细节还不能确认。"
+    },
+    {
+      "query": "有没有在餐饮空间拍过照片",
+      "answer_type": "exists",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann"
+      ],
+      "mode": "approximate_result",
+      "strategy": "",
+      "expected": {
+        "value": true,
+        "total": 2
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "没有完全匹配的照片；下面这几张比较接近，但部分细节还不能确认。"
+    },
+    {
+      "query": "明哥什么时候第一次出现",
+      "answer_type": "first_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": "2025-04-12T19:21:27",
+        "total": 8
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "明哥什么时候最后一次出现",
+      "answer_type": "last_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": "2025-08-17T11:19:58",
+        "total": 8
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "明哥出现过几次",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": 8,
+        "total": 8
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "女儿乐乐有没有出现过",
+      "answer_type": "exists",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "",
+      "strategy": "",
+      "expected": {
+        "value": false,
+        "total": 0
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "你是想让我在你存下的照片或记忆里找这个，还是想聊点别的？"
+    },
+    {
+      "query": "2023年到2025年一共拍了多少张照片",
+      "answer_type": "count",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "no_result",
+      "strategy": "",
+      "expected": {
+        "value": 66,
+        "total": 66
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "目前没有找到足够可靠的依据。可以补充人物、地点或日期再试试。"
+    },
+    {
+      "query": "这个相册是什么时候开始有照片的",
+      "answer_type": "first_occurrence",
+      "scope": "album2_e2b",
+      "verdict": "FAIL",
+      "reasons": [
+        "routed",
+        "exact_value",
+        "no_visual_ann",
+        "mentions_value"
+      ],
+      "mode": "approximate_result",
+      "strategy": "",
+      "expected": {
+        "value": "2023-05-12T19:24:49",
+        "total": 66
+      },
+      "actual": {
+        "value": null,
+        "total": null
+      },
+      "answer": "没有完全匹配的照片；下面这几张比较接近，但部分细节还不能确认。"
+    }
+  ]
+}
