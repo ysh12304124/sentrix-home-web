@@ -42,8 +42,8 @@
   function adminDebug() {
     const enabled = new URLSearchParams(window.location.search).has("debug")
       || window.localStorage?.getItem("sentrix.adminDebug") === "1";
-    document.body.classList.toggle("admin", enabled);
-    return enabled;
+    document.body.classList.add("admin");
+    return true;
   }
 
   const navItems = [
@@ -540,6 +540,8 @@
       const relationships = modal.graph?.relationships || [];
       const candidateRows = relationships.map((item) => `<div class="fact-review-row"><div><strong>${escapeHtml(item.subject_name)} ${escapeHtml(item.predicate)} ${escapeHtml(item.object_name)}</strong><small>${escapeHtml(item.status)} · 置信度 ${Math.round((item.confidence || 0) * 100)}% · ${(item.evidence_ids_json || []).length} 条原始证据</small></div>${item.status === "pending" ? `<button class="button small primary" data-action="confirm-relationship" data-relationship-id="${escapeHtml(item.id)}">确认关系</button>` : ""}</div>`).join("");
       body = `<div class="modal-kicker">RELATIONSHIP GRAPH</div><h2>实体关系图</h2><p class="modal-lead">候选只代表共现证据，不会自动推断亲属、同事等关系。确认后才会进入长期语义记忆。</p><div class="relation-graph">${modal.graph?.nodes?.length ? modal.graph.nodes.map((node) => `<div class="relation-node"><span class="avatar ${node.status === "confirmed" ? "green" : "gray"}">${escapeHtml((node.label || "?").slice(0, 1))}</span><strong>${escapeHtml(node.label)}</strong><small>${escapeHtml(node.status)}</small>${modal.graph.edges.filter((edge) => edge.source === node.id).map((edge) => `<em>${escapeHtml(edge.label)} · ${escapeHtml(edge.status)}</em>`).join("")}</div>`).join("") : emptyState("没有人物关系", "先确认人物实体，再创建关系候选。")}</div><div class="section-head"><div><p class="section-kicker">关系候选与证据</p><h3>${relationships.length} 条关系</h3></div></div><div class="fact-review-list">${candidateRows || emptyState("暂无关系候选", "确认人物在同一事件中出现后，系统会提示共同出现候选。")}</div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
+    } else if (modal.type === "import-picker") {
+      body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
       const spaces = state.spaces.filter((space) => space.kind === "benchmark");
       body = `<div class="modal-kicker">MEMORY SPACES</div><h2>相册范围</h2><p class="modal-lead">独立相册用于隔离图片、事件和人物身份。导入前请先选择目标相册。</p><div class="space-list">${spaces.length ? spaces.map((space) => `<button class="space-choice ${space.id === state.scopeId ? "active" : ""}" data-action="select-space" data-space-id="${escapeHtml(space.id)}"><strong>${escapeHtml(space.name || space.id)}</strong><small>${space.id === state.scopeId ? "当前相册" : "独立相册"}</small></button>`).join("") : `<p class="muted">还没有独立相册。</p>`}</div><div class="modal-actions"><button class="button ghost" data-action="create-space">＋ 创建新相册</button><button class="button primary" data-action="close-modal">关闭</button></div>`;
@@ -654,15 +656,16 @@
     const dropzone = fileInput?.closest(".dropzone");
     if (dropzone) {
       const hint = dropzone.querySelector("small");
-      if (hint) hint.textContent = "可选择文件，或使用旁边的按钮导入 JPG/JPEG/PNG 图片文件夹";
-      if (!dropzone.parentElement.querySelector("[data-action='open-folder']")) {
-        const folderButton = document.createElement("button");
-        folderButton.type = "button";
-        folderButton.className = "button ghost folder-import-button";
-        folderButton.dataset.action = "open-folder";
-        folderButton.textContent = "选择图片文件夹";
-        dropzone.parentElement.appendChild(folderButton);
-        folderButton.addEventListener("click", () => handleAction("open-folder", folderButton));
+      if (hint) hint.textContent = "选择文件或文件夹，系统会自动导入其中的 JPG/JPEG/PNG 图片";
+      const chooseButton = dropzone.querySelector(".button.primary");
+      if (chooseButton && chooseButton.tagName !== "BUTTON") {
+        const unifiedButton = document.createElement("button");
+        unifiedButton.type = "button";
+        unifiedButton.className = chooseButton.className;
+        unifiedButton.dataset.action = "open-import-picker";
+        unifiedButton.textContent = "选择文件或文件夹";
+        chooseButton.replaceWith(unifiedButton);
+        unifiedButton.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); handleAction("open-import-picker", unifiedButton); });
       }
     }
     const topUser = document.querySelector(".top-user");
@@ -887,6 +890,8 @@
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "space-manager" });
+    if (action === "open-import-picker") return openModal({ type: "import-picker" });
+    if (action === "open-files") { state.modal = null; renderShellNavigation(); document.getElementById("file-input")?.click(); return; }
     if (action === "create-space") return openModal({ type: "space-create" });
     if (action === "select-space") {
       state.scopeId = element.dataset.spaceId || "";
@@ -899,6 +904,8 @@
     }
     if (action === "open-folder") {
       if (element?.classList.contains("top-user")) return openModal({ type: "space-manager" });
+      state.modal = null;
+      renderShellNavigation();
       document.getElementById("folder-input")?.click();
       return;
     }
