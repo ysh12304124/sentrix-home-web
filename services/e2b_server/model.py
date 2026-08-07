@@ -6,10 +6,13 @@ and inference to avoid OOM from concurrent GPU operations.
 """
 
 import asyncio
+import inspect
 import os
 import threading
 
 import torch
+
+from .ollama_shape import build_chat_messages
 
 _DTYPE_TABLE = {
     "bf16": "bfloat16",
@@ -28,6 +31,7 @@ class E2BModel:
         self._model = None
         self._processor = None
         self._error = None  # type: str | None
+        self._accepted_forward_keys = None
         self._load_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
 
@@ -79,6 +83,16 @@ class E2BModel:
         # 3. Eval mode
         model.eval()
 
+        try:
+            signature = inspect.signature(model.forward)
+        except (TypeError, ValueError):
+            self._accepted_forward_keys = None
+        else:
+            if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+                self._accepted_forward_keys = None
+            else:
+                self._accepted_forward_keys = set(signature.parameters)
+
         # 4. Processor
         from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(self.base_dir, trust_remote_code=True)
@@ -121,10 +135,37 @@ class E2BModel:
         temperature = kwargs.get("temperature", 0.0)
         do_sample = kwargs.get("do_sample", False)
 
+        messages = build_chat_messages(prompt, pil_images)
+        try:
+            rendered_prompt = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            rendered_prompt = processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        processor_kwargs = {
+            "text": [rendered_prompt],
+            "padding": True,
+            "return_tensors": "pt",
+        }
         if pil_images:
-            inputs = processor(text=prompt, images=pil_images, return_tensors="pt")
-        else:
-            inputs = processor(text=prompt, return_tensors="pt")
+            # Gemma 4 expects one image list per text sample, not a flat list.
+            processor_kwargs["images"] = [pil_images]
+        inputs = processor(**processor_kwargs)
+
+        unused = set(getattr(processor, "unused_input_names", ()) or ())
+        inputs = {key: value for key, value in inputs.items() if value is not None and key not in unused}
+        if self._accepted_forward_keys is not None:
+            inputs = {key: value for key, value in inputs.items() if key in self._accepted_forward_keys}
+        if "input_ids" not in inputs:
+            raise RuntimeError("processor did not produce input_ids")
 
         # Move to the model's device
         device = next(model.parameters()).device
@@ -144,7 +185,9 @@ class E2BModel:
             if "input_ids" in inputs:
                 input_len = inputs["input_ids"].shape[-1]
                 generated_ids = generated_ids[input_len:]
-            return processor.decode(generated_ids, skip_special_tokens=True)
+            if hasattr(processor, "batch_decode"):
+                return processor.batch_decode([generated_ids], skip_special_tokens=True)[0].strip()
+            return processor.decode(generated_ids, skip_special_tokens=True).strip()
 
         # Handle list output
         generated_ids = outputs[0]
@@ -152,7 +195,9 @@ class E2BModel:
             input_len = inputs["input_ids"].shape[-1]
             generated_ids = generated_ids[input_len:]
         try:
-            return processor.decode(generated_ids, skip_special_tokens=True)
+            if hasattr(processor, "batch_decode"):
+                return processor.batch_decode([generated_ids], skip_special_tokens=True)[0].strip()
+            return processor.decode(generated_ids, skip_special_tokens=True).strip()
         except Exception:
             return str(generated_ids)
 

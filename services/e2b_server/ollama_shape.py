@@ -11,6 +11,13 @@ from typing import Any
 JSON_TRAILING_HINT = "\n仅输出 JSON，不要包裹在代码块中。"
 
 
+def build_chat_messages(prompt, pil_images):
+    """Build native Gemma message blocks so the template emits image tokens."""
+    content = [{"type": "image", "image": image} for image in pil_images]
+    content.append({"type": "text", "text": prompt})
+    return [{"role": "user", "content": content}]
+
+
 def extract_prompt_and_images(payload):
     # type: (dict[str, Any]) -> tuple[str, list[str]]
     """Return (prompt_text, [base64_image_strings]) from an Ollama-shape
