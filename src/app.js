@@ -460,8 +460,9 @@
       const properties = new Map((detail.properties || []).map((item) => [item.property_key, item]));
       const isSelf = Boolean(properties.get("is_self")?.value);
       const relation = properties.get("relation_to_user")?.value || "";
+      const canonicalName = detail.entity?.canonical_name || "";
       const groups = Array.isArray(properties.get("groups")?.value) ? properties.get("groups").value.join("、") : "";
-      body = `<form id="modal-form"><div class="modal-kicker">PERSON PROPERTY EDIT</div><h2>修正人物档案</h2><p class="modal-lead">这些是用户维护字段，会保留版本且不会被模型推断覆盖。</p><label class="property-toggle"><input type="checkbox" name="is_self" ${isSelf ? "checked" : ""} />这是相册主人</label><label>与相册主人的关系<input name="relation_to_user" value="${escapeHtml(relation)}" placeholder="例如：本人、母亲、同事" /></label><label>所属圈子<input name="groups" value="${escapeHtml(groups)}" placeholder="例如：家人、大学同学" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-person-profile" data-person-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存人物档案</button></div></form>`;
+      body = `<form id="modal-form"><div class="modal-kicker">PERSON PROPERTY EDIT</div><h2>修正人物档案</h2><p class="modal-lead">这些是用户维护字段，会保留版本且不会被模型推断覆盖。</p><label>名字<input name="canonical_name" value="${escapeHtml(canonicalName)}" placeholder="例如：小张、妈妈" /></label><label class="property-toggle"><input type="checkbox" name="is_self" ${isSelf ? "checked" : ""} />这是相册主人</label><label>与相册主人的关系<input name="relation_to_user" value="${escapeHtml(relation)}" placeholder="例如：本人、母亲、同事" /></label><label>所属圈子<input name="groups" value="${escapeHtml(groups)}" placeholder="例如：家人、大学同学" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-person-profile" data-person-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存人物档案</button></div></form>`;
     } else if (modal.type === "entity") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -702,6 +703,7 @@
         state.toast = "地点属性已按你的修正保存，并保留版本和证据";
       }
       if (modal.type === "person-property-edit") {
+        await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "canonical_name", String(form.get("canonical_name") || "").trim());
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "is_self", form.get("is_self") === "on");
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "relation_to_user", String(form.get("relation_to_user") || "").trim());
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "groups", String(form.get("groups") || "").split(/[、,，]/).map((item) => item.trim()).filter(Boolean));
