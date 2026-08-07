@@ -48,6 +48,8 @@ export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8101}"
 # 153 GPU driver/library NVML mismatch breaks the CUDA caching allocator; run
 # CLIP embedding on CPU so visual/text recall stays available.
 export CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
+export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-/home/asus/Github/stmem-bak/models/open_clip_pytorch_model.bin}"
+export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/asus/.cache/clip/clip_cn_vit-l-14.pt}"
 # R1B proved ViT-B-32 text-to-image is random for Chinese (AUC 0.51); switch the
 # visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
 export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"
@@ -81,6 +83,28 @@ export SENTRIX_MODEL_SPLIT_V1="${SENTRIX_MODEL_SPLIT_V1:-0}"
 export SENTRIX_PARSE_BACKEND="${SENTRIX_PARSE_BACKEND:-openai}"
 export SENTRIX_PARSE_BASE_URL="${SENTRIX_PARSE_BASE_URL:-$SENTRIX_VLLM_BASE_URL}"
 export SENTRIX_PARSE_MODEL="${SENTRIX_PARSE_MODEL:-$SENTRIX_VLLM_MODEL}"
+
+if [[ "$SENTRIX_TEXT_EMBEDDER" == "clip" ]]; then
+  if [[ ! -f "$CLIP_CHECKPOINT" ]]; then
+    echo "OpenCLIP checkpoint is unavailable: $CLIP_CHECKPOINT" >&2
+    exit 1
+  fi
+  if ! "$python_bin" -c 'import open_clip' >/dev/null 2>&1; then
+    echo "OpenCLIP Python dependency is unavailable; install backend/requirements.txt" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$SENTRIX_IMAGE_EMBEDDER" == "chinese_clip" ]]; then
+  if [[ ! -f "$CHINESE_CLIP_CHECKPOINT" ]]; then
+    echo "Chinese-CLIP checkpoint is unavailable: $CHINESE_CLIP_CHECKPOINT" >&2
+    exit 1
+  fi
+  if ! "$python_bin" -c 'import cn_clip' >/dev/null 2>&1; then
+    echo "Chinese-CLIP Python dependency is unavailable; install backend/requirements.txt" >&2
+    exit 1
+  fi
+fi
 
 if [[ "$FACE_EMBEDDING_MODE" == "adaface" ]]; then
   if [[ ! -f "$ADAFACE_MODEL_PATH" ]]; then

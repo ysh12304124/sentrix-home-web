@@ -21,6 +21,10 @@ test("runtime and maintenance entry points use the documented layout", () => {
   const apiStartScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_api.sh"), "utf8");
   assert.match(apiStartScript, /ADAFACE_MODEL_PATH/, "API startup must configure the AdaFace checkpoint");
   assert.match(apiStartScript, /ADAFACE_REPO_ROOT/, "API startup must configure the AdaFace repository root");
+  assert.match(apiStartScript, /CLIP_CHECKPOINT/, "API startup must configure the OpenCLIP checkpoint");
+  assert.match(apiStartScript, /CHINESE_CLIP_CHECKPOINT/, "API startup must configure the Chinese-CLIP checkpoint");
+  assert.match(apiStartScript, /import open_clip/, "API startup must verify the OpenCLIP dependency");
+  assert.match(apiStartScript, /import cn_clip/, "API startup must verify the Chinese-CLIP dependency");
   assert.match(apiStartScript, /OLLAMA_BASE_URL/, "API startup must use the Sentrix Ollama endpoint");
   assert.match(fs.readFileSync(path.join(root, "index.html"), "utf8"), /href="\/src\/styles\.css"/);
 });
