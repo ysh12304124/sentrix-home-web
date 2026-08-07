@@ -11,8 +11,10 @@ class FakeGamma:
 
     def __init__(self):
         self.summary_inputs = []
+        self.image_metadata = None
 
     def analyze_image(self, path, metadata=None):
+        self.image_metadata = metadata
         return {"caption": "一张带文字的家庭照片", "activity": "聚会", "place": "家里", "people": [], "objects": ["蛋糕"], "ocr_text": "生日快乐", "event_type": "聚会", "facts": [], "confidence": 0.8, "model": self.model}
 
     def summarize_event(self, event, observations):
@@ -71,6 +73,18 @@ class FakeFace:
         return [{"bbox": [0, 0, 10, 10], "confidence": 0.95, "embedding": [1.0, 0.0, 0.0], "embedding_model": "test-face", "embedding_version": "v1", "identity_ready": True}]
 
 
+class FakeGeocoder:
+    def lookup(self, gps):
+        return {
+            "source": "offline",
+            "precision": "city",
+            "label": "测试省测试市测试区",
+            "city": "测试市",
+            "district": "测试区",
+            "confidence": 0.72,
+        }
+
+
 class PipelineTests(unittest.TestCase):
     def test_image_runs_native_observation_event_entity_and_vectors(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,6 +106,25 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(store.get_asset(asset["id"])["metadata_json"]["processing_seconds"], 0)
             self.assertIn("analysis_wall_seconds", store.get_asset(asset["id"])["metadata_json"]["processing_timings"])
             self.assertTrue(store.get_asset(asset["id"])["metadata_json"]["processing_timings"]["parallel"])
+
+    def test_gps_context_is_persisted_and_sent_to_captioning_without_overwriting_semantic_place(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "lake.jpg"
+            image.write_bytes(b"test")
+            store = MemoryStore(f"{directory}/memory.db")
+            gamma = FakeGamma()
+            pipeline = IngestionPipeline(store, gamma=gamma, face=FakeFace(), clip=FakeClip(), geocoder=FakeGeocoder())
+            asset = pipeline.create_asset(image, metadata={"exif": {"gps": {"latitude": 31.2, "longitude": 121.4}}})
+
+            self.assertEqual(asset["metadata_json"]["reverse_geocode"]["label"], "测试省测试市测试区")
+            pipeline.process(asset["id"])
+            observation = store.list_observations()[0]
+
+            self.assertEqual(gamma.image_metadata["location_context"]["label"], "测试省测试市测试区")
+            self.assertEqual(observation["place"], "家里")
+            self.assertEqual(observation["canonical"]["semantic"]["place"]["primary"], "居住空间")
+            self.assertEqual(observation["raw"]["location_context"]["label"], "测试省测试市测试区")
+            self.assertNotIn("reverse_geocode", observation["canonical"])
 
     def test_summary_failure_is_completed_by_a_semantic_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -345,6 +378,10 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(asset["content_sha256"]), 64)
             self.assertEqual(asset["captured_at"], "2026-07-01T18:00:00+08:00")
             self.assertIn("exif", asset["metadata_json"])
+
+    def test_gps_metadata_accepts_pair_and_text_formats(self):
+        self.assertEqual(IngestionPipeline._gps_from_metadata({"gps": [31.2, 121.4]}), {"latitude": 31.2, "longitude": 121.4})
+        self.assertEqual(IngestionPipeline._gps_from_metadata({"exif": {"gps": "31.2,121.4"}}), {"latitude": "31.2", "longitude": "121.4"})
 
     def test_asset_import_discards_event_and_activity_hints(self):
         with tempfile.TemporaryDirectory() as directory:

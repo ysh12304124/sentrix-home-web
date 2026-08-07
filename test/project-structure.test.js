@@ -21,6 +21,10 @@ test("runtime and maintenance entry points use the documented layout", () => {
   const apiStartScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_api.sh"), "utf8");
   assert.match(apiStartScript, /ADAFACE_MODEL_PATH/, "API startup must configure the AdaFace checkpoint");
   assert.match(apiStartScript, /ADAFACE_REPO_ROOT/, "API startup must configure the AdaFace repository root");
+  assert.match(apiStartScript, /CLIP_CHECKPOINT/, "API startup must configure the OpenCLIP checkpoint");
+  assert.match(apiStartScript, /CHINESE_CLIP_CHECKPOINT/, "API startup must configure the Chinese-CLIP checkpoint");
+  assert.match(apiStartScript, /import open_clip/, "API startup must verify the OpenCLIP dependency");
+  assert.match(apiStartScript, /import cn_clip/, "API startup must verify the Chinese-CLIP dependency");
   assert.match(apiStartScript, /OLLAMA_BASE_URL/, "API startup must use the Sentrix Ollama endpoint");
   assert.match(fs.readFileSync(path.join(root, "index.html"), "utf8"), /href="\/src\/styles\.css"/);
 });
@@ -46,6 +50,42 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   assert.doesNotMatch(source, /COGNEE_BASE_URL|mockSearch|function handleApi/);
   assert.match(source, /return proxyBackend\(req, res, url\);/);
   assert.match(source, /127\.0\.0\.1:8091/, "web must use the Agent-capable API by default");
+  assert.match(source, /\/api\/model-profiles\/switch/);
+  assert.match(source, /1_000_000/, "model switching must outlive the vLLM ready timeout");
+  assert.match(source, /cache-control.*no-cache/s, "static assets must be revalidated after UI fixes");
+});
+
+test("settings exposes the four benchmark model profiles through the switch API", () => {
+  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  for (const profile of ["gemma4-12b-it", "gemma4-e2b-it", "gemma4-e2b-it-lora-v2", "qwen3.5-0.8b-it"]) {
+    assert.match(appSource, new RegExp(profile.replace(/[.]/g, "\\.")));
+  }
+  for (const label of ["Gemma-4-12B", "Gemma-4-E2B 蒸馏前", "Gemma-4-E2B 蒸馏后（加 LoRA 头）", "Qwen-3.5-0.8B"]) {
+    assert.match(appSource, new RegExp(label.replace(/[()]/g, "\\$&")));
+  }
+  assert.match(apiSource, /getModelProfiles/);
+  assert.match(apiSource, /switchModelProfile/);
+  assert.match(apiSource, /\/api\/model-profiles\/switch/);
+  assert.match(appSource, /switchModelProfile\(target\)/);
+  assert.match(appSource, /current\.status === "running"/);
+  assert.match(appSource, /未托管模型/);
+  assert.match(appSource, /当前运行/);
+  assert.match(appSource, /document\.addEventListener\("change"/);
+  assert.doesNotMatch(appSource, /\["gemma4:12b", "gemma4-12b-it"\]/, "an env default must not be presented as a running profile");
+
+  const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
+  assert.match(backendSource, /_managed_vllm_state/);
+  assert.match(backendSource, /verify_service=True/);
+  assert.match(backendSource, /runtime verification failed/);
+  assert.match(backendSource, /runtime\.get\("profile"\)/);
+});
+
+test("legacy E2B service does not occupy the managed vLLM port", () => {
+  const e2bScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_e2b.sh"), "utf8");
+  const apiScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_api.sh"), "utf8");
+  assert.match(e2bScript, /E2B_PORT:-8101/);
+  assert.match(apiScript, /E2B_BASE_URL:-http:\/\/127\.0\.0\.1:8101/);
 });
 
 test("portal exposes all optimized album scopes and labels their evidence", () => {
@@ -156,11 +196,12 @@ test("person profiles expose user-maintained identity properties", () => {
   assert.match(appSource, /groups/);
 });
 
-test("relationship candidates expose evidence counts before confirmation", () => {
+test("family graph lets users maintain person relationships", () => {
   const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
-  assert.match(appSource, /关系候选与证据/);
-  assert.match(appSource, /evidence_ids_json/);
-  assert.match(appSource, /确认关系/);
+  assert.match(appSource, /家庭关系图/);
+  assert.match(appSource, /edit-family-relation/);
+  assert.match(appSource, /delete-family-relation/);
+  assert.match(appSource, /relationships\(state\.scopeId, "person"\)/);
 });
 
 test("pending trip candidates are loaded as evidence-backed semantic memory", () => {

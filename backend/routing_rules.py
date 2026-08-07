@@ -105,3 +105,23 @@ def has_household_signal(draft) -> bool:
     if getattr(draft, "entity_names", None):
         return True
     return False
+
+
+# RX-0 fix (D7): casual self-inquiry / greetings must never be dragged into the
+# evidence path by the parser's generic semantic condition.  These are general
+# self-referential questions — not household lookups.  The Router only applies
+# this AFTER confirming there is no strong household anchor (time / media /
+# negation / entity / explicit evidence action), so "去年拍的合影感觉怎么样"
+# (media/time anchor) is never misclassified.
+_CASUAL_CHAT_RE = re.compile(
+    r"(感觉怎么样|心情如何|心情怎么样|过得怎么样|最近怎么样|你还好吗|你好|在吗|"
+    r"你是谁|你叫什么|介绍一下你自己|你在干嘛|你现在感觉|状态如何|今天过得如何|"
+    r"今天感觉怎么样|你今天心情|陪我聊聊|陪我说话|聊聊天|想聊聊|有点累|陪我说说话)"
+)
+
+
+def is_casual_chat(message) -> bool:
+    value = str(message or "").strip()
+    if not value or len(value) > 40:
+        return False
+    return bool(_CASUAL_CHAT_RE.search(value))

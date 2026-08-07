@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep runtime imports reproducible. User-site packages previously injected an
+# incompatible Transformers build into the AdaFace/PyTorch dependency graph.
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ -f "$root/.env" ]]; then
   set -a
@@ -32,13 +36,24 @@ if ((${#runtime_dirs[@]})); then
 fi
 
 export FACE_PROVIDERS="${FACE_PROVIDERS:-CUDAExecutionProvider,CPUExecutionProvider}"
+export SENTRIX_LLM_BACKEND="${SENTRIX_LLM_BACKEND:-vllm}"
+export SENTRIX_VLLM_BASE_URL="${SENTRIX_VLLM_BASE_URL:-http://127.0.0.1:8100/v1}"
+export SENTRIX_VLLM_MODEL="${SENTRIX_VLLM_MODEL:-gemma4-12b-it}"
+export SENTRIX_VLLM_REGISTRY="${SENTRIX_VLLM_REGISTRY:-$root/configs/sentrix_vllm_registry_192_168_0_153.json}"
+# Legacy Ollama settings are kept only for explicit SENTRIX_LLM_BACKEND=ollama fallback.
 export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11435}"
 export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:12b}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
-export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8100}"
+export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8101}"
 # 153 GPU driver/library NVML mismatch breaks the CUDA caching allocator; run
 # CLIP embedding on CPU so visual/text recall stays available.
 export CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
+export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-/home/asus/Github/stmem-bak/models/open_clip_pytorch_model.bin}"
+export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/asus/.cache/clip/clip_cn_vit-l-14.pt}"
+# R1B proved ViT-B-32 text-to-image is random for Chinese (AUC 0.51); switch the
+# visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
+export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"
+export SENTRIX_TEXT_EMBEDDER="${SENTRIX_TEXT_EMBEDDER:-clip}"
 export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-adaface}"
 export ADAFACE_MODEL_PATH="${ADAFACE_MODEL_PATH:-/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt}"
 export ADAFACE_REPO_ROOT="${ADAFACE_REPO_ROOT:-/home/asus/models/AdaFace}"
@@ -64,10 +79,32 @@ export SENTRIX_RETRIEVER_TEXT_ANN="${SENTRIX_RETRIEVER_TEXT_ANN:-1}"
 export SENTRIX_RETRIEVER_ADJACENCY="${SENTRIX_RETRIEVER_ADJACENCY:-1}"
 export SENTRIX_RETRIEVER_FUSION="${SENTRIX_RETRIEVER_FUSION:-rrf}"
 export SENTRIX_GATE_PROBE_V1="${SENTRIX_GATE_PROBE_V1:-1}"
-export SENTRIX_MODEL_SPLIT_V1="${SENTRIX_MODEL_SPLIT_V1:-1}"
-export SENTRIX_PARSE_BACKEND="${SENTRIX_PARSE_BACKEND:-e2b}"
-export SENTRIX_PARSE_BASE_URL="${SENTRIX_PARSE_BASE_URL:-http://127.0.0.1:8100}"
-export SENTRIX_PARSE_MODEL="${SENTRIX_PARSE_MODEL:-gemma-4-e2b-it+lora-v2}"
+export SENTRIX_MODEL_SPLIT_V1="${SENTRIX_MODEL_SPLIT_V1:-0}"
+export SENTRIX_PARSE_BACKEND="${SENTRIX_PARSE_BACKEND:-openai}"
+export SENTRIX_PARSE_BASE_URL="${SENTRIX_PARSE_BASE_URL:-$SENTRIX_VLLM_BASE_URL}"
+export SENTRIX_PARSE_MODEL="${SENTRIX_PARSE_MODEL:-$SENTRIX_VLLM_MODEL}"
+
+if [[ "$SENTRIX_TEXT_EMBEDDER" == "clip" ]]; then
+  if [[ ! -f "$CLIP_CHECKPOINT" ]]; then
+    echo "OpenCLIP checkpoint is unavailable: $CLIP_CHECKPOINT" >&2
+    exit 1
+  fi
+  if ! "$python_bin" -c 'import open_clip' >/dev/null 2>&1; then
+    echo "OpenCLIP Python dependency is unavailable; install backend/requirements.txt" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$SENTRIX_IMAGE_EMBEDDER" == "chinese_clip" ]]; then
+  if [[ ! -f "$CHINESE_CLIP_CHECKPOINT" ]]; then
+    echo "Chinese-CLIP checkpoint is unavailable: $CHINESE_CLIP_CHECKPOINT" >&2
+    exit 1
+  fi
+  if ! "$python_bin" -c 'import cn_clip' >/dev/null 2>&1; then
+    echo "Chinese-CLIP Python dependency is unavailable; install backend/requirements.txt" >&2
+    exit 1
+  fi
+fi
 
 if [[ "$FACE_EMBEDDING_MODE" == "adaface" ]]; then
   if [[ ! -f "$ADAFACE_MODEL_PATH" ]]; then
@@ -76,6 +113,10 @@ if [[ "$FACE_EMBEDDING_MODE" == "adaface" ]]; then
   fi
   if [[ ! -f "$ADAFACE_REPO_ROOT/net.py" ]]; then
     echo "AdaFace repository is unavailable: $ADAFACE_REPO_ROOT/net.py" >&2
+    exit 1
+  fi
+  if ! "$python_bin" -c 'import pytorch_lightning, torchmetrics' >/dev/null 2>&1; then
+    echo "AdaFace Python dependencies are unavailable; install backend/requirements.txt" >&2
     exit 1
   fi
 fi

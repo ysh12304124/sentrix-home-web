@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .db import MemoryStore, make_id
+from .geocoding import OfflineReverseGeocoder
 from .image_io import ensure_heif_support, guess_mime_type, media_type_for_path
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, ModelError, normalize_confidence
 from .semantic_taxonomy import normalize_semantic_analysis
@@ -17,7 +18,7 @@ ensure_heif_support()
 IMPORT_METADATA_KEYS = {
     "content_sha256", "sha256", "exif", "captured_at", "captured_location",
     "source_owner_id", "source_owner_label", "source_device_id", "source_album_id",
-    "source_confidence", "scope_id", "batch_id",
+    "source_confidence", "scope_id", "batch_id", "gps",
 }
 
 
@@ -31,12 +32,13 @@ class VideoMemoryAdapter:
 
 
 class IngestionPipeline:
-    def __init__(self, store, gamma=None, asr=None, face=None, clip=None):
+    def __init__(self, store, gamma=None, asr=None, face=None, clip=None, geocoder=None):
         self.store = store
         self.gamma = gamma or GammaClient()
         self.asr = asr or FunASRClient()
         self.face = face or FaceAdapter()
         self.clip = clip or ClipAdapter()
+        self.geocoder = geocoder or OfflineReverseGeocoder()
         self.video_memory_adapter = VideoMemoryAdapter()
 
     def create_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
@@ -54,6 +56,17 @@ class IngestionPipeline:
         for key in ("captured_at", "captured_location", "source_device_id"):
             if metadata.get(key) is None and metadata["exif"].get(key):
                 metadata[key] = metadata["exif"][key]
+        gps = self._gps_from_metadata(metadata)
+        if gps:
+            # Keep the raw GPS coordinate as the event-clustering location
+            # anchor (the original logic); reverse_geocode stays a display-only
+            # semantic place and must not overwrite the coordinate.
+            if not metadata.get("captured_location"):
+                metadata["captured_location"] = f"{float(gps['latitude']):.6f},{float(gps['longitude']):.6f}"
+            if "reverse_geocode" not in metadata:
+                location_context = self.geocoder.lookup(gps)
+                if location_context:
+                    metadata["reverse_geocode"] = location_context
         return self.store.create_asset(
             asset_id,
             file_name or path.name,
@@ -64,6 +77,20 @@ class IngestionPipeline:
             metadata,
             scope_id=metadata.get("scope_id"),
         )
+
+    @staticmethod
+    def _gps_from_metadata(metadata):
+        exif = metadata.get("exif") or {}
+        gps = metadata.get("gps") or exif.get("gps")
+        if isinstance(gps, dict):
+            return gps
+        if isinstance(gps, (list, tuple)) and len(gps) >= 2:
+            return {"latitude": gps[0], "longitude": gps[1]}
+        if isinstance(gps, str):
+            parts = gps.replace(",", " ").split()
+            if len(parts) >= 2:
+                return {"latitude": parts[0], "longitude": parts[1]}
+        return None
 
     @staticmethod
     def _sha256(path):
@@ -81,10 +108,16 @@ class IngestionPipeline:
             with Image.open(path) as image:
                 raw = image.getexif()
                 tags = {ExifTags.TAGS.get(key, str(key)): value for key, value in raw.items()}
+                try:
+                    gps = raw.get_ifd(ExifTags.IFD.GPSInfo) or {}
+                except Exception:
+                    gps = tags.get("GPSInfo") or {}
             result = {"device": tags.get("Model") or tags.get("Make")}
-            if tags.get("DateTimeOriginal"):
-                result["captured_at"] = tags["DateTimeOriginal"].replace(":", "-", 2) + "+00:00"
-            gps = tags.get("GPSInfo") or {}
+            if tags.get("DateTimeOriginal") or tags.get("DateTime"):
+                raw_time = tags.get("DateTimeOriginal") or tags.get("DateTime")
+                normalized = str(raw_time).replace(":", "-", 2)
+                offset = str(tags.get("OffsetTimeOriginal") or tags.get("OffsetTime") or "").strip()
+                result["captured_at"] = normalized + (offset if offset.startswith(("+", "-")) else "")
             def gps_value(value):
                 try:
                     return float(value[0]) / float(value[1])
@@ -226,14 +259,21 @@ class IngestionPipeline:
         analysis = self.gamma.analyze_image(asset["path"], {
             "file_name": asset["file_name"], "captured_at": asset.get("captured_at") or file_time(asset["path"]),
             "captured_location": asset.get("captured_location") or "", "source_owner_id": asset.get("source_owner_id"),
+            "location_context": metadata.get("reverse_geocode") or {},
         })
         analysis = normalize_semantic_analysis(analysis)
         analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
-        analysis["raw"] = {"gamma": analysis.copy(), "semantic_status": "complete"}
+        analysis["location_context"] = metadata.get("reverse_geocode") or {}
+        analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
         observation = self.store.enrich_observation(observation_id, analysis, source="deferred_vision_enrichment")
         event_id = metadata.get("event_id")
         entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation_id, event_id)]
-        text = " ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), " ".join(observation.get("objects") or [])]))
+        objects = observation.get("objects") or []
+        object_text = " ".join(
+            item if isinstance(item, str) else " ".join(str(item.get(key, "")) for key in ("label", "primary", "details") if item.get(key))
+            for item in objects
+        )
+        text = " ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), object_text]))
         embedding = self.clip.embed_text(text)
         self.store.upsert_vector("episodic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
         self.store.upsert_vector("semantic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
@@ -334,6 +374,7 @@ class IngestionPipeline:
             "source_owner_id": asset.get("source_owner_id"),
             "source_device_id": asset.get("source_device_id"),
             "source_album_id": asset.get("source_album_id"),
+            "location_context": (asset.get("metadata_json") or {}).get("reverse_geocode") or {},
         }
         started_at = time.perf_counter()
         def timed(callable_):
@@ -365,13 +406,14 @@ class IngestionPipeline:
         }
         analysis["captured_at"] = captured_at
         analysis["source_owner_id"] = asset.get("source_owner_id")
+        analysis["location_context"] = metadata["location_context"]
         analysis["canonical"] = {
             key: analysis.get(key)
             for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
         }
         analysis["source_type"] = "image"
         analysis["face_candidates"] = faces
-        analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates"}}, "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face_detector": "buffalo_l", "face_embedding": sorted({face.get("embedding_model", "unknown") for face in faces}), "image_embedding": self.clip.model_name}}
+        analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates", "location_context"}}, "location_context": metadata["location_context"], "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face_detector": "buffalo_l", "face_embedding": sorted({face.get("embedding_model", "unknown") for face in faces}), "image_embedding": self.clip.model_name}}
         return analysis
 
     def _audio_observation(self, asset):

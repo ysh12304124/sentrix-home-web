@@ -39,6 +39,14 @@ _QUERY_PARSE_DRAFT_SCHEMA = {
     "semantic_conditions": [{"dimension": "place|activity|clothing|object|visual|ocr", "value": "开放语义值", "strictness": "semantic_required"}],
     "negative_conditions": [{"dimension": "person|media|other", "value": "被排除的值"}],
     "result_requirement": {"mode": "best|top_k|all_relevant", "top_k": 10},
+    "answer_type": "boolean|count|date|date_range|first_occurrence|last_occurrence|exists|list|grouped_list|asset_set|summary|person_summary",
+    "strategy_hint": "structured_fact|aggregation|entity_fact|semantic_text|visual_semantic|hybrid|asset_delivery",
+    "structured": {
+        "time_range": {"start": "2024-01-01", "end": "2025-01-01"},
+        "media_type": "image|video|audio",
+        "place": "地点",
+        "aggregation": {"op": "count|group_by|first|last|exists|list", "group_by": "month|place|media|date"}
+    },
     "ambiguities": ["需要用户澄清的问题"],
     "confidence": 0.0,
 }
@@ -59,6 +67,10 @@ _PARSER_PROMPT = """你是 Sentrix 的查询解析器，不负责回答用户问
 9. 一句话可以包含多个 action（例如 answer_question + return_assets），不要压缩成单一目标。
 10. facets 保留用户提到的所有维度，surface_text 用原文片段。
 11. 只输出 JSON，不要输出 scope_id/scope_mode/viewer_id/conversation_id/entity_ids，不要 Markdown。
+12. answer_type 判断用户要的答案形状：精确数量用 count；某时间/日期用 date 或 date_range；是否存在用 exists/boolean；最早/最晚出现用 first_occurrence/last_occurrence；要列表用 list；要分组统计用 grouped_list；默认找照片用 asset_set。
+13. strategy_hint 判断是否需要看画面：如果仅凭结构化字段（拍摄时间、媒体类型、地点文本、人物出现记录）就能精确回答——例如用户只问数量、某个时间点、最早或最晚出现、哪些月份或地点有记录——选 structured_fact/aggregation/entity_fact；涉及衣着、颜色、物体、场景等必须看画面内容才选 visual_semantic/hybrid；既要精确答案又要照片可 hybrid。
+14. structured.time_range 把相对日期（去年、今年、上月、去年十月这类）按"当前时间 {{now}}"解析成绝对日期区间 {"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}；end 为该时间段的最后一天（含当天），例如"去年"这类整年区间 end 应为该年 12 月 31 日；没有明确时间就不填。
+15. structured.place / media_type / aggregation 只填模型能确定的纯结构化值；不确定就留空，不要猜。
 
 示例（结构参考，人物/地点为占位）：
 1. 用户：帮我写一首关于春天的诗
@@ -122,6 +134,7 @@ class QueryParser:
             draft = self._safe_fallback()
             failed = True
         draft.parser_failed = failed
+        draft.raw_json = raw
         return self._apply_deterministic_overlay(draft, message)
 
     def _call_parser(self, message, recent_turns, now):

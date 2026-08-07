@@ -1,0 +1,62 @@
+{
+  "phase": "RX-0",
+  "date": "2026-08-06",
+  "note": "内部信息泄漏清单 + 12B-FC 实测复现 case（作为 scan_internal_leak 与零容忍验收的输入）",
+  "leak_patterns": {
+    "internal_ids": {"patterns": ["asset_", "obs_", "event_", "entity_", "claim_"], "example_case": "hard_condition/composite/continuous_t3"},
+    "english_labels": {"patterns": ["matched", "possible", "unknown"], "example_case": "simple_evidence/hard_condition"},
+    "condition_keys": {"patterns": ["=matched", "=possible", "=unknown", "clothing:", "semantic:"], "example_case": "continuous_t2"},
+    "scores": {"patterns": ["recall_strength", "fusion_score", "cosine"], "example_case": null},
+    "retrieval_trace": {"patterns": ["retrieval_trace", "stage", "channels"], "example_case": "frontend algorithmEvidence"},
+    "tool_names": {"patterns": ["search_evidence", "summarize_person"], "example_case": "frontend toolTrace"},
+    "table_names": {"patterns": ["assets", "observations", "events"], "example_case": null},
+    "template_language": {"patterns": ["根据本地事件记忆检索到", "找到 N 条完全符合确定条件"], "example_case": "simple_answer template"}
+  },
+  "reproduction_cases": [
+    {
+      "case": "chat", "message": "今天感觉怎么样",
+      "observed": "route=anchored, 7 evidence all unknown, answer '根据现有信息…无法确认（unknown）'",
+      "root_cause": "router _weak_household treats semantic_conditions/message_anchored('今天') as weak household signal -> NeutralProbe upgrade -> evidence",
+      "product_violation": "chat mis-retrieval; all-unknown images shown; internal label in body"
+    },
+    {
+      "case": "hard_condition", "message": "把去年拍的照片给我，不要视频",
+      "observed": "answer body lists asset_ff34f10b39c3 ... 10 ids; image_results 6",
+      "root_cause": "_validation_evidence_answer puts asset_id into prompt; model echoes",
+      "product_violation": "internal id in user-visible body"
+    },
+    {
+      "case": "allow_approximate", "message": "水族馆海豚跃出水面",
+      "observed": "10 images all unknown; answer 'unknown: 有多个相关记录（asset_23e4a6c1550d, ...）'",
+      "root_cause": "_gate_packet_approximate max_count=20 + all-unknown not blocked; _image_results returns all",
+      "product_violation": "approximate overflow; all-unknown auto display; id leak"
+    },
+    {
+      "case": "continuous_t3", "message": "把原图给我",
+      "observed": "answer '我无法提供这些图片' BUT image_results has 6 images",
+      "root_cause": "image_results and answer generated independently; 12B decides availability",
+      "product_violation": "answer/image contradiction"
+    },
+    {
+      "case": "person_chain", "message": "介绍一下明哥",
+      "observed": "evidence=0; answer '明哥在这些记录中多次出现'; ledger [parser, writer] missing claim; case FAIL",
+      "root_cause": "_person_summary unconditional '多次出现'; ComplexAnswerBuilder writer output non-dict/empty -> fallback before claim",
+      "product_violation": "person no-evidence family claim; writer->claim chain broken"
+    },
+    {
+      "case": "composite", "message": "把去年拍的照片给我",
+      "observed": "answer lists 10 asset ids; image_results 6",
+      "root_cause": "same as hard_condition",
+      "product_violation": "internal id in user-visible body"
+    }
+  ],
+  "zero_tolerance_mapping": {
+    "用户正文内部 ID": "scan_internal_leak 命中 asset_/obs_/event_/entity_/claim_",
+    "用户正文内部标签": "scan_internal_leak 命中 matched/possible/unknown/condition_key",
+    "无法提供但图非空 / 已展示但图为空": "image consistency check",
+    "聊天读家庭证据": "chat mode evidence=0/image=0/no evidence entry",
+    "全 unknown 自动展示": "visible_evidence all-unknown gate",
+    "人物 ev=0 仍主张": "person_gap no claims",
+    "用户模式显示 trace/ledger": "frontend admin-gated"
+  }
+}

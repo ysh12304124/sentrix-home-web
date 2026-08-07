@@ -206,6 +206,15 @@ class ThinAgentRuntime:
             )
             if decision.focus_ids:
                 spec = self._merge_focus(spec, decision.focus_ids, scope_id)
+        # TFPE v2: when the model judged a structured answer and no picture-only
+        # dimension is present, answer exactly from the DB — never run visual ANN.
+        from .validation import full_chain_profile as _prof
+        if _prof.structured_memory_active():
+            from .retrieval_strategy import plan_retrieval_strategy
+            strategy = plan_retrieval_strategy(draft, spec)
+            if strategy.strategy in {"structured_fact", "aggregation", "entity_fact"}:
+                return self._structured_answer(message, conversation_id, scope_id, viewer_id,
+                                               decision, spec, draft, strategy)
         with _Perf.measure("retrieval"):
             packet = self.kernel.retrieve(spec)
         if spec.answer_target == "person" and not spec.entity_ids:
@@ -218,6 +227,89 @@ class ThinAgentRuntime:
                                        decision.as_gate_decision(), spec, packet, draft)
         self._save_focus(conversation_id, scope_id, spec, packet)
         return result
+
+    def _structured_answer(self, message, conversation_id, scope_id, viewer_id, decision, spec, draft, strategy):
+        """TFPE v2 structured answer: exact SQL facts -> AnswerBrief -> Writer -> Validator.
+
+        No images, no visual ANN, no fabrication: the facts are the exact SQL
+        values and the validator forbids any quantity outside the facts.
+        """
+        from .structured_memory import StructuredMemoryExecutor
+        from .task_contracts import build_task_contract
+        from .answer_brief import build_structured_brief
+        from .response_plan import plan_response
+        from .response_validator import finalize_answer
+        from .response_writer import safe_fallback, write_response
+
+        result = StructuredMemoryExecutor(self.store).execute(draft, spec, strategy=strategy.strategy)
+        task = build_task_contract(draft, spec)
+        brief = build_structured_brief(message, spec, draft, result, strategy=strategy.strategy)
+        plan = plan_response(brief)
+        mode = brief.response_mode
+
+        answer = None
+        statements: list[dict] = []
+        with _Perf.measure("answer"):
+            answer, statements = write_response(brief, plan, message, router=self.router)
+            _Perf.count("answer_calls")
+        model_unavailable = answer is None
+        if not answer:
+            answer, statements = safe_fallback(brief, plan)
+        final_answer, final_statements, validation = finalize_answer(
+            answer, statements, brief, plan, plan.image_count, lambda: safe_fallback(brief, plan))
+        rx_fallback_used = bool(model_unavailable or validation.get("fallback_used", False))
+
+        fact_map = {f.fact_id: f for f in brief.facts}
+        for statement in final_statements:
+            fact_id = statement.get("fact_id")
+            if fact_id and fact_id in fact_map and not statement.get("evidence_ids"):
+                statement["evidence_ids"] = fact_map[fact_id].evidence_ids
+
+        claims, index = [], {}
+        for number, statement in enumerate(final_statements, 1):
+            claim_id = f"claim_{number}"
+            claims.append({"claim_id": claim_id, "text": statement.get("text", ""),
+                           "status": statement.get("certainty") or "reasonable_summary",
+                           "evidence_ids": statement.get("evidence_ids") or []})
+            index[claim_id] = {"evidence_ids": statement.get("evidence_ids") or [],
+                               "status": statement.get("certainty") or "reasonable_summary"}
+
+        gate = decision.as_gate_decision()
+        status = "anchored" if brief.facts else "gap"
+        trace = [
+            {"stage": "gate", "status": "evidence",
+             "counts": {"query_parse": getattr(gate, "query_parse_calls", 0), "evidence_search": 0}},
+            {"stage": "retrieval_strategy", **strategy.as_dict()},
+            {"stage": "structured", "status": "complete",
+             "counts": {"answer_type": result.answer_type, "total": result.total,
+                        "visual_ann_skipped": "visual_ann" in (strategy.skipped_channels or [])}},
+        ]
+        result_dict = self._envelope(
+            final_answer, conversation_id, scope_id, viewer_id, gate, [], [], status, trace,
+            spec=spec, draft=draft, confidence=0.95 if brief.facts else 0.0,
+            insufficient_evidence=False,
+        )
+        result_dict.update({
+            "claims": claims, "claim_evidence_index": index, "statement_plan": final_statements,
+            "memory_intensity": "targeted", "original_evidence_requested": False,
+            "image_results": [],
+            "response_mode": mode,
+            "answer_brief": brief.as_dict(),
+            "response_plan": plan.as_dict(),
+            "rx_fallback_used": rx_fallback_used,
+            "task_contract": task.as_dict(),
+            "retrieval_strategy": strategy.as_dict(),
+            "structured_result": result.as_dict(),
+        })
+        result_dict["evidence_presentation"] = {
+            "required": True, "available": bool(brief.facts),
+            "default_collapsed": True, "direct_original_evidence": False,
+            "response_mode": mode,
+        }
+        result_dict["tool_trace"] = [{"tool": "structured_memory", "permission": "read",
+                                      "status": "complete", "answer_type": result.answer_type,
+                                      "total": result.total}]
+        return result_dict
 
     def _ambiguous_path(self, message, recent_turns, conversation_id, scope_id, viewer_id, decision, draft):
         """Ambiguous (weak parser signal / bare noun) — the NeutralProbe decides.
@@ -467,6 +559,10 @@ class ThinAgentRuntime:
         # R8-5: gate approximate evidence by recall strength before display —
         # weak approximate candidates must not surface as user-visible images.
         self._gate_packet_approximate(packet, spec, anchored=_query_anchored(message, spec))
+        from .validation import full_chain_profile as _prof
+        if _prof.rx_active():
+            return self._rx_answer(message, conversation_id, scope_id, viewer_id,
+                                   decision, spec, packet, draft)
         evidence = []
         for item in packet.assets:
             evidence.append({
@@ -560,6 +656,155 @@ class ThinAgentRuntime:
                                           "status": "complete" if evidence else "requires_anchor"})
         return result
 
+    def _rx_answer(self, message, conversation_id, scope_id, viewer_id, decision, spec, packet, draft):
+        """RX pipeline: AnswerBrief -> ResponsePlan -> Response Writer -> Validator.
+
+        The EvidencePacket is never handed to the model directly; the brief's
+        writer_payload (display handles only) is.  ``image_results`` are derived
+        from the brief's visible_assets, so text and images cannot contradict.
+        """
+        from .answer_brief import build_answer_brief
+        from .response_plan import plan_response
+        from .response_validator import finalize_answer
+        from .response_writer import safe_fallback, write_response
+        from .visible_evidence import select_visible_assets
+
+        all_relevant = spec.result_requirement.get("mode") == "all_relevant"
+        visible = select_visible_assets(packet, all_relevant=all_relevant)
+        brief = build_answer_brief(message, spec, packet, visible_assets=visible, decision=decision)
+        plan = plan_response(brief)
+        mode = brief.response_mode
+
+        answer = None
+        statements: list[dict] = []
+        with _Perf.measure("answer"):
+            if mode == "person_summary":
+                if brief.facts and os.getenv("SENTRIX_LLM_CLAIM_EXTRACTOR_V1", "0").lower() in {"1", "true", "on"}:
+                    with _Perf.measure("complex_chain"):
+                        complex_result = self.complex_builder.build(message, spec, packet)
+                    _Perf.count("answer_calls")
+                    if not complex_result.get("fallback"):
+                        answer = complex_result["answer"]
+                        statements = complex_result["statements"]
+                if answer is None:
+                    answer, statements = write_response(brief, plan, message, router=self.router)
+            else:
+                answer, statements = write_response(brief, plan, message, router=self.router)
+            _Perf.count("answer_calls")
+        model_unavailable = answer is None
+        if not answer:
+            answer, statements = safe_fallback(brief, plan)
+
+        image_count = plan.image_count
+        final_answer, final_statements, validation = finalize_answer(
+            answer, statements, brief, plan, image_count, lambda: safe_fallback(brief, plan))
+        rx_fallback_used = bool(model_unavailable or validation.get("fallback_used", False))
+
+        fact_map = {f.fact_id: f for f in brief.facts}
+        for st in final_statements:
+            fact_id = st.get("fact_id")
+            if fact_id and fact_id in fact_map and not st.get("evidence_ids"):
+                st["evidence_ids"] = fact_map[fact_id].evidence_ids
+
+        evidence = []
+        for item in packet.assets:
+            evidence.append({
+                "kind": "observation",
+                "id": item["observation_ids"][0] if item["observation_ids"] else item["asset_id"],
+                "asset_id": item["asset_id"],
+                "observation_id": item["observation_ids"][0] if item["observation_ids"] else None,
+                "file_name": item.get("file_name"), "media_type": item.get("media_type"),
+                "captured_at": item.get("captured_at"),
+                "condition_results": item.get("condition_results", {}),
+                "level": item.get("level"), "evidence_ids": item.get("evidence_ids", []),
+                "recall_strength": self._recall_strength(item),
+                "near_duplicate_group": item.get("near_duplicate_group"),
+                "near_duplicate_size": item.get("near_duplicate_size", 1),
+            })
+        if packet.assets:
+            try:
+                from .retrieval.near_duplicate import NearDuplicateGrouper
+                NearDuplicateGrouper(self.store).annotate(evidence)
+            except Exception:
+                pass
+
+        status = self._rx_status(mode, brief)
+        claims, index = [], {}
+        for number, statement in enumerate(final_statements, 1):
+            claim_id = f"claim_{number}"
+            claims.append({
+                "claim_id": claim_id, "text": statement.get("text", ""),
+                "status": statement.get("certainty") or "reasonable_summary",
+                "evidence_ids": statement.get("evidence_ids") or [],
+            })
+            index[claim_id] = {"evidence_ids": statement.get("evidence_ids") or [],
+                               "status": statement.get("certainty") or "reasonable_summary"}
+        if not claims:
+            for number, claim in enumerate(ClaimExtractor().scan(final_answer, final_statements), 1):
+                claim_id = f"claim_{number}"
+                claim["claim_id"] = claim_id
+                claim["status"] = "reasonable_summary"
+                claim["evidence_ids"] = []
+                claims.append(claim)
+                index[claim_id] = {"evidence_ids": [], "status": "reasonable_summary"}
+
+        image_results = []
+        if brief.presentation.show_images:
+            image_results = [{
+                "asset_id": v.asset_id, "file_name": v.file_name, "media_type": "image",
+                "media_url": v.media_url, "display_handle": v.display_handle,
+                "captured_at": v.captured_at, "supported_aspects": v.supported_aspects,
+                "uncertain_aspects": v.uncertain_aspects,
+                "near_duplicate_size": v.near_duplicate_size,
+            } for v in brief.visible_assets if v.media_url]
+
+        trace = [
+            {"stage": "gate", "status": "evidence",
+             "counts": {"query_parse": decision.query_parse_calls, "evidence_search": 1}},
+            {"stage": "rx", "status": "complete",
+             "counts": {"response_mode": mode, "visible": len(image_results),
+                        "facts": len(brief.facts)}},
+        ]
+        if validation.get("reasons"):
+            trace.append({"stage": "rx_validation", "status": "repaired" if not validation["valid"] else "ok",
+                          "reasons": validation["reasons"]})
+
+        result = self._envelope(final_answer, conversation_id, scope_id, viewer_id, decision,
+                                evidence, packet.gaps, status, trace, spec=spec, packet=packet, draft=draft)
+        return_assets_requested = mode == "asset_delivery"
+        result.update({
+            "claims": claims, "claim_evidence_index": index, "statement_plan": final_statements,
+            "memory_intensity": "targeted", "original_evidence_requested": return_assets_requested,
+            "image_results": image_results,
+            "response_mode": mode,
+            "answer_brief": brief.as_dict(),
+            "response_plan": plan.as_dict(),
+            "rx_fallback_used": rx_fallback_used,
+        })
+        result["evidence_presentation"] = {
+            "required": mode not in {"chat"},
+            "available": bool(evidence or packet.gaps or brief.facts),
+            "default_collapsed": mode not in {"asset_delivery"},
+            "direct_original_evidence": return_assets_requested,
+            "response_mode": mode,
+        }
+        result["tool_trace"] = [{"tool": "search_evidence", "permission": "read",
+                                 "status": "complete", "asset_count": len(evidence)}]
+        if mode == "person_summary" and spec.entity_ids:
+            result["tool_trace"].append({"tool": "summarize_person", "permission": "read",
+                                         "status": "complete" if evidence else "requires_anchor"})
+        return result
+
+    @staticmethod
+    def _rx_status(mode, brief):
+        if mode == "no_result" or (mode == "person_summary" and not brief.facts):
+            return "gap"
+        if mode == "clarify":
+            return "clarify"
+        if mode == "chat":
+            return "not_applicable"
+        return "anchored"
+
     def _person_summary_via_complex_or_fallback(self, message, spec, packet):
         """Try Phase 4 Writer/Verifier chain; fall back to inline summary."""
         if os.getenv("SENTRIX_LLM_CLAIM_EXTRACTOR_V1", "0").lower() in {"1", "true", "on"}:
@@ -572,6 +817,12 @@ class ThinAgentRuntime:
 
     def _person_summary(self, spec, packet):
         name = next((item.value for item in spec.constraints if item.dimension == "person"), "这个人")
+        if not packet.assets:
+            # RX-2 (D6): no evidence -> no family claims, only an explicit gap.
+            return (
+                f"目前还没有足够的照片或记录来介绍{name}，只确认了他这个人。可以补充照片后再介绍。",
+                [],
+            )
         places, activities, clothes = [], [], []
         for item in packet.assets:
             observed = item.get("observation_fields") or {}
@@ -581,7 +832,7 @@ class ThinAgentRuntime:
                 activities.append(observed["activity"])
             # Only formation-provided subject bindings enter the person summary.
             clothes.extend(observed.get("subject_clothing") or [])
-        parts = [f"从现有照片记录看，{name}在这些记录中多次出现"]
+        parts = [f"从现有照片记录看，{name}出现在这些记录中"]
         if places:
             parts.append("，出现过的地点包括" + "、".join(dict.fromkeys(places)))
         if activities:
@@ -719,7 +970,8 @@ class ThinAgentRuntime:
         result = {
             "intent": decision.reason, "conversation_id": conversation_id, "answer": answer,
             "confidence": 0.75 if evidence else 0.0,
-            "insufficient_evidence": not bool(evidence), "evidence": evidence, "image_results": [],
+            "insufficient_evidence": (status in {"gap", "anchored"}) and not bool(evidence),
+            "evidence": evidence, "image_results": [],
             "retrieval_trace": trace,
             "memory_used": decision.mode != "none",
             "evidence_required": decision.mode != "none",
@@ -740,5 +992,8 @@ class ThinAgentRuntime:
             result["facets"] = [{"dimension": facet.dimension, "surface_text": facet.surface_text} for facet in draft.facets]
             result["parser_mode"] = draft.mode
             result["parser_confidence"] = draft.confidence
+            result["answer_type"] = getattr(draft, "answer_type", "asset_set")
+            result["strategy_hint"] = getattr(draft, "strategy_hint", "")
+            result["parser_raw"] = getattr(draft, "raw_json", None)
         result.update(extra)
         return result
