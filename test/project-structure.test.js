@@ -173,11 +173,12 @@ test("person profiles expose user-maintained identity properties", () => {
   assert.match(appSource, /groups/);
 });
 
-test("relationship candidates expose evidence counts before confirmation", () => {
+test("family graph lets users maintain person relationships", () => {
   const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
-  assert.match(appSource, /关系候选与证据/);
-  assert.match(appSource, /evidence_ids_json/);
-  assert.match(appSource, /确认关系/);
+  assert.match(appSource, /家庭关系图/);
+  assert.match(appSource, /edit-family-relation/);
+  assert.match(appSource, /delete-family-relation/);
+  assert.match(appSource, /relationships\(state\.scopeId, "person"\)/);
 });
 
 test("pending trip candidates are loaded as evidence-backed semantic memory", () => {

@@ -57,6 +57,7 @@
     health: null,
     vlmBackendOptions: null,
     modal: null,
+    modalHistory: [],
     eventFilter: "all",
     assetFilter: "all",
     assetSort: "newest",
@@ -706,6 +707,7 @@
     } else {
       state.view = target;
       state.modal = null;
+      state.modalHistory = [];
       renderShellNavigation();
     }
   }
@@ -716,6 +718,7 @@
     } else {
       state.view = "overview";
       state.modal = null;
+      state.modalHistory = [];
       renderShellNavigation();
     }
   }
@@ -849,25 +852,37 @@
     renderShellNavigation();
   }
 
-  function openModal(modal) { state.modal = modal; renderShellNavigation(); }
+  function openModal(modal, options = {}) {
+    if (options.push && state.modal && state.modal.type !== "loading") {
+      state.modalHistory.push(state.modal);
+    }
+    state.modal = modal;
+    renderShellNavigation();
+  }
+
+  function closeCurrentModal() {
+    const previous = state.modalHistory.pop();
+    state.modal = previous || null;
+    renderShellNavigation();
+  }
 
   async function openEvent(eventId, edit = false) {
-    openModal({ type: "loading" });
+    openModal({ type: "loading" }, { push: true });
     try { const detail = await window.sentrixApi.event(eventId); openModal(edit ? { type: "event-edit", event: detail.event, observations: detail.observations || [] } : { type: "event", detail }); } catch { state.toast = "无法读取事件证据"; state.modal = null; renderShellNavigation(); }
   }
 
   async function openAsset(assetId) {
-    openModal({ type: "loading" });
+    openModal({ type: "loading" }, { push: true });
     try { const [asset, result] = await Promise.all([window.sentrixApi.asset(assetId), window.sentrixApi.observations(`?assetId=${encodeURIComponent(assetId)}`)]); openModal({ type: "asset", asset, observations: result.observations || [] }); } catch { state.toast = "无法读取原始资料"; state.modal = null; renderShellNavigation(); }
   }
 
   async function openEntity(entityId) {
-    openModal({ type: "loading" });
+    openModal({ type: "loading" }, { push: true });
     try { const detail = await window.sentrixApi.entity(entityId); openModal({ type: "entity", detail }); } catch { state.toast = "无法读取实体记忆"; state.modal = null; renderShellNavigation(); }
   }
 
   async function openEntityGroup(groupId) {
-    openModal({ type: "loading" });
+    openModal({ type: "loading" }, { push: true });
     try { const detail = await window.sentrixApi.entityGroup(groupId, state.scopeId); openModal({ type: "entity-group", detail }); } catch { state.toast = "无法读取语义实体组"; state.modal = null; renderShellNavigation(); }
   }
 
@@ -930,6 +945,7 @@
         state.scopeId = space.id;
         window.localStorage?.setItem("sentrix.scopeId", state.scopeId);
         state.modal = null;
+        state.modalHistory = [];
         state.toast = `已创建并切换到相册“${space.name}”`;
         await refreshData({ forceRender: true });
         renderShellNavigation();
@@ -956,6 +972,7 @@
         return;
       }
       state.modal = null;
+      state.modalHistory = [];
       await refreshData({ forceRender: true });
       state.toast = state.toast || "已保存到本地记忆";
       renderShellNavigation();
@@ -967,7 +984,7 @@
   }
 
   async function handleAction(action, element) {
-    if (action === "close-modal") { state.modal = null; renderShellNavigation(); return; }
+    if (action === "close-modal") { closeCurrentModal(); return; }
     if (action === "back") { state.modal = null; goBack(); return; }
     if (action === "home") { state.modal = null; navigate("overview"); return; }
     if (action === "open-event") return openEvent(element.dataset.eventId);
@@ -983,8 +1000,8 @@
     if (action === "reject-trip") { await window.sentrixApi.rejectTrip(element.dataset.tripId); state.toast = "已标记为非行程，原始事件和照片证据仍保留"; return refreshData(); }
     if (action === "edit-story") { const story = state.stories.find((item) => item.id === element.dataset.storyId); return openModal({ type: "story-edit", story }); }
     if (action === "delete-story") { await window.sentrixApi.deleteStory(element.dataset.storyId); state.toast = "故事草稿已删除"; return refreshData(); }
-    if (action === "open-person") { openModal({ type: "loading" }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
-    if (action === "open-person-profile") { openModal({ type: "loading" }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
+    if (action === "open-person") { openModal({ type: "loading" }, { push: true }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
+    if (action === "open-person-profile") { openModal({ type: "loading" }, { push: true }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
     if (action === "confirm-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-confirm", cluster }); }
@@ -1046,7 +1063,7 @@
     if (action === "reject-entity-merge-candidate") { await window.sentrixApi.rejectEntityMergeCandidate(element.dataset.candidateId); state.toast = "已保留原有实体，不会再次显示同一归并候选"; return refreshData(); }
     if (action === "reload") return refreshData();
     if (action === "recheck") { await fetch("/api/maintenance/recheck", { method: "POST" }); state.toast = "已提交失败任务重试"; return refreshData(); }
-    if (action === "relationship-graph") { openModal({ type: "loading" }); try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); return openModal({ type: "family-graph", graph }); } catch (error) { state.modal = null; state.toast = `无法读取家庭关系：${error.message}`; return renderShellNavigation(); } }
+    if (action === "relationship-graph") { openModal({ type: "loading" }, { push: true }); try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); return openModal({ type: "family-graph", graph }); } catch (error) { state.modal = null; state.toast = `无法读取家庭关系：${error.message}`; return renderShellNavigation(); } }
   }
 
   const initialHash = window.location.hash.replace(/^#\/?/, "");
@@ -1060,6 +1077,7 @@
     if (hashView && hashView !== state.view && (navItems.some((item) => item.id === hashView) || hashView === "settings")) {
       state.view = hashView;
       state.modal = null;
+      state.modalHistory = [];
       renderShellNavigation();
     }
   });
