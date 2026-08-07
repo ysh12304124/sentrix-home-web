@@ -1,4 +1,4 @@
-"""Tests for GET/POST /api/vlm-backend endpoints."""
+"""Tests for the retired /api/vlm-backend compatibility endpoint."""
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -32,34 +32,30 @@ class VLMBackendAPITests(unittest.TestCase):
         self._mock_gamma.base_url = "http://127.0.0.1:11434"
         self._mock_gamma.reset_mock()
 
-    def test_get_vlm_backend_default(self):
-        self._mock_gamma.active_name = "ollama_12b"
+    @patch("backend.app._current_model_runtime", return_value={
+        "profile": "gemma4-12b-it", "model": "gemma4-12b-it", "status": "running",
+    })
+    def test_get_vlm_backend_reports_managed_vllm(self, _runtime):
         response = self.client.get("/api/vlm-backend")
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertIn("available_backends", data)
-        self.assertEqual(data["backend"], "ollama_12b")
+        self.assertEqual(data["backend"], "vllm")
+        self.assertEqual(data["available_backends"], ["vllm"])
+        self.assertEqual(data["profile"], "gemma4-12b-it")
+        self.assertTrue(data["deprecated"])
 
-    def test_post_switch_to_e2b(self):
-        self._mock_gamma.active_name = "e2b_lora"
-        self._mock_gamma.model = "gemma-4-e2b-it+lora-v2"
-        self._mock_gamma.base_url = "http://127.0.0.1:8100"
+    def test_post_switch_to_e2b_is_gone(self):
         response = self.client.post("/api/vlm-backend", json={"backend": "e2b_lora"})
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["backend"], "e2b_lora")
-        self.assertEqual(data["model"], "gemma-4-e2b-it+lora-v2")
+        self.assertEqual(response.status_code, 410)
+        self.assertIn("/api/model-profiles/switch", response.json()["detail"])
 
-    def test_post_rejects_invalid_backend(self):
+    def test_post_rejects_invalid_backend_as_gone(self):
         response = self.client.post("/api/vlm-backend", json={"backend": "invalid"})
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 410)
 
-    def test_post_switch_to_ollama(self):
-        self._mock_gamma.active_name = "ollama_12b"
+    def test_post_switch_to_ollama_is_gone(self):
         response = self.client.post("/api/vlm-backend", json={"backend": "ollama_12b"})
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["backend"], "ollama_12b")
+        self.assertEqual(response.status_code, 410)
 
     def test_health_includes_vlm_key(self):
         with patch("backend.app._current_model_runtime", return_value={"backend": "vllm", "model": "test"}):
@@ -67,24 +63,14 @@ class VLMBackendAPITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("vlm", data["models"])
-        self.assertEqual(data["models"]["vlm"]["active"], "ollama_12b")
+        self.assertEqual(data["models"]["vlm"]["active"], "vllm")
 
-    def test_get_with_e2b_active(self):
-        self._mock_gamma.active_name = "e2b_lora"
-        self._mock_gamma.model = "gemma-4-e2b-it+lora-v2"
-        self._mock_gamma.base_url = "http://127.0.0.1:8100"
-        response = self.client.get("/api/vlm-backend")
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["backend"], "e2b_lora")
-
-    def test_post_invalidates_cache(self):
-        self._mock_gamma.active_name = "e2b_lora"
-        self._mock_gamma.model = "gemma-4-e2b-it+lora-v2"
-        self._mock_gamma.base_url = "http://127.0.0.1:8100"
-        response = self.client.post("/api/vlm-backend", json={"backend": "e2b_lora"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["backend"], "e2b_lora")
+    def test_post_does_not_mutate_legacy_setting(self):
+        with patch.object(backend.app.store, "set_setting") as set_setting:
+            response = self.client.post("/api/vlm-backend", json={"backend": "e2b_lora"})
+        self.assertEqual(response.status_code, 410)
+        set_setting.assert_not_called()
+        self._mock_gamma.invalidate_backend_cache.assert_not_called()
 
 
 if __name__ == "__main__":

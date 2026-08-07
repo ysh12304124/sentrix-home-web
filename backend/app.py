@@ -53,7 +53,6 @@ SUPPORTED_IMPORT_SUFFIXES = {
 }
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
-VLM_BACKENDS = ("ollama_12b", "e2b_lora")
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
 
 
@@ -427,24 +426,24 @@ def process_asset(asset_id):
 
 @app.get("/api/vlm-backend")
 def vlm_backend():
+    runtime = _current_model_runtime()
     return {
-        "backend": gamma.active_name,
-        "available_backends": list(VLM_BACKENDS),
-        "models": {
-            "ollama_12b": _check_ollama_health(),
-            "e2b_lora": _check_e2b_health(),
-        },
+        "backend": "vllm",
+        "available_backends": ["vllm"],
+        "profile": runtime.get("profile"),
+        "model": runtime.get("model"),
+        "status": runtime.get("status"),
+        "deprecated": True,
+        "replacement": "/api/model-profiles",
     }
 
 
 @app.post("/api/vlm-backend")
 def set_vlm_backend(payload: SetVLMBackend):
-    if payload.backend not in VLM_BACKENDS:
-        raise HTTPException(status_code=422, detail=f"backend must be one of {VLM_BACKENDS}")
-    store.set_setting("vlm_backend", payload.backend)
-    gamma.invalidate_backend_cache()
-    _schedule_backend_transition(payload.backend)
-    return {"backend": gamma.active_name, "model": gamma.model, "endpoint": gamma.base_url}
+    raise HTTPException(
+        status_code=410,
+        detail="VLM backend switching is retired; use POST /api/model-profiles/switch",
+    )
 
 @app.get("/api/health")
 def health():
@@ -452,7 +451,7 @@ def health():
         "status": "ok",
         "mode": "sentrix-local-backend",
         "models": {
-            "vlm": {"active": gamma.active_name, "name": gamma.model, "endpoint": gamma.base_url},
+            "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
             "llm": _current_model_runtime(),
             "asr": {"name": pipeline.asr.model_name, "vad": pipeline.asr.vad_model, "punc": pipeline.asr.punc_model, "ready": pipeline.asr.error is None, "error": pipeline.asr.error},
             "face": {
