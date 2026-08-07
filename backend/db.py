@@ -3472,6 +3472,12 @@ class MemoryStore:
             entity_id, f"property:{property_key}", current["value_json"] if current else None,
             json_value(value, None), "user", evidence_ids,
         )
+        if property_key in ("canonical_name", "family_role"):
+            column = "canonical_name" if property_key == "canonical_name" else "family_role"
+            self.connection.execute(
+                f"UPDATE entities SET {column} = ?, updated_at = ? WHERE id = ?",
+                (str(value) if value is not None else None, timestamp, entity_id),
+            )
         self.connection.commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
 
@@ -3805,6 +3811,34 @@ class MemoryStore:
             }
             return detail
         return self.get_entity_detail(entity["id"])
+
+    def auto_confirm_clusters(self, scope_id=None, min_members=2, min_confidence=0.5):
+        """Auto-confirm stable pending clusters with a placeholder name.
+
+        Selects pending clusters with member_count >= min_members and average
+        detection_confidence >= min_confidence. Each is confirmed with a
+        placeholder name "待命名成员#<short_id>" that the user can rename from
+        the dashboard. Returns the list of confirmed cluster summaries.
+        """
+        params = [min_members]
+        where = "WHERE status = 'pending' AND member_count >= ?"
+        if scope_id:
+            where += " AND scope_id = ?"
+            params.append(scope_id)
+        rows = self._rows(f"SELECT id, confidence, member_count FROM face_clusters {where} ORDER BY updated_at ASC", params)
+        confirmed = []
+        for row in rows:
+            avg_confidence = float(row["confidence"] or 0)
+            if avg_confidence < min_confidence:
+                continue
+            short_id = row["id"].replace("cluster_", "")[:8]
+            placeholder = f"待命名成员#{short_id}"
+            try:
+                self.confirm_face_cluster(row["id"], placeholder)
+                confirmed.append({"cluster_id": row["id"], "name": placeholder, "member_count": int(row["member_count"] or 0), "avg_confidence": round(avg_confidence, 3)})
+            except Exception as error:
+                confirmed.append({"cluster_id": row["id"], "error": str(error)})
+        return confirmed
 
     def confirm_person_entity(self, entity_id, name, family_role=None):
         """Resolve a native person entity to its active face cluster."""
