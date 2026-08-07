@@ -13,5 +13,5 @@ torchaudio>=2.2,<3
 pytorch-lightning>=2.5,<3
 torchmetrics>=1.7,<2
 lightning-utilities>=0.12,<1
-open-clip-torch>=2.24,<4
+open-clip-torch==3.3.0
 reverse_geocoder>=1.5.1,<2
