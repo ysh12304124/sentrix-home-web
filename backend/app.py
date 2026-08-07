@@ -149,6 +149,11 @@ class IngestBatchCreateRequest(BaseModel):
     source_path: str | None = None
 
 
+class MemorySpaceCreateRequest(BaseModel):
+    name: str
+    scope_id: str | None = None
+
+
 class ModelSwitchRequest(BaseModel):
     profile: str
     wait_ready: bool = True
@@ -423,6 +428,22 @@ def health():
 @app.get("/api/memory-spaces")
 def memory_spaces():
     return {"spaces": store.list_memory_spaces()}
+
+
+@app.post("/api/memory-spaces", status_code=201)
+def create_memory_space(request: MemorySpaceCreateRequest):
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name is required")
+    if len(name) > 100:
+        raise HTTPException(status_code=422, detail="name must be at most 100 characters")
+    scope_id = (request.scope_id or make_id("album")).strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="scope_id is invalid")
+    existing = store._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,))
+    if existing:
+        raise HTTPException(status_code=409, detail="scope_id already exists")
+    return store.create_memory_space(scope_id, name, kind="benchmark")
 
 
 @app.get("/api/model-profiles")

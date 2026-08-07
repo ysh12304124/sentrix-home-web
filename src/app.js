@@ -42,8 +42,8 @@
   function adminDebug() {
     const enabled = new URLSearchParams(window.location.search).has("debug")
       || window.localStorage?.getItem("sentrix.adminDebug") === "1";
-    document.body.classList.add("admin");
-    return true;
+    document.body.classList.toggle("admin", enabled);
+    return enabled;
   }
 
   const navItems = [
@@ -540,6 +540,11 @@
       const relationships = modal.graph?.relationships || [];
       const candidateRows = relationships.map((item) => `<div class="fact-review-row"><div><strong>${escapeHtml(item.subject_name)} ${escapeHtml(item.predicate)} ${escapeHtml(item.object_name)}</strong><small>${escapeHtml(item.status)} · 置信度 ${Math.round((item.confidence || 0) * 100)}% · ${(item.evidence_ids_json || []).length} 条原始证据</small></div>${item.status === "pending" ? `<button class="button small primary" data-action="confirm-relationship" data-relationship-id="${escapeHtml(item.id)}">确认关系</button>` : ""}</div>`).join("");
       body = `<div class="modal-kicker">RELATIONSHIP GRAPH</div><h2>实体关系图</h2><p class="modal-lead">候选只代表共现证据，不会自动推断亲属、同事等关系。确认后才会进入长期语义记忆。</p><div class="relation-graph">${modal.graph?.nodes?.length ? modal.graph.nodes.map((node) => `<div class="relation-node"><span class="avatar ${node.status === "confirmed" ? "green" : "gray"}">${escapeHtml((node.label || "?").slice(0, 1))}</span><strong>${escapeHtml(node.label)}</strong><small>${escapeHtml(node.status)}</small>${modal.graph.edges.filter((edge) => edge.source === node.id).map((edge) => `<em>${escapeHtml(edge.label)} · ${escapeHtml(edge.status)}</em>`).join("")}</div>`).join("") : emptyState("没有人物关系", "先确认人物实体，再创建关系候选。")}</div><div class="section-head"><div><p class="section-kicker">关系候选与证据</p><h3>${relationships.length} 条关系</h3></div></div><div class="fact-review-list">${candidateRows || emptyState("暂无关系候选", "确认人物在同一事件中出现后，系统会提示共同出现候选。")}</div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
+    } else if (modal.type === "space-manager") {
+      const spaces = state.spaces.filter((space) => space.kind === "benchmark");
+      body = `<div class="modal-kicker">MEMORY SPACES</div><h2>相册范围</h2><p class="modal-lead">独立相册用于隔离图片、事件和人物身份。导入前请先选择目标相册。</p><div class="space-list">${spaces.length ? spaces.map((space) => `<button class="space-choice ${space.id === state.scopeId ? "active" : ""}" data-action="select-space" data-space-id="${escapeHtml(space.id)}"><strong>${escapeHtml(space.name || space.id)}</strong><small>${space.id === state.scopeId ? "当前相册" : "独立相册"}</small></button>`).join("") : `<p class="muted">还没有独立相册。</p>`}</div><div class="modal-actions"><button class="button ghost" data-action="create-space">＋ 创建新相册</button><button class="button primary" data-action="close-modal">关闭</button></div>`;
+    } else if (modal.type === "space-create") {
+      body = `<form id="modal-form"><div class="modal-kicker">NEW MEMORY SPACE</div><h2>创建独立相册</h2><p class="modal-lead">创建后会自动切换到该相册，后续导入的图片和人物标注都会限制在这个范围。</p><label>相册名称<input name="name" autofocus maxlength="100" placeholder="例如：2025年旅行测试" required /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-space">取消</button><button type="submit" class="button primary">创建并切换</button></div></form>`;
     } else if (modal.type === "help") {
       body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在 153 本地运行。</span></div></div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
     }
@@ -813,6 +818,16 @@
         state.modal = null; state.query = command; state.view = "search"; renderShellNavigation(); return submitSearch();
       }
       if (modal.type === "invite") { const invite = await window.sentrixApi.createInvite(form.get("label")); openModal({ type: "invite", invite }); return; }
+      if (modal.type === "space-create") {
+        const space = await window.sentrixApi.createMemorySpace(String(form.get("name") || "").trim());
+        state.scopeId = space.id;
+        window.localStorage?.setItem("sentrix.scopeId", state.scopeId);
+        state.modal = null;
+        state.toast = `已创建并切换到相册“${space.name}”`;
+        await refreshData({ forceRender: true });
+        renderShellNavigation();
+        return;
+      }
       state.modal = null;
       await refreshData({ forceRender: true });
       state.toast = state.toast || "已保存到本地记忆";
@@ -854,7 +869,17 @@
     if (action === "invite") return openModal({ type: "invite" });
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "command") return openModal({ type: "command" });
-    if (action === "open-space") return openModal({ type: "help" });
+    if (action === "open-space") return openModal({ type: "space-manager" });
+    if (action === "create-space") return openModal({ type: "space-create" });
+    if (action === "select-space") {
+      state.scopeId = element.dataset.spaceId || "";
+      window.localStorage?.setItem("sentrix.scopeId", state.scopeId);
+      state.modal = null;
+      state.conversationId = "";
+      state.searchResult = null;
+      state.assistantMessages = [];
+      return refreshData({ forceRender: true });
+    }
     if (action === "open-folder") { document.getElementById("folder-input")?.click(); return; }
     if (action === "toggle-sort") { state.assetSort = state.assetSort === "newest" ? "oldest" : "newest"; renderView(); return; }
     if (action === "toggle-entity-type") { const type = element.dataset.entityType; state.expandedEntityTypes[type] = !state.expandedEntityTypes[type]; renderView(); return; }
