@@ -222,6 +222,22 @@ class MemoryStore:
             self.connection.execute("PRAGMA journal_mode = WAL")
             self._create_schema()
 
+    def get_setting(self, key, default=None):
+        row = self._row("SELECT value FROM runtime_settings WHERE key = ?", (key,))
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.connection.execute(
+            "INSERT INTO runtime_settings(key,value,updated_at) VALUES (?,?,datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (key, str(value)),
+        )
+        self.connection.commit()
+
+    def list_settings(self):
+        rows = self._rows("SELECT key, value, updated_at FROM runtime_settings ORDER BY key")
+        return [{"key": r["key"], "value": r["value"], "updated_at": r["updated_at"]} for r in rows]
+
     def close(self):
         self.connection.close()
 
@@ -706,6 +722,12 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS invites (
                 id TEXT PRIMARY KEY,
                 label TEXT NOT NULL,
@@ -717,6 +739,7 @@ class MemoryStore:
             """
         )
         self._migrate_face_instances_cluster_nullable()
+        self.connection.execute("INSERT OR IGNORE INTO runtime_settings(key,value) VALUES('vlm_backend','ollama_12b')")
         self._ensure_columns("assets", {
             "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "batch_id": "TEXT",

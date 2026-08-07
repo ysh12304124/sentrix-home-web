@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -27,6 +28,7 @@ MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 store = MemoryStore(os.getenv("SENTRIX_DB_PATH", str(DATA_DIR / "sentrix.db")))
 gamma = GammaClient()
+gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
 agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
 
@@ -41,6 +43,81 @@ SUPPORTED_IMPORT_SUFFIXES = {
 }
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
+VLM_BACKENDS = ("ollama_12b", "e2b_lora")
+MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
+
+
+def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_location=None, latitude=None, longitude=None):
+    payload = payload if isinstance(payload, dict) else {}
+    captured_at = payload.get("capturedAt", payload.get("captured_at", captured_at))
+    captured_location = payload.get("capturedLocation", payload.get("captured_location", captured_location))
+    latitude = payload.get("latitude", payload.get("capturedLatitude", payload.get("captured_latitude", latitude)))
+    longitude = payload.get("longitude", payload.get("capturedLongitude", payload.get("captured_longitude", longitude)))
+    if (latitude is None) != (longitude is None):
+        raise ValueError("latitude and longitude must be provided together")
+    result = {}
+    if captured_at:
+        value = str(captured_at).strip()
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("capturedAt must be an ISO 8601 datetime") from error
+        result["captured_at"] = value
+    if captured_location:
+        result["captured_location"] = str(captured_location).strip()
+    if latitude is not None:
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError) as error:
+            raise ValueError("latitude and longitude must be numbers") from error
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError("latitude or longitude is outside its valid range")
+        result["gps"] = {"latitude": latitude, "longitude": longitude}
+    return result
+
+
+def _check_ollama_health():
+    try:
+        import httpx
+        url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11435").rstrip("/")
+        response = httpx.get(f"{url}/api/tags", timeout=10)
+        response.raise_for_status()
+        models = response.json().get("models") or []
+        ollama_model = os.getenv("OLLAMA_MODEL", "gemma4:12b")
+        for model in models:
+            if model.get("name", "").startswith(ollama_model.replace(":12b", "")):
+                return {"available": True, "model": ollama_model, "url": url}
+        return {"available": False, "model": ollama_model, "url": url, "error": "model not found in /api/tags"}
+    except Exception as exc:
+        return {"available": False, "model": os.getenv("OLLAMA_MODEL", "gemma4:12b"), "url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11435"), "error": str(exc)}
+
+
+def _check_e2b_health():
+    try:
+        import httpx
+        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
+        response = httpx.get(f"{url}/api/health", timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return {"available": data.get("status") == "ok", "url": url, "loaded": data.get("loaded", False), "model": data.get("model", ""), "error": data.get("error")}
+    except Exception as exc:
+        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100"), "error": str(exc)}
+
+
+def _fire_and_forget_post(url, payload):
+    try:
+        import httpx
+        httpx.post(url, json=payload, timeout=5)
+    except Exception:
+        pass
+
+
+def _schedule_backend_transition(backend_name):
+    if backend_name == "e2b_lora":
+        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
+        threading.Thread(target=_fire_and_forget_post, args=(f"{e2b_url}/admin/load", {}), daemon=True).start()
+
 
 
 class SearchRequest(BaseModel):
@@ -86,6 +163,11 @@ class ModelSwitchRequest(BaseModel):
     dtype: str | None = None
     default_max_tokens: int | None = None
     cuda_visible_devices: str | None = None
+
+
+class SetVLMBackend(BaseModel):
+    backend: str  # "ollama_12b" | "e2b_lora"
+
 
 
 def _read_json_file(path: Path, fallback):
@@ -289,12 +371,35 @@ def process_asset(asset_id):
         task_store.close()
 
 
+
+@app.get("/api/vlm-backend")
+def vlm_backend():
+    return {
+        "backend": gamma.active_name,
+        "available_backends": list(VLM_BACKENDS),
+        "models": {
+            "ollama_12b": _check_ollama_health(),
+            "e2b_lora": _check_e2b_health(),
+        },
+    }
+
+
+@app.post("/api/vlm-backend")
+def set_vlm_backend(payload: SetVLMBackend):
+    if payload.backend not in VLM_BACKENDS:
+        raise HTTPException(status_code=422, detail=f"backend must be one of {VLM_BACKENDS}")
+    store.set_setting("vlm_backend", payload.backend)
+    gamma.invalidate_backend_cache()
+    _schedule_backend_transition(payload.backend)
+    return {"backend": gamma.active_name, "model": gamma.model, "endpoint": gamma.base_url}
+
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
         "mode": "sentrix-local-backend",
         "models": {
+            "vlm": {"active": gamma.active_name, "name": gamma.model, "endpoint": gamma.base_url},
             "llm": _current_model_runtime(),
             "asr": {"name": pipeline.asr.model_name, "vad": pipeline.asr.vad_model, "punc": pipeline.asr.punc_model, "ready": pipeline.asr.error is None, "error": pipeline.asr.error},
             "face": {
@@ -959,6 +1064,8 @@ async def ingest(
     sourceOwnerLabel: str | None = Form(None),
     capturedAt: str | None = Form(None),
     capturedLocation: str | None = Form(None),
+    capturedLatitude: float | None = Form(None),
+    capturedLongitude: float | None = Form(None),
     scopeId: str | None = Form(None),
     scope_id: str | None = Form(None),
     batchId: str | None = Form(None),
@@ -977,6 +1084,14 @@ async def ingest(
     if batch:
         store.create_memory_space(scope, scope, kind="benchmark")
         store.create_ingest_batch(batch, scope)
+    try:
+        capture_metadata = _normalized_capture_metadata(
+            captured_at=capturedAt, captured_location=capturedLocation,
+            latitude=capturedLatitude, longitude=capturedLongitude,
+        )
+    except ValueError as error:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=str(error)) from error
     metadata = {
         "scope_id": scope,
         "batch_id": batch,
@@ -985,8 +1100,7 @@ async def ingest(
         "source_device_id": sourceDeviceId,
         "source_album_id": sourceAlbumId,
         "source_confidence": 1.0 if sourceOwnerId else 0.0,
-        "captured_at": capturedAt,
-        "captured_location": capturedLocation,
+        **capture_metadata,
     }
     created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=file.content_type, metadata=metadata)
     deduplicated = created.get("path") != str(destination)
@@ -1011,6 +1125,67 @@ async def ingest(
 
 
 @app.post("/api/import", status_code=202)
+async def import_remote_files(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    metadata: str | None = Form(None),
+    sourceOwnerId: str | None = Form(None),
+    sourceDeviceId: str | None = Form(None),
+    sourceAlbumId: str | None = Form(None),
+    sourceOwnerLabel: str | None = Form(None),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
+    batchId: str | None = Form(None),
+    batch_id: str | None = Form(None),
+):
+    if not files:
+        raise HTTPException(status_code=422, detail="at least one file is required")
+    if len(files) > MAX_REMOTE_IMPORT_FILES:
+        raise HTTPException(status_code=413, detail=f"too many files: {len(files)} > {MAX_REMOTE_IMPORT_FILES}")
+    try:
+        per_file = json.loads(metadata) if metadata else []
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=422, detail="metadata must be a JSON array") from error
+    if not isinstance(per_file, list) or len(per_file) not in {0, len(files)}:
+        raise HTTPException(status_code=422, detail="metadata must contain one object per file")
+    per_file = per_file or [{} for _ in files]
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
+    batch = (batch_id or batchId or make_id("batch")).strip()
+    store.create_memory_space(scope, scope, kind="benchmark")
+    store.create_ingest_batch(batch, scope)
+    items = []
+    for index, upload in enumerate(files):
+        safe_name = Path(upload.filename or f"upload-{index}").name
+        destination = MEDIA_DIR / f"{make_id('upload')}_{safe_name}"
+        try:
+            with destination.open("wb") as output:
+                shutil.copyfileobj(upload.file, output)
+            capture = _normalized_capture_metadata(per_file[index])
+            media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
+            if media_type not in {"image", "audio", "video", "text"}:
+                media_type = "text"
+            created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
+                "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
+                "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
+                "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
+                **capture,
+            })
+            deduplicated = created.get("path") != str(destination)
+            if deduplicated:
+                destination.unlink(missing_ok=True)
+            elif created.get("status") in {"queued", "failed"}:
+                background_tasks.add_task(process_asset, created["id"])
+            items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"], "fileName": created["file_name"], "status": created["status"], "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"), "deduplicated": deduplicated})
+        except ValueError as error:
+            destination.unlink(missing_ok=True)
+            items.append({"accepted": False, "fileName": safe_name, "status": "rejected", "error": str(error)})
+        except Exception as error:
+            destination.unlink(missing_ok=True)
+            items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
+    return {"accepted": any(item["accepted"] for item in items), "batch_id": batch, "scope_id": scope, "items": items, "accepted_count": sum(item["accepted"] for item in items), "rejected_count": sum(not item["accepted"] for item in items)}
+
+
+@app.post("/api/import/server-directory", status_code=202)
 def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
     source = Path(request.source_path).expanduser().resolve()
     _assert_import_path_allowed(source)

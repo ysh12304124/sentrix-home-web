@@ -215,25 +215,170 @@ def build_image_prompt(metadata=None):
     return prompt
 
 
+class OllamaBackend:
+    """Ollama 12B backend — local GPU via Ollama server."""
+
+    name = "ollama_12b"
+
+    def __init__(self, base_url, model, timeout, keep_alive):
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self.timeout = timeout
+        self.keep_alive = keep_alive
+
+    @property
+    def endpoint(self):
+        return self._base_url
+
+    @property
+    def model_name(self):
+        return self._model
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        message = {"role": "user", "content": prompt}
+        if images:
+            message["images"] = [img["base64"] for img in images]
+        payload = {
+            "model": self._model,
+            "messages": [message],
+            "stream": False,
+            "keep_alive": self.keep_alive,
+            "options": {"temperature": 0},
+        }
+        if json_mode:
+            payload["format"] = "json"
+        params = ROLE_INFERENCE.get(role)
+        if params is not None:
+            payload["options"].update({
+                "temperature": params["temperature"],
+                "num_ctx": params["num_ctx"],
+                "num_predict": params["num_predict"],
+            })
+            payload["think"] = bool(params.get("think", False))
+        if vision_options:
+            payload["think"] = vision_options.get("think", False)
+            payload["options"].update({
+                "num_ctx": vision_options["num_ctx"],
+                "num_predict": vision_options["num_predict"],
+            })
+        try:
+            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("message", {}).get("content", "")
+        except (httpx.HTTPError, ValueError) as error:
+            raise ModelError(f"ollama request failed: {error}") from error
+
+    def embed_text(self, text):
+        """Ollama embedding endpoint."""
+        if not str(text or "").strip():
+            return []
+        model = os.getenv("SENTRIX_TEXT_EMBED_MODEL", self._model)
+        try:
+            response = httpx.post(f"{self._base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+            embeddings = payload.get("embeddings") or []
+            return embeddings[0] if embeddings else []
+        except (httpx.HTTPError, ValueError, KeyError):
+            return []
+
+
+class E2BBackend:
+    """E2B LoRA backend — local 2B model via E2B server on :8100."""
+
+    name = "e2b_lora"
+    model_name = "gemma-4-e2b-it+lora-v2"
+
+    def __init__(self, base_url=None, timeout=None):
+        self._base_url = (base_url or os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100")).rstrip("/")
+        self.timeout = timeout or float(os.getenv("E2B_TIMEOUT_SECONDS", "300"))
+        self.model_name = os.getenv("E2B_MODEL_NAME", "gemma-4-e2b-it+lora-v2")
+
+    @property
+    def endpoint(self):
+        return self._base_url
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        message = {"role": "user", "content": prompt}
+        if images:
+            message["images"] = [img["base64"] for img in images]
+        payload = {
+            "model": self.model_name,
+            "messages": [message],
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+        if json_mode:
+            payload["format"] = "json"
+        params = ROLE_INFERENCE.get(role)
+        if params is not None:
+            payload["options"].update({
+                "temperature": params["temperature"],
+                "num_ctx": params["num_ctx"],
+                "num_predict": params["num_predict"],
+            })
+            payload["think"] = bool(params.get("think", False))
+        if vision_options:
+            payload["think"] = vision_options.get("think", False)
+            payload["options"].update({
+                "num_ctx": vision_options["num_ctx"],
+                "num_predict": vision_options["num_predict"],
+            })
+        try:
+            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("message", {}).get("content", "")
+        except (httpx.HTTPError, ValueError) as error:
+            raise ModelError(f"e2b request failed: {error}") from error
+
+    def embed_text(self, text):
+        """E2B server does not support embeddings. Always raises NotImplementedError."""
+        raise NotImplementedError("E2B backend does not support text embeddings")
+
+    def health(self):
+        try:
+            response = httpx.get(f"{self._base_url}/api/health", timeout=min(10, self.timeout))
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            return {}
+
+
 class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
                  repair_model=None, backend=None, api_key=None):
         self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
+        ollama_fallback_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         if self.backend == "openai":
-            self.base_url = self._normalize_openai_base_url(
+            self._base_url_setting = self._normalize_openai_base_url(
                 base_url
                 or os.getenv("SENTRIX_VLLM_BASE_URL")
                 or os.getenv("VLLM_BASE_URL")
                 or os.getenv("OPENAI_BASE_URL")
                 or "http://127.0.0.1:8100/v1"
             )
-            self.model = model or os.getenv("SENTRIX_VLLM_MODEL") or os.getenv("VLLM_MODEL") or os.getenv("OPENAI_MODEL") or "gemma4-12b-it"
+            self._model_setting = model or os.getenv("SENTRIX_VLLM_MODEL") or os.getenv("VLLM_MODEL") or os.getenv("OPENAI_MODEL") or "gemma4-12b-it"
         else:
-            self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
-            self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
+            self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+            self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        # --- E2B facade wiring (before per-role setup) ---
+        _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+        _init_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
+        self._ollama = OllamaBackend(
+            base_url=ollama_fallback_url,
+            model=os.getenv("OLLAMA_MODEL", "gemma4:12b"),
+            timeout=_init_timeout,
+            keep_alive=-1 if str(_init_keep_alive).strip() == "-1" else _init_keep_alive,
+        )
+        self._e2b = E2BBackend(os.getenv("E2B_BASE_URL"), _init_timeout)
+        self._store = None
+        self._active_cache = None
+        self._cache_ts = 0.0
         # Phase R R5 + R9-3: per-role model separation.  Explicit per-role env
         # wins; otherwise SENTRIX_AGENT_MODEL_PROFILE decides the default —
         # quality_12b (all roles on the 12B main endpoint) or experimental_2b
@@ -287,6 +432,51 @@ class GammaClient:
         value = str(value or "http://127.0.0.1:8100/v1").rstrip("/")
         return value if value.endswith("/v1") else f"{value}/v1"
 
+    _CACHE_TTL_SECONDS = 5.0
+
+    def bind_store(self, store):
+        self._store = store
+
+    def invalidate_backend_cache(self):
+        self._active_cache = None
+        self._cache_ts = 0.0
+
+    def _read_active_name(self):
+        if self._store is not None:
+            name = self._store.get_setting("vlm_backend")
+            if name in ("ollama_12b", "e2b_lora"):
+                return name
+        return "ollama_12b"
+
+    def _active(self):
+        import time
+        now = time.monotonic()
+        if self._active_cache is not None and (now - self._cache_ts) < self._CACHE_TTL_SECONDS:
+            return self._active_cache
+        name = self._read_active_name()
+        if name == "e2b_lora":
+            self._active_cache = self._e2b
+        else:
+            self._active_cache = getattr(self, '_ollama', None)
+        self._cache_ts = now
+        return self._active_cache
+
+    @property
+    def active_name(self):
+        return self._read_active_name()
+
+    @property
+    def base_url(self):
+        if self.backend == "openai":
+            return self._base_url_setting
+        return self._active().endpoint
+
+    @property
+    def model(self):
+        if self.backend == "openai":
+            return self._model_setting
+        return self._active().model_name
+
     def _endpoint_for(self, role):
         """Resolve (base_url, model) for a model role.
 
@@ -314,10 +504,15 @@ class GammaClient:
     def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
         if httpx is None:
             raise ModelError("httpx is not installed")
-        endpoint_base, model = self._endpoint_for(role)
         if self.backend == "openai":
+            endpoint_base, model = self._endpoint_for(role)
             return self._chat_openai(endpoint_base, model, prompt, images, vision_options, json_mode, role)
-        return self._chat_ollama(endpoint_base, model, prompt, images, vision_options, json_mode, role)
+        backend = self._active()
+        if backend is None:
+            raise ModelError("no active VLM backend")
+        text = backend.chat(prompt, images, vision_options, json_mode, role)
+        self._record_validation_call(role, backend.endpoint, backend.model_name, json_mode, text)
+        return text
 
     def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
@@ -576,18 +771,10 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         }
 
     def embed_text(self, text):
-        """Use the local Ollama embedding endpoint when the configured model supports it."""
-        if httpx is None or not str(text or "").strip():
-            return []
-        model = os.getenv("SENTRIX_TEXT_EMBED_MODEL", self.model)
-        try:
-            response = httpx.post(f"{self.base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout)
-            response.raise_for_status()
-            payload = response.json()
-            embeddings = payload.get("embeddings") or []
-            return embeddings[0] if embeddings else []
-        except (httpx.HTTPError, ValueError, KeyError):
-            return []
+        """Embedding is hard-pinned to Ollama. E2B does not support embeddings."""
+        if getattr(self, '_ollama', None) is not None:
+            return self._ollama.embed_text(text)
+        return []
 
     def answer(self, query, context):
         prompt = f"""你是 Sentrix 家庭记忆 Agent。

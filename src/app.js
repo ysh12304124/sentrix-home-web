@@ -36,6 +36,15 @@
     expandedEntityTypes: {},
   };
 
+  // RX-6: admin/debug presentation is opt-in (URL ?debug=1 or localStorage).
+  // Normal users never see internal ids, retrieval traces or raw JSON.
+  function adminDebug() {
+    const enabled = new URLSearchParams(window.location.search).has("debug")
+      || window.localStorage?.getItem("sentrix.adminDebug") === "1";
+    document.body.classList.toggle("admin", enabled);
+    return enabled;
+  }
+
   const navItems = [
     { id: "overview", icon: "⌂", label: "家庭概览" },
     { id: "search", icon: "⌕", label: "家庭记忆助手" },
@@ -178,17 +187,21 @@
   function overview() {
     const count = stats();
     const events = state.events.slice(0, 3).map(eventViewModel);
-    return `${pageHeader("家庭记忆 / 真实数据", "把家里的记忆，重新放在一起。", "这里展示已经导入并完成处理的本地资料。没有资料时，Sentrix 不会用示例内容填充。", `<button class="button primary" data-view="imports">${icon("＋")}导入资料</button>`)}${state.backendError ? `<div class="error-banner">${escapeHtml(state.backendError)}</div>` : ""}<div class="album-context"><span class="section-kicker">当前数据范围</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong><small>${state.scopeId ? "当前正在查看单个相册" : "当前正在查看 album1、album2、album3 的全部优化内容"}</small></div><section class="overview-search"><div><p class="section-kicker">问 Sentrix</p><h2>你想找回哪一段记忆？</h2><p>从人物、时间、地点、物体或一句描述开始，答案会带回原始证据。</p></div>${searchBar()}</section><section class="stats-grid"><article class="stat-card"><span>已整理内容</span><strong>${count.assets}</strong><small>本地 Asset</small></article><article class="stat-card"><span>已形成事件</span><strong>${count.events}</strong><small>可回到 Observation</small></article><article class="stat-card"><span>待确认事实</span><strong>${state.dashboard?.pendingFacts ?? 0}</strong><small>版本维护队列</small></article><article class="stat-card accent"><span>本地 AI 状态</span><strong>${state.health?.status === "ok" ? "正常" : "未知"}</strong><small>${escapeHtml(state.health?.models?.gamma4_12B?.name || "等待服务")}</small></article></section><section class="content-section"><div class="section-head"><div><p class="section-kicker">三类记忆</p><h2>同一家庭，不同的记忆入口</h2></div><button class="text-button" data-view="settings">查看系统状态 ${icon("→")}</button></div><div class="memory-grid"><article class="memory-card episodic-card"><div class="card-top">${memoryPill("episodic", "事件记忆")}<span class="card-index">01</span></div><h3>把分散的资料聚成共同经历</h3><p>图片、音频和文本共同参与人物、时间、地点与事件整理。</p><div class="card-metric"><strong>${count.events}</strong><span>个已建立事件</span></div></article><article class="memory-card semantic-card"><div class="card-top">${memoryPill("semantic", "语义记忆")}<span class="card-index">02</span></div><h3>让事实持续生长且保留修订</h3><p>每条事实都保留来源、置信度和人工确认历史。</p><div class="card-metric"><strong>${count.facts}</strong><span>条本地事实</span></div></article><article class="memory-card visual-card"><div class="card-top">${memoryPill("visual", "视频编码记忆", "接口预留")}<span class="card-index">03</span></div><h3>视频先归档，编码接口独立接入</h3><p>视频不会在第一版生成动作、片段或向量记忆。</p><div class="reserved-line">${icon("◌")} video_memory_adapter <span>未启用</span></div></article></div></section><section class="content-section two-column"><div><div class="section-head"><div><p class="section-kicker">最近事件</p><h2>家里的时间线</h2></div><button class="text-button" data-view="timeline">查看全部 ${icon("→")}</button></div>${events.length ? `<div class="event-list">${events.map(eventRow).join("")}</div>` : emptyState("还没有事件", "导入图片、音频或文本后，处理完成的 Observation 会在这里形成事件。", `<button class="button small primary" data-view="imports">${icon("＋")}导入第一份资料</button>`)}</div><div><div class="section-head"><div><p class="section-kicker">需要你的确认</p><h2>让记忆更准确</h2></div><button class="text-button" data-view="settings">查看事实 ${icon("→")}</button></div>${(state.dashboard?.pendingFacts || 0) ? `<div class="review-panel"><div class="review-face-pair"><span class="avatar large gray">?</span></div><div><strong>${state.dashboard.pendingFacts} 条事实等待确认</strong><p>确认或驳回前，原始 Observation 会一直保留。</p></div><div class="review-actions"><button class="button small primary" data-view="settings">处理</button></div></div>` : emptyState("目前没有待确认事实", "新资料产生矛盾信息时，会进入版本维护队列。")}</div></section>`;
+    return `${pageHeader("家庭记忆 / 真实数据", "把家里的记忆，重新放在一起。", "这里展示已经导入并完成处理的本地资料。没有资料时，Sentrix 不会用示例内容填充。", `<button class="button primary" data-view="imports">${icon("＋")}导入资料</button>`)}${state.backendError ? `<div class="error-banner">${escapeHtml(state.backendError)}</div>` : ""}<div class="album-context"><span class="section-kicker">当前数据范围</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong><small>${state.scopeId ? "当前正在查看单个相册" : "当前正在查看 album1、album2、album3 的全部优化内容"}</small></div><section class="overview-search"><div><p class="section-kicker">问 Sentrix</p><h2>你想找回哪一段记忆？</h2><p>从人物、时间、地点、物体或一句描述开始，答案会带回原始证据。</p></div>${searchBar()}</section><section class="stats-grid"><article class="stat-card"><span>已整理内容</span><strong>${count.assets}</strong><small>本地 Asset</small></article><article class="stat-card"><span>已形成事件</span><strong>${count.events}</strong><small>可回到 Observation</small></article><article class="stat-card"><span>待确认事实</span><strong>${state.dashboard?.pendingFacts ?? 0}</strong><small>版本维护队列</small></article><article class="stat-card accent"><span>本地 AI 状态</span><strong>${state.health?.status === "ok" ? "正常" : "未知"}</strong><small>${escapeHtml(state.health?.models?.llm?.name || "等待服务")}</small></article></section><section class="content-section"><div class="section-head"><div><p class="section-kicker">三类记忆</p><h2>同一家庭，不同的记忆入口</h2></div><button class="text-button" data-view="settings">查看系统状态 ${icon("→")}</button></div><div class="memory-grid"><article class="memory-card episodic-card"><div class="card-top">${memoryPill("episodic", "事件记忆")}<span class="card-index">01</span></div><h3>把分散的资料聚成共同经历</h3><p>图片、音频和文本共同参与人物、时间、地点与事件整理。</p><div class="card-metric"><strong>${count.events}</strong><span>个已建立事件</span></div></article><article class="memory-card semantic-card"><div class="card-top">${memoryPill("semantic", "语义记忆")}<span class="card-index">02</span></div><h3>让事实持续生长且保留修订</h3><p>每条事实都保留来源、置信度和人工确认历史。</p><div class="card-metric"><strong>${count.facts}</strong><span>条本地事实</span></div></article><article class="memory-card visual-card"><div class="card-top">${memoryPill("visual", "视频编码记忆", "接口预留")}<span class="card-index">03</span></div><h3>视频先归档，编码接口独立接入</h3><p>视频不会在第一版生成动作、片段或向量记忆。</p><div class="reserved-line">${icon("◌")} video_memory_adapter <span>未启用</span></div></article></div></section><section class="content-section two-column"><div><div class="section-head"><div><p class="section-kicker">最近事件</p><h2>家里的时间线</h2></div><button class="text-button" data-view="timeline">查看全部 ${icon("→")}</button></div>${events.length ? `<div class="event-list">${events.map(eventRow).join("")}</div>` : emptyState("还没有事件", "导入图片、音频或文本后，处理完成的 Observation 会在这里形成事件。", `<button class="button small primary" data-view="imports">${icon("＋")}导入第一份资料</button>`)}</div><div><div class="section-head"><div><p class="section-kicker">需要你的确认</p><h2>让记忆更准确</h2></div><button class="text-button" data-view="settings">查看事实 ${icon("→")}</button></div>${(state.dashboard?.pendingFacts || 0) ? `<div class="review-panel"><div class="review-face-pair"><span class="avatar large gray">?</span></div><div><strong>${state.dashboard.pendingFacts} 条事实等待确认</strong><p>确认或驳回前，原始 Observation 会一直保留。</p></div><div class="review-actions"><button class="button small primary" data-view="settings">处理</button></div></div>` : emptyState("目前没有待确认事实", "新资料产生矛盾信息时，会进入版本维护队列。")}</div></section>`;
   }
 
   function evidenceCard(evidence) {
+    const isAdmin = adminDebug();
     const sourceAction = evidence.kind === "observation" && evidence.asset_id ? `data-action="open-asset" data-asset-id="${escapeHtml(evidence.asset_id)}"` : evidence.event_id ? `data-action="open-event" data-event-id="${escapeHtml(evidence.event_id)}"` : evidence.kind === "fact" && evidence.evidence_ids?.[0] ? `data-action="open-observation" data-observation-id="${escapeHtml(evidence.evidence_ids[0])}"` : "";
     const title = evidence.kind === "fact" ? `${evidence.subject} ${evidence.predicate} ${evidence.object}` : evidence.summary || evidence.caption || "原始图片证据";
     const text = evidence.kind === "observation" ? evidence.caption || evidence.transcript || "无文字摘要" : evidence.summary || evidence.status || "";
     const media = evidence.kind === "observation" && evidence.asset_id ? `<button class="evidence-media" data-action="open-asset" data-asset-id="${escapeHtml(evidence.asset_id)}" aria-label="打开原始证据">${assetThumb({ id: evidence.asset_id, media_type: evidence.media_type || "image" }, true)}</button>` : "";
     const assetAction = evidence.kind === "asset" && evidence.id ? `data-action="open-asset" data-asset-id="${escapeHtml(evidence.id)}"` : "";
     const main = sourceAction || assetAction ? `<button class="evidence-main" ${sourceAction || assetAction}><strong>${escapeHtml(title)}</strong><p>${escapeHtml(text)}</p><small>${escapeHtml(evidence.captured_at || evidence.place || evidence.media_type || "证据记录")}</small></button>` : `<div class="evidence-main static"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(text)}</p><small>${escapeHtml(evidence.captured_at || evidence.place || evidence.media_type || "证据记录")}</small></div>`;
-    return `<article class="evidence-card"><div class="evidence-head"><span class="evidence-kind">${evidence.kind === "observation" ? "图片观察" : evidence.kind === "asset" ? "原始资料" : evidence.kind === "fact" ? "人物事实" : "记忆证据"}</span></div>${media}${main}${evidence.raw ? `<details><summary>查看模型原始 JSON</summary><pre>${escapeHtml(JSON.stringify(evidence.raw, null, 2))}</pre></details>` : ""}</article>`;
+    // RX-6: internal ids and raw JSON only in the admin debug layer.
+    const idLine = isAdmin && (evidence.asset_id || evidence.observation_id) ? `<small class="admin-only">${escapeHtml(evidence.asset_id || "")}${evidence.observation_id ? " · " + escapeHtml(evidence.observation_id) : ""}</small>` : "";
+    const debugRaw = isAdmin && evidence.raw ? `<details class="admin-only"><summary>查看模型原始 JSON</summary><pre>${escapeHtml(JSON.stringify(evidence.raw, null, 2))}</pre></details>` : "";
+    return `<article class="evidence-card"><div class="evidence-head"><span class="evidence-kind">${evidence.kind === "observation" ? "图片观察" : evidence.kind === "asset" ? "原始资料" : evidence.kind === "fact" ? "人物事实" : "记忆证据"}</span></div>${idLine}${media}${main}${debugRaw}</article>`;
   }
 
   function evidenceLayer(title, values) {
@@ -199,7 +212,19 @@
   function imageResults(result) {
     const images = result?.image_results || [];
     if (!images.length) return "";
-    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关原始图片</p><h3>${images.length} 张已通过相关度门槛的证据</h3></div></div><div class="image-result-grid">${images.map((item) => `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="原始图片证据" loading="lazy" /><span><strong>原始图片证据</strong><small>${escapeHtml(item.captured_at || item.caption || "可回看的原始证据")}</small></span></button>`).join("")}</div></section>`;
+    const rows = images.map((item) => {
+      const label = item.display_handle || "原始图片";
+      const aspects = [
+        ...(item.supported_aspects || []).map((aspect) => `对上了：${aspect}`),
+        ...(item.uncertain_aspects || []).map((aspect) => `还不能确认：${aspect}`),
+      ];
+      const caption = aspects.length
+        ? aspects.map(escapeHtml).join(" · ")
+        : (item.captured_at || item.caption || "可回看的原始证据");
+      const dup = item.near_duplicate_size > 1 ? `<small class="image-dup">另有 ${item.near_duplicate_size - 1} 张相似照片</small>` : "";
+      return `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
+    }).join("");
+    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关图片</p><h3>${images.length} 张</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
   }
 
   function traceLabel(item) {
@@ -214,15 +239,17 @@
   }
 
   function algorithmEvidence(result) {
+    if (!adminDebug()) return "";
     const trace = result.retrievalTrace || result.retrieval_trace || [];
     const modelEvidence = result.modelEvidence || [];
-    return `<details class="algorithm-evidence"><summary>算法判断依据</summary><div class="algorithm-evidence-body"><p>回答只使用本地语义、事件和原始观察；结构化命中时会跳过向量检索。</p><dl>${trace.map((item) => `<div><dt>${escapeHtml(traceLabel(item))}</dt><dd>${escapeHtml(item.status || "complete")} · ${escapeHtml(traceDetail(item))}</dd></div>`).join("")}</dl><p>模型引用校验：${modelEvidence.length} 项候选引用，未通过证据 ID 校验时自动降级为本地证据回答。</p></div></details>`;
+    return `<details class="algorithm-evidence admin-only"><summary>算法判断依据</summary><div class="algorithm-evidence-body"><p>回答只使用本地语义、事件和原始观察；结构化命中时会跳过向量检索。</p><dl>${trace.map((item) => `<div><dt>${escapeHtml(traceLabel(item))}</dt><dd>${escapeHtml(item.status || "complete")} · ${escapeHtml(traceDetail(item))}</dd></div>`).join("")}</dl><p>模型引用校验：${modelEvidence.length} 项候选引用，未通过证据 ID 校验时自动降级为本地证据回答。</p></div></details>`;
   }
 
   function toolTrace(result) {
+    if (!adminDebug()) return "";
     const trace = result.toolTrace || result.tool_trace || [];
     if (!trace.length) return "";
-    return `<details class="algorithm-evidence"><summary>本轮判断与工具</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}${item.reason ? ` · ${escapeHtml(item.reason)}` : ""}</dd></div>`).join("")}</dl></div></details>`;
+    return `<details class="algorithm-evidence admin-only"><summary>本轮判断与工具</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}${item.reason ? ` · ${escapeHtml(item.reason)}` : ""}</dd></div>`).join("")}</dl></div></details>`;
   }
 
   function assistantAnswer(result) {
@@ -263,6 +290,7 @@
   }
 
   function assistantEvidence(result) {
+    const isAdmin = adminDebug();
     const layers = result.evidence_layers || {};
     const presentation = result.evidence_presentation || {};
     const primary = [...(layers.events || []), ...(layers.observations || []), ...(layers.claims || [])].sort((left, right) => (right.relevance || 0) - (left.relevance || 0));
@@ -272,23 +300,35 @@
     const gapContent = gaps.length ? `<section class="evidence-gap"><div class="section-head"><div><p class="section-kicker">证据缺口</p><h3>当前没有足够的原始依据</h3></div></div><p>${escapeHtml(gaps[0].reason || "请补充人物、地点、日期或其他线索。")}</p></section>` : "";
     const followups = candidates.length ? `<div class="assistant-followups"><p>请选择你指的人物：</p>${candidates.map((item) => `<button class="assistant-identity-choice" data-action="continue-assistant" data-query="${escapeHtml(item.name)}" data-entity-id="${escapeHtml(item.id)}">${item.preview_asset_id ? `<img src="/api/assets/${encodeURIComponent(item.preview_asset_id)}/file" alt="" loading="lazy" />` : `<span class="assistant-choice-placeholder">${escapeHtml((item.name || "?").slice(0, 1))}</span>`}<span><strong>${escapeHtml(item.name || "已确认成员")}</strong><small>${escapeHtml(item.family_role || "已确认人物")} · ${item.evidence_count || 0} 条依据</small></span></button>`).join("")}</div>` : "";
     const ordered = result.evidence_order || [];
-    const order = ordered.length ? `<details class="algorithm-evidence"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
+    const order = ordered.length && isAdmin ? `<details class="algorithm-evidence admin-only"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
     const directEvidence = Boolean(result.original_evidence_requested || presentation.direct_original_evidence);
-    const requiresEvidence = result.intent !== "chat" && result.memory_used !== false && presentation.required !== false;
+    // RX-6: a chat turn (memory_used === false) never shows an evidence entry.
+    const requiresEvidence = result.memory_used !== false && presentation.required !== false;
     const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
     const optionalImages = directEvidence ? "" : imageResults(result);
-    const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看这次回答的依据</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${toolTrace(result)}${algorithmEvidence(result)}</div></details>` : "";
+    const debugBlock = isAdmin ? `${toolTrace(result)}${algorithmEvidence(result)}` : "";
+    const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看为什么找到这些照片</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
+  }
+
+  function evidenceStatusLabel(result) {
+    const mode = result.response_mode || "";
+    if (mode === "asset_delivery" || result.original_evidence_requested) return "已找到并展示";
+    if (result.evidence_status === "not_applicable") return "";
+    if (result.evidence_status === "gap") return "暂时没有足够依据";
+    if (result.evidence_status === "clarify") return "需要补充一点线索";
+    if (result.evidence_status === "anchored") return "已找到相关记忆";
+    return "";
   }
 
   function assistantMessage(message) {
     if (message.role === "user") return `<article class="assistant-message user"><div class="assistant-bubble"><p>${escapeHtml(message.text)}</p></div></article>`;
     const result = message.result || {};
-    const status = result.insufficient_evidence ? "需要补充线索" : `${Math.round((result.confidence || 0) * 100)}% 证据置信度`;
+    const status = evidenceStatusLabel(result);
     const plan = result.dialogue_plan || {};
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span><small>${escapeHtml(status)}</small></div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${assistantEvidence(result)}</div></article>`;
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${assistantEvidence(result)}</div></article>`;
   }
 
   function searchView() {
@@ -338,7 +378,7 @@
   function settingsView() {
     const facts = state.dashboard?.facts || [];
     const pending = facts.filter((fact) => fact.status === "pending");
-    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label">READY</span></div><div class="model-row"><span>主推理</span><strong>${escapeHtml(state.health.models?.gamma4_12B?.name || "未知")}</strong><small>${escapeHtml(state.health.models?.gamma4_12B?.endpoint || "未连接")}</small></div><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${state.health.models?.face?.ready ? "已启用" : "不可用"}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频编码记忆 <b>预留</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}<section class="content-section fact-review"><div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频编码</span><b>接口关闭</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div></div></div></section>`;
+    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label">READY</span></div><div class="model-row"><span>主推理</span><strong>${escapeHtml(state.health.models?.llm?.name || "未知")}</strong><small>${escapeHtml(state.health.models?.llm?.endpoint || "未连接")}</small></div><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${state.health.models?.face?.ready ? "已启用" : "不可用"}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频编码记忆 <b>预留</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}<section class="content-section fact-review"><div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频编码</span><b>接口关闭</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div></div></div></section>`;
   }
 
   function semanticDetails(group) {
@@ -645,9 +685,24 @@
 
   async function handleFiles(event) {
     const files = Array.from(event.target.files || []);
-    for (const file of files) {
-      state.queue.unshift({ fileName: file.name, status: "uploading" });
-      try { const result = await window.sentrixApi.importAsset(file); state.queue[0].assetId = result.assetId; state.queue[0].status = result.status; } catch { state.queue[0].status = "failed"; }
+    if (!files.length) return;
+    const queueEntries = files.map((file) => ({ fileName: file.name, status: "reading-metadata" }));
+    state.queue.unshift(...queueEntries);
+    const items = await Promise.all(files.map(async (file, index) => {
+      const metadata = await window.sentrixImageMetadata.extract(file);
+      queueEntries[index].status = "uploading";
+      queueEntries[index].metadata = metadata;
+      return { file, metadata };
+    }));
+    try {
+      const result = await window.sentrixApi.importAssets(items, { scopeId: state.scopeId });
+      (result.items || []).forEach((item, index) => {
+        if (!queueEntries[index]) return;
+        queueEntries[index].assetId = item.assetId || item.asset_id;
+        queueEntries[index].status = item.status || "failed";
+      });
+    } catch {
+      queueEntries.forEach((item) => { item.status = "failed"; });
     }
     state.toast = `${files.length} 个资料已进入本地处理队列`;
     await refreshData();
