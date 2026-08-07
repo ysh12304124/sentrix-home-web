@@ -368,7 +368,8 @@ def health():
         "status": "ok",
         "mode": "sentrix-local-backend",
         "models": {
-            "vlm": {"active": gamma.active_name, "name": gamma.model, "endpoint": gamma.base_url},
+            "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
+            "llm": _current_model_runtime(),
             "gamma4_12B": {"name": gamma.model, "endpoint": gamma.base_url},
             "asr": {"name": pipeline.asr.model_name, "vad": pipeline.asr.vad_model, "punc": pipeline.asr.punc_model, "ready": pipeline.asr.error is None, "error": pipeline.asr.error},
             "face": {
@@ -417,29 +418,24 @@ def memory_spaces():
 
 @app.get("/api/vlm-backend")
 def vlm_backend():
-    ollama_health = _check_ollama_health()
-    e2b_health = _check_e2b_health()
-    active_health = ollama_health if gamma.active_name == "ollama_12b" else e2b_health
+    runtime = _current_model_runtime()
     return {
-        "backend": gamma.active_name,
-        "status": "running" if active_health.get("available") else "degraded",
-        "error": "" if active_health.get("available") else active_health.get("error", ""),
-        "available_backends": list(VLM_BACKENDS),
-        "models": {
-            "ollama_12b": ollama_health,
-            "e2b_lora": e2b_health,
-        },
+        "backend": "vllm",
+        "available_backends": ["vllm"],
+        "profile": runtime.get("profile"),
+        "model": runtime.get("model"),
+        "status": runtime.get("status"),
+        "deprecated": True,
+        "replacement": "/api/model-profiles",
     }
 
 
 @app.post("/api/vlm-backend")
 def set_vlm_backend(payload: SetVLMBackend):
-    if payload.backend not in VLM_BACKENDS:
-        raise HTTPException(status_code=422, detail=f"backend must be one of {VLM_BACKENDS}")
-    store.set_setting("vlm_backend", payload.backend)
-    gamma.invalidate_backend_cache()
-    _schedule_backend_transition(payload.backend)
-    return {"backend": gamma.active_name, "model": gamma.model, "endpoint": gamma.base_url}
+    raise HTTPException(
+        status_code=410,
+        detail="VLM backend switching is retired; use POST /api/model-profiles/switch",
+    )
 
 @app.get("/api/model-profiles")
 def model_profiles():
@@ -899,9 +895,13 @@ def split_face_cluster(cluster_id: str, payload: dict):
 
 
 @app.get("/api/relationships")
-def relationships(scope_id: str | None = None):
-    entities = store.list_entities(scope_id=scope_id)
-    values = store.list_relationships(scope_id=scope_id)
+def relationships(scope_id: str | None = None, kind: str | None = None):
+    if kind == "person":
+        entities = [entity for entity in store.list_entities(scope_id=scope_id) if entity.get("entity_type") == "person"]
+        values = store.list_person_relationships(scope_id=scope_id)
+    else:
+        entities = store.list_entities(scope_id=scope_id)
+        values = store.list_relationships(scope_id=scope_id)
     nodes = [{"id": entity["id"], "label": entity["canonical_name"], "status": entity["status"], "entity_type": entity["entity_type"]} for entity in entities]
     edges = [{"source": item["subject_entity_id"], "target": item["object_entity_id"], "label": item["predicate"], "status": item["status"], "id": item["id"]} for item in values]
     return {"nodes": nodes, "edges": edges, "relationships": values}
