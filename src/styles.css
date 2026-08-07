@@ -296,7 +296,8 @@ button { cursor: pointer; }
 @media (max-width: 580px) { .trip-grid { grid-template-columns: 1fr; } }
 .space-switcher { align-items: flex-start; }
 .space-switcher > span:last-child { min-width: 0; display: grid; gap: 4px; }
-.space-switcher select { max-width: 150px; border: 0; background: transparent; color: var(--ink); font-weight: 800; font-size: 12px; padding: 0; }
+.space-switcher select { max-width: 150px; border: 0; background: transparent; color: #fff; font-weight: 800; font-size: 12px; padding: 0; }
+.space-switcher select option { background: #151613; color: #fff; }
 .space-switcher small { color: var(--muted); font-size: 9px; }
 .face-evidence-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .face-evidence-item { border: 1px solid var(--line); border-radius: 10px; padding: 8px; background: #fff; }
