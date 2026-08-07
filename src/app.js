@@ -1,5 +1,33 @@
 (function () {
   const app = document.getElementById("app");
+  const benchmarkModelProfiles = [
+    { id: "gemma4-12b-it", label: "Gemma-4-12B" },
+    { id: "gemma4-e2b-it", label: "Gemma-4-E2B 蒸馏前" },
+    { id: "gemma4-e2b-it-lora-v2", label: "Gemma-4-E2B 蒸馏后（加 LoRA 头）" },
+    { id: "qwen3.5-0.8b-it", label: "Qwen-3.5-0.8B" },
+  ];
+
+  function modelProfileOptions(payload) {
+    const profiles = new Map((payload?.profiles || []).map((profile) => [profile.id, profile]));
+    const current = payload?.current || {};
+    let active = current.profile || "";
+    if (!benchmarkModelProfiles.some((profile) => profile.id === active)) {
+      const currentModel = String(current.model || "");
+      active = benchmarkModelProfiles.find((profile) => profiles.get(profile.id)?.served_model_name === currentModel)?.id || "";
+      if (!active && ["gemma4:12b", "gemma4-12b-it"].includes(currentModel)) active = "gemma4-12b-it";
+    }
+    const models = Object.fromEntries(benchmarkModelProfiles.map(({ id, label }) => {
+      const profile = profiles.get(id);
+      return [id, {
+        available: Boolean(profile?.available),
+        loaded: id === active,
+        model: label,
+        url: id === active ? current.base_url : "vLLM profile",
+      }];
+    }));
+    return { backend: active, available_backends: benchmarkModelProfiles.map((profile) => profile.id), models };
+  }
+
   const state = {
     view: "overview",
     query: "",
@@ -646,7 +674,7 @@
     state.stories = calls[4].status === "fulfilled" ? calls[4].value.stories || [] : [];
     state.health = calls[5].status === "fulfilled" ? calls[5].value : null;
     try {
-      state.vlmBackendOptions = await window.sentrixApi.getVlmBackend();
+      state.vlmBackendOptions = modelProfileOptions(await window.sentrixApi.getModelProfiles());
     } catch (err) {
       state.vlmBackendOptions = null;
     }
@@ -733,8 +761,10 @@
     vlmSelect.addEventListener("change", async () => {
       const target = vlmSelect.value;
       vlmSelect.disabled = true;
+      const selectedOption = vlmSelect.selectedOptions[0];
+      if (selectedOption) selectedOption.textContent = `${selectedOption.textContent} · 切换中`;
       try {
-        await window.sentrixApi.setVlmBackend(target);
+        await window.sentrixApi.switchModelProfile(target);
         await refreshData({ silent: true });
         renderView();
       } catch (err) {

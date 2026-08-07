@@ -40,11 +40,12 @@ const readRawBody = (req) => new Promise((resolve, reject) => {
 async function proxyBackend(req, res, url) {
   try {
     const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readRawBody(req);
+    const timeoutMs = url.pathname === "/api/model-profiles/switch" ? 1_000_000 : 240_000;
     const response = await fetch(`${backendBaseUrl}${url.pathname}${url.search}`, {
       method: req.method,
       headers: { "content-type": req.headers["content-type"] || "application/json" },
       body,
-      signal: AbortSignal.timeout(240000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const payload = await response.arrayBuffer();
     res.writeHead(response.status, { "content-type": response.headers.get("content-type") || "application/json; charset=utf-8", "cache-control": "no-store" });

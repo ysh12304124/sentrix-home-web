@@ -84,6 +84,12 @@
     },
     getVlmBackend: () => request("/api/vlm-backend"),
     setVlmBackend: (backend) => request("/api/vlm-backend", { method: "POST", body: JSON.stringify({ backend }) }),
+    getModelProfiles: () => request("/api/model-profiles"),
+    getCurrentModelProfile: () => request("/api/model-profiles/current"),
+    switchModelProfile: (profile) => request("/api/model-profiles/switch", {
+      method: "POST",
+      body: JSON.stringify({ profile, wait_ready: true, ready_timeout: 900 }),
+    }),
     importAsset: (file, metadata = {}, options = {}) => {
       return window.sentrixApi.importAssets([{ file, metadata }], options).then((result) => result.items[0]);
     },

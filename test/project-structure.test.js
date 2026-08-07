@@ -46,6 +46,23 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   assert.doesNotMatch(source, /COGNEE_BASE_URL|mockSearch|function handleApi/);
   assert.match(source, /return proxyBackend\(req, res, url\);/);
   assert.match(source, /127\.0\.0\.1:8091/, "web must use the Agent-capable API by default");
+  assert.match(source, /\/api\/model-profiles\/switch/);
+  assert.match(source, /1_000_000/, "model switching must outlive the vLLM ready timeout");
+});
+
+test("settings exposes the four benchmark model profiles through the switch API", () => {
+  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+  const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
+  for (const profile of ["gemma4-12b-it", "gemma4-e2b-it", "gemma4-e2b-it-lora-v2", "qwen3.5-0.8b-it"]) {
+    assert.match(appSource, new RegExp(profile.replace(/[.]/g, "\\.")));
+  }
+  for (const label of ["Gemma-4-12B", "Gemma-4-E2B 蒸馏前", "Gemma-4-E2B 蒸馏后（加 LoRA 头）", "Qwen-3.5-0.8B"]) {
+    assert.match(appSource, new RegExp(label.replace(/[()]/g, "\\$&")));
+  }
+  assert.match(apiSource, /getModelProfiles/);
+  assert.match(apiSource, /switchModelProfile/);
+  assert.match(apiSource, /\/api\/model-profiles\/switch/);
+  assert.match(appSource, /switchModelProfile\(target\)/);
 });
 
 test("portal exposes all optimized album scopes and labels their evidence", () => {
