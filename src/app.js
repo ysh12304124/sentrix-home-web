@@ -373,7 +373,7 @@
 
   function importsView() {
     const assets = state.assets.filter((asset) => ["queued", "processing", "semantic_enriching", "failed", "video-extraction-reserved"].includes(asset.status));
-      return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "上传后会创建稳定 Asset ID，并在后台生成 Observation、Event 和 Fact；视频只建立原始资产。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择资料</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,audio/*,text/*,video/*" /><span class="drop-icon">↓</span><strong>拖入资料，或点击选择文件</strong><small>支持图片、音频、文本和视频 · 原始文件不会离开本机</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始证据不会被覆盖</strong><p>每个 Asset 都可以追溯到 Observation 和模型原始 JSON。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>LOCAL PIPELINE</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${[["接收与去重", `${state.assets.length} 个 Asset`, "done"], ["图片理解", `${state.assets.filter((a) => a.media_type === "image" && a.status === "processed").length} 个已完成 · ${state.assets.filter((a) => a.status === "semantic_enriching").length} 个语义整理中`, "done"], ["音频转写", `${state.assets.filter((a) => a.media_type === "audio").length} 个音频`, "active"], ["事件与事实", `${stats().events} 个事件 · ${stats().facts} 条事实`, "active"], ["视频编码", `${state.assets.filter((a) => a.media_type === "video").length} 个视频`, "reserved"]].map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : row[2] === "active" ? "•" : "—"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : row[2] === "active" ? "运行中" : "预留"}</em></div>`).join("")}</aside></section><section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}证据</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status === "video-extraction-reserved" ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的 Asset 会显示在这里。")}</div></section>`;
+      return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "上传后会创建稳定 Asset ID，并在后台生成 Observation、Event 和 Fact；视频只建立原始资产。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,image/jpeg,image/png" /><span class="drop-icon">↓</span><strong>拖入资料，或点击选择文件</strong><small>可选择文件，或选择图片文件夹（自动导入 JPG/JPEG/PNG）</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始证据不会被覆盖</strong><p>每个 Asset 都可以追溯到 Observation 和模型原始 JSON。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>LOCAL PIPELINE</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${[["接收与去重", `${state.assets.length} 个 Asset`, "done"], ["图片理解", `${state.assets.filter((a) => a.media_type === "image" && a.status === "processed").length} 个已完成 · ${state.assets.filter((a) => a.status === "semantic_enriching").length} 个语义整理中`, "done"], ["音频转写", `${state.assets.filter((a) => a.media_type === "audio").length} 个音频`, "active"], ["事件与事实", `${stats().events} 个事件 · ${stats().facts} 条事实`, "active"], ["视频编码", `${state.assets.filter((a) => a.media_type === "video").length} 个视频`, "reserved"]].map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : row[2] === "active" ? "•" : "—"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : row[2] === "active" ? "运行中" : "预留"}</em></div>`).join("")}</aside></section><section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}证据</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status === "video-extraction-reserved" ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的 Asset 会显示在这里。")}</div></section>`;
   }
 
   function settingsView() {
@@ -644,6 +644,8 @@
     document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action, element)));
     const fileInput = document.getElementById("file-input");
     if (fileInput) fileInput.addEventListener("change", handleFiles);
+    const folderInput = document.getElementById("folder-input");
+    if (folderInput) folderInput.addEventListener("change", handleFiles);
   const vlmSelect = document.querySelector('[data-action="switch-vlm"]');
   if (vlmSelect) {
     vlmSelect.addEventListener("change", async () => {
@@ -708,7 +710,8 @@
   }
 
   async function handleFiles(event) {
-    const files = Array.from(event.target.files || []);
+    let files = Array.from(event.target.files || []);
+    if (event.target.id === "folder-input") files = files.filter((file) => /\.(jpe?g|png)$/i.test(file.name || ""));
     if (!files.length) return;
     const queueEntries = files.map((file) => ({ fileName: file.name, status: "reading-metadata" }));
     state.queue.unshift(...queueEntries);
@@ -852,7 +855,7 @@
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "help" });
-    if (action === "open-folder") { document.getElementById("file-input")?.click(); return; }
+    if (action === "open-folder") { document.getElementById("folder-input")?.click(); return; }
     if (action === "toggle-sort") { state.assetSort = state.assetSort === "newest" ? "oldest" : "newest"; renderView(); return; }
     if (action === "toggle-entity-type") { const type = element.dataset.entityType; state.expandedEntityTypes[type] = !state.expandedEntityTypes[type]; renderView(); return; }
     if (action === "continue-assistant") { state.query = element.dataset.query || ""; return submitSearch(null, element.dataset.entityId || ""); }
