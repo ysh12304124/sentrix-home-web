@@ -63,11 +63,25 @@
     search: (query) => request("/api/search", { method: "POST", body: JSON.stringify({ query }) }),
     queryGaps: () => request("/api/query-gaps"),
     queryGapFeedback: (id, payload) => request("/api/query-gaps/" + encodeURIComponent(id) + "/feedback", { method: "POST", body: JSON.stringify(payload) }),
-    importAsset: (file, mediaType) => {
-      if (typeof file === "string") return request("/api/import", { method: "POST", body: JSON.stringify({ fileName: file, mediaType }) });
+    importAssets: (items, options = {}) => {
       const form = new FormData();
-      form.append("file", file, file.name);
-      return request("/api/ingest", { method: "POST", body: form });
+      items.forEach((item) => form.append("files", item.file, item.file.name));
+      form.append("metadata", JSON.stringify(items.map((item) => item.metadata || {})));
+      const fields = {
+        scopeId: options.scopeId,
+        batchId: options.batchId,
+        sourceOwnerId: options.sourceOwnerId,
+        sourceOwnerLabel: options.sourceOwnerLabel,
+        sourceDeviceId: options.sourceDeviceId,
+        sourceAlbumId: options.sourceAlbumId,
+      };
+      Object.entries(fields).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && String(value).trim()) form.append(key, value);
+      });
+      return request("/api/import", { method: "POST", body: form });
+    },
+    importAsset: (file, metadata = {}, options = {}) => {
+      return window.sentrixApi.importAssets([{ file, metadata }], options).then((result) => result.items[0]);
     },
   };
 })();
