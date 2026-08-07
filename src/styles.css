@@ -1,3 +1,5 @@
+img { image-orientation: from-image; }
+
 :root {
   --ink: #151613;
   --muted: #73776e;
