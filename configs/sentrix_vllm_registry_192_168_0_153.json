@@ -105,7 +105,7 @@
       "dtype": "bfloat16",
       "gpu_memory_utilization": 0.60,
       "max_model_len": 8192,
-      "max_num_seqs": 8,
+      "max_num_seqs": 4,
       "tensor_parallel_size": 1,
       "trust_remote_code": true,
       "notes": "Downloaded from ModelScope as Qwen/Qwen3.5-0.8B."
@@ -116,7 +116,7 @@
       "dtype": "bfloat16",
       "gpu_memory_utilization": 0.60,
       "max_model_len": 8192,
-      "max_num_seqs": 8,
+      "max_num_seqs": 4,
       "tensor_parallel_size": 1,
       "trust_remote_code": true,
       "enable_lora": true,
