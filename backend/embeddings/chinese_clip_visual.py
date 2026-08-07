@@ -82,6 +82,9 @@ class ChineseClipVisualEmbedder:
         try:
             import torch
             from PIL import Image
+            from backend.image_io import ensure_heif_support
+
+            ensure_heif_support()
             image = self._preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(self._device)
             with torch.no_grad():
                 vector = model.encode_image(image)

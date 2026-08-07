@@ -569,6 +569,29 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(detail["entity"]["status"], "confirmed")
         self.assertEqual(self.store._row("SELECT status FROM face_clusters WHERE id = ?", (face["cluster_id"],))["status"], "confirmed")
 
+    def test_native_person_entity_reject_retires_candidate_and_clusters(self):
+        face = self.store.add_face_instance(
+            "a1", self.obs1["id"],
+            {"bbox": [1, 2, 30, 40], "confidence": 0.95, "embedding": [0, 1, 0]},
+        )
+        entity_id = self.store._row("SELECT entity_id FROM face_clusters WHERE id = ?", (face["cluster_id"],))["entity_id"]
+        other = self.store.add_face_instance(
+            "a2", self.obs2["id"],
+            {"bbox": [2, 3, 40, 50], "confidence": 0.95, "embedding": [0, 0, 1]},
+        )
+        other_entity = self.store._row("SELECT entity_id FROM face_clusters WHERE id = ?", (other["cluster_id"],))["entity_id"]
+        relationship = self.store.create_relationship(entity_id, "可能同框", other_entity, [self.obs1["id"]], 0.6, "pending")
+
+        rejected = self.store.reject_person_entity(entity_id)
+
+        self.assertEqual(rejected["id"], entity_id)
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(self.store._row("SELECT status FROM face_clusters WHERE id = ?", (face["cluster_id"],))["status"], "rejected")
+        self.assertEqual(self.store._row("SELECT status FROM relationships WHERE id = ?", (relationship["id"],))["status"], "retracted")
+        self.assertNotIn(entity_id, {item["id"] for item in self.store.list_entities(scope_id="home-default")})
+        with self.assertRaises(ValueError):
+            self.store.reject_person_entity(self.store.confirm_person_entity(other_entity, "爸爸", "父亲")["entity"]["id"])
+
     def test_observation_entities_link_place_objects_atmosphere_and_event_evidence(self):
         self.store.connection.execute(
             "UPDATE observations SET place = ?, objects_json = ?, raw_json = ?, canonical_json = ? WHERE id = ?",
