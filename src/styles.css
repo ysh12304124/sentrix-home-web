@@ -24,7 +24,7 @@ button, input { font: inherit; }
 button { cursor: pointer; }
 .app-shell { min-height: 100vh; display: flex; background: var(--surface); }
 
-.sidebar { width: 240px; min-height: 100vh; background: var(--ink); color: #fff; padding: 24px 14px 18px; display: flex; flex-direction: column; flex: 0 0 240px; }
+.sidebar { width: 240px; height: 100vh; position: sticky; top: 0; align-self: flex-start; background: var(--ink); color: #fff; padding: 24px 14px 18px; display: flex; flex-direction: column; flex: 0 0 240px; overflow-y: auto; }
 .brand-lockup { display: flex; align-items: center; gap: 10px; padding: 0 10px 26px; }
 .brand-lockup strong { display: block; font-size: 17px; letter-spacing: -.02em; }
 .brand-lockup small { display: block; color: #8e958a; font-size: 10px; margin-top: 3px; }
@@ -53,6 +53,9 @@ button { cursor: pointer; }
 .breadcrumbs { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
 .breadcrumbs b { color: var(--line); }
 .breadcrumbs strong { color: var(--ink); }
+.breadcrumbs button { border: 0; background: transparent; padding: 0; color: var(--muted); font-size: 12px; cursor: pointer; }
+.breadcrumbs button:hover { color: var(--ink); }
+.breadcrumbs .crumb-back { display: inline-flex; align-items: center; gap: 4px; color: var(--green); font-weight: 700; }
 .top-actions { display: flex; gap: 14px; align-items: center; }
 .icon-button, .top-user { border: 0; background: transparent; color: var(--muted); }
 .icon-button { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; font-size: 15px; }
@@ -187,6 +190,8 @@ button { cursor: pointer; }
 .modal-panel { position: relative; width: min(760px, 100%); max-height: min(840px, calc(100vh - 48px)); overflow: auto; padding: 28px; background: #ffffff; color: var(--ink); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 24px 70px rgba(21,22,19,.2); }
 .modal-close { position: absolute; top: 12px; right: 14px; border: 0; background: transparent; color: var(--muted); font-size: 24px; cursor: pointer; }
 .modal-kicker { color: var(--green); font-size: 9px; letter-spacing: .1em; font-weight: 700; margin-bottom: 12px; }
+.modal-back { display: inline-flex; align-items: center; gap: 5px; border: 0; background: transparent; padding: 0; color: var(--green); font-size: 12px; font-weight: 700; cursor: pointer; margin-bottom: 10px; }
+.modal-back:hover { color: var(--ink); }
 .modal-panel h2 { margin-right: 32px; }
 .modal-panel h3 { margin: 0; }
 .modal-lead { color: var(--muted); line-height: 1.65; font-size: 12px; }
@@ -213,6 +218,24 @@ button { cursor: pointer; }
 .relation-node .avatar { margin: 0 auto 8px; }
 .relation-node strong, .relation-node small { display: block; }
 .relation-node small { margin-top: 4px; color: var(--muted); font-size: 9px; }
+.family-graph { width: 100%; max-height: 420px; border: 1px solid var(--line); border-radius: 12px; background: var(--soft); margin-top: 18px; }
+.family-node { cursor: pointer; }
+.family-node circle { fill: var(--lime); stroke: #fff; stroke-width: 3; }
+.family-node:hover circle { stroke: var(--green); }
+.family-node-fallback { fill: var(--mint); }
+.family-node-text { font-size: 11px; fill: var(--ink); text-anchor: middle; font-weight: 700; }
+.family-node-scope { font-size: 9px; fill: var(--muted); text-anchor: middle; }
+.family-edge { cursor: pointer; }
+.family-edge line { stroke: var(--muted); stroke-width: 2; stroke-dasharray: 5 4; }
+.family-edge:hover line { stroke: var(--green); }
+.family-edge-hit { fill: rgba(255, 255, 255, .92); stroke: var(--line); }
+.family-edge:hover .family-edge-hit { stroke: var(--green); }
+.family-edge-label { font-size: 11px; fill: var(--ink); text-anchor: middle; font-weight: 700; pointer-events: none; }
+.family-graph-toolbar { margin-top: 22px; }
+.relation-form { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.relation-form label { display: block; color: var(--muted); font-size: 10px; margin: 0; }
+.relation-form select, .relation-form input { display: block; width: 100%; box-sizing: border-box; margin-top: 6px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); font: inherit; }
+.relation-form .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
 .story-editor .chapter { display: flex; gap: 8px; padding: 6px 8px; }
 .chapter-open { min-width: 0; flex: 1; min-height: 40px; border: 0; background: transparent; display: grid; grid-template-columns: 25px 1fr 12px; gap: 8px; align-items: center; padding: 0 4px; text-align: left; color: var(--ink); cursor: pointer; }
 .chapter-open strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

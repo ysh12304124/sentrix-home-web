@@ -858,10 +858,14 @@ def split_face_cluster(cluster_id: str, payload: dict):
 
 
 @app.get("/api/relationships")
-def relationships(scope_id: str | None = None):
-    entities = store.list_entities(scope_id=scope_id)
-    values = store.list_relationships(scope_id=scope_id)
-    nodes = [{"id": entity["id"], "label": entity["canonical_name"], "status": entity["status"], "entity_type": entity["entity_type"]} for entity in entities]
+def relationships(scope_id: str | None = None, kind: str | None = None):
+    if kind == "person":
+        entities = [entity for entity in store.list_entities(scope_id=scope_id) if entity.get("entity_type") == "person"]
+        values = store.list_person_relationships(scope_id=scope_id)
+    else:
+        entities = store.list_entities(scope_id=scope_id)
+        values = store.list_relationships(scope_id=scope_id)
+    nodes = [{"id": entity["id"], "label": entity["canonical_name"], "status": entity["status"], "entity_type": entity["entity_type"], "scope_id": entity.get("scope_id") or "home-default"} for entity in entities]
     edges = [{"source": item["subject_entity_id"], "target": item["object_entity_id"], "label": item["predicate"], "status": item["status"], "id": item["id"]} for item in values]
     return {"nodes": nodes, "edges": edges, "relationships": values}
 
@@ -872,12 +876,29 @@ def create_relationship(payload: dict):
     if not all(required):
         raise HTTPException(status_code=400, detail="subject_entity_id, predicate and object_entity_id are required")
     value = store.create_relationship(*required, payload.get("evidence_ids") or [], float(payload.get("confidence", 0.5) or 0.5), payload.get("status", "pending"))
+    if value and value.get("status") == "active":
+        try:
+            store.maintain_relationship_claim(value)
+        except Exception:
+            pass
     return value
 
 
 @app.post("/api/relationships/{relationship_id}/confirm")
 def confirm_relationship(relationship_id: str):
     value = store.confirm_relationship(relationship_id)
+    if not value:
+        raise HTTPException(status_code=404, detail="relationship not found")
+    try:
+        store.maintain_relationship_claim(value)
+    except Exception:
+        pass
+    return value
+
+
+@app.post("/api/relationships/{relationship_id}/retract")
+def retract_relationship(relationship_id: str):
+    value = store.retract_relationship(relationship_id)
     if not value:
         raise HTTPException(status_code=404, detail="relationship not found")
     return value

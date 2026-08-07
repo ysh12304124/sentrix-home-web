@@ -4088,6 +4088,42 @@ class MemoryStore:
                 FROM relationships r JOIN entities s ON s.id = r.subject_entity_id JOIN entities o ON o.id = r.object_entity_id""" + (" WHERE r.scope_id = ?" if scope_id else "") + " ORDER BY r.updated_at DESC", (scope_id,) if scope_id else ())
         return [self._decode(row, ["evidence_ids_json"]) for row in rows]
 
+    def list_person_relationships(self, scope_id=None):
+        """Family graph edges: only relationships where both ends are person entities."""
+        scope_clause = " AND r.scope_id = ?" if scope_id else ""
+        rows = self._rows("""SELECT r.*, s.canonical_name AS subject_name, o.canonical_name AS object_name
+            FROM relationships r JOIN entities s ON s.id = r.subject_entity_id JOIN entities o ON o.id = r.object_entity_id
+            WHERE s.entity_type = 'person' AND o.entity_type = 'person' AND r.status != 'retracted'""" + scope_clause + " ORDER BY r.updated_at DESC", (scope_id,) if scope_id else ())
+        return [self._decode(row, ["evidence_ids_json"]) for row in rows]
+
+    def retract_relationship(self, relationship_id):
+        relationship = self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
+        if not relationship:
+            return None
+        self.connection.execute("UPDATE relationships SET status = 'retracted', updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), relationship_id))
+        self.connection.commit()
+        return self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
+
+    def maintain_relationship_claim(self, relationship):
+        """Write a user-confirmed relationship into the subject's semantic claims so
+        person profiles, knowledge and Agent recall can reference it."""
+        subject = self.get_entity(relationship.get("subject_entity_id")) or {}
+        object_entity = self.get_entity(relationship.get("object_entity_id")) or {}
+        predicate = str(relationship.get("predicate") or "").strip()
+        if not predicate or not subject or not object_entity:
+            return None
+        claim = self.maintain_semantic_claim(
+            person_id=subject["id"],
+            dimension="relationship",
+            predicate=predicate,
+            value_text=object_entity.get("canonical_name") or "家人",
+            evidence_ids=relationship.get("evidence_ids_json", []) or [],
+            confidence=float(relationship.get("confidence") or 0.75),
+            confidence_source="user-confirmed",
+        )
+        self.connection.commit()
+        return claim
+
     def create_relationship(self, subject_entity_id, predicate, object_entity_id, evidence_ids=None, confidence=0.5, status="pending"):
         evidence_ids = list(dict.fromkeys(evidence_ids or []))
         subject = self.get_entity(subject_entity_id)

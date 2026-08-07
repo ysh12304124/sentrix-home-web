@@ -181,7 +181,8 @@
     const activeSpace = visibleSpaces().find((space) => space.id === state.scopeId) || visibleSpaces()[0];
     const spaceOptions = visibleSpaces().map((space) => `<option value="${escapeHtml(space.id)}" ${space.id === state.scopeId ? "selected" : ""}>${escapeHtml(space.name || space.id)}</option>`).join("");
     const activeScopeLabel = activeSpace?.kind === "all" ? "三相册合并视图" : "独立相册空间";
-    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><label class="space-switcher"><span class="avatar tiny">S</span><span><b>当前相册</b><select id="space-select" aria-label="切换全部相册或独立相册">${spaceOptions}</select><small>${escapeHtml(activeScopeLabel)}</small></span></label><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav"><button class="nav-item ${state.view === "settings" ? "active" : ""}" data-view="settings">${icon("◌")}<span>设备与隐私</span></button><button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs"><span>Sentrix Home</span>${state.view !== "overview" ? `<b>/</b><strong>${escapeHtml(navItems.find((item) => item.id === state.view)?.label || "设备与隐私")}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>${escapeHtml(activeSpace?.name || "全部相册")}</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
+    const currentLabel = state.view === "settings" ? "设备与隐私" : (navItems.find((item) => item.id === state.view)?.label || "");
+    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><label class="space-switcher"><span class="avatar tiny">S</span><span><b>当前相册</b><select id="space-select" aria-label="切换全部相册或独立相册">${spaceOptions}</select><small>${escapeHtml(activeScopeLabel)}</small></span></label><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav"><button class="nav-item ${state.view === "settings" ? "active" : ""}" data-view="settings">${icon("◌")}<span>设备与隐私</span></button><button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs">${state.view !== "overview" ? `<button class="crumb-back" data-action="back">${icon("←")}返回</button><b>/</b>` : ""}<button data-action="home">Sentrix Home</button>${currentLabel ? `<b>/</b><strong>${escapeHtml(currentLabel)}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>${escapeHtml(activeSpace?.name || "全部相册")}</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
     renderView();
   }
 
@@ -536,10 +537,43 @@
       body = modal.invite ? `<div class="modal-kicker">FAMILY SPACE INVITE</div><h2>局域网邀请已生成</h2><p class="modal-lead">这是一个本地邀请 token。当前不会发送到云端或第三方服务。</p><code class="invite-code">${escapeHtml(modal.invite.invite_url)}</code><div class="modal-actions"><button class="button primary" data-action="close-modal">完成</button></div>` : `<form id="modal-form"><div class="modal-kicker">FAMILY SPACE</div><h2>生成家庭成员邀请</h2><label>邀请备注<input name="label" value="家庭成员" required /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">生成邀请</button></div></form>`;
     } else if (modal.type === "command") {
       body = `<form id="modal-form"><div class="modal-kicker">COMMAND</div><h2>打开一个工作区</h2><label>输入页面或问题<input name="command" autofocus placeholder="例如：时间线、资料库、搜索冰箱" /></label><div class="command-links">${navItems.map((item) => `<button type="button" class="button ghost" data-view="${item.id}">${item.label}</button>`).join("")}</div></form>`;
-    } else if (modal.type === "relation") {
-      const relationships = modal.graph?.relationships || [];
-      const candidateRows = relationships.map((item) => `<div class="fact-review-row"><div><strong>${escapeHtml(item.subject_name)} ${escapeHtml(item.predicate)} ${escapeHtml(item.object_name)}</strong><small>${escapeHtml(item.status)} · 置信度 ${Math.round((item.confidence || 0) * 100)}% · ${(item.evidence_ids_json || []).length} 条原始证据</small></div>${item.status === "pending" ? `<button class="button small primary" data-action="confirm-relationship" data-relationship-id="${escapeHtml(item.id)}">确认关系</button>` : ""}</div>`).join("");
-      body = `<div class="modal-kicker">RELATIONSHIP GRAPH</div><h2>实体关系图</h2><p class="modal-lead">候选只代表共现证据，不会自动推断亲属、同事等关系。确认后才会进入长期语义记忆。</p><div class="relation-graph">${modal.graph?.nodes?.length ? modal.graph.nodes.map((node) => `<div class="relation-node"><span class="avatar ${node.status === "confirmed" ? "green" : "gray"}">${escapeHtml((node.label || "?").slice(0, 1))}</span><strong>${escapeHtml(node.label)}</strong><small>${escapeHtml(node.status)}</small>${modal.graph.edges.filter((edge) => edge.source === node.id).map((edge) => `<em>${escapeHtml(edge.label)} · ${escapeHtml(edge.status)}</em>`).join("")}</div>`).join("") : emptyState("没有人物关系", "先确认人物实体，再创建关系候选。")}</div><div class="section-head"><div><p class="section-kicker">关系候选与证据</p><h3>${relationships.length} 条关系</h3></div></div><div class="fact-review-list">${candidateRows || emptyState("暂无关系候选", "确认人物在同一事件中出现后，系统会提示共同出现候选。")}</div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
+    } else if (modal.type === "family-graph") {
+      const graph = modal.graph || {};
+      const nodes = (graph.nodes || []).filter((node) => node.status === "confirmed");
+      const edges = (graph.edges || []).filter((edge) => nodes.some((node) => node.id === edge.source) && nodes.some((node) => node.id === edge.target));
+      const relById = new Map((graph.relationships || []).map((item) => [item.id, item]));
+      const personById = new Map(state.persons.filter((person) => person.confirmed).map((person) => [person.id, person]));
+      const editing = modal.editing || null;
+      const relationOptions = ["配偶", "丈夫", "妻子", "父亲", "母亲", "儿子", "女儿", "兄弟", "姐妹", "祖父", "祖母", "外祖父", "外祖母", "本人"];
+      const width = 620, height = 400, cx = 310, cy = 195, radius = 145;
+      const pos = new Map();
+      nodes.forEach((node, index) => {
+        const angle = (2 * Math.PI * index) / Math.max(nodes.length, 1) - Math.PI / 2;
+        pos.set(node.id, { x: Math.round(cx + radius * Math.cos(angle)), y: Math.round(cy + radius * Math.sin(angle)) });
+      });
+      const edgeEls = edges.map((edge) => {
+        const a = pos.get(edge.source), b = pos.get(edge.target);
+        if (!a || !b) return "";
+        const mx = Math.round((a.x + b.x) / 2), my = Math.round((a.y + b.y) / 2);
+        return `<g class="family-edge" data-action="edit-family-relation" data-relation-id="${escapeHtml(edge.id)}" tabindex="0" aria-label="编辑关系"><line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><rect class="family-edge-hit" x="${mx - 44}" y="${my - 12}" width="88" height="24" rx="9"/><text class="family-edge-label" x="${mx}" y="${my + 3}">${escapeHtml(edge.label)}</text></g>`;
+      }).join("");
+      const nodeEls = nodes.map((node, index) => {
+        const p = pos.get(node.id);
+        const person = personById.get(node.id);
+        const clipId = `family-clip-${index}`;
+        const avatarUrl = person?.avatar_face_instance_id ? `/api/face-instances/${encodeURIComponent(person.avatar_face_instance_id)}/crop` : "";
+        const img = avatarUrl ? `<image href="${escapeHtml(avatarUrl)}" x="${p.x - 20}" y="${p.y - 20}" width="40" height="40" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clipId})"/>` : `<circle class="family-node-fallback" cx="${p.x}" cy="${p.y}" r="20"/>`;
+        const scopeName = albumLabel(node.scope_id);
+        return `<clipPath id="${clipId}"><circle cx="${p.x}" cy="${p.y}" r="20"/></clipPath><g class="family-node" data-action="open-person-profile" data-person-id="${escapeHtml(node.id)}" tabindex="0" aria-label="打开人物档案"><circle cx="${p.x}" cy="${p.y}" r="26"/><text class="family-node-text" x="${p.x}" y="${p.y + 36}">${escapeHtml(node.label)}</text>${node.scope_id ? `<text class="family-node-scope" x="${p.x}" y="${p.y + 50}">${escapeHtml(scopeName)}</text>` : ""}${img}</g>`;
+      }).join("");
+      const graphBody = nodes.length >= 2
+        ? `<svg class="family-graph" viewBox="0 0 ${width} ${height}" role="img" aria-label="家庭关系图">${nodeEls}${edgeEls}</svg>`
+        : emptyState("至少需要两位已确认人物", "先在人物页确认两位以上的家庭成员，再建立家庭关系。");
+      const personOptions = nodes.map((node) => `<option value="${escapeHtml(node.id)}" ${editing && (editing.subject_entity_id === node.id || editing.object_entity_id === node.id) ? "selected" : ""}>${escapeHtml(node.label)}</option>`).join("");
+      const relationSelect = relationOptions.map((role) => `<option value="${escapeHtml(role)}" ${editing && editing.predicate === role ? "selected" : ""}>${escapeHtml(role)}</option>`).join("");
+      const relationRows = (graph.relationships || []).filter((item) => item.status !== "retracted").map((item) => `<div class="fact-review-row"><div><strong>${escapeHtml(item.subject_name)} ${escapeHtml(item.predicate)} ${escapeHtml(item.object_name)}</strong><small>${escapeHtml(item.status)} · 已由你维护</small></div><div class="review-actions"><button class="text-button" data-action="edit-family-relation" data-relation-id="${escapeHtml(item.id)}">编辑</button><button class="button small ghost" data-action="delete-family-relation" data-relation-id="${escapeHtml(item.id)}">删除</button></div></div>`).join("");
+      const form = nodes.length >= 2 ? `<form id="modal-form" class="relation-form"><label>人物A<select name="person_a" required>${personOptions}</select></label><label>家庭关系<select name="relation">${relationSelect}</select><input name="relation_custom" placeholder="或自定义关系，如：养父" value="${editing && !relationOptions.includes(editing.predicate) ? escapeHtml(editing.predicate) : ""}" /></label><label>人物B<select name="person_b" required>${personOptions}</select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="clear-relation-edit">取消</button><button type="submit" class="button primary">${editing ? "保存修改" : "添加关系"}</button></div></form>` : "";
+      body = `<div class="modal-kicker">FAMILY GRAPH</div><h2>家庭关系图</h2><p class="modal-lead">这里只显示你已确认的人物与家庭关系。关系写入后会进入本地记忆，家庭助手也能回忆这些关系。</p>${graphBody}<div class="family-graph-toolbar"><div class="section-head"><div><p class="section-kicker">维护家庭关系</p><h3>${editing ? "编辑关系" : "添加关系"}</h3></div></div>${form}<div class="section-head" style="margin-top:18px"><div><p class="section-kicker">已建立的关系</p><h3>${(graph.relationships || []).filter((item) => item.status !== "retracted").length} 条</h3></div></div><div class="fact-review-list">${relationRows || emptyState("还没有家庭关系", "从上方选择两个人并填写家庭角色，关系会出现在这张图上。")}</div></div>`;
     } else if (modal.type === "import-picker") {
       body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
@@ -549,7 +583,7 @@
     } else if (modal.type === "help") {
       body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在 153 本地运行。</span></div></div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
     }
-    root.innerHTML = `<div class="modal-backdrop"><div class="modal-panel"><button class="modal-close" data-action="close-modal" aria-label="关闭">×</button>${body}</div></div>`;
+    root.innerHTML = `<div class="modal-backdrop"><div class="modal-panel"><button class="modal-back" data-action="close-modal" aria-label="返回上一页">${icon("←")}返回</button><button class="modal-close" data-action="close-modal" aria-label="关闭">×</button>${body}</div></div>`;
   }
 
   function showToast(message) {
@@ -635,8 +669,31 @@
 
   function renderShellNavigation() { shell(); }
 
+  function navigate(view) {
+    const target = view || "overview";
+    if (state.view === target && !state.modal) return;
+    const nextHash = `#/${target}`;
+    if (window.location.hash !== nextHash) {
+      window.location.hash = nextHash;
+    } else {
+      state.view = target;
+      state.modal = null;
+      renderShellNavigation();
+    }
+  }
+
+  function goBack() {
+    if (window.history.length > 1) {
+      window.history.back();
+    } else {
+      state.view = "overview";
+      state.modal = null;
+      renderShellNavigation();
+    }
+  }
+
   function bindViewEvents() {
-    document.querySelectorAll("[data-view]").forEach((element) => element.addEventListener("click", () => { state.view = element.dataset.view; state.modal = null; renderShellNavigation(); }));
+    document.querySelectorAll("[data-view]").forEach((element) => element.addEventListener("click", () => { navigate(element.dataset.view); }));
     document.querySelectorAll("[data-query]").forEach((element) => element.addEventListener("click", () => { state.query = element.dataset.query; state.view = "search"; renderShellNavigation(); submitSearch(); }));
     document.querySelectorAll("[data-event-filter]").forEach((element) => element.addEventListener("click", () => { state.eventFilter = element.dataset.eventFilter; renderView(); }));
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
@@ -848,6 +905,26 @@
         renderShellNavigation();
         return;
       }
+      if (modal.type === "family-graph") {
+        const subject = String(form.get("person_a") || "").trim();
+        const object = String(form.get("person_b") || "").trim();
+        const predicate = String(form.get("relation_custom") || form.get("relation") || "").trim();
+        if (!subject || !object || !predicate) { state.toast = "请选择人物A、关系类型和人物B"; renderShellNavigation(); return; }
+        const scopeOf = (id) => (modal.graph?.nodes || []).find((node) => node.id === id)?.scope_id;
+        if (scopeOf(subject) && scopeOf(object) && scopeOf(subject) !== scopeOf(object)) {
+          state.toast = "保持相册隔离：这两个人物属于不同相册，请在同一相册内建立家庭关系";
+          renderShellNavigation(); return;
+        }
+        if (modal.editing) {
+          try { await window.sentrixApi.retractRelationship(modal.editing.id); } catch { /* 新关系直接创建 */ }
+        }
+        const created = await window.sentrixApi.createRelationship({ subject_entity_id: subject, predicate, object_entity_id: object, status: "active", confidence: 1 });
+        state.toast = `已保存家庭关系：${predicate}，并写入长期记忆`;
+        try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); state.modal = { type: "family-graph", graph }; } catch { state.modal = null; }
+        await refreshData({ silent: true });
+        renderShellNavigation();
+        return;
+      }
       state.modal = null;
       await refreshData({ forceRender: true });
       state.toast = state.toast || "已保存到本地记忆";
@@ -861,6 +938,8 @@
 
   async function handleAction(action, element) {
     if (action === "close-modal") { state.modal = null; renderShellNavigation(); return; }
+    if (action === "back") { state.modal = null; goBack(); return; }
+    if (action === "home") { state.modal = null; navigate("overview"); return; }
     if (action === "open-event") return openEvent(element.dataset.eventId);
     if (action === "edit-event") return openEvent(element.dataset.eventId, true);
     if (action === "open-asset") return openAsset(element.dataset.assetId);
@@ -886,6 +965,23 @@
     if (action === "confirm-fact") { await window.sentrixApi.confirmFact(element.dataset.fact); state.toast = "事实已确认并生成修订记录"; return refreshData(); }
     if (action === "reject-fact") { await window.sentrixApi.rejectFact(element.dataset.fact); state.toast = "事实已驳回并保留证据记录"; return refreshData(); }
     if (action === "confirm-relationship") { await window.sentrixApi.confirmRelationship(element.dataset.relationshipId); state.toast = "关系已确认并进入语义记忆"; return refreshData(); }
+    if (action === "edit-family-relation") {
+      const relation = (state.modal?.graph?.relationships || []).find((item) => item.id === element.dataset.relationId);
+      if (!relation) return;
+      const graph = state.modal.graph;
+      state.modal = null;
+      return openModal({ type: "family-graph", graph, editing: relation });
+    }
+    if (action === "delete-family-relation") {
+      try { await window.sentrixApi.retractRelationship(element.dataset.relationId); state.toast = "关系已删除，原始证据与修订记录保留"; } catch (error) { state.toast = `删除失败：${error.message}`; }
+      try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); state.modal = { type: "family-graph", graph }; } catch { state.modal = null; }
+      return renderShellNavigation();
+    }
+    if (action === "clear-relation-edit") {
+      const graph = state.modal?.graph;
+      state.modal = null;
+      return openModal({ type: "family-graph", graph });
+    }
     if (action === "invite") return openModal({ type: "invite" });
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "command") return openModal({ type: "command" });
@@ -920,11 +1016,23 @@
     if (action === "reject-entity-merge-candidate") { await window.sentrixApi.rejectEntityMergeCandidate(element.dataset.candidateId); state.toast = "已保留原有实体，不会再次显示同一归并候选"; return refreshData(); }
     if (action === "reload") return refreshData();
     if (action === "recheck") { await fetch("/api/maintenance/recheck", { method: "POST" }); state.toast = "已提交失败任务重试"; return refreshData(); }
-    if (action === "relationship-graph") { openModal({ type: "loading" }); const graph = await window.sentrixApi.relationships(); return openModal({ type: "relation", graph }); }
+    if (action === "relationship-graph") { openModal({ type: "loading" }); try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); return openModal({ type: "family-graph", graph }); } catch (error) { state.modal = null; state.toast = `无法读取家庭关系：${error.message}`; return renderShellNavigation(); } }
   }
 
+  const initialHash = window.location.hash.replace(/^#\/?/, "");
+  if (initialHash && (navItems.some((item) => item.id === initialHash) || initialHash === "settings")) {
+    state.view = initialHash;
+  }
   shell();
   refreshData();
+  window.addEventListener("hashchange", () => {
+    const hashView = window.location.hash.replace(/^#\/?/, "");
+    if (hashView && hashView !== state.view && (navItems.some((item) => item.id === hashView) || hashView === "settings")) {
+      state.view = hashView;
+      state.modal = null;
+      renderShellNavigation();
+    }
+  });
   window.setInterval(() => {
     if (document.visibilityState === "hidden" || isUserEditing()) return;
     refreshData({ silent: true });
