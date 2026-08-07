@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep runtime imports reproducible. User-site packages previously injected an
+# incompatible Transformers build into the AdaFace/PyTorch dependency graph.
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 python_bin="${SENTRIX_PYTHON:-$root/.venv/bin/python}"
 port="${SENTRIX_API_PORT:-8090}"
@@ -74,6 +78,10 @@ if [[ "$FACE_EMBEDDING_MODE" == "adaface" ]]; then
   fi
   if [[ ! -f "$ADAFACE_REPO_ROOT/net.py" ]]; then
     echo "AdaFace repository is unavailable: $ADAFACE_REPO_ROOT/net.py" >&2
+    exit 1
+  fi
+  if ! "$python_bin" -c 'import pytorch_lightning, torchmetrics' >/dev/null 2>&1; then
+    echo "AdaFace Python dependencies are unavailable; install backend/requirements.txt" >&2
     exit 1
   fi
 fi
