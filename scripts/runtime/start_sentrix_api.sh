@@ -39,11 +39,12 @@ export FACE_PROVIDERS="${FACE_PROVIDERS:-CUDAExecutionProvider,CPUExecutionProvi
 export SENTRIX_LLM_BACKEND="${SENTRIX_LLM_BACKEND:-vllm}"
 export SENTRIX_VLLM_BASE_URL="${SENTRIX_VLLM_BASE_URL:-http://127.0.0.1:8100/v1}"
 export SENTRIX_VLLM_MODEL="${SENTRIX_VLLM_MODEL:-gemma4-12b-it}"
+export SENTRIX_VLLM_REGISTRY="${SENTRIX_VLLM_REGISTRY:-$root/configs/sentrix_vllm_registry_192_168_0_153.json}"
 # Legacy Ollama settings are kept only for explicit SENTRIX_LLM_BACKEND=ollama fallback.
 export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11435}"
 export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:12b}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
-export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8100}"
+export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8101}"
 # 153 GPU driver/library NVML mismatch breaks the CUDA caching allocator; run
 # CLIP embedding on CPU so visual/text recall stays available.
 export CLIP_DEVICE="${CLIP_DEVICE:-cpu}"

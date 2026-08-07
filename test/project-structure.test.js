@@ -48,6 +48,7 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   assert.match(source, /127\.0\.0\.1:8091/, "web must use the Agent-capable API by default");
   assert.match(source, /\/api\/model-profiles\/switch/);
   assert.match(source, /1_000_000/, "model switching must outlive the vLLM ready timeout");
+  assert.match(source, /cache-control.*no-cache/s, "static assets must be revalidated after UI fixes");
 });
 
 test("settings exposes the four benchmark model profiles through the switch API", () => {
@@ -63,6 +64,24 @@ test("settings exposes the four benchmark model profiles through the switch API"
   assert.match(apiSource, /switchModelProfile/);
   assert.match(apiSource, /\/api\/model-profiles\/switch/);
   assert.match(appSource, /switchModelProfile\(target\)/);
+  assert.match(appSource, /current\.status === "running"/);
+  assert.match(appSource, /未托管模型/);
+  assert.match(appSource, /当前运行/);
+  assert.match(appSource, /document\.addEventListener\("change"/);
+  assert.doesNotMatch(appSource, /\["gemma4:12b", "gemma4-12b-it"\]/, "an env default must not be presented as a running profile");
+
+  const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
+  assert.match(backendSource, /_managed_vllm_state/);
+  assert.match(backendSource, /verify_service=True/);
+  assert.match(backendSource, /runtime verification failed/);
+  assert.match(backendSource, /runtime\.get\("profile"\)/);
+});
+
+test("legacy E2B service does not occupy the managed vLLM port", () => {
+  const e2bScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_e2b.sh"), "utf8");
+  const apiScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_api.sh"), "utf8");
+  assert.match(e2bScript, /E2B_PORT:-8101/);
+  assert.match(apiScript, /E2B_BASE_URL:-http:\/\/127\.0\.0\.1:8101/);
 });
 
 test("portal exposes all optimized album scopes and labels their evidence", () => {

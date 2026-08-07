@@ -25,7 +25,7 @@ class E2BBackendTests(unittest.TestCase):
     def test_default_base_url_fallback(self):
         with patch.dict("os.environ", {}, clear=True):
             b = E2BBackend()
-            self.assertEqual(b.endpoint, "http://127.0.0.1:8100")
+        self.assertEqual(b.endpoint, "http://127.0.0.1:8101")
 
     @patch("backend.model_clients.httpx.post")
     def test_chat_sends_ollama_shape_payload(self, post):

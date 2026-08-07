@@ -8,7 +8,7 @@ E2B LoRA 模型服务器，兼容 Ollama `/api/chat` 协议。
 scripts/runtime/start_sentrix_e2b.sh
 ```
 
-默认监听 `127.0.0.1:8100`，可通过 `E2B_HOST` / `E2B_PORT` 环境变量覆盖。
+默认监听 `127.0.0.1:8101`，可通过 `E2B_HOST` / `E2B_PORT` 环境变量覆盖。`8100` 保留给统一的 vLLM profile manager。
 
 ## 环境变量
 
@@ -19,7 +19,7 @@ scripts/runtime/start_sentrix_e2b.sh
 | `E2B_DTYPE` | `bf16` |
 | `E2B_DEVICE_MAP` | `auto` |
 | `E2B_HOST` | `127.0.0.1` |
-| `E2B_PORT` | `8100` |
+| `E2B_PORT` | `8101` |
 
 ## API
 

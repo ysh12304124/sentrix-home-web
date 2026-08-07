@@ -291,7 +291,7 @@ class E2BBackend:
     model_name = "gemma-4-e2b-it+lora-v2"
 
     def __init__(self, base_url=None, timeout=None):
-        self._base_url = (base_url or os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100")).rstrip("/")
+        self._base_url = (base_url or os.getenv("E2B_BASE_URL", "http://127.0.0.1:8101")).rstrip("/")
         self.timeout = timeout or float(os.getenv("E2B_TIMEOUT_SECONDS", "300"))
         self.model_name = os.getenv("E2B_MODEL_NAME", "gemma-4-e2b-it+lora-v2")
 

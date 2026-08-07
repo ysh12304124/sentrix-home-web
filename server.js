@@ -65,7 +65,10 @@ function serveFile(req, res, url) {
       if (error.code === "ENOENT") return serveFile(req, res, new URL("/index.html", "http://localhost"));
       return json(res, 500, { error: "Unable to read file" });
     }
-    res.writeHead(200, { "content-type": contentTypes[path.extname(filePath)] || "application/octet-stream" });
+    res.writeHead(200, {
+      "content-type": contentTypes[path.extname(filePath)] || "application/octet-stream",
+      "cache-control": "no-cache",
+    });
     res.end(data);
   });
 }

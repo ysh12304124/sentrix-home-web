@@ -106,13 +106,13 @@ def _check_ollama_health():
 def _check_e2b_health():
     try:
         import httpx
-        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
+        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8101").rstrip("/")
         response = httpx.get(f"{url}/api/health", timeout=10)
         response.raise_for_status()
         data = response.json()
         return {"available": data.get("status") == "ok", "url": url, "loaded": data.get("loaded", False), "model": data.get("model", ""), "error": data.get("error")}
     except Exception as exc:
-        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100"), "error": str(exc)}
+        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8101"), "error": str(exc)}
 
 
 def _fire_and_forget_post(url, payload):
@@ -125,7 +125,7 @@ def _fire_and_forget_post(url, payload):
 
 def _schedule_backend_transition(backend_name):
     if backend_name == "e2b_lora":
-        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
+        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8101").rstrip("/")
         threading.Thread(target=_fire_and_forget_post, args=(f"{e2b_url}/admin/load", {}), daemon=True).start()
 
 
@@ -235,15 +235,43 @@ def _profile_summary(profile_id, profile):
     }
 
 
-def _current_model_runtime():
-    registry = _load_vllm_registry()
+def _managed_vllm_state(registry, verify_service=False):
     state = _load_vllm_state(registry)
+    if not state:
+        return None, "unmanaged", "vLLM manager has no current state"
+    try:
+        pid = int(state.get("pid"))
+    except (TypeError, ValueError):
+        return None, "stale", "managed state has no valid pid"
+    if not Path(f"/proc/{pid}").exists():
+        return None, "stale", f"managed vLLM pid {pid} is not running"
+    if verify_service:
+        try:
+            import httpx
+            port = int(state.get("port") or registry.get("default_port") or 8100)
+            response = httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=5)
+            response.raise_for_status()
+            models = {str(item.get("id")) for item in response.json().get("data") or []}
+            served_name = str(state.get("served_model_name") or "")
+            if served_name not in models:
+                return None, "mismatch", f"managed endpoint does not serve {served_name}"
+        except Exception as error:
+            return None, "unreachable", f"managed vLLM endpoint is unavailable: {error}"
+    return state, "running", None
+
+
+def _current_model_runtime(verify_service=False):
+    registry = _load_vllm_registry()
+    state, status, error = _managed_vllm_state(registry, verify_service=verify_service)
     return {
         "backend": getattr(gamma, "backend", "unknown"),
         "base_url": gamma.base_url,
-        "model": gamma.model,
+        "model": (state or {}).get("served_model_name") or gamma.model,
         "profile": (state or {}).get("profile"),
         "state": state,
+        "status": status,
+        "managed": status == "running",
+        "error": error,
     }
 
 
@@ -269,7 +297,7 @@ def _run_vllm_switch(request: ModelSwitchRequest):
     profile = (registry.get("profiles") or {}).get(request.profile)
     if not profile:
         raise HTTPException(status_code=404, detail="model profile not found")
-    command = [str(VLLM_MANAGER), "switch", request.profile]
+    command = [str(VLLM_MANAGER), "--registry", str(VLLM_REGISTRY), "switch", request.profile]
     option_map = {
         "max_model_len": "--max-model-len",
         "max_num_seqs": "--max-num-seqs",
@@ -304,7 +332,17 @@ def _run_vllm_switch(request: ModelSwitchRequest):
             "stdout": completed.stdout[-4000:],
             "stderr": completed.stderr[-4000:],
         })
-    runtime = _current_model_runtime() if request.dry_run else _apply_vllm_profile_to_runtime(request.profile, profile)
+    if request.dry_run:
+        runtime = _current_model_runtime(verify_service=True)
+    else:
+        _apply_vllm_profile_to_runtime(request.profile, profile)
+        runtime = _current_model_runtime(verify_service=True)
+        if runtime.get("profile") != request.profile or runtime.get("status") != "running":
+            raise HTTPException(status_code=502, detail={
+                "message": "vLLM switch completed but runtime verification failed",
+                "requested_profile": request.profile,
+                "runtime": runtime,
+            })
     return {
         "accepted": True,
         "profile": request.profile,
@@ -464,14 +502,14 @@ def model_profiles():
         "backend": "vllm",
         "registry": str(VLLM_REGISTRY),
         "manager": str(VLLM_MANAGER),
-        "current": _current_model_runtime(),
+        "current": _current_model_runtime(verify_service=True),
         "profiles": [_profile_summary(profile_id, profile) for profile_id, profile in profiles.items()],
     }
 
 
 @app.get("/api/model-profiles/current")
 def current_model_profile():
-    return _current_model_runtime()
+    return _current_model_runtime(verify_service=True)
 
 
 @app.post("/api/model-profiles/switch")
