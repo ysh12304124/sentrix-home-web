@@ -1296,7 +1296,17 @@ class MemoryStore:
             time_score = 0.25
         locations = {item["location"] for item in event_anchors if item["location"]}
         visual_places = {item["visual_place"] for item in event_anchors if item["visual_place"]}
-        location_score = 1.0 if anchor["location"] and anchor["location"] in locations else 0.0
+        # GPS distance matching: nearby coordinates (<= 0.5 km) count as the
+        # same place even when the six-decimal strings differ slightly.
+        location_score = 0.0
+        if anchor.get("gps"):
+            for item in event_anchors:
+                item_gps = item.get("gps")
+                if item_gps and gps_distance_km(anchor["gps"], item_gps) <= 0.5:
+                    location_score = 1.0
+                    break
+        elif anchor["location"] and anchor["location"] in locations:
+            location_score = 1.0
         visual_place_score = 1.0 if anchor["visual_place"] and anchor["visual_place"] in visual_places else 0.0
         event_type = anchor["visual_event_type"]
         event_types = {item["visual_event_type"] for item in event_anchors if item["visual_event_type"]}
@@ -1304,8 +1314,9 @@ class MemoryStore:
         activity = str(observation.get("activity") or "").lower()
         existing_activity = str(event.get("activity") or "").lower()
         activity_score = 0.9 if activity and existing_activity and (activity == existing_activity or activity in existing_activity or existing_activity in activity) else 0.0
-        if activity and existing_activity and not activity_score and event_type and event_type not in event_types:
-            activity_score = -0.8
+        # Different activity phrasing across photos of the same event is normal
+        # (e.g. "拍照" vs "摆花"); never penalise it, otherwise GPS/time matches
+        # still fail to merge a single event into one cluster.
         object_sets = [self._tokens(self.get_observation(item["observation_id"]).get("objects")) for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (event["id"],))]
         objects = self._tokens(observation.get("objects"))
         object_score = 0.8 if objects and any(objects.intersection(values) for values in object_sets) else 0.0
@@ -1525,9 +1536,11 @@ class MemoryStore:
     def _event_anchor(self, observation):
         observation = observation or {}
         asset = self.get_asset(observation.get("asset_id")) or {}
+        captured_location = (asset.get("captured_location") or "").strip().lower()
         return {
             "captured_at": asset.get("captured_at") or observation.get("captured_at"),
-            "location": (asset.get("captured_location") or "").strip().lower(),
+            "location": captured_location,
+            "gps": parse_gps_place(captured_location),
             "visual_place": (observation.get("place") or "").strip().lower(),
             "visual_event_type": (observation.get("event_type") or "").strip().lower(),
         }

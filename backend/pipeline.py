@@ -279,6 +279,10 @@ class IngestionPipeline:
         self.store.upsert_vector("semantic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
         if event_id:
             self.store.upsert_vector("episodic", "event", event_id, embedding, self.clip.model_name, {"observation_id": observation_id})
+            event = self.store.get_event(event_id) or {}
+            visual_place = self.store._event_display_place(observation)
+            if visual_place and str(event.get("place") or "") in {"", "其他或不确定"}:
+                self.store.update_event(event_id, {"place": visual_place})
             if summarize_event:
                 self.summarize_event(event_id)
         return self.store.update_asset(asset_id, "processed", {"semantic_status": "complete", "entity_ids": entity_ids, "semantic_enrichment_seconds": round(time.perf_counter() - started_at, 4)})
