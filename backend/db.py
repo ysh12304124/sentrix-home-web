@@ -1344,10 +1344,15 @@ class MemoryStore:
             max(0.0, min(1.0, (visual_similarity - 0.70) / 0.30))
             if visual_available else 0.0
         )
+        # Strong spatio-temporal prior: photos taken almost at the same time and
+        # place are very likely the same event even when their semantic labels
+        # differ (e.g. "户外集会" vs "节日庆典" on the same street 1 minute apart).
+        spatio_temporal_bonus = 0.20 if time_score >= 0.90 and location_score >= 0.90 else 0.0
         total = (
             0.25 * time_score + 0.25 * location_score + 0.15 * visual_place_score
             + 0.05 * event_type_score + 0.20 * activity_score
             + 0.05 * object_score + 0.20 * person_score + 0.05 * visual_boost
+            + spatio_temporal_bonus
         )
         if split_guard:
             total = 0.0

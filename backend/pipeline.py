@@ -338,8 +338,7 @@ class IngestionPipeline:
                 result = fallback_projection()
             title = str(result.get("title") or "").strip()
             summary = str(result.get("summary") or "").strip()
-            if label and title and label not in title:
-                title = f"{label} · {title}"
+            # GPS place goes into the event description, not the title.
             if label and summary and label not in summary:
                 summary = f"{label}，{summary}"
             updated = self.store.update_event(event_id, {
@@ -356,8 +355,7 @@ class IngestionPipeline:
             result = fallback_projection()
             title = str(result.get("title") or "").strip()
             summary = str(result.get("summary") or "").strip()
-            if label and title and label not in title:
-                title = f"{label} · {title}"
+            # GPS place goes into the event description, not the title.
             if label and summary and label not in summary:
                 summary = f"{label}，{summary}"
             updated = self.store.update_event(event_id, {
