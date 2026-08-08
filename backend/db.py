@@ -1296,15 +1296,19 @@ class MemoryStore:
             time_score = 0.25
         locations = {item["location"] for item in event_anchors if item["location"]}
         visual_places = {item["visual_place"] for item in event_anchors if item["visual_place"]}
-        # GPS distance matching: nearby coordinates (<= 0.5 km) count as the
-        # same place even when the six-decimal strings differ slightly.
+        # GPS distance scoring: linear decay from 1.0 at 0 km to 0.0 at 2 km,
+        # taking the closest anchor. Same-event photos often drift ~1 km apart,
+        # so a hard threshold would miss them.
         location_score = 0.0
         if anchor.get("gps"):
             for item in event_anchors:
                 item_gps = item.get("gps")
-                if item_gps and gps_distance_km(anchor["gps"], item_gps) <= 0.5:
-                    location_score = 1.0
-                    break
+                if not item_gps:
+                    continue
+                distance = gps_distance_km(anchor["gps"], item_gps)
+                score = max(0.0, 1.0 - distance / 2.0)
+                if score > location_score:
+                    location_score = score
         elif anchor["location"] and anchor["location"] in locations:
             location_score = 1.0
         visual_place_score = 1.0 if anchor["visual_place"] and anchor["visual_place"] in visual_places else 0.0
