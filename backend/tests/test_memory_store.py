@@ -58,6 +58,48 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(event["place"], "餐厅")
         self.assertNotIn("30.2458", event["place"])
 
+    def test_refresh_event_summary_keeps_gps_prefix_and_visual_place(self):
+        asset = self.store.create_asset(
+            "geo_asset",
+            "toy.jpg",
+            "image",
+            "/tmp/toy.jpg",
+            metadata={
+                "captured_at": "2026-07-12T15:53:10",
+                "captured_location": "22.532533,114.057664",
+                "reverse_geocode": {
+                    "source": "tianditu",
+                    "label": "广东省深圳市福田区",
+                    "province": "广东省",
+                    "city": "深圳市",
+                    "district": "福田区",
+                    "country": "CN",
+                },
+            },
+        )
+        observation = self.store.add_observation(asset["id"], {
+            "captured_at": "2026-07-12T15:53:10",
+            "place": "室内柜台前",
+            "activity": "拿着玩具枪拍照",
+            "event_type": "人物照",
+            "caption": "一名小女孩拿着玩具步枪",
+        })
+        event = self.store.merge_observation_into_event(observation)
+        person = self.store.create_entity("杨思淇", "person", "confirmed", confidence=1.0)
+        self.store.upsert_event_participant(event["id"], person["id"], "visible_subject", [observation["id"]], 0.9)
+        # Simulate fast-path leftover placeholder before refresh.
+        self.store.connection.execute(
+            "UPDATE events SET place = ?, summary = ? WHERE id = ?",
+            ("其他或不确定", "在深圳市福田区，一名小女孩在室内柜台前拿着玩具步枪拍照。", event["id"]),
+        )
+        self.store.connection.commit()
+
+        refreshed = self.store.refresh_event_summary(event["id"])
+
+        self.assertEqual(refreshed["place"], "室内柜台前")
+        self.assertTrue(refreshed["summary"].startswith("在深圳市福田区，"))
+        self.assertIn("杨思淇在室内柜台前参与拿着玩具枪拍照", refreshed["summary"])
+
     def test_naive_capture_time_is_normalized_before_event_comparison(self):
         naive = parse_time("2018-06-28T12:16:02")
         aware = parse_time("2018-06-28T12:16:02+00:00")
