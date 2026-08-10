@@ -1,25 +1,17 @@
 (function () {
   const app = document.getElementById("app");
-  const benchmarkModelProfiles = [
-    { id: "gemma4-12b-it", label: "Gemma-4-12B (默认)" },
-    { id: "gemma4-e2b-it", label: "Gemma-4-E2B 蒸馏前" },
-    { id: "gemma4-e2b-it-lora-v2", label: "Gemma-4-E2B 蒸馏后+LoRA" },
-    { id: "qwen3.5-0.8b-it", label: "Qwen-3.5-0.8B" },
-    { id: "qwen3-instruct", label: "Qwen-3-4B Instruct" },
-    { id: "qwen3-8b", label: "Qwen-3-8B" },
-  ];
-
+  // dynamic profiles from API, no hardcoded list
   function modelProfileOptions(payload) {
-    const profiles = new Map((payload?.profiles || []).map((profile) => [profile.id, profile]));
+    const profiles = payload?.profiles || [];
     const current = payload?.current || {};
     const candidate = String(current.profile || "");
-    const active = current.status === "running" && benchmarkModelProfiles.some((profile) => profile.id === candidate) ? candidate : "";
-    const models = Object.fromEntries(benchmarkModelProfiles.map(({ id, label }) => {
-      const profile = profiles.get(id);
+    const active = current.status === "running" ? candidate : "";
+    const models = Object.fromEntries(profiles.map((profile) => {
+      const id = profile.id;
       return [id, {
-        available: Boolean(profile?.available),
+        available: Boolean(profile.available),
         loaded: id === active,
-        model: label,
+        model: profile.served_model_name || id,
         url: id === active ? current.base_url : "vLLM profile",
       }];
     }));
@@ -27,7 +19,7 @@
       backend: active,
       status: current.status || "unmanaged",
       error: current.error || "",
-      available_backends: benchmarkModelProfiles.map((profile) => profile.id),
+      available_backends: profiles.map((profile) => profile.id),
       models,
     };
   }
