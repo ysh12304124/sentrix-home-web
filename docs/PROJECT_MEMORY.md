@@ -12,7 +12,8 @@
 - 不记录密码、令牌、`.env` 内容、原始家庭身份数据、临时提示词或未经验证指标。
   数据库备份、模型缓存、日志和 `.ollama-sentrix/` 属于运行状态，不进入 Git。
 - `README.md` 只保存运行入口与本文档链接；设计和实施计划保存于
-  `docs/superpowers/`，历史实现由 Git 历史保存，不再维护第二份当前架构文档。
+  `docs/superpowers/`，阶段验收报告与实测 JSON 保存于 `docs/baseline/`，历史实现
+  由 Git 历史保存，不再维护第二份当前架构文档。
 
 ## 产品定义
 
@@ -31,80 +32,103 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
    人物语义事实。
 4. 相册归属仅是来源证据，不是画面人物、家庭角色、关系或事件分组信号。
 5. 图片查询必须返回可打开的原始 Asset，不得只输出文件名或用生成缩略图替代证据。
+6. 家庭记忆助手以自然对话和长期家庭记忆为中心：先判断普通聊天、记忆查询、
+   反馈/纠正或澄清，再按需调取分层记忆；只有输出家庭具体事实时才附带来源评分
+   与可展开证据。无证据时输出 `gap`/`no_result`，不编造。
 
-## 当前基线
-
-### 2026-08-05 Thin Agent 执行状态
-
-- 执行依据为 `/Users/rm001/Downloads/Sentrix_Thin_Agent与证据检索内核_完整执行计划表.md`；原始规格不覆盖。
-- 本地实现副本为 `psh` 分支的 `/Users/rm001/Sentrix-Thin-Agent-work-20260805`，基线提交为 `fa4e583`，开始实现前工作树干净。
-- 阶段 0 已确认本地 Git 基线和代码边界；153 SSH 短名当前解析到不可达地址，远端 schema、服务健康和真实回放必须在网络恢复后重新核验。
-- 当前任务只改 Agent、证据检索、查询解析、回答约束、测试和相关文档；不修改图片记忆生成语义，不操作 FMA `5173`。
-- 计划中的后续接口替换可能与本任务并行；合并前必须以实际 diff 为准，不能覆盖未提交改动。
-- 计划使用的 Project Memory MCP 在本会话工具列表中不可用，因此本文件作为仓库内交接记录；恢复 MCP 后需补写同一阶段的结构化记忆。
+## 当前基线（2026-08-10 实测）
 
 - 153 仓库：`/home/asus/Github/Sentrix-Home-Web`
 - 正式后端提交分支：`psh`
-- 当前提交：`d588c53` (`perf: accelerate core image semantics`，2026-08-03)。
+- 当前提交：`15039f0` (`fix(api): scope dedup in /api/ingest (same album only, not cross-space)`，2026-08-10)
 - 当前工作树：干净。
-- Web：`http://192.168.0.153:4174`
-- API：端口 `8090`
-- FMA Web：端口 `5173`，与 Sentrix 无关，禁止停止、修改或重启。
+- Web：`http://192.168.0.153:4174`，代理 `http://127.0.0.1:8091`
+- 生产 Agent API：`8090`、`8091`（同一 Thin Agent 全栈 + 同一 `data/sentrix.db`）
+- RX 验证实例：`127.0.0.1:8092`（`SENTRIX_RX_V1=1` + `SENTRIX_12B_FULL_CHAIN_VALIDATION=1` + `AGENT_MODEL_PROFILE=quality_12b`）
+- Ollama RX 实例：`127.0.0.1:8096`（`SENTRIX_RX_V1=1` + `AGENT_MODEL_PROFILE=quality_12b`）
+- 本地开发栈（`/home/asus/Github/ysh/sentrix-home-web`）：`11000` Web / `11001` API
+- 主模型：vLLM `gemma4-12b-it`，`127.0.0.1:8100`（生产默认）
+- E2B LoRA 服务：`127.0.0.1:8101`（可选，默认不启用）
+- FMA Web：端口 `5173`，与 Sentrix 无关，禁止停止、修改或重启；本次检查未监听
 - 当前数据库：`/home/asus/Github/Sentrix-Home-Web/data/sentrix.db`
 - 视频只保留 `VideoMemoryAdapter` 接口；未实现视频解码、关键帧、时序 Observation、
   视频向量和视频事件。
 
 ## 模型与运行隔离
 
-Sentrix 使用项目独立 Ollama：`127.0.0.1:11435`。共享系统 Ollama 位于
-`127.0.0.1:11434`，属于其他项目，禁止修改或停止。
+生产推理使用 vLLM，模型 profile 由 vLLM registry 单例管理；旧 Ollama 专用监听
+`11435` 当前未运行，环境变量保留为兼容。
 
-- 主多模态模型：`gemma4:12b`。
+- 主 VLM/LLM：vLLM `gemma4-12b-it`；模型 `/home/asus/models/gemma-4-12B-it`；
+  `dtype=bf16` + bitsandbytes 4-bit；`max_model_len=4096`；`max_num_seqs=4`；
+  `gpu_memory_utilization=0.68`；OpenAI 兼容端点 `http://127.0.0.1:8100/v1`。
+- vLLM registry：`configs/sentrix_vllm_registry_192_168_0_153.json`。profiles 包括
+  `gemma4-12b-it`、`gemma4-e2b-it`、`gemma4-e2b-it-lora-v2`、`qwen3-instruct` 等；
+  切换管理器 `/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py`，`--wait-ready`
+  等待端点就绪后才激活；`/api/model-profiles/switch` 为唯一切换入口（单例锁）。
+- 图像向量：Chinese-CLIP（`SENTRIX_IMAGE_EMBEDDER=chinese_clip`）。
+- 文本向量：CLIP `ViT-B-32`（`SENTRIX_TEXT_EMBEDDER=clip`）。
 - 语音：FunASR，`paraformer-zh`、`fsmn-vad`、`ct-punc`。
 - 人脸检测及关键点：InsightFace `buffalo_l`。
 - 人脸身份向量：AdaFace `ir_50`；权重路径：
   `/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt`。
-- 视觉向量：CLIP `ViT-B-32`；当前数据库图像向量为 512 维。
-- Sentrix 进程必须设置：`OLLAMA_BASE_URL=http://127.0.0.1:11435`、
-  `OLLAMA_MODEL=gemma4:12b`；生产默认 `OLLAMA_KEEP_ALIVE=-1`，让专用 12B
-  模型常驻以避免每次请求重复加载。
-- `keep_alive=-1` 要发送为数值而不是字符串；模型约占 6.9 GB VRAM。长任务前仍需
-  检查 `11434` 和 `11435` 的 `/api/ps`，确保专用模型不会与其他项目争抢显存；当前
-  `11435` 无常驻模型。
-- 2026-07-30 已验证独立运行器识别 RTX 3090，并将 Gemma `49/49` 层卸载至
-  `CUDA0`。`nvidia-smi` 受 NVML 用户态/内核版本不一致影响不可用；以 Ollama CUDA
-  运行日志作为 GPU 验证来源。
-- 当前 API health 显示 AdaFace、`buffalo_l`、FunASR、CLIP ready。health 字段
-  `gamma4_12B` 是历史命名，实际配置模型为 `gemma4:12b`。
-- `scripts/runtime/start_sentrix_api.sh` 在进程启动前配置 NVIDIA pip runtime
-  动态库，并优先使用 `CUDAExecutionProvider`。当前正式 `8090` 仍为旧直接
-  `uvicorn` 进程；切换须在维护窗口执行。
+- 逆地理：PyGeoCN（天地图行政边界数据）离线返回省/市/区，不联网。
+- 可选 E2B LoRA：`services/e2b_server`，默认 `127.0.0.1:8101`
+  （`gemma-4-E2B-it` + `gemma-4-e2b-lora-v2/artifacts/lora/V2_student_step47`）。
+- 共享 Ollama `127.0.0.1:11434` 属于其他项目，禁止修改或停止；当前运行中且
+  `/api/ps` 无模型。
+- 专用 Ollama `127.0.0.1:11435`：启动脚本仍保留 `OLLAMA_BASE_URL` /
+  `OLLAMA_MODEL=gemma4:12b` / `OLLAMA_KEEP_ALIVE=-1` 环境变量，但当前未运行。
+- 硬件：RTX 3090 24GB（12B-FC 修复后 Driver 595.84 / CUDA 13.2）。
+- `nvidia-smi` 受 NVML 用户态/内核版本不一致影响不可用；以 Ollama/vLLM 运行日志与
+  `/api/model-profiles` 状态作为 GPU/模型验证来源。
 
 ## 仓库结构
 
 ```text
-backend/                 FastAPI、SQLite、处理管线、模型适配器、聚类和 Python 测试
-src/                     浏览器端 JavaScript、API 包装器和样式
-scripts/runtime/         运行时工具，例如独立 Ollama 启动器
-scripts/maintenance/     显式、耗时或可能破坏数据的维护命令
-scripts/benchmarks/      只读评估和家庭基准交集生成工具
-scripts/fixtures/        可复现公开测试资料和元数据生成器
-test/                    Node 前端与目录结构回归测试
-docs/                    本文档和已批准的设计/实施记录
-server.js                静态文件服务与同源 `/api/*` 代理
+backend/             FastAPI + Thin Agent 运行时 + 记忆库
+  app.py             路由与编排
+  thin_agent.py      回答入口 answer_turn
+  router.py          确定性最终路由（8 步决策树 + NeutralProbe）
+  query_parser.py    12B 开放词表解析（sanitize/repair/回退）
+  query_contracts.py QuerySpec 契约（HARD/SEMANTIC/PREFERENCE）
+  model_routing.py   角色路由、RequestDeadline、circuit breaker
+  evidence_retrieval.py  六路检索内核
+  retrieval/         通道与融合（metadata/entity/FTS5/visual/text/adjacency、加权 RRF）
+  retrieval_ann.py    HNSW ANN 索引
+  retrieval_indexes.py 派生检索投影重建
+  embeddings/        视觉/文本 embedder 与路由
+  answer_brief.py    检索 -> 受控 AnswerBrief 边界
+  answer_composer.py 最终回答组装
+  response_plan.py / response_validator.py / response_writer.py
+  structured_memory.py  确定性结构化回答执行器（TFPE）
+  task_contracts.py  只读工具计划与白名单
+  core_memory.py     核心记忆卡片（agent_core_memory_*）
+  memory_corrections.py 纠正提议/授权修订（agent_memory_correction_*）
+  advanced_memory_tools.py 进阶记忆工具（EvidencePacket）
+  claim_extractor.py / complex_answer.py / narrative_context.py
+  visible_evidence.py / memory_gate.py / agent_annotations.py
+  geocoding.py       PyGeoCN 离线逆地理
+  model_clients.py   vLLM/CLIP/AdaFace/FunASR 适配器
+  db.py / pipeline.py / face_embeddings.py / face_clustering.py / person_appearance.py
+  validation/        full_chain_profile、model_call_ledger
+services/e2b_server/ E2B LoRA 模型服务器（Ollama 兼容，8101）
+configs/sentrix_vllm_registry_192_168_0_153.json
+scripts/runtime/     API/Web/Ollama/E2B 启动脚本（8090/8091/8092/8096 等实例）
+scripts/benchmarks/  只读评估（parser slots、hidden、latency、E2E、12B-FC、结构化 QA）
+scripts/maintenance/ 重建、索引投影、GPS 回填等运维脚本
+docs/baseline/       阶段验收报告与实测 JSON（Thin Agent、R7-R9、12B-FC、RX、benchmark）
+docs/plans/          长期计划（semantic-entity-roadmap、digital-memory-steward）
+docs/superpowers/    设计与实施计划
 ```
-
-`server.js` 只代理到 `backend.app`，不包含 mock API、Cognee 回退或第二套记忆实现。
-`backend.app` 与 `MemoryStore` 是唯一 HTTP 和持久化权威边界。
 
 ## 数据模型与证据链
 
-基础证据链：
-
 ```text
-MemorySpace
-  -> Asset -> Observation -> Event -> Person/Entity -> SemanticClaim/Profile
-       \_________________________ 原始证据 __________________________/
+MemorySpace -> Asset -> Observation -> FaceInstance / MemoryVector
+                                  -> Event / EventParticipant
+                                  -> SemanticProfile / SemanticClaim / Relationship
+                                  -> Agent recall（证据校验后回答）
 ```
 
 人物外观声明要求更强证据链：
@@ -114,285 +138,272 @@ Asset -> Observation -> FaceInstance -> PersonAppearanceEvidence -> SemanticClai
                              \-> 已确认 Person -> Event
 ```
 
-基准相册使用人物事件投影：
-
-```text
-MemorySpace / Household
-  -> Asset -> Observation -> Event
-  -> PersonEventMemory
-  -> PersonPattern / SemanticClaim
-  -> 原始 Asset 或 FaceInstance 证据
-```
-
 | 对象 | 责任 | 下游用途 |
 | --- | --- | --- |
-| `memory_spaces` | 记录家庭或基准相册空间与来源 | 隔离全部读写与检索 |
-| `assets` | 原始文件、SHA-256、时间地点、允许来源 | 文件访问、处理、证据 UI |
+| `memory_spaces` / `ingest_batches` | 空间与导入批次 | 隔离全部读写与检索；批次完成后再总结事件 |
+| `assets` | 原始文件、SHA-256、时间地点、`captured_location`、`batch_id` | 文件访问、处理、证据 UI |
 | `observations` | 模型观察、原始 JSON、对象、场景衣物、OCR、转写 | 事件、向量、原始证据 |
-| `face_instances` | 人脸框、质量、姿态、AdaFace 向量、模型版本 | 头像和人物候选 |
-| `face_clusters` / `face_prototypes` | 质量感知多原型候选身份与审计状态 | 人工确认、合并、拆分 |
-| `entities` / `entity_mentions` | 人物实体及其 Observation 提及 | 事件参与者、画像、关系 |
-| `events` / `event_observations` | 事件边界、总结和证据成员 | 时间线、语义、检索 |
-| `event_participants` | 已确认人物在事件中的角色和证据 | 人物事件投影 |
-| `person_event_memory` | 人物在单个事件的活动、地点、时间、共现人与证据 | 人物时间线和 Agent |
-| `person_patterns` | 跨事件活动、地点、共现人和外观模式 | 长期人物画像 |
-| `semantic_profiles` / `semantic_claims` | 跨事件画像和版本化详细声明 | 人物页、知识页、Agent |
+| `face_instances` / `face_clusters` / `face_prototypes` | 人脸框、质量、姿态、AdaFace 向量、多原型候选 | 人工确认、合并、拆分 |
+| `entities` / `entity_mentions` / `entity_observations` | 人物与非人物实体及其提及 | 事件参与者、画像、检索 |
+| `entity_properties` / `entity_merge_candidates` | 实体属性与语义合并候选 | 实体治理（非人物语义组为派生投影） |
+| `events` / `event_revisions` / `event_observations` / `event_participants` | 事件边界、总结、修订和证据成员 | 时间线、语义、检索 |
+| `trips` / `trip_revisions` | 行程候选（跨日、地点序列、同行者） | 行程确认/驳回 |
+| `persons` | 已确认人物（多名称、别名、merged-into） | 人物页、改名、合并 |
+| `person_event_memory` / `person_patterns` | 人物事件投影与跨事件模式 | 人物时间线和 Agent |
+| `semantic_profiles` / `semantic_claims` / `facts` | 画像、版本化声明与事实状态 | 人物页、知识页、Agent |
 | `person_appearance_evidence` | 人脸、上半身裁剪、目标衣物和原始证据 | 人物衣物声明 |
 | `relationships` | 人工确认或维护的实体关系 | 关系图、Agent |
-| `memory_vectors` | `visual`、`episodic`、`semantic` 向量，带 scope 和模型信息 | 相似检索 |
+| `memory_vectors` | `visual`、`episodic`、`semantic` 向量（HNSW ANN） | 相似检索 |
 | `query_gaps` / `memory_feedback` | 查询缺口和人工反馈 | 维护闭环 |
+| `dialogue_states` | 会话焦点（活动实体/事件/地点/证据/未解决歧义） | Thin Agent 连续对话 |
+| `agent_core_memory_cards` / `agent_core_memory_items` / `agent_query_accesses` | Agent 核心记忆卡片（epistemic 类型 + 源修订引用） | 长期记忆与上下文 |
+| `agent_memory_correction_proposals` / `_revisions` / `_audit` | 纠正提议、授权修订与审计 | 记忆修正闭环 |
 | `rebuild_runs` | 重建范围、状态、统计和错误 | 运维审计 |
+| `stories` / `invites` / `runtime_settings` | 故事、邀请与运行设置 | 页面与运维 |
 
 ## 端到端管线
 
 1. **资料导入**：`IngestionPipeline.create_asset()` 计算 SHA-256，只保留时间、
-   地点、设备、相册归属等白名单来源；缺失时读取 EXIF；在同一 `scope_id` 内去重。
-2. **媒体处理**：图片先写入 AdaFace、CLIP、元数据和事件的快速证据，再以
-   896px、禁用思考模式、320 token 的核心中文 JSON 完成语义丰富；音频经 FunASR
-   后走文本分析；文本走同一文本分析路径；视频只返回预留状态。
+   地点、设备、相册归属等白名单来源；缺失时读取 EXIF；在同一 `scope_id` 内去重
+   （`15039f0` 起 `/api/ingest` 去重仅限同一相册，禁止跨空间）。
+2. **媒体处理**：图片支持 HEIC；先写入 AdaFace、CLIP、元数据和事件的快速证据，
+   再以 896px、禁用思考模式、320 token 的核心中文 JSON 完成语义丰富；音频经 FunASR
+   后走文本分析；文本走同一文本分析路径；视频只返回预留状态。批量导入使用
+   `batch_id`，批次完成且资产终态后再总结事件一次。
 3. **证据规范化**：保存中文规范字段、原始模型 JSON、对象、场景衣物、空间关系、
    OCR、转写、人脸实例和模型版本。
-4. **视觉与身份索引**：事件选择前写入 CLIP Asset 向量；`buffalo_l` 检测、对齐后
-   用 AdaFace 写入身份向量。低质量检测保留为证据，但不必进入候选聚类。
-5. **事件构建**：先按时间地点召回，再综合活动/类型、对象、视觉地点、已确认人物、
-   CLIP 相似度和地理邻近度。仅当活动和类型均冲突、无确认人物/对象桥接且向量可比
-   时，低视觉兼容度才触发保守拆分保护。
-6. **事件总结**：导入热路径只建立可检索的事件和 Observation 证据；待总结事件由
-   `POST /api/maintenance/summarize-events` 的后台维护任务生成中文标题、类型、活动
-   和摘要，避免同一事件随每张图片重复推理。导入标签绝不参与。
+4. **视觉与身份索引**：事件选择前写入 CLIP/Chinese-CLIP 向量；`buffalo_l` 检测、
+   对齐后用 AdaFace 写入身份向量。低质量检测保留为证据。
+5. **事件构建**：按时间地点召回，综合活动/类型、对象、视觉地点、已确认人物、
+   CLIP 相似度与 GPS 距离线性评分；同时间同地点给时空加成；仅当活动和类型均冲突、
+   无确认人物/对象桥接且向量可比时，低视觉兼容度触发保守拆分保护。GPS 原始坐标
+   只留在 `captured_location`/`geo`，事件标题、地点和总结只用图片语义地点。
+6. **事件总结**：导入热路径只建立可检索的事件和 Observation 证据；批次/维护任务
+   （`/api/maintenance/summarize-events`）生成中文标题、类型、活动和摘要。导入标签
+   绝不参与。
 7. **人物确认**：确认姓名和可选角色后，刷新实体提及、参与者、事件摘要、
    `person_event_memory`、`person_patterns`、画像和声明。原始 Observation 的匿名
-   模型描述不被改写。
+   模型描述不被改写。人物支持多名称、全局改名、同名人自动合并、拒绝即删除。
 8. **人物外观**：每个关联事件最多选择一个高质量已确认人脸，裁剪头部和上半身并
    分析目标人物衣物；场景衣物不会因共现升级为人物事实。
-9. **检索维护**：Agent 优先召回人物画像、模式、声明、事件、Observation 和向量，
-   校验证据 ID，并返回轨迹、原图和缺口；反馈写入
-   `query_gaps`/`memory_feedback`，不伪装成普通查询。
+9. **Agent 回答**：Thin Agent 先判定普通聊天/写作/记忆查询/反馈/澄清；记忆查询走
+   六路检索 + 硬过滤 -> `AnswerBrief` -> `visible_assets`（唯一决定可见图片）->
+   计划/校验/写作；回答必须可回溯证据，缺口写入 `query_gaps`，反馈写入
+   `memory_feedback`。
 
 ## 模块实现
 
 | 模块 | 实现方式 | 权威输出 |
 | --- | --- | --- |
-| `backend/app.py` | FastAPI 路由、范围筛选、人物确认、检索对话、原图与维护 | HTTP API 编排 |
+| `backend/app.py` | FastAPI 路由、范围筛选、人物确认、模型 profile 切换、原图与维护 | HTTP API 编排 |
 | `backend/db.py` | SQLite 加法迁移、事务、事件评分、空间隔离、聚类与人物投影 | 唯一权威记忆库 |
 | `backend/pipeline.py` | 白名单元数据、媒体适配、向量/人脸先写入再归并事件 | Asset、Observation、事件候选 |
-| `backend/model_clients.py` | Gemma、FunASR、`buffalo_l`、AdaFace、CLIP 薄适配器 | 带版本结构化输出 |
+| `backend/model_clients.py` | vLLM/CLIP/AdaFace/FunASR 薄适配器 | 带版本结构化输出 |
+| `backend/thin_agent.py` | `answer_turn` 编排：路由、检索、证据回答、验证 | Agent 回答与轨迹 |
+| `backend/router.py` | 确定性最终路由 8 步决策树 + NeutralProbe | 最终 route |
+| `backend/query_parser.py` / `query_contracts.py` | 12B 开放词表解析、sanitize/repair/回退、QuerySpec | 结构化查询规格 |
+| `backend/model_routing.py` | parser/answer/verify 角色、RequestDeadline、circuit breaker | 模型调用边界 |
+| `backend/evidence_retrieval.py` / `retrieval/` | 六路检索 + 加权 RRF（visual 2.5）+ 排序 | EvidencePacket |
+| `backend/retrieval_ann.py` / `retrieval_indexes.py` | HNSW ANN、派生投影重建 | ANN 索引 |
+| `backend/answer_brief.py` / `response_*` | AnswerBrief 边界与计划/校验/写作 | 受控回答内容 |
+| `backend/structured_memory.py` | TFPE 确定性 SQL 执行 | 精确结构化答案 |
+| `backend/core_memory.py` / `memory_corrections.py` | 核心记忆卡片、纠正提议/授权修订 | 长期记忆与修正 |
+| `backend/geocoding.py` | PyGeoCN 离线逆地理 | 省/市/区地点 |
 | `backend/face_embeddings.py` / `face_clustering.py` | AdaFace、质量姿态门控、多原型全局重聚类 | 人脸实例、簇、原型 |
-| `backend/person_appearance.py` | 从脸向下扩展的确定性上半身裁剪 | 外观裁剪坐标 |
-| `backend/agent.py` | 意图分类、混合召回、证据校验、局部视觉补全、对话反馈 | 答案、图片结果、轨迹、缺口 |
-| `scripts/maintenance/rebuild_memory.py` | 批量重建，可按来源或 benchmark manifest 运行 | 重建审计与派生记忆 |
-| `scripts/benchmarks/prepare_household_benchmark.py` | 图片与元数据/人脸/查询标注取交集 | 可审计导入 manifest |
-| `scripts/benchmarks/evaluate_household_benchmark.py` | 只读计算人脸、事件、空间和图片查询指标 | 外部评估报告 |
-| `src/api.js` / `src/app.js` | 同源 API、范围选择、证据浏览、Agent 对话、静默轮询 | 浏览器本地状态 |
+| `services/e2b_server/` | E2B LoRA 服务器（Ollama 兼容） | 可选 2B parser/主模型 |
+| `configs/sentrix_vllm_registry_192_168_0_153.json` | vLLM profiles + 状态文件 | 模型切换事实源 |
 
 ## API 与交互约定
 
-- 规范人物确认入口：`POST /api/face-clusters/{cluster_id}/confirm`。
-- 兼容入口：`POST /api/persons/{person_id}/confirm` 会先将原生 `entity_id` 解析到
-  活跃人脸簇，再执行同一传播链，避免实体 ID 被旧 `persons` 路由误判为 404。
-- 人物证据查看与确认分开：查看显示人脸裁剪、原图、关联事件和状态；确认才打开
-  姓名/角色表单。
+- 规范人物确认入口：`POST /api/face-clusters/{cluster_id}/confirm`；兼容入口
+  `POST /api/persons/{person_id}/confirm` 会先将原生 `entity_id` 解析到活跃人脸簇。
+- 人物改名：`POST /api/people/{person_id}/rename`（多名称/别名、merged-into 标记）；
+  `POST /api/persons/{person_id}/reject` 拒绝即删除。
+- 非人物实体：`GET /api/entity-groups`（派生语义组）、`GET /api/entity-merge-candidates`、
+  `POST /api/entity-merge-candidates/{candidate_id}/confirm|reject`、
+  `PUT /api/entities/{entity_id}/properties/{property_key}`。
+- 模型管理：`GET /api/model-profiles`、`GET /api/model-profiles/current`、
+  `POST /api/model-profiles/switch`（单例 vLLM 切换，`--wait-ready` 后才激活）；
+  `GET /api/vlm-backend` 保留为只读兼容，切换功能已退役（写路径返回 410）。
+- 行程：`GET /api/trips`、`POST /api/trips/{trip_id}/confirm|reject`。
+- 地理：`GET /api/geo-places`（离线逆地理地点视图）。
+- 导入：`POST /api/ingest`（同一相册内去重）、`POST /api/import`、
+  `POST /api/import/server-directory`、`POST /api/ingest-batches`、
+  `POST /api/ingest-batches/{batch_id}/complete`。
 - `POST /api/assistant/turn` 接收 message、`conversation_id`、feedback、`scope_id` 和
-  可选 `selected_entity_id`，区分 `query`、`feedback`、`clarification`。`POST /api/search`
-  是兼容包装器。
+  可选 `selected_entity_id`，返回 response_mode、memory_used、evidence、trace；
+  `POST /api/search` 是兼容包装器。
 - Agent 记忆回答必须返回 `memory_used`、`evidence_required`、`evidence_status` 和
   `evidence_presentation`；有具体事实时状态为 `anchored` 并至少绑定 Event、Observation
   或 Asset 证据，无依据时状态为 `gap` 并返回查询缺口。普通聊天明确标记为
   `memory_used=false`，不读取家庭记忆。
-- 证据默认可在对话下方折叠查看，但不得从记忆回答中省略；用户明确要求原图、照片或
-  原始资料时，`original_evidence_requested=true`，前端直接展示可打开的原始媒体或
-  Observation。语义实体组是非人物实体的默认召回入口，成员实体 ID 和原始证据保持不变。
-- Agent 反馈目标和 `query_gap` 均按 `scope_id` 校验；未确认目标、跨空间目标或缺少依据时
-  不写入事实。以上修改只涉及 Agent、assistant API、对话 UI 和 Agent 评估，不改变记忆生成管线。
+- 证据默认折叠展示但不可省略；用户明确要求原图时
+  `original_evidence_requested=true`，前端直接展示可打开的原始媒体。普通用户界面
+  隐藏内部 ID / 检索 trace / 原始 JSON；管理员 `?debug=1` 可见。
 - 图片结果带 `asset_id`、`observation_id`、文件名、时间、caption、`media_url`，前端
-  展示 `/api/assets/{asset_id}/file` 原图缩略图和打开入口。
-- 头像统一使用 `/api/face-instances/{face_instance_id}/crop`，不使用整图冒充头像。
+  展示 `/api/assets/{asset_id}/file` 原图和打开入口；头像统一使用
+  `/api/face-instances/{face_instance_id}/crop`。
+- 反馈目标和 `query_gap` 均按 `scope_id` 校验；未确认目标、跨空间目标或缺少依据时
+  不写入事实。
 - 前端五秒轮询仅刷新计数；当前页面、媒体 DOM、表单和弹窗输入不得被静默重建。
 
 ## 记忆空间与家庭基准
 
-当前家庭基准源：`/Users/rm001/Downloads/samples`。
+家庭基准源：`/Users/rm001/Downloads/samples`（历史导入路径；当前生产库已含更多
+用户相册）。
 
-| 空间 | 当前图片数 | 原始 metadata 条目 | 原始 face-map 条目 | 查询数 |
-| --- | ---: | ---: | ---: | ---: |
-| `album1` | 64 | 1069 | 78 | 20 |
-| `album2` | 58 | 1466 | 638 | 20 |
-| `album3` | 69 | 1047 | 257 | 20 |
+| 空间 | 历史图片数 | 备注 |
+| --- | ---: | --- |
+| `album1` | 64 | 62 assets / 25 events（08-10 实测） |
+| `album2` | 58 | 50 assets / 34 events（08-10 实测，资产数较历史 58 有变化） |
+| `album3` | 69 | 69 assets / 36 events（08-10 实测） |
+| `album*_e2b` | - | 端到端验证空间（62/26、66/35、69/35） |
+| `album_<hash>` | - | 用户新建独立相册空间 |
 
 - 导入器支持根目录 `metadata.json` 和嵌套 `metadata/metadata.json`，只导入
-  `images/` 实际存在的文件，并记录未匹配标注。
+  `images/` 实际存在的文件。
 - `face_info_cn.json`、`face_info_en.json`、`face_id_images`、`query.json` 仅供评估；
   不得自动确认人名、创建关系、生成事件名或写入模型提示。
-- 三个相册为独立 `MemorySpace`。Asset、Observation、事件、实体、向量、语义和
+- 三个基准相册为独立 `MemorySpace`；Asset、Observation、事件、实体、向量、语义和
   Agent 读取均按 `scope_id` 过滤，禁止跨空间事件归并。
-- 本次受控基准显式设定 `FACE_IDENTITY_MIN_QUALITY=0.35`；全局默认仍更严格，
-  此设置不等于生产默认已经放宽。
+- 受控基准曾显式设定 `FACE_IDENTITY_MIN_QUALITY=0.35`；全局默认仍更严格。
 
-## 当前 153 数据库状态
+## 当前 153 数据库状态（2026-08-10 实测）
 
-以下为 2026-08-02 live SQLite 实测值，不是目标值，也不是质量验收结论：
+`data/sentrix.db`，`PRAGMA integrity_check = ok`；全部 841 assets 状态为
+`processed`：
 
-| 记录 | 总计 | `album1` | `album2` | `album3` |
-| --- | ---: | ---: | ---: | ---: |
-| Asset | 189 | 62 | 58 | 69 |
-| 已处理 Asset | 183 | 60 | 57 | 66 |
-| 失败 Asset | 6 | 2 | 1 | 3 |
-| Observation | 183 | 60 | 57 | 66 |
-| 活跃 Event | 92 | 26 | 34 | 32 |
-| Event-Observation 链接 | 183 | 60 | 57 | 66 |
-| EventParticipant | 14 | 1 | 13 | 0 |
-| FaceInstance | 73 | 10 | 38 | 25 |
-| FaceCluster | 11 | 5 | 4 | 2 |
-| 人物 Entity | 11 | 5 | 4 | 2 |
-| SemanticProfile | 3 | 1 | 2 | 0 |
-| SemanticClaim | 86 | 7 | 79 | 0 |
-| PersonEventMemory | 14 | 1 | 13 | 0 |
-| PersonPattern | 29 | 2 | 27 | 0 |
-| Fact | 2 | 1 | 1 | 0 |
-| Relationship | 0 | 0 | 0 | 0 |
-| MemoryVector | 714 | 216 | 243 | 255 |
-| QueryGap / MemoryFeedback | 0 / 0 | - | - | - |
-| RebuildRun | 3 | 1 | 1 | 1 |
+| 记录 | 计数 |
+| --- | ---: |
+| Asset / Observation | 841 / 841 |
+| Event / EventObservation | 595 / 841 |
+| FaceInstance / FaceCluster | 543 / 144 |
+| Entity / EntityMention | 2959 / 108 |
+| SemanticProfile / SemanticClaim | 38 / 742 |
+| PersonEventMemory / PersonPattern | 81 / 303 |
+| Relationship | 6636 |
+| MemoryVector | 2781 |
+| QueryGap / MemoryFeedback | 195 / 0 |
+| EventParticipant / IngestBatch | 81 / 76 |
+| RebuildRun | 4 |
 
-实体状态：`album1` 为 1 已确认、4 待确认；`album2` 为 2 已确认、2 待确认；
-`album3` 为 2 待确认。三次重建均为 `completed_with_failures`，所以当前数据不完整，
-不得把查询、事件、人物关系统计当作最终质量结论。
+主要空间计数（资产/事件）：`album1=62/25`、`album2=50/34`、`album3=69/36`、
+`album1_e2b=62/26`、`album2_e2b=66/35`、`album3_e2b=69/35`，另有多个
+`album_<hash>` 用户相册与 `gps-location-validation-20260807`、
+`photobench-e2e-20260807` 等验证空间。
+
+说明：`album2` 资产数（50）与 2026-08-05 记录的 58 不一致，属用户侧数据变化，
+未做推断。上述计数是运行态事实，不是质量验收结论。
 
 ## 已完成工作
 
-- 原始资料、SHA-256 去重、EXIF 时间/GPS/设备回退、相册来源白名单。
-- `MemorySpace` 隔离的相册导入、查询和网页选择。
+- 原始资料、SHA-256 去重、EXIF 时间/GPS/设备回退、相册来源白名单、HEIC 支持、
+  文件夹/服务器目录导入与批次导入。
+- `MemorySpace` 隔离的相册导入、查询和网页选择；用户可创建独立相册。
 - 图片、音频、文本 Observation 管线；视频原始 Asset 预留。
 - `buffalo_l` 检测、AdaFace 向量、质量/姿态元数据、多原型全局聚类、低质量人脸
   证据化、候选簇确认/拒绝/合并/拆分与审计。
-- 人脸裁剪证据接口与统一头像显示。
-- 事件多信号评分、CLIP 可比性检查、保守拆分保护、事件级中文总结和相册内兼容
-  事件合并。
-- 人物确认后的参与者刷新、保守重分段、事件摘要刷新和人物语义重建。
-- 人物事件投影、跨事件模式、版本化声明、画像和事实状态管理。
-- 目标人物上半身外观证据；无该证据时不生成个人衣物事实。
-- 证据优先 Agent：人物、地点、日期、活动、物体、衣物、空间关系、图片结果、
-  局部视觉补全、缺口、反馈和有界对话。
-- 原图、事件、人物、知识、资产、故事、导入、设置等网页入口；图片搜索不会只列
-  文件名。
-- 独立 GPU Ollama `11435`，自动释放 12B 模型；仓库根目录重复实现已清理，脚本已
-  按运行、维护、夹具和基准分类。
-- 家庭基准交集生成器和只读评估器已实现。
-- LFW 主脸隔离基准与自动质量门禁：120 图 coverage `0.9917`、pairwise F1 `0.9916`，
-  超过 95% 目标；基准只评估，不写入正式记忆。
-- 分层 Agent 已按语义、事件、Observation/Asset 证据检索；时间、地点、人物、物体等
-  结构化命中可跳过向量检索，置信度不足时降级为事件与原始证据回答。
-- 地点、物体、情感实体、`entity_observations` 和带证据 ID 的实体关系已进入记忆库；
-  搜索页显示可折叠的算法判断依据。
-- 核心视觉语义已加入只读 `evaluate_vision_model.py` 门禁；并发后台导入为每任务独立
-  SQLite 连接，初始化锁避免 schema migration 和 GPU 模型重复加载竞争。
+- 人脸裁剪证据接口与统一头像显示；人物多名称、别名、全局改名、同名自动合并、
+  拒绝即删除。
+- 事件多信号评分（含 GPS 距离线性评分、视觉地点、时空加成）、CLIP 可比性检查、
+  保守拆分保护、事件级中文总结和相册内兼容事件合并；GPS 不出现在事件展示文本。
+- 人物确认后的参与者刷新、保守重分段、事件摘要刷新和人物语义重建；人物事件投影、
+  跨事件模式、版本化声明、画像和事实状态管理；目标人物上半身外观证据。
+- Thin Agent 全栈：语义解析 -> 确定性路由 -> 六路检索 -> AnswerBrief -> 证据回答；
+  结构化记忆执行器（时间/计数/首末/地点/媒体精确回答）；核心记忆卡片；纠正提议/
+  授权修订；HNSW ANN 索引；检索缺口与反馈闭环。
+- 12B Evidence Answer 生产默认（vLLM `gemma4-12b-it`）与无降级验证（ModelCallLedger、
+  NO_FALLBACK 等）；RX 回答体验（`visible_assets` 唯一决定可见图片、普通用户隐藏
+  内部 ID/trace）。
+- 离线逆地理（PyGeoCN 省/市/区）与基于地点的照片视图；PyGeoCN 依赖不可用时优雅回退。
+- 原图、事件、人物、知识、资产、故事、行程、导入、设置等网页入口；家庭关系图、
+  相册管理、模型 profile 切换 UI。
+- 独立 vLLM profile registry 单例管理；E2B LoRA 服务器（可选）。
+- 家庭基准交集生成器和只读评估器；LFW 主脸隔离基准 coverage `0.9917`、pairwise
+  F1 `0.9916`（只评估，不写入正式记忆）。
 
 ### 已通过的受控历史验收
 
-以下说明特定受控数据和当时版本曾通过，不替代当前三相册基准验收：
-
-- 120 张虚拟家庭相册曾完整重建，外部 manifest 人脸候选评估为 precision `1.0000`、
-  recall `1.0000`、F1 `1.0000`；148 个检测人脸中，84 个高质量样本形成 4 簇，64 个
-  低质量样本保留证据。
+- 120 张虚拟家庭相册曾完整重建，外部 manifest 人脸候选评估为 precision/recall/F1
+  `1.0000`；148 个检测人脸中 84 个高质量形成 4 簇，64 个低质量保留证据。
 - 一次受控确认生成头像/画像、五条事件活动声明、事件参与者和
   `PersonAppearanceEvidence`；活动、衣物和原图 Agent 查询均有证据返回。
-- 已验证事件导入不读取 `event_id`、`activity_hint` 等评估标签。LFW 衍生
-  “生日/维修”标签没有可观察画面差异，不能作为模型应该切开的有效测试。
-- 已验证独立 Ollama GPU 卸载和闲置后模型卸载。
+- 已验证事件导入不读取 `event_id`、`activity_hint` 等评估标签。
+- Thin Agent 生产切换（2026-08-05）：8091 一次性开启 Phase 0-8 V1 flags，冒烟通过
+  （`memoryUsed=false`、零家庭读取）。
+- RX 双轨验收（2026-08-06）：E2E 14/14、人工盲测新>=旧 91.7%（泄漏 0、文图矛盾 0）、
+  本地单测 597 全绿、前端 27 全绿。
+- 12B-FC（2026-08-06）：全角色探针 100% 存活、全链 E2E 11/12（唯一失败为“人物介绍”
+  完整链缺 claim 角色）、简单证据 p95 8.1s、API<=20s、故障注入证明无静默降级。
+- R9（2026-08-06）：153 E2E 10/10、parser slots 12B mode/date/JSON 全 1.0、
+  文字规则审计 runtime 语义规则=0；R8 检索基线 Recall@10 0.891 / r20 0.926、
+  strict-empty fp=0、hard violation=0。
+- 结构化记忆 QA（2026-08-07）：40 例 15 通过（routed 0.4、exact 0.375）为当前基线，
+  非最终质量结论。
 
-## 最近验证（2026-08-03）
+## 最近验证（2026-08-10）
 
-- `psh` 当前提交为 `d588c53`，工作树干净。正式 API `8090`、Web `4174` 与 FMA
-  `5173` 正常；FMA 未修改。专用 Ollama `11435` 已卸载模型。
-- 人脸门禁：`evaluate_lfw_clusters.py` 在隔离库输出 coverage `0.9917`、pairwise
-  F1 `0.9916`，通过 95% 目标。
-- 核心视觉模型门禁：三张真实场景图均返回完整中文 JSON、必需字段和证据字段，均值
-  `3.2791s/图`，相对 `18.14s/图` 旧视觉基线为 `5.5321x`。
-- 临时 GPU API `8095` 的预热稳定态三图完整语义：`9.8922s`，对比旧同步完整路径
-  `54.4271s`，为 `5.502x`；三个 Asset 均为 `processed`，日志确认
-  `CUDAExecutionProvider`。临时 API 已停止，测试仅写入 `/tmp`。
-- 相关 Python 回归：69 项通过，包括并发 SQLite、FaceAdapter 契约、管道、模型请求
-  参数和视觉门禁。正式 `8090` 尚未重启加载本轮代码。
-- `GET /api/health` 返回 `200`；AdaFace、`buffalo_l`、FunASR、CLIP 均报告 ready；
-  `GET http://127.0.0.1:11435/api/ps` 返回空模型列表。
-- Web `4174` 返回 `200`；FMA `5173` 未改动。
-- `node --test test/*.test.js`：10 项通过。
-- `node --check src/app.js`、`node --check src/api.js`、
+- `psh` 当前提交为 `15039f0`，工作树干净。
+- Node 回归：`node --test test/*.test.js` 31/31 通过（本次同步修正了 3 处陈旧断言：
+  `server.js` 默认后端改为项目本地 `11001`、E2B LoRA 标签为“蒸馏后+LoRA”、
+  app.py vLLM 状态改为 `_load_vllm_state`/`--wait-ready` 契约）。
+- `node --check src/app.js`、`node --check src/api.js`、`node --check server.js`、
   `.venv/bin/python -m compileall -q backend scripts`、`git diff --check` 均通过。
-已知测试警告：隔离测试构造的 `ClipAdapter` 输出
-`No pretrained weights loaded for model 'ViT-B-32'. Model initialized randomly.`。
-这不证明生产运行随机初始化，但也不能替代生产 checkpoint 图文推理验收。
+- `/api/health`（8090/8091）返回 200：`mode=sentrix-local-backend`，VLM/LLM 指向
+  vLLM `8100` 且 `gemma4-12b-it` running；AdaFace、`buffalo_l`、FunASR、CLIP 报告 ready。
+- Web `4174` 返回 200；FMA `5173` 本次未监听（外部服务，未做任何操作）。
+- 完整 Python 套件本次未重跑（避免与生产 vLLM `8100` 争用）；最近文档基线：
+  RX 阶段本地单测 597 全绿、前端 27 全绿、R9 基线 494 pass / 1 skip（均为 08-06 记录）。
 
 ## 当前未完成事项
 
 ### P0：MVP 门槛
 
-1. **生产切换与烟雾验证**：在维护窗口将 `8090` 从直接 `uvicorn` 切换到
-   `scripts/runtime/start_sentrix_api.sh`，确认 health、CUDA provider、快速证据、核心
-   语义和待总结事件维护任务；准备并验证回滚命令，不影响 FMA。
-2. **清理失败资料并完成可复现重建**：定位 `album1` 2 个、`album2` 1 个、
-   `album3` 3 个失败 Asset 的阶段和错误，针对性重试或明确记录不可处理原因；确保
-   每个可用图片都有 Observation、事件链接、空间和处理状态；所有重建不再为
-   `completed_with_failures` 后才可谈完整性验收。
-3. **运行真实基准并设定门槛**：对当前数据库运行事件分割、空间隔离、
-   查询原图召回的只读评估；按相册记录输入交集、precision、recall、F1、误合并、
-   漏合并、事件拆分/合并、hit rate 和证据正确性。在有可观察的同时间同地点不同
-   活动资料前，不改事件拆分 `0.45` 阈值或放宽生产规则。
-4. **完成 CLIP 生产验收**：用真实生产 checkpoint 强制执行一次图片和文本 embedding，
-   确认不是随机初始化，记录跨模态/相似度结果和向量维度；714 条向量的存在不构成
-   质量验收。
-5. **完成人物身份闭环**：审阅 8 个待确认簇，按真实情况命名、拒绝或拆分；确认后
-   检查 UI 与 API 的 Observation、Event、Pattern、Claim、Appearance 影响数量。关系
-   必须人工明确确认，当前 `relationships=0`。
-6. **完成查询和反馈闭环验收**：用三相册 query 集评估原图命中率、答案事实性和
-   证据链；实际执行一次视觉补全后二次查询，及一次接受/纠正反馈，验证
-   `query_gaps`、`memory_feedback` 与后续结果。
-7. **三相册人脸验收数据补齐**：为每个授权身份出现提供 bbox 或 `face_instance_id`
-   对齐；验收同时要求 pairwise F1 `>=0.95` 和可验证覆盖率 `>=0.95`，单人图片局部
-   F1 不得替代该门槛。
-8. **全量端到端性能验收**：以同一三相册 manifest、固定硬件和可审计旧基线运行隔离
-   全量管线；报告导入、视觉、AdaFace、CLIP、事件/实体投影和总结耗时，只有实际平均
-   速度比 `>=5x` 才可关闭性能目标。历史三图受控 `5.502x` 仅供参考。
+1. **真实相册人脸验收**：当前真实相册标签缺 bbox/face-instance 级对齐，无法宣称
+   F1>=0.95 且覆盖率>=0.95；需要补齐标注或显式人工对齐审阅后再评估。
+2. **CLIP 生产验收**：用真实生产 checkpoint 强制执行一次图片和文本 embedding，
+   确认不是随机初始化并记录跨模态/相似度结果；向量存在不构成质量验收。
+3. **全量端到端性能验收**：以同一三相册 manifest、固定硬件和可审计旧基线运行隔离
+   全量管线；实际平均速度比 >=5x 才可关闭性能目标。
+4. **12B 全链人物 claim 场景**：完整链（writer->claim->verify）修复并重跑 11/12 中
+   唯一失败 case。
+5. **结构化 QA 覆盖率**：提升 40 例 15 通过基线；校准 parser action/facet recall
+   指标（标注集过度指定导致的偏差）。
+6. **Hidden acceptance**：16 条 predictions-only 待用户持 GT 用
+   `score_hidden.py` 离线评分。
+7. **查询和反馈闭环验收**：用三相册 query 集评估原图命中率、答案事实性和证据链；
+   实际执行一次视觉补全后二次查询与一次接受/纠正反馈。
 
 ### P1：产品可用性与语义质量
 
-1. 知识 UI 从平铺 Claim 改为清晰的
-   `Person -> Event -> PersonPattern / SemanticClaim -> Evidence`，展示时间线、模式、
-   外观、关系和原图路径。
-2. 完善人物簇合并/拆分的人工审阅流程与端到端 UI 回归。
-3. 制定审核过的中文属性词表后，再做保留证据的同义归一化，例如“深色西装外套”
-   与“黑色西装外套”；当前不得武断合并。
-4. 用真实家庭问题集校准 Agent 排序、置信度和查询缺口策略。
-5. 扩大来源验证、失败阶段重试、异常恢复和重建可观测性。
+1. 完善人物簇合并/拆分的人工审阅流程与端到端 UI 回归。
+2. 制定审核过的中文属性词表后，再做保留证据的同义归一化。
+3. 用真实家庭问题集校准 Agent 排序、置信度和查询缺口策略。
+4. 扩大来源验证、失败阶段重试、异常恢复和重建可观测性。
 
 ### P2：明确延后
 
 - 视频解码、关键帧、时序证据、视频向量和视频事件记忆。
 - 主动式家庭建议和会话外长期推荐。
 - MagFace 对比及是否替换 AdaFace 的生产决策。
-- API 与独立 Ollama 的正式托管服务、重启策略、监控和主机级所有权确认。
+- API 与 vLLM/Ollama 的正式托管服务、重启策略、监控和主机级所有权确认。
 
 ## 运行与验证命令
 
 ```bash
 cd /home/asus/Github/Sentrix-Home-Web
 
-scripts/runtime/start_sentrix_ollama.sh
+# vLLM registry 单例切换（生产默认 gemma4-12b-it）
+/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py switch gemma4-12b-it --wait-ready
 
-FACE_MODEL_ROOT=$PWD/data/face-models \
-FACE_MODEL_NAME=buffalo_l \
-FACE_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider \
-FACE_EMBEDDING_MODE=adaface \
-ADAFACE_ARCHITECTURE=ir_50 \
-ADAFACE_DEVICE=cuda \
-ADAFACE_MODEL_PATH=/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt \
-ADAFACE_REPO_ROOT=/home/asus/models/AdaFace \
-OLLAMA_BASE_URL=http://127.0.0.1:11435 \
-OLLAMA_MODEL=gemma4:12b \
-OLLAMA_KEEP_ALIVE=-1 \
-scripts/runtime/start_sentrix_api.sh
+# 生产 API（8090/8091 使用同一启动脚本，端口由 SENTRIX_API_PORT 决定）
+SENTRIX_API_PORT=8091 scripts/runtime/start_sentrix_api.sh
 
-SENTRIX_BACKEND_URL=http://127.0.0.1:8090 PORT=4174 npm run dev
+# Web（4174 代理 8091）
+SENTRIX_BACKEND_URL=http://127.0.0.1:8091 PORT=4174 npm run dev
+
+# 可选 E2B LoRA
+scripts/runtime/start_sentrix_e2b.sh
 ```
 
 提交或宣称完成前：
@@ -402,11 +413,13 @@ SENTRIX_BACKEND_URL=http://127.0.0.1:8090 PORT=4174 npm run dev
 node --test test/*.test.js
 node --check src/app.js
 node --check src/api.js
+node --check server.js
 .venv/bin/python -m compileall -q backend scripts
 git diff --check
 ```
 
-重建会替换派生记忆，执行前必须确认数据库目标和 `scope_id`：
+模型切换前先确认 `/api/model-profiles/current` 状态；重建会替换派生记忆，执行前
+必须确认数据库目标和 `scope_id`：
 
 ```bash
 .venv/bin/python scripts/maintenance/rebuild_memory.py \
@@ -418,55 +431,54 @@ git diff --check
 | 日期 | 提交/阶段 | 结果 |
 | --- | --- | --- |
 | 2026-07-29 | `6ad4ae8` | 首次提交证据驱动家庭记忆项目，建立项目记忆和基础数据契约。 |
-| 2026-07-30 | AdaFace、聚类、人物确认、事件评分、独立 Ollama | 完成受控 120 图验证；早期 34 簇碎片化方案被淘汰。 |
-| 2026-07-30 | `064d952` | 强化基于证据的事件分割。 |
-| 2026-07-31 | `4fced260` | 完成人物命名兼容、对话 Agent、图片结果和反馈分流。 |
+| 2026-07-30 | AdaFace、聚类、人物确认、事件评分、独立 Ollama | 完成受控 120 图验证。 |
 | 2026-07-31 | `bf286a1` | 引入 MemorySpace、三相册基准、人物事件投影和只读评估工具。 |
-| 2026-07-31 | `d00cd02` 至 `dab0f66` | 改进重建期间页面更新、基准默认相册、事件合并、轮询输入/媒体保护、增量相册隔离和人物事实清理。 |
 | 2026-08-02 | `853ff66` | 对 153 工作树、服务、数据库和未完成 MVP 门槛完成当前状态核验。 |
-| 2026-08-03 | `878579b`、`d588c53` | 加入视觉模型门禁、核心语义快速路径、延迟事件总结与并发导入修复；隔离稳定态完整语义达到 `5.502x`。 |
-| 2026-08-03 | `cefb3f1`、`065f784`、`8c291d5` | 三相册使用 GPU 管线重跑并替换正式派生库：`189/189` Asset 均已处理，全部人物保持待命名。身份查询直接返回可审阅簇、原图证据和 `identity` 查询缺口，跳过向量与大模型；待确认簇内部标识不再从 API/UI 泄漏。 |
-| 2026-08-03 | `52afbd4`、`a42fe5f`、`2406bc2`、`aa61d6b` | Agent 向量候选必须回到事件/原始观察文本锚定；GPS 坐标与视觉场景分层；事件封面选择与折叠证据说明上线。94 个历史事件已用受控脚本回填事件内原图封面，保留 SQLite 备份。 |
+| 2026-08-03 | `878579b`、`d588c53` | 视觉模型门禁、核心语义快速路径 5.5x、延迟事件总结与并发导入修复。 |
+| 2026-08-04 | album1 干净重建 | 62 assets / 25 events；自动导入记忆生成、描述恢复、批次导入修复；三相册语义链路验收 189/189。 |
+| 2026-08-05 | Thin Agent 生产切换 | 8091 一次性开启 Phase 0-8 V1 flags；统一 4174->8091->data/sentrix.db。 |
+| 2026-08-06 | R9 / 12B-FC / RX | 路由收口、12B 无降级 11/12、RX E2E 14/14、盲测 91.7%。 |
+| 2026-08-07 | 人物/地理/检索/vLLM | 多名称与自动合并、PyGeoCN 逆地理、GPS 事件聚类、六路检索 + HNSW ANN、vLLM registry。 |
+| 2026-08-08 | vLLM 生产默认 | `gemma4-12b-it` 在 `8100` 常驻；事件时空加成与视觉地点事件。 |
+| 2026-08-10 | `15039f0` | `/api/ingest` 同一相册内去重；同步项目记忆与 Node 断言。 |
 
-## 当前生产结果（2026-08-03）
+## 历史阶段记录（2026-08-03 至 2026-08-05）
 
-- 正式 SQLite 已备份为 `data/backups/sentrix-before-household-rerun-20260803.db`，不纳入 Git。
-- 当前 `data/sentrix.db` 完整性为 `ok`：`album1=62/62`、`album2=58/58`、`album3=69/69`，合计 `189/189` 均为 `processed`；人物实体为 `2` 已确认（均在 `album2`）和 `22` 待确认。确认结果已回写人物事件投影、语义档案与声明。
-- `94/94` 个事件已持久化一张来自该事件原始图片的派生封面，并记录来源、Observation、候选数、置信度和拍摄时间；备份为 `data/backups/sentrix-before-event-cover-backfill-20260803.db`，不纳入 Git。用户手动选择的封面优先，未来回填不会覆盖。
-- `8090` 由 `scripts/runtime/start_sentrix_api.sh` 启动，进程环境含
-  `FACE_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider` 与 NVIDIA runtime 库路径；Web `4174` 和 FMA `5173` 均在本次切换后返回 `200`，未改动 FMA。
-- 真实相册标签没有人脸框，且存在漏检和标注人数不一致；不能以此宣称三相册人脸 F1 达到 95%。LFW 受控门禁结果仍为 coverage `0.9917`、F1 `0.9916`。
-- 隔离 AdaFace GPU 评估处理了 manifest 内 `191` 张原图、`74` 个检测，失败数为 `0`，
-  生产 SQLite 哈希前后一致。严格评估只接受“单标签且单检测”的无序对齐样本：
-  `threshold=0.20–0.28` 时加权 F1 为 `1.0`，但仅覆盖 `16/34=47.06%` 授权人脸出现。
-  因此全量三相册 `F1>=0.95` 且验证覆盖率 `>=0.95` 仍未通过；需要 bbox/face-instance
-  级标注或显式人工对齐审阅。
-- 本次 `8090` 进程显式配置 AdaFace checkpoint 与仓库根目录；对现有 `album2` 原图实测
-  返回一张 `512` 维 AdaFace 向量且质量门槛通过，ONNX 使用 `CUDAExecutionProvider`。
-  主机 `nvidia-smi` 受 NVML driver/library mismatch 影响不可作为 GPU 成功与否的唯一信号。
+- 2026-08-03：正式 SQLite 备份 `data/backups/sentrix-before-household-rerun-20260803.db`；
+  三相册 `189/189` 均 `processed`，`94/94` 事件持久化原始图片派生封面；8090 由
+  `scripts/runtime/start_sentrix_api.sh` 启动并配置 CUDA providers。
+- 2026-08-04：album1 干净重建 62 assets / 25 events；修复自动导入记忆生成（首轮空
+  `semantic.objects` 时从描述恢复响应投影）、描述恢复物品兼容（`8cd5e6b`）、批次
+  导入事件总结（`224c9f7`，`ingest_batches` + 批次完成接口）。
+- 2026-08-04：三相册语义链路验收 191 文件全部处理，189 assets/observations，
+  95 事件（25/34/36），失败 0、OOM 0；GPS 仅保留在 `geo`，事件文本 GPS 坐标 0；
+  向量 `episodic=284`、`semantic=189`、`visual=263`；正式 `.venv` 语义/模型/数据库/
+  管道测试 58/58。
+- 2026-08-05：统一运行拓扑 `4174 Web -> 8091 Agent API -> data/sentrix.db`；8090 继续
+  作为直接 API 入口；FMA 5173 未改动；Node 27/27。GitHub 仓库
+  `ysh12304124/sentrix-home-web` 发布快照（`psh-archive-20260805` 保留旧远端 tip）。
 
 ## 实体模型待办
 
-当前可回溯实现：`Person`、`Place`、`Object`、`Time`（拍摄日期）、`Event`、`Mood`（模型情绪字段）。所有实体必须绑定 Observation，并在实体详情提供关联事件、原图、置信度和算法证据。
+当前可回溯实现：`Person`、`Place`、`Object`、`Time`（拍摄日期）、`Event`、`Mood`
+（模型情绪字段），另有 `Trip` 候选与派生语义实体组。所有实体必须绑定 Observation，
+并在实体详情提供关联事件、原图、置信度和算法证据。
 
-1. **P0 实体目录与人工维护**：人物页展示全部有样本的待命名簇，单张样本标为谨慎确认；确认后即时刷新事件、人物摘要与语义声明。语义页按人物、地点、物件、日期、情感展示实体，历史 `superseded` 人物声明不作为当前画像展示。
-2. **P1 地点与时间质量**：新资料已区分稳定 GPS 地点、`geo` 属性和视觉 `scene_type`；下一步接入默认关闭的本地逆地理/POI，并在独立维护窗口补齐历史 GPS 属性。时段、季节、日期已存在，节日与用户生命阶段仍待实现。
-3. **P1 人物档案**：在已确认的人脸证据基础上维护首次/最后出现、高频地点、高频活动、同框关系和经用户确认的角色；不从场景描述推断人物外貌或亲密度。
-4. **P2 行程 Trip**：仅在跨日事件、地点序列、城市和同行者均有可追溯证据后聚合，不用普通 Event 冒充行程。
-5. **P2 情感与叙事**：完善 Mood 的置信度、视觉风格与用户纠正链；年度回顾/配乐建议须建立在明确授权和本地证据基础上。
+1. **P0 实体目录与人工维护**：人物页展示全部有样本的待命名簇，单张样本标为谨慎
+   确认；确认后即时刷新事件、人物摘要与语义声明。语义页按人物、地点、物件、日期、
+   情感展示实体，历史 `superseded` 人物声明不作为当前画像展示。
+2. **P1 地点与时间质量**：稳定 GPS 地点、`geo` 属性和视觉 `scene_type` 已区分；
+   PyGeoCN 离线逆地理已接入；继续补齐历史 GPS 属性回填。
+3. **P1 人物档案**：在已确认的人脸证据基础上维护首次/最后出现、高频地点、高频活动、
+   同框关系和经用户确认的角色；不从场景描述推断人物外貌或亲密度。
+4. **P2 行程 Trip**：仅在跨日事件、地点序列、城市和同行者均有可追溯证据后聚合，
+   不用普通 Event 冒充行程。
+5. **P2 情感与叙事**：完善 Mood 的置信度、视觉风格与用户纠正链。
 
-完整的七类实体实施顺序、数据契约和验收条件见
-`docs/plans/semantic-entity-roadmap.md`。用户已接受该路线，当前执行
-P0 的属性版本、用户覆盖和关系聚合，之后依赖顺序推进地点/时间、事件/物件、
-人物档案、行程与情感。
-
-数字人产品定位已确认：Sentrix 是**中性的家庭记忆管家**，不模仿家庭成员，
-不将推测当成事实。它先调用结构化、语义、事件和原始证据工具，再由模型组织回答；
-歧义时澄清，证据不足时记录查询缺口，写入必须由用户显式确认并保留审计。
-完整工具协议、状态和验收见 `docs/plans/digital-memory-steward.md`。
-
-新增待办：对地点、物件、情感等非人物实体生成可审阅的语义聚类候选（例如
-“湖边/水边”），保留稳定 ID、原始描述和证据，未经用户确认不得合并。
+完整七类实体实施顺序、数据契约和验收条件见 `docs/plans/semantic-entity-roadmap.md`。
+数字人产品定位：中性家庭记忆管家，先调用结构化、语义、事件和原始证据工具，再由
+模型组织回答；歧义时澄清，证据不足记录查询缺口，写入必须由用户显式确认并保留
+审计。完整协议见 `docs/plans/digital-memory-steward.md`。
 
 ## 接手原则
 
@@ -477,57 +489,16 @@ P0 的属性版本、用户覆盖和关系聚合，之后依赖顺序推进地�
    实验文件。
 4. 先写会失败的回归测试，再做最小修复；始终保留证据边界和 scope 隔离。
 5. 不得用相册来源、评估标签、匿名模型人物描述或场景衣物替代已确认人物证据。
-6. 完成后先运行新鲜验证，再更新本文档中的当前状态、实测结果和待办，并提交到
+6. 生产推理依赖 vLLM `8100` 单例；模型切换/重启需避开在线服务窗口，并先确认
+   `/api/model-profiles/current` 状态。
+7. 完成后先运行新鲜验证，再更新本文档中的当前状态、实测结果和待办，并提交到
    153 `psh`。
 
-## 当前接手状态（2026-08-04 album1）
+## 同步记录
 
-- 代码提交：`8b08021 fix: complete semantic reprojection and event merging`，153 `psh` 工作树干净。
-- 本阶段完成语义词表兼容投影：地点使用受控主类，GPS 只写入 `geo`，自由地点描述保留为视觉证据；物品与氛围支持主类、细节和原始标签；旧 `emotion` 仅在可映射时转为 `atmosphere`，未知标签保留原始观察并退出默认目录。
-- 网页默认证据卡只显示原始证据缩略图、时间和语义摘要；文件名、Asset/Observation ID、模型和技术字段放入技术详情或不再展示。Node UI 回归为 `23/23`。
-- 按用户要求先只重跑 `album1`。manifest 有 64 条记录，64/64 处理成功；当前数据库包含 62 个 Asset、62 个 Observation、27 个 Event、36 个 Entity、4 个 face cluster，`rebuild_runs` 为 `completed`，SQLite `integrity_check` 为 `ok`。数据库当前只包含 `album1`，`album2/3` 尚未执行。
-- 重跑前回滚数据库保留在 `/tmp/sentrix.db.before-full-rerun-20260804`；此前语义迁移备份为 `/tmp/sentrix.db.before-semantic-taxonomy-20260804`。这些文件不纳入 Git。
-- 服务状态：Sentrix API `8090`、Web `4174`、FMA `5173` 均为 `200`；FMA 未停止、未修改。AdaFace、Gemma、FunASR 和 CLIP 健康接口均为 ready。
-- 修复了事件合并删除前未迁移 `event_entities`、`event_revisions`、`person_event_memory` 和 feedback 外键投影的问题；Python 回归 `215/215`，Node 回归 `23/23`。
-
-下一步先由用户检查 album1 的地点、物品、氛围语义质量，再决定是否输入 album2/3 的重跑命令。不要自动继续重跑其他相册。
-
-## 2026-08-04 自动导入记忆生成修复
-
-- 最新代码提交：`4ae1fd7 fix: auto-complete image descriptions and event summaries`。
-- 视觉提示词现在明确要求同时输出 `caption/activity/place/event_type` 等自然语言观察，不能只返回受控语义选择；若首轮只返回语义结构或空对象，会自动对同一图片发起一次描述恢复请求。
-- `/api/ingest` 的后台任务在图片语义丰富完成后自动调用事件总结，用户不需要手动调用 `/api/maintenance/summarize-events`。音频、文本原本已经使用自动总结路径。
-- 旧 album1 已落库的空观察不会被代码热更新自动重写；当前 album1 的历史语义恢复需要另行执行并先备份数据库。新导入会直接走恢复与事件总结路径。
-- 新鲜验证：Python `216/216`、Node `24/24`；真实 album1 图片恢复测试得到“一个铺满干果碎的芒果蛋糕 / 展示甜点特写 / 室内餐厅或咖啡馆”。
-
-## 2026-08-04 描述恢复物品兼容修复
-
-- 最新代码提交：`8cd5e6b fix: preserve recovered object observations`。
-- 描述恢复请求返回的顶层 `objects` 现在会在首轮 `semantic.objects` 为空时回退进入语义物品层；非空的模型语义选择仍然优先，避免恢复结果覆盖已有选择。
-- 新增回归断言确认“首轮只有语义、恢复返回玩具”最终保留为语义物品；153 Python 回归 `216/216`、Node 回归 `24/24` 均通过。
-- API 已重启并加载新提交：`/api/health=200`，Web `4174=200`，FMA `5173=200`。本次未执行 album2/3，也未修改数据库。
-
-## 2026-08-04 批次导入事件总结修复
-
-- 图片导入支持 `batch_id`；浏览器完成同一批文件上传后调用批次完成接口。
-- 批次图片仍先并行完成 Face、CLIP 和 Gamma 视觉观察；带批次的图片不会在单张完成后调用事件总结。
-- 批次完成且所有资产进入终态后，只总结该批次涉及的事件各一次。事件总结输入事件内全部 Observation 的文字描述和结构化字段，不重新输入原图。
-- 不带 `batch_id` 的旧 API 调用保留原有即时总结兼容行为。
-- 153 验证：Python `233/233`、Node `24/24`；SQLite `integrity_check=ok`；批次回归确认两张图片同一事件只产生一次总结调用。
-
-## 2026-08-04 三相册语义链路验收
-
-- 已在 153 `psh` 使用 `gemma4:12b` 常驻、Face CPU、AdaFace CPU、CLIP CPU 配置完整重建三相册；输入 `191` 个文件，成功处理 `191` 个，落库 `189` 个 Asset 和 `189` 个 Observation，失败 `0`、OOM `0`。
-- 最终活动事件共 `95` 个：`album1=25`、`album2=34`、`album3=36`；事件总结全部完成，没有“待总结事件”。总结输入为事件内全部 Observation 的描述和结构化字段，不重新输入原图。
-- 修复事件展示地点误用 GPS 的根因：GPS 仅保留在 Asset/Place 的 `geo` 属性，Event 的 `place`、标题和总结只允许使用图片语义地点。最终检查事件文本中的 GPS 坐标为 `0`，地点实体名称中 GPS 为 `0`。
-- 语义规范化新增“模型选择其他时从原始地点/物品标签回退”、室内/街道/工业/自然等地点类别，以及自然景观、艺术展品、工业设备、演出用品等物品主类；完整原始标签仍保留在 Observation 证据中。现有数据库已使用新词表重投影，不重新调用视觉模型。
-- 最终验收：SQLite `integrity_check=ok`；资产-观察、观察-事件覆盖无缺失；`raw_json/canonical_json` 全部可解析；向量空间 `episodic=284`、`semantic=189`、`visual=263`，无悬空 source 指针；API `8090`、Web `4174`、FMA `5173` 均正常。
-- 本阶段回归：153 正式 `.venv` 中 `58/58` 语义/模型/数据库/管道测试通过；Agent 相关未提交文件未触碰。重建和重投影备份保留在 `/tmp`，不纳入 Git。
-
-## 2026-08-05 Agent、网页与三相册数据统一
-
-- 运行拓扑固定为 `4174 Web -> 8091 Agent-capable API -> data/sentrix.db`；8090 继续作为直接 Sentrix API 入口，FMA `5173` 未停止、未修改。
-- 8091 与 8090 均使用 `/home/asus/Github/Sentrix-Home-Web/data/sentrix.db`，Agent 的记忆检索、证据回链和网页读取因此使用同一份三相册正式数据；Gemma 使用 `11435` 常驻实例。
-- `/api/memory-spaces` 暴露 `album1`、`album2`、`album3`，网页默认进入“全部相册”合并视图，同时保留单相册切换。当前数据为 `189` 张原始图片、`95` 个事件；分相册为 `62/25`、`58/34`、`69/36`（资产/事件）。事件和原始证据卡均显示来源相册标签。
-- 网页不再默认代理旧的 8091 demo 数据库，也不再把旧 `home-default` 选择当作首屏相册；Agent 助手页在合并视图显示“全部相册”。
-- 统一入口验证：Node 回归 `27/27`、`node --check src/app.js`、`node --check server.js`、`git diff --check` 通过；8090、8091、4174、5173 健康检查均为 `200`，Agent `/api/assistant/turn` 可通过 4174 返回跨相册证据回答。
+- 2026-08-10：本文档按 153 `psh` `15039f0` 实测状态全面更新（Thin Agent、vLLM、
+  运行拓扑、数据库计数、验证结果与待办）；同步修正 `test/project-structure.test.js`
+  三处陈旧断言（Node 31/31 通过）。
+- 项目记忆双层存储约定不变：153 本文档为完整权威来源，Project Memory MCP
+  `projects/sentrix-home-web/` 保存精炼共享摘要、任务、决策与 handoff；重要提交后
+  两边同时更新。

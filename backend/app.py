@@ -4,16 +4,19 @@ import shutil
 import hashlib
 import tempfile
 import threading
+import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .agent import MemoryAgent
+from .agent_conversation import ConversationStore
 from .db import MemoryStore, make_id
 from .image_io import (
     encode_jpeg_preview,
@@ -41,6 +44,8 @@ gamma = GammaClient()
 gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
 agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
+conversation_store = ConversationStore(store)
+CONVERSATION_STORE_ENABLED = os.getenv("SENTRIX_CONVERSATION_STORE_V1", "0").lower() in {"1", "true", "on"}
 
 app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -414,6 +419,24 @@ def create_memory_space(request: MemorySpaceCreateRequest):
 @app.get("/api/memory-spaces")
 def memory_spaces():
     return {"spaces": store.list_memory_spaces()}
+
+@app.delete("/api/memory-spaces/{scope_id}")
+def delete_memory_space(scope_id: str):
+    scope_id = (scope_id or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="scope_id required")
+    if scope_id == "home-default":
+        raise HTTPException(status_code=403, detail="home-default 是系统默认相册,不允许删除")
+    if not store._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,)):
+        raise HTTPException(status_code=404, detail=f"相册 {scope_id} 不存在")
+    try:
+        stats = store.delete_memory_space(scope_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"删除失败: {exc}")
+    return {"ok": True, "scope_id": scope_id, "removed": stats}
+
 
 
 @app.get("/api/vlm-backend")
@@ -1173,15 +1196,152 @@ class AssistantTurnRequest(BaseModel):
     viewer_id: str = "owner"
 
 
+def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=""):
+    """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
+    from .agent_runtime import tools as runtime_tools
+    from .agent_runtime.runtime import AgentRuntime
+
+    runtime_tools.bind_runtime(store, gamma=gamma)
+    runtime_tools.register_tools()
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+
+    def chat_fn(messages):
+        payload = {
+            "model": getattr(gamma, "model", "gemma4-12b-it"),
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 800,
+        }
+        response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
+                              timeout=120)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
+                           scope_id=scope_id, viewer_id=viewer_id)
+    turn = runtime.run(message, history=recent_turns)
+    trace = [
+        {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
+         "reason": s.get("reason") or "",
+         "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
+        for s in turn.steps
+    ]
+    return {
+        "answer": turn.final_answer,
+        "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "intent": "tool_loop",
+        "evidence_status": "tool_loop",
+        "retrieval_trace": trace,
+        "public_progress": turn.public_progress,
+        "tool_loop_status": turn.status,
+        "tool_loop_reason": turn.reason,
+    }
+
+
 @app.post("/api/assistant/turn")
 def assistant_turn(request: AssistantTurnRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
-    result = agent.answer_turn(
-        request.message.strip(), request.conversation_id, request.feedback, request.scope_id,
-        request.selected_entity_id, request.viewer_id,
-    )
+    message = request.message.strip()
+    recent_turns = ""
+    if CONVERSATION_STORE_ENABLED and request.conversation_id:
+        try:
+            history = conversation_store.last_messages(request.conversation_id, limit=8)
+            recent_turns = "\n".join(
+                f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'].get('text', '')}"
+                for m in history if m.get("content", {}).get("text")
+            )
+        except Exception:
+            recent_turns = ""
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+    if profile_name in {"tool_loop", "tool_loop_shadow"}:
+        result = _tool_loop_turn(message, request.conversation_id, request.scope_id,
+                                 request.viewer_id, recent_turns=recent_turns)
+    else:
+        result = agent.answer_turn(
+            message, request.conversation_id, request.feedback, request.scope_id,
+            request.selected_entity_id, request.viewer_id,
+            recent_turns=recent_turns,
+        )
+    if CONVERSATION_STORE_ENABLED and result.get("conversation_id"):
+        try:
+            cid = result["conversation_id"]
+            turn_id = make_id("turn")
+            result["turn_id"] = turn_id
+            scope_id = request.scope_id or "home-default"
+            conversation_store.add_message(cid, "user", {"text": message},
+                                           scope_id=scope_id, turn_id=turn_id)
+            conversation_store.add_message(cid, "assistant", {
+                "text": result.get("answer", ""),
+                "intent": result.get("intent"),
+                "evidence_status": result.get("evidence_status"),
+            }, scope_id=scope_id, turn_id=turn_id)
+            trace = result.get("retrieval_trace") or result.get("trace") or []
+            steps = []
+            for item in trace:
+                if not isinstance(item, dict):
+                    continue
+                steps.append({
+                    "stage": item.get("stage") or item.get("gate") or "unknown",
+                    "status": item.get("status", "complete"),
+                    "detail": item.get("reason") or item.get("counts") or {},
+                })
+            public_progress = result.get("public_progress") or [
+                {"text": _public_progress_text(s), "status": s.get("status", "complete")}
+                for s in steps if _public_progress_text(s)
+            ]
+            conversation_store.save_trajectory(
+                turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
+                steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent")},
+                public_progress=public_progress, scope_id=scope_id,
+            )
+            result["public_progress"] = public_progress
+        except Exception:
+            # 记录失败不影响回答
+            pass
     return assistant_response(result)
+
+
+@app.get("/api/conversation/{conversation_id}/messages")
+def conversation_messages(conversation_id: str, limit: int = 20):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    try:
+        return {"conversation_id": conversation_id,
+                "messages": conversation_store.list_messages(conversation_id, limit=limit)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/conversation/{conversation_id}/trajectory")
+def conversation_trajectory(conversation_id: str, limit: int = 20):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    try:
+        return {"conversation_id": conversation_id,
+                "trajectories": conversation_store.list_trajectories(conversation_id, limit=limit)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _public_progress_text(item):
+    stage = item.get("stage") or ""
+    status = item.get("status") or ""
+    if stage == "gate":
+        return "正在判断你的意图。"
+    if stage == "retrieval":
+        counts = item.get("counts") or {}
+        n = counts.get("assets", counts.get("exact", 0))
+        return f"已找到 {n} 条相关记录。" if n else "正在检索相关记录。"
+    if stage == "answer":
+        return "正在组织回答。"
+    if stage == "channels":
+        return "已合并多路检索结果。"
+    if status == "contextual":
+        return "正在读取记忆上下文。"
+    if status == "gap":
+        return "当前记录中没有找到足够匹配的证据。"
+    return ""
 
 
 @app.post("/api/ingest", status_code=202)
@@ -1193,6 +1353,8 @@ async def ingest(
     sourceAlbumId: str | None = Form(None),
     capturedAt: str | None = Form(None),
     capturedLocation: str | None = Form(None),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
 ):
     safe_name = Path(file.filename or "upload.bin").name
     asset_id = make_id("asset")
@@ -1201,7 +1363,9 @@ async def ingest(
         shutil.copyfileobj(file.file, output)
     media_type = media_type_from_upload(file.content_type, safe_name)
     mime_type = file.content_type or guess_mime_type(safe_name)
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
     metadata = {
+        "scope_id": scope,
         "source_owner_id": sourceOwnerId,
         "source_device_id": sourceDeviceId,
         "source_album_id": sourceAlbumId,
@@ -1213,10 +1377,12 @@ async def ingest(
     }
     metadata["captured_at"] = metadata["captured_at"] or metadata["exif"].get("captured_at")
     metadata["source_device_id"] = metadata["source_device_id"] or metadata["exif"].get("device")
-    existing = store.find_asset_by_hash(metadata["content_sha256"])
+    # Deduplication is scoped to the album: the same photo may legitimately
+    # appear in a different memory space without being treated as a duplicate.
+    existing = store.find_asset_by_hash(metadata["content_sha256"], scope)
     if existing:
         destination.unlink(missing_ok=True)
-        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "deduplicated": True}
+        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "scope_id": scope, "deduplicated": True}
     created = store.create_asset(
         asset_id,
         safe_name,
@@ -1227,7 +1393,7 @@ async def ingest(
         metadata,
     )
     background_tasks.add_task(process_asset, asset_id)
-    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type}
+    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type, "scope_id": scope}
 
 
 @app.post("/api/import", status_code=202)

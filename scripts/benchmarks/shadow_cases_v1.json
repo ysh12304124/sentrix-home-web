@@ -1,0 +1,20 @@
+[
+  {"id": "s01", "category": "count", "query": "去年拍了多少张照片", "expected": "query_memory_facts"},
+  {"id": "s02", "category": "time", "query": "去年有哪些月份拍过照片", "expected": "query_memory_facts"},
+  {"id": "s03", "category": "place", "query": "去年主要在哪些地方拍照", "expected": "query_memory_facts"},
+  {"id": "s04", "category": "first_last", "query": "明哥第一次出现是什么时候", "expected": "query_memory_facts"},
+  {"id": "s05", "category": "find_images", "query": "去年十月爬山拍的照片", "expected": "search_memories"},
+  {"id": "s06", "category": "find_images", "query": "穿红色衣服的照片", "expected": "search_memories"},
+  {"id": "s07", "category": "hybrid", "query": "去年十月在上海的照片", "expected": "search_memories"},
+  {"id": "s08", "category": "find_images", "query": "水族馆的照片", "expected": "search_memories"},
+  {"id": "s09", "category": "find_images", "query": "做饭的照片", "expected": "search_memories"},
+  {"id": "s10", "category": "find_images", "query": "全家福", "expected": "search_memories"},
+  {"id": "s11", "category": "all", "query": "去年十月上海的照片都给我", "expected": "search_memories"},
+  {"id": "s12", "category": "chat", "query": "你好", "expected": "final"},
+  {"id": "s13", "category": "writing", "query": "帮我把这句话改得正式一点：我们上次去海边玩得很开心", "expected": "final"},
+  {"id": "s14", "category": "find_images", "query": "介绍一下明哥", "expected": "search_memories"},
+  {"id": "s15", "category": "count", "query": "去年有几个视频", "expected": "query_memory_facts"},
+  {"id": "s16", "category": "place", "query": "我在杭州拍过照片吗", "expected": "query_memory_facts"},
+  {"id": "s17", "category": "find_images", "query": "猫咪的照片", "expected": "search_memories"},
+  {"id": "s18", "category": "vague", "query": "帮我看看照片", "expected": "search_memories"}
+]
