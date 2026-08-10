@@ -100,7 +100,7 @@ class FinalGuard:
                 elif expected is False:
                     if _POSITIVE_FOUND.search(answer) and not _DENY_WITH_OBJECT.search(answer):
                         issues.append(_issue("fact_exists_contradiction_false", "expected=False"))
-            elif op == "group":
+            elif op in {"group", "meal"}:
                 issues.extend(self._check_group(answer, task_state))
         # 0.5 模板占位符泄漏（[地点名称1]/[数量] 等未填占位）
         if re.search(r"\[[^\[\]]{0,14}(?:名称|数量|时间|地点|内容|数字|照片|记录)[^\[\]]{0,14}\]", answer):
@@ -140,7 +140,9 @@ class FinalGuard:
         condition_summary = task_state.get("search_condition_summary") or {}
         denies = bool(__import__("re").search(
             r"没(?:有)?找到|未找到|不存在|没有(?:任何|符合|相关|一张|一个|一条)?(?:照片|记录|回忆|记忆)|查无|"
-            r"无法看到.{0,6}(?:照片|内容)|看不到任何照片|无法查看(?:照片|内容)|没有(?:可|能看|看过).{0,4}照片", answer))
+            r"无法看到.{0,6}(?:照片|内容)|看不到任何照片|无法查看(?:照片|内容)|没有(?:可|能看|看过).{0,4}照片|"
+            r"没有去过任何(?:地方|地点|城市)|没去过任何(?:地方|地点|城市)|"
+            r"没有(?:任何|一个|什么|一处|哪个)(?:去过)?(?:地方|地点|城市)", answer))
         # 1) 有结果却声称没有：非空结果 + 明确否认存在 → omission（与是否引用无关）
         # C8：条件级否认不算整体否认——"没找到能确认'爬山'的记录"≠"没有找到照片"
         condition_level_deny = bool(re.search(
@@ -206,7 +208,12 @@ class FinalGuard:
         if condition_summary:
             unresolved = [k for k, v in condition_summary.items() if v in {"unknown", "contradicted"}]
             if unresolved:
-                confirm = re.search(r"确认是|确定是|肯定是|就是|确认了|确定了|确认到|确认过", answer)
+                confirm = None
+                for _m in re.finditer(r"确认是|确定是|肯定是|就是|确认了|确定了|确认到|确认过", answer):
+                    before = answer[max(0, _m.start() - 4):_m.start()]
+                    if not re.search(r"没|未|不|还|难|无法|不能", before):
+                        confirm = _m
+                        break
                 label_assert = any(str(label) and str(label) in answer for label in unresolved) or \
                     bool(re.search(r"(?:这些|上述|几个)?条件.{0,8}(?:确认|确定|成立)", answer))
                 if confirm and label_assert:
@@ -236,11 +243,41 @@ class FinalGuard:
                 issues.append(_issue("group_fabrication", f"months={bad}"))
         if re.search(r"没|未", answer):
             return issues
+        # C10：place 分组 / meal 食物分组的列举项必须在 rows 内（编造地点/食物 -> group_fabrication）
+        if group_by == "place" or any(str(r.get("group") or "") for r in rows):
+            known = {str(r.get("group") or "") for r in rows if str(r.get("group") or "")}
+            items = FinalGuard._extract_list_items(answer, r"去过|去了|到过|前往|游玩|参观|出差|旅游")
+            bad = [it for it in items if it and not any(it == k or it in k or k in it for k in known)]
+            if bad:
+                issues.append(_issue("group_fabrication", f"places={bad}"))
+        food_rows = [r for r in rows if "food" in r]
+        if not food_rows:
+            value = task_state.get("fact_value") or []
+            food_rows = [r for r in value if isinstance(r, dict) and "food" in r]
+        if food_rows:
+            known = {str(r.get("food") or "") for r in food_rows if str(r.get("food") or "")}
+            items = FinalGuard._extract_list_items(answer, r"吃过|吃了|喝过|喝了|点了|吃：|吃:|喝过:|吃过:")
+            bad = [it for it in items if it and not any(it == k or it in k or k in it for k in known)]
+            if bad:
+                issues.append(_issue("group_fabrication", f"foods={bad}"))
         has_evidence = bool(valid_months & set(found_months)) or any(
             label and label in answer for label in labels)
         if not has_evidence and re.search(r"主要|包括|有照片|拍了|月份|地点|地方", answer):
             issues.append(_issue("group_no_evidence"))
         return issues
+
+    @staticmethod
+    def _extract_list_items(answer: str, keywords: str) -> list[str]:
+        """从动词/关键词后的列举段提取短名词项（用于校验 place/meal 列举是否在工具结果内）。"""
+        items = []
+        for m in re.finditer(keywords, answer):
+            tail = answer[m.end():m.end() + 80]
+            tail = re.split(r"[。；!！?\n]", tail)[0]
+            for part in re.split(r"[、，,和及与]", tail):
+                part = part.strip("：:、，,和及与 ").strip()
+                if 1 <= len(part) <= 8 and re.match(r"^[\u4e00-\u9fa5A-Za-z0-9]+$", part):
+                    items.append(part)
+        return items
 
     @staticmethod
     def _date_num_ok(num: str, answer: str) -> bool:
