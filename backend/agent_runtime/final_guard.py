@@ -274,9 +274,18 @@ class FinalGuard:
             tail = answer[m.end():m.end() + 80]
             tail = re.split(r"[。；!！?\n]", tail)[0]
             for part in re.split(r"[、，,和及与]", tail):
+                part = re.split(r"[（(]", part)[0]
                 part = part.strip("：:、，,和及与 ").strip()
-                if 1 <= len(part) <= 8 and re.match(r"^[\u4e00-\u9fa5A-Za-z0-9]+$", part):
+                if 1 <= len(part) <= 8 and re.match(r"^[\u4e00-\u9fa5A-Za-z0-9]+$", part) \
+                        and part not in {"以下地方", "这些地方", "以下几个", "以下", "如下",
+                                         "以上", "这些", "几个", "一些地方", "一些", "几个地方"}:
                     items.append(part)
+        # 子弹列表："- 杭州市：150条记录"
+        for m in re.finditer(r"(?:^|\n)\s*[-*•]\s*([\u4e00-\u9fa5A-Za-z0-9]{1,8})[：:]", answer):
+            item = m.group(1)
+            if item not in items and item not in {"以下地方", "这些地方", "以下几个", "以下", "如下",
+                                                  "以上", "这些", "几个", "一些地方", "一些", "几个地方"}:
+                items.append(item)
         return items
 
     @staticmethod

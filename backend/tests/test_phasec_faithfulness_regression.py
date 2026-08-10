@@ -95,6 +95,26 @@ class PlaceAggregationRegressionTests(unittest.TestCase):
             "partial_support", {"杭州": "confirmed", "爬山": "unknown"}))
         self.assertTrue(any("missing_disclosure" in p for p in problems))
 
+    def test_place_bullet_list_fabricated_city_blocked(self):
+        problems = FinalGuard().check(
+            "根据记录，您去年去过以下地方：\n- 杭州市：150条记录\n- 拉萨市：5条记录",
+            task_state=_group_state([{"group": "杭州市", "count": 150},
+                                     {"group": "绍兴市", "count": 34}], group_by="place"))
+        self.assertTrue(any("group_fabrication" in p for p in problems))
+
+    def test_place_inline_parenthetical_passes(self):
+        problems = FinalGuard().check(
+            "去年春天，您的出行记录显示去过杭州市（共有100条记录）。",
+            task_state=_group_state([{"group": "杭州市", "count": 100}], group_by="place"))
+        self.assertEqual(list(problems), [])
+
+    def test_place_structural_phrase_not_fabrication(self):
+        problems = FinalGuard().check(
+            "根据记录，您去年去过以下地方：\n- 杭州市：150条记录\n- 绍兴市：34条记录",
+            task_state=_group_state([{"group": "杭州市", "count": 150},
+                                     {"group": "绍兴市", "count": 34}], group_by="place"))
+        self.assertEqual(list(problems), [])
+
     def test_place_omission_blocked(self):
         problems = FinalGuard().check("去年没有去过任何地方。", task_state=_search_state(
             "full_support", {"杭州": "confirmed"}))
