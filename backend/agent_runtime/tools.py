@@ -367,19 +367,33 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
 
 
 # ---- Tool 2: search_memories ----
+def _even_indices(total: int, n: int) -> list[int]:
+    """在 [0, total) 内均匀取 n 个下标（representative 预览用，避免只展示最新几张），包含首尾。"""
+    if total <= n:
+        return list(range(total))
+    if n <= 1:
+        return [0]
+    return [min(int(round(i * (total - 1) / (n - 1))), total - 1) for i in range(n)]
+
+
 def _search_metadata_only(draft, spec, scope_id, query, mode) -> dict:
     """空 query 搜索：只按硬筛选（时间/媒体/地点/人物）返回资产，构建 ResultSet 预览。"""
     from ..structured_memory import StructuredMemoryExecutor
     executor = StructuredMemoryExecutor(_RUNTIME["store"])
     assets = executor._matching_assets(draft, spec, limit=500)
+    asset_ids = [a["id"] for a in assets]
     rs = _RUNTIME["result_sets"].new(
-        scope_id=scope_id, query=query or "(时间/地点筛选)", asset_ids=[a["id"] for a in assets],
+        scope_id=scope_id, query=query or "(时间/地点筛选)", asset_ids=asset_ids,
         unresolved=[])
-    preview = []
     handles = rs.handles()
-    for i, a in enumerate(assets[:6]):
+    _RUNTIME["last_handles"] = handles
+    indices = _even_indices(len(asset_ids), 6) if mode == "representative" \
+        else list(range(min(6, len(asset_ids))))
+    preview = []
+    for i, idx in enumerate(indices):
+        a = assets[idx]
         preview.append({
-            "handle": f"photo_{i + 1}",
+            "handle": f"photo_{idx + 1}",
             "captured_at": a.get("captured_at"),
             "level": "exact",
             "condition_summary": {},
@@ -634,6 +648,7 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         "question": question,
         "observation": parsed.get("observation") or parsed.get("scene") or "",
         "certainty": parsed.get("certainty") or "supported",
+        "confirms_visual_only": True,
         "source": "runtime_visual_inspection",
         "persisted": False,
     }

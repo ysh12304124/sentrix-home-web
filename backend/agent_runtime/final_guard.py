@@ -142,11 +142,14 @@ class FinalGuard:
             r"没(?:有)?找到|未找到|不存在|没有(?:任何|符合|相关|一张|一个|一条)?(?:照片|记录|回忆|记忆)|查无|"
             r"无法看到.{0,6}(?:照片|内容)|看不到任何照片|无法查看(?:照片|内容)|没有(?:可|能看|看过).{0,4}照片", answer))
         # 1) 有结果却声称没有：非空结果 + 明确否认存在 → omission（与是否引用无关）
+        # C8：条件级否认不算整体否认——"没找到能确认'爬山'的记录"≠"没有找到照片"
+        condition_level_deny = bool(re.search(
+            r"没(?:有)?找到(?:能|办法|足够|明确){0,2}(?:确认|确定|验证|证实)", answer))
         for tr in tool_results:
             total = tr.get("total")
             if total is None:
                 continue
-            if total > 0 and denies and satisfaction != "no_match":
+            if total > 0 and denies and satisfaction != "no_match" and not condition_level_deny:
                 issues.append(_issue("omission_conflict",
                                      f"tool={tr.get('tool')},total={total}"))
             if tr.get("tool_call_id") in refs and total == 0 and not denies:
@@ -154,13 +157,16 @@ class FinalGuard:
                     issues.append(_issue("fabrication_from_empty_ref"))
         inspect_texts = [tr.get("inspect_text") for tr in tool_results
                          if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip()]
-        # 2) candidate_only 声称完全匹配（inspect 复核到具体观察的不算）
-        if satisfaction == "candidate_only" and not inspect_texts:
+        selected_handle = task_state.get("selected_asset_handle")
+        # C8：inspect 只确认照片里直接可见的视觉细节，不能反向确认检索条件。
+        # 用户明确点选某张照片追问时（selected_handle 存在），该照片的视觉回答以 inspect 为准，豁免。
+        # 2) candidate_only 声称完全匹配（inspect 观察存在也不豁免"找到了/确认是"检索条件）
+        if satisfaction == "candidate_only" and not selected_handle:
             if re.search(r"确认|确定|就是|肯定是|找到了|确认是", answer) and \
                not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据", answer):
                 issues.append(_issue("candidate_claimed_as_match"))
-        # 3) partial/candidate 必须披露缺口（已通过 inspect 复核到具体观察的除外）
-        if satisfaction in {"partial_support", "candidate_only"} and not inspect_texts:
+        # 3) partial/candidate 必须披露检索层缺口（inspect 视觉观察不替代检索层披露；点选追问除外）
+        if satisfaction in {"partial_support", "candidate_only"} and not (inspect_texts and selected_handle):
             if not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer):
                 issues.append(_issue("missing_disclosure"))
         # 4.5) inspect 被拒/无观察却断言视觉细节 → inspection_fabrication
@@ -195,11 +201,16 @@ class FinalGuard:
                         if positive_claim:
                             issues.append(_issue("inspect_observation_contradicted"))
 
-        # 4) 条件明确 unknown/contradicted 却升级为 confirmed
+        # 4) 条件明确 unknown/contradicted 却升级为 confirmed（标签感知：只拦"条件本身被确认"的表述，
+        #    不误伤"我确认照片里没有雪"这类视觉断言）
         if condition_summary:
             unresolved = [k for k, v in condition_summary.items() if v in {"unknown", "contradicted"}]
-            if unresolved and re.search(r"确认|确定|肯定|就是", answer):
-                issues.append(_issue("certainty_upgrade", f"conditions={unresolved[:3]}"))
+            if unresolved:
+                confirm = re.search(r"确认是|确定是|肯定是|就是|确认了|确定了|确认到|确认过", answer)
+                label_assert = any(str(label) and str(label) in answer for label in unresolved) or \
+                    bool(re.search(r"(?:这些|上述|几个)?条件.{0,8}(?:确认|确定|成立)", answer))
+                if confirm and label_assert:
+                    issues.append(_issue("certainty_upgrade", f"conditions={unresolved[:3]}"))
         return issues
 
     @staticmethod
