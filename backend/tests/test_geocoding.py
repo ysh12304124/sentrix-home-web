@@ -1,44 +1,76 @@
 import unittest
+from unittest.mock import patch
 
-from backend.geocoding import OfflineReverseGeocoder
+from backend.geocoding import OfflineReverseGeocoder, format_gps_prefix
 
 
 class GeocodingTests(unittest.TestCase):
-    def setUp(self):
-        self.geocoder = OfflineReverseGeocoder(
-            city_records=[
-                {"name": "测试市", "admin1": "测试省", "admin2": "测试区", "cc": "CN", "lat": 31.2304, "lon": 121.4737},
-            ],
-            poi_records=[
-                {"name": "测试湖公园", "kind": "park", "lat": 31.2310, "lon": 121.4740},
-            ],
-        )
-
-    def test_returns_city_context_from_offline_index(self):
-        result = self.geocoder.lookup({"latitude": 31.2304, "longitude": 121.4737})
-
-        self.assertEqual(result["source"], "offline")
-        self.assertEqual(result["precision"], "poi")
-        self.assertEqual(result["label"], "测试湖公园")
-        self.assertEqual(result["city"], "测试市")
-        self.assertEqual(result["district"], "测试区")
-        self.assertGreater(result["confidence"], 0)
-
     def test_returns_empty_for_invalid_coordinates(self):
-        self.assertEqual(self.geocoder.lookup({"latitude": 181, "longitude": 1}), {})
-        self.assertEqual(self.geocoder.lookup(None), {})
+        geocoder = OfflineReverseGeocoder()
+        self.assertEqual(geocoder.lookup({"latitude": 181, "longitude": 1}), {})
+        self.assertEqual(geocoder.lookup(None), {})
 
-    def test_poi_is_not_used_when_it_is_too_far_away(self):
-        geocoder = OfflineReverseGeocoder(
-            city_records=self.geocoder.city_records,
-            poi_records=self.geocoder.poi_records,
-            poi_radius_km=0.01,
-        )
+    def test_format_gps_prefix_joins_china_without_separators(self):
+        prefix = format_gps_prefix({
+            "source": "tianditu",
+            "city": "深圳市",
+            "district": "福田区",
+            "country": "CN",
+            "label": "广东省深圳市福田区",
+        })
+        self.assertEqual(prefix, "深圳市福田区")
 
-        result = geocoder.lookup({"latitude": 31.2304, "longitude": 121.4737})
+    def test_format_gps_prefix_uses_comma_for_international(self):
+        prefix = format_gps_prefix({
+            "source": "geonames",
+            "city": "Kyoto",
+            "admin1": "Kyoto Prefecture",
+            "country": "JP",
+            "label": "Kyoto, Kyoto Prefecture, JP",
+        })
+        self.assertEqual(prefix, "Kyoto, Kyoto Prefecture")
 
-        self.assertEqual(result["precision"], "city")
-        self.assertEqual(result["label"], "测试省测试市测试区")
+    def test_pygeo_success_short_circuits_fallback(self):
+        geocoder = OfflineReverseGeocoder()
+        with patch.object(geocoder, "_lookup_pygeo", return_value={
+            "source": "tianditu",
+            "precision": "district",
+            "label": "广东省深圳市福田区",
+            "province": "广东省",
+            "city": "深圳市",
+            "district": "福田区",
+            "country": "CN",
+            "latitude": 22.53,
+            "longitude": 114.05,
+            "confidence": 0.9,
+        }) as pygeo, patch.object(geocoder, "_lookup_reverse_geocoder") as fallback:
+            result = geocoder.lookup({"latitude": 22.53, "longitude": 114.05})
+        self.assertEqual(result["source"], "tianditu")
+        self.assertEqual(result["label"], "广东省深圳市福田区")
+        pygeo.assert_called_once()
+        fallback.assert_not_called()
+
+    def test_falls_back_to_reverse_geocoder_outside_china(self):
+        geocoder = OfflineReverseGeocoder()
+        with patch.object(geocoder, "_lookup_pygeo", return_value={}), patch.object(
+            geocoder,
+            "_lookup_reverse_geocoder",
+            return_value={
+                "source": "geonames",
+                "precision": "city",
+                "label": "Kyoto, Kyoto Prefecture, JP",
+                "city": "Kyoto",
+                "admin1": "Kyoto Prefecture",
+                "country": "JP",
+                "latitude": 35.02,
+                "longitude": 135.77,
+                "confidence": 0.7,
+            },
+        ) as fallback:
+            result = geocoder.lookup({"latitude": 35.02, "longitude": 135.77})
+        self.assertEqual(result["source"], "geonames")
+        self.assertEqual(result["label"], "Kyoto, Kyoto Prefecture, JP")
+        fallback.assert_called_once()
 
 
 if __name__ == "__main__":

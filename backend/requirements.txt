@@ -15,6 +15,8 @@ torchmetrics>=1.7,<2
 lightning-utilities>=0.12,<1
 open-clip-torch==3.3.0
 pygeo-cn>=0.1.5
+# International offline fallback when PyGeoCN cannot resolve non-China GPS.
+reverse_geocoder>=1.5,<2
 # pygeo-cn depends on geopandas -> pandas; keep pandas inside the venv so
 # PYTHONNOUSERSITE=1 does not hide it (user-site installs are disabled).
 pandas>=2.0,<3
