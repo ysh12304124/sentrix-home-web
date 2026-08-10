@@ -210,6 +210,20 @@ class StructuredMemoryExecutor:
         )
         return [{"group": row["g"]} for row in rows]
 
+    def _sample_observations(self, draft, spec, limit: int = 3) -> list[dict]:
+        """取过滤条件下的代表 observation 证据样本（含 asset_id/caption/captured_at）。
+
+        供 query_memory_facts 等事实工具附加证据，前端可据此展示可点击的原始证据。
+        """
+        joins, where, params = self._base_query(draft, spec)
+        rows = self._rows(
+            "SELECT a.id AS asset_id, a.captured_at, a.media_type, "
+            "(SELECT COALESCE(o.caption, '') FROM observations o "
+            " WHERE o.asset_id = a.id ORDER BY o.captured_at DESC LIMIT 1) AS caption "
+            f"FROM assets a {joins} WHERE {where} ORDER BY a.captured_at DESC LIMIT ?",
+            params + [limit])
+        return [dict(row) for row in rows]
+
     def _matching_assets(self, draft, spec, limit: int = 500) -> list[dict]:
         """纯硬筛选（时间/媒体/地点/人物）的资产列表（search_memories 空 query 用，不依赖 ANN）。"""
         joins, where, params = self._base_query(draft, spec)
