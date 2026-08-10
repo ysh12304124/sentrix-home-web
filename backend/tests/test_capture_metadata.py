@@ -34,7 +34,9 @@ class CaptureMetadataTests(unittest.TestCase):
             geocoder = Geocoder()
             pipeline = IngestionPipeline(store, geocoder=geocoder)
             asset = pipeline.create_asset(image, metadata={"captured_at": "2025-05-20T20:30:00", "gps": {"latitude": 30.25, "longitude": 120.0}})
-            self.assertEqual(asset["captured_location"], "测试省测试市")
+            # The raw GPS coordinate stays the event-clustering location anchor;
+            # the reverse-geocoded label is display-only under reverse_geocode.
+            self.assertEqual(asset["captured_location"], "30.250000,120.000000")
             self.assertEqual(asset["metadata_json"]["gps"]["latitude"], 30.25)
             self.assertEqual(asset["metadata_json"]["reverse_geocode"]["label"], "测试省测试市")
             self.assertEqual(geocoder.gps["longitude"], 120.0)
