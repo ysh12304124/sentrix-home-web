@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 from .face_embeddings import AdaFaceAdapter, FaceEmbeddingUnavailable, MagFaceAdapter, compute_face_quality
@@ -366,6 +367,7 @@ class GammaClient:
             self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
             self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        self._call_metrics_local = threading.local()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
         _init_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
@@ -553,6 +555,20 @@ class GammaClient:
         except (httpx.HTTPError, ValueError) as error:
             raise ModelError(f"gamma request failed: {error}") from error
 
+
+    def _record_call_metrics(self, role, model, endpoint, metrics):
+        """Record per-call LLM metrics (thread-local)."""
+        if not hasattr(self._call_metrics_local, "calls"):
+            self._call_metrics_local.calls = []
+        entry = {"role": role or "unknown", "model": model, "endpoint": endpoint, **metrics}
+        self._call_metrics_local.calls.append(entry)
+
+    def get_and_clear_call_metrics(self):
+        """Retrieve and clear accumulated per-call metrics for this thread."""
+        calls = getattr(self._call_metrics_local, "calls", [])
+        self._call_metrics_local.calls = []
+        return calls
+
     def _chat_openai(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         if images:
             content = [{"type": "text", "text": prompt}]
@@ -565,10 +581,12 @@ class GammaClient:
             message = {"role": "user", "content": content}
         else:
             message = {"role": "user", "content": prompt}
+        use_stream = not json_mode  # only stream non-JSON calls (final answer gen)
         payload = {
             "model": model,
             "messages": [message],
-            "stream": False,
+            "stream": use_stream,
+            "stream_options": {"include_usage": True} if use_stream else None,
             "temperature": 0,
         }
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
@@ -583,16 +601,69 @@ class GammaClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         try:
+            if use_stream:
+                return self._chat_openai_stream(endpoint_base, payload, headers, role, model, json_mode)
             response = httpx.post(f"{endpoint_base}/chat/completions", json=payload, headers=headers, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
             text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
             if isinstance(text, list):
                 text = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in text)
+            usage = data.get("usage") or {}
+            self._record_call_metrics(role, model, endpoint_base, {
+                "ttft_ms": None, "total_ms": None,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "tokens_per_second": None, "streamed": False,
+            })
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             raise ModelError(f"gamma request failed: {error}") from error
+
+    def _chat_openai_stream(self, endpoint_base, payload, headers, role, model, json_mode=False):
+        """Streaming variant: buffer chunks, capture TTFT/tokens/throughput."""
+        t0 = time.perf_counter()
+        first_token_t = None
+        chunks = []
+        prompt_tokens = None
+        completion_tokens = None
+        with httpx.stream("POST", f"{endpoint_base}/chat/completions",
+                           json=payload, headers=headers, timeout=self.timeout) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
+                text_part = delta.get("content") or ""
+                if text_part:
+                    if first_token_t is None:
+                        first_token_t = time.perf_counter()
+                    chunks.append(text_part)
+                usage = chunk.get("usage")
+                if usage:
+                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                    completion_tokens = usage.get("completion_tokens", completion_tokens)
+        total_t = time.perf_counter()
+        text = "".join(chunks)
+        ttft_ms = round((first_token_t - t0) * 1000, 1) if first_token_t else None
+        total_ms = round((total_t - t0) * 1000, 1)
+        gen_ms = round((total_t - (first_token_t or t0)) * 1000, 1) if first_token_t else None
+        tps = round(completion_tokens / (gen_ms / 1000), 1) if completion_tokens and gen_ms and gen_ms > 0 else None
+        self._record_call_metrics(role, model, endpoint_base, {
+            "ttft_ms": ttft_ms, "total_ms": total_ms,
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "tokens_per_second": tps, "streamed": True,
+        })
+        self._record_validation_call(role, endpoint_base, model, json_mode, text)
+        return text
 
     def _record_validation_call(self, role, endpoint_base, model, json_mode, text):
         """Write the actual model into the ModelCallLedger (12B-FC V2).

@@ -1405,6 +1405,7 @@ def assistant_turn(request: AssistantTurnRequest):
             request.selected_entity_id, request.viewer_id,
             recent_turns=recent_turns,
         )
+    result["model_call_metrics"] = gamma.get_and_clear_call_metrics()
     if CONVERSATION_STORE_ENABLED and result.get("conversation_id"):
         try:
             cid = result["conversation_id"]
