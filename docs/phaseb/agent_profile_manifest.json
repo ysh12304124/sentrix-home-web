@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "tool_loop_shadow": {
+      "model": "gemma4-12b-it@8105(4bit)",
+      "tools": [
+        "query_memory_facts",
+        "search_memories",
+        "get_original_photos",
+        "get_result_page",
+        "inspect_photo"
+      ],
+      "budgets": {
+        "max_model_steps": 6,
+        "max_tool_calls": 4,
+        "max_inspections": 1,
+        "wall_time_s": 60.0,
+        "final_reserve_s": 10.0
+      },
+      "features": {
+        "rx": true,
+        "tool_loop": true,
+        "conversation_store": true
+      },
+      "guard": "FinalGuard(L1 rule) + LLM judge(L2)",
+      "runbook": {
+        "start": "SENTRIX_AGENT_PROFILE=tool_loop_shadow SENTRIX_API_PORT=<port> .venv/bin/python -m uvicorn backend.app:app",
+        "health_check": "curl -s http://127.0.0.1:<port>/api/health",
+        "verify": "python scripts/benchmarks/evaluate_search_inspect_e2e.py --base http://127.0.0.1:8105/v1",
+        "rollback": "重启回默认 tool_loop；shadow canary 独立端口不影响 8091"
+      }
+    },
+    "tool_loop": {
+      "model": "gemma4-12b-it@8105(4bit)",
+      "tools": [
+        "query_memory_facts",
+        "search_memories",
+        "get_original_photos",
+        "get_result_page",
+        "inspect_photo"
+      ],
+      "budgets": {
+        "max_model_steps": 6,
+        "max_tool_calls": 5,
+        "max_inspections": 1,
+        "wall_time_s": 60.0,
+        "final_reserve_s": 10.0
+      },
+      "features": {
+        "rx": true,
+        "tool_loop": true,
+        "conversation_store": true
+      },
+      "guard": "FinalGuard(L1 rule) + LLM judge(L2)",
+      "runbook": {
+        "start": "SENTRIX_AGENT_PROFILE=tool_loop SENTRIX_API_PORT=<port> .venv/bin/python -m uvicorn backend.app:app",
+        "health_check": "curl -s http://127.0.0.1:<port>/api/health",
+        "verify": "python scripts/benchmarks/evaluate_search_inspect_e2e.py --base http://127.0.0.1:8105/v1",
+        "rollback": "重启回默认 tool_loop；shadow canary 独立端口不影响 8091"
+      }
+    }
+  },
+  "default": "tool_loop",
+  "canary_candidates": [
+    "tool_loop_shadow"
+  ]
+}

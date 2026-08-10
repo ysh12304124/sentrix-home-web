@@ -1,15 +1,19 @@
 """ResultSetStore + TaskState（v2 §10/§15/§16）。
 
 - ResultSet：服务端持有完整结果集，模型只见 result_set_id / total / preview / has_more。
-- handle 映射：photo_N -> asset_id（不向模型/用户泄漏内部 ID）。
+- handle 映射：photo_N -> asset_id（不向模型/用户泄漏内部 ID）；分页后 photo_N 为全局稳定序号。
+- B3.1：TTL 过期、page(page_no) 分页、owner/revision 记录。
 - TaskState：随 Tool-Loop 动态形成的任务状态（非固定前置 pipeline）。
 """
 
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
+
+RESULT_SET_TTL_S = 30 * 60  # B3.1：ResultSet 内存 TTL 30 分钟
 
 
 @dataclass
@@ -22,9 +26,15 @@ class ResultSet:
     ordering: list = field(default_factory=list)
     unresolved: list = field(default_factory=list)
     created_at: str = ""
+    owner: str = ""
+    expires_at: float = 0.0
+    revision: str = ""
+    page_size: int = 6
+    shown: int = 0
 
     def handles(self) -> dict[str, str]:
-        return {f"photo_{i + 1}": aid for i, aid in enumerate(self.asset_ids[:20])}
+        """全量稳定 handle 映射（photo_N 跨页一致，N 为结果集中全局序号）。"""
+        return {f"photo_{i + 1}": aid for i, aid in enumerate(self.asset_ids)}
 
     def preview(self, limit: int = 6) -> list[dict]:
         return [
@@ -32,18 +42,37 @@ class ResultSet:
             for i, aid in enumerate(self.asset_ids[:limit])
         ]
 
+    def page(self, page_no: int, page_size: int | None = None) -> list[dict]:
+        """返回第 page_no 页（1-based）的 handle 列表；handle 序号为全局序号。"""
+        size = page_size or self.page_size
+        start = max(0, (int(page_no) - 1) * size)
+        end = start + size
+        return [
+            {"handle": f"photo_{start + i + 1}", "asset_id": aid}
+            for i, aid in enumerate(self.asset_ids[start:end])
+        ]
+
 
 class ResultSetStore:
-    def __init__(self, store):
+    def __init__(self, store, ttl_s: float = RESULT_SET_TTL_S):
         self.store = store
         self._memory: dict[str, ResultSet] = {}
+        self.ttl_s = ttl_s
 
     def save(self, rs: ResultSet) -> ResultSet:
+        if not rs.expires_at:
+            rs.expires_at = time.time() + self.ttl_s
         self._memory[rs.result_set_id] = rs
         return rs
 
     def get(self, result_set_id: str) -> ResultSet | None:
-        return self._memory.get(result_set_id)
+        rs = self._memory.get(result_set_id)
+        if rs is None:
+            return None
+        if rs.expires_at and time.time() > rs.expires_at:
+            self._memory.pop(result_set_id, None)
+            return None
+        return rs
 
     def resolve_handle(self, result_set_id: str, handle: str) -> str | None:
         rs = self.get(result_set_id)
@@ -51,12 +80,23 @@ class ResultSetStore:
             return None
         return rs.handles().get(handle)
 
-    def new(self, *, scope_id, query, asset_ids, unresolved=None) -> ResultSet:
+    def cleanup(self) -> int:
+        """惰性清理过期结果集，返回清理数量。"""
+        now = time.time()
+        expired = [rid for rid, rs in self._memory.items()
+                   if rs.expires_at and now > rs.expires_at]
+        for rid in expired:
+            self._memory.pop(rid, None)
+        return len(expired)
+
+    def new(self, *, scope_id, query, asset_ids, unresolved=None, owner="", revision="") -> ResultSet:
         rs = ResultSet(
             result_set_id=f"rs_{uuid.uuid4().hex[:10]}",
             scope_id=scope_id, query=query,
             asset_ids=list(asset_ids), total=len(asset_ids),
             unresolved=unresolved or [],
+            owner=owner, revision=revision,
+            shown=min(6, len(asset_ids)),
         )
         return self.save(rs)
 
@@ -70,6 +110,7 @@ class TaskState:
     unresolved_conditions: list = field(default_factory=list)
     current_result_set: str | None = None
     selected_asset: str | None = None
+    selected_asset_handle: str | None = None
     delivery_state: str = "not_requested"
     fulfillment: str = "pending"
     result_mode: str | None = None
@@ -82,6 +123,30 @@ class TaskState:
     fact_group_by: str | None = None
     last_tool: str | None = None
     write_proposal: dict | None = None
+    tool_results: list = field(default_factory=list)
+    search_satisfaction: str | None = None
+    search_condition_summary: dict = field(default_factory=dict)
+    result_total: int | None = None
+    result_remaining: int | None = None
+    result_preview: list = field(default_factory=list)
+
+    def record_tool_result(self, tool_call_id: str, tool_name: str, observation: dict):
+        self.tool_results.append({
+            "tool_call_id": tool_call_id,
+            "tool": tool_name,
+            "total": observation.get("total"),
+            "satisfaction": observation.get("query_satisfaction"),
+            "blocked": observation.get("blocked"),
+            "inspect_text": observation.get("observation"),
+            "inspect_handle": observation.get("asset_handle"),
+            "confirms_visual_only": observation.get("confirms_visual_only", False),
+            "certainty": observation.get("certainty"),
+            "operation": observation.get("operation"),
+            "value": observation.get("value"),
+            "rows": observation.get("rows"),
+            "answer_type": observation.get("answer_type"),
+            "filters_applied": observation.get("filters_applied"),
+        })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):
         if tool_name == "query_memory_facts":
@@ -99,13 +164,33 @@ class TaskState:
             self.has_more = bool(observation.get("has_more"))
             self.delivery_state = "available" if observation.get("has_more") else "complete"
             total = observation.get("total")
+            self.result_total = int(total) if total is not None else None
+            self.result_remaining = observation.get("remaining")
+            self.result_preview = [p.get("handle") for p in (observation.get("preview") or [])][:20]
             if total == 0:
                 self.fulfillment = "empty"
             else:
                 self.fulfillment = "partial" if observation.get("gaps") else "fulfilled"
+            self.search_satisfaction = observation.get("query_satisfaction")
+            self.search_condition_summary = observation.get("condition_summary") or {}
         if tool_name == "get_original_photos":
             self.delivery_state = "delivered"
             self.delivered_count = observation.get("delivered")
+
+    @classmethod
+    def from_dict(cls, data: dict | None, *, user_goal: str = "") -> "TaskState":
+        """B3.1：跨 turn 恢复结果集上下文（只恢复与结果集续接相关的字段）。"""
+        data = data or {}
+        task = cls(user_goal=user_goal or data.get("user_goal") or "")
+        task.current_result_set = data.get("current_result_set")
+        task.result_mode = data.get("result_mode")
+        task.has_more = data.get("has_more")
+        task.delivery_state = data.get("delivery_state") or "not_requested"
+        task.fulfillment = data.get("fulfillment") or "pending"
+        task.search_satisfaction = data.get("search_satisfaction")
+        task.search_condition_summary = data.get("search_condition_summary") or {}
+        task.selected_asset_handle = data.get("selected_asset_handle")
+        return task
 
     def as_dict(self) -> dict:
         return {
@@ -115,6 +200,7 @@ class TaskState:
             "unresolved_conditions": self.unresolved_conditions,
             "current_result_set": self.current_result_set,
             "selected_asset": self.selected_asset,
+            "selected_asset_handle": self.selected_asset_handle,
             "delivery_state": self.delivery_state,
             "fulfillment": self.fulfillment,
             "result_mode": self.result_mode,
@@ -125,4 +211,10 @@ class TaskState:
             "fact_rows": self.fact_rows,
             "fact_group_by": self.fact_group_by,
             "last_tool": self.last_tool,
+            "search_satisfaction": self.search_satisfaction,
+            "search_condition_summary": self.search_condition_summary,
+            "result_total": self.result_total,
+            "result_remaining": self.result_remaining,
+            "result_preview": self.result_preview,
+            "tool_results": self.tool_results,
         }

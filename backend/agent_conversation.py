@@ -77,7 +77,7 @@ class ConversationStore:
                  result_json = excluded.result_json,
                  public_progress_json = excluded.public_progress_json,
                  updated_at = excluded.updated_at""",
-            (turn_id, conversation_id, scope_id or "home-default", profile or "pipeline",
+            (turn_id, conversation_id, scope_id or "home-default", profile or "tool_loop",
              json.dumps(steps, ensure_ascii=False),
              json.dumps(result, ensure_ascii=False),
              json.dumps(public_progress, ensure_ascii=False),

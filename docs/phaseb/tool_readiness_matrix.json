@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-10T16:14:43",
+  "visual_backbone": "chinese-clip-768d",
+  "text_backbone": "ViT-B-32-512d",
+  "ann_status": {
+    "visual": "ready",
+    "text": "limited"
+  },
+  "tools": {
+    "query_memory_facts": {
+      "count": "ready",
+      "media": "ready",
+      "date": "ready",
+      "first": "ready",
+      "last": "ready",
+      "group": "ready",
+      "place": "limited",
+      "person": "limited"
+    },
+    "search_memories": {
+      "visual": "ready",
+      "text": "limited",
+      "semantic_truth": "limited",
+      "known_limits": [
+        "condition=unknown 时不能视为确认",
+        "place/person 语义覆盖不足"
+      ]
+    },
+    "inspect_photo": {
+      "status": "ready",
+      "known_limits": [
+        "低光/小物体计数可能不准",
+        "观察为临时性，不写入长期记忆"
+      ]
+    },
+    "get_original_photos": {
+      "status": "ready",
+      "auth": "scope+handle 双校验"
+    },
+    "get_result_page": {
+      "status": "ready",
+      "auth": "scope 校验",
+      "ttl_s": 1800
+    }
+  },
+  "registry": {
+    "query_memory_facts": {
+      "readiness": "ready",
+      "reason": "",
+      "cost_class": "cheap",
+      "read_write": "read",
+      "timeout_s": 15.0
+    },
+    "search_memories": {
+      "readiness": "ready",
+      "reason": "",
+      "cost_class": "medium",
+      "read_write": "read",
+      "timeout_s": 15.0
+    },
+    "get_original_photos": {
+      "readiness": "limited",
+      "reason": "ResultSetStore 就绪后完整可用（A4）",
+      "cost_class": "cheap",
+      "read_write": "read",
+      "timeout_s": 15.0
+    },
+    "get_result_page": {
+      "readiness": "ready",
+      "reason": "",
+      "cost_class": "cheap",
+      "read_write": "read",
+      "timeout_s": 15.0
+    },
+    "inspect_photo": {
+      "readiness": "ready",
+      "reason": "",
+      "cost_class": "expensive",
+      "read_write": "read",
+      "timeout_s": 15.0
+    }
+  }
+}

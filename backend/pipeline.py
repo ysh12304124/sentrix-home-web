@@ -279,10 +279,15 @@ class IngestionPipeline:
         self.store.upsert_vector("semantic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
         if event_id:
             self.store.upsert_vector("episodic", "event", event_id, embedding, self.clip.model_name, {"observation_id": observation_id})
-            event = self.store.get_event(event_id) or {}
-            visual_place = self.store._event_display_place(observation)
-            if visual_place and str(event.get("place") or "") in {"", "其他或不确定"}:
-                self.store.update_event(event_id, {"place": visual_place})
+            # Fast-path events keep placeholder place ("其他或不确定"); sync the
+            # visual place after enrichment so later participant refreshes do not
+            # rewrite summaries with a blank location.
+            display_place = self.store._event_display_place(observation)
+            if display_place:
+                current = self.store.get_event(event_id) or {}
+                current_place = str(current.get("place") or "").strip()
+                if current_place in {"", "其他或不确定", "某处", "地点未知", "未标注", "未标注地点", "待判断"}:
+                    self.store.update_event(event_id, {"place": display_place})
             if summarize_event:
                 self.summarize_event(event_id)
         return self.store.update_asset(asset_id, "processed", {"semantic_status": "complete", "entity_ids": entity_ids, "semantic_enrichment_seconds": round(time.perf_counter() - started_at, 4)})
@@ -291,24 +296,6 @@ class IngestionPipeline:
         detail = self.store.get_event_detail(event_id)
         if not detail or not detail["observations"] or not hasattr(self.gamma, "summarize_event"):
             return self.store.get_event(event_id)
-
-        def gps_label():
-            """GPS-derived place (reverse_geocode label) of the first observation
-            that has one; used as a factual prefix in the event description."""
-            for observation in detail["observations"]:
-                asset = self.store.get_asset(observation.get("asset_id")) or {}
-                metadata = asset.get("metadata_json") or {}
-                if isinstance(metadata, str):
-                    try:
-                        import json as _json
-                        metadata = _json.loads(metadata)
-                    except Exception:
-                        metadata = {}
-                reverse = (metadata or {}).get("reverse_geocode") or {}
-                label = str(reverse.get("label") or "").strip()
-                if label:
-                    return label
-            return ""
 
         def fallback_projection():
             event = detail["event"]
@@ -331,21 +318,15 @@ class IngestionPipeline:
                 "summary": summary[:240], "confidence": 0.45, "model": "deterministic_event_fallback",
             }
 
-        label = gps_label()
         try:
             result = self.gamma.summarize_event(detail["event"], detail["observations"])
             if str(result.get("title") or "").strip() in {"待总结事件", "待确认的家庭记录", "待判断"}:
                 result = fallback_projection()
-            title = str(result.get("title") or "").strip()
-            summary = str(result.get("summary") or "").strip()
-            # GPS place goes into the event description, not the title.
-            if label and summary and label not in summary:
-                summary = f"{label}，{summary}"
             updated = self.store.update_event(event_id, {
-                "title": title[:80],
+                "title": result.get("title"),
                 "event_type": result.get("event_type"),
                 "activity": result.get("activity"),
-                "summary": summary[:500],
+                "summary": result.get("summary"),
             })
             event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
             vector = self.clip.embed_text(event_text)
@@ -353,14 +334,9 @@ class IngestionPipeline:
             return updated
         except Exception:
             result = fallback_projection()
-            title = str(result.get("title") or "").strip()
-            summary = str(result.get("summary") or "").strip()
-            # GPS place goes into the event description, not the title.
-            if label and summary and label not in summary:
-                summary = f"{label}，{summary}"
             updated = self.store.update_event(event_id, {
-                "title": title[:80], "event_type": result["event_type"],
-                "activity": result["activity"], "summary": summary[:500],
+                "title": result["title"], "event_type": result["event_type"],
+                "activity": result["activity"], "summary": result["summary"],
             })
             event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
             vector = self.clip.embed_text(event_text)

@@ -23,18 +23,10 @@ class ProfileConfig:
 
 
 PROFILES = {
-    "pipeline": ProfileConfig(
-        name="pipeline",
-        tools=(),
-        max_model_steps=1,
-        max_tool_calls=0,
-        wall_time_s=20.0,
-        features={"rx": False, "tool_loop": False, "conversation_store": True},
-    ),
     "tool_loop_shadow": ProfileConfig(
         name="tool_loop_shadow",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "inspect_photo"),
-        max_model_steps=4,
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page", "inspect_photo"),
+        max_model_steps=6,
         max_tool_calls=4,
         max_inspections=1,
         wall_time_s=60.0,
@@ -43,8 +35,8 @@ PROFILES = {
     ),
     "tool_loop": ProfileConfig(
         name="tool_loop",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "inspect_photo"),
-        max_model_steps=5,
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page", "inspect_photo"),
+        max_model_steps=6,
         max_tool_calls=5,
         max_inspections=1,
         wall_time_s=60.0,
@@ -55,16 +47,10 @@ PROFILES = {
 
 
 def active_profile() -> str:
-    return os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+    return os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
 
 
 def get_profile(name: str | None = None) -> ProfileConfig:
-    return PROFILES.get(name or active_profile(), PROFILES["pipeline"])
+    return PROFILES.get(name or active_profile(), PROFILES["tool_loop"])
 
 
-def tool_loop_active() -> bool:
-    return get_profile().features.get("tool_loop", False)
-
-
-def tool_enabled(tool_name: str) -> bool:
-    return tool_name in get_profile().tools

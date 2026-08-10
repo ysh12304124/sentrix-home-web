@@ -1,9 +1,11 @@
+import asyncio
 import json
 import os
 import shutil
 import hashlib
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -11,11 +13,10 @@ from pathlib import Path
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .agent import MemoryAgent
 from .agent_conversation import ConversationStore
 from .db import MemoryStore, make_id
 from .image_io import (
@@ -43,7 +44,6 @@ store = MemoryStore(os.getenv("SENTRIX_DB_PATH", str(DATA_DIR / "sentrix.db")))
 gamma = GammaClient()
 gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
-agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
 conversation_store = ConversationStore(store)
 CONVERSATION_STORE_ENABLED = os.getenv("SENTRIX_CONVERSATION_STORE_V1", "0").lower() in {"1", "true", "on"}
 
@@ -54,7 +54,6 @@ runtime_lock = threading.Lock()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
-VLM_BACKENDS = ("ollama_12b", "e2b_lora")
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
@@ -92,52 +91,6 @@ def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_loc
         result["gps"] = {"latitude": latitude, "longitude": longitude}
     return result
 
-
-def _check_ollama_health():
-    try:
-        import httpx
-        url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-        response = httpx.get(f"{url}/api/tags", timeout=10)
-        response.raise_for_status()
-        models = response.json().get("models") or []
-        ollama_model = os.getenv("OLLAMA_MODEL", "gemma4:12b")
-        for model in models:
-            if model.get("name", "").startswith(ollama_model.replace(":12b", "")):
-                return {"available": True, "model": ollama_model, "url": url}
-        return {"available": False, "model": ollama_model, "url": url, "error": "model not found in /api/tags"}
-    except Exception as exc:
-        return {"available": False, "model": os.getenv("OLLAMA_MODEL", "gemma4:12b"), "url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"), "error": str(exc)}
-
-
-def _check_e2b_health():
-    try:
-        import httpx
-        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        response = httpx.get(f"{url}/api/health", timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return {"available": data.get("status") == "ok", "url": url, "loaded": data.get("loaded", False), "model": data.get("model", ""), "error": data.get("error")}
-    except Exception as exc:
-        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100"), "error": str(exc)}
-
-
-def _fire_and_forget_post(url, payload):
-    try:
-        import httpx
-        httpx.post(url, json=payload, timeout=5)
-    except Exception:
-        pass
-
-
-def _schedule_backend_transition(backend_name):
-    if backend_name == "e2b_lora":
-        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        threading.Thread(target=_fire_and_forget_post, args=(f"{e2b_url}/admin/load", {}), daemon=True).start()
-
-
-class SearchRequest(BaseModel):
-    query: str
-    spaceId: str = "home-default"
 
 
 class ImportRequest(BaseModel):
@@ -350,7 +303,7 @@ def _current_model_runtime():
 
 
 def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
-    global gamma, pipeline, agent
+    global gamma, pipeline
     registry = _load_vllm_registry()
     profile = profile or (registry.get("profiles") or {}).get(profile_id) or {}
     state = state or _load_vllm_state(registry) or {}
@@ -361,7 +314,6 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
         new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai")
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
-        agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
     return _current_model_runtime()
 
 
@@ -424,9 +376,25 @@ def _sync_vllm_state_on_startup():
 
 @app.get("/api/health")
 def health():
+    # Phase C C12：profile manifest 作为运维真实来源
+    agent = {
+        "profile": os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower(),
+        "runtime": "tool_loop",
+    }
+    try:
+        from .agent_runtime import tools as _runtime_tools
+        _runtime_tools.register_tools()  # 幂等：确保工具注册表在首个 turn 前也可查
+        from .agent_runtime.tool_registry import list_tools
+        agent["tools"] = [
+            {"name": s.name, "readiness": s.readiness}
+            for s in list_tools() if s.readiness != "blocked"
+        ]
+    except Exception:
+        agent["tools"] = []
     return {
         "status": "ok",
         "mode": "sentrix-local-backend",
+        "agent": agent,
         "models": {
             "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
             "llm": _current_model_runtime(),
@@ -1205,16 +1173,46 @@ def asset_file(asset_id: str, original: bool = False):
         raise HTTPException(status_code=422, detail=f"unable to render preview: {error}") from error
 
 
+@app.get("/api/assistant/result-set/{result_set_id}/photo")
+def result_set_photo(result_set_id: str, handle: str = "", scope_id: str = "home-default",
+                     original: bool = False):
+    """B3.2：ResultSet 授权原图交付。handle 必须属于该结果集且 scope 匹配。"""
+    from .agent_runtime import tools as runtime_tools
+    rs_store = runtime_tools.get_result_set_store()
+    if rs_store is None:
+        raise HTTPException(status_code=404, detail="result set service unavailable")
+    rs = rs_store.get(result_set_id)
+    if rs is None:
+        raise HTTPException(status_code=404, detail="result set not found or expired")
+    if rs.scope_id != scope_id:
+        raise HTTPException(status_code=403, detail="scope mismatch")
+    if handle:
+        asset_id = rs_store.resolve_handle(result_set_id, handle)
+        if not asset_id:
+            raise HTTPException(status_code=404, detail="handle not in result set")
+    else:
+        asset_id = rs.asset_ids[0] if rs.asset_ids else None
+        if not asset_id:
+            raise HTTPException(status_code=404, detail="empty result set")
+    return asset_file(asset_id, original=original)
+
+
 @app.get("/api/face-instances/{face_instance_id}/crop")
 def face_instance_crop(face_instance_id: str):
     instance = store.get_face_instance(face_instance_id)
-    if not instance or not Path(instance["asset_path"]).is_file():
+    asset_path = (instance or {}).get("asset_path")
+    if not instance or not asset_path or not Path(asset_path).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
         from PIL import Image
 
-        image = Image.open(instance["asset_path"]).convert("RGB")
-        left, top, right, bottom = (int(value) for value in instance.get("bbox_json") or [])
+        ensure_heif_support()
+        with Image.open(asset_path) as source:
+            image = source.convert("RGB")
+        bbox = instance.get("bbox_json") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            raise ValueError("invalid face bounding box")
+        left, top, right, bottom = (int(value) for value in bbox[:4])
         left, top = max(0, left), max(0, top)
         right, bottom = min(image.width, right), min(image.height, bottom)
         if right <= left or bottom <= top:
@@ -1224,8 +1222,8 @@ def face_instance_crop(face_instance_id: str):
         output = BytesIO()
         face.save(output, format="JPEG", quality=88)
         return Response(content=output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
-    except (OSError, ValueError):
-        raise HTTPException(status_code=422, detail="face crop is unavailable")
+    except (OSError, ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail=f"face crop is unavailable: {error}") from error
 
 
 @app.get("/api/facts")
@@ -1280,6 +1278,254 @@ def create_invite(payload: dict):
     return {**invite, "invite_url": f"sentrix://join/{invite['token']}"}
 
 
+class AssistantTurnRequest(BaseModel):
+    message: str
+    conversation_id: str | None = None
+    feedback: dict | None = None
+    scope_id: str = "home-default"
+    selected_entity_id: str | None = None
+    selected_asset_handle: str | None = None
+    selected_result_set_id: str | None = None
+    viewer_id: str = "owner"
+
+
+_TOOL_LOOP_TASK_STATE: dict[str, dict] = {}  # conversation_id -> task_state（B3.1 跨 turn 结果集续接）
+_TURN_JOBS: dict[str, dict] = {}  # turn_id -> job（B3.4 异步轮询）
+_TURN_EXECUTOR = None  # 惰性初始化 ThreadPoolExecutor
+
+
+def _turn_executor():
+    global _TURN_EXECUTOR
+    if _TURN_EXECUTOR is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+    return _TURN_EXECUTOR
+
+
+def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="",
+                   progress_callback=None, selected_asset_handle=None,
+                   selected_result_set_id=None):
+    """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
+    from .agent_runtime import tools as runtime_tools
+    from .agent_runtime.runtime import AgentRuntime
+
+    try:
+        from .embeddings import EmbeddingRouter
+        from .model_clients import ClipAdapter
+        from .retrieval import RetrievalConfig
+        embedding_router = EmbeddingRouter.from_clip(ClipAdapter())
+        retrieval_config = RetrievalConfig()
+    except Exception:
+        embedding_router = None
+        retrieval_config = None
+    runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
+                               retrieval_config=retrieval_config)
+    runtime_tools.register_tools()
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
+
+    def chat_fn(messages):
+        payload = {
+            "model": getattr(gamma, "model", "gemma4-12b-it"),
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 1500,
+        }
+        response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
+                              timeout=120)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
+                           scope_id=scope_id, viewer_id=viewer_id)
+    prev_state = _TOOL_LOOP_TASK_STATE.get(conversation_id) if conversation_id else None
+    # Phase C C15：用户点选的照片写入本轮 task_state（selected handle 稳定跨轮可用）
+    if selected_asset_handle and selected_result_set_id:
+        prev_state = dict(prev_state or {})
+        prev_state["current_result_set"] = selected_result_set_id
+        prev_state["selected_asset_handle"] = selected_asset_handle
+    turn = runtime.run(message, history=recent_turns, task_state=prev_state,
+                       progress_callback=progress_callback,
+                       selected_handle=selected_asset_handle,
+                       selected_result_set_id=selected_result_set_id)
+    if conversation_id:
+        _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
+    trace = []
+    for s in turn.steps:
+        item = {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
+                "reason": s.get("reason") or "",
+                "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
+        if s.get("type") == "judge":
+            item["detail"] = {"faithful": s.get("faithful"),
+                              "problems": list(s.get("problems") or [])}
+        if s.get("type") == "guard":
+            item["detail"] = {"l1_codes": list(s.get("codes") or []),
+                              "attempt": s.get("attempt", 1)}
+        if isinstance(s.get("arguments"), dict):
+            item["args"] = s.get("arguments")
+        trace.append(item)
+    guard_debug = {
+        "status": turn.status,
+        "reason": turn.reason or "",
+        "recovery_attempts": sum(1 for p in turn.public_progress
+                                 if p.get("stage") == "recovering"),
+        "l1_codes": [c for s in turn.steps if s.get("type") == "guard"
+                     for c in (s.get("codes") or [])],
+        "judge": [{"faithful": s.get("faithful"),
+                   "problems": list(s.get("problems") or [])}
+                  for s in turn.steps if s.get("type") == "judge"],
+    }
+    tool_trace = [
+        {"tool": s.get("tool", ""), "status": s.get("status", ""),
+         "latency_s": s.get("latency_s"), "reason": s.get("reason") or ""}
+        for s in turn.steps if s.get("type") == "tool"
+    ]
+    return {
+        "answer": turn.final_answer,
+        "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "intent": "tool_loop",
+        "evidence_status": "tool_loop",
+        "retrieval_trace": trace,
+        "public_progress": turn.public_progress,
+        "tool_trace": tool_trace,
+        "tool_loop_status": turn.status,
+        "tool_loop_reason": turn.reason,
+        "task_state": turn.task_state,
+        "guard_debug": guard_debug,
+    }
+
+
+@app.post("/api/assistant/turn")
+def assistant_turn(request: AssistantTurnRequest):
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="message is required")
+    message = request.message.strip()
+    recent_turns = ""
+    if CONVERSATION_STORE_ENABLED and request.conversation_id:
+        try:
+            history = conversation_store.last_messages(request.conversation_id, limit=8)
+            recent_turns = "\n".join(
+                f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'].get('text', '')}"
+                for m in history if m.get("content", {}).get("text")
+            )
+        except Exception:
+            recent_turns = ""
+    # tool_loop 是唯一 agent 路径：异步执行，立即返回 turn_id 供前端轮询实时进度
+    turn_id = make_id("turn")
+    _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
+                           "progress_events": [], "result": None,
+                           "created_at": time.time()}
+    _turn_executor().submit(
+        _execute_turn_job, turn_id, message, request.conversation_id,
+        request.scope_id, request.viewer_id, recent_turns,
+        request.selected_asset_handle, request.selected_result_set_id)
+    return {
+        "turn_id": turn_id,
+        "status": "running",
+        "conversation_id": request.conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "intent": "tool_loop",
+    }
+
+
+@app.get("/api/assistant/turn/{turn_id}")
+def assistant_turn_status(turn_id: str):
+    """B3.4：轮询异步 turn 的实时进度与最终结果。"""
+    job = _TURN_JOBS.get(turn_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="turn not found")
+    if job["status"] in {"running", "pending"}:
+        return {"turn_id": turn_id, "status": job["status"],
+                "public_progress": job.get("public_progress") or []}
+    if job["status"] == "error":
+        return {"turn_id": turn_id, "status": "error", "error": job.get("error")}
+    result = job.get("result") or {}
+    return {
+        "turn_id": turn_id,
+        "status": "complete",
+        "public_progress": job.get("public_progress") or result.get("public_progress") or [],
+        "result": result,
+    }
+
+
+@app.get("/api/assistant/turn/{turn_id}/events")
+async def assistant_turn_events(turn_id: str):
+    """Phase C C13：SSE 实时进度事件流（GET EventSource）。
+
+    事件契约：progress {text,status,stage,step_index,timestamp}；结束时 complete {result}。
+    前端断开/失败可回退轮询（/api/assistant/turn/{turn_id} 仍保留快照）。
+    """
+    job = _TURN_JOBS.get(turn_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="turn not found")
+
+    async def _stream():
+        sent = 0
+        while True:
+            events = job.get("progress_events") or []
+            for ev in events[sent:]:
+                sent += 1
+                yield f"event: progress\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            if job["status"] in {"complete", "error"}:
+                payload = {
+                    "type": "complete", "turn_id": turn_id,
+                    "status": job["status"],
+                    "public_progress": job.get("progress_events") or job.get("public_progress") or [],
+                }
+                if job["status"] == "complete" and job.get("result"):
+                    payload["result"] = job["result"]
+                if job["status"] == "error":
+                    payload["error"] = job.get("error")
+                yield f"event: complete\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                return
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(0.3)
+
+    return StreamingResponse(
+        _stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _record_turn_conversation(message, request, result, turn_id=""):
+    """把一轮对话写入 conversation store + trajectory（同步/异步两条路径共用）。"""
+    if not (CONVERSATION_STORE_ENABLED and result.get("conversation_id")):
+        return
+    try:
+        cid = result["conversation_id"]
+        turn_id = turn_id or make_id("turn")
+        result["turn_id"] = turn_id
+        scope_id = request.scope_id or "home-default"
+        conversation_store.add_message(cid, "user", {"text": message},
+                                       scope_id=scope_id, turn_id=turn_id)
+        conversation_store.add_message(cid, "assistant", {
+            "text": result.get("answer", ""),
+            "intent": result.get("intent"),
+            "evidence_status": result.get("evidence_status"),
+        }, scope_id=scope_id, turn_id=turn_id)
+        trace = result.get("retrieval_trace") or result.get("trace") or []
+        steps = []
+        for item in trace:
+            if not isinstance(item, dict):
+                continue
+            steps.append({
+                "stage": item.get("stage") or item.get("gate") or "unknown",
+                "status": item.get("status", "complete"),
+                "detail": item.get("reason") or item.get("counts") or {},
+            })
+        public_progress = result.get("public_progress") or [
+            {"text": _public_progress_text(s), "status": s.get("status", "complete")}
+            for s in steps if _public_progress_text(s)
+        ]
+        conversation_store.save_trajectory(
+            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop"),
+            steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent"),
+                                 "telemetry": result.get("telemetry") or {}},
+            public_progress=public_progress, scope_id=scope_id,
+        )
+        result["public_progress"] = public_progress
+    except Exception:
+        # 记录失败不影响回答
+        pass
+
+
 def assistant_response(result):
     """Expose stable browser names while retaining the internal contract.
 
@@ -1311,10 +1557,13 @@ def assistant_response(result):
     result["claimEvidenceIndex"] = result["claim_evidence_index"]
     if not admin:
         result["retrievalTrace"] = []
-        result["toolTrace"] = []
+        # 思考过程对普通用户可见工具名/状态/耗时；参数与 observation 等明细仍仅管理员可见。
+        result["toolTrace"] = [
+            {k: v for k, v in (t or {}).items() if k in ("tool", "status", "latency_s")}
+            for t in (result.get("tool_trace") or [])
+        ]
         result.pop("validation", None)
         result.pop("model_call_ledger", None)
-        # TFPE v2 structured internals are debug-only.
         result.pop("task_contract", None)
         result.pop("retrieval_strategy", None)
         result.pop("structured_result", None)
@@ -1322,127 +1571,55 @@ def assistant_response(result):
     return result
 
 
-@app.post("/api/search")
-def search(request: SearchRequest):
-    if not request.query.strip():
-        raise HTTPException(status_code=400, detail="query is required")
-    return assistant_response(agent.answer_turn(request.query.strip(), scope_id=request.spaceId))
+def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns,
+                     selected_asset_handle=None, selected_result_set_id=None):
+    """B3.4：后台执行 tool-loop turn，progress 增量写入 job。"""
+    job = _TURN_JOBS.get(turn_id)
+    try:
+        def on_progress(event):
+            if job is not None:
+                job.setdefault("progress_events", []).append(event)
+                job["public_progress"] = job.get("progress_events")
 
-
-class AssistantTurnRequest(BaseModel):
-    message: str
-    conversation_id: str | None = None
-    feedback: dict | None = None
-    scope_id: str = "home-default"
-    selected_entity_id: str | None = None
-    viewer_id: str = "owner"
-
-
-def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=""):
-    """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
-    from .agent_runtime import tools as runtime_tools
-    from .agent_runtime.runtime import AgentRuntime
-
-    runtime_tools.bind_runtime(store, gamma=gamma)
-    runtime_tools.register_tools()
-    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
-
-    def chat_fn(messages):
-        payload = {
-            "model": getattr(gamma, "model", "gemma4-12b-it"),
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": 800,
-        }
-        response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
-                              timeout=120)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-
-    runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
-                           scope_id=scope_id, viewer_id=viewer_id)
-    turn = runtime.run(message, history=recent_turns)
-    trace = [
-        {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
-         "reason": s.get("reason") or "",
-         "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
-        for s in turn.steps
-    ]
-    return {
-        "answer": turn.final_answer,
-        "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
-        "intent": "tool_loop",
-        "evidence_status": "tool_loop",
-        "retrieval_trace": trace,
-        "public_progress": turn.public_progress,
-        "tool_loop_status": turn.status,
-        "tool_loop_reason": turn.reason,
-    }
-
-
-@app.post("/api/assistant/turn")
-def assistant_turn(request: AssistantTurnRequest):
-    if not request.message.strip():
-        raise HTTPException(status_code=400, detail="message is required")
-    message = request.message.strip()
-    recent_turns = ""
-    if CONVERSATION_STORE_ENABLED and request.conversation_id:
+        started = time.time()
+        result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
+                                 recent_turns=recent_turns, progress_callback=on_progress,
+                                 selected_asset_handle=selected_asset_handle,
+                                 selected_result_set_id=selected_result_set_id)
+        # B4 canary telemetry：profile / 工具序列 / guard / 延迟 / fallback 标记
         try:
-            history = conversation_store.last_messages(request.conversation_id, limit=8)
-            recent_turns = "\n".join(
-                f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'].get('text', '')}"
-                for m in history if m.get("content", {}).get("text")
-            )
+            trace = result.get("retrieval_trace") or []
+            result["telemetry"] = {
+                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop"),
+                "status": result.get("tool_loop_status"),
+                "reason": result.get("tool_loop_reason"),
+                "tools": [s.get("tool") for s in trace if s.get("stage") == "tool" and s.get("tool")],
+                "latency_s": round(time.time() - started, 2),
+                "fallback": False,
+                "guard_blocked": result.get("tool_loop_status") in {"blocked_by_guard", "partial", "timeout", "error"},
+                "public_progress_count": len(result.get("public_progress") or []),
+            }
         except Exception:
-            recent_turns = ""
-    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
-    if profile_name in {"tool_loop", "tool_loop_shadow"}:
-        result = _tool_loop_turn(message, request.conversation_id, request.scope_id,
-                                 request.viewer_id, recent_turns=recent_turns)
-    else:
-        result = agent.answer_turn(
-            message, request.conversation_id, request.feedback, request.scope_id,
-            request.selected_entity_id, request.viewer_id,
-            recent_turns=recent_turns,
-        )
-    result["model_call_metrics"] = gamma.get_and_clear_call_metrics()
-    if CONVERSATION_STORE_ENABLED and result.get("conversation_id"):
-        try:
-            cid = result["conversation_id"]
-            turn_id = make_id("turn")
-            result["turn_id"] = turn_id
-            scope_id = request.scope_id or "home-default"
-            conversation_store.add_message(cid, "user", {"text": message},
-                                           scope_id=scope_id, turn_id=turn_id)
-            conversation_store.add_message(cid, "assistant", {
-                "text": result.get("answer", ""),
-                "intent": result.get("intent"),
-                "evidence_status": result.get("evidence_status"),
-            }, scope_id=scope_id, turn_id=turn_id)
-            trace = result.get("retrieval_trace") or result.get("trace") or []
-            steps = []
-            for item in trace:
-                if not isinstance(item, dict):
-                    continue
-                steps.append({
-                    "stage": item.get("stage") or item.get("gate") or "unknown",
-                    "status": item.get("status", "complete"),
-                    "detail": item.get("reason") or item.get("counts") or {},
-                })
-            public_progress = result.get("public_progress") or [
-                {"text": _public_progress_text(s), "status": s.get("status", "complete")}
-                for s in steps if _public_progress_text(s)
-            ]
-            conversation_store.save_trajectory(
-                turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
-                steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent")},
-                public_progress=public_progress, scope_id=scope_id,
-            )
-            result["public_progress"] = public_progress
-        except Exception:
-            # 记录失败不影响回答
             pass
-    return assistant_response(result)
+        result["model_call_metrics"] = gamma.get_and_clear_call_metrics()
+        if conversation_id:
+            _TOOL_LOOP_TASK_STATE[conversation_id] = result.get("task_state") or {}
+        result = assistant_response(result)
+        _record_turn_conversation(message, _AssistantTurnLike(
+            conversation_id=conversation_id, scope_id=scope_id), result, turn_id=turn_id)
+        if job is not None:
+            job.update({"status": "complete", "result": result,
+                        "public_progress": result.get("public_progress") or job.get("public_progress") or []})
+    except Exception as exc:
+        if job is not None:
+            job.update({"status": "error", "error": str(exc)})
+
+
+class _AssistantTurnLike:
+    """异步路径的 request 占位（只暴露 _record_turn_conversation 需要的字段）。"""
+    def __init__(self, *, conversation_id, scope_id):
+        self.conversation_id = conversation_id
+        self.scope_id = scope_id
 
 
 @app.get("/api/conversation/{conversation_id}/messages")

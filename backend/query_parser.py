@@ -105,6 +105,8 @@ _REPAIR_PROMPT = """你是 Sentrix QuerySpec 修复器。
 
 _DATE_RE = re.compile(r"20\d{2}\s*(?:年|[-/.])\s*\d{1,2}\s*(?:月|[-/.])?(?:\s*\d{1,2}\s*日?)?")
 
+_IDENTITY_FIELDS = ("scope_id", "scope_mode", "viewer_id", "entity_ids", "conversation_id")
+
 
 class QueryParser:
     """Emit a validated ``QueryParseDraft`` from a user turn.
@@ -123,19 +125,26 @@ class QueryParser:
         self.call_counts = {"parser": 0, "repair": 0}
 
     def parse(self, message, recent_turns="", now=None):
-        raw = self._call_parser(message, recent_turns, now)
+        raw = self._strip_identity_fields(self._call_parser(message, recent_turns, now))
         failed = raw is None
         draft, errors = self._draft_and_validate(raw)
         if errors and raw:
             repaired = self._call_repair(message, raw, errors)
             if repaired:
-                draft, errors = self._draft_and_validate(repaired)
+                draft, errors = self._draft_and_validate(self._strip_identity_fields(repaired))
         if errors:
             draft = self._safe_fallback()
             failed = True
         draft.parser_failed = failed
         draft.raw_json = raw
         return self._apply_deterministic_overlay(draft, message)
+
+    @staticmethod
+    def _strip_identity_fields(raw):
+        """Drop runtime identity fields the model may echo back (sanitizer contract)."""
+        if isinstance(raw, dict):
+            return {key: value for key, value in raw.items() if key not in _IDENTITY_FIELDS}
+        return raw
 
     def _call_parser(self, message, recent_turns, now):
         self.call_counts["parser"] += 1

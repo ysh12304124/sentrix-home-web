@@ -53,14 +53,22 @@ class ToolPolicy:
         "summary", "result_set_id", "handle", "total", "preview", "has_more",
         "remaining", "counts", "coverage", "facts", "items", "completeness",
         "unresolved", "delivered", "blocked", "observation", "certainty",
-        "source", "persisted", "question", "asset_handle", "reason",
+        "confirms_visual_only", "source", "persisted", "question", "asset_handle",
+        "reason", "url",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
             "operation", "answer_type", "value", "rows", "filters_applied",
+            "scanned_observations", "total_meal_observations", "event_count",
+            "explicit_foods", "explicit_food_events", "meal_scene_events",
+            "possible_events", "time_range", "rows_truncated",
         },
-        "search_memories": _DEFAULT_ALLOWED | {"query", "mode", "gaps"},
+        "search_memories": _DEFAULT_ALLOWED | {
+            "query", "mode", "gaps", "query_satisfaction", "answerability",
+            "condition_summary", "can_inspect", "inspect_hint",
+        },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
+        "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
         "inspect_photo": _DEFAULT_ALLOWED,
     }
 

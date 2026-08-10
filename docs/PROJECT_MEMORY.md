@@ -40,10 +40,10 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
 
 - 153 仓库：`/home/asus/Github/Sentrix-Home-Web`
 - 正式后端提交分支：`psh`
-- 当前提交：`15039f0` (`fix(api): scope dedup in /api/ingest (same album only, not cross-space)`，2026-08-10)
+- 当前提交：`bc1274c` (`merge(agent-runtime-v2): GitHub main sync + pipeline profile removal + dead code cleanup`，2026-08-10)
 - 当前工作树：干净。
 - Web：`http://192.168.0.153:4174`，代理 `http://127.0.0.1:8091`
-- 生产 Agent API：`8090`、`8091`（同一 Thin Agent 全栈 + 同一 `data/sentrix.db`）
+- 生产 Agent API：`8091`（AgentRuntime Tool-Loop 全栈 + `data/sentrix.db`）；`8090` 为旧实例保留
 - RX 验证实例：`127.0.0.1:8092`（`SENTRIX_RX_V1=1` + `SENTRIX_12B_FULL_CHAIN_VALIDATION=1` + `AGENT_MODEL_PROFILE=quality_12b`）
 - Ollama RX 实例：`127.0.0.1:8096`（`SENTRIX_RX_V1=1` + `AGENT_MODEL_PROFILE=quality_12b`）
 - 本地开发栈（`/home/asus/Github/ysh/sentrix-home-web`）：`11000` Web / `11001` API
@@ -186,10 +186,11 @@ Asset -> Observation -> FaceInstance -> PersonAppearanceEvidence -> SemanticClai
    模型描述不被改写。人物支持多名称、全局改名、同名人自动合并、拒绝即删除。
 8. **人物外观**：每个关联事件最多选择一个高质量已确认人脸，裁剪头部和上半身并
    分析目标人物衣物；场景衣物不会因共现升级为人物事实。
-9. **Agent 回答**：Thin Agent 先判定普通聊天/写作/记忆查询/反馈/澄清；记忆查询走
-   六路检索 + 硬过滤 -> `AnswerBrief` -> `visible_assets`（唯一决定可见图片）->
-   计划/校验/写作；回答必须可回溯证据，缺口写入 `query_gaps`，反馈写入
-   `memory_feedback`。
+9. **Agent 回答**：生产走 AgentRuntime Tool-Loop（`backend/agent_runtime/`，默认
+   `SENTRIX_AGENT_PROFILE=tool_loop`）：模型自主选工具（记忆事实/检索/翻页/复核原图），
+   ToolPolicy/BudgetManager 限制循环，FinalGuard + LLM judge 兜底诚实性；回答必须
+   可回溯证据，缺口写入 `query_gaps`，反馈写入 `memory_feedback`。旧 Thin Agent 路径
+   仅保留给 benchmark/回归测试。
 
 ## 模块实现
 
@@ -199,7 +200,8 @@ Asset -> Observation -> FaceInstance -> PersonAppearanceEvidence -> SemanticClai
 | `backend/db.py` | SQLite 加法迁移、事务、事件评分、空间隔离、聚类与人物投影 | 唯一权威记忆库 |
 | `backend/pipeline.py` | 白名单元数据、媒体适配、向量/人脸先写入再归并事件 | Asset、Observation、事件候选 |
 | `backend/model_clients.py` | vLLM/CLIP/AdaFace/FunASR 薄适配器 | 带版本结构化输出 |
-| `backend/thin_agent.py` | `answer_turn` 编排：路由、检索、证据回答、验证 | Agent 回答与轨迹 |
+| `backend/agent_runtime/` | AgentRuntime 薄循环：profile、ToolRegistry、ToolPolicy、BudgetManager、FinalGuard、LLM judge、ResultSet | Agent 回答与轨迹（生产唯一路径） |
+| `backend/thin_agent.py` | 旧 `answer_turn` 编排（仅 benchmark/测试使用） | 回归基准 |
 | `backend/router.py` | 确定性最终路由 8 步决策树 + NeutralProbe | 最终 route |
 | `backend/query_parser.py` / `query_contracts.py` | 12B 开放词表解析、sanitize/repair/回退、QuerySpec | 结构化查询规格 |
 | `backend/model_routing.py` | parser/answer/verify 角色、RequestDeadline、circuit breaker | 模型调用边界 |

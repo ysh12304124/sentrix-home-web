@@ -31,6 +31,8 @@
     searchResult: null,
     assistantMessages: [],
     searchLoading: false,
+    liveProgress: [],
+    selectedAsset: null,
     loading: true,
     backendError: "",
     toast: "",
@@ -281,6 +283,91 @@
     return `<details class="algorithm-evidence admin-only"><summary>本轮判断与工具</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}${item.reason ? ` · ${escapeHtml(item.reason)}` : ""}</dd></div>`).join("")}</dl></div></details>`;
   }
 
+  function guardDebug(result) {
+    if (!adminDebug()) return "";
+    const gd = result.guard_debug || result.guardDebug || {};
+    const l1 = gd.l1_codes || gd.l1Codes || [];
+    const judge = gd.judge || [];
+    const rec = gd.recovery_attempts || 0;
+    const rows = [];
+    rows.push(`<div><dt>L1 规则</dt><dd>${l1.length ? escapeHtml(l1.join(" · ")) : "通过"}</dd></div>`);
+    judge.forEach((j, i) => {
+      const problems = (j.problems || []).join(" · ") || "通过";
+      rows.push(`<div><dt>L2 评审 #${i + 1}</dt><dd>${j.faithful ? "faithful" : "unfaithful"} · ${escapeHtml(problems)}</dd></div>`);
+    });
+    rows.push(`<div><dt>恢复步数</dt><dd>${rec}</dd></div>`);
+    if (gd.status) rows.push(`<div><dt>最终状态</dt><dd>${escapeHtml(gd.status)}${gd.reason ? " · " + escapeHtml(gd.reason) : ""}</dd></div>`);
+    return `<details class="algorithm-evidence admin-only"${gd.status === "blocked_by_guard" ? " open" : ""}><summary>Guard 校验明细</summary><div class="algorithm-evidence-body"><dl>${rows.join("")}</dl></div></details>`;
+  }
+
+  const TOOL_LABELS = {
+    search_memories: "搜索记忆",
+    query_memory_facts: "查询记忆",
+    get_original_photos: "获取原始照片",
+    inspect_photo: "检查照片",
+    result_page: "翻看更多结果",
+  };
+
+  const STAGE_LABELS = {
+    thinking: "理解问题",
+    gate: "判断意图",
+    retrieval: "检索记忆",
+    channels: "合并检索结果",
+    inspecting: "检查照片",
+    recovering: "核对事实",
+    finalizing: "组织回答",
+    answer: "组织回答",
+    tool_result: "调用工具",
+    tool_error: "调用工具",
+  };
+
+  function thinkingStepLabel(step) {
+    if (step.type === "tool") return TOOL_LABELS[step.tool] || step.tool || "调用工具";
+    return STAGE_LABELS[step.stage] || (step.stage ? String(step.stage) : "思考");
+  }
+
+  function buildThinkingSteps(result, liveProgress = null) {
+    const progress = liveProgress || (result && (result.public_progress || [])) || [];
+    const tools = (result && (result.toolTrace || result.tool_trace)) || [];
+    const taskTools = (result && result.task_state && result.task_state.tool_results) || [];
+    let toolIndex = 0;
+    let taskIndex = 0;
+    return progress.map((item) => {
+      const stage = item.stage || "";
+      const status = item.status || "running";
+      if (stage === "tool_result" || stage === "tool_error") {
+        const tool = tools[toolIndex] || {};
+        const fallback = taskTools[taskIndex] || {};
+        toolIndex += 1;
+        taskIndex += 1;
+        const denied = tool.status === "denied" || stage === "tool_error";
+        return {
+          type: "tool",
+          tool: tool.tool || fallback.tool,
+          text: item.text || tool.reason || (denied ? "工具调用被拒绝" : "正在处理…"),
+          status: denied ? "blocked" : "complete",
+          latency: tool.latency_s,
+        };
+      }
+      return {
+        type: "stage",
+        stage,
+        text: item.text || "",
+        status: status === "ok" ? "complete" : status,
+      };
+    });
+  }
+
+  function agentStepHtml(step) {
+    const running = step.status === "running";
+    const blocked = step.status === "blocked" || step.status === "denied" || step.status === "error";
+    const stateClass = running ? "running" : blocked ? "blocked" : "complete";
+    const mark = step.type === "tool" ? "🔧" : "💭";
+    const statusMark = running ? "…" : blocked ? "!" : "✓";
+    const latency = step.latency != null ? `<small>${escapeHtml(String(step.latency))}s</small>` : "";
+    return `<div class="agent-step ${stateClass}"><span class="agent-step-mark">${mark}</span><div class="agent-step-body"><strong>${escapeHtml(thinkingStepLabel(step))}</strong><span>${escapeHtml(step.text || "")}</span>${latency}</div><span class="agent-step-status">${statusMark}</span></div>`;
+  }
+
   function assistantAnswer(result) {
     const segments = result.segments || [{ type: "text", text: result.answer || "" }];
     return segments.map((segment) => {
@@ -335,8 +422,10 @@
     const requiresEvidence = result.memory_used !== false && presentation.required !== false;
     const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
     const optionalImages = directEvidence ? "" : imageResults(result);
-    const debugBlock = isAdmin ? `${toolTrace(result)}${algorithmEvidence(result)}` : "";
-    const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看为什么找到这些照片</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
+    const evidenceCount = primary.length + (result.image_results || []).length;
+    const hasGap = result.evidence_status === "gap";
+    const basis = requiresEvidence ? `<details class="assistant-basis"${hasGap || evidenceCount > 0 ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
 
@@ -350,6 +439,34 @@
     return "";
   }
 
+  function resultSetCard(result) {
+    const ts = result.task_state || {};
+    const rid = ts.current_result_set;
+    if (!rid) return "";
+    // Phase C C7：total 未知显示"找到一批相关结果"；remaining=0 / has_more=false 不显示下一页。
+    const totalKnown = ts.result_total != null;
+    const total = totalKnown ? ts.result_total : null;
+    const remaining = ts.result_remaining != null ? ts.result_remaining : 0;
+    const hasMore = Boolean(ts.has_more) && remaining > 0;
+    const head = totalKnown ? `共 ${total} 张${hasMore ? ` · 还有 ${remaining} 张` : ""}` : "找到一批相关结果";
+    const handles = (ts.result_preview || []).slice(0, 6);
+    const selected = state.selectedAsset && state.selectedAsset.result_set_id === rid ? state.selectedAsset.handle : "";
+    // C8：本轮的 inspect_photo 复核结果与 handle 对应展示（已复核徽标 + 复核观察）
+    const inspectRows = (ts.tool_results || []).filter((tr) => tr.tool === "inspect_photo" && tr.inspect_handle);
+    const inspected = new Set(inspectRows.map((tr) => tr.inspect_handle));
+    const inspectedNotes = inspectRows.filter((tr) => tr.inspect_text)
+      .map((tr) => `<span>${escapeHtml(tr.inspect_handle)} · 复核：${escapeHtml(tr.inspect_text)}</span>`).join("");
+    const thumbs = handles.length ? `<div class="result-set-thumbs">${handles.map((h) => {
+      const active = h === selected ? " selected" : "";
+      const checked = inspected.has(h) ? " inspected" : "";
+      return `<button class="result-set-thumb${active}${checked}" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${h === selected ? `<span class="result-set-check">已选</span>` : ""}${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button>`;
+    }).join("")}</div>` : "";
+    const inspectBlock = inspectedNotes ? `<div class="result-set-inspect-notes">${inspectedNotes}</div>` : "";
+    const originalButton = selected ? `<button class="text-button" data-action="open-selected-original" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(selected)}">查看原图 ${icon("→")}</button>` : "";
+    const next = hasMore ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${originalButton}${next}</section>`;
+  }
+
   function assistantMessage(message) {
     if (message.role === "user") return `<article class="assistant-message user"><div class="assistant-bubble"><p>${escapeHtml(message.text)}</p></div></article>`;
     const result = message.result || {};
@@ -357,15 +474,23 @@
     const plan = result.dialogue_plan || {};
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
-    const progress = Array.isArray(result.public_progress) ? `<div class="assistant-progress">${result.public_progress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : "";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${progress}${assistantEvidence(result)}</div></article>`;
+    const failureStatus = ["partial", "timeout", "error", "blocked_by_guard"].includes(result.tool_loop_status || "");
+    const traceSteps = buildThinkingSteps(result);
+    const trace = traceSteps.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>思考过程 · ${traceSteps.length} 步</summary><div>${traceSteps.map(agentStepHtml).join("")}</div></details>` : "";
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${trace}${resultSetCard(result)}${assistantEvidence(result)}</div></article>`;
+  }
+
+  function updateLiveProgress() {
+    const host = document.querySelector("[data-live-progress]");
+    if (!host) return;
+    host.innerHTML = buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("");
   }
 
   function searchView() {
     const messages = state.assistantMessages;
     const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
     const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想一想，也在整理这段家庭记忆。</p></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
+    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想，正在整理这段记忆。</p><div class="agent-trace live" data-live-progress>${buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("")}</div></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
   }
 
   function timelineView() {
@@ -939,16 +1064,19 @@
     state.view = "search";
     state.assistantMessages.push({ role: "user", text: state.query });
     state.searchLoading = true;
+    state.liveProgress = [];
     renderShellNavigation();
     try {
-      state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
-      state.conversationId = state.searchResult.conversation_id || state.conversationId;
+      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
+      state.conversationId = conversationId;
+      state.searchResult = result;
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
     }
     state.assistantMessages.push({ role: "steward", result: state.searchResult });
     state.query = "";
     state.searchLoading = false;
+    state.liveProgress = [];
     renderShellNavigation();
   }
 
@@ -959,19 +1087,76 @@
     state.searchLoading = true;
     renderShellNavigation();
     try {
-      const result = await window.sentrixApi.assistantTurn(
+      const { result, conversationId } = await runAssistantTurn(
         message, state.conversationId,
         { proactivity_outcome: outcome, proactivity_scene_key: sceneKey },
-        state.scopeId, "", "owner",
+        state.scopeId, "",
       );
       state.searchResult = result;
-      state.conversationId = result.conversation_id || state.conversationId;
-      state.assistantMessages.push({ role: "steward", result });
+      state.conversationId = conversationId;
+      state.assistantMessages.push({ role: "steward", result: state.searchResult });
     } catch (error) {
       state.toast = `主动回忆状态未更新：${error.message}`;
     }
     state.searchLoading = false;
     renderShellNavigation();
+  }
+
+  async function runAssistantTurn(message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", selectedAsset = null) {
+    const start = await window.sentrixApi.assistantTurnAsync(message, conversationId, feedback, scopeId, selectedEntityId, "owner", selectedAsset);
+    if (start && start.turn_id && start.status === "running") {
+      const nextConversationId = start.conversation_id || conversationId;
+      // Phase C C13：优先 SSE 实时事件；EventSource 不可用时回退 700ms 轮询。
+      let done = await subscribeTurnEvents(start.turn_id);
+      if (!done) done = await pollTurnEvents(start.turn_id);
+      return { result: done || { answer: "执行超时，请重试。", evidence_status: "error" }, conversationId: nextConversationId };
+    }
+    return { result: start, conversationId: (start && start.conversation_id) || conversationId };
+  }
+
+  function mergeLiveProgress(event) {
+    const idx = event && event.step_index != null ? event.step_index : null;
+    if (idx != null && Array.isArray(state.liveProgress)) {
+      const existing = state.liveProgress.findIndex((p) => p.step_index === idx);
+      if (existing >= 0) state.liveProgress[existing] = event;
+      else state.liveProgress.push(event);
+    } else {
+      state.liveProgress.push(event);
+    }
+  }
+
+  function subscribeTurnEvents(turnId) {
+    return new Promise((resolve) => {
+      let es = null;
+      try { es = new EventSource(window.sentrixApi.assistantTurnEventsUrl(turnId)); } catch (_) { resolve(null); return; }
+      const finish = (value) => { try { es.close(); } catch (_) { /* noop */ } resolve(value); };
+      es.addEventListener("progress", (e) => {
+        try {
+          const event = JSON.parse(e.data);
+          if (event && event.text) { mergeLiveProgress(event); updateLiveProgress(); }
+        } catch (_) { /* 忽略坏事件 */ }
+      });
+      es.addEventListener("complete", (e) => {
+        try { finish(JSON.parse(e.data).result || JSON.parse(e.data)); } catch (_) { finish(null); }
+      });
+      es.onerror = () => finish(null); // 交给轮询兜底
+      setTimeout(() => finish(null), 600_000); // 超时保护
+    });
+  }
+
+  async function pollTurnEvents(turnId) {
+    let done = null;
+    for (let i = 0; i < 150 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      try {
+        const poll = await window.sentrixApi.assistantTurnPoll(turnId);
+        if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
+        updateLiveProgress();
+        if (poll.status === "complete") done = poll.result;
+        else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
+      } catch (pollError) { /* 单次轮询失败继续等待 */ }
+    }
+    return done;
   }
 
   async function handleFiles(event) {
@@ -1214,6 +1399,17 @@
   }
 
   async function handleAction(action, element) {
+    if (action === "result-next-page") { state.query = "下一页"; state.view = "search"; renderShellNavigation(); submitSearch(); return; }
+    if (action === "select-result-photo") {
+      state.selectedAsset = { result_set_id: element.dataset.resultSetId, handle: element.dataset.handle };
+      renderShellNavigation();
+      state.toast = "已选中这张照片，可以问它里面的内容或要原图。";
+      return;
+    }
+    if (action === "open-selected-original") {
+      window.open(window.sentrixApi.resultSetPhoto(element.dataset.resultSetId, element.dataset.handle, state.scopeId, true), "_blank");
+      return;
+    }
     if (action === "close-modal") { closeCurrentModal(); return; }
     if (action === "back") { state.modal = null; goBack(); return; }
     if (action === "home") { state.modal = null; navigate("overview"); return; }

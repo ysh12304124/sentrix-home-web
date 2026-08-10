@@ -84,7 +84,9 @@ class QueryParseDraft:
     answer_type: str = "asset_set"
     strategy_hint: str = ""
     structured: dict[str, Any] = field(default_factory=dict)
-    # Debug: the raw model JSON before sanitize (admin layer only, never a writer input).
+    # Debug: the raw model JSON after identity-field stripping (admin layer
+    # only, never a writer input). Runtime identity fields the model echoes
+    # back are removed before storage so they never leak into admin output.
     raw_json: Any = None
     # R9: proposed_mode is the ONLY writable mode field; it is advisory — the
     # Router decides the final route.  ``mode`` is a derived compatibility
@@ -307,8 +309,25 @@ def sanitize_query_parse(raw: Any, message: str = "") -> QueryParseDraft:
 
 def parse_time_expression(value: str | None):
     value = _clean_text(value)
+    # 0) 范围表达式：优先月范围（2025年3月-2025年5月 / 2025年3月-5月），再年范围（2025年-2026年 / 2025-2026）
+    month_range = re.fullmatch(
+        r"((?:19|20)\d{2})\s*年?\s*(\d{1,2})\s*月?\s*[-~至到]\s*((?:19|20)\d{2})?\s*年?\s*(\d{1,2})\s*月?",
+        value or "")
+    if month_range:
+        start_year, start_month = int(month_range.group(1)), int(month_range.group(2))
+        end_year = int(month_range.group(3)) if month_range.group(3) else start_year
+        end_month = int(month_range.group(4))
+        start = datetime(start_year, start_month, 1)
+        end = datetime(end_year + (end_month == 12), 1 if end_month == 12 else end_month + 1, 1)
+        return start, end
+    year_range = re.fullmatch(
+        r"((?:19|20)\d{2})\s*年?\s*[-~至到]\s*((?:19|20)\d{2})\s*年?",
+        value or "")
+    if year_range:
+        start_year, end_year = int(year_range.group(1)), int(year_range.group(2))
+        return datetime(start_year, 1, 1), datetime(end_year + 1, 1, 1)
     # 1) 月/日优先：2023年10月 / 2023-10 / 2023年10月5日
-    match = re.search(r"(20\d{2})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])?(?:(\d{1,2})\s*日?)?", value)
+    match = re.search(r"((?:19|20)\d{2})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])?(?:(\d{1,2})\s*日?)?", value)
     if match:
         year, month, day = int(match.group(1)), int(match.group(2)), match.group(3)
         if day:
@@ -318,7 +337,7 @@ def parse_time_expression(value: str | None):
         end = datetime(year + (month == 12), 1 if month == 12 else month + 1, 1)
         return start, end
     # 2) 纯年份：2023 / 2023年 -> 整年范围
-    year_match = re.fullmatch(r"(20\d{2})\s*年?", _clean_text(value) or "")
+    year_match = re.fullmatch(r"((?:19|20)\d{2})\s*年?", _clean_text(value) or "")
     if year_match:
         year = int(year_match.group(1))
         return datetime(year, 1, 1), datetime(year + 1, 1, 1)

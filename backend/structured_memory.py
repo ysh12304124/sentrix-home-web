@@ -22,7 +22,13 @@ _GROUP_EXPR = {
     "year": "substr(a.captured_at, 1, 4)",
     "date": "substr(a.captured_at, 1, 10)",
     "media": "a.media_type",
-    "place": "COALESCE(NULLIF(o.place, ''), NULLIF(a.captured_location, ''), '未知')",
+    "place": (
+        "CASE WHEN TRIM(COALESCE(json_extract(a.metadata_json, '$.reverse_geocode.city'), '')) != '' "
+        "THEN json_extract(a.metadata_json, '$.reverse_geocode.city') "
+        "WHEN TRIM(COALESCE(o.place, '')) != '' THEN o.place "
+        "WHEN TRIM(COALESCE(a.captured_location, '')) != '' THEN '有GPS坐标' "
+        "ELSE '未知' END"),
+
 }
 
 
@@ -203,6 +209,15 @@ class StructuredMemoryExecutor:
             params,
         )
         return [{"group": row["g"]} for row in rows]
+
+    def _matching_assets(self, draft, spec, limit: int = 500) -> list[dict]:
+        """纯硬筛选（时间/媒体/地点/人物）的资产列表（search_memories 空 query 用，不依赖 ANN）。"""
+        joins, where, params = self._base_query(draft, spec)
+        rows = self._rows(
+            "SELECT a.id, a.file_name, a.captured_at, a.media_type, a.captured_location "
+            f"FROM assets a {joins} WHERE {where} ORDER BY a.captured_at DESC LIMIT ?",
+            params + [limit])
+        return [dict(row) for row in rows]
 
     # ---- entry point ----
 
