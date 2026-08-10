@@ -22,7 +22,13 @@ _GROUP_EXPR = {
     "year": "substr(a.captured_at, 1, 4)",
     "date": "substr(a.captured_at, 1, 10)",
     "media": "a.media_type",
-    "place": "COALESCE(NULLIF(o.place, ''), NULLIF(a.captured_location, ''), '未知')",
+    "place": (
+        "CASE WHEN TRIM(COALESCE(json_extract(a.metadata_json, '$.reverse_geocode.city'), '')) != '' "
+        "THEN json_extract(a.metadata_json, '$.reverse_geocode.city') "
+        "WHEN TRIM(COALESCE(o.place, '')) != '' THEN o.place "
+        "WHEN TRIM(COALESCE(a.captured_location, '')) != '' THEN '有GPS坐标' "
+        "ELSE '未知' END"),
+
 }
 
 

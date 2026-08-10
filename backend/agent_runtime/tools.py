@@ -338,6 +338,9 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
     meal_event_keys = {_event_key(oid) for oid in meal_observation_ids}
     return {
         "operation": "meal",
+        "answer_type": "meal_summary",
+        "value": top_foods,
+        "total": len(meal_observation_ids),
         "time_range": {"start": start, "end": end} if (start or end) else None,
         "scanned_observations": len(rows),
         "total_meal_observations": len(meal_observation_ids),
@@ -629,7 +632,9 @@ def register_tools():
     ))
     register(ToolSpec(
         name="search_memories",
-        description="检索家庭记忆：找照片、视觉语义（衣着/颜色/物体/场景）、混合查询。返回结果集摘要。",
+        description=("检索家庭记忆：找照片、视觉语义（衣着/颜色/物体/场景）、混合查询。返回结果集摘要。"
+                     "用户提到时间时必须把时间原样写进 filters.time（如'2024年'、'去年'、'去年春天'），"
+                     "不要只放在 query 文本里；query 只写场景/人物/物体描述。"),
         input_schema={"query": "", "mode": "best|all|representative",
                       "filters": {"time": "", "place": "", "person": ""}},
         executor=_search_memories, read_write="read", cost_class="medium", readiness="ready",
