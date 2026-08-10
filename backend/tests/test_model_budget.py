@@ -37,8 +37,10 @@ class RoleModelResolutionTests(unittest.TestCase):
             model="gemma4:12b", parse_model="gemma4:e2b-it",
             parse_backend="e2b", parse_base_url="http://127.0.0.1:8100",
         )
-        self.assertEqual(client._endpoint_for("parser"), ("http://127.0.0.1:8100", "gemma4:e2b-it"))
-        self.assertEqual(client._endpoint_for("answer"), ("http://127.0.0.1:11434", "gemma4:12b"))
+        # SENTRIX_LLM_BACKEND defaults to vllm (openai-compatible), so every
+        # role endpoint is normalized to a /v1 suffix on the vLLM base URL.
+        self.assertEqual(client._endpoint_for("parser"), ("http://127.0.0.1:8100/v1", "gemma4:e2b-it"))
+        self.assertEqual(client._endpoint_for("answer"), ("http://127.0.0.1:8100/v1", "gemma4:12b"))
 
 
 class RequestDeadlineTests(unittest.TestCase):

@@ -84,7 +84,9 @@ class QueryParseDraft:
     answer_type: str = "asset_set"
     strategy_hint: str = ""
     structured: dict[str, Any] = field(default_factory=dict)
-    # Debug: the raw model JSON before sanitize (admin layer only, never a writer input).
+    # Debug: the raw model JSON after identity-field stripping (admin layer
+    # only, never a writer input). Runtime identity fields the model echoes
+    # back are removed before storage so they never leak into admin output.
     raw_json: Any = None
     # R9: proposed_mode is the ONLY writable mode field; it is advisory — the
     # Router decides the final route.  ``mode`` is a derived compatibility
