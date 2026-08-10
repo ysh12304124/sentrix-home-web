@@ -75,7 +75,8 @@ class FinalGuard:
         satisfaction = task_state.get("search_satisfaction")
         condition_summary = task_state.get("search_condition_summary") or {}
         denies = bool(__import__("re").search(
-            r"没(?:有)?找到|未找到|不存在|没有(?:任何|符合|相关|一张|一个|一条)?(?:照片|记录|回忆|记忆)|查无", answer))
+            r"没(?:有)?找到|未找到|不存在|没有(?:任何|符合|相关|一张|一个|一条)?(?:照片|记录|回忆|记忆)|查无|"
+            r"无法看到.{0,6}(?:照片|内容)|看不到任何照片|无法查看(?:照片|内容)|没有(?:可|能看|看过).{0,4}照片", answer))
         # 1) 有结果却声称没有：非空结果 + 明确否认存在 → omission（与是否引用无关）
         for tr in tool_results:
             total = tr.get("total")
@@ -86,15 +87,48 @@ class FinalGuard:
             if tr.get("tool_call_id") in refs and total == 0 and not denies:
                 if __import__("re").search(r"找到|为您找到|有.{0,10}(照片|记录)", answer):
                     problems.append("fabrication_from_empty_ref")
-        # 2) candidate_only 声称完全匹配
-        if satisfaction == "candidate_only":
+        inspect_texts = [tr.get("inspect_text") for tr in tool_results
+                         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip()]
+        # 2) candidate_only 声称完全匹配（inspect 复核到具体观察的不算）
+        if satisfaction == "candidate_only" and not inspect_texts:
             if __import__("re").search(r"确认|确定|就是|肯定是|找到了|确认是", answer) and \
                not __import__("re").search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据", answer):
                 problems.append("candidate_claimed_as_match")
-        # 3) partial/candidate 必须披露缺口
-        if satisfaction in {"partial_support", "candidate_only"}:
+        # 3) partial/candidate 必须披露缺口（已通过 inspect 复核到具体观察的除外）
+        if satisfaction in {"partial_support", "candidate_only"} and not inspect_texts:
             if not __import__("re").search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer):
                 problems.append("missing_disclosure")
+        # 4.5) inspect 被拒/无观察却断言视觉细节 → inspection_fabrication
+        inspect_results = [tr for tr in tool_results if tr.get("tool") == "inspect_photo"]
+        for tr in inspect_results:
+            if tr.get("blocked") and not (tr.get("inspect_text") or "").strip():
+                # 无观察时：只有未加不确定措辞的视觉断言才算编造（si07 类已 hedge 的不算）
+                if not __import__("re").search(r"无法确认|不能确认|不确定|无法判断|无法看到|看不清|看不清楚", answer):
+                    if __import__("re").search(
+                            r"桌上(?:放着|放了|摆着|有)|穿着|写着|天气(?:是|为|很)|有(?:雪|猫|小孩)|"
+                            r"是(?:雪|猫|小孩)|(?:外套|衣服|招牌).{0,6}(?:是|穿|写)", answer):
+                        problems.append(f"inspection_fabrication:blocked={tr.get('blocked')}")
+            # 4.6) inspect 有真实观察，但 Agent 却否认看到 → inspect_evidence_contradicted
+            elif (tr.get("inspect_text") or "").strip():
+                obs_text = tr["inspect_text"]
+                if __import__("re").search(r"无法看到|看不到|没有看到任何|无法查看|没有(?:任何|可看)的照片|看不到任何照片", answer):
+                    problems.append("inspect_evidence_contradicted")
+                # 4.7) 观察否定存在，回答却断言存在 → 观察与回答直接矛盾（编造）
+                neg_obs = __import__("re").search(
+                    r"没有(?:出现|看到|找到)?(?:任何|一个|一只)?(?:人|猫|小孩)|没有.{0,6}(?:人|猫|小孩)|无(?:人|猫|小孩)", obs_text)
+                if neg_obs:
+                    # 已 hedge/否定语境（“无法确认有人”“并没有出现人”）不算编造
+                    hedged = __import__("re").search(
+                        r"无法确认|不能确认|不确定|无法判断|无法看到|看不清|看不清楚|没有|并无|未出现|未看到|没看到", answer)
+                    if not hedged:
+                        positive_claim = __import__("re").search(
+                            r"有(?:一个|一位|两只|一只|几位|几个人)?[^，。]{0,8}(?:人|猫|小孩|红衣|红衣服)|"
+                            r"穿着.{0,4}(?:红色|白色|黑色|蓝色|黄色|外套)|看到了?.{0,6}(?:人|猫|小孩)|"
+                            r"确认.{0,8}(?:人|猫|小孩)|"
+                            r"(?:人|猫|小孩|雪|山|外套).{0,4}(?:是|为).{0,4}(?:白色|红色|黑色|蓝色|黄色|绿色|灰色|棕色|粉色|紫色)", answer)
+                        if positive_claim:
+                            problems.append("inspect_observation_contradicted")
+
         # 4) 条件明确 unknown/contradicted 却升级为 confirmed
         if condition_summary:
             unresolved = [k for k, v in condition_summary.items() if v in {"unknown", "contradicted"}]

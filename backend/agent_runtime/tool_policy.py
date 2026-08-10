@@ -59,7 +59,10 @@ class ToolPolicy:
         "query_memory_facts": _DEFAULT_ALLOWED | {
             "operation", "answer_type", "value", "rows", "filters_applied",
         },
-        "search_memories": _DEFAULT_ALLOWED | {"query", "mode", "gaps"},
+        "search_memories": _DEFAULT_ALLOWED | {
+            "query", "mode", "gaps", "query_satisfaction", "answerability",
+            "condition_summary", "can_inspect", "inspect_hint",
+        },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
         "inspect_photo": _DEFAULT_ALLOWED,
     }

@@ -182,6 +182,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "query_satisfaction": satisfaction,
         "answerability": answerability,
         "condition_summary": cond,
+        "can_inspect": len(preview) > 0,
+        "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
     }
 
 
@@ -264,11 +266,28 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
 def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     asset_handle = arguments.get("asset_handle") or ""
     question = arguments.get("question") or "请描述这张照片"
-    # shadow 阶段用 handle 反查 asset（A4 后由 ResultSetStore 映射）。
-    asset_id = _handle_to_asset_id(asset_handle)
+    scope_id = (context or {}).get("scope_id") or "home-default"
+    task_state = (context or {}).get("task_state") or {}
+    # B3：handle 必须解析自当前结果集；失败再退回最近一次检索的 handle 映射
+    asset_id = None
+    result_set_id = task_state.get("current_result_set")
+    rs_store = _RUNTIME.get("result_sets")
+    if result_set_id and rs_store is not None:
+        asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
+    if not asset_id:
+        asset_id = _handle_to_asset_id(asset_handle)
     store = _RUNTIME.get("store")
     if not asset_id or store is None:
-        return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False}
+        return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False,
+                "blocked": ["unknown_handle"]}
+    row = store.connection.execute(
+        "SELECT path, scope_id FROM assets WHERE id = ?", (asset_id,)).fetchone()
+    if row and row["scope_id"] != scope_id:
+        return {"summary": "无法复核该照片（不在当前相册范围）。", "certainty": "uncertain",
+                "persisted": False, "blocked": ["scope_mismatch"]}
+    if not row or not row["path"] or not Path(row["path"]).is_file():
+        return {"summary": "照片文件不可用。", "certainty": "uncertain", "persisted": False,
+                "blocked": ["file_unavailable"]}
     row = store.connection.execute("SELECT path FROM assets WHERE id = ?", (asset_id,)).fetchone()
     if not row or not row["path"] or not Path(row["path"]).is_file():
         return {"summary": "照片文件不可用。", "certainty": "uncertain", "persisted": False}
@@ -277,7 +296,8 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         return {"summary": "模型不可用。", "certainty": "uncertain", "persisted": False}
     try:
         image = {"base64": _base64_image(row["path"]), "mime_type": _mime_for(row["path"])}
-        raw = gamma.chat("inspect", _INSPECT_PROMPT.format(question=question), images=[image], json_mode=True)
+        raw = gamma.chat(_INSPECT_PROMPT.format(question=question), images=[image],
+                         json_mode=True, role="inspect")
     except Exception as exc:
         return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False}
     try:
@@ -338,7 +358,7 @@ def register_tools():
     ))
     register(ToolSpec(
         name="inspect_photo",
-        description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。昂贵，默认每轮最多 1 次。",
+        description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 必须使用 search_memories preview 里的 handle（photo_1…）。昂贵，默认每轮最多 1 次。",
         input_schema={"asset_handle": "", "question": ""},
         executor=_inspect_photo, read_write="read", cost_class="expensive", readiness="ready",
     ))

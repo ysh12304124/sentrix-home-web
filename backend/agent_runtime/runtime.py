@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from .budget_manager import BudgetState
 from .final_guard import FinalGuard
+from .judge import judge_faithfulness
 from .profile import get_profile
 from .result_set import TaskState
 from .tool_policy import ToolPolicy
@@ -29,6 +30,13 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   {{"action":"tool_call","tool":"...","arguments":{{...}},"public_status":"..."}}
   或 {{"action":"final","answer":"...","evidence_refs":["tool_call_1", ...]}}
 - 不要重复调用相同的工具和参数：同一轮里相同 tool+arguments 只允许一次，重复会被拒绝。
+- inspect_photo 的 asset_handle 必须原样使用 search_memories 返回 preview 里的 handle（如 photo_1、photo_2）。
+  不要编造 preview 之外的 handle。
+- 当用户询问照片里的视觉细节（桌上物品、衣服颜色、人数、文字/招牌、天气、穿什么、有没有某物）时，
+  如果 search_memories 返回了 preview 候选（有 photo_1 等 handle），你必须调用 inspect_photo 复核 preview 里的照片，
+  不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
+- 只有当 search_memories 返回 total=0 或 preview 为空时，才不能 inspect_photo；
+  此时绝对不要调用 inspect_photo、不要编造 handle、不要声称找到候选照片，直接如实说没有找到符合条件的照片。
 - final 时必须用 evidence_refs 列出你实际引用的工具调用编号（本轮工具调用会按顺序编号 tool_call_1、tool_call_2 …；纯聊天不引用）。
 - 只使用工具返回的事实回答，不编造数字或细节；工具没有返回的内容不要编造。
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
@@ -165,6 +173,16 @@ class AgentRuntime:
         guard_retries = 0
         max_guard_retries = 1
         seen_tool_calls = set()
+        dedup_retries = 0
+        max_dedup_retries = 2
+        search_has_preview = False
+        inspect_called = False
+        tool_call_seq = 0
+        visual_retries = 0
+        max_visual_retries = 1
+        visual_intent = bool(__import__("re").search(
+            r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|在做什么|"
+            r"有没有|是什么|放着|写了|内容|细节", message))
         while True:
             if not turn.budget.can_model_step():
                 turn.status = "partial" if turn.steps else "timeout"
@@ -193,6 +211,25 @@ class AgentRuntime:
                 turn.reason = "unparseable_action"
                 break
             if action.get("action") == "final":
+                # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
+                if search_has_preview and not inspect_called and visual_intent \
+                        and visual_retries < max_visual_retries and turn.budget.can_model_step():
+                    visual_retries += 1
+                    denies_found = bool(__import__("re").search(r"没(?:有|找到)|未找到|没有获取到|找不到|还没有", turn.final_answer))
+                    messages.append({"role": "assistant", "content": raw})
+                    if denies_found:
+                        messages.append({"role": "user", "content": (
+                            "你的回答说“没有找到”，但 search_memories 实际返回了候选照片（preview 里有 photo_1 等 handle），"
+                            "这与工具结果矛盾。请调用 inspect_photo 复核 preview 里的 photo_1（asset_handle=photo_1），"
+                            "根据观察如实回答；如果观察与用户假设不符，以观察为准。"
+                        )})
+                    else:
+                        messages.append({"role": "user", "content": (
+                            "用户询问的是照片里的视觉细节，而你还没有调用 inspect_photo。"
+                            "search_memories 的 preview 里有可复核的照片（photo_1 等 handle）。"
+                            "请先调用 inspect_photo（asset_handle 用 preview 里的 handle），得到观察后再输出 final。"
+                        )})
+                    continue
                 turn.final_answer = str(action.get("answer") or "")
                 problems = guard.check(
                     turn.final_answer,
@@ -214,14 +251,40 @@ class AgentRuntime:
                     },
                     delivered_count=task.delivered_count,
                 )
+                # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性
+                if not problems and task.tool_results and turn.budget.can_model_step():
+                    turn.budget.record_model_step()
+                    faithful, judge_problems = judge_faithfulness(
+                        self.chat_fn, query=message, tool_results=task.tool_results,
+                        answer=turn.final_answer)
+                    turn.steps.append({"type": "judge", "faithful": faithful,
+                                       "problems": judge_problems})
+                    if not faithful:
+                        problems = judge_problems
                 if problems:
                     if guard_retries < max_guard_retries and turn.budget.can_model_step():
                         guard_retries += 1
                         messages.append({"role": "assistant", "content": raw})
+                        inspect_obs = [
+                            tr.get("inspect_text") for tr in task.tool_results
+                            if tr.get("tool") == "inspect_photo" and tr.get("inspect_text")
+                        ]
                         messages.append({"role": "user", "content": (
                             "你的最终回答与工具结果冲突，需要修正后重新输出 final：\n- "
                             + "\n- ".join(problems) +
-                            "\n请只输出一个 JSON final（保留 evidence_refs 引用你使用的工具结果），"
+                            ("\nsearch_memories 实际返回了候选照片，你却回答没有找到："
+                             "不要再说“没有找到”。请调用 inspect_photo 复核 preview 里的 photo_1，"
+                             "或如实改为“找到了候选，但还不能确认”。"
+                             if any("omission_conflict" in p for p in problems) else "") +
+                            ("\n注意：检索或复核没有产生可用照片时，不要声称找到候选照片，"
+                             "也不要引用被拒/空的 inspect 调用；直接如实说没有找到或无法确认。"
+                             if any("fabrication_from_empty" in p or "inspection_fabrication" in p
+                                    for p in problems) else "") +
+                            ("\ninspect_photo 的实际观察是：" + "；".join(inspect_obs)
+                             + "\n如果观察与用户假设矛盾，以观察为准回答，不要迎合用户假设。"
+                             if inspect_obs else "") +
+                            "\n请只输出一个 JSON final（保留 evidence_refs 引用你实际使用的工具结果，"
+                            "并在 evidence_refs 中列出你引用过的 inspect_photo 调用编号），"
                             "并按 query_satisfaction 如实表述（candidate_only 不能声称确认）。"
                         )})
                         continue
@@ -237,10 +300,27 @@ class AgentRuntime:
             tool_name = action.get("tool") or ""
             arguments = action.get("arguments") or {}
             public_status = action.get("public_status") or "正在处理。"
-            tool_call_id = f"tool_call_{len(turn.steps)}"
+            tool_call_seq += 1
+            tool_call_id = f"tool_call_{tool_call_seq}"
             call_signature = json.dumps({"tool": tool_name, "arguments": arguments},
                                         ensure_ascii=False, sort_keys=True)
             if call_signature in seen_tool_calls:
+                if dedup_retries < max_dedup_retries and turn.budget.can_model_step():
+                    dedup_retries += 1
+                    messages.append({"role": "assistant", "content": raw})
+                    if dedup_retries >= max_dedup_retries:
+                        messages.append({"role": "user", "content": (
+                            "你再次重复调用相同的工具和参数，被拒绝。"
+                            "你不能再重复调用该工具。请立即调用 inspect_photo（asset_handle=photo_1）复核预览照片，"
+                            "或直接输出 final 回答。"
+                        )})
+                    else:
+                        messages.append({"role": "user", "content": (
+                            "你刚用相同的工具和参数调用过，重复调用会被拒绝。"
+                            "请换一个动作：如果需要看照片细节请调用 inspect_photo（使用预览里的 handle），"
+                            "否则直接输出 final。"
+                        )})
+                    continue
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:duplicate_tool_call"
                 break
@@ -273,6 +353,10 @@ class AgentRuntime:
                 break
             task.update_from_tool(tool_name, arguments, result.observation or {})
             task.record_tool_result(tool_call_id, tool_name, result.observation or {})
+            if tool_name == "search_memories" and (result.observation or {}).get("can_inspect"):
+                search_has_preview = True
+            if tool_name == "inspect_photo":
+                inspect_called = True
             # Observation 进入下一步模型上下文
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(

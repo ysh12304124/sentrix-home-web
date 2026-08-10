@@ -92,6 +92,9 @@ class TaskState:
             "tool": tool_name,
             "total": observation.get("total"),
             "satisfaction": observation.get("query_satisfaction"),
+            "blocked": observation.get("blocked"),
+            "inspect_text": observation.get("observation"),
+            "certainty": observation.get("certainty"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):
