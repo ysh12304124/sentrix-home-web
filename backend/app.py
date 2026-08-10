@@ -1013,6 +1013,68 @@ def rename_person(person_id: str, payload: dict | None = None):
     return refreshed
 
 
+
+def _seed_face_detect(path: str) -> list[dict]:
+    """Standardised face extraction for identity seeding.
+
+    Flow:
+      1. buffalo_l detection (handles full-body / scene photos)
+      2. If miss: upscale 2x and retry (handles small faces in large images)
+      3. If still miss: whole-image embedding fallback (handles tight face crops)
+
+    Returns a face dict list compatible with seed_person_identity.
+    """
+    faces = pipeline.face.detect(path)
+    if faces:
+        return faces
+
+    if not pipeline.face.identity_configured:
+        return []
+
+    import cv2 as _cv2
+    _img = _cv2.imread(path)
+    if _img is None:
+        return []
+    _h, _w = _img.shape[:2]
+
+    # Step 2: upscale and retry detection for small faces in large images
+    _max_dim = max(_w, _h)
+    if _max_dim > 600:
+        _scale = min(2.0, 1280.0 / _max_dim)
+        if _scale > 1.05:
+            _img_big = _cv2.resize(_img, (int(_w * _scale), int(_h * _scale)),
+                                   interpolation=_cv2.INTER_CUBIC)
+            _tmp_path = path + ".upscaled.jpg"
+            _cv2.imwrite(_tmp_path, _img_big)
+            try:
+                faces = pipeline.face.detect(_tmp_path)
+            finally:
+                import os as _os
+                _os.unlink(_tmp_path)
+            if faces:
+                # Scale bbox coordinates back to original image
+                for f in faces:
+                    f["bbox"] = [v / _scale for v in f["bbox"]]
+                return faces
+
+    # Step 3: whole-image fallback for pre-cropped face photos
+    try:
+        _crop = align_face_crop(_img, [0, 0, _w, _h])
+        _emb = pipeline.face.identity_adapter.embed(_crop)
+        return [{
+            "bbox": [0, 0, float(_w), float(_h)],
+            "confidence": 0.99, "quality": 0.8,
+            "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
+            "landmarks": [], "embedding": _emb.embedding,
+            "embedding_model": pipeline.face.identity_model,
+            "embedding_version": _emb.model_version,
+            "quality_signal": _emb.quality_signal,
+            "pose_bucket": "frontal", "identity_ready": True,
+        }]
+    except Exception:
+        return []
+
+
 @app.post("/api/people/seed", status_code=201)
 async def seed_person_identity(
     background_tasks: BackgroundTasks,
@@ -1040,25 +1102,7 @@ async def seed_person_identity(
         store.create_asset(asset_id, safe_name, "image", str(destination), upload.content_type, destination.stat().st_size, meta, scope_id=scope)
         observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
         store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
-        faces = pipeline.face.detect(str(destination))
-        if not faces and pipeline.face.identity_configured:
-            import cv2 as _cv2
-            _img = _cv2.imread(str(destination))
-            if _img is not None:
-                _h, _w = _img.shape[:2]
-                try:
-                    _crop = align_face_crop(_img, [0, 0, _w, _h])
-                    _emb = pipeline.face.identity_adapter.embed(_crop)
-                    faces = [{"bbox": [0, 0, float(_w), float(_h)],
-                              "confidence": 0.99, "quality": 0.8,
-                              "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
-                              "landmarks": [], "embedding": _emb.embedding,
-                              "embedding_model": pipeline.face.identity_model,
-                              "embedding_version": _emb.model_version,
-                              "quality_signal": _emb.quality_signal,
-                              "pose_bucket": "frontal", "identity_ready": True}]
-                except Exception:
-                    pass
+        faces = _seed_face_detect(str(destination))
         if not faces:
             continue
         best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
@@ -1108,25 +1152,7 @@ async def seed_persons_batch(
             store.create_asset(asset_id, safe_name, "image", str(destination), upload.content_type, destination.stat().st_size, meta, scope_id=scope)
             observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
             store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
-            faces = pipeline.face.detect(str(destination))
-            if not faces and pipeline.face.identity_configured:
-                import cv2 as _cv2
-                _img = _cv2.imread(str(destination))
-                if _img is not None:
-                    _h, _w = _img.shape[:2]
-                    try:
-                        _crop = align_face_crop(_img, [0, 0, _w, _h])
-                        _emb = pipeline.face.identity_adapter.embed(_crop)
-                        faces = [{"bbox": [0, 0, float(_w), float(_h)],
-                                  "confidence": 0.99, "quality": 0.8,
-                                  "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
-                                  "landmarks": [], "embedding": _emb.embedding,
-                                  "embedding_model": pipeline.face.identity_model,
-                                  "embedding_version": _emb.model_version,
-                                  "quality_signal": _emb.quality_signal,
-                                  "pose_bucket": "frontal", "identity_ready": True}]
-                    except Exception:
-                        pass
+            faces = _seed_face_detect(str(destination))
             if not faces:
                 continue
             best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
