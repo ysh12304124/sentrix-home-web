@@ -1041,6 +1041,24 @@ async def seed_person_identity(
         observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
         store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
         faces = pipeline.face.detect(str(destination))
+        if not faces and pipeline.face.identity_configured:
+            import cv2 as _cv2
+            _img = _cv2.imread(str(destination))
+            if _img is not None:
+                _h, _w = _img.shape[:2]
+                try:
+                    _crop = align_face_crop(_img, [0, 0, _w, _h])
+                    _emb = pipeline.face.identity_adapter.embed(_crop)
+                    faces = [{"bbox": [0, 0, float(_w), float(_h)],
+                              "confidence": 0.99, "quality": 0.8,
+                              "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
+                              "landmarks": [], "embedding": _emb.embedding,
+                              "embedding_model": pipeline.face.identity_model,
+                              "embedding_version": _emb.model_version,
+                              "quality_signal": _emb.quality_signal,
+                              "pose_bucket": "frontal", "identity_ready": True}]
+                except Exception:
+                    pass
         if not faces:
             continue
         best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
@@ -1048,7 +1066,7 @@ async def seed_person_identity(
     if not face_photos:
         raise HTTPException(status_code=422, detail="no detectable faces in uploaded photos")
     result = store.seed_person_identity(scope, name, (familyRole or "").strip() or None, alias_list, face_photos)
-    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "aliases": result["aliases"]}
+    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": m_role, "aliases": result["aliases"]}
 
 
 @app.post("/api/people/seed-batch", status_code=201)
@@ -1091,6 +1109,24 @@ async def seed_persons_batch(
             observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
             store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
             faces = pipeline.face.detect(str(destination))
+            if not faces and pipeline.face.identity_configured:
+                import cv2 as _cv2
+                _img = _cv2.imread(str(destination))
+                if _img is not None:
+                    _h, _w = _img.shape[:2]
+                    try:
+                        _crop = align_face_crop(_img, [0, 0, _w, _h])
+                        _emb = pipeline.face.identity_adapter.embed(_crop)
+                        faces = [{"bbox": [0, 0, float(_w), float(_h)],
+                                  "confidence": 0.99, "quality": 0.8,
+                                  "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
+                                  "landmarks": [], "embedding": _emb.embedding,
+                                  "embedding_model": pipeline.face.identity_model,
+                                  "embedding_version": _emb.model_version,
+                                  "quality_signal": _emb.quality_signal,
+                                  "pose_bucket": "frontal", "identity_ready": True}]
+                    except Exception:
+                        pass
             if not faces:
                 continue
             best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
@@ -1099,7 +1135,7 @@ async def seed_persons_batch(
             results.append({"name": m_name, "error": "no detectable faces"})
             continue
         result = store.seed_person_identity(scope, m_name, m_role, m_aliases, face_photos)
-        results.append({"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "aliases": result["aliases"]})
+        results.append({"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": m_role, "aliases": result["aliases"]})
     return {"results": results}
 
 
