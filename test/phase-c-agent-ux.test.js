@@ -28,6 +28,12 @@ test("Phase C: original evidence fold defaults open with item count", () => {
   assert.match(app, /hasGap \|\| evidenceCount > 0 \? " open" : ""/);
 });
 
+test("Phase C/UX: tool-loop evidence samples feed the original-evidence fold", () => {
+  assert.match(app, /function toolLoopEvidence/);
+  assert.match(app, /\(tr\.observation \|\| \{\}\)\.samples/);
+  assert.match(app, /hasToolEvidence \|\| hasResultSet/);
+});
+
 test("Phase C: SSE events and polling fallback are wired", () => {
   assert.match(api, /assistantTurnEventsUrl/);
   assert.match(app, /new EventSource\(/);
