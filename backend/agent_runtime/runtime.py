@@ -95,6 +95,11 @@ def _trusted_facts(task_state: dict) -> list[str]:
         facts.append(f"工具确认{label}是 {value}。")
     elif op == "exists":
         facts.append("工具确认存在相关记录。" if value is True else "工具确认不存在相关记录。")
+    if op == "meal":
+        foods = task_state.get("fact_value") or []
+        if foods:
+            facts.append("工具确认的明确食物（按事件去重）为：" + "、".join(
+                f"{f.get('food')}({f.get('events')}次)" for f in foods[:10]))
     rows = task_state.get("fact_rows") or []
     if rows:
         sample = rows[:6]

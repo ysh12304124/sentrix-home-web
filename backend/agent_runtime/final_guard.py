@@ -49,6 +49,7 @@ def _natural_message(code: str, detail: str = "") -> str:
         "inspect_observation_contradicted": "照片复核的观察与你的回答直接矛盾",
         "certainty_upgrade": "有条件没有确认，回答却说得过于确定",
         "judge_unfaithful": "评审认为回答与工具观察不一致",
+        "placeholder_leak": "回答里出现了'地点名称/数量/时间'这类未填写的占位符，必须替换成真实数据或删除",
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -101,6 +102,9 @@ class FinalGuard:
                         issues.append(_issue("fact_exists_contradiction_false", "expected=False"))
             elif op == "group":
                 issues.extend(self._check_group(answer, task_state))
+        # 0.5 模板占位符泄漏（[地点名称1]/[数量] 等未填占位）
+        if re.search(r"\[[^\[\]]{0,14}(?:名称|数量|时间|地点|内容|数字|照片|记录)[^\[\]]{0,14}\]", answer):
+            issues.append(_issue("placeholder_leak"))
         # 1. 内部 ID 泄漏（asset_/obs_/entity_ 前缀 + 内部表名）
         leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_)[a-f0-9]{6,}\b", answer)
         if leaks:

@@ -111,6 +111,14 @@ class GuardExistsRegressionTests(unittest.TestCase):
         problems = FinalGuard().check("没有找到相关记录。", task_state=self._state(False))
         self.assertEqual(list(problems), [])
 
+    def test_placeholder_leak_blocked(self):
+        problems = FinalGuard().check(
+            "去年春天去过：\n- [地点名称1]\n- [地点名称2]",
+            task_state={"search_satisfaction": "full_support", "condition_summary": {},
+                        "tool_results": [{"tool_call_id": "tool_call_1", "tool": "search_memories", "total": 112}],
+                        "evidence_refs": ["tool_call_1"]})
+        self.assertTrue(any("placeholder_leak" in p for p in problems))
+
     def test_guard_messages_are_natural(self):
         problems = FinalGuard().check("我确认找到了爬山合影。", task_state={
             "search_satisfaction": "candidate_only", "condition_summary": {"semantic": "unknown"},
