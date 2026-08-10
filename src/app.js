@@ -405,6 +405,28 @@
     return `<section class="proactive-recall"><p>${escapeHtml(recall.entry_text || "我想到一段相关回忆。")}</p><div class="proactive-actions"><button class="text-button" data-action="accept-proactive" data-scene-key="${escapeHtml(recall.scene_key)}">看看这段回忆 ${icon("→")}</button><button class="text-button" data-action="dismiss-proactive" data-scene-key="${escapeHtml(recall.scene_key)}">暂不查看</button><button class="text-button muted" data-action="disable-proactive" data-scene-key="${escapeHtml(recall.scene_key)}">关闭主动回忆</button></div></section>`;
   }
 
+  function toolLoopEvidence(result) {
+    const samples = [];
+    for (const tr of ((result.task_state || {}).tool_results) || []) {
+      for (const s of ((tr.observation || {}).samples) || []) {
+        if (!s || !s.asset_id) continue;
+        samples.push({
+          kind: "observation",
+          asset_id: s.asset_id,
+          media_type: s.media_type || "image",
+          caption: s.caption || s.transcript || "",
+          captured_at: s.captured_at,
+        });
+      }
+    }
+    const seen = new Set();
+    return samples.filter((item) => {
+      if (seen.has(item.asset_id)) return false;
+      seen.add(item.asset_id);
+      return true;
+    }).slice(0, 6);
+  }
+
   function assistantEvidence(result) {
     const isAdmin = adminDebug();
     const layers = result.evidence_layers || {};
@@ -418,14 +440,18 @@
     const ordered = result.evidence_order || [];
     const order = ordered.length && isAdmin ? `<details class="algorithm-evidence admin-only"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
     const directEvidence = Boolean(result.original_evidence_requested || presentation.direct_original_evidence);
-    // RX-6: a chat turn (memory_used === false) never shows an evidence entry.
-    const requiresEvidence = result.memory_used !== false && presentation.required !== false;
     const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
     const optionalImages = directEvidence ? "" : imageResults(result);
     const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
-    const evidenceCount = primary.length + (result.image_results || []).length;
-    const hasGap = result.evidence_status === "gap";
-    const basis = requiresEvidence ? `<details class="assistant-basis"${hasGap || evidenceCount > 0 ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    const toolSamples = toolLoopEvidence(result);
+    const toolEvidence = toolSamples.length ? `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">本次依据（工具结果）</p><h3>${toolSamples.length} 项</h3></div></div><div class="evidence-list">${toolSamples.map(evidenceCard).join("")}</div></section>` : "";
+    const evidenceCount = primary.length + (result.image_results || []).length + toolSamples.length;
+    const hasToolEvidence = toolSamples.length > 0;
+    const hasResultSet = Boolean((result.task_state || {}).current_result_set && (result.task_state || {}).result_total > 0);
+    // RX-6: a chat turn (memory_used === false) never shows an evidence entry; tool-loop turns use task_state evidence.
+    const requiresEvidence = (result.memory_used !== false && presentation.required !== false) || hasToolEvidence || hasResultSet;
+    const hasGap = result.evidence_status === "gap" || (!evidenceCount && result.tool_loop_status === "complete");
+    const basis = requiresEvidence ? `<details class="assistant-basis"${hasGap || evidenceCount > 0 ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
 

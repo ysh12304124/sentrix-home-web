@@ -191,7 +191,8 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         draft = _draft_from_filters(filters, answer_type=answer_type)
     from ..structured_memory import StructuredMemoryExecutor
     executor = StructuredMemoryExecutor(_RUNTIME["store"])
-    result = executor.execute(draft, _spec_for(draft, scope_id, viewer_id))
+    spec = _spec_for(draft, scope_id, viewer_id)
+    result = executor.execute(draft, spec)
     out = {
         "operation": operation,
         "answer_type": result.answer_type,
@@ -201,6 +202,10 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         "filters_applied": result.filters_applied,
         "coverage": {"complete": True},
     }
+    try:
+        out["samples"] = executor._sample_observations(draft, spec, limit=3)
+    except Exception:
+        out["samples"] = []
     if operation == "group" and group_by == "place" and isinstance(out["rows"], list) and len(out["rows"]) > 12:
         # 地点分组只给模型前 12 个，避免超长 rows 干扰 12B 输出（month 分组本身 ≤12 不截断）
         out["rows_truncated"] = len(out["rows"])
@@ -357,11 +362,20 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
 
     total_events = len({_event_key(r["observation_id"]) for r in rows})
     meal_event_keys = {_event_key(oid) for oid in meal_observation_ids}
+    meal_samples = []
+    for r in rows[:3]:
+        meal_samples.append({
+            "asset_id": r.get("asset_id"),
+            "captured_at": r.get("captured_at"),
+            "media_type": "image",
+            "caption": (r.get("caption") or r.get("ocr_text") or "")[:120],
+        })
     return {
         "operation": "meal",
         "answer_type": "meal_summary",
         "value": top_foods,
         "total": len(meal_observation_ids),
+        "samples": meal_samples,
         "time_range": {"start": start, "end": end} if (start or end) else None,
         "scanned_observations": len(rows),
         "total_meal_observations": len(meal_observation_ids),
