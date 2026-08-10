@@ -1207,12 +1207,14 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                        selected_result_set_id=selected_result_set_id)
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
-    trace = [
-        {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
-         "reason": s.get("reason") or "",
-         "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
-        for s in turn.steps
-    ]
+    trace = []
+    for s in turn.steps:
+        item = {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
+                "reason": s.get("reason") or "",
+                "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
+        if isinstance(s.get("arguments"), dict):
+            item["args"] = s.get("arguments")
+        trace.append(item)
     return {
         "answer": turn.final_answer,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",

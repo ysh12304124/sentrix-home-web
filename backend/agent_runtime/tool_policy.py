@@ -58,6 +58,9 @@ class ToolPolicy:
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
             "operation", "answer_type", "value", "rows", "filters_applied",
+            "scanned_observations", "total_meal_observations", "event_count",
+            "explicit_foods", "explicit_food_events", "meal_scene_events",
+            "possible_events", "time_range",
         },
         "search_memories": _DEFAULT_ALLOWED | {
             "query", "mode", "gaps", "query_satisfaction", "answerability",
