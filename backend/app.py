@@ -1068,7 +1068,10 @@ async def seed_persons_batch(
         if not m_name:
             results.append({"name": "", "error": "name is required"})
             continue
-        m_aliases = [a.strip() for a in (member.get("aliases") or "").replace("、", ",").split(",") if a.strip()]
+        _raw_aliases = member.get("aliases") or []
+        if isinstance(_raw_aliases, str):
+            _raw_aliases = _raw_aliases.replace("、", ",").split(",")
+        m_aliases = [a.strip() for a in _raw_aliases if isinstance(a, str) and a.strip()]
         m_role = (member.get("family_role") or "").strip() or None
         file_indices = member.get("file_indices") or []
         member_files = [files[i] for i in file_indices if 0 <= i < len(files)]
