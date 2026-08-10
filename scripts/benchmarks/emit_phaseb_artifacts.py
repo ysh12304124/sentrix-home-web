@@ -89,7 +89,7 @@ def emit_coverage(store) -> dict:
         "schema_version": 1,
         "scopes": {
             "home-default": {
-                "assets": count("SELECT COUNT(*) FROM assets WHERE scope_id='home-default' AND status='ready'"),
+                "assets": count("SELECT COUNT(*) FROM assets WHERE scope_id='home-default'"),
                 "observations": count("SELECT COUNT(*) FROM observations WHERE scope_id='home-default'"),
                 "events": count("SELECT COUNT(*) FROM events WHERE scope_id='home-default'"),
                 "entities": count("SELECT COUNT(*) FROM entities WHERE scope_id='home-default'"),
@@ -98,7 +98,7 @@ def emit_coverage(store) -> dict:
                 "query_gaps": count("SELECT COUNT(*) FROM query_gaps"),
             },
             "album2_e2b": {
-                "assets": count("SELECT COUNT(*) FROM assets WHERE scope_id='album2_e2b' AND status='ready'"),
+                "assets": count("SELECT COUNT(*) FROM assets WHERE scope_id='album2_e2b'"),
                 "observations": count("SELECT COUNT(*) FROM observations WHERE scope_id='album2_e2b'"),
                 "events": count("SELECT COUNT(*) FROM events WHERE scope_id='album2_e2b'"),
                 "entities": count("SELECT COUNT(*) FROM entities WHERE scope_id='album2_e2b'"),

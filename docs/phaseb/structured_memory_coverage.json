@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "scopes": {
+    "home-default": {
+      "assets": 1,
+      "observations": 1,
+      "events": 2,
+      "entities": 9,
+      "facts": 19,
+      "memory_vectors": 2528,
+      "query_gaps": 195
+    },
+    "album2_e2b": {
+      "assets": 66,
+      "observations": 66,
+      "events": 35,
+      "entities": 145,
+      "memory_vectors": 246
+    }
+  },
+  "structured_query_types": {
+    "count": "ready",
+    "exists": "ready",
+    "first": "ready",
+    "last": "ready",
+    "date": "ready",
+    "media": "ready",
+    "group_by_month": "ready",
+    "place": "limited",
+    "person": "limited"
+  }
+}
