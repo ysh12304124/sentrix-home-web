@@ -174,7 +174,8 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         }.get(operation, "count")
         draft = _draft_from_filters(filters, answer_type=answer_type)
     from ..structured_memory import StructuredMemoryExecutor
-    result = StructuredMemoryExecutor(_RUNTIME["store"]).execute(draft, _spec_for(draft, scope_id, viewer_id))
+    executor = StructuredMemoryExecutor(_RUNTIME["store"])
+    result = executor.execute(draft, _spec_for(draft, scope_id, viewer_id))
     out = {
         "operation": operation,
         "answer_type": result.answer_type,
@@ -184,6 +185,10 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         "filters_applied": result.filters_applied,
         "coverage": {"complete": True},
     }
+    if operation == "group" and group_by == "place" and isinstance(out["rows"], list) and len(out["rows"]) > 12:
+        # 地点分组只给模型前 12 个，避免超长 rows 干扰 12B 输出（month 分组本身 ≤12 不截断）
+        out["rows_truncated"] = len(out["rows"])
+        out["rows"] = out["rows"][:12]
     if operation == "group" and group_by == "place":
         # Phase C C4：地点聚合必须带 coverage（多少张有/没有可靠地点信息）
         rows = result.rows or []
@@ -362,6 +367,42 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
 
 
 # ---- Tool 2: search_memories ----
+def _search_metadata_only(draft, spec, scope_id, query, mode) -> dict:
+    """空 query 搜索：只按硬筛选（时间/媒体/地点/人物）返回资产，构建 ResultSet 预览。"""
+    from ..structured_memory import StructuredMemoryExecutor
+    executor = StructuredMemoryExecutor(_RUNTIME["store"])
+    assets = executor._matching_assets(draft, spec, limit=500)
+    rs = _RUNTIME["result_sets"].new(
+        scope_id=scope_id, query=query or "(时间/地点筛选)", asset_ids=[a["id"] for a in assets],
+        unresolved=[])
+    preview = []
+    handles = rs.handles()
+    for i, a in enumerate(assets[:6]):
+        preview.append({
+            "handle": f"photo_{i + 1}",
+            "captured_at": a.get("captured_at"),
+            "level": "exact",
+            "condition_summary": {},
+        })
+    total = len(assets)
+    return {
+        "result_set_id": rs.result_set_id,
+        "query": query,
+        "mode": mode,
+        "total": total,
+        "preview": preview,
+        "has_more": total > len(preview),
+        "remaining": max(0, total - len(preview)),
+        "completeness": "complete",
+        "gaps": [],
+        "query_satisfaction": "full_support" if total else "no_match",
+        "answerability": "full" if total else "none",
+        "condition_summary": {},
+        "can_inspect": len(preview) > 0,
+        "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
+    }
+
+
 def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     query = arguments.get("query") or ""
     mode = arguments.get("mode") or "best"
@@ -371,6 +412,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     draft = _draft_from_filters({**filters, "query": query}, answer_type="asset_set")
     draft.result_requirement = {"mode": mode}
     spec = _spec_for(draft, scope_id, viewer_id)
+    if not (query or "").strip():
+        # 纯时间/地点/人物/媒体筛选：走确定性元数据路径，不依赖 ANN 语义召回（生产多检索器下空 query 会 0 召回）
+        return _search_metadata_only(draft, spec, scope_id, query, mode)
     packet = _kernel().retrieve(spec)
     assets = packet.assets or []
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]

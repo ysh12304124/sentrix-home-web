@@ -210,6 +210,15 @@ class StructuredMemoryExecutor:
         )
         return [{"group": row["g"]} for row in rows]
 
+    def _matching_assets(self, draft, spec, limit: int = 500) -> list[dict]:
+        """纯硬筛选（时间/媒体/地点/人物）的资产列表（search_memories 空 query 用，不依赖 ANN）。"""
+        joins, where, params = self._base_query(draft, spec)
+        rows = self._rows(
+            "SELECT a.id, a.file_name, a.captured_at, a.media_type, a.captured_location "
+            f"FROM assets a {joins} WHERE {where} ORDER BY a.captured_at DESC LIMIT ?",
+            params + [limit])
+        return [dict(row) for row in rows]
+
     # ---- entry point ----
 
     def execute(self, draft, spec: QuerySpec, strategy: str = "structured_fact") -> StructuredResult:
