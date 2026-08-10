@@ -503,3 +503,4 @@ body.admin .admin-only { display: revert; }
 .seed-result-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 13px; }
 .seed-result-row.error { border-color: #dc2626; background: #fef2f2; }
 .seed-result-row .error-text { color: #dc2626; font-size: 12px; }
+.page-heading-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
