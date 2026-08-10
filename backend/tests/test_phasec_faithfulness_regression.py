@@ -130,6 +130,22 @@ class PlaceAggregationRegressionTests(unittest.TestCase):
                                      {"group": "绍兴市", "count": 34}], group_by="place"))
         self.assertEqual(list(problems), [])
 
+    def test_place_observation_scene_rows_pass(self):
+        # 去年春天：rows 含观察地点（体育场等），"以下地点"结构短语不应误伤
+        problems = FinalGuard().check(
+            "去年春天，您的出行记录显示去过以下地点：\n- 杭州市（共100条记录）\n- 体育场或演艺场馆（2条记录）\n- 室内环境（2条记录）",
+            task_state=_group_state([{"group": "杭州市", "count": 100},
+                                     {"group": "体育场或演艺场馆", "count": 2},
+                                     {"group": "室内环境", "count": 2}], group_by="place"))
+        self.assertEqual(list(problems), [])
+
+    def test_place_observation_scene_fabrication_blocked(self):
+        problems = FinalGuard().check(
+            "去年春天，您的出行记录显示去过以下地点：\n- 杭州市（共100条记录）\n- 月球基地（1条记录）",
+            task_state=_group_state([{"group": "杭州市", "count": 100},
+                                     {"group": "体育场或演艺场馆", "count": 2}], group_by="place"))
+        self.assertTrue(any("group_fabrication" in p for p in problems))
+
     def test_place_omission_blocked(self):
         problems = FinalGuard().check("去年没有去过任何地方。", task_state=_search_state(
             "full_support", {"杭州": "confirmed"}))
