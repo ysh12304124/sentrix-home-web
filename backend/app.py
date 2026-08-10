@@ -1409,7 +1409,11 @@ def assistant_response(result):
     result["claimEvidenceIndex"] = result["claim_evidence_index"]
     if not admin:
         result["retrievalTrace"] = []
-        result["toolTrace"] = []
+        # 思考过程对普通用户可见工具名/状态/耗时；参数与 observation 等明细仍仅管理员可见。
+        result["toolTrace"] = [
+            {k: v for k, v in (t or {}).items() if k in ("tool", "status", "latency_s")}
+            for t in (result.get("tool_trace") or [])
+        ]
         result.pop("validation", None)
         result.pop("model_call_ledger", None)
         result.pop("task_contract", None)
