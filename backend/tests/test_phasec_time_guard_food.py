@@ -321,5 +321,49 @@ class RepresentativePreviewTests(unittest.TestCase):
         self.assertTrue(out["can_inspect"])
 
 
+
+
+class GuardDebugTraceTests(unittest.TestCase):
+    """C9: guard 检查以结构化步骤记录（L1 codes + 恢复步数），debug 层可见、普通用户不可见。"""
+
+    def test_guard_recovery_steps_recorded(self):
+        from backend.agent_runtime.runtime import AgentRuntime
+        store = MemoryStore(":memory:")
+        store.create_asset("a1", "a1.jpg", "image", "/x/a1.jpg",
+                           metadata={"captured_at": "2023-05-12T10:00:00",
+                                     "captured_location": "上海"},
+                           scope_id="home")
+        store.add_observation("a1", {"id": "obs1", "captured_at": "2023-05-12T10:00:00",
+                                     "caption": "聚会", "objects": []}, scope_id="home")
+        store.connection.commit()
+        runtime_tools.bind_runtime(store)
+        runtime_tools.register_tools()
+        script = [
+            '{"action":"tool_call","tool":"query_memory_facts","arguments":'
+            '{"operation":"exists","filters":{"time":"2023年5月"}},"public_status":"正在查询…"}',
+            '{"action":"final","answer":"没有找到任何相关照片。","evidence_refs":["tool_call_1"]}',
+            '{"action":"final","answer":"2023年5月拍过照片。","evidence_refs":["tool_call_1"]}',
+            '{"faithful": true, "problems": []}',
+        ]
+
+        def chat_fn(messages):
+            return script.pop(0)
+
+        runtime = AgentRuntime(chat_fn=chat_fn, scope_id="home", viewer_id="owner")
+        turn = runtime.run("2023年5月拍过照片吗？")
+        self.assertEqual(turn.status, "complete")
+        guard_steps = [s for s in turn.steps if s.get("type") == "guard"]
+        self.assertGreaterEqual(len(guard_steps), 2)
+        self.assertEqual(guard_steps[0]["status"], "fail")
+        self.assertIn("fact_exists_contradiction", guard_steps[0]["codes"])
+        self.assertEqual(guard_steps[0]["attempt"], 1)
+        self.assertEqual(guard_steps[1]["status"], "pass")
+        self.assertEqual(guard_steps[1]["attempt"], 2)
+        recovering = [p for p in turn.public_progress if p.get("stage") == "recovering"]
+        self.assertEqual(len(recovering), 1)
+        # 恢复后的最终回答是可信事实重写，不是失败文案
+        self.assertEqual(turn.final_answer, "2023年5月拍过照片。")
+
+
 if __name__ == "__main__":
     unittest.main()

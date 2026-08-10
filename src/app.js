@@ -291,6 +291,23 @@
     return `<details class="algorithm-evidence admin-only"><summary>本轮判断与工具</summary><div class="algorithm-evidence-body"><dl>${trace.map((item) => `<div><dt>${escapeHtml(item.tool || "memory_tool")}</dt><dd>${escapeHtml(item.permission || "read")} · ${escapeHtml(item.status || "complete")}${item.reason ? ` · ${escapeHtml(item.reason)}` : ""}</dd></div>`).join("")}</dl></div></details>`;
   }
 
+  function guardDebug(result) {
+    if (!adminDebug()) return "";
+    const gd = result.guard_debug || result.guardDebug || {};
+    const l1 = gd.l1_codes || gd.l1Codes || [];
+    const judge = gd.judge || [];
+    const rec = gd.recovery_attempts || 0;
+    const rows = [];
+    rows.push(`<div><dt>L1 规则</dt><dd>${l1.length ? escapeHtml(l1.join(" · ")) : "通过"}</dd></div>`);
+    judge.forEach((j, i) => {
+      const problems = (j.problems || []).join(" · ") || "通过";
+      rows.push(`<div><dt>L2 评审 #${i + 1}</dt><dd>${j.faithful ? "faithful" : "unfaithful"} · ${escapeHtml(problems)}</dd></div>`);
+    });
+    rows.push(`<div><dt>恢复步数</dt><dd>${rec}</dd></div>`);
+    if (gd.status) rows.push(`<div><dt>最终状态</dt><dd>${escapeHtml(gd.status)}${gd.reason ? " · " + escapeHtml(gd.reason) : ""}</dd></div>`);
+    return `<details class="algorithm-evidence admin-only"${gd.status === "blocked_by_guard" ? " open" : ""}><summary>Guard 校验明细</summary><div class="algorithm-evidence-body"><dl>${rows.join("")}</dl></div></details>`;
+  }
+
   function assistantAnswer(result) {
     const segments = result.segments || [{ type: "text", text: result.answer || "" }];
     return segments.map((segment) => {
@@ -345,7 +362,7 @@
     const requiresEvidence = result.memory_used !== false && presentation.required !== false;
     const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
     const optionalImages = directEvidence ? "" : imageResults(result);
-    const debugBlock = isAdmin ? `${toolTrace(result)}${algorithmEvidence(result)}` : "";
+    const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
     const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看为什么找到这些照片</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }

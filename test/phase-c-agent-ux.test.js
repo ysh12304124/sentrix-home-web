@@ -42,3 +42,12 @@ test("Phase C/C8: inspected thumbnail badge and observation notes render", () =>
   assert.match(app, /tr\.tool === "inspect_photo" && tr\.inspect_handle/);
   assert.match(css, /\.result-set-thumb\.inspected img/);
 });
+
+test("Phase C/C9: guard debug detail is admin-only and layered", () => {
+  assert.match(app, /function guardDebug/);
+  assert.match(app, /Guard 校验明细/);
+  assert.match(app, /l1_codes/);
+  assert.match(app, /L2 评审/);
+  assert.match(app, /恢复步数/);
+  assert.match(app, /adminDebug\(\)/);
+});
