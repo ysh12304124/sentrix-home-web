@@ -491,3 +491,12 @@ body.admin .admin-only { display: revert; }
 .space-row .muted { color: var(--faint); font-size: 11px; }
 .button.danger { background: #dc2626; color: #fff; border: 1px solid #dc2626; }
 .button.danger:hover { background: #b91c1c; border-color: #b91c1c; }
+
+/* B3.3 ResultSet delivery card */
+.result-set-card { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfdf8; }
+.result-set-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }
+.result-set-head .section-kicker { margin: 0; }
+.result-set-head strong { color: var(--ink); font-size: 11px; }
+.result-set-thumbs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.result-set-thumbs img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+.result-set-card .text-button { margin-top: 10px; }

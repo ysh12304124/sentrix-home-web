@@ -308,7 +308,7 @@ def sanitize_query_parse(raw: Any, message: str = "") -> QueryParseDraft:
 def parse_time_expression(value: str | None):
     value = _clean_text(value)
     # 1) 月/日优先：2023年10月 / 2023-10 / 2023年10月5日
-    match = re.search(r"(20\d{2})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])?(?:(\d{1,2})\s*日?)?", value)
+    match = re.search(r"((?:19|20)\d{2})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])?(?:(\d{1,2})\s*日?)?", value)
     if match:
         year, month, day = int(match.group(1)), int(match.group(2)), match.group(3)
         if day:
@@ -318,7 +318,7 @@ def parse_time_expression(value: str | None):
         end = datetime(year + (month == 12), 1 if month == 12 else month + 1, 1)
         return start, end
     # 2) 纯年份：2023 / 2023年 -> 整年范围
-    year_match = re.fullmatch(r"(20\d{2})\s*年?", _clean_text(value) or "")
+    year_match = re.fullmatch(r"((?:19|20)\d{2})\s*年?", _clean_text(value) or "")
     if year_match:
         year = int(year_match.group(1))
         return datetime(year, 1, 1), datetime(year + 1, 1, 1)

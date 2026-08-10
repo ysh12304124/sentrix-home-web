@@ -39,6 +39,7 @@
     searchResult: null,
     assistantMessages: [],
     searchLoading: false,
+    liveProgress: [],
     loading: true,
     backendError: "",
     toast: "",
@@ -358,6 +359,18 @@
     return "";
   }
 
+  function resultSetCard(result) {
+    const ts = result.task_state || {};
+    const rid = ts.current_result_set;
+    if (!rid) return "";
+    const total = ts.result_total != null ? ts.result_total : "?";
+    const remaining = ts.result_remaining != null ? ts.result_remaining : 0;
+    const handles = (ts.result_preview || []).slice(0, 6);
+    const thumbs = handles.length ? handles.map((h) => `<img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />`).join("") : "";
+    const next = ts.has_more ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>共 ${total} 张 · 还有 ${remaining} 张</strong></div>${thumbs ? `<div class="result-set-thumbs">${thumbs}</div>` : ""}${next}</section>`;
+  }
+
   function assistantMessage(message) {
     if (message.role === "user") return `<article class="assistant-message user"><div class="assistant-bubble"><p>${escapeHtml(message.text)}</p></div></article>`;
     const result = message.result || {};
@@ -366,14 +379,20 @@
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
     const progress = Array.isArray(result.public_progress) ? `<div class="assistant-progress">${result.public_progress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : "";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${progress}${assistantEvidence(result)}</div></article>`;
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${progress}${resultSetCard(result)}${assistantEvidence(result)}</div></article>`;
+  }
+
+  function updateLiveProgress() {
+    const host = document.querySelector("[data-live-progress]");
+    if (!host) return;
+    host.innerHTML = state.liveProgress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("");
   }
 
   function searchView() {
     const messages = state.assistantMessages;
     const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
     const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想一想，也在整理这段家庭记忆。</p></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
+    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想一想，也在整理这段家庭记忆。</p>${state.liveProgress.length ? `<div class="assistant-progress" data-live-progress>${state.liveProgress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : ""}</div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
   }
 
   function timelineView() {
@@ -939,16 +958,35 @@
     state.view = "search";
     state.assistantMessages.push({ role: "user", text: state.query });
     state.searchLoading = true;
+    state.liveProgress = [];
     renderShellNavigation();
     try {
-      state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
-      state.conversationId = state.searchResult.conversation_id || state.conversationId;
+      const start = await window.sentrixApi.assistantTurnAsync(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
+      if (start && start.turn_id && start.status === "running") {
+        state.conversationId = start.conversation_id || state.conversationId;
+        let done = null;
+        for (let i = 0; i < 150 && !done; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 700));
+          try {
+            const poll = await window.sentrixApi.assistantTurnPoll(start.turn_id);
+            if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
+            updateLiveProgress();
+            if (poll.status === "complete") done = poll.result;
+            else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
+          } catch (pollError) { /* 单次轮询失败继续等待 */ }
+        }
+        state.searchResult = done || { answer: "执行超时，请重试。", evidence_status: "error" };
+      } else {
+        state.searchResult = start;
+        state.conversationId = (start && start.conversation_id) || state.conversationId;
+      }
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
     }
     state.assistantMessages.push({ role: "steward", result: state.searchResult });
     state.query = "";
     state.searchLoading = false;
+    state.liveProgress = [];
     renderShellNavigation();
   }
 
@@ -1176,6 +1214,7 @@
   }
 
   async function handleAction(action, element) {
+    if (action === "result-next-page") { state.query = "下一页"; state.view = "search"; renderShellNavigation(); submitSearch(); return; }
     if (action === "close-modal") { closeCurrentModal(); return; }
     if (action === "back") { state.modal = null; goBack(); return; }
     if (action === "home") { state.modal = null; navigate("overview"); return; }

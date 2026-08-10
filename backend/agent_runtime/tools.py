@@ -168,6 +168,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "condition_summary": _condition_summary(item),
         })
     _RUNTIME["last_handles"] = handles
+    cond, satisfaction, answerability = _truth_contract(packet, rs.total)
     return {
         "result_set_id": rs.result_set_id,
         "query": query,
@@ -178,6 +179,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "remaining": max(0, len(asset_ids) - len(preview)),
         "completeness": "complete" if not (packet.gaps) else "partial",
         "gaps": rs.unresolved[:3],
+        "query_satisfaction": satisfaction,
+        "answerability": answerability,
+        "condition_summary": cond,
+        "can_inspect": len(preview) > 0,
+        "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
     }
 
 
@@ -187,6 +193,49 @@ def _condition_summary(item: dict) -> dict:
         label = key.split(":", 1)[-1]
         out[label] = cond.get("status")
     return out
+
+
+def _truth_contract(packet, total: int) -> tuple[dict, str, str]:
+    """确定性计算查询满足度（B2）：基于 condition_results 与 gaps，不交给模型判断。"""
+    if total <= 0:
+        return {}, "no_match", "none"
+    condition_verdict: dict[str, dict] = {}
+    for item in (packet.assets or []):
+        for key, cond in (item.get("condition_results") or {}).items():
+            label = key.split(":", 1)[-1]
+            status = cond.get("status") or "unknown"
+            bucket = condition_verdict.setdefault(label, {"confirmed": 0, "supported": 0,
+                                                          "unknown": 0, "contradicted": 0})
+            if status == "matched":
+                bucket["confirmed"] += 1
+            elif status == "possible":
+                bucket["supported"] += 1
+            elif status == "contradicted":
+                bucket["contradicted"] += 1
+            else:
+                bucket["unknown"] += 1
+    summary = {}
+    for label, bucket in condition_verdict.items():
+        if bucket["confirmed"] > 0:
+            summary[label] = "confirmed"
+        elif bucket["supported"] > 0:
+            summary[label] = "supported"
+        elif bucket["contradicted"] > 0 and bucket["confirmed"] == 0:
+            summary[label] = "contradicted"
+        else:
+            summary[label] = "unknown"
+    confirmed = sum(1 for v in summary.values() if v == "confirmed")
+    unknown = sum(1 for v in summary.values() if v in {"unknown", "contradicted"})
+    if not summary:
+        satisfaction = "candidate_only"
+    elif unknown == 0:
+        satisfaction = "full_support"
+    elif confirmed > 0:
+        satisfaction = "partial_support"
+    else:
+        satisfaction = "candidate_only"
+    answerability = "full" if satisfaction == "full_support" else ("partial" if confirmed else "limited")
+    return summary, satisfaction, answerability
 
 
 # ---- Tool 3: get_original_photos ----
@@ -200,16 +249,74 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     rs = rs_store.get(result_set_id)
     if rs is None:
         return {"summary": "结果集不存在。", "delivered": 0, "blocked": ["unknown_result_set"]}
+    if rs.scope_id != ((context or {}).get("scope_id") or "home-default"):
+        return {"summary": "无权交付该结果集的原图。", "delivered": 0, "blocked": ["scope_mismatch"]}
     asset_id = rs_store.resolve_handle(result_set_id, handle) if handle else None
     if handle and not asset_id:
         return {"summary": "无法解析选中的照片。", "delivered": 0, "blocked": ["bad_handle"]}
+    target = handle if asset_id else (rs.asset_ids[0] if rs.asset_ids else None)
+    url = ""
+    if target:
+        url = f"/api/assistant/result-set/{result_set_id}/photo?handle={target}&scope_id={rs.scope_id}"
     return {
         "summary": f"已从结果集 {result_set_id} 授权原图交付。",
         "result_set_id": result_set_id,
-        "handle": handle or "all",
-        "delivered": 1 if asset_id else rs.total,
+        "handle": handle or "first",
+        "delivered": 1 if asset_id else (1 if rs.asset_ids else 0),
         "total": rs.total,
         "scope_id": rs.scope_id,
+        "url": url,
+    }
+
+
+def get_result_set_store():
+    """B3.2：API 层访问 ResultSetStore 的公开入口（原图授权端点用）。"""
+    return _RUNTIME.get("result_sets")
+
+
+def result_set_context(result_set_id: str, scope_id: str) -> str | None:
+    """B3.1：给模型一段当前结果集的续接上下文（不暴露内部 ID 之外的敏感信息）。"""
+    rs_store = _RUNTIME.get("result_sets")
+    if not rs_store:
+        return None
+    rs = rs_store.get(result_set_id)
+    if rs is None or rs.scope_id != scope_id:
+        return None
+    shown = min(rs.total, rs.shown or 0)
+    return (f"当前结果集：{rs.result_set_id}，共 {rs.total} 张，已显示 {shown} 张，"
+            f"还有 {max(0, rs.total - shown)} 张。查看更多用 get_result_page（page 从 1 开始）。")
+
+
+# ---- Tool 3.5: get_result_page（B3.1 分页）----
+def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
+    scope_id = (context or {}).get("scope_id") or "home-default"
+    task_state = (context or {}).get("task_state") or {}
+    result_set_id = arguments.get("result_set_id") or task_state.get("current_result_set")
+    try:
+        page_no = max(1, int(arguments.get("page") or 1))
+        page_size = min(20, max(1, int(arguments.get("page_size") or 6)))
+    except (TypeError, ValueError):
+        return {"summary": "分页参数无效。", "total": 0, "blocked": ["bad_page_args"]}
+    rs_store = _RUNTIME.get("result_sets")
+    if not result_set_id or rs_store is None:
+        return {"summary": "当前没有可用的结果集。", "total": 0, "blocked": ["no_result_set"]}
+    rs = rs_store.get(result_set_id)
+    if rs is None:
+        return {"summary": "结果集不存在或已过期。", "total": 0, "blocked": ["unknown_result_set"]}
+    if rs.scope_id != scope_id:
+        return {"summary": "无权访问该结果集。", "total": 0, "blocked": ["scope_mismatch"]}
+    items = rs.page(page_no, page_size)
+    shown = min(rs.total, (page_no - 1) * page_size + len(items))
+    return {
+        "result_set_id": rs.result_set_id,
+        "page": page_no,
+        "page_size": page_size,
+        "total": rs.total,
+        "shown": shown,
+        "has_more": shown < rs.total,
+        "remaining": max(0, rs.total - shown),
+        "preview": [{"handle": h["handle"]} for h in items],
+        "query": rs.query,
     }
 
 
@@ -217,11 +324,28 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
 def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     asset_handle = arguments.get("asset_handle") or ""
     question = arguments.get("question") or "请描述这张照片"
-    # shadow 阶段用 handle 反查 asset（A4 后由 ResultSetStore 映射）。
-    asset_id = _handle_to_asset_id(asset_handle)
+    scope_id = (context or {}).get("scope_id") or "home-default"
+    task_state = (context or {}).get("task_state") or {}
+    # B3：handle 必须解析自当前结果集；失败再退回最近一次检索的 handle 映射
+    asset_id = None
+    result_set_id = task_state.get("current_result_set")
+    rs_store = _RUNTIME.get("result_sets")
+    if result_set_id and rs_store is not None:
+        asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
+    if not asset_id:
+        asset_id = _handle_to_asset_id(asset_handle)
     store = _RUNTIME.get("store")
     if not asset_id or store is None:
-        return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False}
+        return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False,
+                "blocked": ["unknown_handle"]}
+    row = store.connection.execute(
+        "SELECT path, scope_id FROM assets WHERE id = ?", (asset_id,)).fetchone()
+    if row and row["scope_id"] != scope_id:
+        return {"summary": "无法复核该照片（不在当前相册范围）。", "certainty": "uncertain",
+                "persisted": False, "blocked": ["scope_mismatch"]}
+    if not row or not row["path"] or not Path(row["path"]).is_file():
+        return {"summary": "照片文件不可用。", "certainty": "uncertain", "persisted": False,
+                "blocked": ["file_unavailable"]}
     row = store.connection.execute("SELECT path FROM assets WHERE id = ?", (asset_id,)).fetchone()
     if not row or not row["path"] or not Path(row["path"]).is_file():
         return {"summary": "照片文件不可用。", "certainty": "uncertain", "persisted": False}
@@ -230,7 +354,8 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         return {"summary": "模型不可用。", "certainty": "uncertain", "persisted": False}
     try:
         image = {"base64": _base64_image(row["path"]), "mime_type": _mime_for(row["path"])}
-        raw = gamma.chat("inspect", _INSPECT_PROMPT.format(question=question), images=[image], json_mode=True)
+        raw = gamma.chat(_INSPECT_PROMPT.format(question=question), images=[image],
+                         json_mode=True, role="inspect")
     except Exception as exc:
         return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False}
     try:
@@ -270,9 +395,14 @@ _INSPECT_PROMPT = """观察这张照片，输出 JSON：
 def register_tools():
     register(ToolSpec(
         name="query_memory_facts",
-        description="查询结构化记忆事实：数量、是否存在、首次/最后一次出现、日期、月份/地点分组。",
+        description=("确定性结构化事实查询，不要用模型估算。"
+                     "operation=count(数量)/exists(是否存在)/first(首次出现时间)/last(最近出现时间)/date/group(分组)。"
+                     "filters.time 写具体年份或年月，如 '2023年'、'2025-05'；不加 time 表示全部。"
+                     "operation=group 时 group_by 可填 month 或 place。"),
         input_schema={"operation": "count|exists|first|last|date|group",
-                      "filters": {"time": "", "person": "", "place": "", "media": ""}},
+                      "filters": {"time": "2023年 或 2025-05（必须填具体时间）",
+                                  "person": "", "place": "", "media": ""},
+                      "group_by": "month|place"},
         executor=_query_memory_facts, read_write="read", cost_class="cheap", readiness="ready",
     ))
     register(ToolSpec(
@@ -290,8 +420,14 @@ def register_tools():
         readiness_reason="ResultSetStore 就绪后完整可用（A4）",
     ))
     register(ToolSpec(
+        name="get_result_page",
+        description="查看 search_memories 结果集的下一页/指定页。result_set_id 用 search_memories 返回的，page 从 1 开始。",
+        input_schema={"result_set_id": "", "page": 1, "page_size": 6},
+        executor=_get_result_page, read_write="read", cost_class="cheap", readiness="ready",
+    ))
+    register(ToolSpec(
         name="inspect_photo",
-        description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。昂贵，默认每轮最多 1 次。",
+        description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 必须使用 search_memories preview 里的 handle（photo_1…）。昂贵，默认每轮最多 1 次。",
         input_schema={"asset_handle": "", "question": ""},
         executor=_inspect_photo, read_write="read", cost_class="expensive", readiness="ready",
     ))
