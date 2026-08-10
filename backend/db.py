@@ -7,6 +7,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 
+from .geocoding import format_gps_prefix
 from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
 
 
@@ -1706,6 +1707,49 @@ class MemoryStore:
         )
         return [self._decode(row, ["evidence_ids_json"]) for row in rows]
 
+    def _gps_prefix_for_event(self, event_id):
+        """Build a short place label from asset reverse_geocode (CN or international)."""
+        rows = self._rows(
+            """SELECT DISTINCT json_extract(a.metadata_json, '$.reverse_geocode') AS geo
+               FROM event_observations eo
+               JOIN observations o ON o.id = eo.observation_id
+               JOIN assets a ON a.id = o.asset_id
+               WHERE eo.event_id = ?""",
+            (event_id,),
+        )
+        prefixes = []
+        for row in rows:
+            try:
+                geo = json.loads(row["geo"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            prefix = format_gps_prefix(geo)
+            if prefix and prefix not in prefixes:
+                prefixes.append(prefix)
+        return prefixes[0] if prefixes else ""
+
+    def _resolved_event_place(self, event_id, event=None):
+        """Prefer a concrete visual/semantic place over placeholder event.place."""
+        event = event or self._row("SELECT * FROM events WHERE id = ?", (event_id,))
+        if not event:
+            return OTHER
+        place = str(event.get("place") or "").strip()
+        weak_places = {OTHER, "某处", "地点未知", "未标注", "未标注地点", "待判断", ""}
+        if place and place not in weak_places and not DISPLAY_COORDINATE_RE.fullmatch(place):
+            return place
+        rows = self._rows(
+            """SELECT o.id FROM event_observations eo
+               JOIN observations o ON o.id = eo.observation_id
+               WHERE eo.event_id = ?
+               ORDER BY o.captured_at ASC, o.id ASC""",
+            (event_id,),
+        )
+        for row in rows:
+            display = self._event_display_place(self.get_observation(row["id"]))
+            if display and display not in weak_places:
+                return display
+        return place or OTHER
+
     def refresh_event_summary(self, event_id):
         event = self._row("SELECT * FROM events WHERE id = ?", (event_id,))
         if not event:
@@ -1717,12 +1761,21 @@ class MemoryStore:
             if name and name not in names:
                 names.append(name)
         activity = event.get("activity") or event.get("event_type") or "活动"
-        place = event.get("place") or "某处"
+        place = self._resolved_event_place(event_id, event)
+        gps_prefix = self._gps_prefix_for_event(event_id)
         if names:
-            summary = f"{'、'.join(names)}在{place}参与{activity}"
+            body = f"{'、'.join(names)}在{place}参与{activity}"
         else:
-            summary = event.get("summary") or f"在{place}发生的{activity}"
-        self.connection.execute("UPDATE events SET summary = ?, revision = revision + 1, updated_at = ? WHERE id = ?", (summary, now_iso(), event_id))
+            existing = str(event.get("summary") or "").strip()
+            body = existing if existing and not existing.startswith("待") else f"在{place}发生的{activity}"
+        if gps_prefix and f"在{gps_prefix}" not in body:
+            summary = f"在{gps_prefix}，{body}"
+        else:
+            summary = body
+        self.connection.execute(
+            "UPDATE events SET summary = ?, place = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+            (summary, place, now_iso(), event_id),
+        )
         self.connection.commit()
         return self.get_event(event_id)
 

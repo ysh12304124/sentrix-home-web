@@ -1047,13 +1047,19 @@ def asset_file(asset_id: str, original: bool = False):
 @app.get("/api/face-instances/{face_instance_id}/crop")
 def face_instance_crop(face_instance_id: str):
     instance = store.get_face_instance(face_instance_id)
-    if not instance or not Path(instance["asset_path"]).is_file():
+    asset_path = (instance or {}).get("asset_path")
+    if not instance or not asset_path or not Path(asset_path).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
         from PIL import Image, ImageOps
 
-        image = ImageOps.exif_transpose(Image.open(instance["asset_path"])).convert("RGB")
-        left, top, right, bottom = (int(value) for value in instance.get("bbox_json") or [])
+        ensure_heif_support()
+        with Image.open(asset_path) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+        bbox = instance.get("bbox_json") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            raise ValueError("invalid face bounding box")
+        left, top, right, bottom = (int(value) for value in bbox[:4])
         left, top = max(0, left), max(0, top)
         right, bottom = min(image.width, right), min(image.height, bottom)
         if right <= left or bottom <= top:
@@ -1063,8 +1069,8 @@ def face_instance_crop(face_instance_id: str):
         output = BytesIO()
         face.save(output, format="JPEG", quality=88)
         return Response(content=output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
-    except (OSError, ValueError):
-        raise HTTPException(status_code=422, detail="face crop is unavailable")
+    except (OSError, ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail=f"face crop is unavailable: {error}") from error
 
 
 @app.get("/api/facts")
