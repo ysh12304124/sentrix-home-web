@@ -40,7 +40,7 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
 
 - 153 仓库：`/home/asus/Github/Sentrix-Home-Web`
 - 正式后端提交分支：`psh`
-- 当前提交：`15039f0` (`fix(api): scope dedup in /api/ingest (same album only, not cross-space)`，2026-08-10)
+- 当前提交：`bc1274c` (`merge(agent-runtime-v2): GitHub main sync + pipeline profile removal + dead code cleanup`，2026-08-10)
 - 当前工作树：干净。
 - Web：`http://192.168.0.153:4174`，代理 `http://127.0.0.1:8091`
 - 生产 Agent API：`8091`（AgentRuntime Tool-Loop 全栈 + `data/sentrix.db`）；`8090` 为旧实例保留
