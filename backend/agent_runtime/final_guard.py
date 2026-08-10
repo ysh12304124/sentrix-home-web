@@ -241,8 +241,6 @@ class FinalGuard:
             bad = sorted({m for m in found_months if m not in valid_months})
             if bad:
                 issues.append(_issue("group_fabrication", f"months={bad}"))
-        if re.search(r"没|未", answer):
-            return issues
         # C10：place 分组 / meal 食物分组的列举项必须在 rows 内（编造地点/食物 -> group_fabrication）
         if group_by == "place" or any(str(r.get("group") or "") for r in rows):
             known = {str(r.get("group") or "") for r in rows if str(r.get("group") or "")}
@@ -260,6 +258,8 @@ class FinalGuard:
             bad = [it for it in items if it and not any(it == k or it in k or k in it for k in known)]
             if bad:
                 issues.append(_issue("group_fabrication", f"foods={bad}"))
+        if re.search(r"没|未", answer):
+            return issues
         has_evidence = bool(valid_months & set(found_months)) or any(
             label and label in answer for label in labels)
         if not has_evidence and re.search(r"主要|包括|有照片|拍了|月份|地点|地方", answer):
@@ -278,13 +278,17 @@ class FinalGuard:
                 part = part.strip("：:、，,和及与 ").strip()
                 if 1 <= len(part) <= 8 and re.match(r"^[\u4e00-\u9fa5A-Za-z0-9]+$", part) \
                         and part not in {"以下地方", "这些地方", "以下几个", "以下", "如下",
-                                         "以上", "这些", "几个", "一些地方", "一些", "几个地方"}:
+                                         "以上", "这些", "几个", "一些地方", "一些", "几个地方",
+                                         "的地方包括", "地方包括", "的地方", "包括", "去过的地方",
+                                         "去过的地方包括", "有"}:
                     items.append(part)
         # 子弹列表："- 杭州市：150条记录"
         for m in re.finditer(r"(?:^|\n)\s*[-*•]\s*([\u4e00-\u9fa5A-Za-z0-9]{1,8})[：:]", answer):
             item = m.group(1)
             if item not in items and item not in {"以下地方", "这些地方", "以下几个", "以下", "如下",
-                                                  "以上", "这些", "几个", "一些地方", "一些", "几个地方"}:
+                                                  "以上", "这些", "几个", "一些地方", "一些", "几个地方",
+                                                  "的地方包括", "地方包括", "的地方", "包括", "去过的地方",
+                                                  "去过的地方包括", "有"}:
                 items.append(item)
         return items
 
