@@ -76,7 +76,7 @@ def emit_profile_manifest() -> dict:
             },
         }
     return {"schema_version": 1, "profiles": profiles,
-            "default": "pipeline", "canary_candidates": ["tool_loop_shadow"]}
+            "default": "tool_loop", "canary_candidates": ["tool_loop_shadow"]}
 
 
 def emit_coverage(store) -> dict:
