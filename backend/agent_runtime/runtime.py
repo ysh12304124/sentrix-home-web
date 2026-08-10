@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from .budget_manager import BudgetState
+from .emergency import render_emergency_summary
 from .final_guard import FinalGuard
 from .judge import judge_faithfulness
 from .profile import get_profile
@@ -197,6 +198,8 @@ class AgentRuntime:
             if not turn.budget.can_model_step():
                 turn.status = "partial" if turn.steps else "timeout"
                 turn.reason = "model step budget exhausted"
+                if task.tool_results:
+                    turn.final_answer = render_emergency_summary(task.as_dict(), reason="预算用尽")
                 break
             turn.budget.record_model_step()
             try:
@@ -219,6 +222,8 @@ class AgentRuntime:
                     continue
                 turn.status = "error"
                 turn.reason = "unparseable_action"
+                if task.tool_results:
+                    turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
             if action.get("action") == "final":
                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
@@ -300,12 +305,17 @@ class AgentRuntime:
                         continue
                     turn.status = "blocked_by_guard"
                     turn.reason = ";".join(problems)
+                    if task.tool_results:
+                        turn.final_answer = render_emergency_summary(
+                            task.as_dict(), reason="回答未通过事实校验")
                     break
                 turn.status = "complete"
                 break
             if action.get("action") != "tool_call":
                 turn.status = "error"
                 turn.reason = f"unknown_action:{action.get('action')}"
+                if task.tool_results:
+                    turn.final_answer = render_emergency_summary(task.as_dict(), reason="动作无法识别")
                 break
             tool_name = action.get("tool") or ""
             arguments = action.get("arguments") or {}
@@ -333,6 +343,8 @@ class AgentRuntime:
                     continue
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:duplicate_tool_call"
+                if task.tool_results:
+                    turn.final_answer = render_emergency_summary(task.as_dict(), reason="重复调用被拒绝")
                 break
             seen_tool_calls.add(call_signature)
             spec = get_tool(tool_name)
@@ -365,6 +377,8 @@ class AgentRuntime:
             if not decision.allowed:
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:{decision.reason}"
+                if task.tool_results:
+                    turn.final_answer = render_emergency_summary(task.as_dict(), reason="工具调用被拒绝")
                 break
             task.update_from_tool(tool_name, arguments, result.observation or {})
             task.record_tool_result(tool_call_id, tool_name, result.observation or {})

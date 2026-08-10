@@ -1382,7 +1382,8 @@ def _record_turn_conversation(message, request, result, turn_id=""):
         ]
         conversation_store.save_trajectory(
             turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
-            steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent")},
+            steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent"),
+                                 "telemetry": result.get("telemetry") or {}},
             public_progress=public_progress, scope_id=scope_id,
         )
         result["public_progress"] = public_progress
@@ -1399,8 +1400,24 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
             if job is not None:
                 job["public_progress"] = snapshot
 
+        started = time.time()
         result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
                                  recent_turns=recent_turns, progress_callback=on_progress)
+        # B4 canary telemetry：profile / 工具序列 / guard / 延迟 / fallback 标记
+        try:
+            trace = result.get("retrieval_trace") or []
+            result["telemetry"] = {
+                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
+                "status": result.get("tool_loop_status"),
+                "reason": result.get("tool_loop_reason"),
+                "tools": [s.get("tool") for s in trace if s.get("stage") == "tool" and s.get("tool")],
+                "latency_s": round(time.time() - started, 2),
+                "fallback": False,
+                "guard_blocked": result.get("tool_loop_status") in {"blocked_by_guard", "partial", "timeout", "error"},
+                "public_progress_count": len(result.get("public_progress") or []),
+            }
+        except Exception:
+            pass
         if conversation_id:
             _TOOL_LOOP_TASK_STATE[conversation_id] = result.get("task_state") or {}
         _record_turn_conversation(message, _AssistantTurnLike(
