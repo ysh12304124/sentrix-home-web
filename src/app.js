@@ -416,7 +416,8 @@
   function toolLoopEvidence(result) {
     const samples = [];
     for (const tr of ((result.task_state || {}).tool_results) || []) {
-      for (const s of ((tr.observation || {}).samples) || []) {
+      const samples = (tr.observation && tr.observation.samples) || tr.samples || [];
+      for (const s of samples) {
         if (!s || !s.asset_id) continue;
         samples.push({
           kind: "observation",
