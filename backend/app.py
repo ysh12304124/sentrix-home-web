@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import shutil
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -320,9 +321,23 @@ def _run_vllm_switch(request: ModelSwitchRequest):
 
 @app.get("/api/health")
 def health():
+    # Phase C C12：profile manifest 作为运维真实来源
+    agent = {
+        "profile": os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower(),
+        "runtime": "tool_loop",
+    }
+    try:
+        from .agent_runtime.tool_registry import list_tools
+        agent["tools"] = [
+            {"name": s.name, "readiness": s.readiness}
+            for s in list_tools() if s.readiness != "blocked"
+        ]
+    except Exception:
+        agent["tools"] = []
     return {
         "status": "ok",
         "mode": "sentrix-local-backend",
+        "agent": agent,
         "models": {
             "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
             "llm": _current_model_runtime(),
@@ -1125,6 +1140,8 @@ class AssistantTurnRequest(BaseModel):
     feedback: dict | None = None
     scope_id: str = "home-default"
     selected_entity_id: str | None = None
+    selected_asset_handle: str | None = None
+    selected_result_set_id: str | None = None
     viewer_id: str = "owner"
 
 
@@ -1141,7 +1158,9 @@ def _turn_executor():
     return _TURN_EXECUTOR
 
 
-def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="", progress_callback=None):
+def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="",
+                   progress_callback=None, selected_asset_handle=None,
+                   selected_result_set_id=None):
     """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
     from .agent_runtime import tools as runtime_tools
     from .agent_runtime.runtime import AgentRuntime
@@ -1175,8 +1194,15 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            scope_id=scope_id, viewer_id=viewer_id)
     prev_state = _TOOL_LOOP_TASK_STATE.get(conversation_id) if conversation_id else None
+    # Phase C C15：用户点选的照片写入本轮 task_state（selected handle 稳定跨轮可用）
+    if selected_asset_handle and selected_result_set_id:
+        prev_state = dict(prev_state or {})
+        prev_state["current_result_set"] = selected_result_set_id
+        prev_state["selected_asset_handle"] = selected_asset_handle
     turn = runtime.run(message, history=recent_turns, task_state=prev_state,
-                       progress_callback=progress_callback)
+                       progress_callback=progress_callback,
+                       selected_handle=selected_asset_handle,
+                       selected_result_set_id=selected_result_set_id)
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
     trace = [
@@ -1216,10 +1242,12 @@ def assistant_turn(request: AssistantTurnRequest):
     # tool_loop 是唯一 agent 路径：异步执行，立即返回 turn_id 供前端轮询实时进度
     turn_id = make_id("turn")
     _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
-                           "result": None, "created_at": time.time()}
+                           "progress_events": [], "result": None,
+                           "created_at": time.time()}
     _turn_executor().submit(
         _execute_turn_job, turn_id, message, request.conversation_id,
-        request.scope_id, request.viewer_id, recent_turns)
+        request.scope_id, request.viewer_id, recent_turns,
+        request.selected_asset_handle, request.selected_result_set_id)
     return {
         "turn_id": turn_id,
         "status": "running",
@@ -1246,6 +1274,44 @@ def assistant_turn_status(turn_id: str):
         "public_progress": job.get("public_progress") or result.get("public_progress") or [],
         "result": result,
     }
+
+
+@app.get("/api/assistant/turn/{turn_id}/events")
+async def assistant_turn_events(turn_id: str):
+    """Phase C C13：SSE 实时进度事件流（GET EventSource）。
+
+    事件契约：progress {text,status,stage,step_index,timestamp}；结束时 complete {result}。
+    前端断开/失败可回退轮询（/api/assistant/turn/{turn_id} 仍保留快照）。
+    """
+    job = _TURN_JOBS.get(turn_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="turn not found")
+
+    async def _stream():
+        sent = 0
+        while True:
+            events = job.get("progress_events") or []
+            for ev in events[sent:]:
+                sent += 1
+                yield f"event: progress\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            if job["status"] in {"complete", "error"}:
+                payload = {
+                    "type": "complete", "turn_id": turn_id,
+                    "status": job["status"],
+                    "public_progress": job.get("progress_events") or job.get("public_progress") or [],
+                }
+                if job["status"] == "complete" and job.get("result"):
+                    payload["result"] = job["result"]
+                if job["status"] == "error":
+                    payload["error"] = job.get("error")
+                yield f"event: complete\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                return
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(0.3)
+
+    return StreamingResponse(
+        _stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def _record_turn_conversation(message, request, result, turn_id=""):
@@ -1331,17 +1397,21 @@ def assistant_response(result):
     return result
 
 
-def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns):
+def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns,
+                     selected_asset_handle=None, selected_result_set_id=None):
     """B3.4：后台执行 tool-loop turn，progress 增量写入 job。"""
     job = _TURN_JOBS.get(turn_id)
     try:
-        def on_progress(snapshot):
+        def on_progress(event):
             if job is not None:
-                job["public_progress"] = snapshot
+                job.setdefault("progress_events", []).append(event)
+                job["public_progress"] = job.get("progress_events")
 
         started = time.time()
         result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
-                                 recent_turns=recent_turns, progress_callback=on_progress)
+                                 recent_turns=recent_turns, progress_callback=on_progress,
+                                 selected_asset_handle=selected_asset_handle,
+                                 selected_result_set_id=selected_result_set_id)
         # B4 canary telemetry：profile / 工具序列 / guard / 延迟 / fallback 标记
         try:
             trace = result.get("retrieval_trace") or []

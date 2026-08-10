@@ -41,23 +41,66 @@ def _kernel():
     return EvidenceRetrievalKernel(_RUNTIME["store"])
 
 
+def _cn_month(text: str) -> int | None:
+    """把中文数字月份（十/十月/十一月/十二月）转成阿拉伯数字；阿拉伯数字原样。"""
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    if text.isdigit():
+        return int(text)
+    if not text or any(ch not in digits for ch in text):
+        return None
+    if "十" not in text:
+        return digits.get(text)
+    tens, _, ones = text.partition("十")
+    return (digits.get(tens, 1) if tens else 1) * 10 + digits.get(ones, 0)
+
+
 def _resolve_time_expression(value: str) -> str | None:
-    """把相对时间（去年/今年/上个月/2023）解析成可被 parse_time_expression 接受的绝对时间。"""
-    from datetime import datetime
-    now = datetime.now()
+    """把相对时间解析成可被 parse_time_expression 接受的绝对时间（含范围）。
+
+    模型契约：相对时间必须原样传 filters.time，由这里确定性换算；不依赖模型算年份。
+    支持：去年/今年/前年/这两年/近两年/最近一年/上个月/去年X月/去年春天等。
+    """
+    import re
+    from .time_context import now
+    now = now()
     v = (value or "").strip()
     if not v:
         return None
-    if "去年" in v:
-        return f"{now.year - 1}年"
-    if "今年" in v:
-        return f"{now.year}年"
-    if "前年" in v:
-        return f"{now.year - 2}年"
+    y, m = now.year, now.month
+    seasons = {
+        "春天": (3, 5), "夏天": (6, 8), "秋天": (9, 11), "冬天": (12, 2),
+        "春季": (3, 5), "夏季": (6, 8), "秋季": (9, 11), "冬季": (12, 2),
+    }
+    base_year = {"去年": y - 1, "今年": y, "前年": y - 2}
+    month_rel = re.search(r"(去年|今年|前年)\s*(\d{1,2}|[一二三四五六七八九十]+)\s*月", v)
+    if month_rel:
+        month = _cn_month(month_rel.group(2))
+        return f"{base_year[month_rel.group(1)]}年{month}月"
+    season_rel = re.search(r"(去年|今年|前年)\s*(春天|夏天|秋天|冬天|春季|夏季|秋季|冬季)", v)
+    if season_rel:
+        base = base_year[season_rel.group(1)]
+        sm, em = seasons[season_rel.group(2)]
+        if sm <= em:
+            return f"{base}年{sm}月-{base}年{em}月"
+        return f"{base}年12月-{base + 1}年2月"
+    if "这两年" in v or "近两年" in v or "最近两年" in v:
+        return f"{y - 1}年-{y}年"
+    if "最近一年" in v or "近一年" in v:
+        prev_y, prev_m = (y - 1, m) if m > 1 else (y - 1, 12)
+        return f"{prev_y}年{prev_m}月-{y}年{m}月"
+    if "上上个月" in v:
+        pm2 = (y, m - 2) if m > 2 else (y - 1, m + 10)
+        return f"{pm2[0]}年{pm2[1]}月"
     if "上个月" in v:
-        y, m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
-        return f"{y}年{m}月"
-    import re
+        pm = (y, m - 1) if m > 1 else (y - 1, 12)
+        return f"{pm[0]}年{pm[1]}月"
+    if "去年" in v:
+        return f"{y - 1}年"
+    if "今年" in v:
+        return f"{y}年"
+    if "前年" in v:
+        return f"{y - 2}年"
     if re.fullmatch(r"20\d{2}", v):
         return f"{v}年"
     if re.fullmatch(r"20\d{2}年", v):
@@ -118,6 +161,9 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
     filters = arguments.get("filters") or {}
     scope_id = (context or {}).get("scope_id") or "home-default"
     viewer_id = (context or {}).get("viewer_id") or "owner"
+    if operation == "meal":
+        # Phase C C5：饮食/活动聚合（事件级去重 + 食物证据分层）
+        return _query_meal_evidence(filters, scope_id=scope_id, viewer_id=viewer_id)
     if operation == "group":
         group_by = arguments.get("group_by") or "month"
         draft = _draft_from_filters(filters, answer_type="grouped_list", group_by=group_by)
@@ -129,7 +175,7 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         draft = _draft_from_filters(filters, answer_type=answer_type)
     from ..structured_memory import StructuredMemoryExecutor
     result = StructuredMemoryExecutor(_RUNTIME["store"]).execute(draft, _spec_for(draft, scope_id, viewer_id))
-    return {
+    out = {
         "operation": operation,
         "answer_type": result.answer_type,
         "value": result.value,
@@ -137,6 +183,175 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         "rows": result.rows if operation == "group" else None,
         "filters_applied": result.filters_applied,
         "coverage": {"complete": True},
+    }
+    if operation == "group" and group_by == "place":
+        # Phase C C4：地点聚合必须带 coverage（多少张有/没有可靠地点信息）
+        rows = result.rows or []
+        known = sum(r["count"] for r in rows if str(r.get("group") or "") != "未知")
+        unknown = sum(r["count"] for r in rows if str(r.get("group") or "") == "未知")
+        total_assets = sum(r["count"] for r in rows)
+        out["coverage"] = {
+            "complete": True,
+            "known_location_assets": known,
+            "unknown_location_assets": unknown,
+            "total_assets": total_assets,
+            "disclosure": ("还有部分照片没有可靠的地点信息。" if unknown else
+                           "全部相关照片都有地点信息。"),
+        }
+    return out
+
+
+# ---- Phase C C5：饮食 / 活动证据聚合 ----
+
+_FOOD_WORDS = (
+    "火锅|烧烤|烤肉|烤鸭|蛋糕|面条|米饭|炒饭|饺子|包子|馒头|汤|菜|水果|咖啡|茶|奶茶|"
+    "啤酒|红酒|饮料|零食|冰淇淋|披萨|汉堡|寿司|刺身|拉面|意面|牛排|炸鸡|烤鱼|鱼|虾|"
+    "螃蟹|蛋|面包|饼干|巧克力|甜品|粥|米粉|肠粉|点心|卤味|麻辣烫|串串|小龙虾|牛蛙|"
+    "鸡翅|薯条|玉米|沙拉|三明治|煎饼|油条|豆浆|酸奶|牛奶|糖果|坚果|炒面|凉皮|饺子|"
+    "hotpot|bbq|barbecue|cake|noodles|rice|dumpling|pizza|burger|sushi|steak|"
+    "fried chicken|bread|dessert|salad|sandwich|fruit|coffee|tea|milk|ice cream|wine|beer"
+)
+_MEAL_ACTIVITY = (
+    "吃|餐|饭|聚餐|火锅|烧烤|早餐|午餐|晚餐|夜宵|宴|宴请|下厨|做饭|煮|炒|煎|蒸|烤|"
+    "dining|dinner|lunch|breakfast|eating|meal|bbq|hotpot|cook|cooking|party"
+)
+_FOOD_RE = None
+_MEAL_ACTIVITY_RE = None
+
+
+def _food_re():
+    global _FOOD_RE
+    if _FOOD_RE is None:
+        import re as _re
+        _FOOD_RE = _re.compile(r"(" + _FOOD_WORDS + r")", _re.I)
+    return _FOOD_RE
+
+
+def _meal_activity_re():
+    global _MEAL_ACTIVITY_RE
+    if _MEAL_ACTIVITY_RE is None:
+        import re as _re
+        _MEAL_ACTIVITY_RE = _re.compile(r"(" + _MEAL_ACTIVITY + r")", _re.I)
+    return _MEAL_ACTIVITY_RE
+
+
+def _match_foods(text: str) -> list[str]:
+    """从文本里找出命中的食物词（去重、保持出现顺序）。"""
+    if not text:
+        return []
+    found, seen = [], set()
+    for m in _food_re().finditer(text):
+        word = m.group(1).strip().lower()
+        if word and word not in seen:
+            seen.add(word)
+            found.append(word)
+    return found
+
+
+def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="owner") -> dict:
+    """Phase C C5：饮食/活动聚合。
+
+    数据源分层：objects_json（VLM 物体标签）> caption/ocr（显式食物词）> activity/event_type（用餐场景）。
+    事件级去重：同一 event 的多张照片只算一次用餐；无事件关联的观察按单条计。
+    """
+    from ..structured_memory import StructuredMemoryExecutor
+    store = _RUNTIME.get("store")
+    if store is None:
+        return {"operation": "meal", "summary": "记忆库不可用。", "total": 0,
+                "explicit_foods": [], "coverage": {"complete": False}}
+    draft = _draft_from_filters(filters, answer_type="count")
+    spec = _spec_for(draft, scope_id, viewer_id)
+    executor = StructuredMemoryExecutor(store)
+    start, end = executor._time_range(draft, spec)
+    food_hint = str((filters or {}).get("food") or "").strip().lower()
+
+    clauses = ["a.scope_id = ?"]
+    params = [scope_id]
+    if start:
+        clauses.append("a.captured_at >= ?")
+        params.append(start)
+    if end:
+        clauses.append("a.captured_at < ?")
+        params.append(end)
+    rows = store._rows(
+        "SELECT o.id AS observation_id, o.asset_id, o.activity, o.event_type, o.caption, "
+        "o.ocr_text, o.objects_json, a.captured_at FROM observations o "
+        "JOIN assets a ON a.id = o.asset_id WHERE " + " AND ".join(clauses) +
+        " ORDER BY a.captured_at", params)
+
+    event_rows = store._rows(
+        "SELECT observation_id, event_id FROM event_observations", ())
+    obs_to_event = {}
+    for row in event_rows:
+        obs_to_event.setdefault(row["observation_id"], row["event_id"])
+
+    def _event_key(observation_id):
+        return obs_to_event.get(observation_id) or f"obs:{observation_id}"
+
+    explicit_by_event: dict[str, set[str]] = {}
+    meal_scene_by_event: dict[str, str] = {}
+    possible_by_event: dict[str, set[str]] = {}
+    meal_observation_ids: list[str] = []
+    for row in rows:
+        objects = []
+        try:
+            objects = json.loads(row["objects_json"] or "[]")
+        except Exception:
+            objects = []
+        object_text = " ".join(str(o) for o in objects if isinstance(o, str))
+        caption = str(row["caption"] or "")
+        ocr = str(row["ocr_text"] or "")
+        activity = str(row["activity"] or "")
+        event_type = str(row["event_type"] or "")
+        blob = " ".join([object_text, caption, ocr])
+        foods = _match_foods(blob)
+        if food_hint:
+            foods = [f for f in foods if food_hint in f]
+            if not foods:
+                continue
+        is_meal_scene = bool(_meal_activity_re().search(" ".join([activity, event_type, caption])))
+        key = _event_key(row["observation_id"])
+        if foods:
+            explicit_by_event.setdefault(key, set()).update(foods)
+            meal_observation_ids.append(row["observation_id"])
+        elif is_meal_scene:
+            meal_scene_by_event.setdefault(key, activity or event_type or caption[:40])
+            meal_observation_ids.append(row["observation_id"])
+        else:
+            # caption/ocr 出现"吃了/喝了/点了"等弱用餐语境 → possible 层
+            if _meal_activity_re().search(caption + " " + ocr):
+                possible_by_event.setdefault(key, set()).update(
+                    _match_foods(caption + " " + ocr) or [caption[:40]])
+                meal_observation_ids.append(row["observation_id"])
+
+    food_counts: dict[str, int] = {}
+    for foods in explicit_by_event.values():
+        for food in foods:
+            food_counts[food] = food_counts.get(food, 0) + 1
+    top_foods = [{"food": food, "events": count}
+                 for food, count in sorted(food_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+    total_events = len({_event_key(r["observation_id"]) for r in rows})
+    meal_event_keys = {_event_key(oid) for oid in meal_observation_ids}
+    return {
+        "operation": "meal",
+        "time_range": {"start": start, "end": end} if (start or end) else None,
+        "scanned_observations": len(rows),
+        "total_meal_observations": len(meal_observation_ids),
+        "event_count": len(meal_event_keys),
+        "explicit_foods": top_foods[:20],
+        "explicit_food_events": len(explicit_by_event),
+        "meal_scene_events": len(meal_scene_by_event),
+        "possible_events": len(possible_by_event),
+        "filters_applied": {"scope_id": scope_id,
+                            "time_range": {"start": start, "end": end} if (start or end) else None,
+                            "food_hint": food_hint or None},
+        "coverage": {
+            "complete": True,
+            "disclosure": ("其中一部分用餐场景只能确认'在吃饭'，不能确认具体菜品。"
+                           if meal_scene_by_event or possible_by_event else
+                           "已识别的用餐记录都有明确的食物线索。"),
+        },
     }
 
 
@@ -257,7 +472,8 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     target = handle if asset_id else (rs.asset_ids[0] if rs.asset_ids else None)
     url = ""
     if target:
-        url = f"/api/assistant/result-set/{result_set_id}/photo?handle={target}&scope_id={rs.scope_id}"
+        url = (f"/api/assistant/result-set/{result_set_id}/photo?handle={target}"
+               f"&scope_id={rs.scope_id}&original=1")
     return {
         "summary": f"已从结果集 {result_set_id} 授权原图交付。",
         "result_set_id": result_set_id,
@@ -396,12 +612,15 @@ def register_tools():
     register(ToolSpec(
         name="query_memory_facts",
         description=("确定性结构化事实查询，不要用模型估算。"
-                     "operation=count(数量)/exists(是否存在)/first(首次出现时间)/last(最近出现时间)/date/group(分组)。"
-                     "filters.time 写具体年份或年月，如 '2023年'、'2025-05'；不加 time 表示全部。"
-                     "operation=group 时 group_by 可填 month 或 place。"),
-        input_schema={"operation": "count|exists|first|last|date|group",
-                      "filters": {"time": "2023年 或 2025-05（必须填具体时间）",
-                                  "person": "", "place": "", "media": ""},
+                     "operation=count(数量)/exists(是否存在)/first(首次出现时间)/last(最近出现时间)/date/group(分组)/meal(饮食与用餐场景)。"
+                     "filters.time 写用户原话里的相对时间（如'去年'、'这两年'、'去年春天'、'上个月'）或具体时间，系统会自动换算，不要自己估算年份；"
+                     "不加 time 表示全部。operation=group 时 group_by 可填 month 或 place；group_by=place 会返回地点覆盖情况"
+                     "（known_location_assets/unknown_location_assets），回答必须如实说明还有多少照片没有可靠地点。"
+                     "operation=meal 用于'吃过什么/吃饭/火锅'类问题，会做事件级去重并返回 explicit_foods/meal_scene_events/possible_events 分层证据。"),
+        input_schema={"operation": "count|exists|first|last|date|group|meal",
+                      "filters": {"time": "去年/这两年/2023年 等相对或具体时间（原样写）",
+                                  "person": "", "place": "", "media": "",
+                                  "food": "可选：限定某种食物（如'火锅'）"},
                       "group_by": "month|place"},
         executor=_query_memory_facts, read_write="read", cost_class="cheap", readiness="ready",
     ))
