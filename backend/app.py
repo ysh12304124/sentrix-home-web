@@ -26,7 +26,7 @@ from .image_io import (
     media_type_from_upload,
     needs_browser_transcode,
 )
-from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, parse_json_response
+from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
 
