@@ -4,10 +4,12 @@ import shutil
 import hashlib
 import tempfile
 import threading
+import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -1194,6 +1196,48 @@ class AssistantTurnRequest(BaseModel):
     viewer_id: str = "owner"
 
 
+def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=""):
+    """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
+    from .agent_runtime import tools as runtime_tools
+    from .agent_runtime.runtime import AgentRuntime
+
+    runtime_tools.bind_runtime(store, gamma=gamma)
+    runtime_tools.register_tools()
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+
+    def chat_fn(messages):
+        payload = {
+            "model": getattr(gamma, "model", "gemma4-12b-it"),
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 800,
+        }
+        response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
+                              timeout=120)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
+                           scope_id=scope_id, viewer_id=viewer_id)
+    turn = runtime.run(message, history=recent_turns)
+    trace = [
+        {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
+         "reason": s.get("reason") or "",
+         "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
+        for s in turn.steps
+    ]
+    return {
+        "answer": turn.final_answer,
+        "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "intent": "tool_loop",
+        "evidence_status": "tool_loop",
+        "retrieval_trace": trace,
+        "public_progress": turn.public_progress,
+        "tool_loop_status": turn.status,
+        "tool_loop_reason": turn.reason,
+    }
+
+
 @app.post("/api/assistant/turn")
 def assistant_turn(request: AssistantTurnRequest):
     if not request.message.strip():
@@ -1209,11 +1253,16 @@ def assistant_turn(request: AssistantTurnRequest):
             )
         except Exception:
             recent_turns = ""
-    result = agent.answer_turn(
-        message, request.conversation_id, request.feedback, request.scope_id,
-        request.selected_entity_id, request.viewer_id,
-        recent_turns=recent_turns,
-    )
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+    if profile_name in {"tool_loop", "tool_loop_shadow"}:
+        result = _tool_loop_turn(message, request.conversation_id, request.scope_id,
+                                 request.viewer_id, recent_turns=recent_turns)
+    else:
+        result = agent.answer_turn(
+            message, request.conversation_id, request.feedback, request.scope_id,
+            request.selected_entity_id, request.viewer_id,
+            recent_turns=recent_turns,
+        )
     if CONVERSATION_STORE_ENABLED and result.get("conversation_id"):
         try:
             cid = result["conversation_id"]
@@ -1237,7 +1286,7 @@ def assistant_turn(request: AssistantTurnRequest):
                     "status": item.get("status", "complete"),
                     "detail": item.get("reason") or item.get("counts") or {},
                 })
-            public_progress = [
+            public_progress = result.get("public_progress") or [
                 {"text": _public_progress_text(s), "status": s.get("status", "complete")}
                 for s in steps if _public_progress_text(s)
             ]
