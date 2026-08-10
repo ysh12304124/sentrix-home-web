@@ -83,7 +83,7 @@
       }
     }
   },
-  "default": "pipeline",
+  "default": "tool_loop",
   "canary_candidates": [
     "tool_loop_shadow"
   ]

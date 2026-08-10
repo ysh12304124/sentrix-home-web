@@ -55,7 +55,7 @@ PROFILES = {
 
 
 def active_profile() -> str:
-    return os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+    return os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
 
 
 def get_profile(name: str | None = None) -> ProfileConfig:

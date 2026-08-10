@@ -1251,7 +1251,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
                                retrieval_config=retrieval_config)
     runtime_tools.register_tools()
-    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
 
     def chat_fn(messages):
         payload = {
@@ -1306,7 +1306,7 @@ def assistant_turn(request: AssistantTurnRequest):
             )
         except Exception:
             recent_turns = ""
-    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
     if profile_name in {"tool_loop", "tool_loop_shadow"}:
         # B3.4：异步执行，立即返回 turn_id 供前端轮询实时进度
         turn_id = make_id("turn")
@@ -1381,7 +1381,7 @@ def _record_turn_conversation(message, request, result, turn_id=""):
             for s in steps if _public_progress_text(s)
         ]
         conversation_store.save_trajectory(
-            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
+            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop"),
             steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent"),
                                  "telemetry": result.get("telemetry") or {}},
             public_progress=public_progress, scope_id=scope_id,
@@ -1407,7 +1407,7 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
         try:
             trace = result.get("retrieval_trace") or []
             result["telemetry"] = {
-                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
+                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop"),
                 "status": result.get("tool_loop_status"),
                 "reason": result.get("tool_loop_reason"),
                 "tools": [s.get("tool") for s in trace if s.get("stage") == "tool" and s.get("tool")],
