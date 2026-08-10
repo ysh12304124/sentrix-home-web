@@ -1232,6 +1232,11 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                    "problems": list(s.get("problems") or [])}
                   for s in turn.steps if s.get("type") == "judge"],
     }
+    tool_trace = [
+        {"tool": s.get("tool", ""), "status": s.get("status", ""),
+         "latency_s": s.get("latency_s"), "reason": s.get("reason") or ""}
+        for s in turn.steps if s.get("type") == "tool"
+    ]
     return {
         "answer": turn.final_answer,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
@@ -1239,6 +1244,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "evidence_status": "tool_loop",
         "retrieval_trace": trace,
         "public_progress": turn.public_progress,
+        "tool_trace": tool_trace,
         "tool_loop_status": turn.status,
         "tool_loop_reason": turn.reason,
         "task_state": turn.task_state,
