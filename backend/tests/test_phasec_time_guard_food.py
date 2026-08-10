@@ -367,3 +367,51 @@ class GuardDebugTraceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolSchemaDefaultsTests(unittest.TestCase):
+    """C11: 参数安全默认值——operation 补全、时间提取、handle 默认、分页兜底。"""
+
+    def test_group_by_without_operation_infers_group(self):
+        self.assertEqual(runtime_tools._normalize_fact_arguments({"group_by": "place"}), ("group", "place"))
+
+    def test_invalid_operation_falls_back_to_count(self):
+        self.assertEqual(runtime_tools._normalize_fact_arguments({"operation": "whatever"}), ("count", ""))
+
+    def test_group_without_group_by_defaults_month(self):
+        self.assertEqual(runtime_tools._normalize_fact_arguments({"operation": "group"}), ("group", "month"))
+
+    def test_extract_time_from_query(self):
+        self.assertEqual(runtime_tools._extract_time_from_query("2024年拍的照片"), "2024年")
+        self.assertEqual(runtime_tools._extract_time_from_query("找一下去年的照片"), "去年")
+        self.assertEqual(runtime_tools._extract_time_from_query("去年十月拍的照片"), "去年十月")
+        self.assertIsNone(runtime_tools._extract_time_from_query("找一些海边的照片"))
+
+    def test_inspect_defaults_handle_from_preview(self):
+        store = _meal_store()
+        runtime_tools.bind_runtime(store)
+        runtime_tools.register_tools()
+        rs_store = runtime_tools._RUNTIME["result_sets"]
+        rs = rs_store.new(scope_id="home", query="x", asset_ids=["a1"], unresolved=[])
+        rs_store.save(rs)
+        out = runtime_tools._inspect_photo(
+            {"question": "有什么"}, context={
+                "scope_id": "home", "viewer_id": "owner",
+                "task_state": {"current_result_set": rs.result_set_id,
+                               "result_preview": ["photo_1"]}})
+        # handle 默认到 photo_1 并解析到 a1（文件不存在 -> file_unavailable，而非 unknown_handle）
+        self.assertNotIn("unknown_handle", out.get("blocked") or [])
+        self.assertIn("file_unavailable", out.get("blocked") or [])
+
+    def test_get_result_page_invalid_args_default(self):
+        from backend.agent_runtime.result_set import ResultSetStore
+        store = _meal_store()
+        runtime_tools.bind_runtime(store)
+        rs_store = runtime_tools._RUNTIME["result_sets"]
+        rs = rs_store.new(scope_id="home", query="x", asset_ids=["a1", "a2", "a3"], unresolved=[])
+        rs_store.save(rs)
+        out = runtime_tools._get_result_page(
+            {"result_set_id": rs.result_set_id, "page": "abc", "page_size": "xyz"},
+            context={"scope_id": "home", "task_state": {}})
+        self.assertNotIn("bad_page_args", out.get("blocked") or [])
+        self.assertGreaterEqual(out.get("total", 0), 3)

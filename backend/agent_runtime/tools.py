@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -156,8 +157,24 @@ def _resolve_entity(name, scope_id):
 
 
 # ---- Tool 1: query_memory_facts ----
+_FACT_OPERATIONS = {"count", "exists", "first", "last", "date", "group", "meal"}
+
+
+def _normalize_fact_arguments(arguments: dict) -> tuple[str, str]:
+    """C11：operation/group_by 安全默认（model 只给 group_by 时补 operation=group）。"""
+    operation = (arguments.get("operation") or "").strip()
+    group_by = (arguments.get("group_by") or "").strip()
+    if not operation and group_by:
+        operation = "group"
+    if operation not in _FACT_OPERATIONS:
+        operation = "count"
+    if operation == "group" and not group_by:
+        group_by = "month"
+    return operation, group_by
+
+
 def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict:
-    operation = arguments.get("operation") or "count"
+    operation, group_by = _normalize_fact_arguments(arguments)
     filters = arguments.get("filters") or {}
     scope_id = (context or {}).get("scope_id") or ""
     viewer_id = (context or {}).get("viewer_id") or "owner"
@@ -165,7 +182,6 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         # Phase C C5：饮食/活动聚合（事件级去重 + 食物证据分层）
         return _query_meal_evidence(filters, scope_id=scope_id, viewer_id=viewer_id)
     if operation == "group":
-        group_by = arguments.get("group_by") or "month"
         draft = _draft_from_filters(filters, answer_type="grouped_list", group_by=group_by)
     else:
         answer_type = {
@@ -417,10 +433,36 @@ def _search_metadata_only(draft, spec, scope_id, query, mode) -> dict:
     }
 
 
+_TIME_TOKEN_RE = re.compile(r"20\d{2}\s*年(?:\s*[01]?\d|\s*十[一二]?)?\s*月?")
+_RELATIVE_TIMES = ("这两年", "近两年", "最近两年", "最近一年", "今年", "去年", "前年",
+                   "上上个月", "上个月", "去年春天", "去年夏天", "去年秋天", "去年冬天")
+
+
+def _extract_time_from_query(query: str) -> str | None:
+    """C11：模型把时间写进 query 文本（而非 filters.time）时自动提取。"""
+    m = _TIME_TOKEN_RE.search(query or "")
+    if m:
+        return m.group(0).replace(" ", "")
+    # 先匹配更具体的"去年X月"，再退回相对时间词
+    m = re.search(r"去年(?:[0-9一二三四五六七八九十]+)月", query or "")
+    if m:
+        return m.group(0)
+    for expr in _RELATIVE_TIMES:
+        if expr in (query or ""):
+            return expr
+    return None
+
+
 def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     query = arguments.get("query") or ""
     mode = arguments.get("mode") or "best"
-    filters = arguments.get("filters") or {}
+    if mode not in {"best", "all", "representative"}:
+        mode = "best"
+    filters = dict(arguments.get("filters") or {})
+    if not (filters.get("time") or ""):
+        extracted = _extract_time_from_query(query)
+        if extracted:
+            filters["time"] = extracted
     scope_id = (context or {}).get("scope_id") or ""
     viewer_id = (context or {}).get("viewer_id") or "owner"
     draft = _draft_from_filters({**filters, "query": query}, answer_type="asset_set")
@@ -574,9 +616,12 @@ def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
     result_set_id = arguments.get("result_set_id") or task_state.get("current_result_set")
     try:
         page_no = max(1, int(arguments.get("page") or 1))
+    except (TypeError, ValueError):
+        page_no = 1
+    try:
         page_size = min(20, max(1, int(arguments.get("page_size") or 6)))
     except (TypeError, ValueError):
-        return {"summary": "分页参数无效。", "total": 0, "blocked": ["bad_page_args"]}
+        page_size = 6
     rs_store = _RUNTIME.get("result_sets")
     if not result_set_id or rs_store is None:
         return {"summary": "当前没有可用的结果集。", "total": 0, "blocked": ["no_result_set"]}
@@ -606,6 +651,11 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     question = arguments.get("question") or "请描述这张照片"
     scope_id = (context or {}).get("scope_id") or ""
     task_state = (context or {}).get("task_state") or {}
+    if not asset_handle:
+        # C11：未填 handle 时用当前结果集 preview 首个可复核 handle（安全默认）
+        preview = (task_state.get("result_preview") or []) or []
+        if preview:
+            asset_handle = preview[0]
     # B3：handle 必须解析自当前结果集；失败再退回最近一次检索的 handle 映射
     asset_id = None
     result_set_id = task_state.get("current_result_set")
@@ -679,7 +729,7 @@ def register_tools():
         description=("确定性结构化事实查询，不要用模型估算。"
                      "operation=count(数量)/exists(是否存在)/first(首次出现时间)/last(最近出现时间)/date/group(分组)/meal(饮食与用餐场景)。"
                      "filters.time 写用户原话里的相对时间（如'去年'、'这两年'、'去年春天'、'上个月'）或具体时间，系统会自动换算，不要自己估算年份；"
-                     "不加 time 表示全部。operation=group 时 group_by 可填 month 或 place；group_by=place 会返回地点覆盖情况"
+                     "不加 time 表示全部。operation=group 时必须填 group_by（month 或 place，缺省 month）；group_by=place 会返回地点覆盖情况"
                      "（known_location_assets/unknown_location_assets），回答必须如实说明还有多少照片没有可靠地点。"
                      "operation=meal 用于'吃过什么/吃饭/火锅'类问题，会做事件级去重并返回 explicit_foods/meal_scene_events/possible_events 分层证据。"),
         input_schema={"operation": "count|exists|first|last|date|group|meal",
@@ -693,7 +743,7 @@ def register_tools():
         name="search_memories",
         description=("检索家庭记忆：找照片、视觉语义（衣着/颜色/物体/场景）、混合查询。返回结果集摘要。"
                      "用户提到时间时必须把时间原样写进 filters.time（如'2024年'、'去年'、'去年春天'），"
-                     "不要只放在 query 文本里；query 只写场景/人物/物体描述。"),
+                     "不要只放在 query 文本里；query 只写场景/人物/物体描述（若忘记填 filters.time，系统会自动从 query 提取时间）。"),
         input_schema={"query": "", "mode": "best|all|representative",
                       "filters": {"time": "", "place": "", "person": ""}},
         executor=_search_memories, read_write="read", cost_class="medium", readiness="ready",
@@ -713,7 +763,7 @@ def register_tools():
     ))
     register(ToolSpec(
         name="inspect_photo",
-        description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 必须使用 search_memories preview 里的 handle（photo_1…）。昂贵，默认每轮最多 1 次。",
+        description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。昂贵，默认每轮最多 1 次。",
         input_schema={"asset_handle": "", "question": ""},
         executor=_inspect_photo, read_write="read", cost_class="expensive", readiness="ready",
     ))
