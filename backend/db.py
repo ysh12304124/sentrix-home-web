@@ -1145,6 +1145,168 @@ class MemoryStore:
                 self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.commit()
 
+    def delete_memory_space(self, scope_id):
+        """Delete a memory space and all its scoped data. Physical files in
+        data/media/ are removed only when their content_sha256 is no longer
+        referenced by any other scope."""
+        if not scope_id or scope_id == "home-default":
+            raise ValueError("home-default 是系统默认相册,不允许删除")
+
+        asset_rows = self._rows(
+            "SELECT id, path, content_sha256 FROM assets WHERE scope_id = ?",
+            (scope_id,),
+        )
+        counts = {
+            "assets": len(asset_rows),
+            "events": (self._row("SELECT COUNT(*) AS c FROM events WHERE scope_id = ?", (scope_id,)) or {}).get("c", 0),
+            "persons": (self._row("SELECT COUNT(*) AS c FROM entities WHERE scope_id = ? AND entity_type = 'person'", (scope_id,)) or {}).get("c", 0),
+            "vectors": (self._row("SELECT COUNT(*) AS c FROM memory_vectors WHERE scope_id = ?", (scope_id,)) or {}).get("c", 0),
+        }
+
+        # Subqueries that identify rows owned by this scope
+        S = "(SELECT id FROM {tbl} WHERE scope_id = ?)"
+        # Subquery for face_instances rows anchored in this scope's observations OR assets
+        FI_BY_OBS = "(SELECT fi.id FROM face_instances fi JOIN observations o ON o.id = fi.observation_id WHERE o.scope_id = ?)"
+        FI_BY_ASSET = "(SELECT fi.id FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE a.scope_id = ?)"
+
+        # Phase 1: clean referencing rows (from ANY scope) that point at rows in this scope
+        reference_deletes = [
+            # entity_mentions references entities, observations, face_instances
+            ("DELETE FROM entity_mentions WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM entity_mentions WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            ("DELETE FROM entity_mentions WHERE face_instance_id IN " + FI_BY_OBS, (scope_id,)),
+            ("DELETE FROM entity_mentions WHERE face_instance_id IN " + FI_BY_ASSET, (scope_id,)),
+            # entity_observations references entities, observations
+            ("DELETE FROM entity_observations WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM entity_observations WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            # entity_properties, entity_revisions reference entities
+            ("DELETE FROM entity_properties WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM entity_revisions WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # event_* reference events and entities
+            ("DELETE FROM event_participants WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_participants WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM event_entities WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_entities WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM event_revisions WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_observations WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_observations WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            # trip_revisions references trips
+            ("DELETE FROM trip_revisions WHERE trip_id IN " + S.format(tbl="trips"), (scope_id,)),
+            # face_prototypes references face_clusters, face_instances
+            ("DELETE FROM face_prototypes WHERE cluster_id IN " + S.format(tbl="face_clusters"), (scope_id,)),
+            ("DELETE FROM face_prototypes WHERE face_instance_id IN " + FI_BY_OBS, (scope_id,)),
+            ("DELETE FROM face_prototypes WHERE face_instance_id IN " + FI_BY_ASSET, (scope_id,)),
+            # person_appearance_evidence references entities, face_instances, observations, assets
+            ("DELETE FROM person_appearance_evidence WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE asset_id IN " + S.format(tbl="assets"), (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE face_instance_id IN " + FI_BY_OBS, (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE face_instance_id IN " + FI_BY_ASSET, (scope_id,)),
+            # face_instances references assets, observations, face_clusters
+            ("DELETE FROM face_instances WHERE asset_id IN " + S.format(tbl="assets"), (scope_id,)),
+            ("DELETE FROM face_instances WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            ("DELETE FROM face_instances WHERE cluster_id IN " + S.format(tbl="face_clusters"), (scope_id,)),
+            # relationships references entities (both subject and object)
+            ("DELETE FROM relationships WHERE subject_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM relationships WHERE object_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # semantic_profiles/claims reference entities
+            ("DELETE FROM semantic_profiles WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM semantic_claims WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # person_event_memory references entities, events
+            ("DELETE FROM person_event_memory WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM person_event_memory WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM person_patterns WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # observations reference assets — clean any observations in OTHER scopes that reference our assets
+            ("DELETE FROM observations WHERE asset_id IN " + S.format(tbl="assets"), (scope_id,)),
+        ]
+        # Nullify optional FKs (SET NULL, not DELETE) to preserve cross-scope rows
+        nullify_updates = [
+            ("UPDATE entity_merge_candidates SET target_entity_id = NULL WHERE target_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE face_clusters SET entity_id = NULL WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE semantic_claims SET value_entity_id = NULL WHERE value_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE memory_feedback SET target_entity_id = NULL WHERE target_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE memory_feedback SET target_event_id = NULL WHERE target_event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("UPDATE memory_feedback SET query_gap_id = NULL WHERE query_gap_id IN " + S.format(tbl="query_gaps"), (scope_id,)),
+        ]
+
+        # Phase 2: delete main scoped tables (order: leaf-first, main tables last)
+        # observations must be deleted before assets (FK observations.asset_id → assets.id)
+        scoped_tables_leaf = [
+            "memory_vectors", "observation_search_fts", "observation_search_terms",
+            "facts", "semantic_claims", "semantic_profiles",
+            "person_event_memory", "person_patterns", "query_gaps",
+            "dialogue_states", "relationships", "ingest_batches",
+            "entity_merge_candidates",
+            "agent_user_assertions", "agent_impressions",
+            "agent_proactivity_preferences", "agent_scene_cooldowns",
+            "agent_claim_conflicts", "agent_core_memory_cards",
+        ]
+        # Order-sensitive: observations → face_clusters → events → entities → trips → assets
+        scoped_tables_main = [
+            "observations",
+            "face_clusters",
+            "events",
+            "entities",
+            "trips",
+            "assets",
+        ]
+
+        try:
+            existing = {
+                row["name"]
+                for row in self._rows(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            for sql, params in reference_deletes:
+                # Skip if the referenced table doesn't exist (schema variant)
+                self.connection.execute(sql, params)
+            for sql, params in nullify_updates:
+                self.connection.execute(sql, params)
+            for tbl in scoped_tables_leaf:
+                if tbl not in existing:
+                    continue
+                self.connection.execute(f"DELETE FROM {tbl} WHERE scope_id = ?", (scope_id,))
+            if "rebuild_runs" in existing:
+                self.connection.execute("DELETE FROM rebuild_runs WHERE scope = ?", (scope_id,))
+            for tbl in scoped_tables_main:
+                if tbl not in existing:
+                    continue
+                self.connection.execute(f"DELETE FROM {tbl} WHERE scope_id = ?", (scope_id,))
+            self.connection.execute("DELETE FROM memory_spaces WHERE id = ?", (scope_id,))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        import os as _os
+        db_dir = _os.path.dirname(_os.path.abspath(self.path))
+        media_root = _os.path.abspath(_os.path.join(db_dir, "media"))
+        files_removed = 0
+        for row in asset_rows:
+            path = (row.get("path") if isinstance(row, dict) else row["path"]) or ""
+            sha = (row.get("content_sha256") if isinstance(row, dict) else row["content_sha256"]) or ""
+            if not path or not sha:
+                continue
+            try:
+                real = _os.path.realpath(path)
+            except OSError:
+                continue
+            if not (real == media_root or real.startswith(media_root + _os.sep)):
+                continue
+            still_used = self._row(
+                "SELECT id FROM assets WHERE content_sha256 = ? LIMIT 1", (sha,)
+            )
+            if still_used:
+                continue
+            try:
+                _os.unlink(real)
+                files_removed += 1
+            except OSError:
+                pass
+        counts["files_removed"] = files_removed
+        return counts
+
     def add_observation(self, asset_id, data, scope_id=None):
         observation_id = data.get("id") or make_id("obs")
         asset = self.get_asset(asset_id) or {}

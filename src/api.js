@@ -16,6 +16,7 @@
     health: () => request("/api/health"),
     memorySpaces: () => request("/api/memory-spaces"),
     createMemorySpace: (name) => request("/api/memory-spaces", { method: "POST", body: JSON.stringify({ name }) }),
+    deleteMemorySpace: (scopeId) => request(`/api/memory-spaces/${encodeURIComponent(scopeId)}`, { method: "DELETE" }),
     geoPlaces: (scopeId = "") => request(`/api/geo-places${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     dashboard: (scopeId = "") => request(`/api/dashboard${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     events: (scopeId = "") => request(`/api/events${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),

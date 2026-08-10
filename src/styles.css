@@ -481,3 +481,13 @@ body.admin .admin-only { display: revert; }
   border-radius: 4px;
   align-self: flex-start;
 }
+
+/* Space manager: album list rows + danger button */
+.space-list { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; max-height: 360px; overflow-y: auto; }
+.space-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.space-row.current { background: var(--soft); border-color: var(--green); }
+.space-row strong { display: block; font-size: 14px; color: var(--ink); }
+.space-row small { color: var(--muted); font-size: 11px; }
+.space-row .muted { color: var(--faint); font-size: 11px; }
+.button.danger { background: #dc2626; color: #fff; border: 1px solid #dc2626; }
+.button.danger:hover { background: #b91c1c; border-color: #b91c1c; }

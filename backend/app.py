@@ -415,6 +415,24 @@ def create_memory_space(request: MemorySpaceCreateRequest):
 def memory_spaces():
     return {"spaces": store.list_memory_spaces()}
 
+@app.delete("/api/memory-spaces/{scope_id}")
+def delete_memory_space(scope_id: str):
+    scope_id = (scope_id or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="scope_id required")
+    if scope_id == "home-default":
+        raise HTTPException(status_code=403, detail="home-default 是系统默认相册,不允许删除")
+    if not store._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,)):
+        raise HTTPException(status_code=404, detail=f"相册 {scope_id} 不存在")
+    try:
+        stats = store.delete_memory_space(scope_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"删除失败: {exc}")
+    return {"ok": True, "scope_id": scope_id, "removed": stats}
+
+
 
 @app.get("/api/vlm-backend")
 def vlm_backend():

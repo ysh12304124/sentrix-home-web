@@ -721,9 +721,25 @@
     } else if (modal.type === "import-picker") {
       body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
-      body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在本地运行。</span></div></div><div class="modal-actions"><button class="button ghost" data-action="create-space">＋ 创建新相册</button><button class="button primary" data-action="close-modal">关闭</button></div>`;
+      const spaceRows = (state.spaces || []).map((sp) => {
+        const isDefault = sp.id === "home-default";
+        const isCurrent = sp.id === state.scopeId;
+        const deleteBtn = isDefault
+          ? `<span class="muted">系统默认,不可删除</span>`
+          : `<button class="button small danger" data-action="ask-delete-space" data-scope-id="${escapeHtml(sp.id)}" data-scope-name="${escapeHtml(sp.name || sp.id)}">删除</button>`;
+        return `<div class="space-row ${isCurrent ? "current" : ""}"><div><strong>${escapeHtml(sp.name || sp.id)}</strong><small>${escapeHtml(sp.id)} · ${escapeHtml(sp.kind || "")}</small></div><div>${deleteBtn}</div></div>`;
+      }).join("");
+      body = `<div class="modal-kicker">SPACE MANAGER</div><h2>相册管理</h2><p class="modal-lead">删除相册会同时清除该相册的图片、事件、人物、向量和 <code>data/media/</code> 下的物理文件,不可撤销。<code>home-default</code> 是系统默认相册,不能删除。</p><div class="space-list">${spaceRows || "<p class=\"muted\">暂无相册</p>"}</div><div class="modal-actions"><button class="button ghost" data-action="create-space">＋ 创建新相册</button><button class="button primary" data-action="close-modal">关闭</button></div>`;
     } else if (modal.type === "space-create") {
       body = `<form id="modal-form"><div class="modal-kicker">NEW MEMORY SPACE</div><h2>创建独立相册</h2><p class="modal-lead">创建后会自动切换到该相册，后续导入的图片和人物标注都会限制在这个范围。</p><label>相册名称<input name="name" autofocus maxlength="100" placeholder="例如：2025年旅行测试" required /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-space">取消</button><button type="submit" class="button primary">创建并切换</button></div></form>`;
+    } else if (modal.type === "space-delete-confirm") {
+      const scopeId = modal.scopeId;
+      const scopeName = modal.scopeName || scopeId;
+      const stats = modal.stats;
+      const summary = stats
+        ? `将永久删除:<strong>${stats.assets || 0}</strong> 张图 / <strong>${stats.events || 0}</strong> 个事件 / <strong>${stats.persons || 0}</strong> 个人物 / <strong>${stats.vectors || 0}</strong> 条向量。`
+        : `将永久删除此相册的全部内容。`;
+      body = `<div class="modal-kicker">DELETE SPACE</div><h2>确认删除相册『${escapeHtml(scopeName)}』?</h2><p class="modal-lead">${summary}<br/><strong>此操作不可撤销,物理文件也会一同清理。</strong></p><div class="modal-actions"><button class="button ghost" data-action="open-space">取消</button><button class="button danger" data-action="confirm-delete-space" data-scope-id="${escapeHtml(scopeId)}" data-scope-name="${escapeHtml(scopeName)}">确认删除</button></div>`;
     } else if (modal.type === "help") {
       body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在 153 本地运行。</span></div></div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
     }
@@ -1214,6 +1230,47 @@
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "space-manager" });
+    if (action === "ask-delete-space") {
+      const scopeId = element.dataset.scopeId;
+      const scopeName = element.dataset.scopeName || scopeId;
+      try {
+        const dash = await window.sentrixApi.dashboard(scopeId);
+        const stats = {
+          assets: dash?.stats?.assets ?? 0,
+          events: dash?.stats?.events ?? 0,
+          persons: dash?.stats?.persons ?? 0,
+          vectors: dash?.stats?.vectors ?? 0,
+        };
+        return openModal({ type: "space-delete-confirm", scopeId, scopeName, stats });
+      } catch {
+        return openModal({ type: "space-delete-confirm", scopeId, scopeName, stats: null });
+      }
+    }
+    if (action === "confirm-delete-space") {
+      const scopeId = element.dataset.scopeId;
+      const scopeName = element.dataset.scopeName || scopeId;
+      if (element.disabled) return;
+      element.disabled = true;
+      element.textContent = "删除中…";
+      try {
+        const result = await window.sentrixApi.deleteMemorySpace(scopeId);
+        const r = (result && result.removed) || {};
+        state.toast = `相册『${scopeName}』已删除:${r.assets || 0} 图 / ${r.events || 0} 事件 / ${r.persons || 0} 人物 / ${r.files_removed || 0} 物理文件`;
+        if (state.scopeId === scopeId) {
+          state.scopeId = "";
+          window.localStorage?.removeItem("sentrix.scopeId");
+        }
+        state.modal = null;
+        state.modalHistory = [];
+        await refreshData({ forceRender: true });
+      } catch (err) {
+        state.toast = `删除失败:${err.message || err}`;
+        element.disabled = false;
+        element.textContent = "确认删除";
+        renderShellNavigation();
+      }
+      return;
+    }
     if (action === "open-import-picker") return openModal({ type: "import-picker" });
     if (action === "open-files") { state.modal = null; renderShellNavigation(); document.getElementById("file-input")?.click(); return; }
     if (action === "create-space") return openModal({ type: "space-create" });
