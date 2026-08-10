@@ -1,8 +1,8 @@
 #!/bin/bash
 # Phase B validation/canary API instance.
 # Port 8097, local only. Model = vLLM gemma-12B on 8105 (do NOT use 8100).
-# Default profile=pipeline (RX + structured path) for baseline/structured QA;
-# set SENTRIX_AGENT_PROFILE=tool_loop for the Tool-Loop canary surface.
+# Default profile=tool_loop_shadow for the Tool-Loop shadow canary surface
+# (pipeline agent profile was removed; tool_loop is the sole production path).
 cd /home/asus/Github/Sentrix-Home-Web
 exec env SENTRIX_API_PORT=8097 SENTRIX_THIN_AGENT_V1=1 SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1=1 \
   SENTRIX_IMAGE_EMBEDDER=chinese_clip SENTRIX_TEXT_EMBEDDER=clip SENTRIX_MODEL_SPLIT_V1=1 \
@@ -15,5 +15,5 @@ exec env SENTRIX_API_PORT=8097 SENTRIX_THIN_AGENT_V1=1 SENTRIX_EVIDENCE_MULTI_RE
   SENTRIX_RX_V1=1 SENTRIX_ANSWER_BRIEF_V1=1 SENTRIX_RESPONSE_PLAN_V1=1 SENTRIX_VISIBLE_EVIDENCE_V1=1 \
   SENTRIX_RESPONSE_WRITER_V2=1 SENTRIX_RESPONSE_VALIDATOR_V1=1 SENTRIX_ADMIN_DEBUG_PRESENTATION=1 \
   SENTRIX_TASK_CONTRACT_V2=1 SENTRIX_RETRIEVAL_STRATEGY_V1=1 SENTRIX_STRUCTURED_MEMORY_V1=1 \
-  SENTRIX_AGENT_PROFILE="${SENTRIX_AGENT_PROFILE:-pipeline}" SENTRIX_CONVERSATION_STORE_V1=1 \
+  SENTRIX_AGENT_PROFILE="${SENTRIX_AGENT_PROFILE:-tool_loop_shadow}" SENTRIX_CONVERSATION_STORE_V1=1 \
   PYTHONPATH=. .venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8097

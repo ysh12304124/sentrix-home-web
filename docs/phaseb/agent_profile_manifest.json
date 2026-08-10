@@ -1,29 +1,6 @@
 {
   "schema_version": 1,
   "profiles": {
-    "pipeline": {
-      "model": "gemma4-12b-it@8105(4bit)",
-      "tools": [],
-      "budgets": {
-        "max_model_steps": 1,
-        "max_tool_calls": 0,
-        "max_inspections": 1,
-        "wall_time_s": 20.0,
-        "final_reserve_s": 10.0
-      },
-      "features": {
-        "rx": false,
-        "tool_loop": false,
-        "conversation_store": true
-      },
-      "guard": "pipeline-internal",
-      "runbook": {
-        "start": "SENTRIX_AGENT_PROFILE=pipeline SENTRIX_API_PORT=<port> .venv/bin/python -m uvicorn backend.app:app",
-        "health_check": "curl -s http://127.0.0.1:<port>/api/health",
-        "verify": "python scripts/benchmarks/evaluate_search_inspect_e2e.py --base http://127.0.0.1:8105/v1",
-        "rollback": "SENTRIX_AGENT_PROFILE=pipeline 重启即回退；canary 独立端口不影响 8091"
-      }
-    },
     "tool_loop_shadow": {
       "model": "gemma4-12b-it@8105(4bit)",
       "tools": [
@@ -50,7 +27,7 @@
         "start": "SENTRIX_AGENT_PROFILE=tool_loop_shadow SENTRIX_API_PORT=<port> .venv/bin/python -m uvicorn backend.app:app",
         "health_check": "curl -s http://127.0.0.1:<port>/api/health",
         "verify": "python scripts/benchmarks/evaluate_search_inspect_e2e.py --base http://127.0.0.1:8105/v1",
-        "rollback": "SENTRIX_AGENT_PROFILE=pipeline 重启即回退；canary 独立端口不影响 8091"
+        "rollback": "重启回默认 tool_loop；shadow canary 独立端口不影响 8091"
       }
     },
     "tool_loop": {
@@ -79,7 +56,7 @@
         "start": "SENTRIX_AGENT_PROFILE=tool_loop SENTRIX_API_PORT=<port> .venv/bin/python -m uvicorn backend.app:app",
         "health_check": "curl -s http://127.0.0.1:<port>/api/health",
         "verify": "python scripts/benchmarks/evaluate_search_inspect_e2e.py --base http://127.0.0.1:8105/v1",
-        "rollback": "SENTRIX_AGENT_PROFILE=pipeline 重启即回退；canary 独立端口不影响 8091"
+        "rollback": "重启回默认 tool_loop；shadow canary 独立端口不影响 8091"
       }
     }
   },

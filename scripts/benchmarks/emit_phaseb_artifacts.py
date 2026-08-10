@@ -67,12 +67,12 @@ def emit_profile_manifest() -> dict:
                 "final_reserve_s": cfg.final_reserve_s,
             },
             "features": cfg.features,
-            "guard": "FinalGuard(L1 rule) + LLM judge(L2)" if name != "pipeline" else "pipeline-internal",
+            "guard": "FinalGuard(L1 rule) + LLM judge(L2)",
             "runbook": {
                 "start": f"SENTRIX_AGENT_PROFILE={name} SENTRIX_API_PORT=<port> .venv/bin/python -m uvicorn backend.app:app",
                 "health_check": "curl -s http://127.0.0.1:<port>/api/health",
                 "verify": "python scripts/benchmarks/evaluate_search_inspect_e2e.py --base http://127.0.0.1:8105/v1",
-                "rollback": "SENTRIX_AGENT_PROFILE=pipeline 重启即回退；canary 独立端口不影响 8091",
+                "rollback": "重启回默认 tool_loop；shadow canary 独立端口不影响 8091",
             },
         }
     return {"schema_version": 1, "profiles": profiles,

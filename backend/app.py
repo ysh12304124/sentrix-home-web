@@ -16,7 +16,6 @@ from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .agent import MemoryAgent
 from .agent_conversation import ConversationStore
 from .db import MemoryStore, make_id
 from .image_io import (
@@ -44,7 +43,6 @@ store = MemoryStore(os.getenv("SENTRIX_DB_PATH", str(DATA_DIR / "sentrix.db")))
 gamma = GammaClient()
 gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
-agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
 conversation_store = ConversationStore(store)
 CONVERSATION_STORE_ENABLED = os.getenv("SENTRIX_CONVERSATION_STORE_V1", "0").lower() in {"1", "true", "on"}
 
@@ -54,7 +52,6 @@ maintenance_lock = threading.Lock()
 runtime_lock = threading.Lock()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
-VLM_BACKENDS = ("ollama_12b", "e2b_lora")
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
@@ -92,52 +89,6 @@ def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_loc
         result["gps"] = {"latitude": latitude, "longitude": longitude}
     return result
 
-
-def _check_ollama_health():
-    try:
-        import httpx
-        url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-        response = httpx.get(f"{url}/api/tags", timeout=10)
-        response.raise_for_status()
-        models = response.json().get("models") or []
-        ollama_model = os.getenv("OLLAMA_MODEL", "gemma4:12b")
-        for model in models:
-            if model.get("name", "").startswith(ollama_model.replace(":12b", "")):
-                return {"available": True, "model": ollama_model, "url": url}
-        return {"available": False, "model": ollama_model, "url": url, "error": "model not found in /api/tags"}
-    except Exception as exc:
-        return {"available": False, "model": os.getenv("OLLAMA_MODEL", "gemma4:12b"), "url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"), "error": str(exc)}
-
-
-def _check_e2b_health():
-    try:
-        import httpx
-        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        response = httpx.get(f"{url}/api/health", timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return {"available": data.get("status") == "ok", "url": url, "loaded": data.get("loaded", False), "model": data.get("model", ""), "error": data.get("error")}
-    except Exception as exc:
-        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100"), "error": str(exc)}
-
-
-def _fire_and_forget_post(url, payload):
-    try:
-        import httpx
-        httpx.post(url, json=payload, timeout=5)
-    except Exception:
-        pass
-
-
-def _schedule_backend_transition(backend_name):
-    if backend_name == "e2b_lora":
-        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        threading.Thread(target=_fire_and_forget_post, args=(f"{e2b_url}/admin/load", {}), daemon=True).start()
-
-
-class SearchRequest(BaseModel):
-    query: str
-    spaceId: str = "home-default"
 
 
 class ImportRequest(BaseModel):
@@ -318,7 +269,7 @@ def _current_model_runtime():
 
 
 def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
-    global gamma, pipeline, agent
+    global gamma, pipeline
     registry = _load_vllm_registry()
     profile = profile or (registry.get("profiles") or {}).get(profile_id) or {}
     state = state or _load_vllm_state(registry) or {}
@@ -328,7 +279,6 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
         new_gamma = GammaClient(base_url=f"http://127.0.0.1:{port}/v1", model=served_name, backend="openai")
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
-        agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
     return _current_model_runtime()
 
 
@@ -1091,13 +1041,19 @@ def result_set_photo(result_set_id: str, handle: str = "", scope_id: str = "home
 @app.get("/api/face-instances/{face_instance_id}/crop")
 def face_instance_crop(face_instance_id: str):
     instance = store.get_face_instance(face_instance_id)
-    if not instance or not Path(instance["asset_path"]).is_file():
+    asset_path = (instance or {}).get("asset_path")
+    if not instance or not asset_path or not Path(asset_path).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
         from PIL import Image
 
-        image = Image.open(instance["asset_path"]).convert("RGB")
-        left, top, right, bottom = (int(value) for value in instance.get("bbox_json") or [])
+        ensure_heif_support()
+        with Image.open(asset_path) as source:
+            image = source.convert("RGB")
+        bbox = instance.get("bbox_json") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            raise ValueError("invalid face bounding box")
+        left, top, right, bottom = (int(value) for value in bbox[:4])
         left, top = max(0, left), max(0, top)
         right, bottom = min(image.width, right), min(image.height, bottom)
         if right <= left or bottom <= top:
@@ -1107,8 +1063,8 @@ def face_instance_crop(face_instance_id: str):
         output = BytesIO()
         face.save(output, format="JPEG", quality=88)
         return Response(content=output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
-    except (OSError, ValueError):
-        raise HTTPException(status_code=422, detail="face crop is unavailable")
+    except (OSError, ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail=f"face crop is unavailable: {error}") from error
 
 
 @app.get("/api/facts")
@@ -1161,55 +1117,6 @@ def delete_story(story_id: str):
 def create_invite(payload: dict):
     invite = store.create_invite(payload.get("label", "家庭成员"))
     return {**invite, "invite_url": f"sentrix://join/{invite['token']}"}
-
-
-def assistant_response(result):
-    """Expose stable browser names while retaining the internal contract.
-
-    RX-6: retrieval/tool traces, the validation block and the model-call ledger
-    are debug-only.  They stay out of the default API response unless the admin
-    presentation switch is on; the frontend additionally hides them behind its
-    own debug layer.
-    """
-    from .validation import full_chain_profile as _prof
-    admin = _prof.admin_debug_presentation()
-    result.setdefault("claims", [])
-    result.setdefault("claim_verifications", [])
-    result.setdefault("claim_verification_status", "not_required")
-    result.setdefault("repair_count", 0)
-    result.setdefault("evidence_bundles", [])
-    result.setdefault("claim_evidence_index", {})
-    result.setdefault("segments", [{"type": "text", "text": result.get("answer", "")}])
-    result["retrievalTrace"] = result.get("retrieval_trace", [])
-    result["toolTrace"] = result.get("tool_trace", [])
-    result["evidencePresentation"] = result.get("evidence_presentation", {})
-    result["memoryUsed"] = result.get("memory_used", False)
-    result["evidenceRequired"] = result.get("evidence_required", False)
-    result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
-    result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
-    result["claimVerifications"] = result["claim_verifications"]
-    result["claimVerificationStatus"] = result["claim_verification_status"]
-    result["repairCount"] = result["repair_count"]
-    result["evidenceBundles"] = result["evidence_bundles"]
-    result["claimEvidenceIndex"] = result["claim_evidence_index"]
-    if not admin:
-        result["retrievalTrace"] = []
-        result["toolTrace"] = []
-        result.pop("validation", None)
-        result.pop("model_call_ledger", None)
-        # TFPE v2 structured internals are debug-only.
-        result.pop("task_contract", None)
-        result.pop("retrieval_strategy", None)
-        result.pop("structured_result", None)
-        result.pop("parser_raw", None)
-    return result
-
-
-@app.post("/api/search")
-def search(request: SearchRequest):
-    if not request.query.strip():
-        raise HTTPException(status_code=400, detail="query is required")
-    return assistant_response(agent.answer_turn(request.query.strip(), scope_id=request.spaceId))
 
 
 class AssistantTurnRequest(BaseModel):
@@ -1306,28 +1213,19 @@ def assistant_turn(request: AssistantTurnRequest):
             )
         except Exception:
             recent_turns = ""
-    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
-    if profile_name in {"tool_loop", "tool_loop_shadow"}:
-        # B3.4：异步执行，立即返回 turn_id 供前端轮询实时进度
-        turn_id = make_id("turn")
-        _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
-                               "result": None, "created_at": time.time()}
-        _turn_executor().submit(
-            _execute_turn_job, turn_id, message, request.conversation_id,
-            request.scope_id, request.viewer_id, recent_turns)
-        return {
-            "turn_id": turn_id,
-            "status": "running",
-            "conversation_id": request.conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
-            "intent": "tool_loop",
-        }
-    result = agent.answer_turn(
-        message, request.conversation_id, request.feedback, request.scope_id,
-        request.selected_entity_id, request.viewer_id,
-        recent_turns=recent_turns,
-    )
-    _record_turn_conversation(message, request, result, turn_id="")
-    return assistant_response(result)
+    # tool_loop 是唯一 agent 路径：异步执行，立即返回 turn_id 供前端轮询实时进度
+    turn_id = make_id("turn")
+    _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
+                           "result": None, "created_at": time.time()}
+    _turn_executor().submit(
+        _execute_turn_job, turn_id, message, request.conversation_id,
+        request.scope_id, request.viewer_id, recent_turns)
+    return {
+        "turn_id": turn_id,
+        "status": "running",
+        "conversation_id": request.conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "intent": "tool_loop",
+    }
 
 
 @app.get("/api/assistant/turn/{turn_id}")
@@ -1392,6 +1290,47 @@ def _record_turn_conversation(message, request, result, turn_id=""):
         pass
 
 
+def assistant_response(result):
+    """Expose stable browser names while retaining the internal contract.
+
+    RX-6: retrieval/tool traces, the validation block and the model-call ledger
+    are debug-only.  They stay out of the default API response unless the admin
+    presentation switch is on; the frontend additionally hides them behind its
+    own debug layer.
+    """
+    from .validation import full_chain_profile as _prof
+    admin = _prof.admin_debug_presentation()
+    result.setdefault("claims", [])
+    result.setdefault("claim_verifications", [])
+    result.setdefault("claim_verification_status", "not_required")
+    result.setdefault("repair_count", 0)
+    result.setdefault("evidence_bundles", [])
+    result.setdefault("claim_evidence_index", {})
+    result.setdefault("segments", [{"type": "text", "text": result.get("answer", "")}])
+    result["retrievalTrace"] = result.get("retrieval_trace", [])
+    result["toolTrace"] = result.get("tool_trace", [])
+    result["evidencePresentation"] = result.get("evidence_presentation", {})
+    result["memoryUsed"] = result.get("memory_used", False)
+    result["evidenceRequired"] = result.get("evidence_required", False)
+    result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
+    result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
+    result["claimVerifications"] = result["claim_verifications"]
+    result["claimVerificationStatus"] = result["claim_verification_status"]
+    result["repairCount"] = result["repair_count"]
+    result["evidenceBundles"] = result["evidence_bundles"]
+    result["claimEvidenceIndex"] = result["claim_evidence_index"]
+    if not admin:
+        result["retrievalTrace"] = []
+        result["toolTrace"] = []
+        result.pop("validation", None)
+        result.pop("model_call_ledger", None)
+        result.pop("task_contract", None)
+        result.pop("retrieval_strategy", None)
+        result.pop("structured_result", None)
+        result.pop("parser_raw", None)
+    return result
+
+
 def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns):
     """B3.4：后台执行 tool-loop turn，progress 增量写入 job。"""
     job = _TURN_JOBS.get(turn_id)
@@ -1420,6 +1359,7 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
             pass
         if conversation_id:
             _TOOL_LOOP_TASK_STATE[conversation_id] = result.get("task_state") or {}
+        result = assistant_response(result)
         _record_turn_conversation(message, _AssistantTurnLike(
             conversation_id=conversation_id, scope_id=scope_id), result, turn_id=turn_id)
         if job is not None:

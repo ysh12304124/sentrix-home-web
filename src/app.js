@@ -961,25 +961,9 @@
     state.liveProgress = [];
     renderShellNavigation();
     try {
-      const start = await window.sentrixApi.assistantTurnAsync(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
-      if (start && start.turn_id && start.status === "running") {
-        state.conversationId = start.conversation_id || state.conversationId;
-        let done = null;
-        for (let i = 0; i < 150 && !done; i += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 700));
-          try {
-            const poll = await window.sentrixApi.assistantTurnPoll(start.turn_id);
-            if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
-            updateLiveProgress();
-            if (poll.status === "complete") done = poll.result;
-            else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
-          } catch (pollError) { /* 单次轮询失败继续等待 */ }
-        }
-        state.searchResult = done || { answer: "执行超时，请重试。", evidence_status: "error" };
-      } else {
-        state.searchResult = start;
-        state.conversationId = (start && start.conversation_id) || state.conversationId;
-      }
+      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
+      state.conversationId = conversationId;
+      state.searchResult = result;
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
     }
@@ -997,19 +981,39 @@
     state.searchLoading = true;
     renderShellNavigation();
     try {
-      const result = await window.sentrixApi.assistantTurn(
+      const { result, conversationId } = await runAssistantTurn(
         message, state.conversationId,
         { proactivity_outcome: outcome, proactivity_scene_key: sceneKey },
-        state.scopeId, "", "owner",
+        state.scopeId, "",
       );
       state.searchResult = result;
-      state.conversationId = result.conversation_id || state.conversationId;
-      state.assistantMessages.push({ role: "steward", result });
+      state.conversationId = conversationId;
+      state.assistantMessages.push({ role: "steward", result: state.searchResult });
     } catch (error) {
       state.toast = `主动回忆状态未更新：${error.message}`;
     }
     state.searchLoading = false;
     renderShellNavigation();
+  }
+
+  async function runAssistantTurn(message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "") {
+    const start = await window.sentrixApi.assistantTurnAsync(message, conversationId, feedback, scopeId, selectedEntityId);
+    if (start && start.turn_id && start.status === "running") {
+      const nextConversationId = start.conversation_id || conversationId;
+      let done = null;
+      for (let i = 0; i < 150 && !done; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        try {
+          const poll = await window.sentrixApi.assistantTurnPoll(start.turn_id);
+          if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
+          updateLiveProgress();
+          if (poll.status === "complete") done = poll.result;
+          else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
+        } catch (pollError) { /* 单次轮询失败继续等待 */ }
+      }
+      return { result: done || { answer: "执行超时，请重试。", evidence_status: "error" }, conversationId: nextConversationId };
+    }
+    return { result: start, conversationId: (start && start.conversation_id) || conversationId };
   }
 
   async function handleFiles(event) {

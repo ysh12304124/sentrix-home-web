@@ -56,7 +56,6 @@
     retractRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/retract`, { method: "POST" }),
     confirmPerson: (id, name, familyRole = "") => request(`/api/persons/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify({ name, family_role: familyRole }) }),
     renamePerson: (id, payload) => request(`/api/people/${encodeURIComponent(id)}/rename`, { method: "POST", body: JSON.stringify(payload) }),
-    assistantTurn: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, viewer_id: viewerId || "owner" }) }),
     assistantTurnAsync: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, viewer_id: viewerId || "owner" }) }),
     assistantTurnPoll: (turnId) => request(`/api/assistant/turn/${encodeURIComponent(turnId)}`),
     resultSetPhoto: (resultSetId, handle, scopeId = "home-default", original = false) => `${configuredBase}/api/assistant/result-set/${encodeURIComponent(resultSetId)}/photo?handle=${encodeURIComponent(handle)}&scope_id=${encodeURIComponent(scopeId)}${original ? "&original=1" : ""}`,
@@ -70,7 +69,6 @@
     createInvite: (label) => request("/api/invites", { method: "POST", body: JSON.stringify({ label }) }),
     confirmFact: (factId) => request(`/api/facts/${encodeURIComponent(factId)}/confirm`, { method: "POST" }),
     rejectFact: (factId) => request(`/api/facts/${encodeURIComponent(factId)}/reject`, { method: "POST" }),
-    search: (query) => request("/api/search", { method: "POST", body: JSON.stringify({ query }) }),
     queryGaps: () => request("/api/query-gaps"),
     queryGapFeedback: (id, payload) => request("/api/query-gaps/" + encodeURIComponent(id) + "/feedback", { method: "POST", body: JSON.stringify(payload) }),
     importAssets: (items, options = {}) => {
@@ -90,16 +88,10 @@
       });
       return request("/api/import", { method: "POST", body: form });
     },
-    getVlmBackend: () => request("/api/vlm-backend"),
-    setVlmBackend: (backend) => request("/api/vlm-backend", { method: "POST", body: JSON.stringify({ backend }) }),
     getModelProfiles: () => request("/api/model-profiles"),
-    getCurrentModelProfile: () => request("/api/model-profiles/current"),
     switchModelProfile: (profile) => request("/api/model-profiles/switch", {
       method: "POST",
       body: JSON.stringify({ profile, wait_ready: true, ready_timeout: 900 }),
     }),
-    importAsset: (file, metadata = {}, options = {}) => {
-      return window.sentrixApi.importAssets([{ file, metadata }], options).then((result) => result.items[0]);
-    },
   };
 })();
