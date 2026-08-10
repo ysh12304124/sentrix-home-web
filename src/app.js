@@ -337,17 +337,21 @@
   function buildThinkingSteps(result, liveProgress = null) {
     const progress = liveProgress || (result && (result.public_progress || [])) || [];
     const tools = (result && (result.toolTrace || result.tool_trace)) || [];
+    const taskTools = (result && result.task_state && result.task_state.tool_results) || [];
     let toolIndex = 0;
+    let taskIndex = 0;
     return progress.map((item) => {
       const stage = item.stage || "";
       const status = item.status || "running";
       if (stage === "tool_result" || stage === "tool_error") {
         const tool = tools[toolIndex] || {};
+        const fallback = taskTools[taskIndex] || {};
         toolIndex += 1;
+        taskIndex += 1;
         const denied = tool.status === "denied" || stage === "tool_error";
         return {
           type: "tool",
-          tool: tool.tool,
+          tool: tool.tool || fallback.tool,
           text: item.text || tool.reason || (denied ? "工具调用被拒绝" : "正在处理…"),
           status: denied ? "blocked" : "complete",
           latency: tool.latency_s,
