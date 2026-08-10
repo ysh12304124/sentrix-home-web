@@ -166,9 +166,12 @@ def _allowed_import_roots():
     defaults = [
         DATA_DIR / "imports",
         ROOT / "data" / "imports",
+        # 153-only roots carried over from the hasty backend alignment.
         Path("/home/asus/data"),
         Path("/home/asus/datasets"),
         Path("/home/asus/benchmarks"),
+        # 200-local staging/workspace (000Notes/family_photos, projects).
+        Path("/home/sscy/lingbot-map"),
     ]
     values = configured.split(":") if configured else [str(item) for item in defaults]
     roots = []
@@ -1047,9 +1050,9 @@ def face_instance_crop(face_instance_id: str):
     if not instance or not Path(instance["asset_path"]).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
 
-        image = Image.open(instance["asset_path"]).convert("RGB")
+        image = ImageOps.exif_transpose(Image.open(instance["asset_path"])).convert("RGB")
         left, top, right, bottom = (int(value) for value in instance.get("bbox_json") or [])
         left, top = max(0, left), max(0, top)
         right, bottom = min(image.width, right), min(image.height, bottom)
