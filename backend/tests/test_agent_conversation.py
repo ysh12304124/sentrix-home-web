@@ -34,13 +34,13 @@ def test_trajectory_roundtrip(tmp_path):
     store = _store(tmp_path)
     conv = ConversationStore(store)
     conv.save_trajectory(
-        "turn_x", "c1", profile="pipeline",
+        "turn_x", "c1", profile="tool_loop",
         steps=[{"stage": "retrieval", "status": "complete"}],
         result={"answer": "ok"}, public_progress=[{"text": "已找到 3 条相关记录。"}],
         scope_id="album1",
     )
     traj = conv.get_trajectory("turn_x")
-    assert traj["profile"] == "pipeline"
+    assert traj["profile"] == "tool_loop"
     assert traj["steps"][0]["stage"] == "retrieval"
     assert traj["public_progress"][0]["text"] == "已找到 3 条相关记录。"
     listed = conv.list_trajectories("c1")

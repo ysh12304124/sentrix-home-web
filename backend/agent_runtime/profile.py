@@ -23,14 +23,6 @@ class ProfileConfig:
 
 
 PROFILES = {
-    "pipeline": ProfileConfig(
-        name="pipeline",
-        tools=(),
-        max_model_steps=1,
-        max_tool_calls=0,
-        wall_time_s=20.0,
-        features={"rx": False, "tool_loop": False, "conversation_store": True},
-    ),
     "tool_loop_shadow": ProfileConfig(
         name="tool_loop_shadow",
         tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page", "inspect_photo"),
@@ -59,7 +51,7 @@ def active_profile() -> str:
 
 
 def get_profile(name: str | None = None) -> ProfileConfig:
-    return PROFILES.get(name or active_profile(), PROFILES["pipeline"])
+    return PROFILES.get(name or active_profile(), PROFILES["tool_loop"])
 
 
 def tool_loop_active() -> bool:

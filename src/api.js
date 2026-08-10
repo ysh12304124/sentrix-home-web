@@ -70,7 +70,6 @@
     createInvite: (label) => request("/api/invites", { method: "POST", body: JSON.stringify({ label }) }),
     confirmFact: (factId) => request(`/api/facts/${encodeURIComponent(factId)}/confirm`, { method: "POST" }),
     rejectFact: (factId) => request(`/api/facts/${encodeURIComponent(factId)}/reject`, { method: "POST" }),
-    search: (query) => request("/api/search", { method: "POST", body: JSON.stringify({ query }) }),
     queryGaps: () => request("/api/query-gaps"),
     queryGapFeedback: (id, payload) => request("/api/query-gaps/" + encodeURIComponent(id) + "/feedback", { method: "POST", body: JSON.stringify(payload) }),
     importAssets: (items, options = {}) => {
