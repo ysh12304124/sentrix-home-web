@@ -51,8 +51,9 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - operation=group 且 group_by=place 时，工具会返回 known_location_assets/unknown_location_assets 覆盖信息：
   只要 unknown_location_assets>0，回答必须如实说明还有多少张照片没有可靠地点信息，不能把地点说成完整清单。
 - operation=meal 回答'吃过什么/吃饭/火锅'类问题：工具会返回 explicit_foods（明确食物，按事件去重）、
-  meal_scene_events（只能确认在吃饭）、possible_events；回答时优先列 explicit_foods，
-  有 meal_scene_events 时要说明其中一部分只能确认在用餐、不能确认具体菜品。
+  meal_scene_events（只能确认在吃饭）、possible_events；回答必须逐项列出 explicit_foods 里的食物
+  （如'火锅、蛋糕…'）并说明各出现几次，有 meal_scene_events 时还要说明其中一部分只能确认在用餐、
+  不能确认具体菜品；没有 explicit_foods 时才只说用餐场景。
 - search_memories 返回的 query_satisfaction 决定怎么说：
   full_support=可以确认；partial_support=部分条件确认，必须说出哪些还没确认；
   candidate_only=只是相似候选，**不能说"找到了/确认是"**，要说"找到几张接近的候选，还不能完全确认"；
