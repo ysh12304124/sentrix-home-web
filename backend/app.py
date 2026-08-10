@@ -1215,9 +1215,23 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         if s.get("type") == "judge":
             item["detail"] = {"faithful": s.get("faithful"),
                               "problems": list(s.get("problems") or [])}
+        if s.get("type") == "guard":
+            item["detail"] = {"l1_codes": list(s.get("codes") or []),
+                              "attempt": s.get("attempt", 1)}
         if isinstance(s.get("arguments"), dict):
             item["args"] = s.get("arguments")
         trace.append(item)
+    guard_debug = {
+        "status": turn.status,
+        "reason": turn.reason or "",
+        "recovery_attempts": sum(1 for p in turn.public_progress
+                                 if p.get("stage") == "recovering"),
+        "l1_codes": [c for s in turn.steps if s.get("type") == "guard"
+                     for c in (s.get("codes") or [])],
+        "judge": [{"faithful": s.get("faithful"),
+                   "problems": list(s.get("problems") or [])}
+                  for s in turn.steps if s.get("type") == "judge"],
+    }
     return {
         "answer": turn.final_answer,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
@@ -1228,6 +1242,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "tool_loop_status": turn.status,
         "tool_loop_reason": turn.reason,
         "task_state": turn.task_state,
+        "guard_debug": guard_debug,
     }
 
 

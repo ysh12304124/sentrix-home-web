@@ -351,6 +351,13 @@ class AgentRuntime:
                     },
                     delivered_count=task.delivered_count,
                 )
+                # C9：结构化记录 L1 guard 检查结果（debug 展示用，普通用户不可见）
+                turn.steps.append({
+                    "type": "guard",
+                    "status": "fail" if problems else "pass",
+                    "codes": list(problems) if problems else [],
+                    "attempt": guard_retries + 1,
+                })
                 # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性
                 if not problems and task.tool_results and turn.budget.can_model_step():
                     turn.budget.record_model_step()
