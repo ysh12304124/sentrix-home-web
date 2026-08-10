@@ -1193,6 +1193,8 @@ async def ingest(
     sourceAlbumId: str | None = Form(None),
     capturedAt: str | None = Form(None),
     capturedLocation: str | None = Form(None),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
 ):
     safe_name = Path(file.filename or "upload.bin").name
     asset_id = make_id("asset")
@@ -1201,7 +1203,9 @@ async def ingest(
         shutil.copyfileobj(file.file, output)
     media_type = media_type_from_upload(file.content_type, safe_name)
     mime_type = file.content_type or guess_mime_type(safe_name)
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
     metadata = {
+        "scope_id": scope,
         "source_owner_id": sourceOwnerId,
         "source_device_id": sourceDeviceId,
         "source_album_id": sourceAlbumId,
@@ -1213,10 +1217,12 @@ async def ingest(
     }
     metadata["captured_at"] = metadata["captured_at"] or metadata["exif"].get("captured_at")
     metadata["source_device_id"] = metadata["source_device_id"] or metadata["exif"].get("device")
-    existing = store.find_asset_by_hash(metadata["content_sha256"])
+    # Deduplication is scoped to the album: the same photo may legitimately
+    # appear in a different memory space without being treated as a duplicate.
+    existing = store.find_asset_by_hash(metadata["content_sha256"], scope)
     if existing:
         destination.unlink(missing_ok=True)
-        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "deduplicated": True}
+        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "scope_id": scope, "deduplicated": True}
     created = store.create_asset(
         asset_id,
         safe_name,
@@ -1227,7 +1233,7 @@ async def ingest(
         metadata,
     )
     background_tasks.add_task(process_asset, asset_id)
-    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type}
+    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type, "scope_id": scope}
 
 
 @app.post("/api/import", status_code=202)
