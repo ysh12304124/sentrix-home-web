@@ -202,10 +202,14 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         "filters_applied": result.filters_applied,
         "coverage": {"complete": True},
     }
-    try:
-        out["samples"] = executor._sample_observations(draft, spec, limit=3)
-    except Exception:
+    if operation == "group":
+        # 分组结果不附任意样本：随机照片与分组内容不匹配会造成误导（如城市分组展示无关照片）。
         out["samples"] = []
+    else:
+        try:
+            out["samples"] = executor._sample_observations(draft, spec, limit=3)
+        except Exception:
+            out["samples"] = []
     if operation == "group" and group_by == "place" and isinstance(out["rows"], list) and len(out["rows"]) > 12:
         # 地点分组只给模型前 12 个，避免超长 rows 干扰 12B 输出（month 分组本身 ≤12 不截断）
         out["rows_truncated"] = len(out["rows"])
