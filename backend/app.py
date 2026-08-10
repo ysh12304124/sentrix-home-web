@@ -53,6 +53,9 @@ maintenance_lock = threading.Lock()
 runtime_lock = threading.Lock()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
+VLLM_SSH_HOST = os.getenv("SENTRIX_VLLM_SSH_HOST", "").strip()
+VLLM_SSH_KEY = os.getenv("SENTRIX_VLLM_SSH_KEY", "").strip()
+VLLM_SSH_PYTHON = os.getenv("SENTRIX_VLLM_SSH_PYTHON", "python3").strip()
 VLM_BACKENDS = ("ollama_12b", "e2b_lora")
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
@@ -269,20 +272,67 @@ def _load_vllm_registry():
     return _read_json_file(VLLM_REGISTRY, {"profiles": {}, "default_port": 8100, "state_file": ""})
 
 
+def _vllm_ssh_prefix():
+    if not VLLM_SSH_HOST:
+        return None
+    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5"]
+    if VLLM_SSH_KEY:
+        cmd.extend(["-i", VLLM_SSH_KEY])
+    cmd.append(VLLM_SSH_HOST)
+    return cmd
+
+
+def _vllm_remote_read_json(path_str, fallback):
+    prefix = _vllm_ssh_prefix()
+    if not prefix:
+        return _read_json_file(Path(path_str), fallback)
+    import subprocess as _sp
+    try:
+        result = _sp.run(prefix + ["cat " + path_str], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return fallback
+        return json.loads(result.stdout)
+    except Exception:
+        return fallback
+
+
+def _vllm_remote_path_exists(path_str):
+    prefix = _vllm_ssh_prefix()
+    if not prefix:
+        return Path(path_str).exists()
+    import subprocess as _sp
+    try:
+        result = _sp.run(prefix + ["test -e " + path_str], capture_output=True, timeout=10)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _vllm_remote_exec(args, timeout=60):
+    import subprocess as _sp
+    prefix = _vllm_ssh_prefix()
+    if prefix:
+        remote_cmd = " ".join(str(a) for a in args)
+        full_cmd = prefix + [remote_cmd]
+    else:
+        full_cmd = [str(a) for a in args]
+    return _sp.run(full_cmd, text=True, capture_output=True, timeout=timeout)
+
+
 def _load_vllm_state(registry=None):
     registry = registry or _load_vllm_registry()
-    state_file = Path(registry.get("state_file") or "/home/asus/sentrix-vllm/state/current.json")
-    return _read_json_file(state_file, None) if state_file.exists() else None
+    state_file = registry.get("state_file") or "/home/asus/sentrix-vllm/state/current.json"
+    return _vllm_remote_read_json(state_file, None)
 
 
 def _profile_availability(profile):
     missing = []
     model_path = profile.get("model")
-    if model_path and not Path(model_path).exists():
+    if model_path and not _vllm_remote_path_exists(model_path):
         missing.append(model_path)
     for module in profile.get("lora_modules") or []:
         path = module.get("path")
-        if path and not Path(path).exists():
+        if path and not _vllm_remote_path_exists(path):
             missing.append(path)
     return {"available": not missing, "missing_paths": missing}
 
@@ -324,7 +374,10 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
     port = int(state.get("port") or profile.get("port") or registry.get("default_port") or 8100)
     served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
     with runtime_lock:
-        new_gamma = GammaClient(base_url=f"http://127.0.0.1:{port}/v1", model=served_name, backend="openai")
+        base_url = (state.get("external_url_hint") if state else None) or (
+            f"http://{VLLM_SSH_HOST.split('@')[-1]}:{port}/v1" if VLLM_SSH_HOST
+            else f"http://127.0.0.1:{port}/v1")
+        new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai")
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
         agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
@@ -332,13 +385,16 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
 
 
 def _run_vllm_switch(request: ModelSwitchRequest):
-    if not VLLM_MANAGER.exists():
+    if not VLLM_SSH_HOST and not VLLM_MANAGER.exists():
         raise HTTPException(status_code=503, detail=f"vLLM manager not found: {VLLM_MANAGER}")
     registry = _load_vllm_registry()
     profile = (registry.get("profiles") or {}).get(request.profile)
     if not profile:
         raise HTTPException(status_code=404, detail="model profile not found")
-    command = [str(VLLM_MANAGER), "switch", request.profile]
+    if VLLM_SSH_HOST:
+        command = [VLLM_SSH_PYTHON, str(VLLM_MANAGER), "switch", request.profile]
+    else:
+        command = [str(VLLM_MANAGER), "switch", request.profile]
     option_map = {
         "max_model_len": "--max-model-len", "max_num_seqs": "--max-num-seqs",
         "max_num_batched_tokens": "--max-num-batched-tokens",
@@ -356,8 +412,7 @@ def _run_vllm_switch(request: ModelSwitchRequest):
         command.extend(["--wait-ready", "--ready-timeout", str(max(30, request.ready_timeout))])
     if request.dry_run:
         command.append("--dry-run")
-    import subprocess
-    completed = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True,
+    completed = _vllm_remote_exec(command,
         timeout=max(60, int(request.ready_timeout) + 90 if request.wait_ready else 60))
     if completed.returncode != 0:
         raise HTTPException(status_code=502, detail={
@@ -366,6 +421,17 @@ def _run_vllm_switch(request: ModelSwitchRequest):
     runtime = _current_model_runtime() if request.dry_run else _apply_vllm_profile_to_runtime(request.profile, profile)
     return {"accepted": True, "profile": request.profile, "runtime": runtime,
         "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]}
+
+
+@app.on_event("startup")
+def _sync_vllm_state_on_startup():
+    """Sync gamma client with remote vLLM state on startup."""
+    try:
+        state = _load_vllm_state()
+        if state and state.get("pid"):
+            _apply_vllm_profile_to_runtime(state.get("profile", ""), state=state)
+    except Exception:
+        pass
 
 @app.get("/api/health")
 def health():
