@@ -384,7 +384,7 @@
   function peopleView() {
     const people = state.persons.filter((person) => state.personFilter === "all" || !person.confirmed);
     const pending = state.persons.filter((person) => !person.confirmed);
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会明确标注，仍可查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person, index) => { const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`; const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : ""; return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${caution}<div class="person-stats"><span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>${person.cluster_count || 0}</strong> 个人物簇</span></div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`}</div></article>`; }).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
+    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会明确标注，仍可查看原图后确认或驳回。", `<button class="button primary" data-action="seed-person">${icon("＋")}添加家庭成员</button><button class="button ghost" data-action="seed-person-batch">${icon("▦")}批量导入成员</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person, index) => { const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`; const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : ""; return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${caution}<div class="person-stats"><span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>${person.cluster_count || 0}</strong> 个人物簇</span></div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`}</div></article>`; }).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
   }
 
   function knowledgeView() {
@@ -743,6 +743,14 @@
       body = `<div class="modal-kicker">DELETE SPACE</div><h2>确认删除相册『${escapeHtml(scopeName)}』?</h2><p class="modal-lead">${summary}<br/><strong>此操作不可撤销,物理文件也会一同清理。</strong></p><div class="modal-actions"><button class="button ghost" data-action="open-space">取消</button><button class="button danger" data-action="confirm-delete-space" data-scope-id="${escapeHtml(scopeId)}" data-scope-name="${escapeHtml(scopeName)}">确认删除</button></div>`;
     } else if (modal.type === "help") {
       body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在 153 本地运行。</span></div></div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
+    } else if (modal.type === "seed-person") {
+      body = `<form id="modal-form" enctype="multipart/form-data"><div class="modal-kicker">SEED IDENTITY</div><h2>添加家庭成员</h2><p class="modal-lead">上传家庭成员的人脸照片并填写身份信息。确认后，后续导入的相册照片会自动匹配到该成员，无需人工确认。</p><input type="hidden" name="scopeId" value="${escapeHtml(state.scopeId || "home-default")}" /><label>人脸照片（可多选，建议正面清晰）<input type="file" name="files" accept="image/*" multiple required /></label><label>姓名（必填）<input name="name" placeholder="例如：妈妈" required /></label><label>家庭角色<select name="familyRole"><option value="">暂不指定</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><label>别称（逗号或顿号分隔，可选）<input name="aliases" placeholder="例如：老妈、妈妈咪" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">创建身份</button></div></form>`;
+    } else if (modal.type === "seed-person-batch") {
+      const mkRow = (i) => `<div class="seed-batch-row"><span class="seed-row-num">${i + 1}</span><input data-field="name" placeholder="姓名" required /><select data-field="familyRole"><option value="">不指定</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他</option></select><input data-field="aliases" placeholder="别称(逗号分隔)" /><input type="file" name="files" accept="image/*" multiple required /><button type="button" class="icon-button bordered" data-action="seed-remove-row" aria-label="删除行">×</button></div>`;
+      const rows = Array.from({ length: modal.rowCount || 1 }, (_, i) => mkRow(i)).join("");
+      body = `<form id="modal-form" enctype="multipart/form-data"><div class="modal-kicker">BATCH SEED IDENTITY</div><h2>批量导入家庭成员</h2><p class="modal-lead">为每个家庭成员选择人脸照片并填写身份信息，一次提交全部成员。</p><input type="hidden" name="scopeId" value="${escapeHtml(state.scopeId || "home-default")}" /><div class="seed-batch-rows" id="seed-batch-rows">${rows}</div><button type="button" class="button ghost small" data-action="add-seed-row">${icon("＋")}添加成员</button><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">批量创建</button></div></form>`;
+    } else if (modal.type === "seed-success") {
+      body = `<div class="modal-kicker">SEED COMPLETE</div><h2>${escapeHtml(modal.title || "身份创建完成")}</h2><p class="modal-lead">${escapeHtml(modal.message || "已成功创建家庭成员身份。后续导入的相册照片会自动匹配。")}</p>${modal.results ? `<div class="seed-result-list">${modal.results.map((r) => `<div class="seed-result-row ${r.error ? "error" : ""}"><strong>${escapeHtml(r.name || "未命名")}</strong>${r.error ? `<span class="error-text">${escapeHtml(r.error)}</span>` : `<span>已创建 · ${r.face_count || 0} 张人脸</span>`}</div>`).join("")}</div>` : ""}<div class="modal-actions"><button class="button primary" data-action="close-modal">完成</button></div>`;
     }
     root.innerHTML = `<div class="modal-backdrop"><div class="modal-panel"><button class="modal-back" data-action="close-modal" aria-label="返回上一页">${icon("←")}返回</button><button class="modal-close" data-action="close-modal" aria-label="关闭">×</button>${body}</div></div>`;
   }
@@ -1132,15 +1140,53 @@
         state.modal = null; state.query = command; state.view = "search"; renderShellNavigation(); return submitSearch();
       }
       if (modal.type === "invite") { const invite = await window.sentrixApi.createInvite(form.get("label")); openModal({ type: "invite", invite }); return; }
+      if (modal.type === "seed-person") {
+        await window.sentrixApi.seedPerson(form);
+        state.modal = null;
+        state.toast = "已创建家庭成员身份，后续导入会自动匹配";
+        await refreshData({ forceRender: true });
+        renderShellNavigation();
+        return;
+      }
+      if (modal.type === "seed-person-batch") {
+        const batchRows = [...document.querySelectorAll(".seed-batch-row")];
+        const manifest = [];
+        let fileIdx = 0;
+        for (const row of batchRows) {
+          const mName = (row.querySelector('[data-field="name"]')?.value || "").trim();
+          if (!mName) continue;
+          const mRole = (row.querySelector('[data-field="familyRole"]')?.value || "").trim();
+          const mAliases = (row.querySelector('[data-field="aliases"]')?.value || "").trim();
+          const fileInput = row.querySelector('input[type="file"]');
+          const fCount = fileInput?.files?.length || 0;
+          const fileIndices = Array.from({ length: fCount }, (_, k) => fileIdx + k);
+          fileIdx += fCount;
+          manifest.push({ name: mName, family_role: mRole, aliases: mAliases, file_indices: fileIndices });
+        }
+        form.set("manifest", JSON.stringify(manifest));
+        const batchResult = await window.sentrixApi.seedBatchPerson(form);
+        state.modal = null;
+        if ((batchResult.results || []).some((r) => r.error)) {
+          openModal({ type: "seed-success", title: "部分成员创建失败", results: batchResult.results });
+        } else {
+          state.toast = `已批量创建 ${(batchResult.results || []).length} 个家庭成员`;
+          await refreshData({ forceRender: true });
+          renderShellNavigation();
+        }
+        return;
+      }
+
       if (modal.type === "space-create") {
         const space = await window.sentrixApi.createMemorySpace(String(form.get("name") || "").trim());
         state.scopeId = space.id;
         window.localStorage?.setItem("sentrix.scopeId", state.scopeId);
         state.modal = null;
         state.modalHistory = [];
-        state.toast = `已创建并切换到相册“${space.name}”`;
+        state.toast = `已创建并切换到相册“${space.name}”，请先导入家庭成员身份信息`;
         await refreshData({ forceRender: true });
+        state.view = "people";
         renderShellNavigation();
+        openModal({ type: "seed-person" });
         return;
       }
       if (modal.type === "family-graph") {
@@ -1228,6 +1274,23 @@
       return openModal({ type: "family-graph", graph });
     }
     if (action === "invite") return openModal({ type: "invite" });
+    if (action === "seed-person") return openModal({ type: "seed-person" });
+    if (action === "seed-person-batch") return openModal({ type: "seed-person-batch", rowCount: 1 });
+    if (action === "add-seed-row") {
+      const container = document.getElementById("seed-batch-rows");
+      if (container && container.lastElementChild) {
+        const clone = container.lastElementChild.cloneNode(true);
+        clone.querySelectorAll("input, select").forEach((el) => { if (el.type !== "button") el.value = ""; });
+        const num = clone.querySelector(".seed-row-num");
+        if (num) num.textContent = String(container.children.length + 1);
+        container.appendChild(clone);
+      }
+      return;
+    }
+    if (action === "seed-remove-row") {
+      element.closest(".seed-batch-row")?.remove();
+      return;
+    }
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "space-manager" });

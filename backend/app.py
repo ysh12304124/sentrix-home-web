@@ -990,6 +990,93 @@ def rename_person(person_id: str, payload: dict | None = None):
     return refreshed
 
 
+@app.post("/api/people/seed", status_code=201)
+async def seed_person_identity(
+    background_tasks: BackgroundTasks,
+    name: str = Form(...),
+    familyRole: str | None = Form(None),
+    aliases: str | None = Form(None),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
+    files: list[UploadFile] = File(...),
+):
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
+    alias_list = [a.strip() for a in (aliases or "").replace("、", ",").split(",") if a.strip()]
+    face_photos = []
+    for upload in files:
+        safe_name = Path(upload.filename or "identity.bin").name
+        asset_id = make_id("asset")
+        destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
+        with destination.open("wb") as output:
+            shutil.copyfileobj(upload.file, output)
+        sha = hashlib.sha256(destination.read_bytes()).hexdigest()
+        meta = {"scope_id": scope, "source_type": "identity_seed", "content_sha256": sha}
+        store.create_asset(asset_id, safe_name, "image", str(destination), upload.content_type, destination.stat().st_size, meta, scope_id=scope)
+        observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
+        store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
+        faces = pipeline.face.detect(str(destination))
+        if not faces:
+            continue
+        best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
+        face_photos.append({**best, "asset_id": asset_id, "observation_id": observation["id"]})
+    if not face_photos:
+        raise HTTPException(status_code=422, detail="no detectable faces in uploaded photos")
+    result = store.seed_person_identity(scope, name, (familyRole or "").strip() or None, alias_list, face_photos)
+    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "aliases": result["aliases"]}
+
+
+@app.post("/api/people/seed-batch", status_code=201)
+async def seed_persons_batch(
+    background_tasks: BackgroundTasks,
+    manifest: str = Form(...),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
+    files: list[UploadFile] = File(...),
+):
+    import json as _json
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
+    members = _json.loads(manifest)
+    results = []
+    for member in members:
+        m_name = (member.get("name") or "").strip()
+        if not m_name:
+            results.append({"name": "", "error": "name is required"})
+            continue
+        m_aliases = [a.strip() for a in (member.get("aliases") or "").replace("、", ",").split(",") if a.strip()]
+        m_role = (member.get("family_role") or "").strip() or None
+        file_indices = member.get("file_indices") or []
+        member_files = [files[i] for i in file_indices if 0 <= i < len(files)]
+        if not member_files:
+            results.append({"name": m_name, "error": "no photos provided"})
+            continue
+        face_photos = []
+        for upload in member_files:
+            safe_name = Path(upload.filename or "identity.bin").name
+            asset_id = make_id("asset")
+            destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
+            with destination.open("wb") as output:
+                shutil.copyfileobj(upload.file, output)
+            sha = hashlib.sha256(destination.read_bytes()).hexdigest()
+            meta = {"scope_id": scope, "source_type": "identity_seed", "content_sha256": sha}
+            store.create_asset(asset_id, safe_name, "image", str(destination), upload.content_type, destination.stat().st_size, meta, scope_id=scope)
+            observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
+            store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
+            faces = pipeline.face.detect(str(destination))
+            if not faces:
+                continue
+            best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
+            face_photos.append({**best, "asset_id": asset_id, "observation_id": observation["id"]})
+        if not face_photos:
+            results.append({"name": m_name, "error": "no detectable faces"})
+            continue
+        result = store.seed_person_identity(scope, m_name, m_role, m_aliases, face_photos)
+        results.append({"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "aliases": result["aliases"]})
+    return {"results": results}
+
+
 @app.post("/api/persons/{person_id}/reject")
 def reject_person(person_id: str):
     # /api/people returns native person entities; reject must follow that path.

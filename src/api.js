@@ -59,6 +59,8 @@
     assistantTurn: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner") => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, viewer_id: viewerId || "owner" }) }),
     conversationMessages: (conversationId, limit = 20) => request(`/api/conversation/${encodeURIComponent(conversationId)}/messages?limit=${limit}`),
     conversationTrajectory: (conversationId, limit = 20) => request(`/api/conversation/${encodeURIComponent(conversationId)}/trajectory?limit=${limit}`),
+    seedPerson: (formData) => request("/api/people/seed", { method: "POST", body: formData }),
+    seedBatchPerson: (formData) => request("/api/people/seed-batch", { method: "POST", body: formData }),
     rejectPerson: (id) => request(`/api/persons/${encodeURIComponent(id)}/reject`, { method: "POST" }),
     stories: () => request("/api/stories"),
     createStory: (payload) => request("/api/stories", { method: "POST", body: JSON.stringify(payload) }),

@@ -4258,6 +4258,61 @@ class MemoryStore:
         self._refresh_event_participants(observation_ids)
         return {"deleted": True, "entity_id": entity_id}
 
+    def seed_person_identity(self, scope_id, name, family_role, aliases, face_photos):
+        """Pre-seed a confirmed person identity with face embeddings for guided clustering.
+
+        Creates a confirmed entity + confirmed face_cluster + face_instances from
+        identity photos. Subsequent album imports with matching faces auto-link
+        to this identity without manual confirmation.
+        """
+        entity = self.create_entity(name, "person", "confirmed", family_role, 1.0, "用户预置身份", scope_id=scope_id)
+        if aliases:
+            self.set_person_aliases(entity["id"], aliases)
+        cluster_id = make_id("cluster")
+        timestamp = now_iso()
+        best_face = max(face_photos, key=lambda f: f.get("quality", 0)) if face_photos else None
+        rep_embedding = self._normalise_vector(best_face["embedding"]) if best_face else []
+        self.connection.execute(
+            """INSERT INTO face_clusters(scope_id, id, status, entity_id, representative_embedding_json, member_count, confidence, created_at, updated_at)
+            VALUES (?, ?, 'confirmed', ?, ?, 0, 1.0, ?, ?)""",
+            (scope_id or "home-default", cluster_id, entity["id"], json_value(rep_embedding, []), timestamp, timestamp),
+        )
+        for face in face_photos:
+            instance_id = make_id("face")
+            embedding = self._normalise_vector(face.get("embedding"))
+            self.connection.execute(
+                """INSERT INTO face_instances(
+                    id, asset_id, observation_id, cluster_id, bbox_json, embedding_json,
+                    detection_confidence, quality, pose_json, area_ratio, sharpness,
+                    pose_bucket, embedding_model, embedding_version, embedding_quality_signal, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    instance_id, face["asset_id"], face["observation_id"], cluster_id,
+                    json_value(face.get("bbox"), []), json_value(embedding, []),
+                    float(face.get("confidence", 0) or 0), float(face.get("quality", 0) or 0),
+                    json_value(face.get("pose"), []), float(face.get("area_ratio", 0) or 0),
+                    float(face.get("sharpness", 0) or 0), str(face.get("pose_bucket") or "unknown"),
+                    str(face.get("embedding_model") or "unknown"), str(face.get("embedding_version") or "unknown"),
+                    float(face.get("quality_signal", 0) or 0), now_iso(),
+                ),
+            )
+            self.upsert_vector("visual", "face_instance", instance_id, embedding,
+                               str(face.get("embedding_model") or "unknown"),
+                               {"cluster_id": cluster_id, "asset_id": face["asset_id"],
+                                "observation_id": face["observation_id"],
+                                "quality": float(face.get("quality", 0) or 0),
+                                "pose_bucket": face.get("pose_bucket", "unknown")})
+        member_count = len(face_photos)
+        self.connection.execute("UPDATE face_clusters SET member_count = ? WHERE id = ?", (member_count, cluster_id))
+        if face_photos:
+            self._refresh_face_prototypes(cluster_id)
+        self.connection.commit()
+        return {
+            "entity": entity, "cluster_id": cluster_id,
+            "face_count": member_count, "name": name,
+            "aliases": self.person_aliases(entity["id"]),
+        }
+
     def reject_person_entity(self, entity_id):
         """Delete a candidate that is not a person. Confirmed people are refused."""
         return self.delete_person_candidate(entity_id)
