@@ -63,9 +63,13 @@ def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str) 
         obs_lines = []
         for tr in tool_results or []:
             compact = {k: tr.get(k) for k in (
-                "tool", "total", "satisfaction", "blocked", "inspect_text", "certainty")}
+                "tool", "total", "satisfaction", "blocked", "inspect_text", "certainty",
+                "operation", "value", "rows", "answer_type", "filters_applied")}
             if compact.get("tool") and compact["tool"] == "inspect_photo" and compact.get("satisfaction") is None:
                 compact.pop("satisfaction", None)
+            for k in ("operation", "value", "rows", "answer_type", "filters_applied"):
+                if compact.get(k) is None:
+                    compact.pop(k, None)
             obs_lines.append("- " + json.dumps(compact, ensure_ascii=False))
         user = (
             f"用户问题：{query}\n"

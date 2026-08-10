@@ -43,6 +43,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
   不要补充 rows 中没有的项目，也不要自行概括出 rows 不支持的维度。
 - search_memories 的 preview 只显示前几张；用户要求更多/下一页/还有吗 时，用 get_result_page（result_set_id 用 search_memories 返回的，page 从 1 开始）。
+- 时间、数量、首末存在性、日期、分组等确定性事实一律用 query_memory_facts，并把用户问题里的时间写进 filters.time（如 '2023年'、'2025-05'）。用户问任何年份/月份都必须如实填进 filters.time，不要省略；不要用 search_memories 代替，也不要用模型估算。
+- 按月份/地点统计分布用 query_memory_facts 的 operation=group，并填 group_by（month 或 place）。
 - search_memories 返回的 query_satisfaction 决定怎么说：
   full_support=可以确认；partial_support=部分条件确认，必须说出哪些还没确认；
   candidate_only=只是相似候选，**不能说"找到了/确认是"**，要说"找到几张接近的候选，还不能完全确认"；
@@ -319,6 +321,9 @@ class AgentRuntime:
                 break
             tool_name = action.get("tool") or ""
             arguments = action.get("arguments") or {}
+            # 模型有时把参数包在 arguments.schema 里，统一展开（工具契约兼容层）
+            if isinstance(arguments.get("schema"), dict):
+                arguments = {**arguments, **arguments["schema"]}
             public_status = action.get("public_status") or "正在处理。"
             tool_call_seq += 1
             tool_call_id = f"tool_call_{tool_call_seq}"

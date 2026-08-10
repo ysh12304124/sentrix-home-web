@@ -138,6 +138,11 @@ class TaskState:
             "blocked": observation.get("blocked"),
             "inspect_text": observation.get("observation"),
             "certainty": observation.get("certainty"),
+            "operation": observation.get("operation"),
+            "value": observation.get("value"),
+            "rows": observation.get("rows"),
+            "answer_type": observation.get("answer_type"),
+            "filters_applied": observation.get("filters_applied"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):

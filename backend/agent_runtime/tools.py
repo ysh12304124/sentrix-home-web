@@ -395,9 +395,14 @@ _INSPECT_PROMPT = """观察这张照片，输出 JSON：
 def register_tools():
     register(ToolSpec(
         name="query_memory_facts",
-        description="查询结构化记忆事实：数量、是否存在、首次/最后一次出现、日期、月份/地点分组。",
+        description=("确定性结构化事实查询，不要用模型估算。"
+                     "operation=count(数量)/exists(是否存在)/first(首次出现时间)/last(最近出现时间)/date/group(分组)。"
+                     "filters.time 写具体年份或年月，如 '2023年'、'2025-05'；不加 time 表示全部。"
+                     "operation=group 时 group_by 可填 month 或 place。"),
         input_schema={"operation": "count|exists|first|last|date|group",
-                      "filters": {"time": "", "person": "", "place": "", "media": ""}},
+                      "filters": {"time": "2023年 或 2025-05（必须填具体时间）",
+                                  "person": "", "place": "", "media": ""},
+                      "group_by": "month|place"},
         executor=_query_memory_facts, read_write="read", cost_class="cheap", readiness="ready",
     ))
     register(ToolSpec(
