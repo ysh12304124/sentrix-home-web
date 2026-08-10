@@ -54,9 +54,3 @@ def get_profile(name: str | None = None) -> ProfileConfig:
     return PROFILES.get(name or active_profile(), PROFILES["tool_loop"])
 
 
-def tool_loop_active() -> bool:
-    return get_profile().features.get("tool_loop", False)
-
-
-def tool_enabled(tool_name: str) -> bool:
-    return tool_name in get_profile().tools

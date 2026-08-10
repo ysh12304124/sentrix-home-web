@@ -52,7 +52,6 @@ maintenance_lock = threading.Lock()
 runtime_lock = threading.Lock()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
-VLM_BACKENDS = ("ollama_12b", "e2b_lora")
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
@@ -90,47 +89,6 @@ def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_loc
         result["gps"] = {"latitude": latitude, "longitude": longitude}
     return result
 
-
-def _check_ollama_health():
-    try:
-        import httpx
-        url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-        response = httpx.get(f"{url}/api/tags", timeout=10)
-        response.raise_for_status()
-        models = response.json().get("models") or []
-        ollama_model = os.getenv("OLLAMA_MODEL", "gemma4:12b")
-        for model in models:
-            if model.get("name", "").startswith(ollama_model.replace(":12b", "")):
-                return {"available": True, "model": ollama_model, "url": url}
-        return {"available": False, "model": ollama_model, "url": url, "error": "model not found in /api/tags"}
-    except Exception as exc:
-        return {"available": False, "model": os.getenv("OLLAMA_MODEL", "gemma4:12b"), "url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"), "error": str(exc)}
-
-
-def _check_e2b_health():
-    try:
-        import httpx
-        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        response = httpx.get(f"{url}/api/health", timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return {"available": data.get("status") == "ok", "url": url, "loaded": data.get("loaded", False), "model": data.get("model", ""), "error": data.get("error")}
-    except Exception as exc:
-        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100"), "error": str(exc)}
-
-
-def _fire_and_forget_post(url, payload):
-    try:
-        import httpx
-        httpx.post(url, json=payload, timeout=5)
-    except Exception:
-        pass
-
-
-def _schedule_backend_transition(backend_name):
-    if backend_name == "e2b_lora":
-        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        threading.Thread(target=_fire_and_forget_post, args=(f"{e2b_url}/admin/load", {}), daemon=True).start()
 
 
 class ImportRequest(BaseModel):
