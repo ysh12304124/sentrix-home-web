@@ -1,0 +1,880 @@
+[
+ {
+  "id": "f01",
+  "category": "exact_count",
+  "user_goal": "去年拍了多少张照片",
+  "observation": {
+   "operation": "count",
+   "value": 12,
+   "total": 12,
+   "filters_applied": {
+    "scope_id": "album2_e2b",
+    "time_range": [
+     "2025-01-01",
+     "2025-12-31"
+    ]
+   }
+  },
+  "expected": {
+   "must_include": [
+    "12"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f02",
+  "category": "exact_count",
+  "user_goal": "去年有多少个视频",
+  "observation": {
+   "operation": "media",
+   "value": 3,
+   "total": 3,
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "3"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f03",
+  "category": "exact_count",
+  "user_goal": "2024年拍了多少张照片",
+  "observation": {
+   "operation": "count",
+   "value": 0,
+   "total": 0,
+   "filters_applied": {
+    "scope_id": "album2_e2b",
+    "time_range": [
+     "2024-01-01",
+     "2024-12-31"
+    ]
+   }
+  },
+  "expected": {
+   "must_not_claim_found": true,
+   "allow_deny": true
+  }
+ },
+ {
+  "id": "f04",
+  "category": "exact_count",
+  "user_goal": "今年拍了多少张照片",
+  "observation": {
+   "operation": "count",
+   "value": 45,
+   "total": 45,
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "45"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f05",
+  "category": "exact_count",
+  "user_goal": "相册里一共多少张照片",
+  "observation": {
+   "operation": "count",
+   "value": 747,
+   "total": 747,
+   "filters_applied": {
+    "scope_id": "home-default"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "747"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f06",
+  "category": "exists",
+  "user_goal": "我在杭州拍过照片吗",
+  "observation": {
+   "operation": "exists",
+   "value": true,
+   "total": 5,
+   "filters_applied": {
+    "scope_id": "album2_e2b",
+    "place": "杭州"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "有"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f07",
+  "category": "exists",
+  "user_goal": "有没有去过水族馆",
+  "observation": {
+   "operation": "exists",
+   "value": false,
+   "total": 0,
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_not_claim_found": true,
+   "allow_deny": true
+  }
+ },
+ {
+  "id": "f08",
+  "category": "exists",
+  "user_goal": "明哥出现过吗",
+  "observation": {
+   "operation": "exists",
+   "value": true,
+   "total": 18,
+   "filters_applied": {
+    "scope_id": "album2_e2b",
+    "entity": "明哥"
+   }
+  },
+  "expected": {
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f09",
+  "category": "first_last",
+  "user_goal": "第一次拍照片是什么时候",
+  "observation": {
+   "operation": "first",
+   "value": "2023-04-12",
+   "total": 1,
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "2023"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f10",
+  "category": "first_last",
+  "user_goal": "明哥最后一次出现是什么时候",
+  "observation": {
+   "operation": "last",
+   "value": "2025-08-17",
+   "total": 18,
+   "filters_applied": {
+    "scope_id": "album2_e2b",
+    "entity": "明哥"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "2025"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f11",
+  "category": "first_last",
+  "user_goal": "最早的照片是什么时候",
+  "observation": {
+   "operation": "first",
+   "value": "2023-01-01",
+   "total": 1,
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "2023"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f12",
+  "category": "empty",
+  "user_goal": "猫咪的照片",
+  "observation": {
+   "result_set_id": "rs_x",
+   "query": "猫咪",
+   "total": 0,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "no_match",
+   "answerability": "none",
+   "condition_summary": {}
+  },
+  "expected": {
+   "must_not_claim_found": true,
+   "allow_deny": true
+  }
+ },
+ {
+  "id": "f13",
+  "category": "empty",
+  "user_goal": "去年冬天滑雪的照片",
+  "observation": {
+   "result_set_id": "rs_y",
+   "query": "滑雪",
+   "total": 0,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "no_match",
+   "answerability": "none",
+   "condition_summary": {}
+  },
+  "expected": {
+   "must_not_claim_found": true,
+   "allow_deny": true
+  }
+ },
+ {
+  "id": "f14",
+  "category": "empty",
+  "user_goal": "有没有全家福",
+  "observation": {
+   "result_set_id": "rs_z",
+   "query": "全家福",
+   "total": 0,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "no_match",
+   "answerability": "none",
+   "condition_summary": {}
+  },
+  "expected": {
+   "must_not_claim_found": true,
+   "allow_deny": true
+  }
+ },
+ {
+  "id": "f15",
+  "category": "empty",
+  "user_goal": "穿黄色衣服的照片",
+  "observation": {
+   "result_set_id": "rs_w",
+   "query": "黄色衣服",
+   "total": 0,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "no_match",
+   "answerability": "none",
+   "condition_summary": {}
+  },
+  "expected": {
+   "must_not_claim_found": true,
+   "allow_deny": true
+  }
+ },
+ {
+  "id": "f16",
+  "category": "candidate_only",
+  "user_goal": "去年十月爬山拍的照片",
+  "observation": {
+   "result_set_id": "rs_a",
+   "query": "爬山",
+   "total": 8,
+   "preview": [
+    {
+     "handle": "photo_1",
+     "captured_at": "2023-10-12T10:00:00",
+     "level": "approximate",
+     "condition_summary": {
+      "爬山": "unknown"
+     }
+    }
+   ],
+   "has_more": true,
+   "query_satisfaction": "candidate_only",
+   "answerability": "limited",
+   "condition_summary": {
+    "爬山": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f17",
+  "category": "candidate_only",
+  "user_goal": "穿红色衣服的照片",
+  "observation": {
+   "result_set_id": "rs_b",
+   "query": "红色衣服",
+   "total": 10,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "candidate_only",
+   "answerability": "limited",
+   "condition_summary": {
+    "红色衣服": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f18",
+  "category": "candidate_only",
+  "user_goal": "做饭的照片",
+  "observation": {
+   "result_set_id": "rs_c",
+   "query": "做饭",
+   "total": 6,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "candidate_only",
+   "answerability": "limited",
+   "condition_summary": {
+    "做饭": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f19",
+  "category": "candidate_only",
+  "user_goal": "水族馆的照片",
+  "observation": {
+   "result_set_id": "rs_d",
+   "query": "水族馆",
+   "total": 4,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "candidate_only",
+   "answerability": "limited",
+   "condition_summary": {
+    "水族馆": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f20",
+  "category": "candidate_only",
+  "user_goal": "猫咪的照片",
+  "observation": {
+   "result_set_id": "rs_e",
+   "query": "猫咪",
+   "total": 9,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "candidate_only",
+   "answerability": "limited",
+   "condition_summary": {
+    "猫咪": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f21",
+  "category": "candidate_only",
+  "user_goal": "穿红衣服的照片",
+  "observation": {
+   "result_set_id": "rs_f",
+   "query": "红色",
+   "total": 12,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "candidate_only",
+   "answerability": "limited",
+   "condition_summary": {
+    "红色": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f22",
+  "category": "partial",
+  "user_goal": "去年十月在上海的照片",
+  "observation": {
+   "result_set_id": "rs_g",
+   "query": "上海",
+   "total": 16,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "partial_support",
+   "answerability": "partial",
+   "condition_summary": {
+    "上海": "confirmed",
+    "十月": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_include": [
+    "上海"
+   ]
+  }
+ },
+ {
+  "id": "f23",
+  "category": "partial",
+  "user_goal": "穿黄色外套爬山的照片",
+  "observation": {
+   "result_set_id": "rs_h",
+   "query": "黄色外套",
+   "total": 7,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "partial_support",
+   "answerability": "partial",
+   "condition_summary": {
+    "黄色外套": "confirmed",
+    "爬山": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f24",
+  "category": "partial",
+  "user_goal": "2023年海边拍的照片",
+  "observation": {
+   "result_set_id": "rs_i",
+   "query": "海边",
+   "total": 5,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "partial_support",
+   "answerability": "partial",
+   "condition_summary": {
+    "海边": "confirmed",
+    "2023年": "unknown"
+   }
+  },
+  "expected": {
+   "must_disclose": true
+  }
+ },
+ {
+  "id": "f25",
+  "category": "partial",
+  "user_goal": "去年生日聚会的照片",
+  "observation": {
+   "result_set_id": "rs_j",
+   "query": "生日聚会",
+   "total": 3,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "partial_support",
+   "answerability": "partial",
+   "condition_summary": {
+    "生日聚会": "supported"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f26",
+  "category": "partial",
+  "user_goal": "全家福照片",
+  "observation": {
+   "result_set_id": "rs_k",
+   "query": "全家福",
+   "total": 11,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "partial_support",
+   "answerability": "partial",
+   "condition_summary": {
+    "全家福": "supported"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ },
+ {
+  "id": "f27",
+  "category": "omit",
+  "user_goal": "介绍一下明哥",
+  "observation": {
+   "result_set_id": "rs_l",
+   "query": "明哥",
+   "total": 8,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {
+    "明哥": "confirmed"
+   }
+  },
+  "expected": {
+   "must_not_deny": true,
+   "must_include": [
+    "明哥"
+   ]
+  }
+ },
+ {
+  "id": "f28",
+  "category": "omit",
+  "user_goal": "有没有明哥的照片",
+  "observation": {
+   "result_set_id": "rs_m",
+   "query": "明哥",
+   "total": 8,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {
+    "明哥": "confirmed"
+   }
+  },
+  "expected": {
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f29",
+  "category": "omit",
+  "user_goal": "找到猫的照片了吗",
+  "observation": {
+   "result_set_id": "rs_n",
+   "query": "猫",
+   "total": 3,
+   "preview": [],
+   "has_more": false,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {
+    "猫": "confirmed"
+   }
+  },
+  "expected": {
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f30",
+  "category": "omit",
+  "user_goal": "帮我找一下黄色外套",
+  "observation": {
+   "result_set_id": "rs_o",
+   "query": "黄色外套",
+   "total": 5,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {
+    "黄色外套": "confirmed"
+   }
+  },
+  "expected": {
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f31",
+  "category": "omit",
+  "user_goal": "有哪些在杭州的照片",
+  "observation": {
+   "result_set_id": "rs_p",
+   "query": "杭州",
+   "total": 14,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {
+    "杭州": "confirmed"
+   }
+  },
+  "expected": {
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f32",
+  "category": "all_has_more",
+  "user_goal": "把去年十月上海的照片都给我",
+  "observation": {
+   "result_set_id": "rs_q",
+   "query": "上海",
+   "total": 40,
+   "preview": [],
+   "has_more": true,
+   "remaining": 34,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {
+    "上海": "confirmed",
+    "十月": "confirmed"
+   }
+  },
+  "expected": {
+   "must_not_claim_all": true
+  }
+ },
+ {
+  "id": "f33",
+  "category": "all_has_more",
+  "user_goal": "全部照片都发给我",
+  "observation": {
+   "result_set_id": "rs_r",
+   "query": "",
+   "total": 747,
+   "preview": [],
+   "has_more": true,
+   "remaining": 741,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {}
+  },
+  "expected": {
+   "must_not_claim_all": true
+  }
+ },
+ {
+  "id": "f34",
+  "category": "all_has_more",
+  "user_goal": "还有更多吗",
+  "observation": {
+   "result_set_id": "rs_s",
+   "query": "上海",
+   "total": 16,
+   "preview": [],
+   "has_more": true,
+   "remaining": 10,
+   "query_satisfaction": "full_support",
+   "answerability": "full",
+   "condition_summary": {
+    "上海": "confirmed"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "还有"
+   ],
+   "must_not_claim_all": true
+  }
+ },
+ {
+  "id": "f35",
+  "category": "group",
+  "user_goal": "去年哪些月份拍过照片",
+  "observation": {
+   "operation": "group",
+   "value": null,
+   "total": 40,
+   "rows": [
+    {
+     "group": "2025-01",
+     "count": 5
+    },
+    {
+     "group": "2025-03",
+     "count": 8
+    },
+    {
+     "group": "2025-09",
+     "count": 12
+    },
+    {
+     "group": "2025-12",
+     "count": 15
+    }
+   ],
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "1",
+    "3",
+    "9",
+    "12"
+   ],
+   "must_not_include": [
+    "2月",
+    "4月",
+    "5月",
+    "6月",
+    "7月",
+    "8月",
+    "10月",
+    "11月"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f36",
+  "category": "group",
+  "user_goal": "去年主要在哪些地方拍照",
+  "observation": {
+   "operation": "group",
+   "value": null,
+   "total": 40,
+   "rows": [
+    {
+     "group": "杭州",
+     "count": 18
+    },
+    {
+     "group": "上海",
+     "count": 22
+    }
+   ],
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_include": [
+    "杭州",
+    "上海"
+   ],
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f37",
+  "category": "group",
+  "user_goal": "照片都拍在哪些月份",
+  "observation": {
+   "operation": "group",
+   "value": null,
+   "total": 0,
+   "rows": [],
+   "filters_applied": {
+    "scope_id": "album2_e2b"
+   }
+  },
+  "expected": {
+   "must_not_claim_found": true,
+   "allow_deny": true
+  }
+ },
+ {
+  "id": "f38",
+  "category": "group",
+  "user_goal": "2023年每个月有多少张照片",
+  "observation": {
+   "operation": "group",
+   "value": null,
+   "total": 10,
+   "rows": [
+    {
+     "group": "2023-10",
+     "count": 10
+    }
+   ],
+   "filters_applied": {
+    "scope_id": "album2_e2b",
+    "time_range": [
+     "2023-01-01",
+     "2023-12-31"
+    ]
+   }
+  },
+  "expected": {
+   "must_include": [
+    "10"
+   ],
+   "must_not_include": [
+    "2月",
+    "3月",
+    "4月",
+    "5月",
+    "6月",
+    "7月",
+    "8月",
+    "9月",
+    "11月",
+    "12月"
+   ]
+  }
+ },
+ {
+  "id": "f39",
+  "category": "conflicting",
+  "user_goal": "我在杭州拍过照片吗",
+  "observation": {
+   "operation": "exists",
+   "value": true,
+   "total": 5,
+   "filters_applied": {
+    "scope_id": "album2_e2b",
+    "place": "杭州"
+   }
+  },
+  "expected": {
+   "must_not_deny": true
+  }
+ },
+ {
+  "id": "f40",
+  "category": "conflicting",
+  "user_goal": "去年十月爬山拍的照片",
+  "observation": {
+   "result_set_id": "rs_t",
+   "query": "爬山",
+   "total": 8,
+   "preview": [],
+   "has_more": true,
+   "query_satisfaction": "partial_support",
+   "answerability": "partial",
+   "condition_summary": {
+    "爬山": "contradicted",
+    "十月": "confirmed"
+   }
+  },
+  "expected": {
+   "must_disclose": true,
+   "must_not_claim_confirmed": true
+  }
+ }
+]

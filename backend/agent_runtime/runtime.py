@@ -25,9 +25,10 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 
 规则：
 - 需要家庭记忆事实时调用工具；不需要时直接 final。
-- 每次只输出一个 JSON 对象（不要 markdown、不要解释、不要多余文字）：
+- 每次只输出一个 JSON 对象，直接输出，不要用 markdown 代码块（不要 ```）、不要解释、不要多余文字：
   {{"action":"tool_call","tool":"...","arguments":{{...}},"public_status":"..."}}
   或 {{"action":"final","answer":"...","evidence_refs":["tool_call_1", ...]}}
+- 不要重复调用相同的工具和参数：同一轮里相同 tool+arguments 只允许一次，重复会被拒绝。
 - final 时必须用 evidence_refs 列出你实际引用的工具调用编号（本轮工具调用会按顺序编号 tool_call_1、tool_call_2 …；纯聊天不引用）。
 - 只使用工具返回的事实回答，不编造数字或细节；工具没有返回的内容不要编造。
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
@@ -163,6 +164,7 @@ class AgentRuntime:
         max_parse_retries = 1
         guard_retries = 0
         max_guard_retries = 1
+        seen_tool_calls = set()
         while True:
             if not turn.budget.can_model_step():
                 turn.status = "partial" if turn.steps else "timeout"
@@ -236,6 +238,13 @@ class AgentRuntime:
             arguments = action.get("arguments") or {}
             public_status = action.get("public_status") or "正在处理。"
             tool_call_id = f"tool_call_{len(turn.steps)}"
+            call_signature = json.dumps({"tool": tool_name, "arguments": arguments},
+                                        ensure_ascii=False, sort_keys=True)
+            if call_signature in seen_tool_calls:
+                turn.status = "partial" if turn.steps else "error"
+                turn.reason = f"tool_denied:{tool_name}:duplicate_tool_call"
+                break
+            seen_tool_calls.add(call_signature)
             spec = get_tool(tool_name)
             if spec is None:
                 turn.steps.append({"type": "tool", "tool": tool_name, "status": "error",

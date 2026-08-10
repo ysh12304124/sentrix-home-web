@@ -18,7 +18,22 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
 
-def build_runtime(base_url, scope_id="home-default"):
+ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["tool_call", "final"]},
+        "tool": {"type": "string",
+                 "enum": ["query_memory_facts", "search_memories", "get_original_photos", "inspect_photo"]},
+        "arguments": {"type": "object"},
+        "public_status": {"type": "string"},
+        "answer": {"type": "string"},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["action"],
+}
+
+
+def build_runtime(base_url, scope_id="home-default", guided_json=False):
     from backend.agent_runtime.runtime import AgentRuntime
     from backend.agent_runtime import tools as runtime_tools
     from backend.db import MemoryStore
@@ -42,12 +57,18 @@ def build_runtime(base_url, scope_id="home-default"):
     def chat_fn(messages):
         # 把 messages 渲染成单 prompt 调 12B（shadow 阶段用 OpenAI 兼容 chat）
         import urllib.request
-        body = json.dumps({
+        payload = {
             "model": "gemma4-12b-it",
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 800,
-        }).encode()
+            "max_tokens": 1500,
+        }
+        if guided_json:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "action", "schema": ACTION_SCHEMA},
+            }
+        body = json.dumps(payload).encode()
         req = urllib.request.Request(base_url + "/chat/completions", data=body,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -65,10 +86,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--base", default="http://127.0.0.1:8100/v1")
     ap.add_argument("--scope", default="home-default")
+    ap.add_argument("--guided-json", action="store_true")
     args = ap.parse_args()
 
     cases = json.load(open(args.cases, encoding="utf-8"))
-    runtime = build_runtime(args.base, scope_id=args.scope)
+    runtime = build_runtime(args.base, scope_id=args.scope, guided_json=args.guided_json)
     results = []
     for case in cases:
         t0 = time.time()

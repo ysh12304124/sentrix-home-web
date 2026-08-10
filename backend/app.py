@@ -1220,7 +1220,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             "model": getattr(gamma, "model", "gemma4-12b-it"),
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 800,
+            "max_tokens": 1500,
         }
         response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
                               timeout=120)
