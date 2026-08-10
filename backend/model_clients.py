@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 from .face_embeddings import AdaFaceAdapter, FaceEmbeddingUnavailable, MagFaceAdapter, compute_face_quality
+from .geocoding import format_gps_prefix
 
 
 def align_face_crop(image, bbox, landmarks=None):
@@ -741,14 +742,10 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
         return parsed
 
     def _event_gps_prefix(self, event, observations):
-        """Extract GPS-derived location from observation assets via the store.
-        Returns a location string like "\u676d\u5dde\u5e02\u897f\u6e56\u533a" or ""."""
-        districts = set()
-        cities = set()
+        """Extract GPS-derived location from observation assets via the store."""
         observation_ids = [item.get("id") for item in observations if item.get("id")]
         if not observation_ids or not self._store:
             return ""
-        # Look up assets via observations -> asset_id -> reverse_geocode
         placeholders = ",".join("?" for _ in observation_ids)
         try:
             rows = self._store._rows(
@@ -759,25 +756,16 @@ facts 每项为 subject、predicate、object、confidence；没有明确证据�
             )
         except Exception:
             return ""
+        prefixes = []
         for row in rows:
             try:
                 geo = json.loads(row["geo"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 continue
-            if not isinstance(geo, dict):
-                continue
-            city = str(geo.get("city") or "").strip()
-            district = str(geo.get("district") or "").strip()
-            if city:
-                cities.add(city)
-            if district:
-                districts.add(district)
-        parts = []
-        if cities:
-            parts.extend(sorted(cities))
-        if districts:
-            parts.extend(d for d in sorted(districts) if d not in cities)
-        return "".join(parts[:2])
+            prefix = format_gps_prefix(geo)
+            if prefix and prefix not in prefixes:
+                prefixes.append(prefix)
+        return prefixes[0] if prefixes else ""
 
     def summarize_event(self, event, observations):
         semantic_place = _event_place(event, observations)
