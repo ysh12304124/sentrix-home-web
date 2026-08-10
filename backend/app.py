@@ -504,6 +504,21 @@ def switch_model_profile(request: ModelSwitchRequest):
     return _run_vllm_switch(request)
 
 
+@app.post("/api/model-profiles/sync-runtime")
+def sync_model_runtime():
+    """Sync gamma client to the currently running vLLM model without triggering a restart."""
+    runtime = _apply_vllm_profile_to_runtime_from_state()
+    return {"accepted": True, "runtime": runtime}
+
+
+def _apply_vllm_profile_to_runtime_from_state():
+    """Read vLLM state and update gamma client. No model lifecycle changes."""
+    registry = _load_vllm_registry()
+    state = _load_vllm_state(registry) or {}
+    profile_id = state.get("profile") or ""
+    return _apply_vllm_profile_to_runtime(profile_id, state=state)
+
+
 
 
 @app.get("/api/geo-places")
