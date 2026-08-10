@@ -64,6 +64,9 @@
     vlmBackendOptions: null,
     modal: null,
     modalHistory: [],
+    storyGenerating: false,
+    storyError: false,
+    storyDraftEventIds: [],
     eventFilter: "all",
     assetFilter: "all",
     assetSort: "newest",
@@ -409,7 +412,19 @@
     if (_evtTimes.length >= 2) { const _d = (new Date(_evtTimes[_evtTimes.length-1]) - new Date(_evtTimes[0])) / 86400000; if (_d > 180) _spanText = "跨越 " + (_d/365).toFixed(1) + " 年"; else if (_d > 30) _spanText = "跨越 " + Math.ceil(_d/30) + " 个月"; else _spanText = "跨越 " + Math.ceil(_d) + " 天"; }
     const _places = {}; const _people = {};
     ((state.stories[0]||{}).event_ids||[]).forEach(id => { const ev = (state.events||[]).find(x=>x.id===id); if (!ev) return; (ev.place_names||[]).forEach(p => _places[p] = (_places[p]||0)+1); (ev.companion_ids||[]).forEach(pid => { const ent = (state.entities||[]).find(e=>e.id===pid); const nm = ent?.canonical_name || "未知"; _people[nm] = (_people[nm]||0)+1; }); });
-    return `${pageHeader("家庭表达 / 故事工作室", "把真实事件整理成家人愿意一起看的故事。", "故事只引用你选择的事件和证据；标题、章节和内容保存为本地草稿。", `<button class="button primary" data-action="create-story">${icon("＋")}新建故事</button>`)}<section class="story-layout">${state.stories.length ? `<div class="story-canvas"><div class="story-canvas-label">选择一个故事查看</div><div class="story-title">${escapeHtml(state.stories[0].title)}</div><div class="story-meta" style="font-size:12px;color:#9A9486;margin:4px 0 12px;letter-spacing:0.5px;">${(state.stories[0].event_ids||[]).length} 个事件 · ${(state.stories[0].event_ids||[]).reduce((s,eid)=>{const ev=(state.events||[]).find(x=>x.id===eid);return s+((ev?.observations||[]).length||((ev?.asset_ids||[]).length)||0);},0)} 张照片 · ${(state.stories[0].outline||[]).length} 个章节${_spanText ? " · " + _spanText : ""}</div>${(Object.keys(_places).length||Object.keys(_people).length) ? `<div class="story-keywords" style="margin:8px 0 12px;display:flex;flex-wrap:wrap;gap:6px;">${Object.entries(_places).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<span style="font-size:11px;padding:2px 8px;background:rgba(94,122,24,0.12);color:#5E7A18;border-radius:10px;">${escapeHtml(k)} ${v}</span>`).join("")}${Object.entries(_people).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<span style="font-size:11px;padding:2px 8px;background:rgba(199,112,14,0.12);color:#C7700E;border-radius:10px;">${escapeHtml(k)} ${v}</span>`).join("")}</div>` : ""}${((state.stories[0].tags||[]).length) ? `<div class="story-user-tags" style="margin:4px 0 12px;display:flex;flex-wrap:wrap;gap:6px;">${(state.stories[0].tags||[]).map(t=>`<span style="font-size:11px;padding:2px 8px;background:rgba(28,29,25,0.08);color:#1c1d19;border-radius:10px;">${escapeHtml(t)}</span>`).join("")}</div>` : ""}<div class="story-caption">${escapeHtml(state.stories[0].content || "这个故事还没有内容。")}</div></div><aside class="story-editor"><div class="panel-title"><span>STORY DRAFTS</span><span class="draft-badge">${state.stories.length} 个</span></div>${state.stories.map((story) => `<div class="chapter"><button class="chapter-open" data-action="edit-story" data-story-id="${escapeHtml(story.id)}"><span>●</span><strong>${escapeHtml(story.title)}</strong>${icon("→", "muted")}</button><button class="icon-button bordered" data-action="delete-story" data-story-id="${escapeHtml(story.id)}" aria-label="删除故事">×</button></div>`).join("")}<button class="button primary full" data-action="create-story">新建本地草稿 ${icon("→")}</button></aside></section>` : `<section class="empty-search"><div class="empty-symbol">▤</div><h2>还没有故事草稿</h2><p>先导入并形成事件，再选择真实事件生成故事草稿。</p><button class="button primary" data-action="create-story">${icon("＋")}创建空白故事</button></section>`}`;
+    if (state.storyGenerating) {
+      const _ids = state.storyDraftEventIds || [];
+      const _evs = _ids.map(id => (state.events||[]).find(x=>x.id===id)).filter(Boolean);
+      const _days = new Set();
+      _evs.forEach(e => { if (e?.time_start) _days.add(String(e.time_start).slice(0,10)); if (e?.time_end) _days.add(String(e.time_end).slice(0,10)); });
+      const _photos = _evs.reduce((s,e)=>s+((e?.observations||[]).length||((e?.asset_ids||[]).length)||0),0);
+      const _shimmer = (w) => `<div style="height:14px;width:${w};border-radius:6px;background:linear-gradient(90deg,#ecece6,#f6f6f0,#ecece6);background-size:200% 100%;animation:storyShimmer 1.2s infinite;margin-top:8px;"></div>`;
+      const _hint = state.storyError
+        ? "故事生成失败，请稍后重试。"
+        : `AI 正在根据 ${_ids.length} 个事件撰写故事，约需 10-30 秒…`;
+      return `${pageHeader("家庭表达 / 故事工作室", "把真实事件整理成家人愿意一起看的故事。", "故事只引用你选择的事件和证据；标题、章节和内容保存为本地草稿。", `<button class="button primary" data-action="create-story">${icon("＋")}新建故事</button>`)}<style>@keyframes storyShimmer{to{background-position:-200% 0}}</style><section class="story-layout"><div class="story-canvas"><div class="story-canvas-label">${state.storyError ? "生成失败" : "正在生成故事"}</div><div class="story-meta" style="font-size:12px;color:#9A9486;margin:4px 0 12px;letter-spacing:0.5px;">${_days.size} 天 · ${_ids.length} 个事件 · ${_photos} 张照片</div><div style="margin:20px 0 8px;"><div style="height:22px;width:68%;border-radius:6px;background:linear-gradient(90deg,#ecece6,#f6f6f0,#ecece6);background-size:200% 100%;animation:storyShimmer 1.2s infinite;"></div>${_shimmer("94%")}${_shimmer("87%")}${_shimmer("91%")}${_shimmer("60%")}</div><div style="margin-top:18px;font-size:13px;color:#9A9486;">${_hint}${state.storyError ? ` <button class="button primary" data-action="retry-story" style="margin-left:10px;padding:6px 14px;">重试</button>` : ""}</div></div><aside class="story-editor"><div class="panel-title"><span>STORY DRAFTS</span><span class="draft-badge">${state.stories.length} 个</span></div>${state.stories.map((story) => `<div class="chapter"><button class="chapter-open" data-action="edit-story" data-story-id="${escapeHtml(story.id)}"><span>●</span><strong>${escapeHtml(story.title)}</strong>${icon("→", "muted")}</button><button class="icon-button bordered" data-action="delete-story" data-story-id="${escapeHtml(story.id)}" aria-label="删除故事">×</button></div>`).join("")}<button class="button primary full" data-action="create-story">新建本地草稿 ${icon("→")}</button></aside></section>`;
+    }
+    return `${pageHeader("家庭表达 / 故事工作室", "把真实事件整理成家人愿意一起看的故事。", "故事只引用你选择的事件和证据；标题、章节和内容保存为本地草稿。", `<button class="button primary" data-action="create-story">${icon("＋")}新建故事</button>`)}<section class="story-layout">${state.stories.length ? `<div class="story-canvas"><div class="story-canvas-label">选择一个故事查看</div><div class="story-title">${escapeHtml(state.stories[0].title)}</div><div class="story-meta" style="font-size:12px;color:#9A9486;margin:4px 0 12px;letter-spacing:0.5px;">${(()=>{const es=(state.stories[0].event_ids||[]).map(id=>(state.events||[]).find(x=>x.id===id)).filter(Boolean);const ds=new Set();es.forEach(e=>{if(e?.time_start)ds.add(String(e.time_start).slice(0,10));if(e?.time_end)ds.add(String(e.time_end).slice(0,10));});return ds.size;})()} 天 · ${(state.stories[0].event_ids||[]).length} 个事件 · ${(state.stories[0].event_ids||[]).reduce((s,eid)=>{const ev=(state.events||[]).find(x=>x.id===eid);return s+((ev?.observations||[]).length||((ev?.asset_ids||[]).length)||0);},0)} 张照片${_spanText ? " · " + _spanText : ""}</div>${(Object.keys(_places).length||Object.keys(_people).length) ? `<div class="story-keywords" style="margin:8px 0 12px;display:flex;flex-wrap:wrap;gap:6px;">${Object.entries(_places).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<span style="font-size:11px;padding:2px 8px;background:rgba(94,122,24,0.12);color:#5E7A18;border-radius:10px;">${escapeHtml(k)} ${v}</span>`).join("")}${Object.entries(_people).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<span style="font-size:11px;padding:2px 8px;background:rgba(199,112,14,0.12);color:#C7700E;border-radius:10px;">${escapeHtml(k)} ${v}</span>`).join("")}</div>` : ""}${((state.stories[0].tags||[]).length) ? `<div class="story-user-tags" style="margin:4px 0 12px;display:flex;flex-wrap:wrap;gap:6px;">${(state.stories[0].tags||[]).map(t=>`<span style="font-size:11px;padding:2px 8px;background:rgba(28,29,25,0.08);color:#1c1d19;border-radius:10px;">${escapeHtml(t)}</span>`).join("")}</div>` : ""}<div class="story-caption">${escapeHtml(state.stories[0].content || "这个故事还没有内容。")}</div></div><aside class="story-editor"><div class="panel-title"><span>STORY DRAFTS</span><span class="draft-badge">${state.stories.length} 个</span></div>${state.stories.map((story) => `<div class="chapter"><button class="chapter-open" data-action="edit-story" data-story-id="${escapeHtml(story.id)}"><span>●</span><strong>${escapeHtml(story.title)}</strong>${icon("→", "muted")}</button><button class="icon-button bordered" data-action="delete-story" data-story-id="${escapeHtml(story.id)}" aria-label="删除故事">×</button></div>`).join("")}<button class="button primary full" data-action="create-story">新建本地草稿 ${icon("→")}</button></aside></section>` : `<section class="empty-search"><div class="empty-symbol">▤</div><h2>还没有故事草稿</h2><p>先导入并形成事件，再选择真实事件生成故事草稿。</p><button class="button primary" data-action="create-story">${icon("＋")}创建空白故事</button></section>`}`;
   }
 
   function renderUploadQueue() {
@@ -1113,7 +1128,28 @@
         await window.sentrixApi.splitFaceCluster(modal.cluster.id, modal.sample.id);
         state.toast = "已拆出新人物簇，原始证据仍保留";
       }
-      if (modal.type === "story-create") await window.sentrixApi.createStory({ title: form.get("title"), content: form.get("content"), event_ids: form.getAll("event_ids"), tags: (form.get("tags")||"").split(",").map(s=>s.trim()).filter(Boolean) });
+      if (modal.type === "story-create") {
+        const storyEventIds = form.getAll("event_ids");
+        state.storyGenerating = true;
+        state.storyError = false;
+        state.storyDraftEventIds = storyEventIds;
+        state.modal = null;
+        state.modalHistory = [];
+        state.view = "stories";
+        renderShellNavigation();
+        try {
+          await window.sentrixApi.createStory({ title: form.get("title") || "", content: "", event_ids: storyEventIds, tags: (form.get("tags")||"").split(",").map(s=>s.trim()).filter(Boolean) });
+          await refreshData({ forceRender: true });
+          state.toast = "故事已生成";
+        } catch (error) {
+          state.storyError = true;
+          state.toast = `故事生成失败：${error.message}`;
+        } finally {
+          state.storyGenerating = false;
+          renderShellNavigation();
+        }
+        return;
+      }
       if (modal.type === "story-edit") await window.sentrixApi.updateStory(modal.story.id, { title: form.get("title"), content: form.get("content"), event_ids: form.getAll("event_ids"), tags: (form.get("tags")||"").split(",").map(s=>s.trim()).filter(Boolean) });
       if (modal.type === "command") {
         const command = String(form.get("command") || "").trim();
@@ -1181,6 +1217,24 @@
     if (action === "open-observation") { const observation = await window.sentrixApi.observation(element.dataset.observationId); return openAsset(observation.asset_id); }
     if (action === "create-event") return openModal({ type: "event-create", event: {} });
     if (action === "create-story") return openModal({ type: "story-create", story: {} });
+    if (action === "retry-story") {
+      const ids = state.storyDraftEventIds || [];
+      state.storyGenerating = true;
+      state.storyError = false;
+      renderShellNavigation();
+      try {
+        await window.sentrixApi.createStory({ title: "", content: "", event_ids: ids, tags: [] });
+        await refreshData({ forceRender: true });
+        state.toast = "故事已重新生成";
+      } catch (error) {
+        state.storyError = true;
+        state.toast = `故事生成失败：${error.message}`;
+      } finally {
+        state.storyGenerating = false;
+        renderShellNavigation();
+      }
+      return;
+    }
     if (action === "confirm-trip") { const trip = state.trips.find((item) => item.id === element.dataset.tripId); return trip && openModal({ type: "trip-confirm", trip }); }
     if (action === "reject-trip") { await window.sentrixApi.rejectTrip(element.dataset.tripId); state.toast = "已标记为非行程，原始事件和照片证据仍保留"; return refreshData(); }
     if (action === "edit-story") { const story = state.stories.find((item) => item.id === element.dataset.storyId); return openModal({ type: "story-edit", story }); }

@@ -1083,12 +1083,116 @@ def create_story(payload: dict):
     event_ids = payload.get("event_ids") or []
     if event_ids and not payload.get("content"):
         evidence = []
+        person_freq = {}
+        self_names = set()
+        place_freq = {}
+        days = set()
+        time_values = []
+        object_set = set()
         for event_id in event_ids:
             detail = store.get_event_detail(event_id)
-            if detail:
-                evidence.append({"event": detail["event"], "observations": [{"id": item["id"], "caption": item.get("caption"), "transcript": item.get("transcript"), "asset_id": item.get("asset_id"), "people": [{"name": p.get("name"), "is_self": bool(store._row("SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'", (p.get("entity_id"),)))} for p in (item.get("people") or []) if p.get("entity_id")]} for item in detail["observations"]]})
+            if not detail:
+                continue
+            observations = []
+            for item in detail["observations"]:
+                asset = item.get("asset") or {}
+                people = []
+                for p in (item.get("people") or []):
+                    if not p.get("entity_id"):
+                        continue
+                    is_self = bool(store._row(
+                        "SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'",
+                        (p.get("entity_id"),),
+                    ))
+                    people.append({"name": p.get("name"), "is_self": is_self})
+                    name = p.get("name") or "未知"
+                    person_freq[name] = person_freq.get(name, 0) + 1
+                    if is_self:
+                        self_names.add(name)
+                observations.append({
+                    "id": item.get("id"),
+                    "caption": item.get("caption"),
+                    "transcript": item.get("transcript"),
+                    "captured_at": item.get("captured_at"),
+                    "place": item.get("place"),
+                    "objects": item.get("objects"),
+                    "captured_location": asset.get("captured_location"),
+                    "people": people,
+                })
+                captured = item.get("captured_at")
+                if captured:
+                    days.add(str(captured)[:10])
+                    time_values.append(str(captured))
+                for obj in (item.get("objects") or []):
+                    label = obj if isinstance(obj, str) else (obj.get("label") or obj.get("primary") or "")
+                    if label:
+                        object_set.add(label)
+                location = asset.get("captured_location")
+                if location:
+                    try:
+                        lat, lon = (float(part) for part in str(location).replace(" ", "").split(","))
+                        cluster = f"{round(lat, 1)},{round(lon, 1)}"
+                    except Exception:
+                        cluster = str(location)
+                else:
+                    cluster = item.get("place") or "未知"
+                place_freq[cluster] = place_freq.get(cluster, 0) + 1
+            event_start = (detail["event"] or {}).get("time_start")
+            event_end = (detail["event"] or {}).get("time_end")
+            if event_start:
+                days.add(str(event_start)[:10])
+            if event_end:
+                days.add(str(event_end)[:10])
+            evidence.append({"event": detail["event"], "observations": observations})
         if evidence:
-            prompt = """根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。严格返回 JSON：title、content、outline（数组）。使用中文，content 至少 100 字、上不封顶（照片多则内容长），在叙事中自然融入时间跨度、场景数量、记录时长、本周新场景、物件总数、陪伴人物等统计维度，以出现最多的人和"我"为主语主角。注意：证据中 is_self=true 的人物是相册主人"我"本人，请用第一人称"我"指代，绝不把自己描述成"我与自己相伴"之类的陪伴对象。证据：""" + str(evidence)
+            photo_count = sum(len(ev["observations"]) for ev in evidence)
+            event_count = len(evidence)
+            days_count = len(days)
+            object_count = len(object_set)
+            time_span = f"{min(time_values)[:10]} 至 {max(time_values)[:10]}" if len(time_values) > 1 else (time_values[0][:10] if time_values else "")
+            # topPerson:排除相册主人(我)后的最高频陪伴人物;叙事主语=我+topPerson
+            non_self_freq = {key: value for key, value in person_freq.items() if key not in self_names}
+            top_person = max(non_self_freq, key=non_self_freq.get) if non_self_freq else None
+            subject = f"我和{top_person}" if top_person else "我"
+            # 地点组:GPS聚类给字母标签,附经纬度,不编地名
+            cluster_list = sorted(place_freq.items(), key=lambda item: -item[1])
+            cluster_labels = {}
+            place_lines = []
+            for index, (cluster, count) in enumerate(cluster_list):
+                label = f"地点组{chr(ord('A') + index)}"
+                cluster_labels[cluster] = label
+                place_lines.append(f"{label}(经纬度{cluster},{count}张)")
+            top_label = cluster_labels[cluster_list[0][0]] if cluster_list else ""
+            other_labels = "、".join(cluster_labels[c] for c, _ in cluster_list[1:]) or "无"
+            # 代表事件一句话,给叙事具体画面(防空洞)
+            representative = []
+            for ev in evidence:
+                e = ev["event"] or {}
+                one_line = (e.get("summary") or "").strip() or (e.get("title") or "").strip()
+                if one_line and len(representative) < 3:
+                    representative.append(one_line[:80])
+            stats = (
+                f"时间跨度:{time_span or '未知'};天数:{days_count}天;事件数:{event_count}个;"
+                f"照片数:{photo_count}张;物件数:{object_count}件;"
+                f"地点分布:{'、'.join(place_lines) or '无'};"
+                f"出现最多的地点组(叙述需占约2/3篇幅):{top_label};其他地点组合计约1/3:{other_labels};"
+                f"相册主人(我):{'、'.join(sorted(self_names)) or '无'};陪伴人物:{top_person or '无'}"
+            )
+            prompt = (
+                "根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。\n"
+                "统计概要(系统已算出,仅供叙事参考,不得改动或编造):\n" + stats + "\n"
+                "规则:\n"
+                "1. 严格返回JSON:title、content、outline(数组)。使用中文,content约400字(照片多可略长)。\n"
+                "2. 叙事以" + subject + "为主语主角,第一人称\"我\"。"
+                + ("陪伴人物" + top_person + "与\"我\"是并肩关系,绝不把\"我\"写成\"我与自己相伴\"。"
+                   if top_person else "叙述\"我\"自身的经历,第一人称。") + "\n"
+                "3. 证据中is_self=true的人物=相册主人\"我\"本人。\n"
+                "4. 出现最多的地点组要占叙事约2/3篇幅,其他地点组合计约1/3。\n"
+                "5. 地点可依据经纬度合理推断城市(如22.5,114.1疑似深圳)并使用,但不得编造未经证据支持的具体地名(商场/餐厅/景点等);若不确定就笼统表述。\n"
+                "6. 参考这些代表性画面,让叙事有具体细节而非统计堆砌:\n"
+                + "\n".join("· " + text for text in representative) + "\n"
+                "证据:" + str(evidence)
+            )
             try:
                 generated = parse_json_response(gamma.chat(prompt))
                 payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
