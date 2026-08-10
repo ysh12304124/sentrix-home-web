@@ -49,7 +49,8 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   const source = fs.readFileSync(path.join(root, "server.js"), "utf8");
   assert.doesNotMatch(source, /COGNEE_BASE_URL|mockSearch|function handleApi/);
   assert.match(source, /return proxyBackend\(req, res, url\);/);
-  assert.match(source, /127\.0\.0\.1:8091/, "web must use the Agent-capable API by default");
+  assert.match(source, /SENTRIX_BACKEND_URL/, "backend must be overridable via SENTRIX_BACKEND_URL");
+  assert.match(source, /127\.0\.0\.1:11001/, "default backend is the project-local API reading ./data/sentrix.db");
   assert.match(source, /\/api\/model-profiles\/switch/);
   assert.match(source, /1_000_000/, "model switching must outlive the vLLM ready timeout");
   assert.match(source, /cache-control.*no-cache/s, "static assets must be revalidated after UI fixes");
@@ -61,8 +62,8 @@ test("settings exposes the four benchmark model profiles through the switch API"
   for (const profile of ["gemma4-12b-it", "gemma4-e2b-it", "gemma4-e2b-it-lora-v2", "qwen3.5-0.8b-it"]) {
     assert.match(appSource, new RegExp(profile.replace(/[.]/g, "\\.")));
   }
-  for (const label of ["Gemma-4-12B", "Gemma-4-E2B 蒸馏前", "Gemma-4-E2B 蒸馏后（加 LoRA 头）", "Qwen-3.5-0.8B"]) {
-    assert.match(appSource, new RegExp(label.replace(/[()]/g, "\\$&")));
+  for (const label of ["Gemma-4-12B", "Gemma-4-E2B 蒸馏前", "Gemma-4-E2B 蒸馏后+LoRA", "Qwen-3.5-0.8B"]) {
+    assert.match(appSource, new RegExp(label.replace(/[()+. ]/g, "\\$&")));
   }
   assert.match(apiSource, /getModelProfiles/);
   assert.match(apiSource, /switchModelProfile/);
@@ -75,9 +76,11 @@ test("settings exposes the four benchmark model profiles through the switch API"
   assert.doesNotMatch(appSource, /\["gemma4:12b", "gemma4-12b-it"\]/, "an env default must not be presented as a running profile");
 
   const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
-  assert.match(backendSource, /_managed_vllm_state/);
-  assert.match(backendSource, /verify_service=True/);
-  assert.match(backendSource, /runtime verification failed/);
+  assert.match(backendSource, /_load_vllm_state/, "runtime state is read from the vLLM registry state file");
+  assert.match(backendSource, /_current_model_runtime/);
+  assert.match(backendSource, /--wait-ready/, "model switch waits for the vLLM endpoint before activating");
+  assert.match(backendSource, /--ready-timeout/);
+  assert.match(backendSource, /vLLM switch failed/);
   assert.match(backendSource, /runtime\.get\("profile"\)/);
 });
 
