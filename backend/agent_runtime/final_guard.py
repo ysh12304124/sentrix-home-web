@@ -20,6 +20,7 @@ class FinalGuard:
         problems = []
         answer = answer or ""
         task_state = task_state or {}
+        problems.extend(self._check_faithfulness(answer, task_state))
         # 0. query_memory_facts 事实一致性：final 必须包含工具返回的 value
         if task_state.get("last_tool") == "query_memory_facts":
             op = task_state.get("fact_operation")
@@ -62,6 +63,43 @@ class FinalGuard:
         if task_state.get("fulfillment") == "empty" and not re.search(r"没|未", answer):
             if re.search(r"找到|为您找到|有.{0,10}(照片|记录)", answer):
                 problems.append("fabrication_from_empty")
+        return problems
+
+    @staticmethod
+    def _check_faithfulness(answer: str, task_state: dict) -> list[str]:
+        """B2.1 Observation Faithfulness：omission / certainty upgrade / disclosure。"""
+        problems = []
+        answer = (answer or "").strip()
+        refs = set(task_state.get("evidence_refs") or [])
+        tool_results = task_state.get("tool_results") or []
+        satisfaction = task_state.get("search_satisfaction")
+        condition_summary = task_state.get("search_condition_summary") or {}
+        denies = bool(__import__("re").search(
+            r"没(?:有)?找到|未找到|不存在|没有(?:任何|符合|相关|一张|一个|一条)?(?:照片|记录|回忆|记忆)|查无", answer))
+        # 1) 有结果却声称没有：非空结果 + 明确否认存在 → omission（与是否引用无关）
+        for tr in tool_results:
+            total = tr.get("total")
+            if total is None:
+                continue
+            if total > 0 and denies and satisfaction != "no_match":
+                problems.append(f"omission_conflict:tool={tr.get('tool')},total={total}")
+            if tr.get("tool_call_id") in refs and total == 0 and not denies:
+                if __import__("re").search(r"找到|为您找到|有.{0,10}(照片|记录)", answer):
+                    problems.append("fabrication_from_empty_ref")
+        # 2) candidate_only 声称完全匹配
+        if satisfaction == "candidate_only":
+            if __import__("re").search(r"确认|确定|就是|肯定是|找到了|确认是", answer) and \
+               not __import__("re").search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据", answer):
+                problems.append("candidate_claimed_as_match")
+        # 3) partial/candidate 必须披露缺口
+        if satisfaction in {"partial_support", "candidate_only"}:
+            if not __import__("re").search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer):
+                problems.append("missing_disclosure")
+        # 4) 条件明确 unknown/contradicted 却升级为 confirmed
+        if condition_summary:
+            unresolved = [k for k, v in condition_summary.items() if v in {"unknown", "contradicted"}]
+            if unresolved and __import__("re").search(r"确认|确定|肯定|就是", answer):
+                problems.append(f"certainty_upgrade:conditions={unresolved[:3]}")
         return problems
 
     @staticmethod

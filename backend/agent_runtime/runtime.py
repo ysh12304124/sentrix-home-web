@@ -27,10 +27,15 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - 需要家庭记忆事实时调用工具；不需要时直接 final。
 - 每次只输出一个 JSON 对象（不要 markdown、不要解释、不要多余文字）：
   {{"action":"tool_call","tool":"...","arguments":{{...}},"public_status":"..."}}
-  或 {{"action":"final","answer":"..."}}
+  或 {{"action":"final","answer":"...","evidence_refs":["tool_call_1", ...]}}
+- final 时必须用 evidence_refs 列出你实际引用的工具调用编号（本轮工具调用会按顺序编号 tool_call_1、tool_call_2 …；纯聊天不引用）。
 - 只使用工具返回的事实回答，不编造数字或细节；工具没有返回的内容不要编造。
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
   不要补充 rows 中没有的项目，也不要自行概括出 rows 不支持的维度。
+- search_memories 返回的 query_satisfaction 决定怎么说：
+  full_support=可以确认；partial_support=部分条件确认，必须说出哪些还没确认；
+  candidate_only=只是相似候选，**不能说"找到了/确认是"**，要说"找到几张接近的候选，还不能完全确认"；
+  no_match=没有候选，**不能说找到**。
 - public_status 是给用户看的简短进度说明。
 """
 
@@ -156,6 +161,8 @@ class AgentRuntime:
 
         parse_retries = 0
         max_parse_retries = 1
+        guard_retries = 0
+        max_guard_retries = 1
         while True:
             if not turn.budget.can_model_step():
                 turn.status = "partial" if turn.steps else "timeout"
@@ -198,10 +205,24 @@ class AgentRuntime:
                         "fact_rows": task.fact_rows,
                         "fact_group_by": task.fact_group_by,
                         "last_tool": task.last_tool,
+                        "search_satisfaction": task.search_satisfaction,
+                        "condition_summary": task.search_condition_summary,
+                        "tool_results": task.tool_results,
+                        "evidence_refs": action.get("evidence_refs") or [],
                     },
                     delivered_count=task.delivered_count,
                 )
                 if problems:
+                    if guard_retries < max_guard_retries and turn.budget.can_model_step():
+                        guard_retries += 1
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({"role": "user", "content": (
+                            "你的最终回答与工具结果冲突，需要修正后重新输出 final：\n- "
+                            + "\n- ".join(problems) +
+                            "\n请只输出一个 JSON final（保留 evidence_refs 引用你使用的工具结果），"
+                            "并按 query_satisfaction 如实表述（candidate_only 不能声称确认）。"
+                        )})
+                        continue
                     turn.status = "blocked_by_guard"
                     turn.reason = ";".join(problems)
                     break
@@ -214,6 +235,7 @@ class AgentRuntime:
             tool_name = action.get("tool") or ""
             arguments = action.get("arguments") or {}
             public_status = action.get("public_status") or "正在处理。"
+            tool_call_id = f"tool_call_{len(turn.steps)}"
             spec = get_tool(tool_name)
             if spec is None:
                 turn.steps.append({"type": "tool", "tool": tool_name, "status": "error",
@@ -237,9 +259,11 @@ class AgentRuntime:
             })
             turn.public_progress.append({"text": public_status, "status": result.status})
             if not decision.allowed:
+                turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:{decision.reason}"
                 break
             task.update_from_tool(tool_name, arguments, result.observation or {})
+            task.record_tool_result(tool_call_id, tool_name, result.observation or {})
             # Observation 进入下一步模型上下文
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(

@@ -82,6 +82,17 @@ class TaskState:
     fact_group_by: str | None = None
     last_tool: str | None = None
     write_proposal: dict | None = None
+    tool_results: list = field(default_factory=list)
+    search_satisfaction: str | None = None
+    search_condition_summary: dict = field(default_factory=dict)
+
+    def record_tool_result(self, tool_call_id: str, tool_name: str, observation: dict):
+        self.tool_results.append({
+            "tool_call_id": tool_call_id,
+            "tool": tool_name,
+            "total": observation.get("total"),
+            "satisfaction": observation.get("query_satisfaction"),
+        })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):
         if tool_name == "query_memory_facts":
@@ -103,6 +114,8 @@ class TaskState:
                 self.fulfillment = "empty"
             else:
                 self.fulfillment = "partial" if observation.get("gaps") else "fulfilled"
+            self.search_satisfaction = observation.get("query_satisfaction")
+            self.search_condition_summary = observation.get("condition_summary") or {}
         if tool_name == "get_original_photos":
             self.delivery_state = "delivered"
             self.delivered_count = observation.get("delivered")
@@ -125,4 +138,7 @@ class TaskState:
             "fact_rows": self.fact_rows,
             "fact_group_by": self.fact_group_by,
             "last_tool": self.last_tool,
+            "search_satisfaction": self.search_satisfaction,
+            "search_condition_summary": self.search_condition_summary,
+            "tool_results": self.tool_results,
         }

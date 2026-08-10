@@ -168,6 +168,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "condition_summary": _condition_summary(item),
         })
     _RUNTIME["last_handles"] = handles
+    cond, satisfaction, answerability = _truth_contract(packet, rs.total)
     return {
         "result_set_id": rs.result_set_id,
         "query": query,
@@ -178,6 +179,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "remaining": max(0, len(asset_ids) - len(preview)),
         "completeness": "complete" if not (packet.gaps) else "partial",
         "gaps": rs.unresolved[:3],
+        "query_satisfaction": satisfaction,
+        "answerability": answerability,
+        "condition_summary": cond,
     }
 
 
@@ -187,6 +191,49 @@ def _condition_summary(item: dict) -> dict:
         label = key.split(":", 1)[-1]
         out[label] = cond.get("status")
     return out
+
+
+def _truth_contract(packet, total: int) -> tuple[dict, str, str]:
+    """确定性计算查询满足度（B2）：基于 condition_results 与 gaps，不交给模型判断。"""
+    if total <= 0:
+        return {}, "no_match", "none"
+    condition_verdict: dict[str, dict] = {}
+    for item in (packet.assets or []):
+        for key, cond in (item.get("condition_results") or {}).items():
+            label = key.split(":", 1)[-1]
+            status = cond.get("status") or "unknown"
+            bucket = condition_verdict.setdefault(label, {"confirmed": 0, "supported": 0,
+                                                          "unknown": 0, "contradicted": 0})
+            if status == "matched":
+                bucket["confirmed"] += 1
+            elif status == "possible":
+                bucket["supported"] += 1
+            elif status == "contradicted":
+                bucket["contradicted"] += 1
+            else:
+                bucket["unknown"] += 1
+    summary = {}
+    for label, bucket in condition_verdict.items():
+        if bucket["confirmed"] > 0:
+            summary[label] = "confirmed"
+        elif bucket["supported"] > 0:
+            summary[label] = "supported"
+        elif bucket["contradicted"] > 0 and bucket["confirmed"] == 0:
+            summary[label] = "contradicted"
+        else:
+            summary[label] = "unknown"
+    confirmed = sum(1 for v in summary.values() if v == "confirmed")
+    unknown = sum(1 for v in summary.values() if v in {"unknown", "contradicted"})
+    if not summary:
+        satisfaction = "candidate_only"
+    elif unknown == 0:
+        satisfaction = "full_support"
+    elif confirmed > 0:
+        satisfaction = "partial_support"
+    else:
+        satisfaction = "candidate_only"
+    answerability = "full" if satisfaction == "full_support" else ("partial" if confirmed else "limited")
+    return summary, satisfaction, answerability
 
 
 # ---- Tool 3: get_original_photos ----
