@@ -1212,6 +1212,9 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         item = {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
                 "reason": s.get("reason") or "",
                 "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
+        if s.get("type") == "judge":
+            item["detail"] = {"faithful": s.get("faithful"),
+                              "problems": list(s.get("problems") or [])}
         if isinstance(s.get("arguments"), dict):
             item["args"] = s.get("arguments")
         trace.append(item)
