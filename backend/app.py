@@ -299,14 +299,29 @@ def _profile_availability(profile):
     if model_path and not Path(model_path).exists():
         missing.append(model_path)
     for module in profile.get("lora_modules") or []:
-        path = module.get("path")
-        if path and not Path(path).exists():
-            missing.append(path)
+        lora_path = module.get("path")
+        if lora_path and not Path(lora_path).exists():
+            missing.append(lora_path)
     return {"available": not missing, "missing_paths": missing}
 
 
+_remote_profiles_cache = None
+
+def _remote_profile_availability(profile_id):
+    """Get availability from remote vLLM API, with a simple cache."""
+    global _remote_profiles_cache
+    if not VLLM_API_URL:
+        return None
+    if _remote_profiles_cache is None:
+        _remote_profiles_cache = _vllm_api("/profiles") or []
+    for p in _remote_profiles_cache:
+        if p.get("id") == profile_id:
+            return {"available": p.get("available", False), "missing_paths": p.get("missing_paths", [])}
+    return None
+
+
 def _profile_summary(profile_id, profile):
-    availability = _profile_availability(profile)
+    availability = _remote_profile_availability(profile_id) or _profile_availability(profile)
     return {
         "id": profile_id, "model": profile.get("model"),
         "served_model_name": profile.get("served_model_name") or profile_id,
