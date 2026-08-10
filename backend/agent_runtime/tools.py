@@ -147,7 +147,7 @@ def _resolve_entity(name, scope_id):
     if store is None:
         return None
     try:
-        for entity in store.list_entities(status="confirmed", scope_id=scope_id):
+        for entity in store.list_entities(status="confirmed", scope_id=scope_id or None):
             if entity.get("canonical_name") == name:
                 return entity.get("id")
     except Exception:
@@ -159,7 +159,7 @@ def _resolve_entity(name, scope_id):
 def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict:
     operation = arguments.get("operation") or "count"
     filters = arguments.get("filters") or {}
-    scope_id = (context or {}).get("scope_id") or "home-default"
+    scope_id = (context or {}).get("scope_id") or ""
     viewer_id = (context or {}).get("viewer_id") or "owner"
     if operation == "meal":
         # Phase C C5：饮食/活动聚合（事件级去重 + 食物证据分层）
@@ -265,8 +265,11 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
     start, end = executor._time_range(draft, spec)
     food_hint = str((filters or {}).get("food") or "").strip().lower()
 
-    clauses = ["a.scope_id = ?"]
-    params = [scope_id]
+    clauses = []
+    params = []
+    if scope_id:
+        clauses.append("a.scope_id = ?")
+        params.append(scope_id)
     if start:
         clauses.append("a.captured_at >= ?")
         params.append(start)
@@ -343,7 +346,7 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
         "explicit_food_events": len(explicit_by_event),
         "meal_scene_events": len(meal_scene_by_event),
         "possible_events": len(possible_by_event),
-        "filters_applied": {"scope_id": scope_id,
+        "filters_applied": {"scope_id": scope_id or None,
                             "time_range": {"start": start, "end": end} if (start or end) else None,
                             "food_hint": food_hint or None},
         "coverage": {
@@ -360,7 +363,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     query = arguments.get("query") or ""
     mode = arguments.get("mode") or "best"
     filters = arguments.get("filters") or {}
-    scope_id = (context or {}).get("scope_id") or "home-default"
+    scope_id = (context or {}).get("scope_id") or ""
     viewer_id = (context or {}).get("viewer_id") or "owner"
     draft = _draft_from_filters({**filters, "query": query}, answer_type="asset_set")
     draft.result_requirement = {"mode": mode}
@@ -464,7 +467,7 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     rs = rs_store.get(result_set_id)
     if rs is None:
         return {"summary": "结果集不存在。", "delivered": 0, "blocked": ["unknown_result_set"]}
-    if rs.scope_id != ((context or {}).get("scope_id") or "home-default"):
+    if rs.scope_id != ((context or {}).get("scope_id") or ""):
         return {"summary": "无权交付该结果集的原图。", "delivered": 0, "blocked": ["scope_mismatch"]}
     asset_id = rs_store.resolve_handle(result_set_id, handle) if handle else None
     if handle and not asset_id:
@@ -496,7 +499,7 @@ def result_set_context(result_set_id: str, scope_id: str) -> str | None:
     if not rs_store:
         return None
     rs = rs_store.get(result_set_id)
-    if rs is None or rs.scope_id != scope_id:
+    if rs is None or (scope_id and rs.scope_id != scope_id):
         return None
     shown = min(rs.total, rs.shown or 0)
     return (f"当前结果集：{rs.result_set_id}，共 {rs.total} 张，已显示 {shown} 张，"
@@ -505,7 +508,7 @@ def result_set_context(result_set_id: str, scope_id: str) -> str | None:
 
 # ---- Tool 3.5: get_result_page（B3.1 分页）----
 def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
-    scope_id = (context or {}).get("scope_id") or "home-default"
+    scope_id = (context or {}).get("scope_id") or ""
     task_state = (context or {}).get("task_state") or {}
     result_set_id = arguments.get("result_set_id") or task_state.get("current_result_set")
     try:
@@ -519,7 +522,7 @@ def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
     rs = rs_store.get(result_set_id)
     if rs is None:
         return {"summary": "结果集不存在或已过期。", "total": 0, "blocked": ["unknown_result_set"]}
-    if rs.scope_id != scope_id:
+    if scope_id and rs.scope_id != scope_id:
         return {"summary": "无权访问该结果集。", "total": 0, "blocked": ["scope_mismatch"]}
     items = rs.page(page_no, page_size)
     shown = min(rs.total, (page_no - 1) * page_size + len(items))
@@ -540,7 +543,7 @@ def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
 def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     asset_handle = arguments.get("asset_handle") or ""
     question = arguments.get("question") or "请描述这张照片"
-    scope_id = (context or {}).get("scope_id") or "home-default"
+    scope_id = (context or {}).get("scope_id") or ""
     task_state = (context or {}).get("task_state") or {}
     # B3：handle 必须解析自当前结果集；失败再退回最近一次检索的 handle 映射
     asset_id = None
@@ -556,7 +559,7 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
                 "blocked": ["unknown_handle"]}
     row = store.connection.execute(
         "SELECT path, scope_id FROM assets WHERE id = ?", (asset_id,)).fetchone()
-    if row and row["scope_id"] != scope_id:
+    if row and scope_id and row["scope_id"] != scope_id:
         return {"summary": "无法复核该照片（不在当前相册范围）。", "certainty": "uncertain",
                 "persisted": False, "blocked": ["scope_mismatch"]}
     if not row or not row["path"] or not Path(row["path"]).is_file():
