@@ -115,6 +115,21 @@ class PlaceAggregationRegressionTests(unittest.TestCase):
                                      {"group": "绍兴市", "count": 34}], group_by="place"))
         self.assertEqual(list(problems), [])
 
+    def test_place_bullet_fabrication_with_coverage_note_blocked(self):
+        # "没有可靠地点信息" 的覆盖披露不应让编造地点漏网（没/未 不再跳过编造检查）
+        problems = FinalGuard().check(
+            "去年您去过的地方包括：\n- 北京：有 12 张照片\n- 广州：有 5 张照片\n\n此外，还有 15 张照片没有可靠的地点信息。",
+            task_state=_group_state([{"group": "杭州市", "count": 150},
+                                     {"group": "绍兴市", "count": 34}], group_by="place"))
+        self.assertTrue(any("group_fabrication" in p for p in problems))
+
+    def test_place_bullet_real_cities_with_structural_phrase_passes(self):
+        problems = FinalGuard().check(
+            "根据记录，您去年去过的地方包括：\n- 杭州市：150条记录\n- 绍兴市：34条记录",
+            task_state=_group_state([{"group": "杭州市", "count": 150},
+                                     {"group": "绍兴市", "count": 34}], group_by="place"))
+        self.assertEqual(list(problems), [])
+
     def test_place_omission_blocked(self):
         problems = FinalGuard().check("去年没有去过任何地方。", task_state=_search_state(
             "full_support", {"杭州": "confirmed"}))
