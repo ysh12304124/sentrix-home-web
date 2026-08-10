@@ -1150,6 +1150,10 @@ def create_story(payload: dict):
             if event_end:
                 days.add(str(event_end)[:10])
             evidence.append({"event": detail["event"], "observations": observations})
+        # 按时间排序:每个事件内observations按captured_at,事件按各自最早时间
+        for ev in evidence:
+            ev["observations"].sort(key=lambda o: str(o.get("captured_at") or ""))
+        evidence.sort(key=lambda ev: str((ev["observations"] or [{}])[0].get("captured_at") or ""))
         if evidence:
             photo_count = sum(len(ev["observations"]) for ev in evidence)
             event_count = len(evidence)
@@ -1195,15 +1199,13 @@ def create_story(payload: dict):
                 "3. 证据中is_self=true的人物=相册主人\"我\"本人,叙事中一律用\"我\"称呼,绝不使用其姓名(如\"zhx\")作为第三人称提及。\n"
                 "4. 出现最多的地点组要占叙事约2/3篇幅,其他地点组合计约1/3。\n"
                 "5. 地点可依据经纬度合理推断城市(如22.5,114.1疑似深圳)并使用,但不得编造未经证据支持的具体地名(商场/餐厅/景点等);若不确定就笼统表述。\n"
-                "6. 参考这些代表性画面,让叙事有具体细节而非统计堆砌:\n"
+                "6. 严格按时间先后顺序(早→晚)组织叙事,不得倒序或乱序。\n"
+                "7. 参考这些代表性画面,让叙事有具体细节而非统计堆砌:\n"
                 + "\n".join("· " + text for text in representative) + "\n"
                 "证据:" + str(evidence)
             )
-            try:
-                generated = parse_json_response(gamma.chat(prompt))
-                payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
-            except Exception:
-                pass
+            generated = parse_json_response(gamma.chat(prompt))
+            payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
     return store.create_story(payload)
 
 
