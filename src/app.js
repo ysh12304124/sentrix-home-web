@@ -308,6 +308,70 @@
     return `<details class="algorithm-evidence admin-only"${gd.status === "blocked_by_guard" ? " open" : ""}><summary>Guard 校验明细</summary><div class="algorithm-evidence-body"><dl>${rows.join("")}</dl></div></details>`;
   }
 
+  const TOOL_LABELS = {
+    search_memories: "搜索记忆",
+    query_memory_facts: "查询记忆",
+    get_original_photos: "获取原始照片",
+    inspect_photo: "检查照片",
+    result_page: "翻看更多结果",
+  };
+
+  const STAGE_LABELS = {
+    thinking: "理解问题",
+    gate: "判断意图",
+    retrieval: "检索记忆",
+    channels: "合并检索结果",
+    inspecting: "检查照片",
+    recovering: "核对事实",
+    finalizing: "组织回答",
+    answer: "组织回答",
+    tool_result: "调用工具",
+    tool_error: "调用工具",
+  };
+
+  function thinkingStepLabel(step) {
+    if (step.type === "tool") return TOOL_LABELS[step.tool] || step.tool || "调用工具";
+    return STAGE_LABELS[step.stage] || (step.stage ? String(step.stage) : "思考");
+  }
+
+  function buildThinkingSteps(result, liveProgress = null) {
+    const progress = liveProgress || (result && (result.public_progress || [])) || [];
+    const tools = (result && (result.toolTrace || result.tool_trace)) || [];
+    let toolIndex = 0;
+    return progress.map((item) => {
+      const stage = item.stage || "";
+      const status = item.status || "running";
+      if (stage === "tool_result" || stage === "tool_error") {
+        const tool = tools[toolIndex] || {};
+        toolIndex += 1;
+        const denied = tool.status === "denied" || stage === "tool_error";
+        return {
+          type: "tool",
+          tool: tool.tool,
+          text: item.text || tool.reason || (denied ? "工具调用被拒绝" : "正在处理…"),
+          status: denied ? "blocked" : "complete",
+          latency: tool.latency_s,
+        };
+      }
+      return {
+        type: "stage",
+        stage,
+        text: item.text || "",
+        status: status === "ok" ? "complete" : status,
+      };
+    });
+  }
+
+  function agentStepHtml(step) {
+    const running = step.status === "running";
+    const blocked = step.status === "blocked" || step.status === "denied" || step.status === "error";
+    const stateClass = running ? "running" : blocked ? "blocked" : "complete";
+    const mark = step.type === "tool" ? "🔧" : "💭";
+    const statusMark = running ? "…" : blocked ? "!" : "✓";
+    const latency = step.latency != null ? `<small>${escapeHtml(String(step.latency))}s</small>` : "";
+    return `<div class="agent-step ${stateClass}"><span class="agent-step-mark">${mark}</span><div class="agent-step-body"><strong>${escapeHtml(thinkingStepLabel(step))}</strong><span>${escapeHtml(step.text || "")}</span>${latency}</div><span class="agent-step-status">${statusMark}</span></div>`;
+  }
+
   function assistantAnswer(result) {
     const segments = result.segments || [{ type: "text", text: result.answer || "" }];
     return segments.map((segment) => {
@@ -363,7 +427,9 @@
     const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
     const optionalImages = directEvidence ? "" : imageResults(result);
     const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
-    const basis = requiresEvidence ? `<details class="assistant-basis"${result.evidence_status === "gap" ? " open" : ""}><summary>查看为什么找到这些照片</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    const evidenceCount = primary.length + (result.image_results || []).length;
+    const hasGap = result.evidence_status === "gap";
+    const basis = requiresEvidence ? `<details class="assistant-basis"${hasGap || evidenceCount > 0 ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
 
@@ -413,22 +479,22 @@
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
     const failureStatus = ["partial", "timeout", "error", "blocked_by_guard"].includes(result.tool_loop_status || "");
-    const progressSteps = Array.isArray(result.public_progress) ? result.public_progress : [];
-    const progress = progressSteps.length ? `<details class="assistant-progress"${failureStatus ? " open" : ""}><summary>查看处理过程 · ${progressSteps.length} 步</summary><div>${progressSteps.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div></details>` : "";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${progress}${resultSetCard(result)}${assistantEvidence(result)}</div></article>`;
+    const traceSteps = buildThinkingSteps(result);
+    const trace = traceSteps.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>思考过程 · ${traceSteps.length} 步</summary><div>${traceSteps.map(agentStepHtml).join("")}</div></details>` : "";
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${trace}${resultSetCard(result)}${assistantEvidence(result)}</div></article>`;
   }
 
   function updateLiveProgress() {
     const host = document.querySelector("[data-live-progress]");
     if (!host) return;
-    host.innerHTML = state.liveProgress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("");
+    host.innerHTML = buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("");
   }
 
   function searchView() {
     const messages = state.assistantMessages;
     const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
     const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想一想，也在整理这段家庭记忆。</p>${state.liveProgress.length ? `<div class="assistant-progress" data-live-progress>${state.liveProgress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : ""}</div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
+    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想，正在整理这段记忆。</p><div class="agent-trace live" data-live-progress>${buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("")}</div></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
   }
 
   function timelineView() {

@@ -13,11 +13,19 @@ test("Phase C: ResultSet card never renders unknown total or zero-remaining CTA"
   assert.match(app, /hasMore = Boolean\(ts\.has_more\) && remaining > 0/);
 });
 
-test("Phase C: work trace auto-collapses after final and stays open on failure", () => {
-  assert.match(app, /查看处理过程 · \$\{progressSteps\.length\} 步/);
+test("Phase C: agent-style work trace auto-collapses after final and stays open on failure", () => {
+  assert.match(app, /思考过程 · \$\{traceSteps\.length\} 步/);
+  assert.match(app, /buildThinkingSteps/);
+  assert.match(app, /agentStepHtml/);
   assert.match(app, /failureStatus/);
   assert.match(app, /blocked_by_guard/);
-  assert.match(css, /details\.assistant-progress summary/);
+  assert.match(css, /details\.agent-trace-box summary/);
+  assert.match(css, /\.agent-step\.running/);
+});
+
+test("Phase C: original evidence fold defaults open with item count", () => {
+  assert.match(app, /<summary>原始证据\$\{evidenceCount/);
+  assert.match(app, /hasGap \|\| evidenceCount > 0 \? " open" : ""/);
 });
 
 test("Phase C: SSE events and polling fallback are wired", () => {
