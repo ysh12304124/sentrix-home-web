@@ -500,3 +500,16 @@ body.admin .admin-only { display: revert; }
 .result-set-thumbs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .result-set-thumbs img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
 .result-set-card .text-button { margin-top: 10px; }
+
+/* Phase C C7/C14: ResultSet 可选中缩略图 + Work Trace 折叠 */
+.result-set-thumb { position: relative; display: block; padding: 0; border: none; background: none; cursor: pointer; }
+.result-set-thumb img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 8px; border: 2px solid transparent; }
+.result-set-thumb:hover img { border-color: var(--lime); }
+.result-set-thumb.selected img { border-color: var(--green); }
+.result-set-check { position: absolute; right: 6px; top: 6px; padding: 2px 7px; border-radius: 20px; background: var(--green); color: #fff; font-size: 9px; font-weight: 700; }
+details.assistant-progress { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfdf8; padding: 0; }
+details.assistant-progress summary { cursor: pointer; list-style: none; padding: 9px 12px; color: var(--muted); font-size: 10px; font-weight: 650; user-select: none; }
+details.assistant-progress summary::-webkit-details-marker { display: none; }
+details.assistant-progress summary::before { content: "▸ "; color: var(--green); }
+details.assistant-progress[open] summary::before { content: "▾ "; }
+details.assistant-progress > div { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 10px; }

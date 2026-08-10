@@ -309,6 +309,23 @@ def sanitize_query_parse(raw: Any, message: str = "") -> QueryParseDraft:
 
 def parse_time_expression(value: str | None):
     value = _clean_text(value)
+    # 0) 范围表达式：优先月范围（2025年3月-2025年5月 / 2025年3月-5月），再年范围（2025年-2026年 / 2025-2026）
+    month_range = re.fullmatch(
+        r"((?:19|20)\d{2})\s*年?\s*(\d{1,2})\s*月?\s*[-~至到]\s*((?:19|20)\d{2})?\s*年?\s*(\d{1,2})\s*月?",
+        value or "")
+    if month_range:
+        start_year, start_month = int(month_range.group(1)), int(month_range.group(2))
+        end_year = int(month_range.group(3)) if month_range.group(3) else start_year
+        end_month = int(month_range.group(4))
+        start = datetime(start_year, start_month, 1)
+        end = datetime(end_year + (end_month == 12), 1 if end_month == 12 else end_month + 1, 1)
+        return start, end
+    year_range = re.fullmatch(
+        r"((?:19|20)\d{2})\s*年?\s*[-~至到]\s*((?:19|20)\d{2})\s*年?",
+        value or "")
+    if year_range:
+        start_year, end_year = int(year_range.group(1)), int(year_range.group(2))
+        return datetime(start_year, 1, 1), datetime(end_year + 1, 1, 1)
     # 1) 月/日优先：2023年10月 / 2023-10 / 2023年10月5日
     match = re.search(r"((?:19|20)\d{2})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])?(?:(\d{1,2})\s*日?)?", value)
     if match:

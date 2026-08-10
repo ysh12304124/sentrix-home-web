@@ -40,6 +40,7 @@
     assistantMessages: [],
     searchLoading: false,
     liveProgress: [],
+    selectedAsset: null,
     loading: true,
     backendError: "",
     toast: "",
@@ -363,12 +364,21 @@
     const ts = result.task_state || {};
     const rid = ts.current_result_set;
     if (!rid) return "";
-    const total = ts.result_total != null ? ts.result_total : "?";
+    // Phase C C7：total 未知显示"找到一批相关结果"；remaining=0 / has_more=false 不显示下一页。
+    const totalKnown = ts.result_total != null;
+    const total = totalKnown ? ts.result_total : null;
     const remaining = ts.result_remaining != null ? ts.result_remaining : 0;
+    const hasMore = Boolean(ts.has_more) && remaining > 0;
+    const head = totalKnown ? `共 ${total} 张${hasMore ? ` · 还有 ${remaining} 张` : ""}` : "找到一批相关结果";
     const handles = (ts.result_preview || []).slice(0, 6);
-    const thumbs = handles.length ? handles.map((h) => `<img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />`).join("") : "";
-    const next = ts.has_more ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
-    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>共 ${total} 张 · 还有 ${remaining} 张</strong></div>${thumbs ? `<div class="result-set-thumbs">${thumbs}</div>` : ""}${next}</section>`;
+    const selected = state.selectedAsset && state.selectedAsset.result_set_id === rid ? state.selectedAsset.handle : "";
+    const thumbs = handles.length ? `<div class="result-set-thumbs">${handles.map((h) => {
+      const active = h === selected ? " selected" : "";
+      return `<button class="result-set-thumb${active}" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${h === selected ? `<span class="result-set-check">已选</span>` : ""}</button>`;
+    }).join("")}</div>` : "";
+    const originalButton = selected ? `<button class="text-button" data-action="open-selected-original" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(selected)}">查看原图 ${icon("→")}</button>` : "";
+    const next = hasMore ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${originalButton}${next}</section>`;
   }
 
   function assistantMessage(message) {
@@ -378,7 +388,9 @@
     const plan = result.dialogue_plan || {};
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
-    const progress = Array.isArray(result.public_progress) ? `<div class="assistant-progress">${result.public_progress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : "";
+    const failureStatus = ["partial", "timeout", "error", "blocked_by_guard"].includes(result.tool_loop_status || "");
+    const progressSteps = Array.isArray(result.public_progress) ? result.public_progress : [];
+    const progress = progressSteps.length ? `<details class="assistant-progress"${failureStatus ? " open" : ""}><summary>查看处理过程 · ${progressSteps.length} 步</summary><div>${progressSteps.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div></details>` : "";
     return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${progress}${resultSetCard(result)}${assistantEvidence(result)}</div></article>`;
   }
 
@@ -961,7 +973,7 @@
     state.liveProgress = [];
     renderShellNavigation();
     try {
-      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
+      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
       state.conversationId = conversationId;
       state.searchResult = result;
     } catch (error) {
@@ -996,24 +1008,61 @@
     renderShellNavigation();
   }
 
-  async function runAssistantTurn(message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "") {
-    const start = await window.sentrixApi.assistantTurnAsync(message, conversationId, feedback, scopeId, selectedEntityId);
+  async function runAssistantTurn(message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", selectedAsset = null) {
+    const start = await window.sentrixApi.assistantTurnAsync(message, conversationId, feedback, scopeId, selectedEntityId, "owner", selectedAsset);
     if (start && start.turn_id && start.status === "running") {
       const nextConversationId = start.conversation_id || conversationId;
-      let done = null;
-      for (let i = 0; i < 150 && !done; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 700));
-        try {
-          const poll = await window.sentrixApi.assistantTurnPoll(start.turn_id);
-          if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
-          updateLiveProgress();
-          if (poll.status === "complete") done = poll.result;
-          else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
-        } catch (pollError) { /* 单次轮询失败继续等待 */ }
-      }
+      // Phase C C13：优先 SSE 实时事件；EventSource 不可用时回退 700ms 轮询。
+      let done = await subscribeTurnEvents(start.turn_id);
+      if (!done) done = await pollTurnEvents(start.turn_id);
       return { result: done || { answer: "执行超时，请重试。", evidence_status: "error" }, conversationId: nextConversationId };
     }
     return { result: start, conversationId: (start && start.conversation_id) || conversationId };
+  }
+
+  function mergeLiveProgress(event) {
+    const idx = event && event.step_index != null ? event.step_index : null;
+    if (idx != null && Array.isArray(state.liveProgress)) {
+      const existing = state.liveProgress.findIndex((p) => p.step_index === idx);
+      if (existing >= 0) state.liveProgress[existing] = event;
+      else state.liveProgress.push(event);
+    } else {
+      state.liveProgress.push(event);
+    }
+  }
+
+  function subscribeTurnEvents(turnId) {
+    return new Promise((resolve) => {
+      let es = null;
+      try { es = new EventSource(window.sentrixApi.assistantTurnEventsUrl(turnId)); } catch (_) { resolve(null); return; }
+      const finish = (value) => { try { es.close(); } catch (_) { /* noop */ } resolve(value); };
+      es.addEventListener("progress", (e) => {
+        try {
+          const event = JSON.parse(e.data);
+          if (event && event.text) { mergeLiveProgress(event); updateLiveProgress(); }
+        } catch (_) { /* 忽略坏事件 */ }
+      });
+      es.addEventListener("complete", (e) => {
+        try { finish(JSON.parse(e.data).result || JSON.parse(e.data)); } catch (_) { finish(null); }
+      });
+      es.onerror = () => finish(null); // 交给轮询兜底
+      setTimeout(() => finish(null), 600_000); // 超时保护
+    });
+  }
+
+  async function pollTurnEvents(turnId) {
+    let done = null;
+    for (let i = 0; i < 150 && !done; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      try {
+        const poll = await window.sentrixApi.assistantTurnPoll(turnId);
+        if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
+        updateLiveProgress();
+        if (poll.status === "complete") done = poll.result;
+        else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
+      } catch (pollError) { /* 单次轮询失败继续等待 */ }
+    }
+    return done;
   }
 
   async function handleFiles(event) {
@@ -1219,6 +1268,16 @@
 
   async function handleAction(action, element) {
     if (action === "result-next-page") { state.query = "下一页"; state.view = "search"; renderShellNavigation(); submitSearch(); return; }
+    if (action === "select-result-photo") {
+      state.selectedAsset = { result_set_id: element.dataset.resultSetId, handle: element.dataset.handle };
+      renderShellNavigation();
+      state.toast = "已选中这张照片，可以问它里面的内容或要原图。";
+      return;
+    }
+    if (action === "open-selected-original") {
+      window.open(window.sentrixApi.resultSetPhoto(element.dataset.resultSetId, element.dataset.handle, state.scopeId, true), "_blank");
+      return;
+    }
     if (action === "close-modal") { closeCurrentModal(); return; }
     if (action === "back") { state.modal = null; goBack(); return; }
     if (action === "home") { state.modal = null; navigate("overview"); return; }

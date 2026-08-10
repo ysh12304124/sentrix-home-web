@@ -15,6 +15,7 @@ from .budget_manager import BudgetState
 from .emergency import render_emergency_summary
 from .final_guard import FinalGuard
 from .judge import judge_faithfulness
+from .time_context import current_time_line
 from .profile import get_profile
 from .result_set import TaskState
 from .tool_policy import ToolPolicy
@@ -24,6 +25,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 
 可用工具（JSON 动作）：
 {tools}
+
+{current_time}
 
 规则：
 - 需要家庭记忆事实时调用工具；不需要时直接 final。
@@ -72,6 +75,36 @@ class RuntimeTurn:
     status: str = "pending"   # complete | partial | timeout | error
     reason: str = ""
     task_state: dict = field(default_factory=dict)
+
+
+def _trusted_facts(task_state: dict) -> list[str]:
+    """从 TaskState 提取用户可见、可用于恢复的确定性事实（C2 recovery 用）。"""
+    facts: list[str] = []
+    op = task_state.get("fact_operation")
+    value = task_state.get("fact_value")
+    if op in {"count", "media"} and isinstance(value, int):
+        facts.append(f"工具确认符合条件的结果数量为 {value}。")
+    elif op in {"first", "last", "date"} and value:
+        label = {"first": "最早一次", "last": "最近一次", "date": "相关时间"}.get(op, "时间")
+        facts.append(f"工具确认{label}是 {value}。")
+    elif op == "exists":
+        facts.append("工具确认存在相关记录。" if value is True else "工具确认不存在相关记录。")
+    rows = task_state.get("fact_rows") or []
+    if rows:
+        sample = rows[:6]
+        facts.append("工具返回的分组为：" + "、".join(
+            f"{r.get('group')}({r.get('count')}条)" for r in sample))
+    result_total = task_state.get("result_total")
+    if result_total is not None:
+        satisfaction = task_state.get("search_satisfaction")
+        label = {"full_support": "已确认", "partial_support": "部分确认",
+                 "candidate_only": "只是相似候选", "no_match": "无结果"}.get(
+            satisfaction, "")
+        facts.append(f"检索到 {result_total} 张候选照片{('，' + label) if label else ''}。")
+    for tr in task_state.get("tool_results") or []:
+        if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
+            facts.append(f"照片复核观察：{tr['inspect_text']}")
+    return facts
 
 
 class AgentRuntime:
@@ -155,9 +188,28 @@ class AgentRuntime:
                 out.append(s)
         return out
 
+    @staticmethod
+    def _emit_progress(turn, callback, *, stage: str, text: str, status: str) -> None:
+        """记录一条公开进度事件（C13 数据合同：stage/step_index/timestamp 增量推送）。"""
+        from datetime import datetime
+        event = {
+            "text": text,
+            "status": status,
+            "stage": stage,
+            "step_index": len(turn.public_progress) + 1,
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        turn.public_progress.append(event)
+        if callback is not None:
+            try:
+                callback(event)
+            except Exception:
+                pass
+
     def run(self, message: str, *, history: str = "", task_state: dict | None = None,
-            progress_callback=None) -> RuntimeTurn:
-        """progress_callback(progress_snapshot: list[dict]) 在每次新增 public_progress 后调用（B3.4 实时进度）。"""
+            progress_callback=None, selected_handle: str | None = None,
+            selected_result_set_id: str | None = None) -> RuntimeTurn:
+        """progress_callback(event: dict) 在每次新增公开进度事件后调用（C13 数据合同：stage/step_index/timestamp 增量推送）。"""
         turn = RuntimeTurn(profile=self.profile.name, budget=BudgetState(
             max_model_steps=self.profile.max_model_steps,
             max_tool_calls=self.profile.max_tool_calls,
@@ -169,7 +221,8 @@ class AgentRuntime:
         policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget)
         task = TaskState.from_dict(task_state, user_goal=message)
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
-        system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions())
+        system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
+                                        current_time=current_time_line())
         messages = [{"role": "system", "content": system}]
         if task.current_result_set:
             # B3.1：跨 turn 续接同一结果集，让模型知道当前可分页的结果集
@@ -177,9 +230,19 @@ class AgentRuntime:
             ctx = result_set_context(task.current_result_set, self.scope_id)
             if ctx:
                 messages.append({"role": "system", "content": ctx})
+        if selected_handle and selected_result_set_id:
+            # Phase C C15：用户点选了结果集里的照片，模型可直接用该 handle 复核/交付原图
+            messages.append({"role": "system", "content": (
+                f"用户当前选中了结果集 {selected_result_set_id} 里的照片 "
+                f"（handle={selected_handle}）。问'这张/原图/里面有几个人'时，"
+                f"直接用 get_original_photos(handle={selected_handle}) 或 "
+                f"inspect_photo(asset_handle={selected_handle})，不要重新全库搜索。"
+            )})
         if history:
             messages.append({"role": "system", "content": f"最近对话：\n{history}"})
         messages.append({"role": "user", "content": message})
+        self._emit_progress(turn, progress_callback, stage="thinking", status="running",
+                            text="正在理解你的问题…")
 
         parse_retries = 0
         max_parse_retries = 1
@@ -232,7 +295,9 @@ class AgentRuntime:
                 if search_has_preview and not inspect_called and visual_intent \
                         and visual_retries < max_visual_retries and turn.budget.can_model_step():
                     visual_retries += 1
-                    denies_found = bool(__import__("re").search(r"没(?:有|找到)|未找到|没有获取到|找不到|还没有", turn.final_answer))
+                    denies_found = bool(__import__("re").search(
+                        r"没(?:有|找到)|未找到|没有获取到|找不到|还没有",
+                        str(action.get("answer") or "")))
                     messages.append({"role": "assistant", "content": raw})
                     if denies_found:
                         messages.append({"role": "user", "content": (
@@ -271,28 +336,34 @@ class AgentRuntime:
                 # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性
                 if not problems and task.tool_results and turn.budget.can_model_step():
                     turn.budget.record_model_step()
+                    trusted = _trusted_facts(task.as_dict())
                     faithful, judge_problems = judge_faithfulness(
                         self.chat_fn, query=message, tool_results=task.tool_results,
-                        answer=turn.final_answer)
+                        answer=turn.final_answer, trusted_facts=trusted)
                     turn.steps.append({"type": "judge", "faithful": faithful,
-                                       "problems": judge_problems})
+                                       "problems": list(judge_problems)})
                     if not faithful:
                         problems = judge_problems
                 if problems:
                     if guard_retries < max_guard_retries and turn.budget.can_model_step():
                         guard_retries += 1
+                        self._emit_progress(
+                            turn, progress_callback,
+                            stage="recovering", status="running",
+                            text="结果里有一处信息对不上，我正在重新核对。")
                         messages.append({"role": "assistant", "content": raw})
                         inspect_obs = [
                             tr.get("inspect_text") for tr in task.tool_results
                             if tr.get("tool") == "inspect_photo" and tr.get("inspect_text")
                         ]
-                        messages.append({"role": "user", "content": (
-                            "你的最终回答与工具结果冲突，需要修正后重新输出 final：\n- "
-                            + "\n- ".join(problems) +
-                            ("\nsearch_memories 实际返回了候选照片，你却回答没有找到："
-                             "不要再说“没有找到”。请调用 inspect_photo 复核 preview 里的 photo_1，"
-                             "或如实改为“找到了候选，但还不能确认”。"
-                             if any("omission_conflict" in p for p in problems) else "") +
+                        trusted = _trusted_facts(task.as_dict())
+                        issue_lines = problems.natural_messages if hasattr(problems, "natural_messages") \
+                            else [str(p) for p in problems]
+                        recovery = (
+                            "你的最终回答与工具结果有冲突，需要修正后重新输出 final：\n- "
+                            + "\n- ".join(issue_lines) +
+                            "\n\n可信事实（只能基于这些，不要重新调用昂贵工具）：\n- "
+                            + "\n- ".join(trusted or ["(无工具结果)"]) +
                             ("\n注意：检索或复核没有产生可用照片时，不要声称找到候选照片，"
                              "也不要引用被拒/空的 inspect 调用；直接如实说没有找到或无法确认。"
                              if any("fabrication_from_empty" in p or "inspection_fabrication" in p
@@ -303,7 +374,8 @@ class AgentRuntime:
                             "\n请只输出一个 JSON final（保留 evidence_refs 引用你实际使用的工具结果，"
                             "并在 evidence_refs 中列出你引用过的 inspect_photo 调用编号），"
                             "并按 query_satisfaction 如实表述（candidate_only 不能声称确认）。"
-                        )})
+                        )
+                        messages.append({"role": "user", "content": recovery})
                         continue
                     turn.status = "blocked_by_guard"
                     turn.reason = ";".join(problems)
@@ -311,6 +383,10 @@ class AgentRuntime:
                         turn.final_answer = render_emergency_summary(
                             task.as_dict(), reason="回答未通过事实校验")
                     break
+                self._emit_progress(
+                    turn, progress_callback,
+                    stage="finalizing", status="complete",
+                    text="正在整理回答…")
                 turn.status = "complete"
                 break
             if action.get("action") != "tool_call":
@@ -373,12 +449,10 @@ class AgentRuntime:
                 "status": result.status, "observation": result.observation,
                 "error": result.error, "latency_s": latency,
             })
-            turn.public_progress.append({"text": public_status, "status": result.status})
-            if progress_callback is not None:
-                try:
-                    progress_callback(list(turn.public_progress))
-                except Exception:
-                    pass
+            self._emit_progress(
+                turn, progress_callback,
+                stage="tool_result" if result.status == "ok" else "tool_error",
+                status=result.status, text=public_status)
             if not decision.allowed:
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:{decision.reason}"
