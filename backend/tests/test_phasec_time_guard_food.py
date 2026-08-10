@@ -200,5 +200,126 @@ class MealEvidenceTests(unittest.TestCase):
         self.assertTrue(out["coverage"]["disclosure"])
 
 
+
+
+class SearchInspectCertaintyTests(unittest.TestCase):
+    """C8: search certainty 与 inspect certainty 分层；inspect 不能反向确认检索条件。"""
+
+    def _state(self, satisfaction="candidate_only", condition=None, inspect=None,
+               selected=None, total=8):
+        tool_results = [{"tool_call_id": "tool_call_1", "tool": "search_memories", "total": total}]
+        if inspect:
+            tool_results.append({
+                "tool_call_id": "tool_call_2", "tool": "inspect_photo",
+                "inspect_handle": "photo_1", "inspect_text": inspect,
+                "confirms_visual_only": True,
+            })
+        return {
+            "search_satisfaction": satisfaction,
+            "search_condition_summary": condition or {},
+            "tool_results": tool_results,
+            "evidence_refs": ["tool_call_1", "tool_call_2"],
+            "selected_asset_handle": selected,
+        }
+
+    def test_candidate_plus_inspect_cannot_back_confirm_search(self):
+        # 检索只是候选（爬山未确认），即使 inspect 看到积雪，也不能说"确认是爬山"
+        problems = FinalGuard().check("找到爬山的照片了，确认是那次爬山。", task_state=self._state(
+            condition={"爬山": "unknown"}, inspect="照片里有明显积雪"))
+        self.assertTrue(any("candidate_claimed_as_match" in p or "certainty_upgrade" in p
+                            for p in problems))
+
+    def test_candidate_plus_inspect_natural_layered_answer_passes(self):
+        # C8 目标形态：检索层披露 + 复核层观察，两层分开
+        problems = FinalGuard().check(
+            "我没找到能明确确认'爬山'的记录。不过最接近的一张里没有看到明显积雪。",
+            task_state=self._state(condition={"爬山": "unknown"}, inspect="照片里没有明显积雪"))
+        self.assertEqual(list(problems), [])
+
+    def test_candidate_plus_inspect_visual_answer_requires_disclosure(self):
+        # 只给视觉观察、不披露检索层缺口 → missing_disclosure（可被恢复循环修正）
+        problems = FinalGuard().check("照片里没有看到积雪。", task_state=self._state(
+            condition={"爬山": "unknown"}, inspect="照片里没有明显积雪"))
+        self.assertTrue(any("missing_disclosure" in p for p in problems))
+
+    def test_selected_photo_follow_up_exempt_from_disclosure(self):
+        # 用户点选 photo_1 追问视觉细节：该照片的视觉回答以 inspect 为准，豁免检索层披露
+        problems = FinalGuard().check("照片里有2个人。", task_state=self._state(
+            inspect="照片里有2个人", selected="photo_1"))
+        self.assertEqual(list(problems), [])
+
+    def test_visual_confirm_claim_not_treated_as_condition_upgrade(self):
+        # 规则4 标签感知：条件标签（爬山）没出现在回答里时，"我确认照片里没有雪"不应被误拦
+        problems = FinalGuard().check("我确认照片里没有看到积雪。", task_state=self._state(
+            condition={"爬山": "unknown"}, inspect="照片里没有明显积雪"))
+        self.assertFalse(any("certainty_upgrade" in p for p in problems))
+
+    def test_condition_label_claimed_confirmed_blocks(self):
+        problems = FinalGuard().check("确认是爬山，照片里就是那座山。", task_state=self._state(
+            condition={"爬山": "unknown"}, inspect="照片里有积雪"))
+        self.assertTrue(any("certainty_upgrade" in p for p in problems))
+
+
+class TaskStateInspectHandleTests(unittest.TestCase):
+    def test_record_tool_result_keeps_inspect_handle(self):
+        from backend.agent_runtime.result_set import TaskState
+        ts = TaskState(user_goal="x")
+        ts.record_tool_result("tool_call_2", "inspect_photo", {
+            "asset_handle": "photo_3", "observation": "没有雪",
+            "confirms_visual_only": True, "certainty": "supported"})
+        row = ts.tool_results[-1]
+        self.assertEqual(row["inspect_handle"], "photo_3")
+        self.assertTrue(row["confirms_visual_only"])
+        self.assertEqual(row["inspect_text"], "没有雪")
+
+    def test_from_dict_restores_selected_asset_handle(self):
+        from backend.agent_runtime.result_set import TaskState
+        ts = TaskState.from_dict({"selected_asset_handle": "photo_1",
+                                  "current_result_set": "rs_abc",
+                                  "search_satisfaction": "candidate_only"},
+                                 user_goal="这张有几个人？")
+        self.assertEqual(ts.selected_asset_handle, "photo_1")
+        self.assertEqual(ts.as_dict()["selected_asset_handle"], "photo_1")
+
+
+class RepresentativePreviewTests(unittest.TestCase):
+    def test_even_indices_spread(self):
+        idx = runtime_tools._even_indices(52, 6)
+        self.assertEqual(len(idx), 6)
+        self.assertEqual(idx[0], 0)
+        self.assertEqual(idx[-1], 51)
+        self.assertEqual(idx, sorted(idx))
+        self.assertGreaterEqual(min(idx[i + 1] - idx[i] for i in range(len(idx) - 1)), 5)
+        # 均匀覆盖：相邻间隔差异不超过 2（不集中在某一端）
+
+    def test_even_indices_small(self):
+        self.assertEqual(runtime_tools._even_indices(3, 6), [0, 1, 2])
+
+    def test_metadata_search_representative_preview(self):
+        store = MemoryStore(":memory:")
+        for i in range(13):
+            store.create_asset(f"a{i:02d}", f"a{i:02d}.jpg", "image", f"/x/a{i:02d}.jpg",
+                               metadata={"captured_at": f"2024-01-{i + 1:02d}T10:00:00",
+                                         "captured_location": ""},
+                               scope_id="home")
+        store.connection.commit()
+        runtime_tools.bind_runtime(store)
+        draft = runtime_tools._draft_from_filters({"time": "2024"}, answer_type="asset_set")
+        spec = runtime_tools._spec_for(draft, "home", "owner")
+        out = runtime_tools._search_metadata_only(draft, spec, "home", "", "representative")
+        self.assertEqual(out["mode"], "representative")
+        self.assertEqual(out["total"], 13)
+        handles = [p["handle"] for p in out["preview"]]
+        self.assertEqual(len(handles), 6)
+        # 均匀采样：预览横跨整个时间范围，而不是只取最新 6 张
+        self.assertNotEqual(handles, ["photo_1", "photo_2", "photo_3",
+                                      "photo_4", "photo_5", "photo_6"])
+        self.assertEqual(handles[0], "photo_1")
+        self.assertEqual(handles[-1], "photo_13")
+        self.assertTrue(out["has_more"])
+        self.assertEqual(out["remaining"], 7)
+        self.assertTrue(out["can_inspect"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -513,3 +513,9 @@ details.assistant-progress summary::-webkit-details-marker { display: none; }
 details.assistant-progress summary::before { content: "▸ "; color: var(--green); }
 details.assistant-progress[open] summary::before { content: "▾ "; }
 details.assistant-progress > div { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 10px; }
+
+/* C8: inspected thumbnail + observation notes */
+.result-set-thumb.inspected img { border-color: var(--blue, #4a7dff); }
+.result-set-check.inspected { background: var(--blue, #4a7dff); }
+.result-set-inspect-notes { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.result-set-inspect-notes span { font-size: 12px; color: var(--muted, #888); }

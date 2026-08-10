@@ -110,6 +110,7 @@ class TaskState:
     unresolved_conditions: list = field(default_factory=list)
     current_result_set: str | None = None
     selected_asset: str | None = None
+    selected_asset_handle: str | None = None
     delivery_state: str = "not_requested"
     fulfillment: str = "pending"
     result_mode: str | None = None
@@ -137,6 +138,8 @@ class TaskState:
             "satisfaction": observation.get("query_satisfaction"),
             "blocked": observation.get("blocked"),
             "inspect_text": observation.get("observation"),
+            "inspect_handle": observation.get("asset_handle"),
+            "confirms_visual_only": observation.get("confirms_visual_only", False),
             "certainty": observation.get("certainty"),
             "operation": observation.get("operation"),
             "value": observation.get("value"),
@@ -186,6 +189,7 @@ class TaskState:
         task.fulfillment = data.get("fulfillment") or "pending"
         task.search_satisfaction = data.get("search_satisfaction")
         task.search_condition_summary = data.get("search_condition_summary") or {}
+        task.selected_asset_handle = data.get("selected_asset_handle")
         return task
 
     def as_dict(self) -> dict:
@@ -196,6 +200,7 @@ class TaskState:
             "unresolved_conditions": self.unresolved_conditions,
             "current_result_set": self.current_result_set,
             "selected_asset": self.selected_asset,
+            "selected_asset_handle": self.selected_asset_handle,
             "delivery_state": self.delivery_state,
             "fulfillment": self.fulfillment,
             "result_mode": self.result_mode,

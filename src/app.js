@@ -372,13 +372,20 @@
     const head = totalKnown ? `共 ${total} 张${hasMore ? ` · 还有 ${remaining} 张` : ""}` : "找到一批相关结果";
     const handles = (ts.result_preview || []).slice(0, 6);
     const selected = state.selectedAsset && state.selectedAsset.result_set_id === rid ? state.selectedAsset.handle : "";
+    // C8：本轮的 inspect_photo 复核结果与 handle 对应展示（已复核徽标 + 复核观察）
+    const inspectRows = (ts.tool_results || []).filter((tr) => tr.tool === "inspect_photo" && tr.inspect_handle);
+    const inspected = new Set(inspectRows.map((tr) => tr.inspect_handle));
+    const inspectedNotes = inspectRows.filter((tr) => tr.inspect_text)
+      .map((tr) => `<span>${escapeHtml(tr.inspect_handle)} · 复核：${escapeHtml(tr.inspect_text)}</span>`).join("");
     const thumbs = handles.length ? `<div class="result-set-thumbs">${handles.map((h) => {
       const active = h === selected ? " selected" : "";
-      return `<button class="result-set-thumb${active}" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${h === selected ? `<span class="result-set-check">已选</span>` : ""}</button>`;
+      const checked = inspected.has(h) ? " inspected" : "";
+      return `<button class="result-set-thumb${active}${checked}" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${h === selected ? `<span class="result-set-check">已选</span>` : ""}${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button>`;
     }).join("")}</div>` : "";
+    const inspectBlock = inspectedNotes ? `<div class="result-set-inspect-notes">${inspectedNotes}</div>` : "";
     const originalButton = selected ? `<button class="text-button" data-action="open-selected-original" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(selected)}">查看原图 ${icon("→")}</button>` : "";
     const next = hasMore ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
-    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${originalButton}${next}</section>`;
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${originalButton}${next}</section>`;
   }
 
   function assistantMessage(message) {

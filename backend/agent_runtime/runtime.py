@@ -58,6 +58,11 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   full_support=可以确认；partial_support=部分条件确认，必须说出哪些还没确认；
   candidate_only=只是相似候选，**不能说"找到了/确认是"**，要说"找到几张接近的候选，还不能完全确认"；
   no_match=没有候选，**不能说找到**。
+- 检索满足度与照片复核是两层，必须分开表述，inspect 不能反向确认检索条件：
+  检索层：query_satisfaction 只描述用户语义条件（活动/地点/时间）是否被确认；
+  复核层：inspect_photo 只确认照片里直接可见的视觉细节（雪、人、物品、文字、颜色等）。
+  即使照片里看到了山/雪，也不能把 candidate_only 的"爬山"说成已确认；
+  示例："找到 3 张候选，但'爬山'还不能完全确认；最接近的一张照片里没有看到明显积雪。"
 - public_status 是给用户看的简短进度说明。
 """
 
@@ -114,7 +119,8 @@ def _trusted_facts(task_state: dict) -> list[str]:
         facts.append(f"检索到 {result_total} 张候选照片{('，' + label) if label else ''}。")
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
-            facts.append(f"照片复核观察：{tr['inspect_text']}")
+            handle = tr.get("inspect_handle") or ""
+            facts.append(f"照片{(' ' + handle) if handle else ''}复核观察：{tr['inspect_text']}")
     return facts
 
 
@@ -339,6 +345,7 @@ class AgentRuntime:
                         "last_tool": task.last_tool,
                         "search_satisfaction": task.search_satisfaction,
                         "condition_summary": task.search_condition_summary,
+                        "selected_asset_handle": task.selected_asset_handle or selected_handle,
                         "tool_results": task.tool_results,
                         "evidence_refs": action.get("evidence_refs") or [],
                     },
@@ -445,6 +452,12 @@ class AgentRuntime:
                                    "reason": "unknown_tool"})
                 turn.reason = "unknown_tool:" + tool_name
                 break
+            if tool_name == "inspect_photo":
+                handle_arg = str(arguments.get("asset_handle") or "")
+                self._emit_progress(
+                    turn, progress_callback,
+                    stage="inspecting", status="running",
+                    text=f"正在检查照片 {handle_arg}…" if handle_arg else "正在检查照片…")
             t0 = time.monotonic()
             decision = policy.execute(spec, arguments, context={
                 "scope_id": self.scope_id, "viewer_id": self.viewer_id,
@@ -460,10 +473,14 @@ class AgentRuntime:
                 "status": result.status, "observation": result.observation,
                 "error": result.error, "latency_s": latency,
             })
+            emit_text = public_status
+            if tool_name == "inspect_photo" and result.status == "ok":
+                handle_arg = str(arguments.get("asset_handle") or "")
+                emit_text = f"已检查照片 {handle_arg}…" if handle_arg else "已检查照片…"
             self._emit_progress(
                 turn, progress_callback,
                 stage="tool_result" if result.status == "ok" else "tool_error",
-                status=result.status, text=public_status)
+                status=result.status, text=emit_text)
             if not decision.allowed:
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:{decision.reason}"

@@ -34,3 +34,11 @@ test("Phase C: selected photo flows into next turn and original delivery", () =>
   assert.match(app, /open-selected-original/);
   assert.match(app, /state\.selectedAsset/);
 });
+
+test("Phase C/C8: inspected thumbnail badge and observation notes render", () => {
+  assert.match(app, /已复核/);
+  assert.match(app, /result-set-check inspected/);
+  assert.match(app, /result-set-inspect-notes/);
+  assert.match(app, /tr\.tool === "inspect_photo" && tr\.inspect_handle/);
+  assert.match(css, /\.result-set-thumb\.inspected img/);
+});

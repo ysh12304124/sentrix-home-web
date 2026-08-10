@@ -57,7 +57,8 @@ def render_emergency_summary(task_state: dict, *, reason: str = "") -> str:
                 parts.append("部分条件已确认，仍有条件未完全确认。")
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
-            parts.append(f"照片复核：{tr['inspect_text']}")
+            handle = tr.get("inspect_handle") or ""
+            parts.append(f"照片{(' ' + handle) if handle else ''}复核：{tr['inspect_text']}")
         if tr.get("tool") == "get_original_photos" and tr.get("total"):
             parts.append("原图交付已授权。")
     if not parts:
