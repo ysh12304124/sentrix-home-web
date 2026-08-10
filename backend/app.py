@@ -327,6 +327,8 @@ def health():
         "runtime": "tool_loop",
     }
     try:
+        from .agent_runtime import tools as _runtime_tools
+        _runtime_tools.register_tools()  # 幂等：确保工具注册表在首个 turn 前也可查
         from .agent_runtime.tool_registry import list_tools
         agent["tools"] = [
             {"name": s.name, "readiness": s.readiness}
