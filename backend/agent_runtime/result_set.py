@@ -146,6 +146,7 @@ class TaskState:
             "rows": observation.get("rows"),
             "answer_type": observation.get("answer_type"),
             "filters_applied": observation.get("filters_applied"),
+            "samples": observation.get("samples"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):

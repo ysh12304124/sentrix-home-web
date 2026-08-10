@@ -30,7 +30,7 @@ test("Phase C: original evidence fold defaults open with item count", () => {
 
 test("Phase C/UX: tool-loop evidence samples feed the original-evidence fold", () => {
   assert.match(app, /function toolLoopEvidence/);
-  assert.match(app, /\(tr\.observation \|\| \{\}\)\.samples/);
+  assert.match(app, /tr\.samples \|\| \[\]/);
   assert.match(app, /hasToolEvidence \|\| hasResultSet/);
 });
 
