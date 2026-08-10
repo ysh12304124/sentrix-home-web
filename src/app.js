@@ -365,7 +365,8 @@
     const plan = result.dialogue_plan || {};
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${assistantEvidence(result)}</div></article>`;
+    const progress = Array.isArray(result.public_progress) ? `<div class="assistant-progress">${result.public_progress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : "";
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${progress}${assistantEvidence(result)}</div></article>`;
   }
 
   function searchView() {

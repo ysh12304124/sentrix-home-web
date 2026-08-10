@@ -702,6 +702,28 @@ class MemoryStore:
                 state_json TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_conversation_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                turn_id TEXT,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_conversation_messages_cid
+                ON agent_conversation_messages(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS agent_trajectories (
+                turn_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                profile TEXT,
+                steps_json TEXT NOT NULL DEFAULT '[]',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                public_progress_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS rebuild_runs (
                 id TEXT PRIMARY KEY,
                 run_version TEXT NOT NULL,
