@@ -26,7 +26,17 @@ def build_runtime(base_url, scope_id="home-default"):
 
     store = MemoryStore(os.getenv("SENTRIX_DB_PATH", os.path.join(ROOT, "data", "sentrix.db")))
     gamma = GammaClient(base_url=base_url, backend="openai")
-    runtime_tools.bind_runtime(store, gamma=gamma)
+    try:
+        from backend.embeddings import EmbeddingRouter
+        from backend.model_clients import ClipAdapter
+        from backend.retrieval import RetrievalConfig
+        embedding_router = EmbeddingRouter.from_clip(ClipAdapter())
+        retrieval_config = RetrievalConfig()
+    except Exception:
+        embedding_router = None
+        retrieval_config = None
+    runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
+                               retrieval_config=retrieval_config)
     runtime_tools.register_tools()
 
     def chat_fn(messages):

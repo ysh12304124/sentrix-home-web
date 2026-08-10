@@ -1201,7 +1201,17 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     from .agent_runtime import tools as runtime_tools
     from .agent_runtime.runtime import AgentRuntime
 
-    runtime_tools.bind_runtime(store, gamma=gamma)
+    try:
+        from .embeddings import EmbeddingRouter
+        from .model_clients import ClipAdapter
+        from .retrieval import RetrievalConfig
+        embedding_router = EmbeddingRouter.from_clip(ClipAdapter())
+        retrieval_config = RetrievalConfig()
+    except Exception:
+        embedding_router = None
+        retrieval_config = None
+    runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
+                               retrieval_config=retrieval_config)
     runtime_tools.register_tools()
     profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
 
