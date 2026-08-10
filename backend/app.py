@@ -4,6 +4,7 @@ import shutil
 import hashlib
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -1063,6 +1064,30 @@ def asset_file(asset_id: str, original: bool = False):
         raise HTTPException(status_code=422, detail=f"unable to render preview: {error}") from error
 
 
+@app.get("/api/assistant/result-set/{result_set_id}/photo")
+def result_set_photo(result_set_id: str, handle: str = "", scope_id: str = "home-default",
+                     original: bool = False):
+    """B3.2：ResultSet 授权原图交付。handle 必须属于该结果集且 scope 匹配。"""
+    from .agent_runtime import tools as runtime_tools
+    rs_store = runtime_tools.get_result_set_store()
+    if rs_store is None:
+        raise HTTPException(status_code=404, detail="result set service unavailable")
+    rs = rs_store.get(result_set_id)
+    if rs is None:
+        raise HTTPException(status_code=404, detail="result set not found or expired")
+    if rs.scope_id != scope_id:
+        raise HTTPException(status_code=403, detail="scope mismatch")
+    if handle:
+        asset_id = rs_store.resolve_handle(result_set_id, handle)
+        if not asset_id:
+            raise HTTPException(status_code=404, detail="handle not in result set")
+    else:
+        asset_id = rs.asset_ids[0] if rs.asset_ids else None
+        if not asset_id:
+            raise HTTPException(status_code=404, detail="empty result set")
+    return asset_file(asset_id, original=original)
+
+
 @app.get("/api/face-instances/{face_instance_id}/crop")
 def face_instance_crop(face_instance_id: str):
     instance = store.get_face_instance(face_instance_id)
@@ -1196,7 +1221,20 @@ class AssistantTurnRequest(BaseModel):
     viewer_id: str = "owner"
 
 
-def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=""):
+_TOOL_LOOP_TASK_STATE: dict[str, dict] = {}  # conversation_id -> task_state（B3.1 跨 turn 结果集续接）
+_TURN_JOBS: dict[str, dict] = {}  # turn_id -> job（B3.4 异步轮询）
+_TURN_EXECUTOR = None  # 惰性初始化 ThreadPoolExecutor
+
+
+def _turn_executor():
+    global _TURN_EXECUTOR
+    if _TURN_EXECUTOR is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+    return _TURN_EXECUTOR
+
+
+def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="", progress_callback=None):
     """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
     from .agent_runtime import tools as runtime_tools
     from .agent_runtime.runtime import AgentRuntime
@@ -1229,7 +1267,11 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
 
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            scope_id=scope_id, viewer_id=viewer_id)
-    turn = runtime.run(message, history=recent_turns)
+    prev_state = _TOOL_LOOP_TASK_STATE.get(conversation_id) if conversation_id else None
+    turn = runtime.run(message, history=recent_turns, task_state=prev_state,
+                       progress_callback=progress_callback)
+    if conversation_id:
+        _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
     trace = [
         {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
          "reason": s.get("reason") or "",
@@ -1245,6 +1287,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "public_progress": turn.public_progress,
         "tool_loop_status": turn.status,
         "tool_loop_reason": turn.reason,
+        "task_state": turn.task_state,
     }
 
 
@@ -1265,51 +1308,116 @@ def assistant_turn(request: AssistantTurnRequest):
             recent_turns = ""
     profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "pipeline").strip().lower()
     if profile_name in {"tool_loop", "tool_loop_shadow"}:
-        result = _tool_loop_turn(message, request.conversation_id, request.scope_id,
-                                 request.viewer_id, recent_turns=recent_turns)
-    else:
-        result = agent.answer_turn(
-            message, request.conversation_id, request.feedback, request.scope_id,
-            request.selected_entity_id, request.viewer_id,
-            recent_turns=recent_turns,
-        )
-    if CONVERSATION_STORE_ENABLED and result.get("conversation_id"):
-        try:
-            cid = result["conversation_id"]
-            turn_id = make_id("turn")
-            result["turn_id"] = turn_id
-            scope_id = request.scope_id or "home-default"
-            conversation_store.add_message(cid, "user", {"text": message},
-                                           scope_id=scope_id, turn_id=turn_id)
-            conversation_store.add_message(cid, "assistant", {
-                "text": result.get("answer", ""),
-                "intent": result.get("intent"),
-                "evidence_status": result.get("evidence_status"),
-            }, scope_id=scope_id, turn_id=turn_id)
-            trace = result.get("retrieval_trace") or result.get("trace") or []
-            steps = []
-            for item in trace:
-                if not isinstance(item, dict):
-                    continue
-                steps.append({
-                    "stage": item.get("stage") or item.get("gate") or "unknown",
-                    "status": item.get("status", "complete"),
-                    "detail": item.get("reason") or item.get("counts") or {},
-                })
-            public_progress = result.get("public_progress") or [
-                {"text": _public_progress_text(s), "status": s.get("status", "complete")}
-                for s in steps if _public_progress_text(s)
-            ]
-            conversation_store.save_trajectory(
-                turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
-                steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent")},
-                public_progress=public_progress, scope_id=scope_id,
-            )
-            result["public_progress"] = public_progress
-        except Exception:
-            # 记录失败不影响回答
-            pass
+        # B3.4：异步执行，立即返回 turn_id 供前端轮询实时进度
+        turn_id = make_id("turn")
+        _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
+                               "result": None, "created_at": time.time()}
+        _turn_executor().submit(
+            _execute_turn_job, turn_id, message, request.conversation_id,
+            request.scope_id, request.viewer_id, recent_turns)
+        return {
+            "turn_id": turn_id,
+            "status": "running",
+            "conversation_id": request.conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+            "intent": "tool_loop",
+        }
+    result = agent.answer_turn(
+        message, request.conversation_id, request.feedback, request.scope_id,
+        request.selected_entity_id, request.viewer_id,
+        recent_turns=recent_turns,
+    )
+    _record_turn_conversation(message, request, result, turn_id="")
     return assistant_response(result)
+
+
+@app.get("/api/assistant/turn/{turn_id}")
+def assistant_turn_status(turn_id: str):
+    """B3.4：轮询异步 turn 的实时进度与最终结果。"""
+    job = _TURN_JOBS.get(turn_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="turn not found")
+    if job["status"] in {"running", "pending"}:
+        return {"turn_id": turn_id, "status": job["status"],
+                "public_progress": job.get("public_progress") or []}
+    if job["status"] == "error":
+        return {"turn_id": turn_id, "status": "error", "error": job.get("error")}
+    result = job.get("result") or {}
+    return {
+        "turn_id": turn_id,
+        "status": "complete",
+        "public_progress": job.get("public_progress") or result.get("public_progress") or [],
+        "result": result,
+    }
+
+
+def _record_turn_conversation(message, request, result, turn_id=""):
+    """把一轮对话写入 conversation store + trajectory（同步/异步两条路径共用）。"""
+    if not (CONVERSATION_STORE_ENABLED and result.get("conversation_id")):
+        return
+    try:
+        cid = result["conversation_id"]
+        turn_id = turn_id or make_id("turn")
+        result["turn_id"] = turn_id
+        scope_id = request.scope_id or "home-default"
+        conversation_store.add_message(cid, "user", {"text": message},
+                                       scope_id=scope_id, turn_id=turn_id)
+        conversation_store.add_message(cid, "assistant", {
+            "text": result.get("answer", ""),
+            "intent": result.get("intent"),
+            "evidence_status": result.get("evidence_status"),
+        }, scope_id=scope_id, turn_id=turn_id)
+        trace = result.get("retrieval_trace") or result.get("trace") or []
+        steps = []
+        for item in trace:
+            if not isinstance(item, dict):
+                continue
+            steps.append({
+                "stage": item.get("stage") or item.get("gate") or "unknown",
+                "status": item.get("status", "complete"),
+                "detail": item.get("reason") or item.get("counts") or {},
+            })
+        public_progress = result.get("public_progress") or [
+            {"text": _public_progress_text(s), "status": s.get("status", "complete")}
+            for s in steps if _public_progress_text(s)
+        ]
+        conversation_store.save_trajectory(
+            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "pipeline"),
+            steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent")},
+            public_progress=public_progress, scope_id=scope_id,
+        )
+        result["public_progress"] = public_progress
+    except Exception:
+        # 记录失败不影响回答
+        pass
+
+
+def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns):
+    """B3.4：后台执行 tool-loop turn，progress 增量写入 job。"""
+    job = _TURN_JOBS.get(turn_id)
+    try:
+        def on_progress(snapshot):
+            if job is not None:
+                job["public_progress"] = snapshot
+
+        result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
+                                 recent_turns=recent_turns, progress_callback=on_progress)
+        if conversation_id:
+            _TOOL_LOOP_TASK_STATE[conversation_id] = result.get("task_state") or {}
+        _record_turn_conversation(message, _AssistantTurnLike(
+            conversation_id=conversation_id, scope_id=scope_id), result, turn_id=turn_id)
+        if job is not None:
+            job.update({"status": "complete", "result": result,
+                        "public_progress": result.get("public_progress") or job.get("public_progress") or []})
+    except Exception as exc:
+        if job is not None:
+            job.update({"status": "error", "error": str(exc)})
+
+
+class _AssistantTurnLike:
+    """异步路径的 request 占位（只暴露 _record_turn_conversation 需要的字段）。"""
+    def __init__(self, *, conversation_id, scope_id):
+        self.conversation_id = conversation_id
+        self.scope_id = scope_id
 
 
 @app.get("/api/conversation/{conversation_id}/messages")

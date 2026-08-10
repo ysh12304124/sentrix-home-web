@@ -249,16 +249,74 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     rs = rs_store.get(result_set_id)
     if rs is None:
         return {"summary": "结果集不存在。", "delivered": 0, "blocked": ["unknown_result_set"]}
+    if rs.scope_id != ((context or {}).get("scope_id") or "home-default"):
+        return {"summary": "无权交付该结果集的原图。", "delivered": 0, "blocked": ["scope_mismatch"]}
     asset_id = rs_store.resolve_handle(result_set_id, handle) if handle else None
     if handle and not asset_id:
         return {"summary": "无法解析选中的照片。", "delivered": 0, "blocked": ["bad_handle"]}
+    target = handle if asset_id else (rs.asset_ids[0] if rs.asset_ids else None)
+    url = ""
+    if target:
+        url = f"/api/assistant/result-set/{result_set_id}/photo?handle={target}&scope_id={rs.scope_id}"
     return {
         "summary": f"已从结果集 {result_set_id} 授权原图交付。",
         "result_set_id": result_set_id,
-        "handle": handle or "all",
-        "delivered": 1 if asset_id else rs.total,
+        "handle": handle or "first",
+        "delivered": 1 if asset_id else (1 if rs.asset_ids else 0),
         "total": rs.total,
         "scope_id": rs.scope_id,
+        "url": url,
+    }
+
+
+def get_result_set_store():
+    """B3.2：API 层访问 ResultSetStore 的公开入口（原图授权端点用）。"""
+    return _RUNTIME.get("result_sets")
+
+
+def result_set_context(result_set_id: str, scope_id: str) -> str | None:
+    """B3.1：给模型一段当前结果集的续接上下文（不暴露内部 ID 之外的敏感信息）。"""
+    rs_store = _RUNTIME.get("result_sets")
+    if not rs_store:
+        return None
+    rs = rs_store.get(result_set_id)
+    if rs is None or rs.scope_id != scope_id:
+        return None
+    shown = min(rs.total, rs.shown or 0)
+    return (f"当前结果集：{rs.result_set_id}，共 {rs.total} 张，已显示 {shown} 张，"
+            f"还有 {max(0, rs.total - shown)} 张。查看更多用 get_result_page（page 从 1 开始）。")
+
+
+# ---- Tool 3.5: get_result_page（B3.1 分页）----
+def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
+    scope_id = (context or {}).get("scope_id") or "home-default"
+    task_state = (context or {}).get("task_state") or {}
+    result_set_id = arguments.get("result_set_id") or task_state.get("current_result_set")
+    try:
+        page_no = max(1, int(arguments.get("page") or 1))
+        page_size = min(20, max(1, int(arguments.get("page_size") or 6)))
+    except (TypeError, ValueError):
+        return {"summary": "分页参数无效。", "total": 0, "blocked": ["bad_page_args"]}
+    rs_store = _RUNTIME.get("result_sets")
+    if not result_set_id or rs_store is None:
+        return {"summary": "当前没有可用的结果集。", "total": 0, "blocked": ["no_result_set"]}
+    rs = rs_store.get(result_set_id)
+    if rs is None:
+        return {"summary": "结果集不存在或已过期。", "total": 0, "blocked": ["unknown_result_set"]}
+    if rs.scope_id != scope_id:
+        return {"summary": "无权访问该结果集。", "total": 0, "blocked": ["scope_mismatch"]}
+    items = rs.page(page_no, page_size)
+    shown = min(rs.total, (page_no - 1) * page_size + len(items))
+    return {
+        "result_set_id": rs.result_set_id,
+        "page": page_no,
+        "page_size": page_size,
+        "total": rs.total,
+        "shown": shown,
+        "has_more": shown < rs.total,
+        "remaining": max(0, rs.total - shown),
+        "preview": [{"handle": h["handle"]} for h in items],
+        "query": rs.query,
     }
 
 
@@ -355,6 +413,12 @@ def register_tools():
         input_schema={"result_set_id": "", "handle": ""},
         executor=_get_original_photos, read_write="read", cost_class="cheap", readiness="limited",
         readiness_reason="ResultSetStore 就绪后完整可用（A4）",
+    ))
+    register(ToolSpec(
+        name="get_result_page",
+        description="查看 search_memories 结果集的下一页/指定页。result_set_id 用 search_memories 返回的，page 从 1 开始。",
+        input_schema={"result_set_id": "", "page": 1, "page_size": 6},
+        executor=_get_result_page, read_write="read", cost_class="cheap", readiness="ready",
     ))
     register(ToolSpec(
         name="inspect_photo",

@@ -53,7 +53,7 @@ class ToolPolicy:
         "summary", "result_set_id", "handle", "total", "preview", "has_more",
         "remaining", "counts", "coverage", "facts", "items", "completeness",
         "unresolved", "delivered", "blocked", "observation", "certainty",
-        "source", "persisted", "question", "asset_handle", "reason",
+        "source", "persisted", "question", "asset_handle", "reason", "url",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
@@ -64,6 +64,7 @@ class ToolPolicy:
             "condition_summary", "can_inspect", "inspect_hint",
         },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
+        "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
         "inspect_photo": _DEFAULT_ALLOWED,
     }
 

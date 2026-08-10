@@ -33,7 +33,7 @@ PROFILES = {
     ),
     "tool_loop_shadow": ProfileConfig(
         name="tool_loop_shadow",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "inspect_photo"),
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page", "inspect_photo"),
         max_model_steps=6,
         max_tool_calls=4,
         max_inspections=1,
@@ -43,7 +43,7 @@ PROFILES = {
     ),
     "tool_loop": ProfileConfig(
         name="tool_loop",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "inspect_photo"),
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page", "inspect_photo"),
         max_model_steps=6,
         max_tool_calls=5,
         max_inspections=1,

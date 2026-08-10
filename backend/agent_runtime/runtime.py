@@ -41,6 +41,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - 只使用工具返回的事实回答，不编造数字或细节；工具没有返回的内容不要编造。
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
   不要补充 rows 中没有的项目，也不要自行概括出 rows 不支持的维度。
+- search_memories 的 preview 只显示前几张；用户要求更多/下一页/还有吗 时，用 get_result_page（result_set_id 用 search_memories 返回的，page 从 1 开始）。
 - search_memories 返回的 query_satisfaction 决定怎么说：
   full_support=可以确认；partial_support=部分条件确认，必须说出哪些还没确认；
   candidate_only=只是相似候选，**不能说"找到了/确认是"**，要说"找到几张接近的候选，还不能完全确认"；
@@ -67,6 +68,7 @@ class RuntimeTurn:
     final_answer: str = ""
     status: str = "pending"   # complete | partial | timeout | error
     reason: str = ""
+    task_state: dict = field(default_factory=dict)
 
 
 class AgentRuntime:
@@ -150,7 +152,9 @@ class AgentRuntime:
                 out.append(s)
         return out
 
-    def run(self, message: str, *, history: str = "", task_state: dict | None = None) -> RuntimeTurn:
+    def run(self, message: str, *, history: str = "", task_state: dict | None = None,
+            progress_callback=None) -> RuntimeTurn:
+        """progress_callback(progress_snapshot: list[dict]) 在每次新增 public_progress 后调用（B3.4 实时进度）。"""
         turn = RuntimeTurn(profile=self.profile.name, budget=BudgetState(
             max_model_steps=self.profile.max_model_steps,
             max_tool_calls=self.profile.max_tool_calls,
@@ -160,10 +164,16 @@ class AgentRuntime:
         ))
         turn.budget.start()
         policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget)
-        task = TaskState(user_goal=message)
+        task = TaskState.from_dict(task_state, user_goal=message)
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
         system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions())
         messages = [{"role": "system", "content": system}]
+        if task.current_result_set:
+            # B3.1：跨 turn 续接同一结果集，让模型知道当前可分页的结果集
+            from .tools import result_set_context
+            ctx = result_set_context(task.current_result_set, self.scope_id)
+            if ctx:
+                messages.append({"role": "system", "content": ctx})
         if history:
             messages.append({"role": "system", "content": f"最近对话：\n{history}"})
         messages.append({"role": "user", "content": message})
@@ -347,6 +357,11 @@ class AgentRuntime:
                 "error": result.error, "latency_s": latency,
             })
             turn.public_progress.append({"text": public_status, "status": result.status})
+            if progress_callback is not None:
+                try:
+                    progress_callback(list(turn.public_progress))
+                except Exception:
+                    pass
             if not decision.allowed:
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:{decision.reason}"
@@ -362,4 +377,5 @@ class AgentRuntime:
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(
                 result.observation or {}, ensure_ascii=False)})
 
+        turn.task_state = task.as_dict()
         return turn
