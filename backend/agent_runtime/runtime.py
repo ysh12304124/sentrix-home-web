@@ -46,7 +46,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
   不要补充 rows 中没有的项目，也不要自行概括出 rows 不支持的维度。
 - search_memories 的 preview 只显示前几张；用户要求更多/下一页/还有吗 时，用 get_result_page（result_set_id 用 search_memories 返回的，page 从 1 开始）。
-- 时间、数量、首末存在性、日期、分组等确定性事实一律用 query_memory_facts，并把用户问题里的时间写进 filters.time（如 '2023年'、'2025-05'）。用户问任何年份/月份都必须如实填进 filters.time，不要省略；不要用 search_memories 代替，也不要用模型估算。
+- 纯时间、数量、首末存在性、日期、分组等确定性事实用 query_memory_facts，并把用户问题里的时间写进 filters.time（如 '2023年'、'2025-05'）。涉及活动在哪里、地点、人物合影、场景、照片内容或需要从事件摘要判断的事实，优先用 search_memories，并同时填写时间/人物等 filters；不要把“在哪里”误用 query_memory_facts 的 date 操作。用户问任何年份/月份都必须如实填进 filters.time，不要省略；不要用模型估算。
 - 按月份/地点统计分布用 query_memory_facts 的 operation=group，并填 group_by（month 或 place）。
 - operation=group 且 group_by=place 时，工具会返回 known_location_assets/unknown_location_assets 覆盖信息：
   只要 unknown_location_assets>0，回答必须如实说明还有多少张照片没有可靠地点信息，不能把地点说成完整清单。
