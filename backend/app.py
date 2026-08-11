@@ -5,16 +5,19 @@ import shutil
 import hashlib
 import tempfile
 import threading
+import time
+import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .agent import MemoryAgent
+from .agent_conversation import ConversationStore
 from .db import MemoryStore, make_id
 from .image_io import (
     encode_jpeg_preview,
@@ -41,7 +44,8 @@ store = MemoryStore(os.getenv("SENTRIX_DB_PATH", str(DATA_DIR / "sentrix.db")))
 gamma = GammaClient()
 gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
-agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
+conversation_store = ConversationStore(store)
+CONVERSATION_STORE_ENABLED = os.getenv("SENTRIX_CONVERSATION_STORE_V1", "0").lower() in {"1", "true", "on"}
 
 app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -49,7 +53,6 @@ maintenance_lock = threading.Lock()
 runtime_lock = threading.Lock()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
-VLM_BACKENDS = ("ollama_12b", "e2b_lora")
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
@@ -87,52 +90,6 @@ def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_loc
         result["gps"] = {"latitude": latitude, "longitude": longitude}
     return result
 
-
-def _check_ollama_health():
-    try:
-        import httpx
-        url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-        response = httpx.get(f"{url}/api/tags", timeout=10)
-        response.raise_for_status()
-        models = response.json().get("models") or []
-        ollama_model = os.getenv("OLLAMA_MODEL", "gemma4:12b")
-        for model in models:
-            if model.get("name", "").startswith(ollama_model.replace(":12b", "")):
-                return {"available": True, "model": ollama_model, "url": url}
-        return {"available": False, "model": ollama_model, "url": url, "error": "model not found in /api/tags"}
-    except Exception as exc:
-        return {"available": False, "model": os.getenv("OLLAMA_MODEL", "gemma4:12b"), "url": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"), "error": str(exc)}
-
-
-def _check_e2b_health():
-    try:
-        import httpx
-        url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        response = httpx.get(f"{url}/api/health", timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return {"available": data.get("status") == "ok", "url": url, "loaded": data.get("loaded", False), "model": data.get("model", ""), "error": data.get("error")}
-    except Exception as exc:
-        return {"available": False, "url": os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100"), "error": str(exc)}
-
-
-def _fire_and_forget_post(url, payload):
-    try:
-        import httpx
-        httpx.post(url, json=payload, timeout=5)
-    except Exception:
-        pass
-
-
-def _schedule_backend_transition(backend_name):
-    if backend_name == "e2b_lora":
-        e2b_url = os.getenv("E2B_BASE_URL", "http://127.0.0.1:8100").rstrip("/")
-        threading.Thread(target=_fire_and_forget_post, args=(f"{e2b_url}/admin/load", {}), daemon=True).start()
-
-
-class SearchRequest(BaseModel):
-    query: str
-    spaceId: str = "home-default"
 
 
 class ImportRequest(BaseModel):
@@ -316,7 +273,7 @@ def _current_model_runtime():
 
 
 def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
-    global gamma, pipeline, agent
+    global gamma, pipeline
     registry = _load_vllm_registry()
     profile = profile or (registry.get("profiles") or {}).get(profile_id) or {}
     state = state or _load_vllm_state(registry) or {}
@@ -326,7 +283,6 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
         new_gamma = GammaClient(base_url=f"http://127.0.0.1:{port}/v1", model=served_name, backend="openai")
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
-        agent = MemoryAgent(store, gamma=gamma, clip=pipeline.clip)
     return _current_model_runtime()
 
 
@@ -418,6 +374,24 @@ def create_memory_space(request: MemorySpaceCreateRequest):
 @app.get("/api/memory-spaces")
 def memory_spaces():
     return {"spaces": store.list_memory_spaces()}
+
+@app.delete("/api/memory-spaces/{scope_id}")
+def delete_memory_space(scope_id: str):
+    scope_id = (scope_id or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="scope_id required")
+    if scope_id == "home-default":
+        raise HTTPException(status_code=403, detail="home-default 是系统默认相册,不允许删除")
+    if not store._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,)):
+        raise HTTPException(status_code=404, detail=f"相册 {scope_id} 不存在")
+    try:
+        stats = store.delete_memory_space(scope_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"删除失败: {exc}")
+    return {"ok": True, "scope_id": scope_id, "removed": stats}
+
 
 
 @app.get("/api/vlm-backend")
@@ -1048,6 +1022,30 @@ def asset_file(asset_id: str, original: bool = False):
         raise HTTPException(status_code=422, detail=f"unable to render preview: {error}") from error
 
 
+@app.get("/api/assistant/result-set/{result_set_id}/photo")
+def result_set_photo(result_set_id: str, handle: str = "", scope_id: str = "home-default",
+                     original: bool = False):
+    """B3.2：ResultSet 授权原图交付。handle 必须属于该结果集且 scope 匹配。"""
+    from .agent_runtime import tools as runtime_tools
+    rs_store = runtime_tools.get_result_set_store()
+    if rs_store is None:
+        raise HTTPException(status_code=404, detail="result set service unavailable")
+    rs = rs_store.get(result_set_id)
+    if rs is None:
+        raise HTTPException(status_code=404, detail="result set not found or expired")
+    if rs.scope_id != scope_id:
+        raise HTTPException(status_code=403, detail="scope mismatch")
+    if handle:
+        asset_id = rs_store.resolve_handle(result_set_id, handle)
+        if not asset_id:
+            raise HTTPException(status_code=404, detail="handle not in result set")
+    else:
+        asset_id = rs.asset_ids[0] if rs.asset_ids else None
+        if not asset_id:
+            raise HTTPException(status_code=404, detail="empty result set")
+    return asset_file(asset_id, original=original)
+
+
 @app.get("/api/face-instances/{face_instance_id}/crop")
 def face_instance_crop(face_instance_id: str):
     instance = store.get_face_instance(face_instance_id)
@@ -1240,6 +1238,177 @@ def create_invite(payload: dict):
     return {**invite, "invite_url": f"sentrix://join/{invite['token']}"}
 
 
+class AssistantTurnRequest(BaseModel):
+    message: str
+    conversation_id: str | None = None
+    feedback: dict | None = None
+    scope_id: str = "home-default"
+    selected_entity_id: str | None = None
+    viewer_id: str = "owner"
+
+
+_TOOL_LOOP_TASK_STATE: dict[str, dict] = {}  # conversation_id -> task_state（B3.1 跨 turn 结果集续接）
+_TURN_JOBS: dict[str, dict] = {}  # turn_id -> job（B3.4 异步轮询）
+_TURN_EXECUTOR = None  # 惰性初始化 ThreadPoolExecutor
+
+
+def _turn_executor():
+    global _TURN_EXECUTOR
+    if _TURN_EXECUTOR is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+    return _TURN_EXECUTOR
+
+
+def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="", progress_callback=None):
+    """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
+    from .agent_runtime import tools as runtime_tools
+    from .agent_runtime.runtime import AgentRuntime
+
+    try:
+        from .embeddings import EmbeddingRouter
+        from .model_clients import ClipAdapter
+        from .retrieval import RetrievalConfig
+        embedding_router = EmbeddingRouter.from_clip(ClipAdapter())
+        retrieval_config = RetrievalConfig()
+    except Exception:
+        embedding_router = None
+        retrieval_config = None
+    runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
+                               retrieval_config=retrieval_config)
+    runtime_tools.register_tools()
+    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
+
+    def chat_fn(messages):
+        payload = {
+            "model": getattr(gamma, "model", "gemma4-12b-it"),
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 1500,
+        }
+        response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
+                              timeout=120)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
+                           scope_id=scope_id, viewer_id=viewer_id)
+    prev_state = _TOOL_LOOP_TASK_STATE.get(conversation_id) if conversation_id else None
+    turn = runtime.run(message, history=recent_turns, task_state=prev_state,
+                       progress_callback=progress_callback)
+    if conversation_id:
+        _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
+    trace = [
+        {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
+         "reason": s.get("reason") or "",
+         "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
+        for s in turn.steps
+    ]
+    return {
+        "answer": turn.final_answer,
+        "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "intent": "tool_loop",
+        "evidence_status": "tool_loop",
+        "retrieval_trace": trace,
+        "public_progress": turn.public_progress,
+        "tool_loop_status": turn.status,
+        "tool_loop_reason": turn.reason,
+        "task_state": turn.task_state,
+    }
+
+
+@app.post("/api/assistant/turn")
+def assistant_turn(request: AssistantTurnRequest):
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="message is required")
+    message = request.message.strip()
+    recent_turns = ""
+    if CONVERSATION_STORE_ENABLED and request.conversation_id:
+        try:
+            history = conversation_store.last_messages(request.conversation_id, limit=8)
+            recent_turns = "\n".join(
+                f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'].get('text', '')}"
+                for m in history if m.get("content", {}).get("text")
+            )
+        except Exception:
+            recent_turns = ""
+    # tool_loop 是唯一 agent 路径：异步执行，立即返回 turn_id 供前端轮询实时进度
+    turn_id = make_id("turn")
+    _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
+                           "result": None, "created_at": time.time()}
+    _turn_executor().submit(
+        _execute_turn_job, turn_id, message, request.conversation_id,
+        request.scope_id, request.viewer_id, recent_turns)
+    return {
+        "turn_id": turn_id,
+        "status": "running",
+        "conversation_id": request.conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "intent": "tool_loop",
+    }
+
+
+@app.get("/api/assistant/turn/{turn_id}")
+def assistant_turn_status(turn_id: str):
+    """B3.4：轮询异步 turn 的实时进度与最终结果。"""
+    job = _TURN_JOBS.get(turn_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="turn not found")
+    if job["status"] in {"running", "pending"}:
+        return {"turn_id": turn_id, "status": job["status"],
+                "public_progress": job.get("public_progress") or []}
+    if job["status"] == "error":
+        return {"turn_id": turn_id, "status": "error", "error": job.get("error")}
+    result = job.get("result") or {}
+    return {
+        "turn_id": turn_id,
+        "status": "complete",
+        "public_progress": job.get("public_progress") or result.get("public_progress") or [],
+        "result": result,
+    }
+
+
+def _record_turn_conversation(message, request, result, turn_id=""):
+    """把一轮对话写入 conversation store + trajectory（同步/异步两条路径共用）。"""
+    if not (CONVERSATION_STORE_ENABLED and result.get("conversation_id")):
+        return
+    try:
+        cid = result["conversation_id"]
+        turn_id = turn_id or make_id("turn")
+        result["turn_id"] = turn_id
+        scope_id = request.scope_id or "home-default"
+        conversation_store.add_message(cid, "user", {"text": message},
+                                       scope_id=scope_id, turn_id=turn_id)
+        conversation_store.add_message(cid, "assistant", {
+            "text": result.get("answer", ""),
+            "intent": result.get("intent"),
+            "evidence_status": result.get("evidence_status"),
+        }, scope_id=scope_id, turn_id=turn_id)
+        trace = result.get("retrieval_trace") or result.get("trace") or []
+        steps = []
+        for item in trace:
+            if not isinstance(item, dict):
+                continue
+            steps.append({
+                "stage": item.get("stage") or item.get("gate") or "unknown",
+                "status": item.get("status", "complete"),
+                "detail": item.get("reason") or item.get("counts") or {},
+            })
+        public_progress = result.get("public_progress") or [
+            {"text": _public_progress_text(s), "status": s.get("status", "complete")}
+            for s in steps if _public_progress_text(s)
+        ]
+        conversation_store.save_trajectory(
+            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop"),
+            steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent"),
+                                 "telemetry": result.get("telemetry") or {}},
+            public_progress=public_progress, scope_id=scope_id,
+        )
+        result["public_progress"] = public_progress
+    except Exception:
+        # 记录失败不影响回答
+        pass
+
+
 def assistant_response(result):
     """Expose stable browser names while retaining the internal contract.
 
@@ -1274,7 +1443,6 @@ def assistant_response(result):
         result["toolTrace"] = []
         result.pop("validation", None)
         result.pop("model_call_ledger", None)
-        # TFPE v2 structured internals are debug-only.
         result.pop("task_contract", None)
         result.pop("retrieval_strategy", None)
         result.pop("structured_result", None)
@@ -1282,31 +1450,92 @@ def assistant_response(result):
     return result
 
 
-@app.post("/api/search")
-def search(request: SearchRequest):
-    if not request.query.strip():
-        raise HTTPException(status_code=400, detail="query is required")
-    return assistant_response(agent.answer_turn(request.query.strip(), scope_id=request.spaceId))
+def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns):
+    """B3.4：后台执行 tool-loop turn，progress 增量写入 job。"""
+    job = _TURN_JOBS.get(turn_id)
+    try:
+        def on_progress(snapshot):
+            if job is not None:
+                job["public_progress"] = snapshot
+
+        started = time.time()
+        result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
+                                 recent_turns=recent_turns, progress_callback=on_progress)
+        # B4 canary telemetry：profile / 工具序列 / guard / 延迟 / fallback 标记
+        try:
+            trace = result.get("retrieval_trace") or []
+            result["telemetry"] = {
+                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop"),
+                "status": result.get("tool_loop_status"),
+                "reason": result.get("tool_loop_reason"),
+                "tools": [s.get("tool") for s in trace if s.get("stage") == "tool" and s.get("tool")],
+                "latency_s": round(time.time() - started, 2),
+                "fallback": False,
+                "guard_blocked": result.get("tool_loop_status") in {"blocked_by_guard", "partial", "timeout", "error"},
+                "public_progress_count": len(result.get("public_progress") or []),
+            }
+        except Exception:
+            pass
+        if conversation_id:
+            _TOOL_LOOP_TASK_STATE[conversation_id] = result.get("task_state") or {}
+        result = assistant_response(result)
+        _record_turn_conversation(message, _AssistantTurnLike(
+            conversation_id=conversation_id, scope_id=scope_id), result, turn_id=turn_id)
+        if job is not None:
+            job.update({"status": "complete", "result": result,
+                        "public_progress": result.get("public_progress") or job.get("public_progress") or []})
+    except Exception as exc:
+        if job is not None:
+            job.update({"status": "error", "error": str(exc)})
 
 
-class AssistantTurnRequest(BaseModel):
-    message: str
-    conversation_id: str | None = None
-    feedback: dict | None = None
-    scope_id: str = "home-default"
-    selected_entity_id: str | None = None
-    viewer_id: str = "owner"
+class _AssistantTurnLike:
+    """异步路径的 request 占位（只暴露 _record_turn_conversation 需要的字段）。"""
+    def __init__(self, *, conversation_id, scope_id):
+        self.conversation_id = conversation_id
+        self.scope_id = scope_id
 
 
-@app.post("/api/assistant/turn")
-def assistant_turn(request: AssistantTurnRequest):
-    if not request.message.strip():
-        raise HTTPException(status_code=400, detail="message is required")
-    result = agent.answer_turn(
-        request.message.strip(), request.conversation_id, request.feedback, request.scope_id,
-        request.selected_entity_id, request.viewer_id,
-    )
-    return assistant_response(result)
+@app.get("/api/conversation/{conversation_id}/messages")
+def conversation_messages(conversation_id: str, limit: int = 20):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    try:
+        return {"conversation_id": conversation_id,
+                "messages": conversation_store.list_messages(conversation_id, limit=limit)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/conversation/{conversation_id}/trajectory")
+def conversation_trajectory(conversation_id: str, limit: int = 20):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    try:
+        return {"conversation_id": conversation_id,
+                "trajectories": conversation_store.list_trajectories(conversation_id, limit=limit)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _public_progress_text(item):
+    stage = item.get("stage") or ""
+    status = item.get("status") or ""
+    if stage == "gate":
+        return "正在判断你的意图。"
+    if stage == "retrieval":
+        counts = item.get("counts") or {}
+        n = counts.get("assets", counts.get("exact", 0))
+        return f"已找到 {n} 条相关记录。" if n else "正在检索相关记录。"
+    if stage == "answer":
+        return "正在组织回答。"
+    if stage == "channels":
+        return "已合并多路检索结果。"
+    if status == "contextual":
+        return "正在读取记忆上下文。"
+    if status == "gap":
+        return "当前记录中没有找到足够匹配的证据。"
+    return ""
 
 
 @app.post("/api/ingest", status_code=202)
@@ -1318,6 +1547,8 @@ async def ingest(
     sourceAlbumId: str | None = Form(None),
     capturedAt: str | None = Form(None),
     capturedLocation: str | None = Form(None),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
 ):
     safe_name = Path(file.filename or "upload.bin").name
     asset_id = make_id("asset")
@@ -1326,7 +1557,9 @@ async def ingest(
         shutil.copyfileobj(file.file, output)
     media_type = media_type_from_upload(file.content_type, safe_name)
     mime_type = file.content_type or guess_mime_type(safe_name)
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
     metadata = {
+        "scope_id": scope,
         "source_owner_id": sourceOwnerId,
         "source_device_id": sourceDeviceId,
         "source_album_id": sourceAlbumId,
@@ -1338,10 +1571,12 @@ async def ingest(
     }
     metadata["captured_at"] = metadata["captured_at"] or metadata["exif"].get("captured_at")
     metadata["source_device_id"] = metadata["source_device_id"] or metadata["exif"].get("device")
-    existing = store.find_asset_by_hash(metadata["content_sha256"])
+    # Deduplication is scoped to the album: the same photo may legitimately
+    # appear in a different memory space without being treated as a duplicate.
+    existing = store.find_asset_by_hash(metadata["content_sha256"], scope)
     if existing:
         destination.unlink(missing_ok=True)
-        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "deduplicated": True}
+        return {"accepted": True, "assetId": existing["id"], "fileName": existing["file_name"], "status": existing["status"], "mediaType": existing["media_type"], "scope_id": scope, "deduplicated": True}
     created = store.create_asset(
         asset_id,
         safe_name,
@@ -1352,7 +1587,7 @@ async def ingest(
         metadata,
     )
     background_tasks.add_task(process_asset, asset_id)
-    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type}
+    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type, "scope_id": scope}
 
 
 @app.post("/api/import", status_code=202)

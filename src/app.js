@@ -39,6 +39,7 @@
     searchResult: null,
     assistantMessages: [],
     searchLoading: false,
+    liveProgress: [],
     loading: true,
     backendError: "",
     toast: "",
@@ -361,6 +362,18 @@
     return "";
   }
 
+  function resultSetCard(result) {
+    const ts = result.task_state || {};
+    const rid = ts.current_result_set;
+    if (!rid) return "";
+    const total = ts.result_total != null ? ts.result_total : "?";
+    const remaining = ts.result_remaining != null ? ts.result_remaining : 0;
+    const handles = (ts.result_preview || []).slice(0, 6);
+    const thumbs = handles.length ? handles.map((h) => `<img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />`).join("") : "";
+    const next = ts.has_more ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>共 ${total} 张 · 还有 ${remaining} 张</strong></div>${thumbs ? `<div class="result-set-thumbs">${thumbs}</div>` : ""}${next}</section>`;
+  }
+
   function assistantMessage(message) {
     if (message.role === "user") return `<article class="assistant-message user"><div class="assistant-bubble"><p>${escapeHtml(message.text)}</p></div></article>`;
     const result = message.result || {};
@@ -368,14 +381,21 @@
     const plan = result.dialogue_plan || {};
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${assistantEvidence(result)}</div></article>`;
+    const progress = Array.isArray(result.public_progress) ? `<div class="assistant-progress">${result.public_progress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : "";
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${progress}${resultSetCard(result)}${assistantEvidence(result)}</div></article>`;
+  }
+
+  function updateLiveProgress() {
+    const host = document.querySelector("[data-live-progress]");
+    if (!host) return;
+    host.innerHTML = state.liveProgress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("");
   }
 
   function searchView() {
     const messages = state.assistantMessages;
     const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
     const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想一想，也在整理这段家庭记忆。</p></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
+    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想一想，也在整理这段家庭记忆。</p>${state.liveProgress.length ? `<div class="assistant-progress" data-live-progress>${state.liveProgress.map((p) => `<span class="progress-step ${escapeHtml(p.status || "complete")}">${escapeHtml(p.text || "")}</span>`).join("")}</div>` : ""}</div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
   }
 
   function timelineView() {
@@ -742,9 +762,25 @@
     } else if (modal.type === "import-picker") {
       body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
-      body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在本地运行。</span></div></div><div class="modal-actions"><button class="button ghost" data-action="create-space">＋ 创建新相册</button><button class="button primary" data-action="close-modal">关闭</button></div>`;
+      const spaceRows = (state.spaces || []).map((sp) => {
+        const isDefault = sp.id === "home-default";
+        const isCurrent = sp.id === state.scopeId;
+        const deleteBtn = isDefault
+          ? `<span class="muted">系统默认,不可删除</span>`
+          : `<button class="button small danger" data-action="ask-delete-space" data-scope-id="${escapeHtml(sp.id)}" data-scope-name="${escapeHtml(sp.name || sp.id)}">删除</button>`;
+        return `<div class="space-row ${isCurrent ? "current" : ""}"><div><strong>${escapeHtml(sp.name || sp.id)}</strong><small>${escapeHtml(sp.id)} · ${escapeHtml(sp.kind || "")}</small></div><div>${deleteBtn}</div></div>`;
+      }).join("");
+      body = `<div class="modal-kicker">SPACE MANAGER</div><h2>相册管理</h2><p class="modal-lead">删除相册会同时清除该相册的图片、事件、人物、向量和 <code>data/media/</code> 下的物理文件,不可撤销。<code>home-default</code> 是系统默认相册,不能删除。</p><div class="space-list">${spaceRows || "<p class=\"muted\">暂无相册</p>"}</div><div class="modal-actions"><button class="button ghost" data-action="create-space">＋ 创建新相册</button><button class="button primary" data-action="close-modal">关闭</button></div>`;
     } else if (modal.type === "space-create") {
       body = `<form id="modal-form"><div class="modal-kicker">NEW MEMORY SPACE</div><h2>创建独立相册</h2><p class="modal-lead">创建后会自动切换到该相册，后续导入的图片和人物标注都会限制在这个范围。</p><label>相册名称<input name="name" autofocus maxlength="100" placeholder="例如：2025年旅行测试" required /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-space">取消</button><button type="submit" class="button primary">创建并切换</button></div></form>`;
+    } else if (modal.type === "space-delete-confirm") {
+      const scopeId = modal.scopeId;
+      const scopeName = modal.scopeName || scopeId;
+      const stats = modal.stats;
+      const summary = stats
+        ? `将永久删除:<strong>${stats.assets || 0}</strong> 张图 / <strong>${stats.events || 0}</strong> 个事件 / <strong>${stats.persons || 0}</strong> 个人物 / <strong>${stats.vectors || 0}</strong> 条向量。`
+        : `将永久删除此相册的全部内容。`;
+      body = `<div class="modal-kicker">DELETE SPACE</div><h2>确认删除相册『${escapeHtml(scopeName)}』?</h2><p class="modal-lead">${summary}<br/><strong>此操作不可撤销,物理文件也会一同清理。</strong></p><div class="modal-actions"><button class="button ghost" data-action="open-space">取消</button><button class="button danger" data-action="confirm-delete-space" data-scope-id="${escapeHtml(scopeId)}" data-scope-name="${escapeHtml(scopeName)}">确认删除</button></div>`;
     } else if (modal.type === "help") {
       body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在 153 本地运行。</span></div></div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
     }
@@ -943,16 +979,19 @@
     state.view = "search";
     state.assistantMessages.push({ role: "user", text: state.query });
     state.searchLoading = true;
+    state.liveProgress = [];
     renderShellNavigation();
     try {
-      state.searchResult = await window.sentrixApi.assistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
-      state.conversationId = state.searchResult.conversation_id || state.conversationId;
+      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId);
+      state.conversationId = conversationId;
+      state.searchResult = result;
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
     }
     state.assistantMessages.push({ role: "steward", result: state.searchResult });
     state.query = "";
     state.searchLoading = false;
+    state.liveProgress = [];
     renderShellNavigation();
   }
 
@@ -963,19 +1002,39 @@
     state.searchLoading = true;
     renderShellNavigation();
     try {
-      const result = await window.sentrixApi.assistantTurn(
+      const { result, conversationId } = await runAssistantTurn(
         message, state.conversationId,
         { proactivity_outcome: outcome, proactivity_scene_key: sceneKey },
-        state.scopeId, "", "owner",
+        state.scopeId, "",
       );
       state.searchResult = result;
-      state.conversationId = result.conversation_id || state.conversationId;
-      state.assistantMessages.push({ role: "steward", result });
+      state.conversationId = conversationId;
+      state.assistantMessages.push({ role: "steward", result: state.searchResult });
     } catch (error) {
       state.toast = `主动回忆状态未更新：${error.message}`;
     }
     state.searchLoading = false;
     renderShellNavigation();
+  }
+
+  async function runAssistantTurn(message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "") {
+    const start = await window.sentrixApi.assistantTurnAsync(message, conversationId, feedback, scopeId, selectedEntityId);
+    if (start && start.turn_id && start.status === "running") {
+      const nextConversationId = start.conversation_id || conversationId;
+      let done = null;
+      for (let i = 0; i < 150 && !done; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        try {
+          const poll = await window.sentrixApi.assistantTurnPoll(start.turn_id);
+          if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
+          updateLiveProgress();
+          if (poll.status === "complete") done = poll.result;
+          else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
+        } catch (pollError) { /* 单次轮询失败继续等待 */ }
+      }
+      return { result: done || { answer: "执行超时，请重试。", evidence_status: "error" }, conversationId: nextConversationId };
+    }
+    return { result: start, conversationId: (start && start.conversation_id) || conversationId };
   }
 
   async function handleFiles(event) {
@@ -1202,6 +1261,7 @@
   }
 
   async function handleAction(action, element) {
+    if (action === "result-next-page") { state.query = "下一页"; state.view = "search"; renderShellNavigation(); submitSearch(); return; }
     if (action === "close-modal") { closeCurrentModal(); return; }
     if (action === "back") { state.modal = null; goBack(); return; }
     if (action === "home") { state.modal = null; navigate("overview"); return; }
@@ -1275,6 +1335,47 @@
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "space-manager" });
+    if (action === "ask-delete-space") {
+      const scopeId = element.dataset.scopeId;
+      const scopeName = element.dataset.scopeName || scopeId;
+      try {
+        const dash = await window.sentrixApi.dashboard(scopeId);
+        const stats = {
+          assets: dash?.stats?.assets ?? 0,
+          events: dash?.stats?.events ?? 0,
+          persons: dash?.stats?.persons ?? 0,
+          vectors: dash?.stats?.vectors ?? 0,
+        };
+        return openModal({ type: "space-delete-confirm", scopeId, scopeName, stats });
+      } catch {
+        return openModal({ type: "space-delete-confirm", scopeId, scopeName, stats: null });
+      }
+    }
+    if (action === "confirm-delete-space") {
+      const scopeId = element.dataset.scopeId;
+      const scopeName = element.dataset.scopeName || scopeId;
+      if (element.disabled) return;
+      element.disabled = true;
+      element.textContent = "删除中…";
+      try {
+        const result = await window.sentrixApi.deleteMemorySpace(scopeId);
+        const r = (result && result.removed) || {};
+        state.toast = `相册『${scopeName}』已删除:${r.assets || 0} 图 / ${r.events || 0} 事件 / ${r.persons || 0} 人物 / ${r.files_removed || 0} 物理文件`;
+        if (state.scopeId === scopeId) {
+          state.scopeId = "";
+          window.localStorage?.removeItem("sentrix.scopeId");
+        }
+        state.modal = null;
+        state.modalHistory = [];
+        await refreshData({ forceRender: true });
+      } catch (err) {
+        state.toast = `删除失败:${err.message || err}`;
+        element.disabled = false;
+        element.textContent = "确认删除";
+        renderShellNavigation();
+      }
+      return;
+    }
     if (action === "open-import-picker") return openModal({ type: "import-picker" });
     if (action === "open-files") { state.modal = null; renderShellNavigation(); document.getElementById("file-input")?.click(); return; }
     if (action === "create-space") return openModal({ type: "space-create" });

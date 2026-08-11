@@ -703,6 +703,28 @@ class MemoryStore:
                 state_json TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_conversation_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                turn_id TEXT,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_conversation_messages_cid
+                ON agent_conversation_messages(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS agent_trajectories (
+                turn_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                profile TEXT,
+                steps_json TEXT NOT NULL DEFAULT '[]',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                public_progress_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS rebuild_runs (
                 id TEXT PRIMARY KEY,
                 run_version TEXT NOT NULL,
@@ -775,7 +797,6 @@ class MemoryStore:
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
-        self._ensure_columns("stories", {"tags_json": "TEXT NOT NULL DEFAULT '[]'"})
         self._ensure_columns("query_gaps", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("memory_feedback", {
             "target_entity_id": "TEXT REFERENCES entities(id)", "target_event_id": "TEXT REFERENCES events(id)",
@@ -1147,6 +1168,168 @@ class MemoryStore:
                 self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.commit()
 
+    def delete_memory_space(self, scope_id):
+        """Delete a memory space and all its scoped data. Physical files in
+        data/media/ are removed only when their content_sha256 is no longer
+        referenced by any other scope."""
+        if not scope_id or scope_id == "home-default":
+            raise ValueError("home-default 是系统默认相册,不允许删除")
+
+        asset_rows = self._rows(
+            "SELECT id, path, content_sha256 FROM assets WHERE scope_id = ?",
+            (scope_id,),
+        )
+        counts = {
+            "assets": len(asset_rows),
+            "events": (self._row("SELECT COUNT(*) AS c FROM events WHERE scope_id = ?", (scope_id,)) or {}).get("c", 0),
+            "persons": (self._row("SELECT COUNT(*) AS c FROM entities WHERE scope_id = ? AND entity_type = 'person'", (scope_id,)) or {}).get("c", 0),
+            "vectors": (self._row("SELECT COUNT(*) AS c FROM memory_vectors WHERE scope_id = ?", (scope_id,)) or {}).get("c", 0),
+        }
+
+        # Subqueries that identify rows owned by this scope
+        S = "(SELECT id FROM {tbl} WHERE scope_id = ?)"
+        # Subquery for face_instances rows anchored in this scope's observations OR assets
+        FI_BY_OBS = "(SELECT fi.id FROM face_instances fi JOIN observations o ON o.id = fi.observation_id WHERE o.scope_id = ?)"
+        FI_BY_ASSET = "(SELECT fi.id FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE a.scope_id = ?)"
+
+        # Phase 1: clean referencing rows (from ANY scope) that point at rows in this scope
+        reference_deletes = [
+            # entity_mentions references entities, observations, face_instances
+            ("DELETE FROM entity_mentions WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM entity_mentions WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            ("DELETE FROM entity_mentions WHERE face_instance_id IN " + FI_BY_OBS, (scope_id,)),
+            ("DELETE FROM entity_mentions WHERE face_instance_id IN " + FI_BY_ASSET, (scope_id,)),
+            # entity_observations references entities, observations
+            ("DELETE FROM entity_observations WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM entity_observations WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            # entity_properties, entity_revisions reference entities
+            ("DELETE FROM entity_properties WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM entity_revisions WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # event_* reference events and entities
+            ("DELETE FROM event_participants WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_participants WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM event_entities WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_entities WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM event_revisions WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_observations WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM event_observations WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            # trip_revisions references trips
+            ("DELETE FROM trip_revisions WHERE trip_id IN " + S.format(tbl="trips"), (scope_id,)),
+            # face_prototypes references face_clusters, face_instances
+            ("DELETE FROM face_prototypes WHERE cluster_id IN " + S.format(tbl="face_clusters"), (scope_id,)),
+            ("DELETE FROM face_prototypes WHERE face_instance_id IN " + FI_BY_OBS, (scope_id,)),
+            ("DELETE FROM face_prototypes WHERE face_instance_id IN " + FI_BY_ASSET, (scope_id,)),
+            # person_appearance_evidence references entities, face_instances, observations, assets
+            ("DELETE FROM person_appearance_evidence WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE asset_id IN " + S.format(tbl="assets"), (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE face_instance_id IN " + FI_BY_OBS, (scope_id,)),
+            ("DELETE FROM person_appearance_evidence WHERE face_instance_id IN " + FI_BY_ASSET, (scope_id,)),
+            # face_instances references assets, observations, face_clusters
+            ("DELETE FROM face_instances WHERE asset_id IN " + S.format(tbl="assets"), (scope_id,)),
+            ("DELETE FROM face_instances WHERE observation_id IN " + S.format(tbl="observations"), (scope_id,)),
+            ("DELETE FROM face_instances WHERE cluster_id IN " + S.format(tbl="face_clusters"), (scope_id,)),
+            # relationships references entities (both subject and object)
+            ("DELETE FROM relationships WHERE subject_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM relationships WHERE object_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # semantic_profiles/claims reference entities
+            ("DELETE FROM semantic_profiles WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM semantic_claims WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # person_event_memory references entities, events
+            ("DELETE FROM person_event_memory WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("DELETE FROM person_event_memory WHERE event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("DELETE FROM person_patterns WHERE person_id IN " + S.format(tbl="entities"), (scope_id,)),
+            # observations reference assets — clean any observations in OTHER scopes that reference our assets
+            ("DELETE FROM observations WHERE asset_id IN " + S.format(tbl="assets"), (scope_id,)),
+        ]
+        # Nullify optional FKs (SET NULL, not DELETE) to preserve cross-scope rows
+        nullify_updates = [
+            ("UPDATE entity_merge_candidates SET target_entity_id = NULL WHERE target_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE face_clusters SET entity_id = NULL WHERE entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE semantic_claims SET value_entity_id = NULL WHERE value_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE memory_feedback SET target_entity_id = NULL WHERE target_entity_id IN " + S.format(tbl="entities"), (scope_id,)),
+            ("UPDATE memory_feedback SET target_event_id = NULL WHERE target_event_id IN " + S.format(tbl="events"), (scope_id,)),
+            ("UPDATE memory_feedback SET query_gap_id = NULL WHERE query_gap_id IN " + S.format(tbl="query_gaps"), (scope_id,)),
+        ]
+
+        # Phase 2: delete main scoped tables (order: leaf-first, main tables last)
+        # observations must be deleted before assets (FK observations.asset_id → assets.id)
+        scoped_tables_leaf = [
+            "memory_vectors", "observation_search_fts", "observation_search_terms",
+            "facts", "semantic_claims", "semantic_profiles",
+            "person_event_memory", "person_patterns", "query_gaps",
+            "dialogue_states", "relationships", "ingest_batches",
+            "entity_merge_candidates",
+            "agent_user_assertions", "agent_impressions",
+            "agent_proactivity_preferences", "agent_scene_cooldowns",
+            "agent_claim_conflicts", "agent_core_memory_cards",
+        ]
+        # Order-sensitive: observations → face_clusters → events → entities → trips → assets
+        scoped_tables_main = [
+            "observations",
+            "face_clusters",
+            "events",
+            "entities",
+            "trips",
+            "assets",
+        ]
+
+        try:
+            existing = {
+                row["name"]
+                for row in self._rows(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            for sql, params in reference_deletes:
+                # Skip if the referenced table doesn't exist (schema variant)
+                self.connection.execute(sql, params)
+            for sql, params in nullify_updates:
+                self.connection.execute(sql, params)
+            for tbl in scoped_tables_leaf:
+                if tbl not in existing:
+                    continue
+                self.connection.execute(f"DELETE FROM {tbl} WHERE scope_id = ?", (scope_id,))
+            if "rebuild_runs" in existing:
+                self.connection.execute("DELETE FROM rebuild_runs WHERE scope = ?", (scope_id,))
+            for tbl in scoped_tables_main:
+                if tbl not in existing:
+                    continue
+                self.connection.execute(f"DELETE FROM {tbl} WHERE scope_id = ?", (scope_id,))
+            self.connection.execute("DELETE FROM memory_spaces WHERE id = ?", (scope_id,))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        import os as _os
+        db_dir = _os.path.dirname(_os.path.abspath(self.path))
+        media_root = _os.path.abspath(_os.path.join(db_dir, "media"))
+        files_removed = 0
+        for row in asset_rows:
+            path = (row.get("path") if isinstance(row, dict) else row["path"]) or ""
+            sha = (row.get("content_sha256") if isinstance(row, dict) else row["content_sha256"]) or ""
+            if not path or not sha:
+                continue
+            try:
+                real = _os.path.realpath(path)
+            except OSError:
+                continue
+            if not (real == media_root or real.startswith(media_root + _os.sep)):
+                continue
+            still_used = self._row(
+                "SELECT id FROM assets WHERE content_sha256 = ? LIMIT 1", (sha,)
+            )
+            if still_used:
+                continue
+            try:
+                _os.unlink(real)
+                files_removed += 1
+            except OSError:
+                pass
+        counts["files_removed"] = files_removed
+        return counts
+
     def add_observation(self, asset_id, data, scope_id=None):
         observation_id = data.get("id") or make_id("obs")
         asset = self.get_asset(asset_id) or {}
@@ -1298,12 +1481,21 @@ class MemoryStore:
             time_score = 0.25
         locations = {item["location"] for item in event_anchors if item["location"]}
         visual_places = {item["visual_place"] for item in event_anchors if item["visual_place"]}
-        if anchor["location"] and locations:
-            _location_distances = [self._geo_distance_meters(anchor["location"], loc) for loc in locations]
-            _location_distances = [d for d in _location_distances if d is not None]
-            location_score = max((max(0.0, 1.0 - min(d, 1000.0) / 1000.0) for d in _location_distances), default=0.0)
-        else:
-            location_score = 0.0
+        # GPS distance scoring: linear decay from 1.0 at 0 km to 0.0 at 2 km,
+        # taking the closest anchor. Same-event photos often drift ~1 km apart,
+        # so a hard threshold would miss them.
+        location_score = 0.0
+        if anchor.get("gps"):
+            for item in event_anchors:
+                item_gps = item.get("gps")
+                if not item_gps:
+                    continue
+                distance = gps_distance_km(anchor["gps"], item_gps)
+                score = max(0.0, 1.0 - distance / 2.0)
+                if score > location_score:
+                    location_score = score
+        elif anchor["location"] and anchor["location"] in locations:
+            location_score = 1.0
         visual_place_score = 1.0 if anchor["visual_place"] and anchor["visual_place"] in visual_places else 0.0
         event_type = anchor["visual_event_type"]
         event_types = {item["visual_event_type"] for item in event_anchors if item["visual_event_type"]}
@@ -1311,12 +1503,9 @@ class MemoryStore:
         activity = str(observation.get("activity") or "").lower()
         existing_activity = str(event.get("activity") or "").lower()
         activity_score = 0.9 if activity and existing_activity and (activity == existing_activity or activity in existing_activity or existing_activity in activity) else 0.0
-        if activity and existing_activity and not activity_score and event_type and event_type not in event_types:
-            activity_score = -0.8
-        # 同时间(<60s)+同地点(<50m)时,不因activity冲突惩罚
-        same_time_place = time_score >= 0.99 and location_score >= 0.95
-        if same_time_place and activity_score < 0:
-            activity_score = 0.0
+        # Different activity phrasing across photos of the same event is normal
+        # (e.g. "拍照" vs "摆花"); never penalise it, otherwise GPS/time matches
+        # still fail to merge a single event into one cluster.
         object_sets = [self._tokens(self.get_observation(item["observation_id"]).get("objects")) for item in self._rows("SELECT observation_id FROM event_observations WHERE event_id = ?", (event["id"],))]
         objects = self._tokens(observation.get("objects"))
         object_score = 0.8 if objects and any(objects.intersection(values) for values in object_sets) else 0.0
@@ -1325,7 +1514,8 @@ class MemoryStore:
         person_score = 0.8 if people and existing_people and people.intersection(existing_people) else 0.0
         visual_similarity, visual_available = self._event_visual_similarity(observation, event["id"])
         semantic_conflict = bool(
-            event_type and event_types and event_type not in event_types
+            activity and existing_activity and activity != existing_activity
+            and event_type and event_types and event_type not in event_types
         )
         corroborated = bool(object_score or person_score)
         split_guard = None
@@ -1333,19 +1523,24 @@ class MemoryStore:
         # group shots, and different camera angles need not look alike. Split
         # only when independent semantic evidence also conflicts and no known
         # person/object bridges the candidate event.
-        if visual_available and semantic_conflict and visual_similarity < 0.45 and not corroborated and not same_time_place:
+        if visual_available and semantic_conflict and visual_similarity < 0.45 and not corroborated:
             split_guard = "semantic_visual_conflict"
         visual_boost = (
             max(0.0, min(1.0, (visual_similarity - 0.70) / 0.30))
             if visual_available else 0.0
         )
+        # Strong spatio-temporal prior: photos taken almost at the same time and
+        # place are very likely the same event even when their semantic labels
+        # differ (e.g. "户外集会" vs "节日庆典" on the same street 1 minute apart).
+        spatio_temporal_bonus = 0.20 if time_score >= 0.90 and location_score >= 0.90 else 0.0
         total = (
             0.25 * time_score + 0.25 * location_score + 0.15 * visual_place_score
             + 0.05 * event_type_score + 0.20 * activity_score
             + 0.05 * object_score + 0.20 * person_score + 0.05 * visual_boost
+            + spatio_temporal_bonus
         )
         if split_guard:
-            total *= 0.3
+            total = 0.0
         return {
             "total": max(0.0, min(1.0, total)), "time": time_score, "location": location_score,
             "visual_place": visual_place_score, "event_type": event_type_score,
@@ -1535,9 +1730,11 @@ class MemoryStore:
     def _event_anchor(self, observation):
         observation = observation or {}
         asset = self.get_asset(observation.get("asset_id")) or {}
+        captured_location = (asset.get("captured_location") or "").strip().lower()
         return {
             "captured_at": asset.get("captured_at") or observation.get("captured_at"),
-            "location": (asset.get("captured_location") or "").strip().lower(),
+            "location": captured_location,
+            "gps": parse_gps_place(captured_location),
             "visual_place": (observation.get("place") or "").strip().lower(),
             "visual_event_type": (observation.get("event_type") or "").strip().lower(),
         }
@@ -3627,29 +3824,6 @@ class MemoryStore:
             entity_id, f"property:{property_key}", current["value_json"] if current else None,
             json_value(value, None), "user", evidence_ids,
         )
-        if property_key in ("canonical_name", "family_role"):
-            column = "canonical_name" if property_key == "canonical_name" else "family_role"
-            self.connection.execute(
-                f"UPDATE entities SET {column} = ?, updated_at = ? WHERE id = ?",
-                (str(value) if value is not None else None, timestamp, entity_id),
-            )
-            if property_key == "canonical_name" and value:
-                new_name = str(value)
-                for cluster in self._rows("SELECT id FROM face_clusters WHERE entity_id = ?", (entity_id,)):
-                    short_id = (cluster.get("id") or "").replace("cluster_", "")[:8]
-                    if not short_id:
-                        continue
-                    old_placeholder = f"待命名成员#{short_id}"
-                    if old_placeholder == new_name:
-                        continue
-                    self.connection.execute(
-                        "UPDATE observations SET caption = REPLACE(caption, ?, ?) WHERE caption LIKE ?",
-                        (old_placeholder, new_name, f"%{old_placeholder}%"),
-                    )
-                    self.connection.execute(
-                        "UPDATE events SET summary = REPLACE(summary, ?, ?) WHERE summary LIKE ?",
-                        (old_placeholder, new_name, f"%{old_placeholder}%"),
-                    )
         self.connection.commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
 
@@ -3664,7 +3838,7 @@ class MemoryStore:
             raise ValueError("face clusters must belong to the same memory space")
         target_entity = self.get_entity(target["entity_id"]) if target.get("entity_id") else None
         source_entity = self.get_entity(other["entity_id"]) if other.get("entity_id") else None
-        if target_entity and source_entity and target_entity["id"] != source_entity["id"] and target_entity["status"] == "confirmed" and source_entity["status"] == "confirmed" and source != "user_merge":
+        if target_entity and source_entity and target_entity["id"] != source_entity["id"] and target_entity["status"] == "confirmed" and source_entity["status"] == "confirmed":
             raise ValueError("two confirmed people cannot be merged automatically")
         self.connection.execute("UPDATE face_instances SET cluster_id = ? WHERE cluster_id = ?", (target_cluster_id, source_cluster_id))
         self.connection.execute("UPDATE face_clusters SET status = 'rejected', member_count = 0, updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), source_cluster_id))
@@ -3987,34 +4161,6 @@ class MemoryStore:
             }
             return detail
         return self.get_entity_detail(entity["id"])
-
-    def auto_confirm_clusters(self, scope_id=None, min_members=2, min_confidence=0.5):
-        """Auto-confirm stable pending clusters with a placeholder name.
-
-        Selects pending clusters with member_count >= min_members and average
-        detection_confidence >= min_confidence. Each is confirmed with a
-        placeholder name "待命名成员#<short_id>" that the user can rename from
-        the dashboard. Returns the list of confirmed cluster summaries.
-        """
-        params = [min_members]
-        where = "WHERE status = 'pending' AND member_count >= ?"
-        if scope_id:
-            where += " AND scope_id = ?"
-            params.append(scope_id)
-        rows = self._rows(f"SELECT id, confidence, member_count FROM face_clusters {where} ORDER BY updated_at ASC", params)
-        confirmed = []
-        for row in rows:
-            avg_confidence = float(row["confidence"] or 0)
-            if avg_confidence < min_confidence:
-                continue
-            short_id = row["id"].replace("cluster_", "")[:8]
-            placeholder = f"待命名成员#{short_id}"
-            try:
-                self.confirm_face_cluster(row["id"], placeholder)
-                confirmed.append({"cluster_id": row["id"], "name": placeholder, "member_count": int(row["member_count"] or 0), "avg_confidence": round(avg_confidence, 3)})
-            except Exception as error:
-                confirmed.append({"cluster_id": row["id"], "error": str(error)})
-        return confirmed
 
     def _merge_cluster_into_person(self, cluster_id, target_entity_id):
         """Merge a just-confirmed cluster into an existing confirmed person:
@@ -4431,19 +4577,18 @@ class MemoryStore:
         story_id = data.get("id") or make_id("story")
         timestamp = now_iso()
         self.connection.execute(
-            """INSERT INTO stories(id, title, status, outline_json, event_ids_json, tags_json, content, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (story_id, data.get("title") or "未命名故事", data.get("status", "draft"), json_value(data.get("outline"), []), json_value(data.get("event_ids"), []), json_value(data.get("tags"), []), data.get("content", ""), timestamp, timestamp),
+            """INSERT INTO stories(id, title, status, outline_json, event_ids_json, content, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (story_id, data.get("title") or "未命名故事", data.get("status", "draft"), json_value(data.get("outline"), []), json_value(data.get("event_ids"), []), data.get("content", ""), timestamp, timestamp),
         )
         self.connection.commit()
         return self.get_story(story_id)
 
     def get_story(self, story_id):
-        story = self._decode(self._row("SELECT * FROM stories WHERE id = ?", (story_id,)), ["outline_json", "event_ids_json", "tags_json"])
+        story = self._decode(self._row("SELECT * FROM stories WHERE id = ?", (story_id,)), ["outline_json", "event_ids_json"])
         if story:
             story["outline"] = story.pop("outline_json")
             story["event_ids"] = story.pop("event_ids_json")
-            story["tags"] = story.pop("tags_json", [])
         return story
 
     def list_stories(self):
@@ -4462,8 +4607,6 @@ class MemoryStore:
             values["outline_json"] = json_value(fields["outline"], [])
         if "event_ids" in fields:
             values["event_ids_json"] = json_value(fields["event_ids"], [])
-        if "tags" in fields:
-            values["tags_json"] = json_value(fields["tags"], [])
         if not values:
             return story
         assignments = ", ".join(f"{key} = ?" for key in values)
