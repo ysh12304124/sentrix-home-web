@@ -284,40 +284,37 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
 
 
 def _run_vllm_switch(request: ModelSwitchRequest):
-    if not VLLM_MANAGER.exists():
-        raise HTTPException(status_code=503, detail=f"vLLM manager not found: {VLLM_MANAGER}")
     registry = _load_vllm_registry()
     profile = (registry.get("profiles") or {}).get(request.profile)
     if not profile:
         raise HTTPException(status_code=404, detail="model profile not found")
-    command = [str(VLLM_MANAGER), "switch", request.profile]
-    option_map = {
-        "max_model_len": "--max-model-len", "max_num_seqs": "--max-num-seqs",
-        "max_num_batched_tokens": "--max-num-batched-tokens",
-        "gpu_memory_utilization": "--gpu-memory-utilization",
-        "quantization": "--quantization", "load_format": "--load-format",
-        "dtype": "--dtype", "default_max_tokens": "--default-max-tokens",
-        "cuda_visible_devices": "--cuda-visible-devices",
-    }
+    # 统一走 vLLM Manager 服务（HTTP），不再由后端直接拉起子进程 CLI。
+    manager_api = os.getenv("SENTRIX_VLLM_MANAGER_API", "http://127.0.0.1:8500").rstrip("/")
     values = request.model_dump() if hasattr(request, "model_dump") else request.dict()
-    for field, flag in option_map.items():
-        value = values.get(field)
-        if value is not None and value != "":
-            command.extend([flag, str(value)])
-    if request.wait_ready:
-        command.extend(["--wait-ready", "--ready-timeout", str(max(30, request.ready_timeout))])
-    if request.dry_run:
-        command.append("--dry-run")
-    import subprocess
-    completed = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True,
-        timeout=max(60, int(request.ready_timeout) + 90 if request.wait_ready else 60))
-    if completed.returncode != 0:
+    body = {k: values.get(k) for k in (
+        "profile", "wait_ready", "ready_timeout", "dry_run",
+        "max_model_len", "max_num_seqs", "max_num_batched_tokens",
+        "gpu_memory_utilization", "quantization", "load_format", "dtype",
+        "default_max_tokens", "cuda_visible_devices",
+    )}
+    timeout = max(60, int(request.ready_timeout) + 90 if request.wait_ready else 60)
+    try:
+        response = httpx.post(f"{manager_api}/switch", json=body, timeout=timeout)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail={
+            "message": f"vLLM manager API unreachable: {manager_api}", "error": str(exc)})
+    if response.status_code != 200:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = {"stdout": response.text[-4000:]}
         raise HTTPException(status_code=502, detail={
-            "message": "vLLM switch failed", "command": command,
-            "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]})
+            "message": "vLLM switch failed", "manager_api": manager_api, **detail})
     runtime = _current_model_runtime() if request.dry_run else _apply_vllm_profile_to_runtime(request.profile, profile)
+    payload = response.json()
     return {"accepted": True, "profile": request.profile, "runtime": runtime,
-        "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]}
+        "stdout": (payload.get("stdout") or "")[-4000:],
+        "stderr": (payload.get("stderr") or "")[-4000:]}
 
 @app.get("/api/health")
 def health():
