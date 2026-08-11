@@ -65,7 +65,7 @@ class ToolPolicy:
         },
         "search_memories": _DEFAULT_ALLOWED | {
             "query", "mode", "gaps", "query_satisfaction", "answerability",
-            "condition_summary", "can_inspect", "inspect_hint",
+            "condition_summary", "can_inspect", "inspect_hint", "retrieval_timing",
         },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
         "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 

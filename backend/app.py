@@ -1402,18 +1402,14 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                                retrieval_config=retrieval_config)
     runtime_tools.register_tools()
     profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
+    model_call_metrics = []
+    gamma.get_and_clear_call_metrics()
 
     def chat_fn(messages):
-        payload = {
-            "model": getattr(gamma, "model", "gemma4-12b-it"),
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": 1500,
-        }
-        response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
-                              timeout=120)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        text = gamma.chat_messages(
+            messages, role="tool_loop", temperature=0.0, max_tokens=1500)
+        model_call_metrics.extend(gamma.get_and_clear_call_metrics())
+        return text
 
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            scope_id=scope_id, viewer_id=viewer_id)
@@ -1427,6 +1423,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                        progress_callback=progress_callback,
                        selected_handle=selected_asset_handle,
                        selected_result_set_id=selected_result_set_id)
+    model_call_metrics.extend(gamma.get_and_clear_call_metrics())
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
     trace = []
@@ -1456,11 +1453,13 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     }
     tool_trace = [
         {"tool": s.get("tool", ""), "status": s.get("status", ""),
-         "latency_s": s.get("latency_s"), "reason": s.get("reason") or ""}
+         "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
+         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
         for s in turn.steps if s.get("type") == "tool"
     ]
     return {
         "answer": turn.final_answer,
+        "model_call_metrics": model_call_metrics,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
         "evidence_status": "tool_loop",
@@ -1639,7 +1638,8 @@ def assistant_response(result):
         result["retrievalTrace"] = []
         # 思考过程对普通用户可见工具名/状态/耗时；参数与 observation 等明细仍仅管理员可见。
         result["toolTrace"] = [
-            {k: v for k, v in (t or {}).items() if k in ("tool", "status", "latency_s")}
+            {k: v for k, v in (t or {}).items()
+             if k in ("tool", "status", "latency_s", "retrieval_timing")}
             for t in (result.get("tool_trace") or [])
         ]
         result.pop("validation", None)
@@ -1681,7 +1681,9 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
             }
         except Exception:
             pass
-        result["model_call_metrics"] = gamma.get_and_clear_call_metrics()
+        residual_metrics = gamma.get_and_clear_call_metrics()
+        if residual_metrics:
+            result.setdefault("model_call_metrics", []).extend(residual_metrics)
         if conversation_id:
             _TOOL_LOOP_TASK_STATE[conversation_id] = result.get("task_state") or {}
         result = assistant_response(result)

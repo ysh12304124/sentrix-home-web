@@ -517,6 +517,44 @@ class GammaClient:
         self._record_validation_call(role, backend.endpoint, backend.model_name, json_mode, text)
         return text
 
+    def chat_messages(self, messages, *, role=None, temperature=0.0, max_tokens=None):
+        """Stream a complete OpenAI messages array and record per-call metrics.
+
+        AgentRuntime owns a multi-message conversation, so routing it through
+        ``chat(prompt)`` would collapse the role structure.  This entry point
+        preserves the original messages while reusing the same TTFT/usage
+        instrumentation as normal GammaClient calls.
+        """
+        if httpx is None:
+            raise ModelError("httpx is not installed")
+        if not isinstance(messages, list) or not messages:
+            raise ModelError("messages must be a non-empty list")
+        if self.backend != "openai":
+            prompt = "\n\n".join(
+                f"[{str(message.get('role') or 'user')}] {message.get('content') or ''}"
+                for message in messages if isinstance(message, dict)
+            )
+            return self.chat(prompt, json_mode=False, role=role)
+
+        endpoint_base, model = self._endpoint_for(role)
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            return self._chat_openai_stream(
+                endpoint_base, payload, headers, role, model, json_mode=False)
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            raise ModelError(f"gamma request failed: {error}") from error
+
     def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
         if images:

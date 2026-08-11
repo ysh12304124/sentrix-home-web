@@ -15,12 +15,14 @@ corresponding ANN retriever skips with a trace reason — never a silent empty.
 from __future__ import annotations
 
 import os
+import time
 
 
 class EmbeddingRouter:
     def __init__(self, visual=None, text=None):
         self.visual = visual
         self.text = text
+        self._timing_events = []
 
     @classmethod
     def from_clip(cls, clip):
@@ -56,11 +58,30 @@ class EmbeddingRouter:
         return bool(self.text and getattr(self.text, "available", False))
 
     def embed_visual(self, text: str) -> list[float]:
-        if not self.visual_available:
-            return []
-        return self.visual.embed_query(text) or []
+        started = time.monotonic()
+        try:
+            if not self.visual_available:
+                return []
+            return self.visual.embed_query(text) or []
+        finally:
+            self._timing_events.append({
+                "slot": "visual",
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            })
 
     def embed_text(self, text: str) -> list[float]:
-        if not self.text_available:
-            return []
-        return self.text.embed_query(text) or []
+        started = time.monotonic()
+        try:
+            if not self.text_available:
+                return []
+            return self.text.embed_query(text) or []
+        finally:
+            self._timing_events.append({
+                "slot": "text",
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            })
+
+    def get_and_clear_timing_events(self) -> list[dict]:
+        events = list(self._timing_events)
+        self._timing_events.clear()
+        return events

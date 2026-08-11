@@ -519,6 +519,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "condition_summary": cond,
         "can_inspect": len(preview) > 0,
         "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
+        "retrieval_timing": packet.retrieval_timing,
     }
 
 

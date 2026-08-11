@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 
 from .query_contracts import HARD, SEMANTIC, QueryFacet, QuerySpec, parse_time_expression
 
@@ -40,6 +41,7 @@ class EvidencePacket:
     # Phase R R2: per-channel recall trace so API/benchmark can prove each
     # retriever was invoked (or give an explicit unavailable reason).
     channel_trace: dict = field(default_factory=dict)
+    retrieval_timing: dict = field(default_factory=dict)
 
     def as_dict(self):
         return {
@@ -52,6 +54,8 @@ class EvidencePacket:
             "approximate_results": self.approximate_results,
             "gaps": self.gaps,
             "excluded_count": self.excluded_count,
+            "channel_trace": self.channel_trace,
+            "retrieval_timing": self.retrieval_timing,
             "result_summary": {
                 "exact_count": len(self.exact_results),
                 "strong_count": len(self.strong_results),
@@ -150,14 +154,17 @@ class EvidenceRetrievalKernel:
         Only candidate Assets recalled by at least one enabled retriever are
         evaluated, which is the semantic-difference this phase introduces.
         """
+        total_started = time.monotonic()
         from .retrieval import HardFilterContext, RetrievalQuery, fuse
         from .retrieval.config import RetrievalConfig
         from .retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS
         from .retrieval.ranking import VISUAL_ONLY, rank
 
+        query_started = time.monotonic()
         config = self.config or RetrievalConfig()
         filters = HardFilterContext.from_spec(spec)
         query = RetrievalQuery.from_spec(spec, embedding_router=self.embedding_router)
+        query_build_ms = round((time.monotonic() - query_started) * 1000, 1)
         recall_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
@@ -169,16 +176,32 @@ class EvidenceRetrievalKernel:
             if retriever.kind == "expander":
                 expanders.append(retriever)
                 continue
+            if self.embedding_router and hasattr(self.embedding_router, "get_and_clear_timing_events"):
+                self.embedding_router.get_and_clear_timing_events()
+            channel_started = time.monotonic()
             try:
                 hits = retriever.retrieve(query, filters, limit=recall_limit)
                 channel_hits[retriever.name] = hits
-                channel_trace[retriever.name] = {
-                    "invoked": True, "candidate_count": len(hits), "status": getattr(retriever, "status", "ok"),
-                }
+                channel_status = getattr(retriever, "status", "ok")
+                channel_reason = None
             except Exception as error:
                 channel_hits[retriever.name] = []
-                channel_trace[retriever.name] = {"invoked": True, "candidate_count": 0,
-                                                 "status": "error", "reason": str(error)}
+                channel_status = "error"
+                channel_reason = str(error)
+            embedding_events = []
+            if self.embedding_router and hasattr(self.embedding_router, "get_and_clear_timing_events"):
+                embedding_events = self.embedding_router.get_and_clear_timing_events()
+            trace = {
+                "invoked": True,
+                "candidate_count": len(channel_hits[retriever.name]),
+                "status": channel_status,
+                "latency_ms": round((time.monotonic() - channel_started) * 1000, 1),
+                "embedding_ms": round(sum(event.get("latency_ms", 0) for event in embedding_events), 1),
+                "embedding_events": embedding_events,
+            }
+            if channel_reason:
+                trace["reason"] = channel_reason
+            channel_trace[retriever.name] = trace
 
         scope_id = spec.scope_id or (spec.scope_ids[0] if spec.scope_ids else "all_authorized")
         all_authorized = spec.scope_mode == "all_authorized"
@@ -188,9 +211,11 @@ class EvidenceRetrievalKernel:
         # GT's rank per channel (which channel moved it up or down).
         packet.channel_hits = {name: [hit.asset_id for hit in hits] for name, hits in channel_hits.items()}
 
+        primary_fusion_started = time.monotonic()
         primary_items = self._evaluate_fused(
             rank(channel_hits, strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
             spec, packet, filters, all_authorized, scope_id, skip_assets=set())
+        primary_fusion_ms = round((time.monotonic() - primary_fusion_started) * 1000, 1)
 
         # R3B seed-gated adjacency — R8-3: only expands when the strategy is
         # not visual_only, and only for all_relevant or reliable seeds.
@@ -200,6 +225,7 @@ class EvidenceRetrievalKernel:
             seeds = [item["asset_id"] for item in primary_items if item.get("level") in {"exact", "strong"}]
             adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "no_seeds"}
             for expander in expanders:
+                channel_started = time.monotonic()
                 try:
                     adjacency_hits = expander.expand(seeds, filters, limit=recall_limit)
                     adjacency_trace = {"invoked": True, "candidate_count": len(adjacency_hits),
@@ -207,14 +233,22 @@ class EvidenceRetrievalKernel:
                 except Exception as error:
                     adjacency_hits = []
                     adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "error", "reason": str(error)}
+                adjacency_trace["latency_ms"] = round((time.monotonic() - channel_started) * 1000, 1)
+                adjacency_trace["embedding_ms"] = 0.0
+                adjacency_trace["embedding_events"] = []
                 channel_hits[expander.name] = adjacency_hits
                 channel_trace[expander.name] = adjacency_trace
             packet.channel_hits[expander.name] = [hit.asset_id for hit in channel_hits.get(expander.name, [])]
+            adjacency_fusion_started = time.monotonic()
             adjacency_items = self._evaluate_fused(
                 rank({expander.name: channel_hits[expander.name] for expander in expanders},
                      strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
                 spec, packet, filters, all_authorized, scope_id, skip_assets=already)
+            adjacency_fusion_ms = round((time.monotonic() - adjacency_fusion_started) * 1000, 1)
+        else:
+            adjacency_fusion_ms = 0.0
 
+        postprocess_started = time.monotonic()
         packet.assets = primary_items + [item for item in adjacency_items if item["asset_id"] not in already]
         for item in packet.assets:
             if item["level"] == "exact":
@@ -233,6 +267,13 @@ class EvidenceRetrievalKernel:
         packet.exact_results = [item for item in packet.exact_results if item in packet.assets]
         packet.strong_results = [item for item in packet.strong_results if item in packet.assets]
         packet.approximate_results = [item for item in packet.approximate_results if item in packet.assets]
+        packet.retrieval_timing = {
+            "total_ms": round((time.monotonic() - total_started) * 1000, 1),
+            "query_build_ms": query_build_ms,
+            "channels": channel_trace,
+            "fusion_ms": round(primary_fusion_ms + adjacency_fusion_ms, 1),
+            "postprocess_ms": round((time.monotonic() - postprocess_started) * 1000, 1),
+        }
         return packet
 
     def _evaluate_fused(self, fused, spec, packet, filters, all_authorized, scope_id, *, skip_assets):
