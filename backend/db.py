@@ -285,6 +285,7 @@ class MemoryStore:
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
                 status TEXT NOT NULL DEFAULT 'open',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completed_at TEXT
@@ -763,6 +764,9 @@ class MemoryStore:
         )
         self._migrate_face_instances_cluster_nullable()
         self.connection.execute("INSERT OR IGNORE INTO runtime_settings(key,value) VALUES('vlm_backend','ollama_12b')")
+        self._ensure_columns("ingest_batches", {
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+        })
         self._ensure_columns("assets", {
             "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
             "batch_id": "TEXT",
@@ -1080,7 +1084,23 @@ class MemoryStore:
         return self.get_ingest_batch(batch_id)
 
     def get_ingest_batch(self, batch_id):
-        return self._row("SELECT * FROM ingest_batches WHERE id = ?", (str(batch_id),))
+        batch = self._row("SELECT * FROM ingest_batches WHERE id = ?", (str(batch_id),))
+        if batch:
+            batch["metadata_json"] = json.loads(batch.get("metadata_json") or "{}")
+        return batch
+
+    def update_ingest_batch_metadata(self, batch_id, metadata):
+        batch = self.get_ingest_batch(batch_id)
+        if not batch:
+            return None
+        merged = dict(batch.get("metadata_json") or {})
+        merged.update(metadata or {})
+        self.connection.execute(
+            "UPDATE ingest_batches SET metadata_json = ?, updated_at = ? WHERE id = ?",
+            (json_value(merged, {}), now_iso(), str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
 
     def complete_ingest_batch(self, batch_id):
         timestamp = now_iso()
