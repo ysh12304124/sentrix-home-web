@@ -411,7 +411,7 @@
     let _spanText = "";
     if (_evtTimes.length >= 2) { const _d = (new Date(_evtTimes[_evtTimes.length-1]) - new Date(_evtTimes[0])) / 86400000; if (_d > 180) _spanText = "跨越 " + (_d/365).toFixed(1) + " 年"; else if (_d > 30) _spanText = "跨越 " + Math.ceil(_d/30) + " 个月"; else _spanText = "跨越 " + Math.ceil(_d) + " 天"; }
     const _places = {}; const _people = {};
-    ((state.stories[0]||{}).event_ids||[]).forEach(id => { const ev = (state.events||[]).find(x=>x.id===id); if (!ev) return; if (ev?.place && ev.place !== "其他或不确定") _places[ev.place] = (_places[ev.place]||0)+1; (ev.participants||[]).forEach(p => { const nm = typeof p === 'string' ? p : (p?.canonical_name || p?.name || "未知"); _people[nm] = (_people[nm]||0)+1; }); });
+    ((state.stories[0]||{}).event_ids||[]).forEach(id => { const ev = (state.events||[]).find(x=>x.id===id); if (!ev) return; if (ev?.place && ev.place !== "其他或不确定") _places[ev.place] = (_places[ev.place]||0)+1; (ev.participants||[]).forEach(p => { const eid = (typeof p === 'object' && p) ? (p.entity_id||null) : null; const ent = eid ? (state.entities||[]).find(e=>e.id===eid) : null; if (ent?.is_self) return; const nm = typeof p === 'string' ? p : (p?.canonical_name || p?.name || "未知"); _people[nm] = (_people[nm]||0)+1; }); });
     if (state.storyGenerating) {
       const _ids = state.storyDraftEventIds || [];
       const _evs = _ids.map(id => (state.events||[]).find(x=>x.id===id)).filter(Boolean);

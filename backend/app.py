@@ -664,6 +664,10 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
     if not includePeople:
         values = [item for item in values if item["entity_type"] != "person"]
     for item in values:
+        if item.get("entity_type") == "person":
+            item["is_self"] = bool(store._row("SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'", (item["id"],)))
+        else:
+            item["is_self"] = False
         if item.get("entity_type") == "person" and item.get("status") == "pending":
             item["canonical_name"] = "待命名成员"
             item["family_role"] = None
