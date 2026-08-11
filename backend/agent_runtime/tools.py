@@ -429,12 +429,20 @@ def _search_metadata_only(draft, spec, scope_id, query, mode) -> dict:
     indices = _even_indices(len(asset_ids), 6) if mode == "representative" \
         else list(range(min(6, len(asset_ids))))
     preview = []
+    store = _RUNTIME.get("store")
     for i, idx in enumerate(indices):
         a = assets[idx]
+        place = ""
+        if store is not None:
+            try:
+                place = _short_place_label(store.get_asset(a.get("id")) or {})
+            except Exception:
+                place = ""
         preview.append({
             "handle": f"photo_{idx + 1}",
             "captured_at": a.get("captured_at"),
             "level": "exact",
+            "place": place,
             "condition_summary": {},
         })
     total = len(assets)
@@ -503,12 +511,20 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     )
     preview = []
     handles = rs.handles()
+    store = _RUNTIME.get("store")
     for i, item in enumerate(assets[:6]):
         handle = f"photo_{i + 1}"
+        place = ""
+        if store is not None:
+            try:
+                place = _short_place_label(store.get_asset(item.get("asset_id")) or {})
+            except Exception:
+                place = ""
         preview.append({
             "handle": handle,
             "captured_at": item.get("captured_at"),
             "level": item.get("level"),
+            "place": place,
             "condition_summary": _condition_summary(item),
         })
     _RUNTIME["last_handles"] = handles
@@ -529,6 +545,33 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "can_inspect": len(preview) > 0,
         "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
     }
+
+
+def _short_place_label(asset: dict) -> str:
+    """从资产反地理编码取短地点标签（'秦皇岛市昌黎县' / 'Chiang Mai'），供 preview 证据展示。"""
+    import json as _json
+    metadata = asset.get("metadata_json") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = _json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    geocode = metadata.get("reverse_geocode") or {}
+    if isinstance(geocode, str):
+        try:
+            geocode = _json.loads(geocode)
+        except (TypeError, ValueError):
+            geocode = {}
+    if not isinstance(geocode, dict):
+        return ""
+    parts = []
+    for key in ("city", "district"):
+        value = str(geocode.get(key) or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    if parts:
+        return "".join(parts)
+    return str(geocode.get("label") or "")
 
 
 def _condition_summary(item: dict) -> dict:

@@ -104,6 +104,15 @@ class PlaceRetrievalTest(unittest.TestCase):
             {"operation": "count", "filters": {"time": "2019年7月", "place": "秦皇岛如是海度假村"}},
             context=ctx)
         self.assertEqual(out["total"], 2, out)
+    def test_search_preview_includes_place(self):
+        ctx = {"scope_id": "album3-v2", "viewer_id": "owner", "task_state": {}}
+        out = runtime_tools._search_memories(
+            {"query": "沙雕合影", "filters": {"time": "2019年7月", "place": "秦皇岛"}},
+            context=ctx)
+        self.assertEqual(out["total"], 2, out)
+        places = {p.get("place") for p in (out.get("preview") or [])}
+        self.assertTrue(places, "preview 应包含 place 字段")
+        self.assertTrue(any("秦皇岛" in str(pl) for pl in places), places)
 
 
 class DenialWithoutSearchTest(unittest.TestCase):
