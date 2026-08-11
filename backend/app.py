@@ -58,6 +58,8 @@ active_batch_workers = set()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
+RUNTIME_VLLM_API_URL = None
+RUNTIME_VLLM_BASE_URL = None
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
@@ -454,11 +456,12 @@ def _load_vllm_registry():
 
 
 def _vllm_api(path: str, method: str = "GET", json_body=None, timeout=30):
-    """Call the remote vLLM Manager HTTP API."""
-    if not VLLM_API_URL:
+    """Call the selected remote vLLM Manager HTTP API."""
+    manager_url = RUNTIME_VLLM_API_URL or VLLM_API_URL
+    if not manager_url:
         return None
     import httpx as _httpx
-    url = VLLM_API_URL.rstrip("/") + path
+    url = manager_url.rstrip("/") + path
     try:
         resp = _httpx.request(method, url, json=json_body, timeout=timeout)
         if resp.status_code >= 400:
@@ -734,9 +737,32 @@ def switch_model_profile(request: ModelSwitchRequest):
     return _run_vllm_switch(request)
 
 
+class RuntimeBindRequest(BaseModel):
+    manager_url: str
+    model_base_url: str | None = None
+
+@app.post("/api/model-profiles/bind-runtime")
+def bind_model_runtime(request: RuntimeBindRequest):
+    """Bind Agent runtime to one fixed Manager/model-service pair for this process."""
+    global RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL
+    if not request.manager_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid vLLM manager URL")
+    if request.model_base_url and not request.model_base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid vLLM model URL")
+    previous = (RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL)
+    RUNTIME_VLLM_API_URL = request.manager_url.rstrip("/")
+    RUNTIME_VLLM_BASE_URL = request.model_base_url.rstrip("/") if request.model_base_url else None
+    state = _load_vllm_state()
+    if not state or not state.get("pid"):
+        RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL = previous
+        raise HTTPException(status_code=502, detail="selected vLLM Manager has no active model")
+    runtime = _apply_vllm_profile_to_runtime_from_state()
+    return {"accepted": True, "manager_url": RUNTIME_VLLM_API_URL,
+            "model_base_url": RUNTIME_VLLM_BASE_URL, "runtime": runtime}
+
 @app.post("/api/model-profiles/sync-runtime")
 def sync_model_runtime():
-    """Sync gamma client to the currently running vLLM model without triggering a restart."""
+    """Sync gamma client to the currently bound vLLM model without restarting it."""
     runtime = _apply_vllm_profile_to_runtime_from_state()
     return {"accepted": True, "runtime": runtime}
 
