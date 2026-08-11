@@ -17,8 +17,8 @@ _OPERATION_LABEL = {
 }
 
 _REASON_TAIL = {
-    "回答未通过事实校验": "我已经查到了部分记录，但刚才有一处信息没有核对上，所以没有直接给你结论。我可以继续帮你核对。",
-    "guard_blocked": "我已经查到了部分记录，但刚才有一处信息没有核对上，所以没有直接给你结论。我可以继续帮你核对。",
+    "回答未通过事实校验": "以上是我目前能确认的部分信息。",
+    "guard_blocked": "以上是我目前能确认的部分信息。",
     "预算用尽": "我这次处理的步骤用完了，暂时没有完成全部回答。你可以让我继续，或换个问法。",
     "输出无法解析": "我这次没能完成处理，可以换个说法再问我一次。",
     "动作无法识别": "我这次没能完成处理，可以换个说法再问我一次。",
@@ -50,11 +50,11 @@ def render_emergency_summary(task_state: dict, *, reason: str = "") -> str:
             parts.append("检索没有找到符合条件的照片。")
         else:
             remaining = task_state.get("result_remaining") or 0
-            parts.append(f"已找到 {result_total} 张候选照片，还有 {remaining} 张未查看。")
+            parts.append(f"找到 {result_total} 张接近的照片。")
             if satisfaction == "candidate_only":
-                parts.append("目前只是相似候选，还不能确认完全匹配。")
+                parts.append("这几张只是接近，还不能完全确认。")
             elif satisfaction == "partial_support":
-                parts.append("部分条件已确认，仍有条件未完全确认。")
+                parts.append("部分信息能对上，还有细节不能完全确认。")
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
             handle = tr.get("inspect_handle") or ""

@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentrix QA Dashboard</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--text:#1f2328;--muted:#6b7280;--faint:#9ca3af;
+--ok:#137a3b;--okbg:#e7f6ec;--warn:#a05a00;--warnbg:#fdf3e0;--bad:#b42318;--badbg:#fde8e8;--acc:#2563eb}
+*{box-sizing:border-box}
+body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;margin:0;background:var(--bg);color:var(--text)}
+header{background:#111418;color:#fff;padding:16px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+header h1{font-size:18px;margin:0;font-weight:600}
+header .sub{color:#9aa4af;font-size:12px;flex:1}
+.wrap{display:grid;grid-template-columns:280px 1fr;gap:16px;padding:16px;align-items:start}
+aside{position:sticky;top:16px;display:flex;flex-direction:column;gap:8px}
+main{display:flex;flex-direction:column;gap:16px;min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card h3{margin:0 0 10px;font-size:13px;color:var(--muted);font-weight:600}
+.run-item{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;cursor:pointer;transition:border-color .15s}
+.run-item:hover{border-color:var(--acc)}
+.run-item.active{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
+.run-item .rid{font-size:12px;font-weight:600}
+.run-item .rmeta{font-size:11px;color:var(--faint);margin-top:2px}
+.run-item .rsum{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap}
+.badge{display:inline-block;border-radius:6px;padding:1px 8px;font-size:11px}
+.ok{background:var(--okbg);color:var(--ok)} .warn{background:var(--warnbg);color:var(--warn)} .bad{background:var(--badbg);color:var(--bad)} .muted{background:#eef2f6;color:var(--muted)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.kpi b{display:block;font-size:22px}
+.kpi span{font-size:12px;color:var(--muted)}
+.chart{width:100%;height:120px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.filters select,.filters input{border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:12px;background:#fff}
+.qcard{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.qhead{display:flex;gap:10px;padding:12px 16px;cursor:pointer;align-items:flex-start}
+.qhead:hover{background:#fafbfc}
+.qhead .qid{font-size:11px;color:var(--faint);white-space:nowrap}
+.qhead .q{font-size:13px;flex:1}
+.qhead .tags{display:flex;gap:4px;flex-wrap:wrap}
+.qbody{display:none;border-top:1px solid var(--line);padding:14px 16px;font-size:13px;gap:16px}
+.qbody.open{display:grid;grid-template-columns:1fr 1fr}
+.qbody .col{display:flex;flex-direction:column;gap:8px;min-width:0}
+.qbody .lbl{font-size:11px;color:var(--faint);font-weight:600}
+.ans{white-space:pre-wrap;line-height:1.6;background:#fafbfc;border:1px solid #eef0f3;border-radius:8px;padding:10px}
+.gold{background:#f0f7ff;border:1px solid #d8e8ff;border-radius:8px;padding:10px}
+.evline{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.evimg{border:1px solid var(--line);border-radius:6px;overflow:hidden;width:64px;height:64px;cursor:zoom-in;background:#fafbfc;position:relative}
+.evimg img{width:100%;height:100%;object-fit:cover;display:block}
+.evimg.hit{outline:2px solid var(--ok)}
+.evimg .fname{position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.55);color:#fff;font-size:9px;padding:1px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.evimg.nohit{opacity:.55}
+.timeline{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
+.tl-step{display:flex;gap:8px;align-items:baseline}
+.tl-step .tool{font-weight:600;color:var(--text)}
+.tl-step .dur{color:var(--faint);font-size:11px}
+.review-row{display:flex;gap:8px;align-items:center;margin-top:8px}
+.review-row select,.review-row input{border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:12px}
+.review-row input{flex:1}
+.lightbox{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:50}
+.lightbox img{max-width:92vw;max-height:92vh;border-radius:8px}
+.lightbox.open{display:flex}
+.row{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
+.pri{font-weight:700}
+.pri-R{color:var(--bad)} .pri-V{color:var(--warn)} .pri-T{color:#7c3aed} .pri-S{color:#0e7490} .pri-G{color:#be185d} .pri-J{color:#64748b} .pri-PASS{color:var(--ok)}
+.hw-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px}
+.hw-cell{background:#fafbfc;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.hw-cell span{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
+.hw-cell b{font-size:12.5px;font-weight:600;word-break:break-all}
+.tl-tool{background:var(--okbg);color:var(--ok);border-radius:6px;padding:2px 7px;font-size:12px;white-space:nowrap}
+.tl-tool i{font-style:normal;opacity:.75;margin-left:3px}
+.tl-arrow{color:var(--faint);margin:0 3px}
+@media(max-width:900px){.wrap{grid-template-columns:1fr}.qbody.open{grid-template-columns:1fr}aside{position:static}}
+.lay{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+.lay .ly{display:inline-block;border-radius:6px;padding:1px 6px;font-size:10.5px;font-weight:600;letter-spacing:.3px}
+.ly-p{background:var(--okbg);color:var(--ok)} .ly-f{background:var(--badbg);color:var(--bad)} .ly-n{background:#eef2f6;color:var(--faint)}
+.tperf{width:100%;border-collapse:collapse;font-size:12px}
+.tperf th,.tperf td{padding:5px 8px;text-align:right;border-bottom:1px solid #eef0f3}
+.tperf th:first-child,.tperf td:first-child{text-align:left}
+.tperf th{color:var(--faint);font-weight:600;font-size:11px}
+.tperf td b{font-weight:600}
+.decom-kpi{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+
+</style>
+</head>
+<body>
+<header>
+  <h1>Sentrix QA Dashboard</h1>
+  <div class="sub" id="hdr">加载中…</div>
+</header>
+<div class="wrap">
+  <aside>
+    <div class="card"><h3>QA Runs</h3><div id="runList" style="display:flex;flex-direction:column;gap:8px"></div></div>
+  </aside>
+  <main>
+    <div id="overview" style="display:none">
+      <div class="cards" id="kpis"></div>
+      <div class="card" id="hwBox" style="display:none"><h3>硬件参数（run 起 → 末）</h3></div>
+      <div class="card"><h3>多 Run 对比（correct / 证据召回 / 平均时延）</h3><canvas class="chart" id="cmpChart"></canvas></div>
+      <div class="card" id="decomBox" style="display:none"><h3>分层归因（每题 primary 层：R检索 / V视觉 / O-OCR / T工具序列 / S综合 / G-guard / J-judge）</h3><div id="decomKpi" class="decom-kpi"></div></div>
+      <div class="card" id="toolPerfBox" style="display:none"><h3>Tool 性能（p50/p95 来自 tool_trace，OCR provider/cache 来自行级 tool_perf）</h3><div id="toolPerfTable"></div></div>
+      <div class="card">
+        <div class="filters" id="filters">
+          <select id="fVerdict"><option value="">全部判定</option></select>
+          <select id="fStatus"><option value="">全部状态</option></select>
+          <select id="fTask"><option value="">全部任务类型</option></select>
+          <select id="fAngle"><option value="">全部角度</option></select>
+          <select id="fDiff"><option value="">全部难度</option></select>
+          <select id="fPri"><option value="">全部分层</option></select>
+          <button onclick="saveAllReviews()" style="margin-left:auto;border:1px solid var(--acc);background:var(--acc);color:#fff;border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer">保存评审</button>
+          <span id="saveState" style="font-size:12px;color:var(--faint)"></span>
+        </div>
+      </div>
+    </div>
+    <div id="qaList" style="display:flex;flex-direction:column;gap:10px"></div>
+  </main>
+</div>
+<div class="lightbox" id="lightbox" onclick="this.classList.remove('open')"><img id="lbImg" src=""></div>
+<script>
+const state = {runs:[], run:null, decom:null, review:{}, filter:{}, open:new Set()};
+const $ = id => document.getElementById(id);
+
+async function j(method, url, body){
+  const opt = {method, headers:{}};
+  if(body !== undefined){opt.headers['content-type']='application/json'; opt.body=JSON.stringify(body);}
+  const r = await fetch(url, opt);
+  if(!r.ok) throw new Error(url+' -> '+r.status);
+  return r.json();
+}
+
+async function loadRuns(){
+  const data = await j('GET','/api/qa/runs');
+  state.runs = data.runs || [];
+  $('hdr').textContent = state.runs.length + ' 次 QA run';
+  renderRunList();
+  if(state.runs.length) selectRun(state.runs[0].run_id);
+}
+function renderRunList(){
+  $('runList').innerHTML = state.runs.map(r=>{
+    const v = r.summary.verdicts||{};
+    const st = r.summary.statuses||{};
+    return `<div class="run-item" data-id="${r.run_id}" onclick="selectRun('${r.run_id}')">
+      <div class="rid">${r.tag}</div>
+      <div class="rmeta">${r.created_at} · ${r.summary.total||0} 题 · ${r.profile||''}</div>
+      <div class="rsum">
+        <span class="badge ok">正确 ${v.correct||0}</span>
+        <span class="badge warn">部分 ${v.partial||0}</span>
+        <span class="badge bad">错误 ${v.wrong||0}</span>
+        <span class="badge muted">召回 ${r.summary.evidence_recall_avg??'—'}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+async function selectRun(runId){
+  document.querySelectorAll('.run-item').forEach(el=>el.classList.toggle('active', el.dataset.id===runId));
+  state.run = await j('GET','/api/qa/runs/'+runId);
+  state.decom = null;
+  try{ state.review = (await j('GET','/api/qa/runs/'+runId+'/review')).reviews||{}; }catch(e){ state.review={}; }
+  buildFilters();
+  renderOverview();
+  renderList();
+  drawCompare();
+}
+function buildFilters(){
+  const rows = state.run.rows||[];
+  const opts = (sel,key,def)=>{
+    const v=[...new Set(rows.map(r=>r[key]).filter(Boolean))];
+    sel.innerHTML = `<option value="">${def}</option>`+v.map(x=>`<option>${x}</option>`).join('');
+  };
+  const vb={correct:'correct',partial:'partial',wrong:'wrong',error:'error'};
+  const jv = rows.map(r=>(r.judge||{}).verdict).filter(Boolean);
+  $('fVerdict').innerHTML = '<option value="">全部判定</option>'+[...new Set(jv)].map(x=>`<option>${x}</option>`).join('');
+  opts($('fStatus'),'status','全部状态');
+  opts($('fTask'),'task_type','全部任务类型');
+  opts($('fAngle'),'angle','全部角度');
+  opts($('fDiff'),'difficulty','全部难度');
+  const pri = rows.map(r=>(r.primary||'')).filter(Boolean);
+  $('fPri').innerHTML = '<option value="">全部分层</option>'+[...new Set(pri)].map(x=>`<option>${x}</option>`).join('');
+  ['fVerdict','fStatus','fTask','fAngle','fDiff','fPri'].forEach(id=>$(id).onchange=()=>{state.filter[id]=$(id).value;renderList();});
+}
+function renderOverview(){
+  $('overview').style.display='block';
+  const s = state.run.summary||{};
+  const v = s.verdicts||{};
+  const st = s.statuses||{};
+  $('kpis').innerHTML = [
+    ['题目总数', s.total||0], ['complete', st.complete||0], ['blocked', st.blocked_by_guard||0],
+    ['correct', v.correct||0], ['partial', v.partial||0], ['wrong', v.wrong||0],
+    ['证据命中', (s.evidence_hit||0)+'/'+(s.evidence_questions||0)],
+    ['证据召回', s.evidence_recall_avg??'—'], ['平均时延', (s.avg_latency_s??'—')+'s'],
+  ].map(([k,v])=>`<div class="kpi"><b>${v}</b><span>${k}</span></div>`).join('');
+  const hw = hwHtml();
+  $('hwBox').style.display = hw ? 'block' : 'none';
+  $('hwBox').innerHTML = '<h3>硬件参数（run 起 → 末）</h3>'+hw;
+  $('hdr').textContent = `${state.run.run_id} · ${(state.run.meta||{}).qa_file||''} · ${(state.run.meta||{}).timestamp||''}`;
+  renderDecom();
+  renderToolPerf();
+}
+function renderDecom(){
+  const d = (state.run.summary||{}).decom||{};
+  const prim = d.primary||{}; const lf = d.layer_fail||{};
+  const has = Object.keys(prim).length;
+  $('decomBox').style.display = has ? 'block' : 'none';
+  if(!has) return;
+  const layHtml = ['R','V','O','T','S','G','J'].map(L=>{
+    const n = lf[L]||0;
+    return `<span class="ly ${n?'ly-f':'ly-p'}">${L} ${n}</span>`;
+  }).join('');
+  $('decomKpi').innerHTML = layHtml + `<span class="ly ly-p">PASS ${prim.PASS||0}</span>`;
+}
+function pct(n){ return n==null?'—':(n+'%'); }
+function pctile(arr,q){
+  if(!arr.length) return null;
+  const a=[...arr].sort((x,y)=>x-y);
+  const i=Math.min(a.length-1, Math.ceil(a.length*q)-1);
+  return Math.round(a[i]);
+}
+function renderToolPerf(){
+  const rows = state.run.rows||[];
+  const per = {};
+  for(const r of rows){
+    const tel = r.telemetry||{};
+    for(const t of (tel.tool_trace||[])){
+      const name=t.tool||''; if(!name) continue;
+      const s = per[name] = per[name]||{calls:0,ok:0,lat:[],providers:new Set(),tiles:new Set(),cacheHits:0,vlmCalls:0};
+      s.calls++; if((t.status||'')==='ok') s.ok++;
+      if(typeof t.latency_s==='number' && t.latency_s>=0) s.lat.push(t.latency_s*1000);
+    }
+    for(const [name,st] of Object.entries(tel.tool_perf||{})){
+      const s = per[name] = per[name]||{calls:0,ok:0,lat:[],providers:new Set(),tiles:new Set(),cacheHits:0,vlmCalls:0};
+      (st.providers||[]).forEach(p=>s.providers.add(p));
+      (st.tiles||[]).forEach(p=>s.tiles.add(p));
+      s.cacheHits += st.cache_hits||0; s.vlmCalls += st.vlm_calls||0;
+    }
+  }
+  const names = Object.keys(per).sort((a,b)=>per[b].calls-per[a].calls);
+  $('toolPerfBox').style.display = names.length ? 'block':'none';
+  if(!names.length) return;
+  $('toolPerfTable').innerHTML = `<table class="tperf"><tr><th>Tool</th><th>调用</th><th>成功</th><th>p50</th><th>p95</th><th>max</th><th>OCR provider</th><th>tiles</th><th>cache 命中</th><th>VLM 调用</th></tr>` + names.map(n=>{
+    const s=per[n];
+    return `<tr><td><b>${n}</b></td><td>${s.calls}</td><td>${Math.round(100*s.ok/Math.max(1,s.calls))}%</td>
+      <td>${pctile(s.lat,0.5)??'—'}ms</td><td>${pctile(s.lat,0.95)??'—'}ms</td><td>${pctile(s.lat,1)??'—'}ms</td>
+      <td>${[...s.providers].join(',')||'—'}</td><td>${[...s.tiles].join(',')||'—'}</td>
+      <td>${s.cacheHits}</td><td>${s.vlmCalls}</td></tr>`;
+  }).join('') + '</table>';
+}
+function filteredRows(){
+  const rows = state.run.rows||[];
+  return rows.filter(r=>{
+    if(state.filter.fVerdict && (r.judge||{}).verdict !== state.filter.fVerdict) return false;
+    if(state.filter.fStatus && r.status !== state.filter.fStatus) return false;
+    if(state.filter.fTask && r.task_type !== state.filter.fTask) return false;
+    if(state.filter.fAngle && r.angle !== state.filter.fAngle) return false;
+    if(state.filter.fDiff && r.difficulty !== state.filter.fDiff) return false;
+    if(state.filter.fPri && r.primary !== state.filter.fPri) return false;
+    return true;
+  });
+}
+function evImg(aid, fname, hit){
+  return `<div class="evimg${hit?' hit':''}"><img src="/api/assets/${aid}/file" loading="lazy" onclick="event.stopPropagation();openLb('/api/assets/${aid}/file')"><span class="fname">${fname||aid}</span></div>`;
+}
+function goldImgs(r){
+  const amap = state.run.asset_map||{};
+  const out = [];
+  for(const gp of (r.gold_evidence_ids||[])){
+    const key = gp.split('/').pop().toLowerCase();
+    const aid = amap[key];
+    out.push(aid ? evImg(aid, key, true) : `<span class="badge muted">${key}</span>`);
+  }
+  return out.join('');
+}
+function agentImgs(r){
+  const seen = new Set(); const out=[];
+  for(const a of (r.agent_evidence||[])){
+    const aid = a.asset_id; if(!aid||seen.has(aid)) continue; seen.add(aid);
+    out.push(evImg(aid, a.file_name||'', true));
+  }
+  return out.join('')||'<span class="muted">—</span>';
+}
+function tlHtml(r){
+  const tl = r.telemetry||{};
+  const steps = [];
+  const tr = tl.tool_trace||[];
+  if(tr.length){
+    const sum = tr.reduce((a,t)=>a+(t.latency_s||0),0);
+    steps.push(`<div class="tl-step"><span class="tool">工具耗时合计</span><span>${tr.length} 次 / ${sum.toFixed(1)}s</span></div>`);
+  }
+  if(tl.model_steps) steps.push(`<div class="tl-step"><span class="tool">模型步</span><span>${tl.model_steps}</span></div>`);
+  if(tl.tool_calls) steps.push(`<div class="tl-step"><span class="tool">工具调用</span><span>${tl.tool_calls}</span></div>`);
+  if(tl.inspections) steps.push(`<div class="tl-step"><span class="tool">图片复核</span><span>${tl.inspections}</span></div>`);
+  if(tl.elapsed_s) steps.push(`<div class="tl-step"><span class="tool">总耗时</span><span>${tl.elapsed_s}s</span></div>`);
+  return steps.join('')||'—';
+}
+function hwHtml(){
+  const m = state.run.meta||{};
+  const st = m.hardware_start||{}, en = m.hardware_end||{};
+  const g = (st.gpu||[])[0], ge = (en.gpu||[])[0];
+  if(!g && !st.cpu && !st.memory && !st.models) return '';
+  const miB = v => v==null?'—':(v>=1024?(v/1024).toFixed(1)+'G':v+'M');
+  const cpu = st.cpu||{}, mem = st.memory||{};
+  const vlm = (st.models&&st.models.vlm)||{};
+  const llm = (st.models&&st.models.llm)||{};
+  const items = [
+    ['GPU 型号', g?g.name:'—'],
+    ['显存 起→末', (g?miB(g.memory_used_mib):'—')+' → '+(ge?miB(ge.memory_used_mib):'—')+' / '+(g?miB(g.memory_total_mib):'—')],
+    ['GPU 利用率', (g?g.utilization_percent+'%':'—')+' → '+(ge?ge.utilization_percent+'%':'—')],
+    ['GPU 温度', (g?g.temperature_c+'°C':'—')+' → '+(ge?ge.temperature_c+'°C':'—')],
+    ['VLM', vlm.name||'—'],
+    ['LLM', (llm.backend||'—')+' · '+(llm.model||'—')],
+    ['CPU', (cpu.cores||'—')+' 核 · load '+(cpu.load_avg?cpu.load_avg.join('/'):'—')],
+    ['内存可用', miB(mem.available_mib)+' / '+miB(mem.total_mib)],
+  ];
+  return '<div class="hw-grid">'+items.map(([k,v])=>`<div class="hw-cell"><span>${k}</span><b title="${v}">${v}</b></div>`).join('')+'</div>';
+}
+function toolChainHtml(r){
+  const tr = (r.telemetry&&r.telemetry.tool_trace)||[];
+  if(tr.length){
+    return tr.map(t=>`<span class="tl-tool" title="${(t.status||'')}${t.reason?(' · '+t.reason):''}">${t.tool}${t.latency_s!=null?` <i>${Number(t.latency_s).toFixed(1)}s</i>`:''}</span>`).join('<span class="tl-arrow">→</span>');
+  }
+  return (r.tools||[]).join(' → ')||'—';
+}
+function renderList(){
+  const rows = filteredRows();
+  $('qaList').innerHTML = rows.map(r=>{
+    const j = r.judge||{}; const ev = r.evidence||{};
+    const pri = r.primary||'';
+    const vcls = {correct:'ok',partial:'warn',wrong:'bad',error:'bad'}[j.verdict]||'muted';
+    const scls = {complete:'ok',blocked_by_guard:'warn',error:'bad',timeout:'bad'}[r.status]||'muted';
+    const rev = state.review[r.qa_id]||{};
+    const open = state.open.has(r.qa_id)?' open':'';
+    return `<div class="qcard">
+      <div class="qhead" onclick="toggle('${r.qa_id}')">
+        <div class="qid">${r.qa_id}</div>
+        <div class="q">${r.question}</div>
+        <div class="tags">
+          ${decomHtml(r)}
+          ${pri?`<span class="badge pri pri-${pri}">${pri}</span>`:''}
+          <span class="badge ${scls}">${r.status||''}</span>
+          <span class="badge ${vcls}">${j.verdict||'skip'}</span>
+          <span class="badge muted">${r.task_type||''}</span><span class="badge muted">${r.angle||''}</span><span class="badge muted">${r.difficulty||''}</span>
+        </div>
+      </div>
+      <div class="qbody${open}">
+        <div class="col">
+          <div><span class="lbl">标准答案</span><div class="gold">${r.gold_answer||''}</div></div>
+          <div><span class="lbl">Agent 回答</span><div class="ans">${(r.answer||'').replace(/</g,'&lt;')||'<span class="muted">(无答案)</span>'}</div></div>
+          <div><span class="lbl">Judge</span><div class="ans">${j.reason||''}</div></div>
+        </div>
+        <div class="col">
+          <div><span class="lbl">标准证据</span><div class="evline">${goldImgs(r)}</div></div>
+          <div><span class="lbl">Agent 使用证据</span><div class="evline">${agentImgs(r)}</div></div>
+          <div><span class="lbl">工具调用（含单次耗时）</span><div class="timeline">${toolChainHtml(r)}</div></div>
+          <div><span class="lbl">Telemetry</span><div class="timeline">${tlHtml(r)}</div></div>
+          ${r.guard_debug?`<div><span class="lbl">Guard</span><div class="ans">${JSON.stringify(r.guard_debug)}</div></div>`:''}
+          <div class="review-row">
+            <select data-qa="${r.qa_id}" class="revv">
+              <option value="">人工判定…</option>
+              ${['correct','partial','wrong'].map(v=>`<option ${rev.verdict===v?'selected':''}>${v}</option>`).join('')}
+            </select>
+            <input data-qa="${r.qa_id}" class="revn" placeholder="备注（可选）" value="${(rev.note||'').replace(/"/g,'&quot;')}">
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+function decomHtml(r){
+  const d = r.decom||null;
+  if(!d || !d.layers) return '';
+  return '<span class="lay">'+['R','V','O','T','S','G','J'].map(L=>{
+    const st = d.layers[L]||'na';
+    const cls = st==='pass'?'ly-p':(st==='fail'?'ly-f':'ly-n');
+    return `<span class="ly ${cls}" title="${L}: ${(d.detail||{})[L]||''}">${L}</span>`;
+  }).join('')+'</span>';
+}
+function toggle(id){ if(state.open.has(id)) state.open.delete(id); else state.open.add(id); renderList(); }
+function openLb(src){ $('lbImg').src=src; $('lightbox').classList.add('open'); }
+function drawCompare(){
+  const c = $('cmpChart'), ctx = c.getContext('2d');
+  const w = c.parentElement.clientWidth; c.width = w; c.height = 120;
+  ctx.clearRect(0,0,w,120);
+  const runs = state.runs.slice(0,12).reverse();
+  if(runs.length<2){ ctx.fillStyle='#9ca3af'; ctx.font='12px sans-serif'; ctx.fillText('至少需要 2 次 run 才能对比', 12, 20); return; }
+  const series = [
+    {key:r=>(r.summary.verdicts||{}).correct||0, color:'#137a3b', label:'correct'},
+    {key:r=>r.summary.evidence_recall_avg??null, color:'#2563eb', label:'召回'},
+    {key:r=>r.summary.avg_latency_s??null, color:'#a05a00', label:'时延'},
+  ];
+  const pad={l:34,r:10,t:10,b:22};
+  const plotW=w-pad.l-pad.r, plotH=120-pad.t-pad.b;
+  series.forEach(s=>{
+    const vals = runs.map(r=>s.key(r)).filter(v=>v!=null);
+    if(vals.length<2) return;
+    const min=Math.min(...vals), max=Math.max(...vals);
+    const span=(max-min)||1;
+    ctx.strokeStyle=s.color; ctx.lineWidth=2; ctx.beginPath();
+    runs.forEach((r,i)=>{
+      const v=s.key(r); if(v==null) return;
+      const x=pad.l+i*(plotW/Math.max(1,runs.length-1));
+      const y=pad.t+plotH-(v-min)/span*plotH;
+      i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+    });
+    ctx.stroke();
+    ctx.fillStyle=s.color; ctx.font='10px sans-serif'; ctx.fillText(s.label, pad.l, pad.t-2);
+  });
+  ctx.fillStyle='#9ca3af'; ctx.font='10px sans-serif';
+  runs.forEach((r,i)=>{
+    const x=pad.l+i*(plotW/Math.max(1,runs.length-1));
+    ctx.save(); ctx.translate(x, 120-6); ctx.rotate(-0.5);
+    ctx.fillText((r.tag||'').slice(-12), 0, 0); ctx.restore();
+  });
+}
+async function saveAllReviews(){
+  const reviews = {};
+  document.querySelectorAll('.revv').forEach(sel=>{
+    if(!sel.value) return;
+    const qa = sel.dataset.qa;
+    const note = document.querySelector(`.revn[data-qa="${qa}"]`).value||'';
+    reviews[qa] = {verdict: sel.value, note};
+  });
+  try{
+    await j('POST','/api/qa/runs/'+state.run.run_id+'/review',{reviews});
+    $('saveState').textContent='已保存 ✓';
+    setTimeout(()=>$('saveState').textContent='',2000);
+  }catch(e){ $('saveState').textContent='保存失败: '+e.message; }
+}
+loadRuns();
+</script>
+</body>
+</html>

@@ -40,7 +40,7 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
 
 - 153 仓库：`/home/asus/Github/Sentrix-Home-Web`
 - 正式后端提交分支：`psh`
-- 当前提交：`bc1274c` (`merge(agent-runtime-v2): GitHub main sync + pipeline profile removal + dead code cleanup`，2026-08-10)
+- 当前提交：`15039f0` (`fix(api): scope dedup in /api/ingest (same album only, not cross-space)`，2026-08-10)
 - 当前工作树：干净。
 - Web：`http://192.168.0.153:4174`，代理 `http://127.0.0.1:8091`
 - 生产 Agent API：`8091`（AgentRuntime Tool-Loop 全栈 + `data/sentrix.db`）；`8090` 为旧实例保留
@@ -481,6 +481,24 @@ git diff --check
 数字人产品定位：中性家庭记忆管家，先调用结构化、语义、事件和原始证据工具，再由
 模型组织回答；歧义时澄清，证据不足记录查询缺口，写入必须由用户显式确认并保留
 审计。完整协议见 `docs/plans/digital-memory-steward.md`。
+
+## Phase E 待办（2026-08-11）
+
+1. **OCR 显存/时间超预算（P0 待办）**：`read_photo_text` 当前 = 整图 + 3x3 tile（2x 放大）
+   共 10 次 12B VLM 图片推理，首图实测 ~150s，GPU 已用 19.2/24GB，端侧不可行。
+   候选方案：① 换专用轻量 OCR（PaddleOCR/RapidOCR，CPU/小显存，Numeric Exact Match
+   目标 ≥95%）并保留 12B 仅做语义兜底；② 压缩 VLM 用量（mosaic 单次推理 / 2x2 tile /
+   scale 1.5）；③ OCR 走 CPU/小核，12B 按需加载。用现有 7 题 spike 集 + final3 4 个
+   成功题复测 exact match 后定案。
+2. **Answer Style 未达标**：final3 retrieval jargon 泄漏 15 条、direct rate 57.7%
+   （目标 0 / 95%）；根因是 final 仍拼接 evidence 摘要文本，需重构 response writer。
+3. **inspect_result_set 无结论**：未做 spike、未上线；现由 adaptive budget（多图→4）+
+   `read_photo_text` 部分替代，需正式实测结论。
+4. **benchmark 产物缺口**：tool sequence（`evaluate_search_inspect_e2e.py`）与
+   synthesis faithfulness 无运行输出；capability matrix 未接入 health/Agent prompt；
+   dashboard 每题未显示 R/V/O/T/S/G/J 分层标签。
+5. **Product wrong 未下降**：final3 wrong 15 > Phase D 基线 11；V 层（招牌/小字）与
+   S 层回避是主要贡献。
 
 ## 接手原则
 

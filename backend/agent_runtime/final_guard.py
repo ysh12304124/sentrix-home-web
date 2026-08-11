@@ -20,10 +20,22 @@ _DENY_WITH_OBJECT = re.compile(
     r"|不存在|未找到|没找到|没拍过|查无|找不到", re.I)
 # 只是不确定/hedge，不算否认
 _HEDGE = re.compile(r"无法确认|不能确认|不确定|还不能|没有完全|暂时|无法判断|记不清|可能没有|未必", re.I)
+# D12：记录级否认（"没有找到相关记录"），用于"未检索就声称找不到"检查；
+# 不含"我没去过北京"这类出行否定。
+_DENY_RECORDS = re.compile(
+    r"没(?:有)?找到|未找到|找不到|查无|没有(?:任何|符合|相关|一张|一个|一条|拍到|拍过)?(?:照片|记录|回忆|记忆)", re.I)
 # 正向断言找到（exists=False 用），排除 没/未/无 前缀
 _POSITIVE_FOUND = re.compile(
     r"(?<!没)(?<!未)(?<!无)(?:有|找到|存在|拍了?)(?:相关|任何|一些)?(?:的)?(?:照片|记录|回忆|记忆|去)")
 _FOUND_CLAIM = re.compile(r"找到|为您找到|有.{0,10}(照片|记录)")
+
+# D1：家庭记忆事实信号（时间/地点/人物/活动/证据词），用于 memory_fact_without_evidence。
+_FAMILY_FACT_RE = re.compile(
+    r"\d{4}\s*年|[1-9]?\d\s*月|去年|今年|前年|那年|那天|那次|"
+    r"去(?:过|了|玩|到)|到过|去了|在.{0,4}(?:玩|拍|吃|住|度假|旅行|聚会|聚)|"
+    r"一起|家人|妈妈|爸爸|儿子|女儿|孩子|家庭|"
+    r"吃(?:过|了)|喝(?:过|了)|玩(?:过|了)|旅行|度假|聚餐|聚会|"
+    r"照片|照片里|图里|图片|记录|回忆|拍的|拍摄|景区|酒店|餐厅|城市|地方")
 
 
 def _natural_message(code: str, detail: str = "") -> str:
@@ -50,6 +62,9 @@ def _natural_message(code: str, detail: str = "") -> str:
         "certainty_upgrade": "有条件没有确认，回答却说得过于确定",
         "judge_unfaithful": "评审认为回答与工具观察不一致",
         "placeholder_leak": "回答里出现了'地点名称/数量/时间'这类未填写的占位符，必须替换成真实数据或删除",
+        "memory_fact_without_evidence": "回答包含了家庭记忆事实，但没有引用任何工具证据（evidence_refs 为空）。请列出你实际引用的工具调用编号；如果没有工具结果支持，如实改为没有找到相关记录",
+        "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
+        "ocr_value_conflict": "回答里的电话/价格数字与照片文字不一致。请只使用 read_photo_text 实际读到的数字，删除照片文字里没有的数字",
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -78,6 +93,25 @@ class FinalGuard:
         answer = answer or ""
         task_state = task_state or {}
         issues.extend(self._check_faithfulness(answer, task_state))
+        issues.extend(self._check_ocr_hard_values(answer, task_state))
+        # D1：照片/检索类家庭事实回答必须有证据引用（有结果集但 evidence_refs 为空 → recoverable）。
+        # 确定性事实操作（query_memory_facts）由上方事实一致性校验兜底，不强制照片引用。
+        refs = task_state.get("evidence_refs") or []
+        tool_results = task_state.get("tool_results") or []
+        has_tool_evidence = any(
+            (tr.get("tool") == "search_memories" and (tr.get("total") or 0) > 0)
+            or (tr.get("tool") == "get_original_photos" and (tr.get("total") or 0) > 0)
+            or (tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip())
+            for tr in tool_results
+        )
+        if not refs and has_tool_evidence and _FAMILY_FACT_RE.search(answer):
+            issues.append(_issue("memory_fact_without_evidence"))
+        # D12：声称"没有找到记录"但本轮从未调用任何检索工具 → 必须纠正后重试检索。
+        retrieval_tools = {"search_memories", "query_memory_facts", "search_conversation_history",
+                           "get_core_memory", "get_person_memory", "get_result_page"}
+        if not any((tr.get("tool") or "") in retrieval_tools for tr in tool_results) \
+                and _DENY_RECORDS.search(answer):
+            issues.append(_issue("denial_without_search"))
         # 0. query_memory_facts 事实一致性：final 必须包含工具返回的 value
         if task_state.get("last_tool") == "query_memory_facts":
             op = task_state.get("fact_operation")
@@ -102,11 +136,11 @@ class FinalGuard:
                         issues.append(_issue("fact_exists_contradiction_false", "expected=False"))
             elif op in {"group", "meal"}:
                 issues.extend(self._check_group(answer, task_state))
-        # 0.5 模板占位符泄漏（[地点名称1]/[数量] 等未填占位）
-        if re.search(r"\[[^\[\]]{0,14}(?:名称|数量|时间|地点|内容|数字|照片|记录)[^\[\]]{0,14}\]", answer):
+        # 0.5 模板占位符泄漏（[地点名称1]/[数量]/[此处填入…店名] 等未填占位）
+        if re.search(r"\[[^\[\]]{0,48}(?:填入|此处|占位|待填|名称|数量|时间|地点|内容|数字|照片|记录|店名|电话|价格|姓名|日期|金额)[^\[\]]{0,36}\]", answer):
             issues.append(_issue("placeholder_leak"))
         # 1. 内部 ID 泄漏（asset_/obs_/entity_ 前缀 + 内部表名）
-        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_)[a-f0-9]{6,}\b", answer)
+        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_|conversation_)[a-f0-9]{6,}\b", answer)
         if leaks:
             issues.append(_issue("internal_id_leak", f"{sorted(set(leaks))[:3]}",
                                  revision=REVISION_HARD_BLOCK))
@@ -128,6 +162,56 @@ class FinalGuard:
             if _FOUND_CLAIM.search(answer):
                 issues.append(_issue("fabrication_from_empty"))
         return GuardResult(issues)
+
+    @staticmethod
+    def _has_substantive_fact(answer: str, task_state: dict) -> bool:
+        """回答是否包含工具已确认的实质事实（地点/数字/OCR 硬值/观察词组）。
+
+        Phase F 修复：missing_disclosure 只该拦“纯套话回避”，
+        不能把“直接回答了已确认部分”的正确回答拦掉。
+        """
+        import re
+        clean = re.sub(r"找到\s*\d+\s*张", "", answer)
+        if re.search(r"\d{2,}", clean):
+            return True
+        for tr in task_state.get("tool_results") or []:
+            if tr.get("tool") == "search_memories":
+                for p in (tr.get("preview") or []):
+                    place = str(p.get("place") or "").strip()
+                    if len(place) >= 2 and place in answer:
+                        return True
+            if tr.get("tool") == "read_photo_text":
+                ocr = tr.get("ocr_text") or ""
+                for val in re.findall(r"\d{4,}|\d+(?:\.\d+)?\s*(?:元|块)", ocr):
+                    if val and val in answer:
+                        return True
+            if tr.get("tool") == "inspect_photo":
+                obs = tr.get("inspect_text") or ""
+                for phrase in re.findall(r"[\u4e00-\u9fff]{4,8}", obs):
+                    if phrase and phrase in answer:
+                        return True
+        return False
+
+    @staticmethod
+    def _check_ocr_hard_values(answer: str, task_state: dict) -> list[GuardIssue]:
+        """Phase F F6：OCR 硬值绑定——final 里的电话/价格必须出现在 read_photo_text 实际读到的文字中。
+
+        只约束 phone-like（>=7 位数字）与 price-like（数字+元/块/¥）两类易错硬值；
+        年份/日期/数量可能来自其他可信来源，不做此约束。
+        """
+        issues = []
+        ocr_texts = [tr.get("ocr_text") or "" for tr in task_state.get("tool_results") or []
+                     if tr.get("tool") == "read_photo_text" and (tr.get("ocr_text") or "").strip()]
+        if not ocr_texts:
+            return issues
+        ocr_all = "\n".join(ocr_texts)
+        for num in re.findall(r"(?<!\d)\d{7,}(?!\d)", answer):
+            if num not in ocr_all:
+                issues.append(_issue("ocr_value_conflict", f"电话/长数字 {num} 不在照片文字里"))
+        for num in re.findall(r"(\d+(?:\.\d+)?)\s*(?:元|块|¥|￥)", answer):
+            if num not in ocr_all:
+                issues.append(_issue("ocr_value_conflict", f"价格 {num} 不在照片文字里"))
+        return issues
 
     @staticmethod
     def _check_faithfulness(answer: str, task_state: dict) -> list[GuardIssue]:
@@ -160,6 +244,11 @@ class FinalGuard:
         inspect_texts = [tr.get("inspect_text") for tr in tool_results
                          if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip()]
         selected_handle = task_state.get("selected_asset_handle")
+        # Phase E：read_photo_text 的 supported OCR 证据（价格/文字/年份/电话）是复核层确定内容，
+        # 模型基于 OCR 直接引用细节时，不再强制整句"还不能确认"；检索层条件的确认仍由规则 2 拦截。
+        has_ocr_evidence = any(
+            tr.get("tool") == "read_photo_text" and tr.get("certainty") == "supported"
+            for tr in tool_results)
         # C8：inspect 只确认照片里直接可见的视觉细节，不能反向确认检索条件。
         # 用户明确点选某张照片追问时（selected_handle 存在），该照片的视觉回答以 inspect 为准，豁免。
         # 2) candidate_only 声称完全匹配（inspect 观察存在也不豁免"找到了/确认是"检索条件）
@@ -168,8 +257,12 @@ class FinalGuard:
                not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据", answer):
                 issues.append(_issue("candidate_claimed_as_match"))
         # 3) partial/candidate 必须披露检索层缺口（inspect 视觉观察不替代检索层披露；点选追问除外）
-        if satisfaction in {"partial_support", "candidate_only"} and not (inspect_texts and selected_handle):
-            if not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer):
+        # Phase F 修复：回答已包含实质事实（值绑定通过）时不再强求不确定措辞，
+        #   避免把“直接回答已确认部分（如地点）”的正确回答拦成 hedge。
+        if satisfaction in {"partial_support", "candidate_only"} and not (inspect_texts and selected_handle) \
+                and not has_ocr_evidence:
+            if not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer) \
+                    and not FinalGuard._has_substantive_fact(answer, task_state):
                 issues.append(_issue("missing_disclosure"))
         # 4.5) inspect 被拒/无观察却断言视觉细节 → inspection_fabrication
         inspect_results = [tr for tr in tool_results if tr.get("tool") == "inspect_photo"]

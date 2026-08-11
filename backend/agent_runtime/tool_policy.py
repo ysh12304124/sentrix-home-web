@@ -20,13 +20,16 @@ class ToolDecision:
 
 class ToolPolicy:
     def __init__(self, *, scope_id="home-default", viewer_id="owner",
-                 budget=None, inspect_allowed=True):
+                 budget=None, inspect_allowed=True, allowed_tools=None):
         self.scope_id = scope_id
         self.viewer_id = viewer_id
         self.budget = budget
         self.inspect_allowed = inspect_allowed
+        self.allowed_tools = set(allowed_tools) if allowed_tools else None
 
     def authorize(self, spec, tool_name: str, arguments: dict) -> ToolDecision:
+        if self.allowed_tools is not None and tool_name not in self.allowed_tools:
+            return ToolDecision(False, f"tool not allowed in this context: {tool_name}")
         if spec.read_write != "read":
             return ToolDecision(False, f"write tool not allowed in read-only runtime: {tool_name}")
         if spec.readiness == "blocked":
@@ -65,11 +68,29 @@ class ToolPolicy:
         },
         "search_memories": _DEFAULT_ALLOWED | {
             "query", "mode", "gaps", "query_satisfaction", "answerability",
-            "condition_summary", "can_inspect", "inspect_hint", "retrieval_timing",
+            "condition_summary", "can_inspect", "inspect_hint",
+            "recommended_resolution",
+            "asset_ids", "evidence_count", "place",
+            "retrieval_timing",
         },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
         "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
         "inspect_photo": _DEFAULT_ALLOWED,
+        "read_photo_text": _DEFAULT_ALLOWED | {
+            "full_text", "text_regions",
+        },
+        "search_conversation_history": _DEFAULT_ALLOWED | {
+            "query", "scope", "matches", "note",
+        },
+        "get_core_memory": _DEFAULT_ALLOWED | {
+            "subject", "topic", "cards", "note",
+        },
+        "get_person_memory": _DEFAULT_ALLOWED | {
+            "person", "operation", "readiness", "asset_count", "observation_count",
+            "event_count", "entity_binding_coverage", "first_occurrence",
+            "last_occurrence", "common_places", "co_occurrence", "events",
+            "representative_events", "insufficient_evidence", "note",
+        },
     }
 
     @classmethod

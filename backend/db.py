@@ -713,8 +713,23 @@ class MemoryStore:
                 content_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_conversations (
+                conversation_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                title TEXT NOT NULL DEFAULT '新对话',
+                summary TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_message_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_conversations_scope
+                ON agent_conversations(scope_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_agent_conversation_messages_cid
                 ON agent_conversation_messages(conversation_id, created_at);
+            CREATE VIRTUAL TABLE IF NOT EXISTS agent_conversation_messages_fts USING fts5(
+                id UNINDEXED, conversation_id UNINDEXED, role UNINDEXED,
+                content, tokenize='unicode61');
             CREATE TABLE IF NOT EXISTS agent_trajectories (
                 turn_id TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL,
@@ -723,6 +738,25 @@ class MemoryStore:
                 steps_json TEXT NOT NULL DEFAULT '[]',
                 result_json TEXT NOT NULL DEFAULT '{}',
                 public_progress_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_result_sets (
+                result_set_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                query TEXT NOT NULL DEFAULT '',
+                asset_ids_json TEXT NOT NULL DEFAULT '[]',
+                total INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                expires_at REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS agent_photo_threads (
+                thread_id TEXT PRIMARY KEY,
+                parent_conversation_id TEXT,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                asset_handle TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                result_set_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
