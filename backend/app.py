@@ -1086,6 +1086,33 @@ def stories():
     return {"stories": store.list_stories()}
 
 
+def _truncate_story_evidence(evidence):
+    """Limit story-evidence size so the LLM prompt stays well under the
+    model's context window (vllm gemma4-12b-it caps at 8192 tokens).
+    Statistics (topPlace/topPerson/objects) are computed from the full
+    evidence; only the LLM-facing copy is trimmed here."""
+    trimmed = []
+    for ev in evidence:
+        event = ev.get("event") or {}
+        observations = []
+        for item in (ev.get("observations") or [])[:6]:
+            observations.append({
+                "id": item.get("id"),
+                "captured_at": item.get("captured_at"),
+                "place": item.get("place"),
+                "caption": (item.get("caption") or "")[:150],
+                "transcript": (item.get("transcript") or "")[:150],
+                "objects": (item.get("objects") or [])[:5],
+                "people": [{"name": p.get("name"), "is_self": p.get("is_self")} for p in (item.get("people") or [])[:4]],
+            })
+        trimmed.append({"event": {
+            "title": (event.get("title") or "")[:80],
+            "summary": (event.get("summary") or "")[:150],
+            "time_start": event.get("time_start"),
+            "place": (event.get("place") or "")[:60],
+        }, "observations": observations})
+    return trimmed
+
 @app.post("/api/stories")
 def create_story(payload: dict):
     event_ids = payload.get("event_ids") or []
@@ -1204,7 +1231,7 @@ def create_story(payload: dict):
                 "6. 严格按时间先后顺序(早→晚)组织叙事,不得倒序或乱序。\n"
                 "7. 参考这些代表性画面,让叙事有具体细节而非统计堆砌:\n"
                 + "\n".join("· " + text for text in representative) + "\n"
-                "证据:" + str(evidence)
+                "证据:" + str(_truncate_story_evidence(evidence))
             )
             generated = parse_json_response(gamma.chat(prompt))
             payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
