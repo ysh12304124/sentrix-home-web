@@ -256,6 +256,10 @@ class TaskState:
         task.fulfillment = data.get("fulfillment") or "pending"
         task.search_satisfaction = data.get("search_satisfaction")
         task.search_condition_summary = data.get("search_condition_summary") or {}
+        # D12：跨轮续接时恢复结果集预览（显式要图/追问时 grounding 仍能展示证据网格）
+        task.result_preview = data.get("result_preview") or []
+        task.result_total = data.get("result_total")
+        task.result_remaining = data.get("result_remaining")
         task.selected_asset_handle = data.get("selected_asset_handle")
         task.active_person = data.get("active_person")
         task.active_event = data.get("active_event")

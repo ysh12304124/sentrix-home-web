@@ -56,6 +56,21 @@ class TerminationReasonTest(unittest.TestCase):
             self.assertEqual(_classify_termination(turn), expected, turn.reason)
 
 
+class TaskStateRestoreTest(unittest.TestCase):
+    """D12：跨轮续接必须恢复结果集预览，否则显式要图无法展示证据网格。"""
+
+    def test_from_dict_restores_result_preview(self):
+        from backend.agent_runtime.result_set import TaskState
+        task = TaskState.from_dict(
+            {"current_result_set": "rs_x", "result_preview": ["photo_1", "photo_2"],
+             "result_total": 2, "result_remaining": 0},
+            user_goal="把照片给我看看")
+        self.assertEqual(task.result_preview, ["photo_1", "photo_2"])
+        self.assertEqual(task.result_total, 2)
+        g = _build_answer_grounding(message="把刚才的照片给我看看", task=task)
+        self.assertEqual(g["display_mode"], "result_grid")
+
+
 class ResultSetPersistenceTest(unittest.TestCase):
     def test_db_restore_after_memory_clear(self):
         d = tempfile.mkdtemp()
