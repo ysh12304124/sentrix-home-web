@@ -84,6 +84,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - 照片里的文字/数字问题（菜单价格、招牌、店名、电话、年份、写了什么）：当 search_memories 的
   recommended_resolution 提示用 read_photo_text 时，调用 read_photo_text 读取文字后再回答，
   不要只 search 后就说"无法确认"或反问用户。
+- 如果已经调用 read_photo_text / inspect_photo，但照片里仍读不到可靠内容（没有文字、看不清、
+  与问题无关），直接如实回答"现有照片里看不出来/不知道"，不要继续绕圈子，不要承诺"可以继续核对"。
 - filters.place 填结构化地点名（城市/区县/景区/地标）。系统会按行政区匹配照片的 GPS 反地理编码：
   例如"秦皇岛如是海度假村"也能匹配"河北省秦皇岛市昌黎县"的照片，"清迈"能匹配英文"Chiang Mai"。
   不要把要找的目标/活动/主题当作 place（"沙雕"是主题不是地点）。地点不确定时留空，只按时间和人物过滤。
@@ -171,10 +173,10 @@ def _trusted_facts(task_state: dict) -> list[str]:
     result_total = task_state.get("result_total")
     if result_total is not None:
         satisfaction = task_state.get("search_satisfaction")
-        label = {"full_support": "已确认", "partial_support": "部分确认",
-                 "candidate_only": "只是相似候选", "no_match": "无结果"}.get(
+        label = {"full_support": "可以确认", "partial_support": "部分信息已确认",
+                 "candidate_only": "还不能完全确认", "no_match": "无结果"}.get(
             satisfaction, "")
-        facts.append(f"检索到 {result_total} 张候选照片{('，' + label) if label else ''}。")
+        facts.append(f"找到 {result_total} 张相关照片{('，' + label) if label else ''}。")
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
             handle = tr.get("inspect_handle") or ""
@@ -241,6 +243,32 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     }
 
 
+def _capability_note(tool_name: str) -> str:
+    """Phase F F8：从 tool_capability_matrix 读取 capability 级 readiness，注入 Agent 提示。
+
+    只输出关键结论（ready 高置信 / limited 提示），避免上下文膨胀。
+    """
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        matrix_path = _Path(__file__).resolve().parent.parent.parent / "configs" / "tool_capability_matrix.json"
+        if not matrix_path.is_file():
+            return ""
+        matrix = _json.loads(matrix_path.read_text(encoding="utf-8"))
+        caps = matrix.get(tool_name) or {}
+        notes = []
+        for key, info in (caps or {}).items():
+            status = str(info.get("status") or "")
+            acc = info.get("accuracy")
+            if status == "ready" or status.startswith("ready"):
+                notes.append(f"{key}=ready" + (f"({acc:.2f})" if isinstance(acc, (int, float)) else ""))
+            elif status == "limited":
+                notes.append(f"{key}=limited")
+        return "；".join(notes)
+    except Exception:
+        return ""
+
+
 class AgentRuntime:
     """Thin tool-loop runtime. 模型调用通过传入的 chat_fn 注入。"""
 
@@ -261,8 +289,12 @@ class AgentRuntime:
                 continue
             if allowed is not None and spec.name not in allowed:
                 continue
-            lines.append(f"- {spec.name}: {spec.description} 输入schema={json.dumps(spec.input_schema, ensure_ascii=False)}")
+            capability = _capability_note(spec.name)
+            lines.append(f"- {spec.name}: {spec.description}"
+                         f"{(' 能力=' + capability) if capability else ''}"
+                         f" 输入schema={json.dumps(spec.input_schema, ensure_ascii=False)}")
         return "\n".join(lines) or "(无工具)"
+
 
     def _parse_action(self, text: str) -> dict | None:
         """把模型输出解析为 action JSON；对常见畸形输出做有限修复。"""
@@ -428,7 +460,8 @@ class AgentRuntime:
         elif ocr_intent:
             adaptive_inspections = max(adaptive_inspections, 2)
             # read_photo_text 需要整图 + 3x3 tile 多次图片推理，放宽总预算
-            turn.budget.wall_time_s = max(turn.budget.wall_time_s, 180)
+            # （同图 OCR 结果已缓存，只有首次需要长预算）
+            turn.budget.wall_time_s = max(turn.budget.wall_time_s, 240)
         turn.budget.max_inspections = adaptive_inspections
         while True:
             if not turn.budget.can_model_step():
@@ -542,6 +575,19 @@ class AgentRuntime:
                         )})
                     continue
                 turn.final_answer = str(action.get("answer") or "")
+                # Phase F F1：Final Answer Writer——草稿违反 Answer Policy 时用受控事实重写
+                if turn.final_answer and turn.budget.can_model_step():
+                    try:
+                        from .final_writer import build_final_context, needs_rewrite, rewrite_final
+                        fctx = build_final_context(message, task.as_dict())
+                        if needs_rewrite(turn.final_answer, fctx):
+                            turn.budget.record_model_step()
+                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
+                            if rewritten and rewritten != turn.final_answer:
+                                turn.steps.append({"type": "writer", "status": "rewritten"})
+                                turn.final_answer = rewritten
+                    except Exception:
+                        pass
                 problems = guard.check(
                     turn.final_answer,
                     task_state={
@@ -595,6 +641,11 @@ class AgentRuntime:
                             tr.get("inspect_text") for tr in task.tool_results
                             if tr.get("tool") == "inspect_photo" and tr.get("inspect_text")
                         ]
+                        ocr_obs = [
+                            (tr.get("ocr_text") or "")[:600] for tr in task.tool_results
+                            if tr.get("tool") == "read_photo_text"
+                            and (tr.get("ocr_text") or "").strip()
+                        ]
                         trusted = _trusted_facts(task.as_dict())
                         issue_lines = problems.natural_messages if hasattr(problems, "natural_messages") \
                             else [str(p) for p in problems]
@@ -610,6 +661,10 @@ class AgentRuntime:
                             ("\ninspect_photo 的实际观察是：" + "；".join(inspect_obs)
                              + "\n如果观察与用户假设矛盾，以观察为准回答，不要迎合用户假设。"
                              if inspect_obs else "") +
+                            ("\nread_photo_text 实际读到的文字是：\n" + "\n".join(ocr_obs)
+                             + "\n基于这些读到的文字直接回答具体内容（价格/店名/电话/年份），"
+                               "不要笼统说'还不能确认'；检索层的不确定可单独用一句自然语言带过。"
+                             if ocr_obs else "") +
                             "\n请只输出一个 JSON final（保留 evidence_refs 引用你实际使用的工具结果，"
                             "并在 evidence_refs 中列出你引用过的 inspect_photo 调用编号），"
                             "并按 query_satisfaction 如实表述（candidate_only 不能声称确认）。"

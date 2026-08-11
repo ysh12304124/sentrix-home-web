@@ -820,6 +820,21 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
 # ---- Tool 4b: read_photo_text（Phase E：OCR 专用 Tool）----
 _OCR_PROMPT = """请读出这张照片中的全部文字（招牌/菜单/价格/数字/电话/年份/小字）。只输出文字内容本身，不要描述图片、不要评价。如果完全看不清就输出空字符串。"""
 _OCR_PROMPT_FULL = """观察这张照片，墙面上有哪些招牌、牌子或文字？请逐条列出文字内容本身（店名、电话、价格、年份、标语等），不要描述人物和场景。看不清的部分不要编造。"""
+_OCR_CACHE: dict[str, tuple[tuple, dict]] = {}  # (asset_id, mtime, provider, tiles) -> result
+
+# Phase F F5：OCR Provider 抽象（预留 lightweight 插槽，当前只有 VLM）
+# SENTRIX_OCR_PROVIDER=vlm  |  SENTRIX_OCR_TILES=none|2x2|3x3（默认 2x2，提速用）
+_OCR_PROVIDERS: dict[str, str] = {"vlm": "vlm"}
+_OCR_TILE_DEFAULT = "2x2"
+
+
+def _ocr_provider() -> str:
+    return os.getenv("SENTRIX_OCR_PROVIDER", "vlm").strip().lower() or "vlm"
+
+
+def _ocr_tile_layout() -> str:
+    layout = os.getenv("SENTRIX_OCR_TILES", _OCR_TILE_DEFAULT).strip().lower()
+    return layout if layout in {"none", "2x2", "3x3"} else _OCR_TILE_DEFAULT
 
 
 def _clean_ocr_text(raw) -> str:
@@ -906,14 +921,25 @@ def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
     if not row or not row["path"] or not Path(row["path"]).is_file():
         return {"summary": "照片文件不可用。", "full_text": "", "text_regions": [],
                 "certainty": "uncertain", "persisted": False}
+    # Phase F F5：cache key v2 = (asset_id, mtime, provider, tile_layout)
+    # 换 provider / tile 策略后旧结果自动失效，不会读到过期 OCR。
+    try:
+        _mtime = Path(row["path"]).stat().st_mtime
+    except Exception:
+        _mtime = 0.0
+    provider = _ocr_provider()
+    tile_layout = _ocr_tile_layout()
+    cache_key = (asset_id, _mtime, provider, tile_layout)
+    cached = _OCR_CACHE.get(cache_key)
+    if cached is not None:
+        hit = dict(cached[1])
+        hit["cache_hit"] = True
+        return hit
     gamma = _RUNTIME.get("gamma")
     if gamma is None:
         return {"summary": "模型不可用。", "full_text": "", "text_regions": [],
                 "certainty": "uncertain", "persisted": False}
-    # Phase E：整图 OCR（保留招牌/大字号文字上下文）与 3x3 tile（放大补小字）并行提交，
-    # 总耗时 ≈ max(整图, tile 批次)，避免串行叠加。
-    # 实测：招牌等艺术字被 tile 切碎后 12B 读不出，整图一次推理更有上下文；
-    # 电话/价格/小字则 tile 放大后更准。两者合并去重后交给模型。
+    # Provider 执行：当前仅 vlm（整图 + 按配置 tile 并行），lightweight 插槽预留。
     regions = []
     from concurrent.futures import ThreadPoolExecutor
 
@@ -928,7 +954,11 @@ def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
 
     with open(row["path"], "rb") as fh:
         full_b64 = base64.b64encode(fh.read()).decode()
-    tiles = _tile_images(row["path"])
+    tiles = []
+    if tile_layout == "3x3":
+        tiles = _tile_images(row["path"], rows=3, cols=3)
+    elif tile_layout == "2x2":
+        tiles = _tile_images(row["path"], rows=2, cols=2)
     tasks = [("full_image", full_b64)] + tiles
     with ThreadPoolExecutor(max_workers=4) as ex:
         results = list(ex.map(lambda item: _ocr_once(*item), tasks))
@@ -942,14 +972,20 @@ def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
     if full_clean and not full_clean.startswith("__ERROR__"):
         regions.insert(0, {"text": full_clean[:200], "source": "full_image"})
     full_text = "\n".join(f"[{r['source']}] {r['text']}" for r in regions)
-    return {
+    result = {
         "summary": f"已读取 {len(regions)} 个文字区域。" if regions else "照片中没有识别到文字。",
         "full_text": full_text[:1600],
         "text_regions": regions[:24],
         "source": "runtime_ocr",
+        "provider": provider,
+        "tiles": tile_layout,
         "certainty": "supported" if regions else "uncertain",
         "persisted": False,
+        "cache_hit": False,
+        "vlm_calls": len(tasks),
     }
+    _OCR_CACHE[cache_key] = result
+    return result
 
 
 # ---- Tool 5: search_conversation_history（D4）----

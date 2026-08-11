@@ -346,6 +346,14 @@ def health():
             "delete_conversation": CONVERSATION_STORE_ENABLED,
             "view_original": matrix.get("get_original_photos", {}).get("readiness") in {"ready", "limited"},
         }
+        from pathlib import Path as _Path
+        _matrix_path = _Path(__file__).resolve().parent.parent / "configs" / "tool_capability_matrix.json"
+        if _matrix_path.is_file():
+            import json as _json
+            try:
+                agent["capability_matrix"] = _json.loads(_matrix_path.read_text(encoding="utf-8"))
+            except Exception:
+                agent["capability_matrix"] = {}
     except Exception:
         agent["tools"] = []
     return {
@@ -373,6 +381,21 @@ def health():
         "videoExtraction": "reserved",
         "database": store.path,
     }
+
+@app.get("/api/hardware")
+def hardware():
+    """QA 硬件参数采集：GPU / CPU / 内存 + 当前模型快照（全容错）。"""
+    from .hardware import collect_hardware
+    hw = collect_hardware()
+    try:
+        hw["models"] = {
+            "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
+            "llm": _current_model_runtime(),
+            "asr": {"name": pipeline.asr.model_name, "ready": pipeline.asr.error is None},
+        }
+    except Exception:
+        hw["models"] = {}
+    return hw
 
 
 

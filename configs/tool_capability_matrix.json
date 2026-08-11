@@ -1,0 +1,112 @@
+{
+  "inspect_photo": {
+    "people_count": {
+      "status": "untested",
+      "accuracy": null,
+      "tested": 0,
+      "passed": 0,
+      "cases": [],
+      "failed": []
+    },
+    "clothing_color": {
+      "status": "ready",
+      "accuracy": 1.0,
+      "tested": 2,
+      "passed": 2,
+      "cases": [
+        "validation-album3-012-q08",
+        "validation-album3-024-q05"
+      ],
+      "failed": []
+    },
+    "large_object": {
+      "status": "ready",
+      "accuracy": 1.0,
+      "tested": 2,
+      "passed": 2,
+      "cases": [
+        "validation-album3-047-q04",
+        "validation-album3-047-q03"
+      ],
+      "failed": []
+    },
+    "small_object": {
+      "status": "limited",
+      "accuracy": 0.0,
+      "tested": 1,
+      "passed": 0,
+      "cases": [
+        "validation-album3-040-q01"
+      ],
+      "failed": [
+        "validation-album3-040-q01"
+      ]
+    },
+    "visible_text_short": {
+      "status": "limited",
+      "accuracy": 0.0,
+      "tested": 2,
+      "passed": 0,
+      "cases": [
+        "validation-album3-012-q03",
+        "validation-album3-024-q02"
+      ],
+      "failed": [
+        "validation-album3-012-q03",
+        "validation-album3-024-q02"
+      ]
+    },
+    "ocr_number": {
+      "status": "limited",
+      "accuracy": 0.4,
+      "tested": 5,
+      "passed": 2,
+      "cases": [
+        "validation-album3-024-q07",
+        "validation-album3-026-q01",
+        "validation-album3-026-q03",
+        "validation-album3-026-q06",
+        "validation-album3-026-q07"
+      ],
+      "failed": [
+        "validation-album3-024-q07",
+        "validation-album3-026-q03",
+        "validation-album3-026-q06"
+      ]
+    },
+    "scene": {
+      "status": "untested",
+      "accuracy": null,
+      "tested": 0,
+      "passed": 0,
+      "cases": [],
+      "failed": []
+    }
+  },
+  "read_photo_text": {
+    "ocr_number": {
+      "status": "ready(需tile)",
+      "accuracy": 0.57,
+      "evidence": "OCR spike: crop/tile 放大后 4/7 读出关键数字(电话/价格/年份)"
+    },
+    "visible_text_short": {
+      "status": "limited",
+      "evidence": "沙雕艺术字/倾斜招牌仍读不出,需要 PaddleOCR 或接受失败"
+    }
+  },
+  "search_memories": {
+    "retrieval_recall": {
+      "status": "ready",
+      "accuracy": 1.0,
+      "evidence": "26 题 Oracle Decomposition R 层全部 PASS(含 unanswerable 归一)"
+    },
+    "evidence_finder": {
+      "status": "ready",
+      "evidence": "recommended_resolution 已上线"
+    }
+  },
+  "query_memory_facts": {
+    "note": "Phase D 仅 5 次调用覆盖不足,专项 capability benchmark 待建",
+    "status": "untested"
+  }
+}

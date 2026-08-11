@@ -213,6 +213,7 @@ class TaskState:
             "filters_applied": observation.get("filters_applied"),
             "samples": observation.get("samples"),
             "recommended_resolution": observation.get("recommended_resolution"),
+            "preview": observation.get("preview"),
             "condition_summary": observation.get("condition_summary"),
         })
 

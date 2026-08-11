@@ -64,6 +64,7 @@ def _natural_message(code: str, detail: str = "") -> str:
         "placeholder_leak": "回答里出现了'地点名称/数量/时间'这类未填写的占位符，必须替换成真实数据或删除",
         "memory_fact_without_evidence": "回答包含了家庭记忆事实，但没有引用任何工具证据（evidence_refs 为空）。请列出你实际引用的工具调用编号；如果没有工具结果支持，如实改为没有找到相关记录",
         "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
+        "ocr_value_conflict": "回答里的电话/价格数字与照片文字不一致。请只使用 read_photo_text 实际读到的数字，删除照片文字里没有的数字",
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -92,6 +93,7 @@ class FinalGuard:
         answer = answer or ""
         task_state = task_state or {}
         issues.extend(self._check_faithfulness(answer, task_state))
+        issues.extend(self._check_ocr_hard_values(answer, task_state))
         # D1：照片/检索类家庭事实回答必须有证据引用（有结果集但 evidence_refs 为空 → recoverable）。
         # 确定性事实操作（query_memory_facts）由上方事实一致性校验兜底，不强制照片引用。
         refs = task_state.get("evidence_refs") or []
@@ -162,6 +164,27 @@ class FinalGuard:
         return GuardResult(issues)
 
     @staticmethod
+    def _check_ocr_hard_values(answer: str, task_state: dict) -> list[GuardIssue]:
+        """Phase F F6：OCR 硬值绑定——final 里的电话/价格必须出现在 read_photo_text 实际读到的文字中。
+
+        只约束 phone-like（>=7 位数字）与 price-like（数字+元/块/¥）两类易错硬值；
+        年份/日期/数量可能来自其他可信来源，不做此约束。
+        """
+        issues = []
+        ocr_texts = [tr.get("ocr_text") or "" for tr in task_state.get("tool_results") or []
+                     if tr.get("tool") == "read_photo_text" and (tr.get("ocr_text") or "").strip()]
+        if not ocr_texts:
+            return issues
+        ocr_all = "\n".join(ocr_texts)
+        for num in re.findall(r"(?<!\d)\d{7,}(?!\d)", answer):
+            if num not in ocr_all:
+                issues.append(_issue("ocr_value_conflict", f"电话/长数字 {num} 不在照片文字里"))
+        for num in re.findall(r"(\d+(?:\.\d+)?)\s*(?:元|块|¥|￥)", answer):
+            if num not in ocr_all:
+                issues.append(_issue("ocr_value_conflict", f"价格 {num} 不在照片文字里"))
+        return issues
+
+    @staticmethod
     def _check_faithfulness(answer: str, task_state: dict) -> list[GuardIssue]:
         """B2.1 Observation Faithfulness：omission / certainty upgrade / disclosure。"""
         issues: list[GuardIssue] = []
@@ -192,6 +215,11 @@ class FinalGuard:
         inspect_texts = [tr.get("inspect_text") for tr in tool_results
                          if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip()]
         selected_handle = task_state.get("selected_asset_handle")
+        # Phase E：read_photo_text 的 supported OCR 证据（价格/文字/年份/电话）是复核层确定内容，
+        # 模型基于 OCR 直接引用细节时，不再强制整句"还不能确认"；检索层条件的确认仍由规则 2 拦截。
+        has_ocr_evidence = any(
+            tr.get("tool") == "read_photo_text" and tr.get("certainty") == "supported"
+            for tr in tool_results)
         # C8：inspect 只确认照片里直接可见的视觉细节，不能反向确认检索条件。
         # 用户明确点选某张照片追问时（selected_handle 存在），该照片的视觉回答以 inspect 为准，豁免。
         # 2) candidate_only 声称完全匹配（inspect 观察存在也不豁免"找到了/确认是"检索条件）
@@ -200,7 +228,8 @@ class FinalGuard:
                not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据", answer):
                 issues.append(_issue("candidate_claimed_as_match"))
         # 3) partial/candidate 必须披露检索层缺口（inspect 视觉观察不替代检索层披露；点选追问除外）
-        if satisfaction in {"partial_support", "candidate_only"} and not (inspect_texts and selected_handle):
+        if satisfaction in {"partial_support", "candidate_only"} and not (inspect_texts and selected_handle) \
+                and not has_ocr_evidence:
             if not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer):
                 issues.append(_issue("missing_disclosure"))
         # 4.5) inspect 被拒/无观察却断言视觉细节 → inspection_fabrication

@@ -29,6 +29,9 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from decompose_layers import decompose_row, decompose_summary, aggregate_tool_perf
+
 DEFAULT_QA = "/Users/rm001/Downloads/album3/qa/full-album3.jsonl"
 DEFAULT_BASE = "http://192.168.0.153:4174"
 DEFAULT_SCOPE = "album3"
@@ -89,6 +92,14 @@ def health(base):
         return http_json("GET", f"{base}/api/health", timeout=20)
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
+
+
+def hardware(base):
+    """QA 硬件快照：GPU/CPU/内存 + 当前模型（/api/hardware，全容错）。"""
+    try:
+        return http_json("GET", f"{base}/api/hardware", timeout=20)
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def start_turn(base, message, scope_id):
@@ -196,15 +207,17 @@ def judge_answer(question, gold, agent, answerable, judge_base):
 
 
 def _error_row(qa, message, latency):
-    return {"qa_id": qa.get("qa_id", ""), "question": qa.get("question", ""),
-            "gold_answer": qa.get("answer", ""), "answer": "", "status": "error",
-            "reason": "", "tools": [], "latency_s": latency, "telemetry": {},
-            "task_type": qa.get("task_type", ""), "angle": qa.get("angle", ""),
-            "difficulty": qa.get("difficulty", ""), "answerability": qa.get("answerability", ""),
-            "gold_evidence_ids": qa.get("answer_evidence_image_ids", []),
-            "agent_evidence": [], "evidence": {"has_gold": False, "recall": None,
-            "precision": None, "hit": None, "overlap": [], "gold": [], "agent": []},
-            "judge": None, "guard_debug": {}, "error": message}
+    row = {"qa_id": qa.get("qa_id", ""), "question": qa.get("question", ""),
+           "gold_answer": qa.get("answer", ""), "answer": "", "status": "error",
+           "reason": "", "tools": [], "latency_s": latency, "telemetry": {},
+           "task_type": qa.get("task_type", ""), "angle": qa.get("angle", ""),
+           "difficulty": qa.get("difficulty", ""), "answerability": qa.get("answerability", ""),
+           "gold_evidence_ids": qa.get("answer_evidence_image_ids", []),
+           "agent_evidence": [], "evidence": {"has_gold": False, "recall": None,
+           "precision": None, "hit": None, "overlap": [], "gold": [], "agent": []},
+           "judge": None, "guard_debug": {}, "error": message}
+    row["decom"] = decompose_row(row)
+    return row
 
 
 def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total):
@@ -225,11 +238,34 @@ def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total
     status = result.get("tool_loop_status") or poll.get("status")
     tools = [t.get("tool") for t in (result.get("tool_trace") or []) if t.get("tool")]
     telemetry = result.get("telemetry") or {}
+    if telemetry and result.get("tool_trace"):
+        telemetry["tool_trace"] = result.get("tool_trace")
+    # F9：行级 tool_perf（OCR provider / tiles / cache / vlm_calls，来自 task_state.tool_results）
+    tp = {}
+    for tr in (result.get("task_state") or {}).get("tool_results") or []:
+        name = tr.get("tool") or ""
+        obs = tr.get("observation") or {}
+        if not name:
+            continue
+        slot = tp.setdefault(name, {"providers": set(), "tiles": set(), "cache_hits": 0, "vlm_calls": 0})
+        if obs.get("provider"):
+            slot["providers"].add(obs.get("provider"))
+        if obs.get("tiles"):
+            slot["tiles"].add(obs.get("tiles"))
+        if obs.get("cache_hit"):
+            slot["cache_hits"] += 1
+        if isinstance(obs.get("vlm_calls"), int):
+            slot["vlm_calls"] += obs["vlm_calls"]
+    for slot in tp.values():
+        slot["providers"] = sorted(slot["providers"])
+        slot["tiles"] = sorted(slot["tiles"])
+    if tp:
+        telemetry["tool_perf"] = tp
     evidence = collect_evidence(result, asset_map)
     score = evidence_score(evidence, qa.get("answer_evidence_image_ids") or [])
     judge = judge_answer(qa["question"], qa.get("answer") or "", answer,
                          qa.get("answerability") == "answerable", judge_base) if judge_enabled else None
-    return {
+    row = {
         "qa_id": qa["qa_id"],
         "question": qa["question"],
         "gold_answer": qa.get("answer", ""),
@@ -250,6 +286,8 @@ def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total
         "guard_debug": result.get("guard_debug") or {},
         "error": None,
     }
+    row["decom"] = decompose_row(row)
+    return row
 
 
 def summarize(rows, health_data):
@@ -273,6 +311,8 @@ def summarize(rows, health_data):
         "evidence_questions": len(ev_has), "evidence_hit": ev_hit,
         "evidence_recall_avg": ev_recall,
         "tool_usage": dict(tool_usage),
+        "decom": decompose_summary(rows),
+        "tool_perf": aggregate_tool_perf(rows),
         "health": health_data,
     }
 
@@ -399,6 +439,14 @@ def main():
     asset_map = load_assets(args.base, args.scope)
     print(f"asset 映射: {len(asset_map)} 张（scope={args.scope}）")
 
+    hw_start = hardware(args.base)
+    if hw_start.get("gpu"):
+        g = hw_start["gpu"][0]
+        print(f"硬件快照: {g['name']} VRAM {g['memory_used_mib']}/{g['memory_total_mib']} MiB "
+              f"util={g['utilization_percent']}% temp={g['temperature_c']}C")
+    else:
+        print(f"硬件快照: 不可用（{hw_start.get('error', '无 GPU/仅系统信息')}）")
+
     results = []
     if args.concurrency <= 1:
         for i, qa in enumerate(rows_in, 1):
@@ -414,9 +462,11 @@ def main():
         results.sort(key=lambda r: r.get("qa_id", ""))
 
     summary = summarize(results, h)
+    hw_end = hardware(args.base)
     meta = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "qa_file": str(qa_path), "base": args.base, "scope": args.scope,
-            "judge_base": args.judge_base, "tag": args.tag}
+            "judge_base": args.judge_base, "tag": args.tag,
+            "hardware_start": hw_start, "hardware_end": hw_end}
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + args.tag
     run_dir = out_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)

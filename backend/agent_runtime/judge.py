@@ -29,6 +29,10 @@ JUDGE_SYSTEM = """你是 Sentrix 家庭记忆助手的“事实一致性评审�
 - 回答忠实复述观察（包括如实说“没有猫/没有人/无法判断”）。
 - 检索为空（total=0）时如实回答“没有找到”。
 - 回答基于 inspect_photo 观察描述照片内容。
+- read_photo_text / inspect_photo 返回 supported 的观察中直接读出的内容（价格/文字/颜色/年份/电话/店名）
+  是照片复核层证据，模型引用这些细节回答不算编造；不要因为检索层只是 partial/candidate，
+  就要求模型把这些已读出的细节也改成“还不能确认”。
+- 但模型把检索层未确认的条件（如“这家店就是顶呱呱”）说成确定事实，仍算 certainty_upgrade / missing_disclosure。
 - 诚实的不确定性（Phase E D2）：回答已给出核心事实，同时用自然语言说明“还不能完全确认/可能是…”，
   不算 certainty_upgrade 或 missing_disclosure；只有完全没有给出核心事实、纯回避式“无法确认/如果需要可以再看”，
   或把“只是候选/未确认”说成“确认/确定是”（确定性升级）才算问题。
@@ -82,6 +86,8 @@ def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
             compact = {k: tr.get(k) for k in (
                 "tool", "total", "satisfaction", "blocked", "inspect_text", "certainty",
                 "operation", "value", "rows", "answer_type", "filters_applied")}
+            if compact.get("tool") == "read_photo_text":
+                compact["ocr_text"] = (tr.get("ocr_text") or "")[:800]
             if compact.get("tool") and compact["tool"] == "inspect_photo" and compact.get("satisfaction") is None:
                 compact.pop("satisfaction", None)
             for k in ("operation", "value", "rows", "answer_type", "filters_applied"):
