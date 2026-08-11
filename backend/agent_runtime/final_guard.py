@@ -136,8 +136,8 @@ class FinalGuard:
                         issues.append(_issue("fact_exists_contradiction_false", "expected=False"))
             elif op in {"group", "meal"}:
                 issues.extend(self._check_group(answer, task_state))
-        # 0.5 模板占位符泄漏（[地点名称1]/[数量] 等未填占位）
-        if re.search(r"\[[^\[\]]{0,14}(?:名称|数量|时间|地点|内容|数字|照片|记录)[^\[\]]{0,14}\]", answer):
+        # 0.5 模板占位符泄漏（[地点名称1]/[数量]/[此处填入…店名] 等未填占位）
+        if re.search(r"\[[^\[\]]{0,48}(?:填入|此处|占位|待填|名称|数量|时间|地点|内容|数字|照片|记录|店名|电话|价格|姓名|日期|金额)[^\[\]]{0,36}\]", answer):
             issues.append(_issue("placeholder_leak"))
         # 1. 内部 ID 泄漏（asset_/obs_/entity_ 前缀 + 内部表名）
         leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_|conversation_)[a-f0-9]{6,}\b", answer)
@@ -162,6 +162,35 @@ class FinalGuard:
             if _FOUND_CLAIM.search(answer):
                 issues.append(_issue("fabrication_from_empty"))
         return GuardResult(issues)
+
+    @staticmethod
+    def _has_substantive_fact(answer: str, task_state: dict) -> bool:
+        """回答是否包含工具已确认的实质事实（地点/数字/OCR 硬值/观察词组）。
+
+        Phase F 修复：missing_disclosure 只该拦“纯套话回避”，
+        不能把“直接回答了已确认部分”的正确回答拦掉。
+        """
+        import re
+        clean = re.sub(r"找到\s*\d+\s*张", "", answer)
+        if re.search(r"\d{2,}", clean):
+            return True
+        for tr in task_state.get("tool_results") or []:
+            if tr.get("tool") == "search_memories":
+                for p in (tr.get("preview") or []):
+                    place = str(p.get("place") or "").strip()
+                    if len(place) >= 2 and place in answer:
+                        return True
+            if tr.get("tool") == "read_photo_text":
+                ocr = tr.get("ocr_text") or ""
+                for val in re.findall(r"\d{4,}|\d+(?:\.\d+)?\s*(?:元|块)", ocr):
+                    if val and val in answer:
+                        return True
+            if tr.get("tool") == "inspect_photo":
+                obs = tr.get("inspect_text") or ""
+                for phrase in re.findall(r"[\u4e00-\u9fff]{4,8}", obs):
+                    if phrase and phrase in answer:
+                        return True
+        return False
 
     @staticmethod
     def _check_ocr_hard_values(answer: str, task_state: dict) -> list[GuardIssue]:
@@ -228,9 +257,12 @@ class FinalGuard:
                not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据", answer):
                 issues.append(_issue("candidate_claimed_as_match"))
         # 3) partial/candidate 必须披露检索层缺口（inspect 视觉观察不替代检索层披露；点选追问除外）
+        # Phase F 修复：回答已包含实质事实（值绑定通过）时不再强求不确定措辞，
+        #   避免把“直接回答已确认部分（如地点）”的正确回答拦成 hedge。
         if satisfaction in {"partial_support", "candidate_only"} and not (inspect_texts and selected_handle) \
                 and not has_ocr_evidence:
-            if not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer):
+            if not re.search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer) \
+                    and not FinalGuard._has_substantive_fact(answer, task_state):
                 issues.append(_issue("missing_disclosure"))
         # 4.5) inspect 被拒/无观察却断言视觉细节 → inspection_fabrication
         inspect_results = [tr for tr in tool_results if tr.get("tool") == "inspect_photo"]

@@ -79,8 +79,10 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   示例："找到 3 张接近的，'爬山'还不能完全确认；最接近的一张照片里没有看到明显积雪。"
 - 地点问题：search_memories preview 每张带 place 字段（GPS 反地理编码），回答时直接引用该地点，
   不要因为没有 inspect 就回答"无法确认地点"。
-- 检索条件已确认（condition_summary 标记 confirmed，或 query_satisfaction=full_support）时，直接当作确定事实回答，
+- 检索条件已确认（condition_summary 标记 matched/confirmed，或 query_satisfaction=full_support）时，直接当作确定事实回答，
   不要画蛇添足加"还不能完全确认"；只有 candidate_only 或关键条件 unknown 时才说"找到几张接近的，还不能完全确认"。
+- 部分条件确认（partial_support）时：先直接回答已经确认的部分（如地点、时间、数量、价格），
+  再用一句自然语言带过未确认的条件；绝对不要因为部分条件未知就整体说"无法确认/还不能确定在哪里/没有直接给你结论"。
 - 照片里的文字/数字问题（菜单价格、招牌、店名、电话、年份、写了什么）：当 search_memories 的
   recommended_resolution 提示用 read_photo_text 时，调用 read_photo_text 读取文字后再回答，
   不要只 search 后就说"无法确认"或反问用户。
@@ -181,6 +183,27 @@ def _trusted_facts(task_state: dict) -> list[str]:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
             handle = tr.get("inspect_handle") or ""
             facts.append(f"照片{(' ' + handle) if handle else ''}复核观察：{tr['inspect_text']}")
+    return facts
+
+
+def _confirmed_facts(task_state: dict) -> list[str]:
+    """Phase F 回归修复：提取工具已确认、可直接引用的实质事实（地点/OCR/观察），
+    recovery 与 L2 评审时注入，避免模型只能复述“找到 N 张/部分确认”套话。"""
+    facts: list[str] = []
+    places: list[str] = []
+    for tr in task_state.get("tool_results") or []:
+        if tr.get("tool") == "search_memories":
+            for p in (tr.get("preview") or []) or []:
+                place = str(p.get("place") or "").strip()
+                if len(place) >= 2 and place not in places:
+                    places.append(place)
+        if tr.get("tool") == "read_photo_text" and (tr.get("ocr_text") or "").strip():
+            facts.append(f"照片文字读到的内容：{tr['ocr_text']}")
+        if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
+            handle = tr.get("inspect_handle") or ""
+            facts.append(f"照片{(' ' + handle) if handle else ''}复核观察：{tr['inspect_text']}")
+    if places:
+        facts.append("照片 GPS 反编码确认的地点：" + "、".join(places[:5]) + "。")
     return facts
 
 
@@ -619,7 +642,7 @@ class AgentRuntime:
                 # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性
                 if not problems and task.tool_results and turn.budget.can_model_step():
                     turn.budget.record_model_step()
-                    trusted = _trusted_facts(task.as_dict())
+                    trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                     faithful, judge_problems = judge_faithfulness(
                         self.chat_fn, query=message, tool_results=task.tool_results,
                         answer=turn.final_answer, trusted_facts=trusted)
@@ -646,7 +669,7 @@ class AgentRuntime:
                             if tr.get("tool") == "read_photo_text"
                             and (tr.get("ocr_text") or "").strip()
                         ]
-                        trusted = _trusted_facts(task.as_dict())
+                        trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                         issue_lines = problems.natural_messages if hasattr(problems, "natural_messages") \
                             else [str(p) for p in problems]
                         recovery = (
@@ -668,6 +691,9 @@ class AgentRuntime:
                             "\n请只输出一个 JSON final（保留 evidence_refs 引用你实际使用的工具结果，"
                             "并在 evidence_refs 中列出你引用过的 inspect_photo 调用编号），"
                             "并按 query_satisfaction 如实表述（candidate_only 不能声称确认）。"
+                            "final 必须先直接回答用户问题本身（地点问题直接说'是在…'，数字问题直接给数字），"
+                            "不确定的其余条件用一句自然语言带过；禁止输出"
+                            "'找到 N 张接近的照片；部分信息能对上；我可以继续帮你核对'这类套话。"
                         )
                         messages.append({"role": "user", "content": recovery})
                         continue
