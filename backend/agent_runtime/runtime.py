@@ -63,8 +63,25 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   复核层：inspect_photo 只确认照片里直接可见的视觉细节（雪、人、物品、文字、颜色等）。
   即使照片里看到了山/雪，也不能把 candidate_only 的"爬山"说成已确认；
   示例："找到 3 张候选，但'爬山'还不能完全确认；最接近的一张照片里没有看到明显积雪。"
+- filters.place 只能填结构化地点名（城市/景区/地标等实际地名）。不要把要找的目标名称、
+  活动、主题、物品当作 place 过滤条件（如"沙雕"是主题不是地点；"秦皇岛如是海度假村"
+  如果是你要找的结果而不是数据中已知的地点，不要放进 place）。不确定地点时留空，只按时间和人物过滤。
 - public_status 是给用户看的简短进度说明。
 """
+
+
+_IMAGE_REQUEST_RE = __import__("re").compile(
+    r"照片|图片|相片|给我看看|给我看|发我|发给我|发来|原图|都给我|全部给我|"
+    r"展示|显示(?:一下|给我)?|让我看看|看看(?:这些|照片|图)?|"
+    r"把.{0,6}(?:照片|图片|图)|第二张|第三张|第\d张|那张|哪张|"
+    r"打开(?:照片|图片)|看图|给我图", __import__("re").I)
+_INLINE_QUESTION_RE = __import__("re").compile(
+    r"这张|这张照片|这张图|这图|图里|照片里|画面里|里面|放大|细节|"
+    r"有几个人|几个人|穿.{0,4}(?:什么|颜色)|桌上|桌子上|写的?什么|什么字|"
+    r"招牌|文字|天气|在哪拍的|哪里拍的", __import__("re").I)
+_CHAT_ONLY_RE = __import__("re").compile(
+    r"你好|谢谢|在吗|再见|哈哈|好的|嗯|哦|你是谁|你叫什么|你会什么|帮我写|"
+    r"写一|写个|改一|翻译|解释一下什么是|什么是|怎么用|步骤|教程", __import__("re").I)
 
 
 @dataclass
@@ -86,6 +103,8 @@ class RuntimeTurn:
     status: str = "pending"   # complete | partial | timeout | error
     reason: str = ""
     task_state: dict = field(default_factory=dict)
+    answer_grounding: dict = field(default_factory=dict)
+    termination_reason: str = ""
 
 
 def _trusted_facts(task_state: dict) -> list[str]:
@@ -122,6 +141,66 @@ def _trusted_facts(task_state: dict) -> list[str]:
             handle = tr.get("inspect_handle") or ""
             facts.append(f"照片{(' ' + handle) if handle else ''}复核观察：{tr['inspect_text']}")
     return facts
+
+
+def _build_answer_grounding(*, message: str, task: TaskState,
+                            selected_handle: str | None = None) -> dict:
+    """D1：Evidence-by-Default 契约。
+
+    display_mode：
+      - result_grid：用户明确要求图片 → 图片直接可见。
+      - inline_images：用户针对当前选中照片提问 → 当前照片直接可见。
+      - collapsed：回答依赖证据但未要求图片 → 原始证据默认折叠。
+      - none：闲聊/一般知识/纯写作，无家庭证据。
+    """
+    tool_results = task.tool_results or []
+    evidence_handles: list[str] = []
+    evidence_assets: list[str] = []
+    rep_assets: list[dict] = []
+    for tr in reversed(tool_results):
+        if tr.get("tool") == "inspect_photo" and tr.get("inspect_handle"):
+            handle = str(tr["inspect_handle"])
+            if handle not in evidence_handles:
+                evidence_handles.append(handle)
+                rep_assets.append({"handle": handle, "kind": "inspection",
+                                   "observation": (tr.get("inspect_text") or "")[:80]})
+        for s in (tr.get("samples") or []) or []:
+            if isinstance(s, dict) and s.get("asset_id"):
+                aid = s["asset_id"]
+                if aid not in evidence_assets:
+                    evidence_assets.append(aid)
+                    if len(rep_assets) < 6:
+                        rep_assets.append({"asset_id": aid,
+                                           "captured_at": s.get("captured_at") or "",
+                                           "caption": (s.get("caption") or s.get("transcript") or "")[:80]})
+    for handle in (task.result_preview or [])[:12]:
+        if handle and handle not in evidence_handles:
+            evidence_handles.append(handle)
+            if len(rep_assets) < 6:
+                rep_assets.append({"handle": handle, "kind": "result_preview"})
+    evidence_count = len(evidence_handles) + len(evidence_assets)
+    used_evidence = bool(tool_results) and (
+        evidence_count > 0 or task.fact_total is not None or task.result_total is not None)
+    explicit_image = bool(_IMAGE_REQUEST_RE.search(message or ""))
+    inline_question = bool(selected_handle) and bool(_INLINE_QUESTION_RE.search(message or ""))
+    chat_only = bool(_CHAT_ONLY_RE.search(message or "")) and not tool_results
+    if chat_only or not used_evidence:
+        display_mode = "none"
+    elif explicit_image:
+        display_mode = "result_grid"
+    elif inline_question:
+        display_mode = "inline_images"
+    else:
+        display_mode = "collapsed"
+    return {
+        "required": used_evidence,
+        "display_mode": display_mode,
+        "evidence_count": evidence_count,
+        "representative_evidence": rep_assets[:6],
+        "all_evidence_available": bool(task.current_result_set),
+        "result_set_id": task.current_result_set,
+        "explicit_image_request": explicit_image,
+    }
 
 
 class AgentRuntime:
@@ -506,4 +585,33 @@ class AgentRuntime:
                 result.observation or {}, ensure_ascii=False)})
 
         turn.task_state = task.as_dict()
+        turn.answer_grounding = _build_answer_grounding(
+            message=message, task=task, selected_handle=selected_handle)
+        turn.termination_reason = _classify_termination(turn)
         return turn
+
+
+def _classify_termination(turn: RuntimeTurn) -> str:
+    """D11：termination_reason 全量分类（telemetry 用）。"""
+    reason = turn.reason or ""
+    if turn.status == "complete":
+        return "complete"
+    if turn.status == "blocked_by_guard" or "guard" in reason:
+        return "guard_recovery_exhausted"
+    if "unparseable" in reason:
+        return "parse_failure"
+    if "model step budget" in reason:
+        return "model_step_limit"
+    if "wall" in reason or turn.status == "timeout":
+        return "wall_time_limit"
+    if "unknown_tool" in reason:
+        return "tool_unavailable"
+    if "tool_denied" in reason:
+        return "tool_rejected"
+    if "budget" in reason:
+        return "tool_call_limit"
+    if "l2" in reason.lower():
+        return "l2_recovery_failed"
+    if turn.status == "partial":
+        return "partial"
+    return turn.status or "unknown"

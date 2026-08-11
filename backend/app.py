@@ -1246,6 +1246,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "tool_loop_reason": turn.reason,
         "task_state": turn.task_state,
         "guard_debug": guard_debug,
+        "answer_grounding": turn.answer_grounding,
+        "termination_reason": turn.termination_reason,
     }
 
 
@@ -1405,6 +1407,8 @@ def assistant_response(result):
     result["evidenceRequired"] = result.get("evidence_required", False)
     result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
     result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
+    result["answerGrounding"] = result.get("answer_grounding", {})
+    result["terminationReason"] = result.get("termination_reason", "")
     result["claimVerifications"] = result["claim_verifications"]
     result["claimVerificationStatus"] = result["claim_verification_status"]
     result["repairCount"] = result["repair_count"]

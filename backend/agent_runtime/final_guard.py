@@ -25,6 +25,14 @@ _POSITIVE_FOUND = re.compile(
     r"(?<!没)(?<!未)(?<!无)(?:有|找到|存在|拍了?)(?:相关|任何|一些)?(?:的)?(?:照片|记录|回忆|记忆|去)")
 _FOUND_CLAIM = re.compile(r"找到|为您找到|有.{0,10}(照片|记录)")
 
+# D1：家庭记忆事实信号（时间/地点/人物/活动/证据词），用于 memory_fact_without_evidence。
+_FAMILY_FACT_RE = re.compile(
+    r"\d{4}\s*年|[1-9]?\d\s*月|去年|今年|前年|那年|那天|那次|"
+    r"去(?:过|了|玩|到)|到过|去了|在.{0,4}(?:玩|拍|吃|住|度假|旅行|聚会|聚)|"
+    r"一起|家人|妈妈|爸爸|儿子|女儿|孩子|家庭|"
+    r"吃(?:过|了)|喝(?:过|了)|玩(?:过|了)|旅行|度假|聚餐|聚会|"
+    r"照片|照片里|图里|图片|记录|回忆|拍的|拍摄|景区|酒店|餐厅|城市|地方")
+
 
 def _natural_message(code: str, detail: str = "") -> str:
     """把内部规则码转成用户可读、模型可执行的恢复文案（D4：用户不看到内部规则名）。"""
@@ -50,6 +58,7 @@ def _natural_message(code: str, detail: str = "") -> str:
         "certainty_upgrade": "有条件没有确认，回答却说得过于确定",
         "judge_unfaithful": "评审认为回答与工具观察不一致",
         "placeholder_leak": "回答里出现了'地点名称/数量/时间'这类未填写的占位符，必须替换成真实数据或删除",
+        "memory_fact_without_evidence": "回答包含了家庭记忆事实，但没有引用任何工具证据（evidence_refs 为空）。请列出你实际引用的工具调用编号；如果没有工具结果支持，如实改为没有找到相关记录",
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -78,6 +87,18 @@ class FinalGuard:
         answer = answer or ""
         task_state = task_state or {}
         issues.extend(self._check_faithfulness(answer, task_state))
+        # D1：照片/检索类家庭事实回答必须有证据引用（有结果集但 evidence_refs 为空 → recoverable）。
+        # 确定性事实操作（query_memory_facts）由上方事实一致性校验兜底，不强制照片引用。
+        refs = task_state.get("evidence_refs") or []
+        tool_results = task_state.get("tool_results") or []
+        has_tool_evidence = any(
+            (tr.get("tool") == "search_memories" and (tr.get("total") or 0) > 0)
+            or (tr.get("tool") == "get_original_photos" and (tr.get("total") or 0) > 0)
+            or (tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip())
+            for tr in tool_results
+        )
+        if not refs and has_tool_evidence and _FAMILY_FACT_RE.search(answer):
+            issues.append(_issue("memory_fact_without_evidence"))
         # 0. query_memory_facts 事实一致性：final 必须包含工具返回的 value
         if task_state.get("last_tool") == "query_memory_facts":
             op = task_state.get("fact_operation")

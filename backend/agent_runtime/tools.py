@@ -749,7 +749,9 @@ def register_tools():
                      "filters.time 写用户原话里的相对时间（如'去年'、'这两年'、'去年春天'、'上个月'）或具体时间，系统会自动换算，不要自己估算年份；"
                      "不加 time 表示全部。operation=group 时必须填 group_by（month 或 place，缺省 month）；group_by=place 会返回地点覆盖情况"
                      "（known_location_assets/unknown_location_assets），回答必须如实说明还有多少照片没有可靠地点。"
-                     "operation=meal 用于'吃过什么/吃饭/火锅'类问题，会做事件级去重并返回 explicit_foods/meal_scene_events/possible_events 分层证据。"),
+                     "operation=meal 用于'吃过什么/吃饭/火锅'类问题，会做事件级去重并返回 explicit_foods/meal_scene_events/possible_events 分层证据。"
+                     "注意：filters.place 只能填结构化地点名（城市/景区/地标等实际地名）；不要把要找的目标名称、活动、主题当作 place"
+                     "（如'沙雕'是主题不是地点）。不确定时留空。"),
         input_schema={"operation": "count|exists|first|last|date|group|meal",
                       "filters": {"time": "去年/这两年/2023年 等相对或具体时间（原样写）",
                                   "person": "", "place": "", "media": "",
@@ -761,7 +763,9 @@ def register_tools():
         name="search_memories",
         description=("检索家庭记忆：找照片、视觉语义（衣着/颜色/物体/场景）、混合查询。返回结果集摘要。"
                      "用户提到时间时必须把时间原样写进 filters.time（如'2024年'、'去年'、'去年春天'），"
-                     "不要只放在 query 文本里；query 只写场景/人物/物体描述（若忘记填 filters.time，系统会自动从 query 提取时间）。"),
+                     "不要只放在 query 文本里；query 只写场景/人物/物体描述（若忘记填 filters.time，系统会自动从 query 提取时间）。"
+                     "filters.place 只能填结构化地点名（城市/景区/地标等实际地名），不要把要找的目标名称、活动、主题当作 place"
+                     "（如'沙雕'是主题不是地点；'秦皇岛如是海度假村'如果是你要找的结果而不是已知地点，不要放进 place）。不确定时留空。"),
         input_schema={"query": "", "mode": "best|all|representative",
                       "filters": {"time": "", "place": "", "person": ""}},
         executor=_search_memories, read_write="read", cost_class="medium", readiness="ready",

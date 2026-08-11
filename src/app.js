@@ -440,6 +440,8 @@
     const isAdmin = adminDebug();
     const layers = result.evidence_layers || {};
     const presentation = result.evidence_presentation || {};
+    const grounding = result.answerGrounding || result.answer_grounding || {};
+    const displayMode = grounding.display_mode || "";
     const primary = [...(layers.events || []), ...(layers.observations || []), ...(layers.claims || [])].sort((left, right) => (right.relevance || 0) - (left.relevance || 0));
     const candidates = result.clarification_candidates || [];
     const evidence = primary.length ? evidenceLayer("本次依据（按相关度）", primary.slice(0, 6)) : "";
@@ -454,13 +456,17 @@
     const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
     const toolSamples = toolLoopEvidence(result);
     const toolEvidence = toolSamples.length ? `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">本次依据（工具结果）</p><h3>${toolSamples.length} 项</h3></div></div><div class="evidence-list">${toolSamples.map(evidenceCard).join("")}</div></section>` : "";
-    const evidenceCount = primary.length + (result.image_results || []).length + toolSamples.length;
+    const evidenceCount = grounding.evidence_count != null ? grounding.evidence_count
+      : (primary.length + (result.image_results || []).length + toolSamples.length);
     const hasToolEvidence = toolSamples.length > 0;
     const hasResultSet = Boolean((result.task_state || {}).current_result_set && (result.task_state || {}).result_total > 0);
     // RX-6: a chat turn (memory_used === false) never shows an evidence entry; tool-loop turns use task_state evidence.
     const requiresEvidence = (result.memory_used !== false && presentation.required !== false) || hasToolEvidence || hasResultSet;
     const hasGap = result.evidence_status === "gap" || (!evidenceCount && result.tool_loop_status === "complete");
-    const basis = requiresEvidence ? `<details class="assistant-basis"${hasGap || evidenceCount > 0 ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${claimEvidence(result)}${optionalImages}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    const resultSetBlock = displayMode === "collapsed" ? resultSetCard(result) : "";
+    const basisOpen = displayMode === "result_grid" || hasGap || (displayMode !== "collapsed" && evidenceCount > 0);
+    const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalImages}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    if (displayMode === "none") return `${followups}${gapContent}`;
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
 
@@ -512,7 +518,9 @@
     const failureStatus = ["partial", "timeout", "error", "blocked_by_guard"].includes(result.tool_loop_status || "");
     const traceSteps = buildThinkingSteps(result);
     const trace = traceSteps.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>思考过程 · ${traceSteps.length} 步</summary><div>${traceSteps.map(agentStepHtml).join("")}</div></details>` : "";
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${trace}${resultSetCard(result)}${assistantEvidence(result)}</div></article>`;
+    const grounding = result.answerGrounding || result.answer_grounding || {};
+    const gridVisible = ["result_grid", "inline_images"].includes(grounding.display_mode);
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${trace}${gridVisible ? resultSetCard(result) : ""}${assistantEvidence(result)}</div></article>`;
   }
 
   function updateLiveProgress() {
