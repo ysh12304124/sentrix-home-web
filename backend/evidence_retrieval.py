@@ -1,8 +1,10 @@
 """Correctness-first Asset-level Evidence Retrieval Kernel."""
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .geocoding import place_text_matches
 from .query_contracts import HARD, SEMANTIC, QueryFacet, QuerySpec, parse_time_expression
 
 
@@ -386,6 +388,8 @@ class EvidenceRetrievalKernel:
             return ("unknown", None, None, 0.0)
         if constraint.dimension in self._OPEN_WORLD_LIST_DIMENSIONS:
             return self._evaluate_open_world(observation, constraint)
+        if constraint.dimension == "place":
+            return self._evaluate_place(asset, observation, constraint)
         if constraint.dimension in self._SINGLE_VALUE_DIMENSIONS:
             return self._evaluate_single_value(observation, constraint)
         if constraint.dimension == "activity":
@@ -439,6 +443,47 @@ class EvidenceRetrievalKernel:
         if _contains(joined, constraint.value):
             return ("possible", "observation", observation.get("id"),
                     float(observation.get("confidence", 0) or 0))
+        return ("unknown", None, None, 0.0)
+
+    @staticmethod
+    def _asset_geocode(asset):
+        """从资产元数据解析反地理编码记录（dict 或 JSON 字符串都兼容）。"""
+        metadata = asset.get("metadata_json") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        geocode = metadata.get("reverse_geocode") or {}
+        if isinstance(geocode, str):
+            try:
+                geocode = json.loads(geocode)
+            except (TypeError, ValueError):
+                geocode = {}
+        return geocode if isinstance(geocode, dict) else {}
+
+    def _evaluate_place(self, asset, observation, constraint):
+        """地理地点条件（D12）。
+
+        权威来源是 assets.metadata_json.reverse_geocode（GPS 反地理编码）；
+        observation.place 是场景类型（"室内餐厅或咖啡馆"），只作为弱文本信号，
+        不能产生矛盾。有权威 geocode 但确不匹配才判 contradicted（排除）；
+        无 geocode 时保持 unknown（开放世界，不能因为照片没 GPS 就剔除）。
+        """
+        value = str(constraint.value or "").strip()
+        if not value:
+            return ("unknown", None, None, 0.0)
+        geocode = self._asset_geocode(asset)
+        if geocode and place_text_matches(value, geocode):
+            return ("matched", "asset_metadata", asset.get("id"),
+                    float(geocode.get("confidence") or 0.9))
+        pool = " ".join(filter(None, [observation.get("place"), observation.get("caption")]))
+        if _contains(pool, value):
+            return ("possible", "observation", observation.get("id"),
+                    float(observation.get("confidence") or 0))
+        if geocode:
+            return ("contradicted", "asset_metadata", asset.get("id"),
+                    float(geocode.get("confidence") or 0.9))
         return ("unknown", None, None, 0.0)
 
     @staticmethod

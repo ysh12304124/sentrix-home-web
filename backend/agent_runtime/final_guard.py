@@ -20,6 +20,10 @@ _DENY_WITH_OBJECT = re.compile(
     r"|不存在|未找到|没找到|没拍过|查无|找不到", re.I)
 # 只是不确定/hedge，不算否认
 _HEDGE = re.compile(r"无法确认|不能确认|不确定|还不能|没有完全|暂时|无法判断|记不清|可能没有|未必", re.I)
+# D12：记录级否认（"没有找到相关记录"），用于"未检索就声称找不到"检查；
+# 不含"我没去过北京"这类出行否定。
+_DENY_RECORDS = re.compile(
+    r"没(?:有)?找到|未找到|找不到|查无|没有(?:任何|符合|相关|一张|一个|一条|拍到|拍过)?(?:照片|记录|回忆|记忆)", re.I)
 # 正向断言找到（exists=False 用），排除 没/未/无 前缀
 _POSITIVE_FOUND = re.compile(
     r"(?<!没)(?<!未)(?<!无)(?:有|找到|存在|拍了?)(?:相关|任何|一些)?(?:的)?(?:照片|记录|回忆|记忆|去)")
@@ -59,6 +63,7 @@ def _natural_message(code: str, detail: str = "") -> str:
         "judge_unfaithful": "评审认为回答与工具观察不一致",
         "placeholder_leak": "回答里出现了'地点名称/数量/时间'这类未填写的占位符，必须替换成真实数据或删除",
         "memory_fact_without_evidence": "回答包含了家庭记忆事实，但没有引用任何工具证据（evidence_refs 为空）。请列出你实际引用的工具调用编号；如果没有工具结果支持，如实改为没有找到相关记录",
+        "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -99,6 +104,12 @@ class FinalGuard:
         )
         if not refs and has_tool_evidence and _FAMILY_FACT_RE.search(answer):
             issues.append(_issue("memory_fact_without_evidence"))
+        # D12：声称"没有找到记录"但本轮从未调用任何检索工具 → 必须纠正后重试检索。
+        retrieval_tools = {"search_memories", "query_memory_facts", "search_conversation_history",
+                           "get_core_memory", "get_person_memory", "get_result_page"}
+        if not any((tr.get("tool") or "") in retrieval_tools for tr in tool_results) \
+                and _DENY_RECORDS.search(answer):
+            issues.append(_issue("denial_without_search"))
         # 0. query_memory_facts 事实一致性：final 必须包含工具返回的 value
         if task_state.get("last_tool") == "query_memory_facts":
             op = task_state.get("fact_operation")

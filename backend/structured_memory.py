@@ -168,13 +168,47 @@ class StructuredMemoryExecutor:
             params.append(end)
         place = self._place(draft, spec)
         if place:
-            clauses.append("(o.place LIKE ? OR a.captured_location LIKE ?)")
-            params.extend((f"%{place}%", f"%{place}%"))
+            place_clause, place_params = self._place_clause(place)
+            clauses.append(place_clause)
+            params.extend(place_params)
         if entity_ids:
             clauses.append(f"em.entity_id IN ({', '.join('?' * len(entity_ids))})")
             params.extend(entity_ids)
         where = " AND ".join(f"({clause})" for clause in clauses)
         return " ".join(joins), where, params
+
+    @staticmethod
+    def _place_clause(value):
+        """地点过滤 WHERE 子句（D12）。
+
+        覆盖：
+        1) 场景类型 / GPS 原文 / 反编码 label / name 包含约束值；
+        2) 存储的行政区（省/市/区/县，去后缀）出现在约束值里
+           （'秦皇岛' 匹配约束 '秦皇岛如是海度假村'）；
+        3) 中英别名展开（'清迈' 匹配 'Chiang Mai'）。
+        """
+        from .geocoding import place_alias_names
+        value = str(value or "").strip()
+        if not value:
+            return "1=1", []
+        clauses = []
+        params = []
+        label = "json_extract(a.metadata_json, '$.reverse_geocode.label')"
+        name = "json_extract(a.metadata_json, '$.reverse_geocode.name')"
+        clauses.append(f"(o.place LIKE ? OR a.captured_location LIKE ? OR {label} LIKE ? OR {name} LIKE ?)")
+        params += [f"%{value}%"] * 4
+        for field in ("province", "city", "district"):
+            expr = (
+                f"replace(replace(replace(replace(replace(COALESCE("
+                f"json_extract(a.metadata_json, '$.reverse_geocode.{field}'), ''), "
+                f"'省', ''), '市', ''), '区', ''), '县', ''), '地区', '')"
+            )
+            clauses.append(f"(instr(?, {expr}) > 0 AND length({expr}) >= 2)")
+            params.append(value)
+        for alias in place_alias_names(value):
+            clauses.append(f"({name} LIKE ? OR {label} LIKE ?)")
+            params += [f"%{alias}%"] * 2
+        return "(" + " OR ".join(clauses) + ")", params
 
     # ---- aggregation ops ----
 

@@ -28,7 +28,7 @@ echo "  4174 : $BASE (scope=$SCOPE)"
 echo "  输出 : $OUT"
 echo
 
-python3 "$PY" --qa "$QA" --base "$BASE" --scope "$SCOPE" --out "$OUT" "${EXTRA[@]}"
+python3 "$PY" --qa "$QA" --base "$BASE" --scope "$SCOPE" --out "$OUT" ${EXTRA[@]+"${EXTRA[@]}"}
 
 HTML="$OUT/qa_report.html"
 if [[ -f "$HTML" ]]; then
