@@ -18,7 +18,9 @@ import argparse
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.request import urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -42,6 +44,79 @@ def _read_json(path: Path, fallback):
 def _state_file_path() -> Path:
     registry = _read_json(REGISTRY, {})
     return Path(registry.get("state_file") or STATE_FILE_DEFAULT)
+
+
+def _process_tree(root_pid: int) -> set[int]:
+    """Return the tracked vLLM process and all of its current descendants."""
+    seen: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        children_path = Path(f"/proc/{pid}/task/{pid}/children")
+        try:
+            pending.extend(int(value) for value in children_path.read_text().split())
+        except (FileNotFoundError, PermissionError, ValueError):
+            continue
+    return seen
+
+
+def _compute_process_memory() -> list[dict]:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "nvidia-smi failed")
+    processes = []
+    for line in result.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) != 3:
+            continue
+        try:
+            processes.append({
+                "pid": int(parts[0]),
+                "process_name": parts[1],
+                "memory_used_mib": float(parts[2]),
+            })
+        except ValueError:
+            continue
+    return processes
+
+
+def _vllm_runtime_metrics(port: int) -> dict:
+    wanted = {
+        "vllm:kv_cache_usage_perc": "kv_cache_usage_pct",
+        "vllm:num_requests_running": "requests_running",
+        "vllm:num_requests_waiting": "requests_waiting",
+    }
+    metrics = {}
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/metrics", timeout=3) as response:
+            text = response.read().decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            metric_name = line.split("{", 1)[0].split(" ", 1)[0]
+            output_name = wanted.get(metric_name)
+            if not output_name:
+                continue
+            try:
+                value = float(line.rsplit(" ", 1)[-1])
+            except ValueError:
+                continue
+            metrics[output_name] = value * 100 if output_name == "kv_cache_usage_pct" else value
+    except Exception as exc:
+        metrics["error"] = str(exc)
+    return metrics
 
 
 @app.get("/state")
@@ -235,6 +310,46 @@ def gpu_stats():
         raise HTTPException(status_code=504, detail="nvidia-smi timeout")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/process-memory")
+def process_memory():
+    """Return GPU memory physically occupied by the managed vLLM process tree."""
+    state = _read_json(_state_file_path(), None)
+    if not state or not state.get("pid"):
+        return {
+            "sampled_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "active": False,
+            "process_memory_used_mib": 0.0,
+            "processes": [],
+            "vllm_metrics": {},
+        }
+    try:
+        root_pid = int(state["pid"])
+        tracked_pids = _process_tree(root_pid)
+        all_processes = _compute_process_memory()
+        model_processes = [item for item in all_processes if item["pid"] in tracked_pids]
+        return {
+            "sampled_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "active": Path(f"/proc/{root_pid}").exists(),
+            "profile": state.get("profile"),
+            "served_model_name": state.get("served_model_name"),
+            "root_pid": root_pid,
+            "tracked_pids": sorted(tracked_pids),
+            "process_memory_used_mib": round(sum(item["memory_used_mib"] for item in model_processes), 1),
+            "process_memory_limit_mib": 10240.0,
+            "process_memory_over_limit": sum(item["memory_used_mib"] for item in model_processes) > 10240.0,
+            "processes": model_processes,
+            "configured_gpu_memory_utilization": state.get("gpu_memory_utilization"),
+            "configured_max_model_len": state.get("max_model_len"),
+            "configured_max_num_seqs": state.get("max_num_seqs"),
+            "configured_default_max_tokens": state.get("default_max_tokens"),
+            "vllm_metrics": _vllm_runtime_metrics(int(state.get("port") or 8100)),
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="nvidia-smi timeout")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 if __name__ == "__main__":
