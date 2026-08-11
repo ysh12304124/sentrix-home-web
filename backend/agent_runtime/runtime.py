@@ -71,7 +71,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 
 
 _IMAGE_REQUEST_RE = __import__("re").compile(
-    r"照片|图片|相片|给我看看|给我看|发我|发给我|发来|原图|都给我|全部给我|"
+    r"给我看看|给我看|发我|发给我|发来|原图|都给我|全部给我|"
     r"展示|显示(?:一下|给我)?|让我看看|看看(?:这些|照片|图)?|"
     r"把.{0,6}(?:照片|图片|图)|第二张|第三张|第\d张|那张|哪张|"
     r"打开(?:照片|图片)|看图|给我图", __import__("re").I)
@@ -179,8 +179,7 @@ def _build_answer_grounding(*, message: str, task: TaskState,
             if len(rep_assets) < 6:
                 rep_assets.append({"handle": handle, "kind": "result_preview"})
     evidence_count = len(evidence_handles) + len(evidence_assets)
-    used_evidence = bool(tool_results) and (
-        evidence_count > 0 or task.fact_total is not None or task.result_total is not None)
+    used_evidence = evidence_count > 0
     explicit_image = bool(_IMAGE_REQUEST_RE.search(message or ""))
     inline_question = bool(selected_handle) and bool(_INLINE_QUESTION_RE.search(message or ""))
     chat_only = bool(_CHAT_ONLY_RE.search(message or "")) and not tool_results
@@ -207,17 +206,21 @@ class AgentRuntime:
     """Thin tool-loop runtime. 模型调用通过传入的 chat_fn 注入。"""
 
     def __init__(self, *, chat_fn, profile_name: str | None = None,
-                 scope_id="home-default", viewer_id="owner"):
+                 scope_id="home-default", viewer_id="owner", conversation_id=None):
         self.chat_fn = chat_fn
         self.profile = get_profile(profile_name)
         self.scope_id = scope_id
         self.viewer_id = viewer_id
+        self.conversation_id = conversation_id
 
     def _tool_descriptions(self) -> str:
         lines = []
         from .tool_registry import list_tools
+        allowed = set(self.profile.tools) if self.profile.tools else None
         for spec in list_tools():
             if spec.readiness == "blocked":
+                continue
+            if allowed is not None and spec.name not in allowed:
                 continue
             lines.append(f"- {spec.name}: {spec.description} 输入schema={json.dumps(spec.input_schema, ensure_ascii=False)}")
         return "\n".join(lines) or "(无工具)"
@@ -304,7 +307,8 @@ class AgentRuntime:
 
     def run(self, message: str, *, history: str = "", task_state: dict | None = None,
             progress_callback=None, selected_handle: str | None = None,
-            selected_result_set_id: str | None = None) -> RuntimeTurn:
+            selected_result_set_id: str | None = None,
+            conversation_summary: str = "") -> RuntimeTurn:
         """progress_callback(event: dict) 在每次新增公开进度事件后调用（C13 数据合同：stage/step_index/timestamp 增量推送）。"""
         turn = RuntimeTurn(profile=self.profile.name, budget=BudgetState(
             max_model_steps=self.profile.max_model_steps,
@@ -314,7 +318,8 @@ class AgentRuntime:
             final_reserve_s=self.profile.final_reserve_s,
         ))
         turn.budget.start()
-        policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget)
+        policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget,
+                            allowed_tools=set(self.profile.tools) if self.profile.tools else None)
         task = TaskState.from_dict(task_state, user_goal=message)
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
         system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
@@ -326,22 +331,34 @@ class AgentRuntime:
             ctx = result_set_context(task.current_result_set, self.scope_id)
             if ctx:
                 messages.append({"role": "system", "content": ctx})
-        if selected_handle and selected_result_set_id:
+        if selected_handle:
             # Phase C C15：用户点选了结果集里的照片，模型可直接用该 handle 复核/交付原图
-            messages.append({"role": "system", "content": (
-                f"用户当前选中了结果集 {selected_result_set_id} 里的照片 "
-                f"（handle={selected_handle}）。问'这张/原图/里面有几个人'时，"
-                f"直接用 get_original_photos(handle={selected_handle}) 或 "
-                f"inspect_photo(asset_handle={selected_handle})，不要重新全库搜索。"
-            )})
+            ctx = f"用户当前选中了照片（handle={selected_handle}）"
+            if selected_result_set_id:
+                ctx += f"，属于结果集 {selected_result_set_id}"
+            ctx += ("。问'这张/原图/里面有几个人'时，直接用 "
+                    f"get_original_photos(handle={selected_handle}) 或 "
+                    f"inspect_photo(asset_handle={selected_handle})，不要重新全库搜索。")
+            messages.append({"role": "system", "content": ctx})
         if history:
             messages.append({"role": "system", "content": f"最近对话：\n{history}"})
+        if conversation_summary:
+            messages.append({"role": "system", "content": f"本会话摘要：\n{conversation_summary}"})
+        active_lines = []
+        if task.active_person:
+            active_lines.append(f"当前关注人物：{task.active_person}")
+        if task.active_event:
+            active_lines.append(f"当前关注事件：{task.active_event}")
+        if task.open_questions:
+            active_lines.append("未解决问题：" + "、".join(str(q) for q in task.open_questions[:5]))
+        if active_lines:
+            messages.append({"role": "system", "content": "当前上下文：\n" + "\n".join(active_lines)})
         messages.append({"role": "user", "content": message})
         self._emit_progress(turn, progress_callback, stage="thinking", status="running",
                             text="正在理解你的问题…")
 
         parse_retries = 0
-        max_parse_retries = 1
+        max_parse_retries = 2
         guard_retries = 0
         max_guard_retries = 1
         seen_tool_calls = set()
@@ -352,6 +369,8 @@ class AgentRuntime:
         tool_call_seq = 0
         visual_retries = 0
         max_visual_retries = 1
+        unknown_tool_retries = 0
+        max_unknown_tool_retries = 1
         visual_intent = bool(__import__("re").search(
             r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|在做什么|"
             r"有没有|是什么|放着|写了|内容|细节", message))
@@ -375,14 +394,27 @@ class AgentRuntime:
                 if parse_retries < max_parse_retries and turn.budget.can_model_step():
                     parse_retries += 1
                     messages.append({"role": "assistant", "content": raw})
-                    messages.append({"role": "user", "content": (
-                        "你的上一条输出不是合法的 JSON 对象，无法解析。"
-                        "请严格只输出一个 JSON 对象（action 只能是 tool_call 或 final），"
-                        "不要 markdown、不要多余文字、不要省略结尾的引号或括号。"
-                    )})
+                    if parse_retries >= 2:
+                        # D11：第二次恢复——只要求输出最简单的 final（12B 长输出/跑题时最有效）
+                        self._emit_progress(
+                            turn, progress_callback, stage="recovering", status="running",
+                            text="刚才的输出没有解析成功，我正在简化处理。")
+                        messages.append({"role": "user", "content": (
+                            "你连续两次输出的 JSON 都无法解析。现在请只输出一个最简单的 final JSON："
+                            '{"action":"final","answer":"<一句话回答>","evidence_refs":["tool_call_1"]}。'
+                            "answer 基于已返回的工具结果用一句自然的话；没有工具结果就如实说没有找到相关记录；"
+                            "不要调用任何工具、不要写解释。"
+                        )})
+                    else:
+                        messages.append({"role": "user", "content": (
+                            "你的上一条输出不是合法的 JSON 对象，无法解析。"
+                            "请严格只输出一个 JSON 对象（action 只能是 tool_call 或 final），"
+                            "不要 markdown、不要多余文字、不要省略结尾的引号或括号。"
+                        )})
                     continue
                 turn.status = "error"
                 turn.reason = "unparseable_action"
+                turn.termination_reason = "parse_failure"
                 if task.tool_results:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
@@ -534,9 +566,21 @@ class AgentRuntime:
             seen_tool_calls.add(call_signature)
             spec = get_tool(tool_name)
             if spec is None:
+                if unknown_tool_retries < max_unknown_tool_retries and turn.budget.can_model_step():
+                    unknown_tool_retries += 1
+                    messages.append({"role": "assistant", "content": raw})
+                    from .tool_registry import list_tools
+                    valid = "、".join(sorted({s.name for s in list_tools()
+                                              if s.readiness != "blocked"}))
+                    messages.append({"role": "user", "content": (
+                        f"工具「{tool_name}」不存在。可用工具只有：{valid}。"
+                        "请重新选择一个可用工具，或直接输出 final。"
+                    )})
+                    continue
                 turn.steps.append({"type": "tool", "tool": tool_name, "status": "error",
                                    "reason": "unknown_tool"})
                 turn.reason = "unknown_tool:" + tool_name
+                turn.termination_reason = "tool_unavailable"
                 break
             if tool_name == "inspect_photo":
                 handle_arg = str(arguments.get("asset_handle") or "")
@@ -548,6 +592,7 @@ class AgentRuntime:
             decision = policy.execute(spec, arguments, context={
                 "scope_id": self.scope_id, "viewer_id": self.viewer_id,
                 "task_state": task.as_dict(), "history": history,
+                "conversation_id": self.conversation_id,
             })
             latency = round(time.monotonic() - t0, 2)
             result = ToolResult(tool=tool_name,

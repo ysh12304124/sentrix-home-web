@@ -331,6 +331,21 @@ def health():
             {"name": s.name, "readiness": s.readiness}
             for s in list_tools() if s.readiness != "blocked"
         ]
+        matrix = {t["name"]: t for t in agent["tools"]}
+        # D10：Capability Manifest — 前端按真实 readiness 渲染能力
+        agent["capabilities"] = {
+            "conversation_management": CONVERSATION_STORE_ENABLED,
+            "photo_inspector": matrix.get("inspect_photo", {}).get("readiness") == "ready",
+            "long_term_memory": matrix.get("get_core_memory", {}).get("readiness") != "blocked",
+            "person_memory": matrix.get("get_person_memory", {}).get("readiness") != "blocked",
+            "conversation_search": matrix.get("search_conversation_history", {}).get("readiness") != "blocked",
+            "memory_write": False,
+        }
+        agent["ui_actions"] = {
+            "new_conversation": CONVERSATION_STORE_ENABLED,
+            "delete_conversation": CONVERSATION_STORE_ENABLED,
+            "view_original": matrix.get("get_original_photos", {}).get("readiness") in {"ready", "limited"},
+        }
     except Exception:
         agent["tools"] = []
     return {
@@ -1159,7 +1174,8 @@ def _turn_executor():
 
 def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="",
                    progress_callback=None, selected_asset_handle=None,
-                   selected_result_set_id=None):
+                   selected_result_set_id=None, conversation_summary="",
+                   profile_name=None):
     """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
     from .agent_runtime import tools as runtime_tools
     from .agent_runtime.runtime import AgentRuntime
@@ -1175,8 +1191,9 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         retrieval_config = None
     runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
                                retrieval_config=retrieval_config)
+    runtime_tools.set_conversation_id(conversation_id)
     runtime_tools.register_tools()
-    profile_name = os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
+    profile_name = (profile_name or os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop")).strip().lower()
 
     def chat_fn(messages):
         payload = {
@@ -1191,17 +1208,20 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         return response.json()["choices"][0]["message"]["content"]
 
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
-                           scope_id=scope_id, viewer_id=viewer_id)
+                           scope_id=scope_id, viewer_id=viewer_id,
+                           conversation_id=conversation_id)
     prev_state = _TOOL_LOOP_TASK_STATE.get(conversation_id) if conversation_id else None
     # Phase C C15：用户点选的照片写入本轮 task_state（selected handle 稳定跨轮可用）
-    if selected_asset_handle and selected_result_set_id:
+    if selected_asset_handle:
         prev_state = dict(prev_state or {})
-        prev_state["current_result_set"] = selected_result_set_id
+        if selected_result_set_id:
+            prev_state["current_result_set"] = selected_result_set_id
         prev_state["selected_asset_handle"] = selected_asset_handle
     turn = runtime.run(message, history=recent_turns, task_state=prev_state,
                        progress_callback=progress_callback,
                        selected_handle=selected_asset_handle,
-                       selected_result_set_id=selected_result_set_id)
+                       selected_result_set_id=selected_result_set_id,
+                       conversation_summary=conversation_summary)
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
     trace = []
@@ -1221,6 +1241,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     guard_debug = {
         "status": turn.status,
         "reason": turn.reason or "",
+        "termination_reason": turn.termination_reason or "",
         "recovery_attempts": sum(1 for p in turn.public_progress
                                  if p.get("stage") == "recovering"),
         "l1_codes": [c for s in turn.steps if s.get("type") == "guard"
@@ -1256,14 +1277,21 @@ def assistant_turn(request: AssistantTurnRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
     message = request.message.strip()
+    conversation_id = request.conversation_id
     recent_turns = ""
-    if CONVERSATION_STORE_ENABLED and request.conversation_id:
+    conversation_summary = ""
+    if CONVERSATION_STORE_ENABLED:
+        # D2：无会话时自动创建；恢复旧会话时按 active 校验
+        if not conversation_id:
+            conversation_id = conversation_store.create_conversation(scope_id=request.scope_id)
         try:
-            history = conversation_store.last_messages(request.conversation_id, limit=8)
-            recent_turns = "\n".join(
-                f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'].get('text', '')}"
-                for m in history if m.get("content", {}).get("text")
-            )
+            if conversation_store.get_conversation(conversation_id):
+                history = conversation_store.last_messages(conversation_id, limit=8)
+                recent_turns = "\n".join(
+                    f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'].get('text', '')}"
+                    for m in history if m.get("content", {}).get("text")
+                )
+                conversation_summary = conversation_store.get_summary(conversation_id)
         except Exception:
             recent_turns = ""
     # tool_loop 是唯一 agent 路径：异步执行，立即返回 turn_id 供前端轮询实时进度
@@ -1272,13 +1300,14 @@ def assistant_turn(request: AssistantTurnRequest):
                            "progress_events": [], "result": None,
                            "created_at": time.time()}
     _turn_executor().submit(
-        _execute_turn_job, turn_id, message, request.conversation_id,
+        _execute_turn_job, turn_id, message, conversation_id,
         request.scope_id, request.viewer_id, recent_turns,
-        request.selected_asset_handle, request.selected_result_set_id)
+        request.selected_asset_handle, request.selected_result_set_id,
+        conversation_summary)
     return {
         "turn_id": turn_id,
         "status": "running",
-        "conversation_id": request.conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
+        "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
     }
 
@@ -1350,6 +1379,13 @@ def _record_turn_conversation(message, request, result, turn_id=""):
         turn_id = turn_id or make_id("turn")
         result["turn_id"] = turn_id
         scope_id = request.scope_id or "home-default"
+        # D2：生命周期维护（自动建会话/标题/更新时间）
+        is_photo_thread = str(cid).startswith("photothread_")
+        if not conversation_store.get_conversation(cid) and not is_photo_thread:
+            conversation_store.create_conversation(scope_id=scope_id)
+        if not is_photo_thread:
+            conversation_store.ensure_title(cid, message)
+            conversation_store.touch_conversation(cid)
         conversation_store.add_message(cid, "user", {"text": message},
                                        scope_id=scope_id, turn_id=turn_id)
         conversation_store.add_message(cid, "assistant", {
@@ -1381,6 +1417,199 @@ def _record_turn_conversation(message, request, result, turn_id=""):
     except Exception:
         # 记录失败不影响回答
         pass
+
+
+# ---- D2: Conversation Lifecycle API ----
+class ConversationCreateRequest(BaseModel):
+    scope_id: str = "home-default"
+    title: str | None = None
+
+
+class ConversationRenameRequest(BaseModel):
+    title: str
+
+
+@app.post("/api/conversations")
+def create_conversation_api(request: ConversationCreateRequest):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    cid = conversation_store.create_conversation(scope_id=request.scope_id, title=request.title)
+    return {"conversation_id": cid, "conversation": conversation_store.get_conversation(cid)}
+
+
+@app.get("/api/conversations")
+def list_conversations_api(scope_id: str | None = None, limit: int = 50):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    return {"conversations": conversation_store.list_conversations(scope_id=scope_id, limit=limit)}
+
+
+@app.get("/api/conversations/{conversation_id}")
+def get_conversation_api(conversation_id: str, limit: int = 50):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    conv = conversation_store.get_conversation(conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    messages = conversation_store.list_messages(conversation_id, limit=limit)
+    return {"conversation": conv, "messages": messages}
+
+
+@app.patch("/api/conversations/{conversation_id}")
+def rename_conversation_api(conversation_id: str, request: ConversationRenameRequest):
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    conv = conversation_store.rename_conversation(conversation_id, request.title)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"conversation": conv}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def delete_conversation_api(conversation_id: str):
+    """删除会话：只删聊天历史/轨迹/摘要/临时 ResultSet 引用，不删家庭长期记忆与 Asset。"""
+    if not CONVERSATION_STORE_ENABLED:
+        raise HTTPException(status_code=404, detail="conversation store disabled")
+    conv = conversation_store.get_conversation(conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    conversation_store.delete_conversation(conversation_id)
+    _TOOL_LOOP_TASK_STATE.pop(conversation_id, None)
+    return {"deleted": True, "conversation_id": conversation_id,
+            "note": "已删除聊天记录与处理过程；家庭照片和长期记忆不受影响。"}
+
+
+# ---- D8: Photo Inspector（照片子会话）----
+class PhotoThreadCreateRequest(BaseModel):
+    asset_handle: str | None = None
+    result_set_id: str | None = None
+    asset_id: str | None = None
+    parent_conversation_id: str | None = None
+    scope_id: str = "home-default"
+
+
+class PhotoThreadMessageRequest(BaseModel):
+    message: str
+    viewer_id: str = "owner"
+
+
+def _photo_thread_meta(thread_id: str):
+    try:
+        row = store.connection.execute(
+            "SELECT * FROM agent_photo_threads WHERE thread_id = ?", (thread_id,)).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+@app.post("/api/photo-threads")
+def create_photo_thread(request: PhotoThreadCreateRequest):
+    from .agent_runtime import tools as runtime_tools
+    runtime_tools.register_tools()
+    scope_id = request.scope_id or "home-default"
+    handle = request.asset_handle or ""
+    asset_id = request.asset_id
+    if not asset_id:
+        asset_id = runtime_tools.resolve_handle_asset_id(
+            handle, request.result_set_id, scope_id)
+    if not asset_id:
+        raise HTTPException(status_code=404, detail="无法定位照片")
+    row = store.connection.execute(
+        "SELECT scope_id FROM assets WHERE id = ?", (asset_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="照片不存在")
+    if scope_id and row["scope_id"] != scope_id:
+        raise HTTPException(status_code=404, detail="照片不在当前相册范围")
+    thread_id = make_id("photothread")
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    store.connection.execute(
+        """INSERT INTO agent_photo_threads
+           (thread_id, parent_conversation_id, scope_id, asset_handle, asset_id,
+            result_set_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (thread_id, request.parent_conversation_id, scope_id, handle or "photo_1",
+         asset_id, request.result_set_id or "", now, now))
+    store.connection.commit()
+    return {"thread_id": thread_id, "asset_handle": handle or "photo_1",
+            "asset_id": asset_id, "result_set_id": request.result_set_id or "",
+            "scope_id": scope_id, "parent_conversation_id": request.parent_conversation_id}
+
+
+@app.post("/api/photo-threads/{thread_id}/turn")
+def photo_thread_turn(thread_id: str, request: PhotoThreadMessageRequest):
+    meta = _photo_thread_meta(thread_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="photo thread not found")
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    recent_turns = ""
+    try:
+        history = conversation_store.last_messages(thread_id, limit=8)
+        recent_turns = "\n".join(
+            f"{'用户' if m['role'] == 'user' else '助手'}：{m['content'].get('text', '')}"
+            for m in history if m.get("content", {}).get("text"))
+    except Exception:
+        recent_turns = ""
+    turn_id = make_id("turn")
+    _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
+                           "progress_events": [], "result": None,
+                           "created_at": time.time()}
+    _turn_executor().submit(
+        _execute_photo_thread_job, turn_id, thread_id, message,
+        meta["scope_id"], request.viewer_id, recent_turns, meta)
+    return {"turn_id": turn_id, "status": "running", "thread_id": thread_id}
+
+
+def _execute_photo_thread_job(turn_id, thread_id, message, scope_id, viewer_id,
+                              recent_turns, meta):
+    """D8：photo thread 后台 turn（复用 tool-loop，profile=photo_inspector，绑定当前照片）。"""
+    job = _TURN_JOBS.get(turn_id)
+    try:
+        def on_progress(event):
+            if job is not None:
+                job.setdefault("progress_events", []).append(event)
+                job["public_progress"] = job.get("progress_events")
+
+        result = _tool_loop_turn(
+            message, conversation_id=thread_id, scope_id=scope_id,
+            viewer_id=viewer_id, recent_turns=recent_turns,
+            progress_callback=on_progress,
+            selected_asset_handle=meta["asset_handle"],
+            selected_result_set_id=meta["result_set_id"] or None,
+            profile_name="photo_inspector")
+        result["photo_thread_id"] = thread_id
+        result = assistant_response(result)
+        _record_turn_conversation(message, _AssistantTurnLike(
+            conversation_id=thread_id, scope_id=scope_id), result, turn_id=turn_id)
+        if job is not None:
+            job.update({"status": "complete", "result": result,
+                        "public_progress": result.get("public_progress") or job.get("public_progress") or []})
+    except Exception as exc:
+        if job is not None:
+            job.update({"status": "error", "error": str(exc)})
+
+
+@app.get("/api/photo-threads/{thread_id}/messages")
+def photo_thread_messages(thread_id: str, limit: int = 20):
+    meta = _photo_thread_meta(thread_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="photo thread not found")
+    return {"thread_id": thread_id, "asset_handle": meta["asset_handle"],
+            "asset_id": meta["asset_id"], "result_set_id": meta["result_set_id"],
+            "messages": conversation_store.list_messages(thread_id, limit=limit)}
+
+
+@app.delete("/api/photo-threads/{thread_id}")
+def delete_photo_thread(thread_id: str):
+    meta = _photo_thread_meta(thread_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="photo thread not found")
+    store.connection.execute(
+        "DELETE FROM agent_photo_threads WHERE thread_id = ?", (thread_id,))
+    conversation_store.delete_conversation(thread_id)
+    _TOOL_LOOP_TASK_STATE.pop(thread_id, None)
+    return {"deleted": True, "thread_id": thread_id}
 
 
 def assistant_response(result):
@@ -1431,7 +1660,8 @@ def assistant_response(result):
 
 
 def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns,
-                     selected_asset_handle=None, selected_result_set_id=None):
+                     selected_asset_handle=None, selected_result_set_id=None,
+                     conversation_summary=""):
     """B3.4：后台执行 tool-loop turn，progress 增量写入 job。"""
     job = _TURN_JOBS.get(turn_id)
     try:
@@ -1444,7 +1674,8 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
         result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
                                  recent_turns=recent_turns, progress_callback=on_progress,
                                  selected_asset_handle=selected_asset_handle,
-                                 selected_result_set_id=selected_result_set_id)
+                                 selected_result_set_id=selected_result_set_id,
+                                 conversation_summary=conversation_summary)
         # B4 canary telemetry：profile / 工具序列 / guard / 延迟 / fallback 标记
         try:
             trace = result.get("retrieval_trace") or []
@@ -1452,6 +1683,7 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
                 "profile": os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop"),
                 "status": result.get("tool_loop_status"),
                 "reason": result.get("tool_loop_reason"),
+                "termination_reason": result.get("termination_reason"),
                 "tools": [s.get("tool") for s in trace if s.get("stage") == "tool" and s.get("tool")],
                 "latency_s": round(time.time() - started, 2),
                 "fallback": False,
@@ -1468,9 +1700,38 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
         if job is not None:
             job.update({"status": "complete", "result": result,
                         "public_progress": result.get("public_progress") or job.get("public_progress") or []})
+        # D3：后台生成会话摘要（不阻塞回答交付）
+        if CONVERSATION_STORE_ENABLED and conversation_id and result.get("tool_loop_status") == "complete":
+            threading.Thread(target=_background_conversation_summary,
+                             args=(conversation_id, scope_id), daemon=True).start()
     except Exception as exc:
         if job is not None:
             job.update({"status": "error", "error": str(exc)})
+
+
+def _background_conversation_summary(conversation_id, scope_id):
+    """D3：对话轮次足够后，用 12B 生成/更新会话摘要并保存。"""
+    try:
+        from .agent_runtime.conversation_summary import summarize_with_model
+        messages = conversation_store.list_messages(conversation_id, limit=60)
+        count = sum(1 for m in messages if m.get("role") in {"user", "assistant"})
+        if count < 6:
+            return
+
+        def _chat_fn(msgs):
+            payload = {
+                "model": getattr(gamma, "model", "gemma4-12b-it"),
+                "messages": msgs, "temperature": 0.0, "max_tokens": 700,
+            }
+            resp = httpx.post(f"{gamma.base_url}/chat/completions", json=payload, timeout=60)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+        summary = summarize_with_model(_chat_fn, messages)
+        if summary.strip():
+            conversation_store.save_summary(conversation_id, summary)
+    except Exception:
+        pass
 
 
 class _AssistantTurnLike:

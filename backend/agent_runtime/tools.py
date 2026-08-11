@@ -31,6 +31,11 @@ def bind_runtime(store, *, gamma=None, embedding_router=None, retrieval_config=N
     _RUNTIME["result_sets"] = ResultSetStore(store)
 
 
+def set_conversation_id(conversation_id):
+    """D4：把当前 conversation_id 绑定到 tool 层（search_conversation_history 用）。"""
+    _RUNTIME["conversation_id"] = conversation_id
+
+
 def _kernel():
     from ..evidence_retrieval import EvidenceRetrievalKernel
     if _RUNTIME.get("embedding_router") is not None:
@@ -614,6 +619,17 @@ def get_result_set_store():
     return _RUNTIME.get("result_sets")
 
 
+def resolve_handle_asset_id(handle: str, result_set_id: str | None = None,
+                            scope_id: str | None = None) -> str | None:
+    """D8：从 handle（+结果集）解析 asset_id；API 层 Photo Thread 用。"""
+    rs_store = _RUNTIME.get("result_sets")
+    if result_set_id and rs_store is not None:
+        aid = rs_store.resolve_handle(result_set_id, handle)
+        if aid:
+            return aid
+    return _handle_to_asset_id(handle)
+
+
 def result_set_context(result_set_id: str, scope_id: str) -> str | None:
     """B3.1：给模型一段当前结果集的续接上下文（不暴露内部 ID 之外的敏感信息）。"""
     rs_store = _RUNTIME.get("result_sets")
@@ -722,6 +738,325 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     }
 
 
+# ---- Tool 5: search_conversation_history（D4）----
+def _search_conversation_history(arguments: dict, *, context: dict | None = None) -> dict:
+    """检索历史对话：current（当前会话）/ recent（最近会话）/ all（全部历史会话）。"""
+    from ..agent_conversation import ConversationStore
+    query = (arguments.get("query") or "").strip()
+    scope = str(arguments.get("scope") or "current").strip()
+    if scope not in {"current", "recent", "all_user_conversations"}:
+        scope = "current"
+    store = _RUNTIME.get("store")
+    if store is None or not query:
+        return {"summary": "对话检索暂不可用。", "total": 0, "scope": scope}
+    cs = ConversationStore(store)
+    scope_id = (context or {}).get("scope_id") or ""
+    current_cid = arguments.get("conversation_id") or _RUNTIME.get("conversation_id")
+    matches = []
+    if scope == "current":
+        if current_cid:
+            for m in cs.search_messages(query, conversation_id=current_cid, limit=8):
+                matches.append({"role": m.get("role"), "text": _msg_text_short(m.get("content")),
+                                "created_at": m.get("created_at")})
+    elif scope == "recent":
+        convs = cs.list_conversations(scope_id=scope_id, limit=5)
+        seen = set()
+        for conv in convs:
+            if conv["conversation_id"] == current_cid:
+                continue
+            for m in cs.search_messages(query, conversation_id=conv["conversation_id"], limit=2):
+                key = m.get("id")
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append({"role": m.get("role"), "text": _msg_text_short(m.get("content")),
+                                "created_at": m.get("created_at"),
+                                "conversation_title": conv.get("title")})
+    else:
+        for m in cs.search_messages(query, scope_id=scope_id, limit=10):
+            matches.append({"role": m.get("role"), "text": _msg_text_short(m.get("content")),
+                            "created_at": m.get("created_at")})
+    if not matches:
+        return {"summary": "历史对话中没有找到相关内容。", "total": 0, "scope": scope}
+    return {
+        "summary": f"在{'当前' if scope == 'current' else '历史'}对话中找到 {len(matches)} 条相关内容。",
+        "total": len(matches),
+        "scope": scope,
+        "matches": matches[:10],
+        "note": "对话内容属于用户表述，不等于照片证据；回答时需说明这是'你之前说过'而非照片事实。",
+    }
+
+
+def _msg_text_short(content) -> str:
+    if isinstance(content, dict):
+        text = str(content.get("text") or content.get("content") or "")
+    elif isinstance(content, str):
+        text = content
+    else:
+        text = ""
+    return text.strip().replace("\n", " ")[:160]
+
+
+# ---- Tool 6: get_core_memory（D5）----
+def _sync_core_memory_from_entities(scope_id: str) -> "CoreMemoryStore":
+    """把已确认人物/关系同步为 Core Memory 卡片（只写人物名与家庭关系，用户授权数据）。"""
+    from ..core_memory import CoreMemoryStore
+    store = _RUNTIME.get("store")
+    cms = CoreMemoryStore(store)
+    if store is None:
+        return cms
+    try:
+        entities = store.list_entities(status="confirmed", scope_id=scope_id or None)
+        name_by_id = {e["id"]: e["canonical_name"] for e in entities}
+        for ent in entities:
+            card_id = cms.upsert_card(scope_id=scope_id or "home-default",
+                                      subject_type="person", subject_id=ent["id"],
+                                      display_name=ent["canonical_name"])
+            role = (ent.get("family_role") or "").strip()
+            if role:
+                cms.upsert_item(card_id=card_id,
+                                text=f"{ent['canonical_name']} 的家庭角色是 {role}。",
+                                epistemic_type="confirmed_fact", source_type="entity",
+                                source_ids=[ent["id"]], source_revisions={"entity": 1})
+        rels = store.list_person_relationships(scope_id=scope_id or None)
+        for rel in rels:
+            if rel.get("status") != "active" and rel.get("status") != "confirmed":
+                continue
+            subj, obj = rel.get("subject_entity_id"), rel.get("object_entity_id")
+            subj_name = name_by_id.get(subj) or rel.get("subject_name")
+            obj_name = name_by_id.get(obj) or rel.get("object_name")
+            predicate = (rel.get("predicate") or "").strip()
+            if not (subj and obj and subj_name and obj_name and predicate):
+                continue
+            card_id = cms.upsert_card(scope_id=scope_id or "home-default",
+                                      subject_type="person", subject_id=subj,
+                                      display_name=subj_name)
+            cms.upsert_item(card_id=card_id,
+                            text=f"{subj_name} 和 {obj_name} 的关系是 {predicate}。",
+                            epistemic_type="confirmed_fact", source_type="relationship",
+                            source_ids=[rel["id"]],
+                            source_revisions={"relationship": int(rel.get("revision") or 1)})
+    except Exception:
+        pass
+    return cms
+
+
+def _get_core_memory(arguments: dict, *, context: dict | None = None) -> dict:
+    scope_id = (context or {}).get("scope_id") or ""
+    viewer_id = (context or {}).get("viewer_id") or "owner"
+    conversation_id = (context or {}).get("conversation_id")
+    subject = (arguments.get("subject") or "").strip()
+    topic = (arguments.get("topic") or "").strip()
+    limit = max(1, min(10, int(arguments.get("limit") or 5)))
+    cms = _sync_core_memory_from_entities(scope_id)
+    store = _RUNTIME.get("store")
+    if store is None:
+        return {"summary": "长期记忆不可用。", "cards": [], "total": 0}
+    subject_ids = None
+    if subject:
+        matched = []
+        try:
+            for ent in store.list_entities(status="confirmed", scope_id=scope_id or None):
+                if subject in (ent.get("canonical_name") or "") or subject in (ent.get("family_role") or ""):
+                    matched.append(ent["id"])
+        except Exception:
+            matched = []
+        subject_ids = matched or None
+    cards = cms.list_cards(scope_id=scope_id or None, subject_ids=subject_ids, limit=limit)
+    if topic:
+        topic = topic.lower()
+        filtered = []
+        for card in cards:
+            keep = []
+            for item in card.get("items") or []:
+                if topic in (item.get("text") or "").lower():
+                    keep.append(item)
+            if keep:
+                card = dict(card)
+                card["items"] = keep
+                filtered.append(card)
+        cards = filtered
+    public_cards = []
+    for card in cards:
+        try:
+            cms.record_access(card_id=card["card_id"], conversation_id=conversation_id,
+                              viewer_id=viewer_id)
+        except Exception:
+            pass
+        public_cards.append({
+            "subject_type": card.get("subject_type"),
+            "subject_id": card.get("subject_id"),
+            "display_name": card.get("display_name"),
+            "items": [{
+                "text": item.get("text"),
+                "truth_status": item.get("epistemic_type"),
+                "source_type": item.get("source_type"),
+                "source_ids": item.get("source_ids"),
+                "source_revisions": item.get("source_revisions"),
+                "updated_at": item.get("created_at"),
+            } for item in (card.get("items") or [])],
+        })
+    if not public_cards:
+        return {"summary": "长期记忆中没有找到相关内容。", "cards": [], "total": 0,
+                "note": "只读长期记忆；agent_inference 不会被当作 confirmed。"}
+    return {
+        "summary": f"找到 {len(public_cards)} 张长期记忆卡片。",
+        "total": len(public_cards),
+        "cards": public_cards,
+        "note": "truth_status: confirmed_fact/user_assertion/agent_inference/observed_pattern；agent_inference 不能表述为 confirmed。",
+    }
+
+
+# ---- Tool 7: get_person_memory（D6）----
+def _resolve_person_entity(person: str, scope_id: str):
+    store = _RUNTIME.get("store")
+    if store is None or not person:
+        return None
+    try:
+        for ent in store.list_entities(status="confirmed", scope_id=scope_id or None):
+            name = ent.get("canonical_name") or ""
+            role = ent.get("family_role") or ""
+            if person in name or person in role or name in person or role in person:
+                return ent
+    except Exception:
+        return None
+    return None
+
+
+def _person_assets(entity_id: str, scope_id: str) -> list:
+    store = _RUNTIME.get("store")
+    if store is None:
+        return []
+    sql = ("SELECT DISTINCT a.id AS asset_id, a.captured_at, a.captured_location "
+           "FROM assets a "
+           "JOIN face_instances fi ON fi.asset_id = a.id "
+           "JOIN face_clusters fc ON fc.id = fi.cluster_id AND fc.entity_id = ? "
+           "WHERE a.scope_id = ?")
+    try:
+        rows = store.connection.execute(sql, (entity_id, scope_id or "")).fetchall()
+    except Exception:
+        rows = []
+    sql2 = ("SELECT DISTINCT a.id AS asset_id, a.captured_at, a.captured_location "
+            "FROM assets a "
+            "JOIN observations o ON o.asset_id = a.id "
+            "JOIN entity_mentions em ON em.observation_id = o.id AND em.entity_id = ? "
+            "WHERE a.scope_id = ?")
+    try:
+        rows2 = store.connection.execute(sql2, (entity_id, scope_id or "")).fetchall()
+    except Exception:
+        rows2 = []
+    seen = {}
+    for row in list(rows) + list(rows2):
+        seen.setdefault(row["asset_id"], row)
+    return list(seen.values())
+
+
+def _person_events(entity_id: str, scope_id: str) -> list:
+    store = _RUNTIME.get("store")
+    if store is None:
+        return []
+    try:
+        rows = store.connection.execute(
+            """SELECT DISTINCT ev.id AS event_id, ev.title, ev.time_start, ev.scope_id
+               FROM events ev
+               JOIN event_observations eo ON eo.event_id = ev.id
+               JOIN observations o ON o.id = eo.observation_id
+               JOIN entity_mentions em ON em.observation_id = o.id AND em.entity_id = ?
+               WHERE ev.scope_id = ?
+               ORDER BY ev.time_start""",
+            (entity_id, scope_id or "")).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _person_co_occurrence(entity_id: str, scope_id: str) -> list:
+    store = _RUNTIME.get("store")
+    if store is None:
+        return []
+    try:
+        rows = store.connection.execute(
+            """SELECT e.canonical_name, COUNT(DISTINCT a.id) AS shared_assets
+               FROM assets a
+               JOIN observations o ON o.asset_id = a.id
+               JOIN entity_mentions em2 ON em2.observation_id = o.id
+               JOIN entities e ON e.id = em2.entity_id AND e.entity_type = 'person' AND e.status = 'confirmed'
+               WHERE a.scope_id = ? AND em2.entity_id != ?
+                 AND a.id IN (
+                   SELECT DISTINCT a2.id FROM assets a2
+                   JOIN observations o2 ON o2.asset_id = a2.id
+                   JOIN entity_mentions em ON em.observation_id = o2.id AND em.entity_id = ?
+                 )
+               GROUP BY e.id ORDER BY shared_assets DESC LIMIT 10""",
+            (scope_id or "", entity_id, entity_id)).fetchall()
+        return [{"name": r["canonical_name"], "shared_assets": r["shared_assets"]} for r in rows]
+    except Exception:
+        return []
+
+
+def _get_person_memory(arguments: dict, *, context: dict | None = None) -> dict:
+    person = (arguments.get("person") or "").strip()
+    operation = (arguments.get("operation") or "overview").strip()
+    if operation not in {"overview", "first_occurrence", "last_occurrence",
+                         "common_places", "co_occurrence", "events"}:
+        operation = "overview"
+    scope_id = (context or {}).get("scope_id") or ""
+    ent = _resolve_person_entity(person, scope_id)
+    if ent is None:
+        return {"person": person, "readiness": "limited", "operation": operation,
+                "insufficient_evidence": True,
+                "summary": f"没有找到已确认人物「{person}」的记忆数据。",
+                "note": "人物未确认或数据不足时返回 limited，不编造。"}
+    assets = _person_assets(ent["id"], scope_id)
+    if not assets:
+        return {"person": person, "readiness": "limited", "operation": operation,
+                "insufficient_evidence": True,
+                "summary": f"「{person}」暂无足够的照片/观察数据。",
+                "note": "数据不足时返回 limited，不编造。"}
+    captured = [a.get("captured_at") for a in assets if a.get("captured_at")]
+    captured.sort()
+    places: dict[str, int] = {}
+    for a in assets:
+        loc = (a.get("captured_location") or "").strip()
+        if loc:
+            places[loc] = places.get(loc, 0) + 1
+    common_places = [{"place": k, "count": v}
+                     for k, v in sorted(places.items(), key=lambda kv: -kv[1])[:8]]
+    events = _person_events(ent["id"], scope_id)
+    co_occurrence = _person_co_occurrence(ent["id"], scope_id)
+    base = {
+        "person": ent["canonical_name"],
+        "family_role": ent.get("family_role") or "",
+        "readiness": "ready",
+        "operation": operation,
+        "asset_count": len(assets),
+        "first_occurrence": captured[0] if captured else None,
+        "last_occurrence": captured[-1] if captured else None,
+        "common_places": common_places,
+        "co_occurrence": co_occurrence,
+        "events": [{"event_id": e["event_id"], "title": e["title"], "time_start": e.get("time_start")}
+                   for e in events[:10]],
+        "representative_events": [e["title"] for e in events[:3]],
+        "observation_count": len(events) + len(assets),
+        "event_count": len(events),
+        "entity_binding_coverage": "confirmed",
+        "note": "主观性格等无法从照片确认的问题应回答 insufficient evidence，不要臆测。",
+    }
+    if operation == "first_occurrence":
+        return {k: base[k] for k in ("person", "readiness", "operation", "first_occurrence", "asset_count")}
+    if operation == "last_occurrence":
+        return {k: base[k] for k in ("person", "readiness", "operation", "last_occurrence", "asset_count")}
+    if operation == "common_places":
+        return {k: base[k] for k in ("person", "readiness", "operation", "common_places", "asset_count")}
+    if operation == "co_occurrence":
+        return {k: base[k] for k in ("person", "readiness", "operation", "co_occurrence", "asset_count")}
+    if operation == "events":
+        return {k: base[k] for k in ("person", "readiness", "operation", "events", "event_count", "asset_count")}
+    base["summary"] = (f"「{ent['canonical_name']}」共出现在 {len(assets)} 张照片中，"
+                       f"最早 {captured[0][:10]}，最近 {captured[-1][:10]}。")
+    return base
+
+
 def _base64_image(path: str) -> str:
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
@@ -788,4 +1123,32 @@ def register_tools():
         description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。昂贵，默认每轮最多 1 次。",
         input_schema={"asset_handle": "", "question": ""},
         executor=_inspect_photo, read_write="read", cost_class="expensive", readiness="ready",
+    ))
+    register(ToolSpec(
+        name="search_conversation_history",
+        description=("检索历史对话内容：回答'我之前是不是说过…/上次聊到哪里/你之前说那张在哪'类问题。"
+                     "scope=current 只查当前会话；scope=recent 查最近几个会话；scope=all_user_conversations 查全部历史会话。"
+                     "对话内容属于用户表述，不等于照片证据；回答时应说'你之前说过'而不是当成照片事实。"),
+        input_schema={"query": "", "scope": "current|recent|all_user_conversations",
+                      "conversation_id": ""},
+        executor=_search_conversation_history, read_write="read", cost_class="cheap", readiness="ready",
+    ))
+    register(ToolSpec(
+        name="get_core_memory",
+        description=("读取长期家庭记忆（已确认人物/家庭角色/关系/偏好等）。"
+                     "subject 填人物名（如'明哥'）；topic 填话题关键词（如'西湖'）；都不填返回优先级最高的卡片。"
+                     "每条记忆带 truth_status（confirmed_fact/user_stated/agent_inference/observed_pattern），"
+                     "agent_inference 不能说成 confirmed。"),
+        input_schema={"subject": "", "topic": "", "limit": 5},
+        executor=_get_core_memory, read_write="read", cost_class="cheap", readiness="ready",
+    ))
+    register(ToolSpec(
+        name="get_person_memory",
+        description=("读取已确认人物的结构化记忆：首次/最近出现时间、出现次数、常去地点、同行人物、参与事件。"
+                     "operation=overview(总览)/first_occurrence(首次)/last_occurrence(最近一次)/"
+                     "common_places(常去地点)/co_occurrence(同行)/events(参与事件)。"
+                     "人物未确认或数据不足时返回 limited，要如实说明，不要编造。"
+                     "性格等主观问题：照片无法确认时回答 insufficient evidence。"),
+        input_schema={"person": "", "operation": "overview|first_occurrence|last_occurrence|common_places|co_occurrence|events"},
+        executor=_get_person_memory, read_write="read", cost_class="cheap", readiness="ready",
     ))

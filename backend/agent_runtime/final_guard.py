@@ -127,7 +127,7 @@ class FinalGuard:
         if re.search(r"\[[^\[\]]{0,14}(?:名称|数量|时间|地点|内容|数字|照片|记录)[^\[\]]{0,14}\]", answer):
             issues.append(_issue("placeholder_leak"))
         # 1. 内部 ID 泄漏（asset_/obs_/entity_ 前缀 + 内部表名）
-        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_)[a-f0-9]{6,}\b", answer)
+        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_|conversation_)[a-f0-9]{6,}\b", answer)
         if leaks:
             issues.append(_issue("internal_id_leak", f"{sorted(set(leaks))[:3]}",
                                  revision=REVISION_HARD_BLOCK))

@@ -38,9 +38,12 @@
     conversationId: "",
     searchResult: null,
     assistantMessages: [],
+    conversations: [],
+    activeConversationSummary: "",
     searchLoading: false,
     liveProgress: [],
     selectedAsset: null,
+    photoInspector: null,
     loading: true,
     backendError: "",
     toast: "",
@@ -81,6 +84,11 @@
       || window.localStorage?.getItem("sentrix.adminDebug") === "1";
     document.body.classList.toggle("admin", enabled);
     return enabled;
+  }
+
+  function capability(name) {
+    return Boolean(state.health && state.health.agent && state.health.agent.capabilities
+      && state.health.agent.capabilities[name]);
   }
 
   const navItems = [
@@ -500,7 +508,7 @@
     const thumbs = handles.length ? `<div class="result-set-thumbs">${handles.map((h) => {
       const active = h === selected ? " selected" : "";
       const checked = inspected.has(h) ? " inspected" : "";
-      return `<button class="result-set-thumb${active}${checked}" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${h === selected ? `<span class="result-set-check">已选</span>` : ""}${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button>`;
+      return `<div class="result-set-thumb-wrap${active}${checked}"><button class="result-set-thumb" data-action="open-photo-inspector" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}" title="打开照片检查器"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button><button class="result-set-select" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}" title="在主对话中选中这张">${h === selected ? "✓" : "＋"}</button></div>`;
     }).join("")}</div>` : "";
     const inspectBlock = inspectedNotes ? `<div class="result-set-inspect-notes">${inspectedNotes}</div>` : "";
     const originalButton = selected ? `<button class="text-button" data-action="open-selected-original" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(selected)}">查看原图 ${icon("→")}</button>` : "";
@@ -529,11 +537,26 @@
     host.innerHTML = buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("");
   }
 
+  function conversationRail() {
+    if (!capability("conversation_management")) return "";
+    const convs = state.conversations || [];
+    const items = convs.length ? convs.map((conv) => {
+      const active = conv.conversation_id === state.conversationId;
+      const when = conv.last_message_at || conv.updated_at || "";
+      const whenLabel = when ? String(when).slice(5, 16).replace("T", " ") : "";
+      return `<div class="conversation-item${active ? " active" : ""}"><button class="conversation-open" data-action="open-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}"><span class="conversation-title">${escapeHtml(conv.title || "新对话")}</span><small>${escapeHtml(whenLabel)}</small></button><button class="conversation-delete" data-action="delete-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}" aria-label="删除对话" title="删除对话">✕</button></div>`;
+    }).join("") : `<div class="conversation-empty">还没有历史对话</div>`;
+    return `<aside class="conversation-rail"><div class="conversation-rail-head"><strong>对话</strong><button class="text-button" data-action="new-conversation">${icon("＋")}新对话</button></div><div class="conversation-list">${items}</div></aside>`;
+  }
+
   function searchView() {
     const messages = state.assistantMessages;
     const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
     const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${introduction}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想，正在整理这段记忆。</p><div class="agent-trace live" data-live-progress>${buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("")}</div></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
+    const summary = state.activeConversationSummary ? `<details class="conversation-summary"><summary>本会话摘要</summary><p>${escapeHtml(state.activeConversationSummary).replace(/\n/g, "<br />")}</p></details>` : "";
+    const rail = conversationRail();
+    const inner = `${introduction}${summary}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想，正在整理这段记忆。</p><div class="agent-trace live" data-live-progress>${buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("")}</div></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
+    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${rail ? `<div class="assistant-layout">${rail}<div class="assistant-main">${inner}</div></div>` : inner}`;
   }
 
   function timelineView() {
@@ -807,6 +830,13 @@
     } else if (modal.type === "entity") {
       const detail = modal.detail;
       const entity = detail.entity;
+    } else if (modal.type === "photo-inspector") {
+      const pi = state.photoInspector || {};
+      const photoUrl = pi.result_set_id ? window.sentrixApi.resultSetPhoto(pi.result_set_id, pi.asset_handle, state.scopeId) : (pi.asset_id ? `/api/assets/${encodeURIComponent(pi.asset_id)}/file` : "");
+      const originalUrl = pi.result_set_id ? window.sentrixApi.resultSetPhoto(pi.result_set_id, pi.asset_handle, state.scopeId, true) : (pi.asset_id ? `/api/assets/${encodeURIComponent(pi.asset_id)}/file?original=1` : "");
+      const msgRows = (pi.messages || []).map((msg) => `<div class="photo-thread-msg ${msg.role}"><strong>${msg.role === "user" ? "你" : "助手"}</strong><p>${escapeHtml(msg.text || "")}</p></div>`).join("");
+      const quick = ["这是什么地方？", "有几个人？", "穿什么颜色？", "桌上是什么？", "文字写了什么？"].map((q) => `<button class="photo-thread-quick" data-action="photo-inspector-quick" data-query="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join("");
+      body = `<div class="modal-kicker">PHOTO INSPECTOR</div><h2>照片检查</h2><div class="photo-inspector-layout"><div class="photo-inspector-media"><img src="${escapeHtml(photoUrl)}" alt="当前检查的照片" /><div class="detail-facts"><span>handle · ${escapeHtml(pi.asset_handle || "photo_1")}</span>${pi.result_set_id ? `<span>结果集 · ${escapeHtml(pi.result_set_id)}</span>` : ""}</div><div class="photo-inspector-actions"><a class="button small ghost" href="${escapeHtml(originalUrl)}" target="_blank" rel="noopener">查看原图 ${icon("→")}</a></div></div><div class="photo-inspector-chat"><div class="photo-thread-messages">${msgRows || `<div class="photo-thread-empty">关于这张照片，问我任何细节。</div>`}${pi.loading ? `<div class="photo-thread-msg assistant loading"><strong>助手</strong><p>正在检查这张照片…</p></div>` : ""}</div><div class="photo-thread-quick-row">${quick}</div><form id="photo-thread-form" class="photo-thread-form"><input id="photo-thread-input" value="${escapeHtml(pi.draft || "")}" placeholder="关于这张照片问我…" /><button type="submit">→</button></form></div></div>`;
       const observations = detail.observations || [];
       const properties = detail.properties || [];
       const propertyHistory = detail.property_history || properties;
@@ -1002,6 +1032,7 @@
     state.persons = calls[3].status === "fulfilled" ? calls[3].value.people || [] : [];
     state.stories = calls[4].status === "fulfilled" ? calls[4].value.stories || [] : [];
     state.health = calls[5].status === "fulfilled" ? calls[5].value : null;
+    loadConversations().catch(() => {});
     try {
       const profilePayload = await window.sentrixApi.getModelProfiles();
       if (!modelSwitchInFlight) state.vlmBackendOptions = modelProfileOptions(profilePayload);
@@ -1060,11 +1091,18 @@
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
     document.querySelectorAll("[data-person-filter]").forEach((element) => element.addEventListener("click", () => { state.personFilter = element.dataset.personFilter; renderView(); }));
     const spaceSelect = document.getElementById("space-select");
-    if (spaceSelect) spaceSelect.addEventListener("change", async (event) => { state.scopeId = event.target.value; window.localStorage?.setItem("sentrix.scopeId", state.scopeId); state.modal = null; state.conversationId = ""; state.searchResult = null; state.assistantMessages = []; await refreshData(); });
+    if (spaceSelect) spaceSelect.addEventListener("change", async (event) => { state.scopeId = event.target.value; window.localStorage?.setItem("sentrix.scopeId", state.scopeId); state.modal = null; state.conversationId = ""; state.searchResult = null; state.assistantMessages = []; state.activeConversationSummary = ""; state.selectedAsset = null; await refreshData(); });
     const form = document.getElementById("search-form");
     if (form) form.addEventListener("submit", submitSearch);
     const modalForm = document.getElementById("modal-form");
     if (modalForm) modalForm.addEventListener("submit", handleModalSubmit);
+    const photoThreadForm = document.getElementById("photo-thread-form");
+    if (photoThreadForm) photoThreadForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = document.getElementById("photo-thread-input");
+      if (input && state.photoInspector) state.photoInspector.draft = input.value;
+      submitPhotoInspector();
+    });
     document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action, element)));
     const fileInput = document.getElementById("file-input");
     if (fileInput) fileInput.addEventListener("change", handleFiles);
@@ -1112,6 +1150,65 @@
     state.query = "";
     state.searchLoading = false;
     state.liveProgress = [];
+    loadConversations().catch(() => {});
+    renderShellNavigation();
+  }
+
+  async function loadConversations() {
+    try {
+      const data = await window.sentrixApi.conversations(state.scopeId);
+      state.conversations = (data && data.conversations) || [];
+      if (state.conversationId && !state.conversations.some((conv) => conv.conversation_id === state.conversationId)) {
+        try {
+          const one = await window.sentrixApi.conversation(state.conversationId);
+          if (one && one.conversation) state.conversations.unshift(one.conversation);
+        } catch { /* 已删除或不可用 */ }
+      }
+    } catch { state.conversations = state.conversations || []; }
+  }
+
+  async function newConversation() {
+    try {
+      const data = await window.sentrixApi.createConversation(state.scopeId);
+      state.conversationId = data.conversation_id;
+    } catch { state.conversationId = `conversation_${Date.now()}`; }
+    state.assistantMessages = [];
+    state.searchResult = null;
+    state.selectedAsset = null;
+    state.activeConversationSummary = "";
+    await loadConversations();
+    renderShellNavigation();
+  }
+
+  async function openConversation(id) {
+    state.conversationId = id;
+    state.selectedAsset = null;
+    try {
+      const data = await window.sentrixApi.conversation(id);
+      state.activeConversationSummary = (data.conversation && data.conversation.summary) || "";
+      state.assistantMessages = (data.messages || []).map((msg) => {
+        const text = (msg.content && (msg.content.text || msg.content.content)) || "";
+        if (msg.role === "user") return { role: "user", text };
+        return { role: "steward", result: { answer: text, conversation_id: id, answer_grounding: { display_mode: "none" }, tool_loop_status: "complete" } };
+      });
+    } catch { state.assistantMessages = []; }
+    renderShellNavigation();
+  }
+
+  async function deleteConversationAction(id) {
+    const target = (state.conversations || []).find((conv) => conv.conversation_id === id);
+    const title = (target && target.title) || "这个对话";
+    if (!window.confirm(`删除「${title}」？\n这会删除聊天记录和处理过程，但不会删除已经保存的家庭照片和记忆。`)) return;
+    try {
+      await window.sentrixApi.deleteConversation(id);
+      if (state.conversationId === id) {
+        state.conversationId = "";
+        state.assistantMessages = [];
+        state.selectedAsset = null;
+        state.activeConversationSummary = "";
+      }
+      await loadConversations();
+    } catch (error) { state.toast = `删除失败：${error.message}`; }
     renderShellNavigation();
   }
 
@@ -1256,6 +1353,11 @@
   }
 
   function closeCurrentModal() {
+    if (state.modal && state.modal.type === "photo-inspector" && state.photoInspector && state.photoInspector.thread_id) {
+      const tid = state.photoInspector.thread_id;
+      state.photoInspector = null;
+      window.sentrixApi.deletePhotoThread(tid).catch(() => {});
+    }
     const previous = state.modalHistory.pop();
     state.modal = previous || null;
     renderShellNavigation();
@@ -1269,6 +1371,62 @@
   async function openAsset(assetId) {
     openModal({ type: "loading" }, { push: true });
     try { const [asset, result] = await Promise.all([window.sentrixApi.asset(assetId), window.sentrixApi.observations(`?assetId=${encodeURIComponent(assetId)}`)]); openModal({ type: "asset", asset, observations: result.observations || [] }); } catch { state.toast = "无法读取原始资料"; state.modal = null; renderShellNavigation(); }
+  }
+
+  async function openPhotoInspector(resultSetId, handle) {
+    openModal({ type: "loading" }, { push: true });
+    try {
+      const thread = await window.sentrixApi.createPhotoThread({
+        asset_handle: handle, result_set_id: resultSetId,
+        scope_id: state.scopeId, parent_conversation_id: state.conversationId || null,
+      });
+      state.photoInspector = { ...thread, messages: [], draft: "", loading: false };
+      openModal({ type: "photo-inspector" });
+      await loadPhotoInspectorMessages();
+    } catch (error) {
+      state.toast = `无法打开照片检查器：${error.message}`;
+      state.modal = null;
+      renderShellNavigation();
+    }
+  }
+
+  async function loadPhotoInspectorMessages() {
+    const pi = state.photoInspector;
+    if (!pi || !pi.thread_id) return;
+    try {
+      const data = await window.sentrixApi.photoThreadMessages(pi.thread_id, 30);
+      pi.messages = (data.messages || []).map((msg) => {
+        const text = (msg.content && (msg.content.text || msg.content.content)) || "";
+        return { role: msg.role, text };
+      });
+    } catch { /* 保持现有消息 */ }
+    renderShellNavigation();
+  }
+
+  async function submitPhotoInspector() {
+    const pi = state.photoInspector;
+    if (!pi || !pi.thread_id) return;
+    const message = (pi.draft || "").trim();
+    if (!message || pi.loading) return;
+    pi.draft = "";
+    pi.loading = true;
+    pi.messages = pi.messages || [];
+    pi.messages.push({ role: "user", text: message });
+    renderShellNavigation();
+    try {
+      const start = await window.sentrixApi.photoThreadTurnAsync(pi.thread_id, message, "owner");
+      let done = null;
+      if (start && start.turn_id && start.status === "running") {
+        done = await subscribeTurnEvents(start.turn_id);
+        if (!done) done = await pollTurnEvents(start.turn_id);
+      }
+      const answer = (done && (done.answer || done.result?.answer)) || "没有收到回答。";
+      pi.messages.push({ role: "assistant", text: answer });
+    } catch (error) {
+      pi.messages.push({ role: "assistant", text: `处理失败：${error.message}` });
+    }
+    pi.loading = false;
+    renderShellNavigation();
   }
 
   async function openEntity(entityId) {
@@ -1397,6 +1555,17 @@
 
   async function handleAction(action, element) {
     if (action === "result-next-page") { state.query = "下一页"; state.view = "search"; renderShellNavigation(); submitSearch(); return; }
+    if (action === "new-conversation") { await newConversation(); return; }
+    if (action === "open-conversation") { await openConversation(element.dataset.conversationId); return; }
+    if (action === "delete-conversation") { await deleteConversationAction(element.dataset.conversationId); return; }
+    if (action === "open-photo-inspector") { await openPhotoInspector(element.dataset.resultSetId, element.dataset.handle); return; }
+    if (action === "photo-inspector-quick") {
+      if (state.photoInspector) state.photoInspector.draft = element.dataset.query || "";
+      renderShellNavigation();
+      const input = document.getElementById("photo-thread-input");
+      if (input) input.focus();
+      return;
+    }
     if (action === "select-result-photo") {
       state.selectedAsset = { result_set_id: element.dataset.resultSetId, handle: element.dataset.handle };
       renderShellNavigation();

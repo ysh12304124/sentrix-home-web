@@ -25,7 +25,8 @@ class ProfileConfig:
 PROFILES = {
     "tool_loop_shadow": ProfileConfig(
         name="tool_loop_shadow",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page", "inspect_photo"),
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
+               "inspect_photo", "search_conversation_history"),
         max_model_steps=6,
         max_tool_calls=4,
         max_inspections=1,
@@ -35,13 +36,25 @@ PROFILES = {
     ),
     "tool_loop": ProfileConfig(
         name="tool_loop",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page", "inspect_photo"),
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
+               "inspect_photo", "search_conversation_history"),
         max_model_steps=6,
         max_tool_calls=5,
         max_inspections=1,
         wall_time_s=60.0,
         final_reserve_s=10.0,
         features={"rx": True, "tool_loop": True, "conversation_store": True},
+    ),
+    "photo_inspector": ProfileConfig(
+        name="photo_inspector",
+        tools=("inspect_photo", "get_original_photos", "search_memories", "get_result_page"),
+        max_model_steps=5,
+        max_tool_calls=4,
+        max_inspections=2,
+        wall_time_s=60.0,
+        final_reserve_s=8.0,
+        features={"rx": True, "tool_loop": True, "photo_inspector": True,
+                  "conversation_store": True},
     ),
 }
 
@@ -52,5 +65,3 @@ def active_profile() -> str:
 
 def get_profile(name: str | None = None) -> ProfileConfig:
     return PROFILES.get(name or active_profile(), PROFILES["tool_loop"])
-
-
