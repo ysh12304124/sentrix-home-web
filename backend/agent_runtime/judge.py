@@ -29,6 +29,11 @@ JUDGE_SYSTEM = """你是 Sentrix 家庭记忆助手的“事实一致性评审�
 - 回答忠实复述观察（包括如实说“没有猫/没有人/无法判断”）。
 - 检索为空（total=0）时如实回答“没有找到”。
 - 回答基于 inspect_photo 观察描述照片内容。
+- 诚实的不确定性（Phase E D2）：回答已给出核心事实，同时用自然语言说明“还不能完全确认/可能是…”，
+  不算 certainty_upgrade 或 missing_disclosure；只有完全没有给出核心事实、纯回避式“无法确认/如果需要可以再看”，
+  或把“只是候选/未确认”说成“确认/确定是”（确定性升级）才算问题。
+- 回答不再复述检索过程（不出现 candidate_only/partial_support/候选照片/匹配程度等内部词汇）
+  不代表信息缺失，不应因此判 unfaithful。
 
 只输出一个 JSON 对象，不要 markdown、不要多余文字：
 {"faithful": true 或 false, "problems": [{"type": "...", "detail": "..."}], "reason": "一句话理由"}"""

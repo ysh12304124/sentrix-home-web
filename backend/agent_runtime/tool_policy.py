@@ -69,11 +69,15 @@ class ToolPolicy:
         "search_memories": _DEFAULT_ALLOWED | {
             "query", "mode", "gaps", "query_satisfaction", "answerability",
             "condition_summary", "can_inspect", "inspect_hint",
+            "recommended_resolution",
             "asset_ids", "evidence_count", "place",
         },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
         "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
         "inspect_photo": _DEFAULT_ALLOWED,
+        "read_photo_text": _DEFAULT_ALLOWED | {
+            "full_text", "text_regions",
+        },
         "search_conversation_history": _DEFAULT_ALLOWED | {
             "query", "scope", "matches", "note",
         },

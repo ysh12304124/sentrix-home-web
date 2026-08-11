@@ -200,10 +200,11 @@ class TaskState:
             "total": observation.get("total"),
             "satisfaction": observation.get("query_satisfaction"),
             "blocked": observation.get("blocked"),
-            "inspect_text": observation.get("observation"),
+            "inspect_text": observation.get("observation") or observation.get("summary"),
             "inspect_handle": observation.get("asset_handle"),
             "confirms_visual_only": observation.get("confirms_visual_only", False),
             "certainty": observation.get("certainty"),
+            "ocr_text": observation.get("full_text") or "",
             "asset_ids": observation.get("asset_ids"),
             "operation": observation.get("operation"),
             "value": observation.get("value"),
@@ -211,6 +212,8 @@ class TaskState:
             "answer_type": observation.get("answer_type"),
             "filters_applied": observation.get("filters_applied"),
             "samples": observation.get("samples"),
+            "recommended_resolution": observation.get("recommended_resolution"),
+            "condition_summary": observation.get("condition_summary"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):

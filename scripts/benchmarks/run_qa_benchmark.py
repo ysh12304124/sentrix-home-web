@@ -44,9 +44,14 @@ JUDGE_SYSTEM = """你是 Sentrix 家庭记忆助手的 QA 自动评分员。给�
 - wrong：核心事实错误、关键细节编造、或回答与标准答案冲突。
 
 关键规则：
-1. 对 answerable 的问题：标准答案是一段实质事实。若助手回答属于“没有找到/未找到/无法确认/没有相关记录/查不到/无法回答”，一律判 wrong（这是检索/回答失败），即使语气诚恳。
+1. 对 answerable 的问题：标准答案是一段实质事实。
+   - 助手回答包含标准答案的核心事实（允许措辞不同）→ correct；核心事实完整但附带“还不能完全确认/看起来是”这类不确定性 → correct。
+   - 助手给出部分核心事实或方向正确但缺关键细节 → partial。
+   - 助手回答完全没有任何核心事实，只是“无法确认/没有找到/如果需要可以再看”这类回避 → wrong（这是回答失败），即使语气诚恳。
+   - 助手把“只是候选/未确认”说成“确认/确定是”（编造或确定性升级）→ wrong。
 2. 对 unanswerable（无法回答）的问题：标准答案是“无法确定/没有足够信息”。助手如实说明无法确定/信息不足 → correct；助手编造答案或强行给结论 → wrong。
 3. 若助手只回答出标准答案的一部分（例如只答了地点没答人物，或多张照片只找到一张），判 partial。
+4. 助手回答简洁直接、不重复检索过程，是加分项，不应因此扣分。
 
 只输出一个 JSON 对象，不要 markdown、不要多余文字：
 {"verdict": "correct" 或 "partial" 或 "wrong", "reason": "一句话理由"}
@@ -369,6 +374,9 @@ def main():
     ap.add_argument("--concurrency", type=int, default=1, help="并发 turn 数（默认 1，GPU 共享）")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 题（0=全部）")
     ap.add_argument("--out", default="~/Downloads/sentrix_qa_report", help="输出目录")
+    ap.add_argument("--tag", default="qa", help="run 标签（如 phasee、baseline）")
+    ap.add_argument("--note", default="", help="run 备注")
+    ap.add_argument("--no-upload", action="store_true", help="不上传 QA Dashboard")
     args = ap.parse_args()
 
     qa_path = Path(args.qa).expanduser()
@@ -408,12 +416,35 @@ def main():
     summary = summarize(results, h)
     meta = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "qa_file": str(qa_path), "base": args.base, "scope": args.scope,
-            "judge_base": args.judge_base}
+            "judge_base": args.judge_base, "tag": args.tag}
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + args.tag
+    run_dir = out_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # 前端需要 file_name -> asset_id（load_assets 返回 asset_id -> file_name）
+    asset_map_rev = {Path(fn).name.lower(): aid for aid, fn in asset_map.items()}
+    run_payload = {"meta": meta, "summary": summary, "rows": results, "asset_map": asset_map_rev}
+    (run_dir / "qa_result.json").write_text(json.dumps(run_payload, ensure_ascii=False, indent=2),
+                                            encoding="utf-8")
+    run_meta = {"run_id": run_id, "tag": args.tag, "created_at": meta["timestamp"],
+                "note": args.note, "branch_153": "", "profile": (h.get("agent") or {}).get("profile", "")}
+    (run_dir / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2),
+                                           encoding="utf-8")
+    # 最新副本（兼容旧工具）
     json_path = out_dir / "qa_result.json"
-    json_path.write_text(json.dumps({"meta": meta, "summary": summary, "rows": results},
-                                    ensure_ascii=False, indent=2), encoding="utf-8")
-    html_path = out_dir / "qa_report.html"
-    html_path.write_text(render_html(results, summary, meta), encoding="utf-8")
+    json_path.write_text(json.dumps(run_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    uploaded = False
+    if not args.no_upload:
+        try:
+            up = http_json("POST", f"{args.base}/api/qa/runs/upload",
+                           {"run_id": run_id, "meta": meta, "summary": summary,
+                            "rows": results, "asset_map": asset_map_rev,
+                            "tag": args.tag, "note": args.note,
+                            "profile": run_meta["profile"]}, timeout=120)
+            uploaded = up.get("status") == "ok"
+            print(f"Dashboard 上传: {up.get('status')} ({up.get('run_id')})")
+        except Exception as exc:
+            print(f"[warn] Dashboard 上传失败: {exc}")
 
     print()
     print("-" * 90)
@@ -421,8 +452,11 @@ def main():
           f"| avg={summary['avg_latency_s']}s | judge={summary['verdicts']} "
           f"| evidence hit={summary['evidence_hit']}/{summary['evidence_questions']} recall={summary['evidence_recall_avg']}")
     print(f"工具使用: {summary['tool_usage']}")
-    print(f"JSON: {json_path}")
-    print(f"HTML: {html_path}")
+    print(f"run 归档: {run_dir}")
+    if uploaded:
+        print(f"QA Dashboard: {args.base}/qa")
+    else:
+        print("QA Dashboard: 未上传（用 --no-upload 关闭此提示）")
     return 0 if summary["errored"] == 0 else 1
 
 

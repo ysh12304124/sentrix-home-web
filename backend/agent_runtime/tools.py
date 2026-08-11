@@ -415,7 +415,7 @@ def _even_indices(total: int, n: int) -> list[int]:
     return [min(int(round(i * (total - 1) / (n - 1))), total - 1) for i in range(n)]
 
 
-def _search_metadata_only(draft, spec, scope_id, query, mode) -> dict:
+def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> dict:
     """空 query 搜索：只按硬筛选（时间/媒体/地点/人物）返回资产，构建 ResultSet 预览。"""
     from ..structured_memory import StructuredMemoryExecutor
     executor = StructuredMemoryExecutor(_RUNTIME["store"])
@@ -463,6 +463,9 @@ def _search_metadata_only(draft, spec, scope_id, query, mode) -> dict:
         "condition_summary": {},
         "can_inspect": len(preview) > 0,
         "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
+        "recommended_resolution": _recommended_resolution(query, preview,
+                                                       "full_support" if total else "no_match",
+                                                       user_goal=user_goal),
     }
 
 
@@ -503,7 +506,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     spec = _spec_for(draft, scope_id, viewer_id)
     if not (query or "").strip():
         # 纯时间/地点/人物/媒体筛选：走确定性元数据路径，不依赖 ANN 语义召回（生产多检索器下空 query 会 0 召回）
-        return _search_metadata_only(draft, spec, scope_id, query, mode)
+        user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
+        return _search_metadata_only(draft, spec, scope_id, query, mode, user_goal=user_goal)
     packet = _kernel().retrieve(spec)
     assets = packet.assets or []
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
@@ -548,6 +552,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "condition_summary": cond,
         "can_inspect": len(preview) > 0,
         "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
+        "recommended_resolution": _recommended_resolution(
+            query, preview, satisfaction,
+            user_goal=((context or {}).get("task_state") or {}).get("user_goal") or ""),
     }
 
 
@@ -584,6 +591,31 @@ def _condition_summary(item: dict) -> dict:
         label = key.split(":", 1)[-1]
         out[label] = cond.get("status")
     return out
+
+
+def _recommended_resolution(query: str, preview: list, satisfaction: str,
+                            user_goal: str = "") -> dict:
+    """Evidence Finder（Phase E §8.2）：告诉 Agent 下一步证据解析方案。
+
+    不替 Agent 做决定，只把"这条检索还需要什么"翻译成工具建议。
+    """
+    if not preview:
+        return {"needed": False, "tool": None,
+                "reason": "" if satisfaction == "full_support" else "没有候选可复核"}
+    q = f"{query or ''} {user_goal or ''}"
+    needs_ocr = bool(re.search(
+        r"菜单|价格|多少钱|售价|招牌|店名|电话|写了什么|什么字|文字|创始|价位|"
+        r"几块钱|多少钱一份|数字|号码", q))
+    needs_visual = bool(re.search(
+        r"颜色|穿|衣服|外套|几个|多少人|猫|雪|拿着|道具|火把|有没有|哪[一123]?张|"
+        r"植物|雕塑|场景|内容|细节|在做什么|拍的什么|什么造型|什么样子", q))
+    if needs_ocr:
+        return {"needed": True, "tool": "read_photo_text",
+                "reason": "问题需要读取照片中的文字/数字，请用 read_photo_text 复核 preview 里的照片"}
+    if needs_visual:
+        return {"needed": True, "tool": "inspect_photo",
+                "reason": "问题需要查看照片中的视觉细节，请用 inspect_photo 复核 preview 里的照片"}
+    return {"needed": False, "tool": None, "reason": ""}
 
 
 def _truth_contract(packet, total: int) -> tuple[dict, str, str]:
@@ -781,6 +813,141 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         "certainty": parsed.get("certainty") or "supported",
         "confirms_visual_only": True,
         "source": "runtime_visual_inspection",
+        "persisted": False,
+    }
+
+
+# ---- Tool 4b: read_photo_text（Phase E：OCR 专用 Tool）----
+_OCR_PROMPT = """请读出这张照片中的全部文字（招牌/菜单/价格/数字/电话/年份/小字）。只输出文字内容本身，不要描述图片、不要评价。如果完全看不清就输出空字符串。"""
+_OCR_PROMPT_FULL = """观察这张照片，墙面上有哪些招牌、牌子或文字？请逐条列出文字内容本身（店名、电话、价格、年份、标语等），不要描述人物和场景。看不清的部分不要编造。"""
+
+
+def _clean_ocr_text(raw) -> str:
+    """清洗 12B OCR 输出：去掉 thought/code block/JSON 包装与重复行，只保留文字。"""
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    text = re.sub(r"```(?:json|JSON)?", "", text)
+    text = re.sub(r"^\s*thought\s*", "", text, flags=re.I)
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            for key in ("text", "ocr", "content", "result"):
+                val = obj.get(key)
+                if isinstance(val, str):
+                    text = val.strip()
+                    break
+            else:
+                return ""
+    except (TypeError, ValueError):
+        pass
+    seen, lines = set(), []
+    for line in text.splitlines():
+        s = line.strip()
+        if s and s not in seen:
+            seen.add(s)
+            lines.append(s)
+    return "\n".join(lines)[:1200]
+
+
+def _tile_images(path: str, rows: int = 3, cols: int = 3, scale: float = 2.0):
+    """把图片切成 rows*cols 个 tile，每块放大 scale 倍，返回 [(label, base64), ...]。"""
+    try:
+        from io import BytesIO
+        from PIL import Image
+    except Exception:
+        return []
+    try:
+        img = Image.open(path)
+    except Exception:
+        return []
+    w, h = img.size
+    tiles = []
+    tw, th = max(1, w // cols), max(1, h // rows)
+    for r in range(rows):
+        for c in range(cols):
+            box = (c * tw, r * th, min(w, (c + 1) * tw), min(h, (r + 1) * th))
+            tile = img.crop(box)
+            if scale != 1.0:
+                tile = tile.resize((int(tile.width * scale), int(tile.height * scale)),
+                                   Image.LANCZOS)
+            buf = BytesIO()
+            tile.convert("RGB").save(buf, "JPEG", quality=92)
+            tiles.append((f"tile_r{r}c{c}", base64.b64encode(buf.getvalue()).decode()))
+    return tiles
+
+
+def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
+    """OCR 专用：读取照片中的文字（菜单/价格/招牌/电话/年份/小字）。
+
+    与 inspect_photo 的分工：inspect_photo 做视觉理解（颜色/物体/场景），
+    read_photo_text 做文本读取。内部把照片切成 3x3 tile 放大后交给 VLM OCR，
+    避免整图小字被压缩丢失。
+    """
+    asset_handle = arguments.get("asset_handle") or ""
+    scope_id = (context or {}).get("scope_id") or ""
+    task_state = (context or {}).get("task_state") or {}
+    if not asset_handle:
+        preview = (task_state.get("result_preview") or []) or []
+        if preview:
+            asset_handle = preview[0]
+    asset_id = None
+    result_set_id = task_state.get("current_result_set")
+    rs_store = _RUNTIME.get("result_sets")
+    if result_set_id and rs_store is not None:
+        asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
+    if not asset_id:
+        asset_id = _handle_to_asset_id(asset_handle)
+    store = _RUNTIME.get("store")
+    if not asset_id or store is None:
+        return {"summary": "无法定位照片。", "full_text": "", "text_regions": [],
+                "certainty": "uncertain", "persisted": False}
+    row = store.connection.execute("SELECT path FROM assets WHERE id = ?", (asset_id,)).fetchone()
+    if not row or not row["path"] or not Path(row["path"]).is_file():
+        return {"summary": "照片文件不可用。", "full_text": "", "text_regions": [],
+                "certainty": "uncertain", "persisted": False}
+    gamma = _RUNTIME.get("gamma")
+    if gamma is None:
+        return {"summary": "模型不可用。", "full_text": "", "text_regions": [],
+                "certainty": "uncertain", "persisted": False}
+    # Phase E：整图 OCR（保留招牌/大字号文字上下文）与 3x3 tile（放大补小字）并行提交，
+    # 总耗时 ≈ max(整图, tile 批次)，避免串行叠加。
+    # 实测：招牌等艺术字被 tile 切碎后 12B 读不出，整图一次推理更有上下文；
+    # 电话/价格/小字则 tile 放大后更准。两者合并去重后交给模型。
+    regions = []
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _ocr_once(label, b64):
+        prompt = _OCR_PROMPT_FULL if label == "full_image" else _OCR_PROMPT
+        try:
+            raw = gamma.chat(prompt, images=[{"base64": b64, "mime_type": "image/jpeg"}],
+                             json_mode=False, role="ocr")
+        except Exception as exc:
+            raw = f"__ERROR__ {exc}"
+        return label, _clean_ocr_text(raw)
+
+    with open(row["path"], "rb") as fh:
+        full_b64 = base64.b64encode(fh.read()).decode()
+    tiles = _tile_images(row["path"])
+    tasks = [("full_image", full_b64)] + tiles
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(lambda item: _ocr_once(*item), tasks))
+    full_clean = ""
+    for label, text in results:
+        if label == "full_image":
+            full_clean = text
+            continue
+        if text and not text.startswith("__ERROR__"):
+            regions.append({"text": text[:200], "source": label})
+    if full_clean and not full_clean.startswith("__ERROR__"):
+        regions.insert(0, {"text": full_clean[:200], "source": "full_image"})
+    full_text = "\n".join(f"[{r['source']}] {r['text']}" for r in regions)
+    return {
+        "summary": f"已读取 {len(regions)} 个文字区域。" if regions else "照片中没有识别到文字。",
+        "full_text": full_text[:1600],
+        "text_regions": regions[:24],
+        "source": "runtime_ocr",
+        "certainty": "supported" if regions else "uncertain",
         "persisted": False,
     }
 
@@ -1173,6 +1340,15 @@ def register_tools():
         description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。昂贵，默认每轮最多 1 次。",
         input_schema={"asset_handle": "", "question": ""},
         executor=_inspect_photo, read_write="read", cost_class="expensive", readiness="ready",
+    ))
+    register(ToolSpec(
+        name="read_photo_text",
+        description=("读取照片中的文字内容（菜单/价格/招牌/店名/电话/年份/小字）。"
+                     "适用于'多少钱/价格/售价/店名/招牌/电话/写了什么/什么字/创始于哪一年'等需要看照片文字的题；"
+                     "内部会把照片切块放大后 OCR。asset_handle 用 search_memories preview 里的 handle，可省略（默认预览第一张）。"
+                     "昂贵，每轮最多 1 次。"),
+        input_schema={"asset_handle": "", "question": ""},
+        executor=_read_photo_text, read_write="read", cost_class="expensive", readiness="ready",
     ))
     register(ToolSpec(
         name="search_conversation_history",

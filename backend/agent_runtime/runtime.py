@@ -60,15 +60,30 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   meal_scene_events（只能确认在吃饭）、possible_events；回答必须逐项列出 explicit_foods 里的食物
   （如'火锅、蛋糕…'）并说明各出现几次，有 meal_scene_events 时还要说明其中一部分只能确认在用餐、
   不能确认具体菜品；没有 explicit_foods 时才只说用餐场景。
-- search_memories 返回的 query_satisfaction 决定怎么说：
-  full_support=可以确认；partial_support=部分条件确认，必须说出哪些还没确认；
-  candidate_only=只是相似候选，**不能说"找到了/确认是"**，要说"找到几张接近的候选，还不能完全确认"；
-  no_match=没有候选，**不能说找到**。
-- 检索满足度与照片复核是两层，必须分开表述，inspect 不能反向确认检索条件：
-  检索层：query_satisfaction 只描述用户语义条件（活动/地点/时间）是否被确认；
-  复核层：inspect_photo 只确认照片里直接可见的视觉细节（雪、人、物品、文字、颜色等）。
+- final 回答直接给答案，先回答用户问题本身；需要说明不确定时用自然语言，不要复述检索过程。
+- 回答结构：1) 直接答案 2) 必要的 uncertainty 3) 可选一句补充。不要以"我为您找到 N 张候选照片/检索到…"开头。
+- 内部检索词汇（query_satisfaction、candidate_only、partial_support、full_support、no_match、候选照片、
+  匹配程度、检索结果、相似候选）不得原样出现在 final 回答里；需要用用户能懂的话转译。
+- 不确定性用自然语言四级：
+  确定 → 直接给答案（"是在秦皇岛如是海度假村。"）；
+  较可能 → "看起来是在…"；
+  不确定 → "可能是在…，但我还不能完全确定。"；
+  无依据 → "现有记录里看不出来。"。
+- 内部工具状态只用于决定怎么说（这些词本身不能出现在回答里）：
+  full_support=可以确认；partial_support=部分条件确认，用自然语言说出哪些还没确认（如"地点可以确认，时间还不能完全确定"）；
+  candidate_only=只是相似候选，不能声称确认，要说"找到几张接近的，还不能完全确认"；
+  no_match=如实说没有找到。
+- 检索满足度与照片复核是两层，分开表述：检索层描述用户语义条件（活动/地点/时间）是否确认；
+  复核层（inspect_photo/read_photo_text）确认照片里直接可见的细节（雪、人、物品、文字、颜色、价格）。
   即使照片里看到了山/雪，也不能把 candidate_only 的"爬山"说成已确认；
-  示例："找到 3 张候选，但'爬山'还不能完全确认；最接近的一张照片里没有看到明显积雪。"
+  示例："找到 3 张接近的，'爬山'还不能完全确认；最接近的一张照片里没有看到明显积雪。"
+- 地点问题：search_memories preview 每张带 place 字段（GPS 反地理编码），回答时直接引用该地点，
+  不要因为没有 inspect 就回答"无法确认地点"。
+- 检索条件已确认（condition_summary 标记 confirmed，或 query_satisfaction=full_support）时，直接当作确定事实回答，
+  不要画蛇添足加"还不能完全确认"；只有 candidate_only 或关键条件 unknown 时才说"找到几张接近的，还不能完全确认"。
+- 照片里的文字/数字问题（菜单价格、招牌、店名、电话、年份、写了什么）：当 search_memories 的
+  recommended_resolution 提示用 read_photo_text 时，调用 read_photo_text 读取文字后再回答，
+  不要只 search 后就说"无法确认"或反问用户。
 - filters.place 填结构化地点名（城市/区县/景区/地标）。系统会按行政区匹配照片的 GPS 反地理编码：
   例如"秦皇岛如是海度假村"也能匹配"河北省秦皇岛市昌黎县"的照片，"清迈"能匹配英文"Chiang Mai"。
   不要把要找的目标/活动/主题当作 place（"沙雕"是主题不是地点）。地点不确定时留空，只按时间和人物过滤。
@@ -97,6 +112,24 @@ class ToolResult:
     observation: dict | None = None
     error: str | None = None
     latency_s: float = 0.0
+
+
+def _pending_resolution(task) -> dict | None:
+    """Phase E §14：Premature Final Guard —— 检索明确要求视觉/OCR 复核但尚未执行时，阻止提前 final。
+
+    依据 search_memories observation 里的 recommended_resolution（确定性字段），
+    不依赖模型自觉。对应工具已调用过则不再要求。
+    """
+    for tr in reversed(task.tool_results or []):
+        if tr.get("tool") == "search_memories":
+            obs = tr.get("observation") or {}
+            rec = obs.get("recommended_resolution") or {}
+            if rec.get("needed") and rec.get("tool"):
+                called = any((x.get("tool") or "") == rec["tool"]
+                             for x in (task.tool_results or []))
+                if not called:
+                    return rec
+    return None
 
 
 @dataclass
@@ -375,11 +408,28 @@ class AgentRuntime:
         tool_call_seq = 0
         visual_retries = 0
         max_visual_retries = 1
+        resolution_retries = 0
+        max_resolution_retries = 2
         unknown_tool_retries = 0
         max_unknown_tool_retries = 1
         visual_intent = bool(__import__("re").search(
             r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|在做什么|"
             r"有没有|是什么|放着|写了|内容|细节", message))
+        # Phase E：Adaptive Visual Budget——按问题类型放宽视觉复核预算
+        multi_image_intent = bool(__import__("re").search(
+            r"哪一张|哪张|哪些|哪几张|每一张|逐[一一张]|逐一|对比|还有吗|还有没有|都看|全部|每张|"
+            r"所有照片|哪几张|哪几个|翻看", message))
+        ocr_intent = bool(__import__("re").search(
+            r"菜单|价格|多少钱|售价|招牌|店名|电话|写了什么|什么字|文字|创始于|"
+            r"价位|几块钱|面单|多少钱一份", message))
+        adaptive_inspections = self.profile.max_inspections
+        if multi_image_intent:
+            adaptive_inspections = max(adaptive_inspections, 4)
+        elif ocr_intent:
+            adaptive_inspections = max(adaptive_inspections, 2)
+            # read_photo_text 需要整图 + 3x3 tile 多次图片推理，放宽总预算
+            turn.budget.wall_time_s = max(turn.budget.wall_time_s, 180)
+        turn.budget.max_inspections = adaptive_inspections
         while True:
             if not turn.budget.can_model_step():
                 turn.status = "partial" if turn.steps else "timeout"
@@ -430,6 +480,46 @@ class AgentRuntime:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
             if action.get("action") == "final":
+                # Phase E §14：Premature Final Guard —— recommended_resolution 要求继续证据解析
+                resolution = _pending_resolution(task)
+                if resolution:
+                    if resolution_retries >= max_resolution_retries:
+                        # 模型多次忽略提示 → runtime 自动执行证据解析工具（代码兜底，不依赖 12B 自觉）
+                        auto_spec = get_tool(resolution["tool"])
+                        preview = (task.result_preview or []) or []
+                        if auto_spec is not None and preview and turn.budget.can_tool_call():
+                            tool_name = resolution["tool"]
+                            auto_args = {"asset_handle": preview[0]}
+                            if tool_name == "read_photo_text":
+                                auto_args["question"] = message
+                            self._emit_progress(
+                                turn, progress_callback, stage="inspecting", status="running",
+                                text=f"正在复核照片 {preview[0]}…" if tool_name == "inspect_photo"
+                                else "正在读取照片中的文字…")
+                            auto_decision = policy.execute(auto_spec, auto_args, context={
+                                "scope_id": self.scope_id, "viewer_id": self.viewer_id,
+                                "task_state": task.as_dict(), "history": history,
+                                "conversation_id": self.conversation_id,
+                            })
+                            if auto_decision.allowed:
+                                task.update_from_tool(tool_name, auto_args, auto_decision.observation or {})
+                                task.record_tool_result(f"auto_{tool_name}", tool_name,
+                                                        auto_decision.observation or {})
+                                messages.append({"role": "assistant", "content": raw})
+                                messages.append({"role": "tool", "tool_call_id": f"auto_{tool_name}",
+                                                 "content": json.dumps(
+                                                     auto_decision.observation or {}, ensure_ascii=False)})
+                                continue
+                    elif resolution_retries < max_resolution_retries and turn.budget.can_model_step():
+                        resolution_retries += 1
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({"role": "user", "content": (
+                            f"{resolution.get('reason') or '问题需要复核照片'}。"
+                            f"这是完成回答的必要步骤：你必须立即调用 {resolution['tool']}"
+                            "（asset_handle 用 preview 里的 handle，例如 photo_1），"
+                            "先拿到实际观察，再基于观察输出 final。不调用该工具就无法正确回答。"
+                        )})
+                        continue
                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
                 if search_has_preview and not inspect_called and visual_intent \
                         and visual_retries < max_visual_retries and turn.budget.can_model_step():

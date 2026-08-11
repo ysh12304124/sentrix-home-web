@@ -97,7 +97,7 @@ function serveFile(req, res, url) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  if (url.pathname.startsWith("/api/")) return proxyBackend(req, res, url);
+  if (url.pathname.startsWith("/api/") || url.pathname === "/qa") return proxyBackend(req, res, url);
   return serveFile(req, res, url);
 });
 
