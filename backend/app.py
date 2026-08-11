@@ -370,6 +370,7 @@ def process_ingest_batch(asset_ids, batch_id):
         active_batch_workers.add(batch_id)
     task_store = MemoryStore(store.path)
     all_asset_ids = list(dict.fromkeys(asset_ids or []))
+    pipeline_started_at = time.perf_counter()
     try:
         first = True
         while True:
@@ -408,6 +409,7 @@ def process_ingest_batch(asset_ids, batch_id):
                 "event_summary_wall_seconds": summary_wall_seconds,
                 "event_summaries": event_results,
                 "stage_timings": _pipeline_timing_summary(task_store, all_asset_ids),
+                "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4),
             }
             task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
     except Exception as error:
