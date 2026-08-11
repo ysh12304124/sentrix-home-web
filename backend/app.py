@@ -1206,6 +1206,11 @@ def create_story(payload: dict):
             )
             generated = parse_json_response(gamma.chat(prompt))
             payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
+            # 方案B:后处理把is_self人物名字替换成"我",防止LLM不服从
+            for name in sorted(self_names):
+                if name and name != "我":
+                    payload["title"] = payload.get("title","").replace("我和"+name, "我").replace(name, "我")
+                    payload["content"] = payload.get("content","").replace("我和"+name, "我").replace(name, "我")
     return store.create_story(payload)
 
 
