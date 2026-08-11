@@ -124,3 +124,28 @@ class DenialWithoutSearchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecoveryResilienceTest(unittest.TestCase):
+    """D12：恢复阶段模型调用失败时，必须保留已产出的 final 回答。"""
+
+    def test_model_error_after_final_keeps_answer(self):
+        from backend.agent_runtime.runtime import AgentRuntime
+        calls = {"n": 0}
+
+        def chat_fn(messages):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ('{"action":"final","answer":"活动是在秦皇岛如是海度假村进行的。",'
+                        '"evidence_refs":["tool_call_1"]}')
+            raise RuntimeError("simulated vLLM 400 on recovery")
+
+        rt = AgentRuntime(chat_fn=chat_fn, profile_name="tool_loop")
+        turn = rt.run("2019年7月22日明明和乐乐在主题沙雕前合影的活动是在哪里进行的？")
+        self.assertIn("活动是在秦皇岛如是海度假村进行的", turn.final_answer)
+        self.assertIn(turn.status, {"complete", "partial"})
+        self.assertNotEqual(turn.status, "error")
+
+
+if __name__ == "__main__":
+    unittest.main()

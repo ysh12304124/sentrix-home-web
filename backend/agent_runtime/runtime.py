@@ -388,6 +388,11 @@ class AgentRuntime:
             try:
                 raw = self.chat_fn(messages)
             except Exception as exc:
+                # D12：恢复/后续模型调用失败时，不丢弃已产出的 final 回答
+                if turn.final_answer:
+                    turn.status = "partial"
+                    turn.reason = f"model_error_after_final: {exc}"
+                    break
                 turn.status = "error"
                 turn.reason = f"model_call_error: {exc}"
                 break
@@ -490,7 +495,9 @@ class AgentRuntime:
                             turn, progress_callback,
                             stage="recovering", status="running",
                             text="结果里有一处信息对不上，我正在重新核对。")
-                        messages.append({"role": "assistant", "content": raw})
+                        last_answer = (turn.final_answer or "").strip()[:300]
+                        messages.append({"role": "assistant",
+                                         "content": f"（你上一版 final 回答）{last_answer}"})
                         inspect_obs = [
                             tr.get("inspect_text") for tr in task.tool_results
                             if tr.get("tool") == "inspect_photo" and tr.get("inspect_text")
