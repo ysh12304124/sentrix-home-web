@@ -204,6 +204,7 @@ class TaskState:
             "inspect_handle": observation.get("asset_handle"),
             "confirms_visual_only": observation.get("confirms_visual_only", False),
             "certainty": observation.get("certainty"),
+            "asset_ids": observation.get("asset_ids"),
             "operation": observation.get("operation"),
             "value": observation.get("value"),
             "rows": observation.get("rows"),
