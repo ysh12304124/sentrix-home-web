@@ -1701,7 +1701,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     gamma.get_and_clear_call_metrics()
 
     def chat_fn(messages):
-        max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "768"))))
+        max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
         text = gamma.chat_messages(
             messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
         model_call_metrics.extend(gamma.get_and_clear_call_metrics())
