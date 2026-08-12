@@ -125,6 +125,10 @@ class IngestBatchCreateRequest(BaseModel):
     source_path: str | None = None
 
 
+class IngestBatchCancelRequest(BaseModel):
+    source: str | None = None
+
+
 def _allowed_import_roots():
     configured = os.getenv("SENTRIX_IMPORT_ALLOWED_ROOTS")
     defaults = [
@@ -287,8 +291,11 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
         "pipeline_metrics": {**limits, "status": "processing", "asset_count": len(asset_ids)}
     })
     try:
+        if (task_store.get_ingest_batch(batch_id) or {}).get("status") == "cancelled":
+            return
         image_ids = []
-        for asset_id in asset_ids:
+        candidate_ids = asset_ids[:limits["effective_workers"]]
+        for asset_id in candidate_ids:
             asset = task_store.get_asset(asset_id) or {}
             if asset.get("media_type") == "image" and asset.get("status") in {"queued", "failed"}:
                 task_store.update_asset(asset_id, "processing", {
@@ -310,6 +317,8 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
                         task_store.cleanup_asset_derivatives(asset_id)
                         task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
 
+        if (task_store.get_ingest_batch(batch_id) or {}).get("status") == "cancelled":
+            return
         semantic_ids = [
             asset_id for asset_id in image_ids
             if (task_store.get_asset(asset_id) or {}).get("status") == "semantic_enriching"
@@ -376,9 +385,16 @@ def process_ingest_batch(asset_ids, batch_id):
     try:
         first = True
         while True:
+            batch = task_store.get_ingest_batch(batch_id) or {}
+            if batch.get("status") == "cancelled":
+                task_store.update_ingest_batch_metadata(batch_id, {
+                    "pipeline_metrics": {"status": "cancelled", "asset_count": len(all_asset_ids),
+                    "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4)}
+                })
+                return
             rows = task_store._rows(
-                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id",
-                (batch_id,),
+                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id LIMIT ?",
+                (batch_id, _pipeline_worker_limits()["effective_workers"]),
             )
             queued_ids = [row["id"] for row in rows]
             if queued_ids:
@@ -395,6 +411,12 @@ def process_ingest_batch(asset_ids, batch_id):
                 break
             time.sleep(0.5)
 
+        if (task_store.get_ingest_batch(batch_id) or {}).get("status") == "cancelled":
+            task_store.update_ingest_batch_metadata(batch_id, {
+                "pipeline_metrics": {"status": "cancelled", "asset_count": len(all_asset_ids),
+                "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4)}
+            })
+            return
         task_store.complete_ingest_batch(batch_id)
         if task_store.claim_ingest_batch_summary(batch_id):
             event_ids = task_store.batch_event_ids(batch_id)
@@ -2683,6 +2705,14 @@ def create_ingest_batch(request: IngestBatchCreateRequest):
 
 @app.get("/api/ingest-batches/{batch_id}")
 def ingest_batch(batch_id: str):
+    return _batch_status(batch_id)
+
+
+@app.post("/api/ingest-batches/{batch_id}/cancel")
+def cancel_ingest_batch(batch_id: str, request: IngestBatchCancelRequest):
+    if not store.get_ingest_batch(batch_id):
+        raise HTTPException(status_code=404, detail="ingest batch not found")
+    store.cancel_ingest_batch(batch_id, request.source)
     return _batch_status(batch_id)
 
 

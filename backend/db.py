@@ -1139,9 +1139,23 @@ class MemoryStore:
     def complete_ingest_batch(self, batch_id):
         timestamp = now_iso()
         self.connection.execute(
-            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'summarizing') THEN status ELSE 'complete' END,
+            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'summarizing', 'cancelled') THEN status ELSE 'complete' END,
             updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?""",
             (timestamp, timestamp, str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
+    def cancel_ingest_batch(self, batch_id, source=None):
+        batch = self.get_ingest_batch(batch_id)
+        if not batch:
+            return None
+        metadata = dict(batch.get("metadata_json") or {})
+        metadata.update({"cancel_requested_at": now_iso(), "cancel_source": source or "api"})
+        timestamp = now_iso()
+        self.connection.execute(
+            "UPDATE ingest_batches SET status = 'cancelled', metadata_json = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?",
+            (json_value(metadata, {}), timestamp, timestamp, str(batch_id)),
         )
         self.connection.commit()
         return self.get_ingest_batch(batch_id)
