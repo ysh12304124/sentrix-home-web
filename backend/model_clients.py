@@ -356,7 +356,7 @@ class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
-                 repair_model=None, backend=None, api_key=None):
+                 repair_model=None, backend=None, api_key=None, manager_url=None):
         self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
         ollama_fallback_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         if self.backend == "openai":
@@ -372,6 +372,12 @@ class GammaClient:
             self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
             self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        self.manager_url = (
+            manager_url
+            or os.getenv("SENTRIX_VLLM_MANAGER_API")
+            or os.getenv("SENTRIX_VLLM_API_URL")
+            or ""
+        ).strip().rstrip("/")
         self._call_metrics_local = threading.local()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
@@ -608,11 +614,7 @@ class GammaClient:
 
     def _tokenize_for_budget(self, endpoint_base, messages):
         """Ask the Manager bound to this endpoint to tokenize with the active model."""
-        manager_url = (
-            os.getenv("SENTRIX_VLLM_MANAGER_API")
-            or os.getenv("SENTRIX_VLLM_API_URL")
-            or ""
-        ).strip().rstrip("/")
+        manager_url = self.manager_url
         if not manager_url:
             return None
         try:

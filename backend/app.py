@@ -544,7 +544,12 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
     served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
     with runtime_lock:
         base_url = (state.get("external_url_hint") if state else None) or gamma.base_url
-        new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai")
+        new_gamma = GammaClient(
+            base_url=base_url,
+            model=served_name,
+            backend="openai",
+            manager_url=RUNTIME_VLLM_API_URL or VLLM_API_URL,
+        )
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
     return _current_model_runtime()

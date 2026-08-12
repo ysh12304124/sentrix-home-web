@@ -40,6 +40,14 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(metrics[0]["prompt_tokens"], 4501)
         self.assertEqual(metrics[0]["estimated_total_tokens"], 4885)
 
+    def test_token_budget_uses_runtime_bound_manager(self):
+        client = GammaClient(
+            base_url="http://sentrix-vllm/v1",
+            model="test-model",
+            manager_url="http://manager-8500/",
+        )
+        self.assertEqual(client.manager_url, "http://manager-8500")
+
     def test_parses_json_inside_markdown_fence(self):
         result = parse_json_response('```json\n{"caption":"公园"}\n```')
         self.assertEqual(result["caption"], "公园")
