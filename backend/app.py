@@ -123,12 +123,6 @@ def _allowed_import_roots():
     defaults = [
         DATA_DIR / "imports",
         ROOT / "data" / "imports",
-        # 153-only roots carried over from the hasty backend alignment.
-        Path("/home/asus/data"),
-        Path("/home/asus/datasets"),
-        Path("/home/asus/benchmarks"),
-        # 200-local staging/workspace (000Notes/family_photos, projects).
-        Path("/home/sscy/lingbot-map"),
     ]
     values = configured.split(":") if configured else [str(item) for item in defaults]
     roots = []
