@@ -4,10 +4,42 @@ from unittest.mock import patch
 from pathlib import Path
 import tempfile
 
-from backend.model_clients import GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
+from backend.model_clients import ContextBudgetExceeded, GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
 
 
 class ModelClientTests(unittest.TestCase):
+    def test_chat_messages_caps_output_to_remaining_context(self):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        with patch.object(client, "_tokenize_for_budget", return_value={
+            "prompt_tokens": 4401, "max_model_len": 4501,
+        }), patch.object(client, "_chat_openai_stream", return_value="ok") as stream:
+            result = client.chat_messages(
+                [{"role": "user", "content": "test"}],
+                role="tool_loop", max_tokens=384,
+            )
+
+        self.assertEqual(result, "ok")
+        payload = stream.call_args.args[1]
+        self.assertEqual(payload["max_tokens"], 100)
+        self.assertEqual(stream.call_args.kwargs["budget_metrics"]["estimated_total_tokens"], 4501)
+
+    def test_chat_messages_blocks_prompt_that_fills_context(self):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        with patch.object(client, "_tokenize_for_budget", return_value={
+            "prompt_tokens": 4501, "max_model_len": 4501,
+        }), patch.object(client, "_chat_openai_stream") as stream:
+            with self.assertRaises(ContextBudgetExceeded):
+                client.chat_messages(
+                    [{"role": "user", "content": "test"}],
+                    role="tool_loop", max_tokens=384,
+                )
+
+        stream.assert_not_called()
+        metrics = client.get_and_clear_call_metrics()
+        self.assertEqual(metrics[0]["status"], "context_budget_exceeded")
+        self.assertEqual(metrics[0]["prompt_tokens"], 4501)
+        self.assertEqual(metrics[0]["estimated_total_tokens"], 4885)
+
     def test_parses_json_inside_markdown_fence(self):
         result = parse_json_response('```json\n{"caption":"公园"}\n```')
         self.assertEqual(result["caption"], "公园")
