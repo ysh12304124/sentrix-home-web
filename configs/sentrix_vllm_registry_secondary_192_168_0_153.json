@@ -1,0 +1,209 @@
+{
+  "service_root": "/home/asus/sentrix-vllm-secondary",
+  "state_file": "/home/asus/sentrix-vllm-secondary/state/current.json",
+  "vllm_binary": "/home/asus/miniconda3/envs/sentrix-vllm/bin/vllm",
+  "default_host": "0.0.0.0",
+  "default_port": 8101,
+  "profiles": {
+    "gemma4-e2b-it": {
+      "model": "/home/asus/models/gemma-4-E2B-it",
+      "served_model_name": "gemma4-e2b-it",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 4,
+        "video": 0,
+        "audio": 1
+      },
+      "mm_processor_cache_gb": 0,
+      "notes": "On-demand main model. Sized to coexist with resident ASR, face pipeline and CompassJudger.",
+      "default_max_tokens": 1501
+    },
+    "gemma4-e2b-it-lora-v2": {
+      "model": "/home/asus/models/gemma-4-E2B-it",
+      "served_model_name": "gemma4-e2b-it-lora-v2",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 4,
+        "video": 0,
+        "audio": 1
+      },
+      "mm_processor_cache_gb": 0,
+      "enable_lora": true,
+      "max_lora_rank": 16,
+      "lora_modules": [
+        {
+          "name": "gemma4-e2b-lora-v2",
+          "path": "/home/asus/models/gemma-4-e2b-lora-v2/artifacts/lora/V2_student_step47"
+        }
+      ],
+      "notes": "On-demand main model with language-decoder LoRA. Sized to coexist with resident services.",
+      "default_max_tokens": 1501
+    },
+    "gemma4-12b-it": {
+      "model": "/home/asus/models/gemma-4-12B-it",
+      "served_model_name": "gemma4-12b-it",
+      "dtype": "bfloat16",
+      "quantization": "bitsandbytes",
+      "load_format": "bitsandbytes",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 1
+      },
+      "mm_processor_cache_gb": 0,
+      "default_max_tokens": 1501,
+      "notes": "On-demand main model using vLLM bitsandbytes 4-bit loading; sized to coexist with resident services."
+    },
+    "qwen3-instruct": {
+      "model": "/home/asus/models/Qwen3-4B-Instruct-2507",
+      "served_model_name": "qwen3-4b-instruct-2507",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "notes": "Downloaded from ModelScope as Qwen/Qwen3-4B-Instruct-2507.",
+      "default_max_tokens": 1501
+    },
+    "qwen3-8b": {
+      "model": "/home/asus/models/Qwen3-8B",
+      "served_model_name": "qwen3-8b",
+      "dtype": "bfloat16",
+      "quantization": "bitsandbytes",
+      "load_format": "bitsandbytes",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "default_max_tokens": 1501,
+      "notes": "Downloaded 16-bit safetensors are present. Default profile serves with vLLM bitsandbytes 4-bit load-time quantization."
+    },
+    "qwen3-instruct-lora": {
+      "model": "/home/asus/models/Qwen3-4B-Instruct-2507",
+      "served_model_name": "qwen3-4b-instruct-2507-lora",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "enable_lora": true,
+      "max_lora_rank": 64,
+      "lora_modules": [
+        {
+          "name": "qwen3-lora",
+          "path": "/home/asus/models/qwen3-lora"
+        }
+      ],
+      "notes": "Placeholder profile. Update model and lora path after the Qwen3 base/adapter are copied to the host.",
+      "default_max_tokens": 1501
+    },
+    "qwen3.5-0.8b-it": {
+      "model": "/home/asus/models/Qwen3.5-0.8B",
+      "served_model_name": "qwen3.5-0.8b",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "notes": "Downloaded from ModelScope as Qwen/Qwen3.5-0.8B.",
+      "default_max_tokens": 1501
+    },
+    "qwen3.5-0.8b-it-lora": {
+      "model": "/home/asus/models/Qwen3.5-0.8B",
+      "served_model_name": "qwen3.5-0.8b-lora",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "enable_lora": true,
+      "max_lora_rank": 64,
+      "lora_modules": [
+        {
+          "name": "qwen3.5-lora",
+          "path": "/home/asus/models/qwen3.5-lora"
+        }
+      ],
+      "notes": "Placeholder profile. Update model and lora path after the Qwen3.5 base/adapter are copied to the host.",
+      "default_max_tokens": 1501
+    },
+    "qwen3.5-4b": {
+      "model": "/home/asus/models/Qwen3.5-4B",
+      "served_model_name": "qwen3.5-4b",
+      "dtype": "bfloat16",
+      "quantization": "bitsandbytes",
+      "load_format": "bitsandbytes",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0,
+      "notes": "Qwen3.5-4B multimodal (hybrid linear+full attention). bf16 native weights ~8.8GB.",
+      "default_max_tokens": 1501
+    },
+    "qwen3.5-9b": {
+      "model": "/home/asus/models/Qwen3.5-9B",
+      "served_model_name": "qwen3.5-9b",
+      "dtype": "bfloat16",
+      "quantization": "bitsandbytes",
+      "load_format": "bitsandbytes",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0,
+      "default_max_tokens": 1501,
+      "notes": "Qwen3.5-9B multimodal. Native bf16 weights ~18GB too large for single 3090; uses bitsandbytes 4-bit."
+    },
+    "qwen3-vl-4b": {
+      "model": "/home/asus/models/Qwen3-VL-4B-Instruct",
+      "served_model_name": "qwen3-vl-4b",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.4,
+      "max_model_len": 4501,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0,
+      "notes": "Qwen3-VL-4B-Instruct. bf16 native weights ~8.4GB.",
+      "default_max_tokens": 1501
+    }
+  }
+}
