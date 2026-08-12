@@ -57,7 +57,7 @@ class ToolPolicy:
         "remaining", "counts", "coverage", "facts", "items", "completeness",
         "unresolved", "delivered", "blocked", "observation", "certainty",
         "confirms_visual_only", "source", "persisted", "question", "asset_handle",
-        "reason", "url",
+        "reason", "url", "status",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
@@ -77,7 +77,8 @@ class ToolPolicy:
         "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
         "inspect_photo": _DEFAULT_ALLOWED,
         "read_photo_text": _DEFAULT_ALLOWED | {
-            "full_text", "text_regions",
+            "full_text", "text_regions", "confidence", "exact_values", "fallback_used",
+            "provider", "cache_hit", "tiles", "vlm_calls",
         },
         "search_conversation_history": _DEFAULT_ALLOWED | {
             "query", "scope", "matches", "note",

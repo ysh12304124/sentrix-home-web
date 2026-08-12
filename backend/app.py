@@ -758,6 +758,46 @@ def set_vlm_backend(payload: SetVLMBackend):
         detail="VLM backend switching is retired; use POST /api/model-profiles/switch",
     )
 
+_OCR_SETTING_KEY = "ocr.small_enabled"
+
+
+def _ocr_settings():
+    from .agent_runtime.tools import small_ocr_available
+    enabled = store.get_setting(_OCR_SETTING_KEY, "false").lower() in {"1", "true", "on"}
+    available = small_ocr_available()
+    return {
+        "small_ocr_enabled": enabled,
+        "small_ocr_available": available,
+        "readiness": "ready" if available else "unavailable",
+        "model": "rapidocr" if available else None,
+    }
+
+
+class OCRSettingsPayload(BaseModel):
+    small_ocr_enabled: bool
+
+
+@app.get("/api/settings/ocr")
+def get_ocr_settings():
+    return _ocr_settings()
+
+
+@app.put("/api/settings/ocr")
+def put_ocr_settings(payload: OCRSettingsPayload):
+    store.set_setting(_OCR_SETTING_KEY, "true" if payload.small_ocr_enabled else "false")
+    return _ocr_settings()
+
+
+@app.get("/api/telemetry/ocr")
+def ocr_telemetry():
+    """Phase H H6：OCR provider 使用率/延迟/置信度聚合（dashboard 用）。"""
+    from .agent_runtime.tools import ocr_telemetry_snapshot
+    return {
+        "providers": ocr_telemetry_snapshot(),
+        "small_enabled": _ocr_settings().get("small_ocr_enabled"),
+    }
+
+
 @app.get("/api/model-profiles")
 def model_profiles():
     registry = _load_vllm_registry()
@@ -1705,14 +1745,42 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     model_call_metrics = []
     gamma.get_and_clear_call_metrics()
 
+    def _estimate_prompt_tokens(messages):
+        # 估算：中文约 0.7 token/字，ASCII 约 0.25 token/字符；加 300 结构开销。
+        # 系数按实测校准（system 提示以 ASCII JSON schema 为主，0.6 统一系数会高估 2 倍）。
+        zh = 0
+        total = 0
+        for m in messages:
+            c = m.get("content") or ""
+            if isinstance(c, str):
+                total += len(c)
+                zh += sum(1 for ch in c if "\u4e00" <= ch <= "\u9fff")
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict):
+                        t = part.get("text") or ""
+                        total += len(t)
+                        zh += sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
+        return int(zh * 0.7 + (total - zh) * 0.25) + 400
+
     def chat_fn(messages):
         max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
+        # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
+        # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
+        try:
+            room = 4400 - _estimate_prompt_tokens(messages)
+            if room < max_tokens:
+                max_tokens = max(64, room)
+        except Exception:
+            pass
         text = gamma.chat_messages(
             messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
         model_call_metrics.extend(gamma.get_and_clear_call_metrics())
         return text
 
+    _ocr_setting = store.get_setting("ocr.small_enabled", "false").lower() in {"1", "true", "on"}
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
+                           ocr_settings={"small_ocr_enabled": _ocr_setting},
                            scope_id=scope_id, viewer_id=viewer_id,
                            conversation_id=conversation_id)
     prev_state = _TOOL_LOOP_TASK_STATE.get(conversation_id) if conversation_id else None
@@ -1759,6 +1827,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     tool_trace = [
         {"tool": s.get("tool", ""), "status": s.get("status", ""),
          "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
+         "error": s.get("error") or "",
          "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
         for s in turn.steps if s.get("type") == "tool"
     ]

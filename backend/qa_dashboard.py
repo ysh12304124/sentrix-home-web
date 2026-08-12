@@ -37,6 +37,16 @@ class QARunStore:
     def __init__(self, qa_dir: Path):
         self.qa_dir = Path(qa_dir)
         self.qa_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest = self._load_manifest()
+
+    def _load_manifest(self) -> dict:
+        path = self.qa_dir / "manifest.json"
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
     def list_runs(self) -> list[dict]:
         runs = []
@@ -60,6 +70,12 @@ class QARunStore:
                     "note": meta.get("note", ""),
                     "branch": meta.get("branch_153", ""),
                     "profile": meta.get("profile", ""),
+                    "qa_checksum_md5": meta.get("qa_checksum_md5") or (result.get("meta") or {}).get("qa_checksum_md5", ""),
+                    "manifest_mismatch": bool(
+                        self.manifest.get("qa_checksum_md5")
+                        and (meta.get("qa_checksum_md5") or (result.get("meta") or {}).get("qa_checksum_md5"))
+                        and (meta.get("qa_checksum_md5") or (result.get("meta") or {}).get("qa_checksum_md5"))
+                        != self.manifest["qa_checksum_md5"]),
                     "summary": {
                         "total": summary.get("total", 0),
                         "errored": summary.get("errored", 0),
@@ -96,6 +112,13 @@ class QARunStore:
         asset_map = payload.get("asset_map") or {}
         if not rows and not summary:
             raise HTTPException(status_code=400, detail="empty run payload")
+        # G8：manifest/checksum —— 与当前 QA 数据集不一致的 run 拒绝入库
+        checksum = payload.get("qa_checksum_md5") or meta.get("qa_checksum_md5") or ""
+        expected = self.manifest.get("qa_checksum_md5")
+        if expected and checksum and checksum != expected:
+            raise HTTPException(
+                status_code=409,
+                detail=f"run checksum mismatch: {checksum} != manifest {expected}（QA 数据集已变更，拒绝入库）")
         run_dir = self.qa_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         result = {"meta": meta, "summary": summary, "rows": rows, "asset_map": asset_map}
@@ -109,6 +132,7 @@ class QARunStore:
             "note": payload.get("note", ""),
             "branch_153": payload.get("branch_153", ""),
             "profile": payload.get("profile", ""),
+            "qa_checksum_md5": checksum,
         }
         (run_dir / "run_meta.json").write_text(
             json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -165,6 +189,17 @@ def register_qa_routes(app, qa_dir: Path, dashboard_html: Path | None = None):
     @app.get("/api/qa/runs")
     def qa_runs():
         return {"runs": store.list_runs()}
+
+    @app.get("/api/qa/manifest")
+    def qa_manifest():
+        manifest = dict(store.manifest)
+        expected = manifest.get("qa_checksum_md5")
+        mismatched = [
+            r["run_id"] for r in store.list_runs()
+            if expected and r.get("qa_checksum_md5") and r["qa_checksum_md5"] != expected
+        ]
+        manifest["runs_mismatched"] = mismatched
+        return manifest
 
     @app.get("/api/qa/runs/{run_id}")
     def qa_run(run_id: str):

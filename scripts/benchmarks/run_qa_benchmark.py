@@ -19,6 +19,7 @@
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import re
 import sys
@@ -30,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from backend.agent_runtime.answer_nucleus import build_nucleus
 from decompose_layers import decompose_row, decompose_summary, aggregate_tool_perf
 
 DEFAULT_QA = "/Users/rm001/Downloads/album3/qa/full-album3.jsonl"
@@ -100,6 +102,68 @@ def hardware(base):
         return http_json("GET", f"{base}/api/hardware", timeout=20)
     except Exception as exc:
         return {"error": str(exc)}
+
+
+_ROW_OCR_STATS: list[dict] = []
+
+
+def _collect_ocr_stats(result: dict) -> dict:
+    """从单题结果收集 OCR provider 使用情况（供 summary 聚合）。"""
+    stats = {"providers": [], "latency_s": [], "conf": [], "fallback": 0}
+    seen = set()
+    for tr in (result.get("task_state") or {}).get("tool_results") or []:
+        if tr.get("tool") != "read_photo_text":
+            continue
+        key = (tr.get("tool_call_id"), tr.get("provider"))
+        if key in seen:
+            continue
+        seen.add(key)
+        if tr.get("provider"):
+            stats["providers"].append(tr["provider"])
+        if tr.get("confidence") is not None:
+            stats["conf"].append(float(tr["confidence"]))
+        if tr.get("fallback_used"):
+            stats["fallback"] += 1
+    for t in (result.get("tool_trace") or []):
+        if t.get("tool") == "read_photo_text" and t.get("latency_s"):
+            stats["latency_s"].append(float(t["latency_s"]))
+    return stats
+
+
+def _pctile(vals: list, q: float):
+    if not vals:
+        return None
+    a = sorted(vals)
+    i = min(len(a) - 1, max(0, int(round(len(a) * q)) - 1))
+    return round(a[i], 2)
+
+
+def aggregate_ocr_stats() -> dict:
+    """聚合所有题的 OCR provider 使用率 / 延迟分位 / fallback rate。"""
+    prov = {}
+    lat = []
+    conf = []
+    fallback = 0
+    rows_with_ocr = 0
+    for st in _ROW_OCR_STATS:
+        if st["providers"]:
+            rows_with_ocr += 1
+        lat.extend(st["latency_s"])
+        conf.extend(st["conf"])
+        fallback += st["fallback"]
+        for p in st["providers"]:
+            prov[p] = prov.get(p, 0) + 1
+    total = sum(prov.values())
+    return {
+        "rows_with_ocr": rows_with_ocr,
+        "provider_usage": prov,
+        "small_share": round(prov.get("small", 0) / total, 3) if total else None,
+        "latency_p50_s": _pctile(lat, 0.5),
+        "latency_p95_s": _pctile(lat, 0.95),
+        "confidence_avg": round(sum(conf) / len(conf), 3) if conf else None,
+        "fallback_count": fallback,
+        "call_total": total,
+    }
 
 
 def start_turn(base, message, scope_id):
@@ -240,37 +304,48 @@ def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total
     telemetry = result.get("telemetry") or {}
     if telemetry and result.get("tool_trace"):
         telemetry["tool_trace"] = result.get("tool_trace")
-    # F9：行级 tool_perf（OCR provider / tiles / cache / vlm_calls，来自 task_state.tool_results）
+    # F9：行级 tool_perf（OCR provider / confidence / exact / cache，来自 task_state.tool_results）
     tp = {}
     for tr in (result.get("task_state") or {}).get("tool_results") or []:
         name = tr.get("tool") or ""
-        obs = tr.get("observation") or {}
         if not name:
             continue
-        slot = tp.setdefault(name, {"providers": set(), "tiles": set(), "cache_hits": 0, "vlm_calls": 0})
-        if obs.get("provider"):
-            slot["providers"].add(obs.get("provider"))
-        if obs.get("tiles"):
-            slot["tiles"].add(obs.get("tiles"))
-        if obs.get("cache_hit"):
+        slot = tp.setdefault(name, {"providers": set(), "confidences": [],
+                                    "exact_counts": [], "cache_hits": 0})
+        if tr.get("provider"):
+            slot["providers"].add(tr.get("provider"))
+        if tr.get("confidence") is not None:
+            slot["confidences"].append(round(float(tr["confidence"]), 3))
+        if isinstance(tr.get("exact_values"), list):
+            slot["exact_counts"].append(len(tr["exact_values"]))
+        if tr.get("cache_hit"):
             slot["cache_hits"] += 1
-        if isinstance(obs.get("vlm_calls"), int):
-            slot["vlm_calls"] += obs["vlm_calls"]
     for slot in tp.values():
         slot["providers"] = sorted(slot["providers"])
-        slot["tiles"] = sorted(slot["tiles"])
     if tp:
         telemetry["tool_perf"] = tp
+    # Phase H H6：本行 OCR provider 记录（供 summary 聚合 small/VLM 使用率）
+    _ROW_OCR_STATS.append(_collect_ocr_stats(result))
     evidence = collect_evidence(result, asset_map)
     score = evidence_score(evidence, qa.get("answer_evidence_image_ids") or [])
     judge = judge_answer(qa["question"], qa.get("answer") or "", answer,
                          qa.get("answerability") == "answerable", judge_base) if judge_enabled else None
+    try:
+        _nuc = build_nucleus(result.get("task_state") or {}, qa.get("question", ""))
+        nucleus = {v.kind: {"value": v.display or str(v.value), "unit": v.unit,
+                            "certainty": v.certainty}
+                   for v in _nuc.values
+                   if v.kind in ("count", "date", "first", "last", "result_total",
+                                 "boolean", "price", "phone", "year")}
+    except Exception:
+        nucleus = {}
     row = {
         "qa_id": qa["qa_id"],
         "question": qa["question"],
         "gold_answer": qa.get("answer", ""),
         "answer": answer,
         "status": status,
+        "nucleus": nucleus,
         "reason": result.get("tool_loop_reason") or "",
         "tools": tools,
         "latency_s": latency,
@@ -284,6 +359,8 @@ def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total
         "evidence": score,
         "judge": judge,
         "guard_debug": result.get("guard_debug") or {},
+        "ocr_texts": [tr.get("ocr_text") for tr in (result.get("task_state") or {}).get("tool_results") or []
+                      if tr.get("tool") == "read_photo_text" and tr.get("ocr_text")],
         "error": None,
     }
     row["decom"] = decompose_row(row)
@@ -313,6 +390,7 @@ def summarize(rows, health_data):
         "tool_usage": dict(tool_usage),
         "decom": decompose_summary(rows),
         "tool_perf": aggregate_tool_perf(rows),
+        "ocr": aggregate_ocr_stats(),
         "health": health_data,
     }
 
@@ -428,6 +506,36 @@ def main():
     out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # G8：manifest / checksum —— QA 数据集在跑前/跑后必须一致，不一致拒绝 run
+    qa_md5 = hashlib.md5(qa_path.read_bytes()).hexdigest()
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+        expected = manifest.get("qa_checksum_md5")
+        if expected and expected != qa_md5:
+            sys.exit(
+                f"[拒绝] QA manifest 校验失败：当前文件 md5={qa_md5}，"
+                f"manifest 记录={expected}（{manifest.get('qa_file','')}）。"
+                "QA 数据集被修改过，为保持基准可比性已终止。如确需更换数据集，请先更新 manifest.json。")
+    else:
+        manifest = {
+            "qa_file": str(qa_path),
+            "qa_checksum_md5": qa_md5,
+            "cases": len(rows_in),
+            "scope_id": args.scope,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+        print(f"[manifest] 首次运行，已记录 QA 数据集 md5={qa_md5}")
+    # 跑完后再次校验，防止运行期间数据集被改动
+    _after_md5 = hashlib.md5(qa_path.read_bytes()).hexdigest()
+    if _after_md5 != qa_md5:
+        sys.exit(f"[拒绝] QA 文件在运行期间被修改（{qa_md5} -> {_after_md5}），结果作废。")
+
     print("=" * 90)
     print(f"Sentrix QA 自动测评 | base={args.base} scope={args.scope} qa={qa_path}")
     h = health(args.base)
@@ -476,7 +584,8 @@ def main():
     (run_dir / "qa_result.json").write_text(json.dumps(run_payload, ensure_ascii=False, indent=2),
                                             encoding="utf-8")
     run_meta = {"run_id": run_id, "tag": args.tag, "created_at": meta["timestamp"],
-                "note": args.note, "branch_153": "", "profile": (h.get("agent") or {}).get("profile", "")}
+                "note": args.note, "branch_153": "", "profile": (h.get("agent") or {}).get("profile", ""),
+                "qa_file": str(qa_path), "qa_checksum_md5": qa_md5, "cases": len(rows_in)}
     (run_dir / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2),
                                            encoding="utf-8")
     # 最新副本（兼容旧工具）
@@ -490,7 +599,8 @@ def main():
                            {"run_id": run_id, "meta": meta, "summary": summary,
                             "rows": results, "asset_map": asset_map_rev,
                             "tag": args.tag, "note": args.note,
-                            "profile": run_meta["profile"]}, timeout=120)
+                            "profile": run_meta["profile"],
+                            "qa_checksum_md5": qa_md5}, timeout=120)
             uploaded = up.get("status") == "ok"
             print(f"Dashboard 上传: {up.get('status')} ({up.get('run_id')})")
         except Exception as exc:
