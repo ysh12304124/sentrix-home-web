@@ -36,6 +36,11 @@ def _model_visible_observation(observation: dict | None) -> dict:
         compact["asset_ids"] = asset_ids[:20]
     return compact
 
+
+def _model_visible_action(action: dict) -> str:
+    """Feed the parsed action back without model reasoning or prose."""
+    return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+
 SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协作完成用户请求。
 
 可用工具（JSON 动作）：
@@ -576,7 +581,7 @@ class AgentRuntime:
                                 task.update_from_tool(tool_name, auto_args, auto_decision.observation or {})
                                 task.record_tool_result(f"auto_{tool_name}", tool_name,
                                                         auto_decision.observation or {})
-                                messages.append({"role": "assistant", "content": raw})
+                                messages.append({"role": "assistant", "content": _model_visible_action(action)})
                                 messages.append({"role": "tool", "tool_call_id": f"auto_{tool_name}",
                                                  "content": json.dumps(
                                                      _model_visible_observation(
@@ -585,7 +590,7 @@ class AgentRuntime:
                                 continue
                     elif resolution_retries < max_resolution_retries and turn.budget.can_model_step():
                         resolution_retries += 1
-                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
                         messages.append({"role": "user", "content": (
                             f"{resolution.get('reason') or '问题需要复核照片'}。"
                             f"这是完成回答的必要步骤：你必须立即调用 {resolution['tool']}"
@@ -600,7 +605,7 @@ class AgentRuntime:
                     denies_found = bool(__import__("re").search(
                         r"没(?:有|找到)|未找到|没有获取到|找不到|还没有",
                         str(action.get("answer") or "")))
-                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     if denies_found:
                         messages.append({"role": "user", "content": (
                             "你的回答说“没有找到”，但 search_memories 实际返回了候选照片（preview 里有 photo_1 等 handle），"
@@ -745,7 +750,7 @@ class AgentRuntime:
             if call_signature in seen_tool_calls:
                 if dedup_retries < max_dedup_retries and turn.budget.can_model_step():
                     dedup_retries += 1
-                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     if dedup_retries >= max_dedup_retries:
                         messages.append({"role": "user", "content": (
                             "你再次重复调用相同的工具和参数，被拒绝。"
@@ -769,7 +774,7 @@ class AgentRuntime:
             if spec is None:
                 if unknown_tool_retries < max_unknown_tool_retries and turn.budget.can_model_step():
                     unknown_tool_retries += 1
-                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     from .tool_registry import list_tools
                     valid = "、".join(sorted({s.name for s in list_tools()
                                               if s.readiness != "blocked"}))
@@ -826,7 +831,7 @@ class AgentRuntime:
             if tool_name == "inspect_photo":
                 inspect_called = True
             # Observation 进入下一步模型上下文
-            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "assistant", "content": _model_visible_action(action)})
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(
                 _model_visible_observation(result.observation), ensure_ascii=False)})
 
