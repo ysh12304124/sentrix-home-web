@@ -69,6 +69,17 @@ class ContextBudgetExceeded(ModelError):
     pass
 
 
+def _http_error_detail(error, limit=2000):
+    response = getattr(error, "response", None)
+    if response is None:
+        return str(error)
+    try:
+        body = response.text.strip()
+    except Exception:
+        body = ""
+    return f"{error}: {body[:limit]}" if body else str(error)
+
+
 def parse_json_response(value):
     if isinstance(value, dict):
         return value
@@ -611,9 +622,10 @@ class GammaClient:
                     "token_count_source": "vllm_tokenize" if budget else "response_usage",
                 })
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            error_detail = _http_error_detail(error)
             self._record_call_metrics(role, model, endpoint_base, {
                 "status": "error",
-                "error": str(error),
+                "error": error_detail,
                 "ttft_ms": None,
                 "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
                 "prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
@@ -625,7 +637,7 @@ class GammaClient:
                 "max_model_len": int(budget["max_model_len"]) if budget else None,
                 "token_count_source": "vllm_tokenize" if budget else None,
             })
-            raise ModelError(f"gamma request failed: {error}") from error
+            raise ModelError(f"model request failed: {error_detail}") from error
 
     def _tokenize_for_budget(self, endpoint_base, messages):
         """Ask the Manager bound to this endpoint to tokenize with the active model."""
@@ -685,7 +697,7 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError) as error:
-            raise ModelError(f"gamma request failed: {error}") from error
+            raise ModelError(f"model request failed: {_http_error_detail(error)}") from error
 
 
     def _record_call_metrics(self, role, model, endpoint, metrics):
@@ -752,9 +764,10 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            error_detail = _http_error_detail(error)
             self._record_call_metrics(role, model, endpoint_base, {
                 "status": "error",
-                "error": str(error),
+                "error": error_detail,
                 "ttft_ms": None,
                 "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
                 "prompt_tokens": None,
@@ -762,7 +775,7 @@ class GammaClient:
                 "tokens_per_second": None,
                 "streamed": use_stream,
             })
-            raise ModelError(f"gamma request failed: {error}") from error
+            raise ModelError(f"model request failed: {error_detail}") from error
 
     def _chat_openai_stream(self, endpoint_base, payload, headers, role, model, json_mode=False,
                             budget_metrics=None):
@@ -846,7 +859,7 @@ class GammaClient:
             "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "320")),
         }
 
-    def _encode_core_image(self, path):
+    def encode_vision_image(self, path):
         """Downsample only the model input; the source asset remains untouched."""
         file_path = Path(path)
         max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "896"))
@@ -865,6 +878,9 @@ class GammaClient:
             encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
             mime_type = guess_mime_type(file_path)
             return encoded, mime_type
+
+    def _encode_core_image(self, path):
+        return self.encode_vision_image(path)
 
     def analyze_image(self, path, metadata=None):
         file_path = Path(path)

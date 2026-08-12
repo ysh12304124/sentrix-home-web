@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 
 import httpx
+from PIL import Image
 
 from backend.model_clients import ContextBudgetExceeded, GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
 from backend.agent_runtime.tool_policy import ToolPolicy
@@ -26,12 +27,16 @@ class ModelClientTests(unittest.TestCase):
     @patch("backend.model_clients.httpx.post")
     def test_failed_multimodal_call_keeps_error_metrics(self, post):
         request = httpx.Request("POST", "http://sentrix-vllm/v1/chat/completions")
-        response = httpx.Response(400, request=request)
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"error": {"message": "Input length (11888) exceeds maximum context length (4501)."}},
+        )
         post.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
             "bad request", request=request, response=response)
         client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(Exception, "model request failed"):
             client.chat(
                 "看图", [{"base64": "image", "mime_type": "image/jpeg"}],
                 json_mode=True, role="inspect",
@@ -42,8 +47,29 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(metrics[0]["role"], "inspect")
         self.assertEqual(metrics[0]["status"], "error")
         self.assertIn("bad request", metrics[0]["error"])
+        self.assertIn("11888", metrics[0]["error"])
         self.assertFalse(metrics[0]["streamed"])
         self.assertIsNotNone(metrics[0]["total_ms"])
+
+    def test_vision_image_encoding_downsamples_without_modifying_source(self):
+        client = GammaClient()
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image_file:
+            source = Image.new("RGB", (4032, 3024), color=(100, 120, 140))
+            source.save(image_file.name, format="JPEG")
+            original_bytes = Path(image_file.name).read_bytes()
+
+            encoded, mime_type = client.encode_vision_image(image_file.name)
+
+            decoded_path = Path(image_file.name).with_suffix(".decoded.jpg")
+            try:
+                import base64
+                decoded_path.write_bytes(base64.b64decode(encoded))
+                with Image.open(decoded_path) as resized:
+                    self.assertEqual(resized.size, (896, 672))
+            finally:
+                decoded_path.unlink(missing_ok=True)
+            self.assertEqual(mime_type, "image/jpeg")
+            self.assertEqual(Path(image_file.name).read_bytes(), original_bytes)
 
     def test_chat_messages_caps_output_to_remaining_context(self):
         client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")

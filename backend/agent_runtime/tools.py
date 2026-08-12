@@ -799,7 +799,8 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         return {"summary": "模型不可用。", "certainty": "uncertain", "persisted": False}
     model_call_metrics = []
     try:
-        image = {"base64": _base64_image(row["path"]), "mime_type": _mime_for(row["path"])}
+        encoded, mime_type = gamma.encode_vision_image(row["path"])
+        image = {"base64": encoded, "mime_type": mime_type}
         raw = gamma.chat(_INSPECT_PROMPT.format(question=question), images=[image],
                          json_mode=True, role="inspect")
     except Exception as exc:
