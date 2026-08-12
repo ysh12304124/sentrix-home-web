@@ -36,7 +36,7 @@
     personProfile: (id) => request("/api/people/" + encodeURIComponent(id) + "/profile"),
     personEvidence: (id, scopeId = "") => request("/api/people/" + encodeURIComponent(id) + "/evidence" + (scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : "")),
     knowledge: (personId = "", scopeId = "") => request("/api/knowledge" + new URLSearchParams({ ...(personId ? { person_id: personId } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")),
-    entities: (status = "", scopeId = "") => request(`/api/entities${new URLSearchParams({ ...(status ? { status } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")}`),
+    entities: (status = "", scopeId = "") => request(`/api/entities${new URLSearchParams({ includePeople: "true", ...(status ? { status } : {}), ...(scopeId ? { scope_id: scopeId } : {}) }).toString().replace(/^/, "?")}`),
     entityGroups: (scopeId = "") => request(`/api/entity-groups${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     entityGroup: (id, scopeId = "") => request(`/api/entity-groups/${encodeURIComponent(id)}${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     entityMergeCandidates: (scopeId = "", status = "pending") => request(`/api/entity-merge-candidates${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(status ? { status } : {}) }).toString().replace(/^/, "?")}`),
