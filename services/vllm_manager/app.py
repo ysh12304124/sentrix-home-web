@@ -20,7 +20,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -252,6 +253,62 @@ class StopRequest(BaseModel):
     profile: str | None = None
     timeout: int = 60
     force: bool = False
+
+
+class TokenizeRequest(BaseModel):
+    messages: list[dict]
+    tools: list[dict] | None = None
+    add_generation_prompt: bool = True
+
+
+@app.post("/tokenize-current")
+def tokenize_current(req: TokenizeRequest):
+    """Tokenize a chat request with the model currently managed by this instance."""
+    state = _read_json(_state_file_path(), None)
+    if not state or not state.get("pid") or not state.get("port"):
+        raise HTTPException(status_code=503, detail="no active managed vLLM model")
+    if not req.messages:
+        raise HTTPException(status_code=422, detail="messages must not be empty")
+
+    payload = {
+        "messages": req.messages,
+        "add_generation_prompt": req.add_generation_prompt,
+    }
+    if req.tools is not None:
+        payload["tools"] = req.tools
+    request = Request(
+        f"http://127.0.0.1:{int(state['port'])}/tokenize",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            tokenized = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[-4000:]
+        raise HTTPException(status_code=502, detail={
+            "message": "current vLLM tokenizer rejected the request",
+            "status": exc.code,
+            "response": detail,
+        }) from exc
+    except (URLError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail={
+            "message": "current vLLM tokenizer unavailable",
+            "error": str(exc),
+        }) from exc
+
+    return {
+        "profile": state.get("profile"),
+        "served_model_name": state.get("served_model_name"),
+        "port": int(state["port"]),
+        "prompt_tokens": int(tokenized.get("count") or 0),
+        "max_model_len": int(
+            tokenized.get("max_model_len")
+            or state.get("max_model_len")
+            or 0
+        ),
+    }
 
 
 @app.post("/stop")
