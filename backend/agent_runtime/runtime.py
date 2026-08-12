@@ -21,6 +21,21 @@ from .result_set import TaskState
 from .tool_policy import ToolPolicy
 from .tool_registry import get_tool
 
+
+def _model_visible_observation(observation: dict | None) -> dict:
+    """Keep tool evidence for planning while excluding telemetry from LLM context."""
+    if not isinstance(observation, dict):
+        return {}
+    hidden = {"retrieval_timing", "debug", "telemetry", "trace"}
+    compact = {key: value for key, value in observation.items() if key not in hidden}
+    preview = compact.get("preview")
+    if isinstance(preview, list):
+        compact["preview"] = preview[:5]
+    asset_ids = compact.get("asset_ids")
+    if isinstance(asset_ids, list):
+        compact["asset_ids"] = asset_ids[:20]
+    return compact
+
 SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协作完成用户请求。
 
 可用工具（JSON 动作）：
@@ -564,7 +579,9 @@ class AgentRuntime:
                                 messages.append({"role": "assistant", "content": raw})
                                 messages.append({"role": "tool", "tool_call_id": f"auto_{tool_name}",
                                                  "content": json.dumps(
-                                                     auto_decision.observation or {}, ensure_ascii=False)})
+                                                     _model_visible_observation(
+                                                         auto_decision.observation),
+                                                     ensure_ascii=False)})
                                 continue
                     elif resolution_retries < max_resolution_retries and turn.budget.can_model_step():
                         resolution_retries += 1
@@ -811,7 +828,7 @@ class AgentRuntime:
             # Observation 进入下一步模型上下文
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(
-                result.observation or {}, ensure_ascii=False)})
+                _model_visible_observation(result.observation), ensure_ascii=False)})
 
         turn.task_state = task.as_dict()
         turn.answer_grounding = _build_answer_grounding(
