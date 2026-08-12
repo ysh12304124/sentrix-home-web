@@ -99,13 +99,14 @@ class GuardExistsRegressionTests(unittest.TestCase):
         problems = FinalGuard().check("我确认过记录，但没有完全确认时间范围。", task_state=self._state(True))
         self.assertEqual(list(problems), [])
 
-    def test_exists_true_explicit_denial_blocked(self):
+    def test_exists_true_explicit_denial_passes_l1(self):
+        # exists 否认属于事实矛盾，由 L2 模型评审判定；L1 不做"没有找到"词语拦截
         problems = FinalGuard().check("没有找到任何相关照片。", task_state=self._state(True))
-        self.assertTrue(any("fact_exists_contradiction" in p for p in problems))
+        self.assertEqual(list(problems), [])
 
-    def test_exists_false_assertion_blocked(self):
+    def test_exists_false_assertion_passes_l1(self):
         problems = FinalGuard().check("有照片，我找到了。", task_state=self._state(False))
-        self.assertTrue(any("fact_exists_contradiction_false" in p for p in problems))
+        self.assertEqual(list(problems), [])
 
     def test_exists_false_denial_passes(self):
         problems = FinalGuard().check("没有找到相关记录。", task_state=self._state(False))
@@ -125,6 +126,9 @@ class GuardExistsRegressionTests(unittest.TestCase):
             "tool_results": [{"tool_call_id": "tool_call_1", "tool": "search_memories", "total": 8}],
             "evidence_refs": ["tool_call_1"],
         })
+        self.assertEqual(list(problems), [])
+        # 用结构性规则验证自然文案：内部码/结构化 detail 不泄漏给用户
+        problems = FinalGuard().check("没有找到相关照片。", task_state={"tool_results": []})
         self.assertTrue(problems)
         for issue in problems.issues:
             self.assertNotIn(issue.code, issue.message)
@@ -203,7 +207,11 @@ class MealEvidenceTests(unittest.TestCase):
 
 
 class SearchInspectCertaintyTests(unittest.TestCase):
-    """C8: search certainty 与 inspect certainty 分层；inspect 不能反向确认检索条件。"""
+    """C8: search certainty 与 inspect certainty 分层（Phase H H7 改造后）。
+
+    candidate→confirmed 升级 / 缺口披露属于事实合格性问题，由 L2 模型评审判定；
+    L1 不再做"确认/确定是/还不能确认"的词语正则判断。
+    """
 
     def _state(self, satisfaction="candidate_only", condition=None, inspect=None,
                selected=None, total=8):
@@ -222,42 +230,33 @@ class SearchInspectCertaintyTests(unittest.TestCase):
             "selected_asset_handle": selected,
         }
 
-    def test_candidate_plus_inspect_cannot_back_confirm_search(self):
-        # 检索只是候选（爬山未确认），即使 inspect 看到积雪，也不能说"确认是爬山"
+    def test_candidate_claim_passes_l1(self):
+        # 检索只是候选却断言确认：L1 放行（交给 L2 certainty_upgrade，truth recoverable）
         problems = FinalGuard().check("找到爬山的照片了，确认是那次爬山。", task_state=self._state(
             condition={"爬山": "unknown"}, inspect="照片里有明显积雪"))
-        self.assertTrue(any("candidate_claimed_as_match" in p or "certainty_upgrade" in p
-                            for p in problems))
+        self.assertEqual(list(problems), [])
 
-    def test_candidate_plus_inspect_natural_layered_answer_passes(self):
-        # C8 目标形态：检索层披露 + 复核层观察，两层分开
+    def test_candidate_natural_layered_answer_passes(self):
         problems = FinalGuard().check(
             "我没找到能明确确认'爬山'的记录。不过最接近的一张里没有看到明显积雪。",
             task_state=self._state(condition={"爬山": "unknown"}, inspect="照片里没有明显积雪"))
         self.assertEqual(list(problems), [])
 
-    def test_candidate_plus_inspect_visual_answer_requires_disclosure(self):
-        # 只给视觉观察、不披露检索层缺口 → missing_disclosure（可被恢复循环修正）
+    def test_visual_answer_passes_l1(self):
+        # 只给视觉观察、不披露检索层缺口：披露问题由 L2 missing_disclosure（style）处理
         problems = FinalGuard().check("照片里没有看到积雪。", task_state=self._state(
             condition={"爬山": "unknown"}, inspect="照片里没有明显积雪"))
-        self.assertTrue(any("missing_disclosure" in p for p in problems))
+        self.assertEqual(list(problems), [])
 
-    def test_selected_photo_follow_up_exempt_from_disclosure(self):
-        # 用户点选 photo_1 追问视觉细节：该照片的视觉回答以 inspect 为准，豁免检索层披露
+    def test_selected_photo_follow_up_passes(self):
         problems = FinalGuard().check("照片里有2个人。", task_state=self._state(
             inspect="照片里有2个人", selected="photo_1"))
         self.assertEqual(list(problems), [])
 
-    def test_visual_confirm_claim_not_treated_as_condition_upgrade(self):
-        # 规则4 标签感知：条件标签（爬山）没出现在回答里时，"我确认照片里没有雪"不应被误拦
-        problems = FinalGuard().check("我确认照片里没有看到积雪。", task_state=self._state(
-            condition={"爬山": "unknown"}, inspect="照片里没有明显积雪"))
-        self.assertFalse(any("certainty_upgrade" in p for p in problems))
-
-    def test_condition_label_claimed_confirmed_blocks(self):
+    def test_condition_label_claimed_confirmed_passes_l1(self):
         problems = FinalGuard().check("确认是爬山，照片里就是那座山。", task_state=self._state(
             condition={"爬山": "unknown"}, inspect="照片里有积雪"))
-        self.assertTrue(any("certainty_upgrade" in p for p in problems))
+        self.assertEqual(list(problems), [])
 
 
 class TaskStateInspectHandleTests(unittest.TestCase):
@@ -324,7 +323,7 @@ class RepresentativePreviewTests(unittest.TestCase):
 
 
 class GuardDebugTraceTests(unittest.TestCase):
-    """C9: guard 检查以结构化步骤记录（L1 codes + 恢复步数），debug 层可见、普通用户不可见。"""
+    """C9: guard 检查以结构化步骤记录（L1 codes + L2 judge + 恢复步数），debug 层可见。"""
 
     def test_guard_recovery_steps_recorded(self):
         from backend.agent_runtime.runtime import AgentRuntime
@@ -342,6 +341,7 @@ class GuardDebugTraceTests(unittest.TestCase):
             '{"action":"tool_call","tool":"query_memory_facts","arguments":'
             '{"operation":"exists","filters":{"time":"2023年5月"}},"public_status":"正在查询…"}',
             '{"action":"final","answer":"没有找到任何相关照片。","evidence_refs":["tool_call_1"]}',
+            '{"faithful": false, "problems": [{"type": "omission", "detail": "工具确认存在相关记录，回答却说没有找到"}], "reason": "存在性矛盾"}',
             '{"action":"final","answer":"2023年5月拍过照片。","evidence_refs":["tool_call_1"]}',
             '{"faithful": true, "problems": []}',
         ]
@@ -354,19 +354,16 @@ class GuardDebugTraceTests(unittest.TestCase):
         self.assertEqual(turn.status, "complete")
         guard_steps = [s for s in turn.steps if s.get("type") == "guard"]
         self.assertGreaterEqual(len(guard_steps), 2)
-        self.assertEqual(guard_steps[0]["status"], "fail")
-        self.assertIn("fact_exists_contradiction", guard_steps[0]["codes"])
-        self.assertEqual(guard_steps[0]["attempt"], 1)
-        self.assertEqual(guard_steps[1]["status"], "pass")
-        self.assertEqual(guard_steps[1]["attempt"], 2)
+        # L1 结构性检查全部 pass；事实矛盾由 L2 judge 拦截
+        self.assertTrue(all(s["status"] == "pass" for s in guard_steps))
+        judge_steps = [s for s in turn.steps if s.get("type") == "judge"]
+        self.assertGreaterEqual(len(judge_steps), 1)
+        self.assertFalse(judge_steps[0]["faithful"])
+        self.assertEqual(judge_steps[-1]["faithful"], True)
         recovering = [p for p in turn.public_progress if p.get("stage") == "recovering"]
         self.assertEqual(len(recovering), 1)
         # 恢复后的最终回答是可信事实重写，不是失败文案
         self.assertEqual(turn.final_answer, "2023年5月拍过照片。")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ToolSchemaDefaultsTests(unittest.TestCase):

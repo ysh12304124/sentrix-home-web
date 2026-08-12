@@ -1,16 +1,14 @@
-"""Phase G — G3/G4/G5/G6/G7 正式回归集。
+"""Phase G — G3/G4/G5 正式回归集（Phase H H7 改造后）。
 
 覆盖：
 - G3 Completion State / Gate：最小动态 requirements（retrieve/resolve_visual/resolve_ocr/deliver_media）
-- G4 Guard 三层：Safety hard_block / Truth recoverable / Style advisory
-- G5 L2 Judge advisory：可确定性验证 → truth；否则 style，不得 hard block
-- G6 natural partial：不暴露工程错误、不猜答案；OCR 失败显式 partial
+- G4 Guard 分层：Safety hard_block / Truth recoverable / Style advisory
+- H7 拍板：L1 FinalGuard 只做结构性兜底（安全/占位符/交付完整性/流程结构），
+  回答"是否合格"（数字等价/编造/矛盾/漏报/过度声称/缺口披露）由 L2 模型评审（judge.py）判断。
+- G6 natural partial：不暴露工程错误、不猜答案
 - G7 答案自然化：删除空壳收尾套话
 """
 
-import json
-import os
-import tempfile
 import unittest
 
 from backend.agent_runtime.completion import (CompletionState, DELIVER_MEDIA,
@@ -18,11 +16,8 @@ from backend.agent_runtime.completion import (CompletionState, DELIVER_MEDIA,
                                               RETRIEVE_EVIDENCE)
 from backend.agent_runtime.final_guard import FinalGuard
 from backend.agent_runtime.final_writer import naturalize_answer
-from backend.agent_runtime.guard_types import (SEVERITY_HARD_BLOCK, SEVERITY_STYLE,
-                                               SEVERITY_TRUTH)
-from backend.agent_runtime.judge import deterministic_verify
+from backend.agent_runtime.guard_types import SEVERITY_HARD_BLOCK, SEVERITY_TRUTH
 from backend.agent_runtime.runtime import _natural_partial
-from backend.db import MemoryStore
 
 
 def _search_state(satisfaction="candidate_only", total=8, preview=None, inspect=None):
@@ -88,30 +83,7 @@ class CompletionGateTests(unittest.TestCase):
 
 
 class GuardTierTests(unittest.TestCase):
-    def test_candidate_claimed_as_match_is_truth(self):
-        problems = FinalGuard().check(
-            "确认就是这家店拍的。", task_state=_search_state("candidate_only"))
-        codes = {i.code: i for i in problems.issues}
-        self.assertIn("candidate_claimed_as_match", codes)
-        self.assertEqual(codes["candidate_claimed_as_match"].severity, SEVERITY_TRUTH)
-
-    def test_certainty_upgrade_is_truth(self):
-        state = _search_state("candidate_only")
-        state["search_condition_summary"] = {"爬山": "unknown"}
-        problems = FinalGuard().check(
-            "确认就是爬山的活动。", task_state=state)
-        codes = {i.code: i for i in problems.issues}
-        self.assertIn("certainty_upgrade", codes)
-        self.assertEqual(codes["certainty_upgrade"].severity, SEVERITY_TRUTH)
-
-    def test_missing_disclosure_is_style(self):
-        problems = FinalGuard().check(
-            "找到了几张照片。", task_state=_search_state("candidate_only", total=8, preview=[]))
-        for issue in problems.issues:
-            if issue.code == "missing_disclosure":
-                self.assertEqual(issue.severity, SEVERITY_STYLE)
-                return
-        self.fail("missing_disclosure 未触发")
+    """L1 结构性检查：安全/占位符/交付结构。事实合格性交给 L2 模型评审。"""
 
     def test_internal_id_leak_is_hard_block(self):
         problems = FinalGuard().check(
@@ -125,36 +97,45 @@ class GuardTierTests(unittest.TestCase):
         self.assertEqual(problems.severity, SEVERITY_HARD_BLOCK)
         self.assertIn("write_not_allowed", list(problems))
 
-    def test_boilerplate_tail_is_style_not_truth(self):
+    def test_placeholder_leak_is_truth(self):
+        problems = FinalGuard().check(
+            "地点是[地点名称1]，时间是[时间]。", task_state={"tool_results": []})
+        self.assertIn("placeholder_leak", list(problems))
+        self.assertEqual(problems.severity, SEVERITY_TRUTH)
+
+    def test_denial_without_search_is_truth(self):
+        problems = FinalGuard().check("没有找到相关照片。", task_state={"tool_results": []})
+        self.assertIn("denial_without_search", list(problems))
+        self.assertEqual(problems.severity, SEVERITY_TRUTH)
+
+    def test_denial_after_search_passes(self):
+        problems = FinalGuard().check("没有找到相关照片。", task_state={
+            "tool_results": [{"tool": "search_memories", "total": 0}]})
+        self.assertEqual(list(problems), [])
+
+    def test_all_but_has_more_blocked(self):
+        problems = FinalGuard().check("都给你了。", task_state={
+            "result_mode": "all", "has_more": True, "tool_results": []})
+        self.assertIn("all_requested_but_has_more", list(problems))
+
+    def test_delivery_contradiction_blocked(self):
+        problems = FinalGuard().check("全部照片都交付了。", task_state={
+            "delivery_state": "complete", "tool_results": []},
+            delivered_count=0)
+        self.assertIn("delivery_contradiction", list(problems))
+
+    def test_candidate_claim_passes_l1(self):
+        # candidate_only 却声称确认：事实合格性问题，L1 不再拦截，交给 L2 模型
+        problems = FinalGuard().check(
+            "确认就是这家店拍的。", task_state=_search_state("candidate_only"))
+        self.assertEqual(list(problems), [])
+
+    def test_boilerplate_tail_passes_l1(self):
+        # 风格/披露问题由 L2 missing_disclosure（style advisory）处理，L1 不拦
         problems = FinalGuard().check(
             "是在秦皇岛如是海度假村。以上是我目前能确认的部分信息。",
             task_state=_search_state("full_support", total=2))
-        self.assertEqual(problems.severity, SEVERITY_STYLE)
-        self.assertNotIn("candidate_claimed_as_match", list(problems))
-
-    def test_truth_dominates_style(self):
-        problems = FinalGuard().check(
-            "确认就是这家店拍的。以上是我目前能确认的部分信息。",
-            task_state=_search_state("candidate_only"))
-        self.assertEqual(problems.severity, SEVERITY_TRUTH)
-
-
-class JudgeAdvisoryTests(unittest.TestCase):
-    def test_omission_verifiable_is_truth(self):
-        self.assertTrue(deterministic_verify(
-            "omission", [{"tool": "search_memories", "total": 5}], "没有找到相关照片"))
-
-    def test_contradiction_not_verifiable_is_style(self):
-        self.assertFalse(deterministic_verify(
-            "contradiction", [{"tool": "search_memories", "total": 5}], "天气很好"))
-
-    def test_missing_disclosure_not_verifiable(self):
-        self.assertFalse(deterministic_verify(
-            "missing_disclosure", [{"tool": "search_memories", "total": 5}], "不太确定"))
-
-    def test_fabrication_verifiable_when_empty(self):
-        self.assertTrue(deterministic_verify(
-            "fabrication", [{"tool": "search_memories", "total": 0}], "我找到了那张照片"))
+        self.assertEqual(list(problems), [])
 
 
 class NaturalPartialTests(unittest.TestCase):
@@ -197,77 +178,3 @@ class NaturalizeAnswerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class FabricationFromEmptyRefTests(unittest.TestCase):
-    """G6：引用 total=0 的工具却断言具体事实（人名/身份/价格）→ 编造拦截面。"""
-
-    def _check(self, answer):
-        return FinalGuard().check(answer, task_state={
-            "tool_results": [
-                {"tool_call_id": "tool_call_1", "tool": "search_memories", "total": 4},
-                {"tool_call_id": "tool_call_2", "tool": "search_conversation_history", "total": 0}],
-            "evidence_refs": ["tool_call_1", "tool_call_2"]})
-
-    def test_fabricated_name_flagged(self):
-        probs = self._check("和您一起去的朋友是小明。")
-        self.assertIn("fabrication_from_empty_ref", list(probs))
-        self.assertEqual(probs.severity, SEVERITY_TRUTH)
-
-    def test_honest_denial_allowed(self):
-        probs = self._check("现有记录中没有明确提到一起去的朋友名字。")
-        self.assertNotIn("fabrication_from_empty_ref", list(probs))
-
-    def test_positive_found_claim_flagged(self):
-        probs = self._check("找到了那张照片。")
-        self.assertIn("fabrication_from_empty_ref", list(probs))
-
-
-class PersonFabricationTests(unittest.TestCase):
-    """Phase G：同行/身份语境断言的人名必须有出处（问题/工具观察/最近对话），否则 truth 编造拦截。"""
-
-    def _check(self, answer, q="", tools=None, history=""):
-        return FinalGuard().check(answer, task_state={
-            "user_query": q,
-            "history_text": history,
-            "tool_results": tools or [
-                {"tool_call_id": "t1", "tool": "search_memories", "total": 4,
-                 "preview": [{"handle": "photo_1", "place": "Hang Dong"}]}],
-            "evidence_refs": ["t1"]})
-
-    def test_fabricated_name_flagged_truth(self):
-        probs = self._check("和你一起去的朋友是小明和李华。",
-                            q="去清迈看表演时一起去的朋友是谁？")
-        self.assertIn("person_fabrication", list(probs))
-        self.assertEqual(probs.severity, SEVERITY_TRUTH)
-
-    def test_name_in_question_allowed(self):
-        probs = self._check("明明和乐乐在主题沙雕前合影。",
-                            q="2019年7月明明和乐乐在哪合影？")
-        self.assertNotIn("person_fabrication", list(probs))
-
-    def test_name_in_tool_observation_allowed(self):
-        tools = [
-            {"tool_call_id": "t1", "tool": "search_memories", "total": 2,
-             "preview": [{"handle": "photo_1"}]},
-            {"tool_call_id": "t2", "tool": "query_memory_facts", "rows": [{"name": "小宇"}]},
-        ]
-        probs = self._check("另外那个男孩是小宇。", q="那个男孩是谁？", tools=tools)
-        self.assertNotIn("person_fabrication", list(probs))
-
-    def test_name_in_recent_history_allowed(self):
-        probs = self._check("朋友是小明。", q="再说一下刚才那个人",
-                            history="用户：和谁一起去的？\n助手：小明。")
-        self.assertNotIn("person_fabrication", list(probs))
-
-    def test_honest_denial_allowed(self):
-        probs = self._check("现有记录中无法确认一起去的朋友名字。",
-                            q="和你一起去的朋友是谁？")
-        self.assertNotIn("person_fabrication", list(probs))
-
-    def test_place_and_common_noun_not_flagged(self):
-        probs = self._check("活动是在河北省秦皇岛市昌黎县的秦皇岛如是海度假村进行的。",
-                            q="活动在哪进行？")
-        self.assertNotIn("person_fabrication", list(probs))
-        probs = self._check("你们主要和沙雕互动合影。", q="2023年8月6日你们主要做什么？")
-        self.assertNotIn("person_fabrication", list(probs))

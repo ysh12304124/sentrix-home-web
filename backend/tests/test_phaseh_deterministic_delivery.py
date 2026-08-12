@@ -1,10 +1,11 @@
-"""Phase H — H-A Deterministic Fact Delivery 单测。
+"""Phase H — H-A Deterministic Fact Delivery 单测（Phase H H7 改造后）。
 
 覆盖：
 - Answer Nucleus 提取（count/date/boolean/result_total/place/OCR 硬值/person）
 - 简单确定性问题直接渲染（数量/日期/布尔）
 - 硬值约束文本生成
-- Guard 兜底：count_conflict / count_missing / date_missing
+- Nucleus 工具函数单测（check_nucleus_preservation 保留为纯工具校验函数）
+- 集成：L1 不再用数字正则判定 final 合格性（"3 张" vs "三张" 等价），由 L2 模型评审
 """
 
 import unittest
@@ -14,7 +15,6 @@ from backend.agent_runtime.answer_nucleus import (AnswerNucleus, build_nucleus,
                                                   classify_deterministic,
                                                   render_simple)
 from backend.agent_runtime.final_guard import FinalGuard
-from backend.agent_runtime.guard_types import SEVERITY_TRUTH
 
 
 def _search_state(total=5, satisfaction="full_support", place="上海", ocr=""):
@@ -81,6 +81,8 @@ class SimpleRenderTests(unittest.TestCase):
 
 
 class PreservationCheckTests(unittest.TestCase):
+    """Nucleus 工具函数单测：check_nucleus_preservation 是纯工具，运行时不再由 L1 guard 调用。"""
+
     def test_count_conflict_detected(self):
         n = build_nucleus(_search_state(total=5))
         issues = check_nucleus_preservation("为您找到 3 张照片。", n, "一共有几张？")
@@ -103,14 +105,17 @@ class PreservationCheckTests(unittest.TestCase):
 
 
 class GuardIntegrationTests(unittest.TestCase):
-    def test_count_conflict_is_truth(self):
-        probs = FinalGuard().check("为您找到 3 张照片。", task_state=_search_state(total=5))
-        self.assertIn("count_conflict", list(probs))
-        self.assertEqual(probs.severity, SEVERITY_TRUTH)
+    """L1 不再拦截数字改写——硬值合格性由 L2 模型评审（judge.py）判断。"""
 
-    def test_count_preserved_passes(self):
-        probs = FinalGuard().check("找到了 5 张相关照片。", task_state=_search_state(total=5))
-        self.assertNotIn("count_conflict", list(probs))
+    def test_count_conflict_passes_l1(self):
+        # 工具确认 5 张、回答写 3 张：这是实质冲突，L1 不做数字正则判断，交给 L2
+        probs = FinalGuard().check("为您找到 3 张照片。", task_state=_search_state(total=5))
+        self.assertEqual(list(probs), [])
+
+    def test_chinese_number_equivalent_passes_l1(self):
+        # "3 张" vs "三张"：表达等价，L1 不拦
+        probs = FinalGuard().check("为您找到三张照片。", task_state=_search_state(total=3))
+        self.assertEqual(list(probs), [])
 
 
 if __name__ == "__main__":

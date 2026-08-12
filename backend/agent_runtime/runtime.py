@@ -897,7 +897,8 @@ class AgentRuntime:
                             + "\n- ".join(trusted or ["(无工具结果)"]) +
                             ("\n注意：检索或复核没有产生可用照片时，不要声称找到候选照片，"
                              "也不要引用被拒/空的 inspect 调用；直接如实说没有找到或无法确认。"
-                             if any("fabrication_from_empty" in p or "inspection_fabrication" in p
+                             if any("fabrication" in p or "fabrication_from_empty" in p
+                                    or "inspection_fabrication" in p
                                     for p in problems) else "") +
                             ("\ninspect_photo 的实际观察是：" + "；".join(inspect_obs)
                              + "\n如果观察与用户假设矛盾，以观察为准回答，不要迎合用户假设。"

@@ -44,6 +44,8 @@ class TruthContractTests(unittest.TestCase):
 
 
 class FaithfulnessGuardTests(unittest.TestCase):
+    """事实合格性由 L2 模型评审；L1 只做结构性检查（Phase H H7 拍板）。"""
+
     def _state(self, satisfaction="candidate_only", total=8, refs=("tool_call_1",), conditions=None):
         return {
             "search_satisfaction": satisfaction,
@@ -52,25 +54,26 @@ class FaithfulnessGuardTests(unittest.TestCase):
             "evidence_refs": list(refs),
         }
 
-    def test_candidate_claimed_as_match(self):
+    def test_candidate_claimed_as_match_passes_l1(self):
         g = FinalGuard()
         problems = g.check("我确认找到了爬山合影。", task_state=self._state())
-        self.assertTrue(any(x.startswith("candidate_claimed_as_match") for x in problems))
+        self.assertEqual(list(problems), [])
 
     def test_honest_candidate_disclosure_passes(self):
         g = FinalGuard()
         problems = g.check("找到几张接近的候选，还不能完全确认是爬山合影。", task_state=self._state())
         self.assertEqual(problems, [])
 
-    def test_omission_conflict(self):
+    def test_omission_passes_l1(self):
         g = FinalGuard()
-        problems = g.check("我没有找到任何相关照片。", task_state=self._state(satisfaction="full_support", conditions={"semantic": "confirmed"}))
-        self.assertTrue(any(x.startswith("omission_conflict") for x in problems))
+        problems = g.check("我没有找到任何相关照片。", task_state=self._state(
+            satisfaction="full_support", conditions={"semantic": "confirmed"}))
+        self.assertEqual(list(problems), [])
 
-    def test_certainty_upgrade_blocked(self):
+    def test_certainty_upgrade_passes_l1(self):
         g = FinalGuard()
         problems = g.check("确认就是爬山，不用再查了。", task_state=self._state())
-        self.assertTrue(any("certainty_upgrade" in p or "candidate_claimed" in p for p in problems))
+        self.assertEqual(list(problems), [])
 
     def test_no_match_can_say_not_found(self):
         g = FinalGuard()
