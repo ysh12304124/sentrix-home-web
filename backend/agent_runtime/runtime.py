@@ -21,6 +21,26 @@ from .result_set import TaskState
 from .tool_policy import ToolPolicy
 from .tool_registry import get_tool
 
+
+def _model_visible_observation(observation: dict | None) -> dict:
+    """Keep tool evidence for planning while excluding telemetry from LLM context."""
+    if not isinstance(observation, dict):
+        return {}
+    hidden = {"retrieval_timing", "debug", "telemetry", "trace"}
+    compact = {key: value for key, value in observation.items() if key not in hidden}
+    preview = compact.get("preview")
+    if isinstance(preview, list):
+        compact["preview"] = preview[:5]
+    asset_ids = compact.get("asset_ids")
+    if isinstance(asset_ids, list):
+        compact["asset_ids"] = asset_ids[:20]
+    return compact
+
+
+def _model_visible_action(action: dict) -> str:
+    """Feed the parsed action back without model reasoning or prose."""
+    return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+
 SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协作完成用户请求。
 
 可用工具（JSON 动作）：
@@ -561,14 +581,16 @@ class AgentRuntime:
                                 task.update_from_tool(tool_name, auto_args, auto_decision.observation or {})
                                 task.record_tool_result(f"auto_{tool_name}", tool_name,
                                                         auto_decision.observation or {})
-                                messages.append({"role": "assistant", "content": raw})
+                                messages.append({"role": "assistant", "content": _model_visible_action(action)})
                                 messages.append({"role": "tool", "tool_call_id": f"auto_{tool_name}",
                                                  "content": json.dumps(
-                                                     auto_decision.observation or {}, ensure_ascii=False)})
+                                                     _model_visible_observation(
+                                                         auto_decision.observation),
+                                                     ensure_ascii=False)})
                                 continue
                     elif resolution_retries < max_resolution_retries and turn.budget.can_model_step():
                         resolution_retries += 1
-                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
                         messages.append({"role": "user", "content": (
                             f"{resolution.get('reason') or '问题需要复核照片'}。"
                             f"这是完成回答的必要步骤：你必须立即调用 {resolution['tool']}"
@@ -583,7 +605,7 @@ class AgentRuntime:
                     denies_found = bool(__import__("re").search(
                         r"没(?:有|找到)|未找到|没有获取到|找不到|还没有",
                         str(action.get("answer") or "")))
-                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     if denies_found:
                         messages.append({"role": "user", "content": (
                             "你的回答说“没有找到”，但 search_memories 实际返回了候选照片（preview 里有 photo_1 等 handle），"
@@ -643,13 +665,17 @@ class AgentRuntime:
                 if not problems and task.tool_results and turn.budget.can_model_step():
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
-                    faithful, judge_problems = judge_faithfulness(
-                        self.chat_fn, query=message, tool_results=task.tool_results,
-                        answer=turn.final_answer, trusted_facts=trusted)
-                    turn.steps.append({"type": "judge", "faithful": faithful,
-                                       "problems": list(judge_problems)})
-                    if not faithful:
-                        problems = judge_problems
+                    try:
+                        faithful, judge_problems = judge_faithfulness(
+                            self.chat_fn, query=message, tool_results=task.tool_results,
+                            answer=turn.final_answer, trusted_facts=trusted)
+                        turn.steps.append({"type": "judge", "faithful": faithful,
+                                           "problems": list(judge_problems)})
+                        if not faithful:
+                            problems = judge_problems
+                    except Exception as exc:
+                        turn.steps.append({"type": "judge", "status": "skipped",
+                                           "reason": f"model_call_error:{exc}"})
                 if problems:
                     if guard_retries < max_guard_retries and turn.budget.can_model_step():
                         guard_retries += 1
@@ -728,7 +754,7 @@ class AgentRuntime:
             if call_signature in seen_tool_calls:
                 if dedup_retries < max_dedup_retries and turn.budget.can_model_step():
                     dedup_retries += 1
-                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     if dedup_retries >= max_dedup_retries:
                         messages.append({"role": "user", "content": (
                             "你再次重复调用相同的工具和参数，被拒绝。"
@@ -752,7 +778,7 @@ class AgentRuntime:
             if spec is None:
                 if unknown_tool_retries < max_unknown_tool_retries and turn.budget.can_model_step():
                     unknown_tool_retries += 1
-                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     from .tool_registry import list_tools
                     valid = "、".join(sorted({s.name for s in list_tools()
                                               if s.readiness != "blocked"}))
@@ -809,9 +835,9 @@ class AgentRuntime:
             if tool_name == "inspect_photo":
                 inspect_called = True
             # Observation 进入下一步模型上下文
-            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "assistant", "content": _model_visible_action(action)})
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(
-                result.observation or {}, ensure_ascii=False)})
+                _model_visible_observation(result.observation), ensure_ascii=False)})
 
         turn.task_state = task.as_dict()
         turn.answer_grounding = _build_answer_grounding(

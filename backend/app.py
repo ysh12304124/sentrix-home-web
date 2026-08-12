@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -26,7 +27,7 @@ from .image_io import (
     media_type_from_upload,
     needs_browser_transcode,
 )
-from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, parse_json_response
+from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
 
@@ -51,8 +52,14 @@ app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 maintenance_lock = threading.Lock()
 runtime_lock = threading.Lock()
+pipeline_commit_lock = threading.Lock()
+batch_worker_lock = threading.Lock()
+active_batch_workers = set()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
+VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
+RUNTIME_VLLM_API_URL = None
+RUNTIME_VLLM_BASE_URL = None
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
@@ -157,6 +164,7 @@ def _batch_status(batch_id: str):
     total = sum(counts.values())
     return {
         "batch": batch,
+        "pipeline_metrics": (batch.get("metadata_json") or {}).get("pipeline_metrics") or {},
         "scope_id": batch.get("scope_id"),
         "asset_counts": counts,
         "asset_total": total,
@@ -188,6 +196,231 @@ def process_asset(asset_id):
             task_pipeline.enrich_fast_image(asset_id, summarize_event=True)
     finally:
         task_store.close()
+
+
+def _pipeline_worker_limits():
+    configured = max(1, int(os.getenv("SENTRIX_PIPELINE_MAX_WORKERS", "2")))
+    state = _load_vllm_state() or {}
+    service_limit = max(1, int(state.get("max_num_seqs") or 1))
+    summary_configured = max(1, int(os.getenv("SENTRIX_EVENT_SUMMARY_MAX_WORKERS", "2")))
+    return {
+        "configured_workers": configured,
+        "vllm_max_num_seqs": service_limit,
+        "effective_workers": min(configured, service_limit),
+        "event_summary_workers": min(summary_configured, service_limit),
+    }
+
+
+def _prepare_asset_stage(asset_id, stage):
+    worker_store = MemoryStore(store.path)
+    worker_pipeline = IngestionPipeline(
+        worker_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+    )
+    try:
+        if stage == "fast":
+            return worker_pipeline.prepare_fast_image(asset_id)
+        if stage == "semantic":
+            return worker_pipeline.prepare_semantic_image(asset_id)
+        raise ValueError(f"unknown pipeline stage: {stage}")
+    finally:
+        worker_store.close()
+
+
+def _summarize_event_worker(event_id):
+    worker_store = MemoryStore(store.path)
+    worker_pipeline = IngestionPipeline(
+        worker_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+    )
+    started_at = time.perf_counter()
+    try:
+        worker_pipeline.summarize_event(event_id)
+        return {"event_id": event_id, "seconds": round(time.perf_counter() - started_at, 4), "status": "completed"}
+    except Exception as error:
+        return {"event_id": event_id, "seconds": round(time.perf_counter() - started_at, 4), "status": "failed", "error": str(error)}
+    finally:
+        worker_store.close()
+
+
+def _pipeline_timing_summary(task_store, asset_ids):
+    values = {}
+    for asset_id in asset_ids:
+        asset = task_store.get_asset(asset_id) or {}
+        asset_metadata = asset.get("metadata_json") or {}
+        timings = {
+            **(asset_metadata.get("import_timings") or {}),
+            **(asset_metadata.get("processing_timings") or {}),
+        }
+        for key, value in timings.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                values.setdefault(key, []).append(float(value))
+
+    def percentile(items, ratio):
+        ordered = sorted(items)
+        if not ordered:
+            return None
+        index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * ratio))))
+        return ordered[index]
+
+    return {
+        key: {
+            "count": len(items),
+            "sum_seconds": round(sum(items), 4),
+            "mean_seconds": round(sum(items) / len(items), 4),
+            "p50_seconds": round(percentile(items, 0.50), 4),
+            "p95_seconds": round(percentile(items, 0.95), 4),
+            "max_seconds": round(max(items), 4),
+        }
+        for key, items in values.items() if items
+    }
+
+
+def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
+    """Parallelize model work while committing clustering state in upload order."""
+    asset_ids = list(dict.fromkeys(asset_ids or []))
+    task_store = MemoryStore(store.path)
+    task_pipeline = IngestionPipeline(
+        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+    )
+    limits = _pipeline_worker_limits()
+    started_at = time.perf_counter()
+    task_store.update_ingest_batch_metadata(batch_id, {
+        "pipeline_metrics": {**limits, "status": "processing", "asset_count": len(asset_ids)}
+    })
+    try:
+        image_ids = []
+        for asset_id in asset_ids:
+            asset = task_store.get_asset(asset_id) or {}
+            if asset.get("media_type") == "image" and asset.get("status") in {"queued", "failed"}:
+                task_store.update_asset(asset_id, "processing", {
+                    "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
+                })
+                image_ids.append(asset_id)
+            elif asset.get("status") in {"queued", "failed"}:
+                process_asset(asset_id)
+
+        with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-fast") as executor:
+            futures = {asset_id: executor.submit(_prepare_asset_stage, asset_id, "fast") for asset_id in image_ids}
+            for asset_id in image_ids:
+                try:
+                    prepared = futures[asset_id].result()
+                    with pipeline_commit_lock:
+                        task_pipeline.commit_fast_image(asset_id, prepared)
+                except Exception as error:
+                    with pipeline_commit_lock:
+                        task_store.cleanup_asset_derivatives(asset_id)
+                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
+
+        semantic_ids = [
+            asset_id for asset_id in image_ids
+            if (task_store.get_asset(asset_id) or {}).get("status") == "semantic_enriching"
+        ]
+        with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-semantic") as executor:
+            futures = {asset_id: executor.submit(_prepare_asset_stage, asset_id, "semantic") for asset_id in semantic_ids}
+            for asset_id in semantic_ids:
+                try:
+                    prepared = futures[asset_id].result()
+                    with pipeline_commit_lock:
+                        task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
+                except Exception as error:
+                    with pipeline_commit_lock:
+                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic"})
+
+        if finalize_batch:
+            task_store.complete_ingest_batch(batch_id)
+        if finalize_batch and task_store.claim_ingest_batch_summary(batch_id):
+            event_ids = task_store.batch_event_ids(batch_id)
+            summary_started = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=limits["event_summary_workers"], thread_name_prefix="sentrix-event-summary") as executor:
+                event_results = list(executor.map(_summarize_event_worker, event_ids))
+            summary_wall_seconds = round(time.perf_counter() - summary_started, 4)
+            task_store.finish_ingest_batch(batch_id)
+        else:
+            event_ids = []
+            event_results = []
+            summary_wall_seconds = 0.0
+
+        metrics = {
+            **limits,
+            "status": "completed" if finalize_batch else "processing",
+            "asset_count": len(asset_ids),
+            "image_count": len(image_ids),
+            "event_count": len(event_ids),
+            "event_summary_call_count": len(event_results),
+            "event_summary_wall_seconds": summary_wall_seconds,
+            "event_summaries": event_results,
+            "stage_timings": _pipeline_timing_summary(task_store, asset_ids),
+            "total_wall_seconds": round(time.perf_counter() - started_at, 4),
+        }
+        task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
+    except Exception as error:
+        task_store.update_ingest_batch_metadata(batch_id, {
+            "pipeline_metrics": {
+                **limits, "status": "failed", "asset_count": len(asset_ids),
+                "total_wall_seconds": round(time.perf_counter() - started_at, 4), "error": str(error),
+            }
+        })
+        raise
+    finally:
+        task_store.close()
+
+
+def process_ingest_batch(asset_ids, batch_id):
+    """Consume a batch incrementally while uploads continue, then finalize once."""
+    with batch_worker_lock:
+        if batch_id in active_batch_workers:
+            return
+        active_batch_workers.add(batch_id)
+    task_store = MemoryStore(store.path)
+    all_asset_ids = list(dict.fromkeys(asset_ids or []))
+    pipeline_started_at = time.perf_counter()
+    try:
+        first = True
+        while True:
+            rows = task_store._rows(
+                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id",
+                (batch_id,),
+            )
+            queued_ids = [row["id"] for row in rows]
+            if queued_ids:
+                all_asset_ids.extend(item for item in queued_ids if item not in all_asset_ids)
+                _process_ingest_asset_group(queued_ids, batch_id, finalize_batch=False)
+                first = False
+                continue
+            batch = task_store.get_ingest_batch(batch_id) or {}
+            pending_row = task_store._row(
+                "SELECT COUNT(*) AS count FROM assets WHERE batch_id = ? AND status IN ('queued', 'processing', 'semantic_enriching')",
+                (batch_id,),
+            )
+            if batch.get("status") == "complete" and not (pending_row and pending_row["count"]):
+                break
+            time.sleep(0.5)
+
+        task_store.complete_ingest_batch(batch_id)
+        if task_store.claim_ingest_batch_summary(batch_id):
+            event_ids = task_store.batch_event_ids(batch_id)
+            limits = _pipeline_worker_limits()
+            summary_started = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=limits["event_summary_workers"], thread_name_prefix="sentrix-event-summary") as executor:
+                event_results = list(executor.map(_summarize_event_worker, event_ids))
+            summary_wall_seconds = round(time.perf_counter() - summary_started, 4)
+            task_store.finish_ingest_batch(batch_id)
+            metrics = {
+                **limits, "status": "completed", "asset_count": len(all_asset_ids),
+                "image_count": len(all_asset_ids), "event_count": len(event_ids),
+                "event_summary_call_count": len(event_results),
+                "event_summary_wall_seconds": summary_wall_seconds,
+                "event_summaries": event_results,
+                "stage_timings": _pipeline_timing_summary(task_store, all_asset_ids),
+                "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4),
+            }
+            task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
+    except Exception as error:
+        task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": {"status": "failed", "error": str(error)}})
+        raise
+    finally:
+        task_store.close()
+        with batch_worker_lock:
+            active_batch_workers.discard(batch_id)
 
 
 
@@ -222,7 +455,25 @@ def _load_vllm_registry():
     return _read_json_file(VLLM_REGISTRY, {"profiles": {}, "default_port": 8100, "state_file": ""})
 
 
+def _vllm_api(path: str, method: str = "GET", json_body=None, timeout=30):
+    """Call the selected remote vLLM Manager HTTP API."""
+    manager_url = RUNTIME_VLLM_API_URL or VLLM_API_URL
+    if not manager_url:
+        return None
+    import httpx as _httpx
+    url = manager_url.rstrip("/") + path
+    try:
+        resp = _httpx.request(method, url, json=json_body, timeout=timeout)
+        if resp.status_code >= 400:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
 def _load_vllm_state(registry=None):
+    if VLLM_API_URL:
+        return _vllm_api("/state")
     registry = registry or _load_vllm_registry()
     state_file = Path(registry.get("state_file") or "/home/asus/sentrix-vllm/state/current.json")
     return _read_json_file(state_file, None) if state_file.exists() else None
@@ -234,14 +485,29 @@ def _profile_availability(profile):
     if model_path and not Path(model_path).exists():
         missing.append(model_path)
     for module in profile.get("lora_modules") or []:
-        path = module.get("path")
-        if path and not Path(path).exists():
-            missing.append(path)
+        lora_path = module.get("path")
+        if lora_path and not Path(lora_path).exists():
+            missing.append(lora_path)
     return {"available": not missing, "missing_paths": missing}
 
 
+_remote_profiles_cache = None
+
+def _remote_profile_availability(profile_id):
+    """Get availability from remote vLLM API, with a simple cache."""
+    global _remote_profiles_cache
+    if not VLLM_API_URL:
+        return None
+    if _remote_profiles_cache is None:
+        _remote_profiles_cache = _vllm_api("/profiles") or []
+    for p in _remote_profiles_cache:
+        if p.get("id") == profile_id:
+            return {"available": p.get("available", False), "missing_paths": p.get("missing_paths", [])}
+    return None
+
+
 def _profile_summary(profile_id, profile):
-    availability = _profile_availability(profile)
+    availability = _remote_profile_availability(profile_id) or _profile_availability(profile)
     return {
         "id": profile_id, "model": profile.get("model"),
         "served_model_name": profile.get("served_model_name") or profile_id,
@@ -277,13 +543,26 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
     port = int(state.get("port") or profile.get("port") or registry.get("default_port") or 8100)
     served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
     with runtime_lock:
-        new_gamma = GammaClient(base_url=f"http://127.0.0.1:{port}/v1", model=served_name, backend="openai")
+        base_url = (state.get("external_url_hint") if state else None) or gamma.base_url
+        new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai")
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
     return _current_model_runtime()
 
 
 def _run_vllm_switch(request: ModelSwitchRequest):
+    if VLLM_API_URL:
+        values = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+        payload = {k: v for k, v in values.items() if v is not None and v != ""}
+        timeout = max(60, int(request.ready_timeout) + 90) if request.wait_ready else 60
+        result = _vllm_api("/switch", method="POST", json_body=payload, timeout=timeout)
+        if not result:
+            raise HTTPException(status_code=502, detail="vLLM switch failed: no response from remote API")
+        runtime = _apply_vllm_profile_to_runtime(request.profile, state=result.get("state"))
+        return {"accepted": True, "profile": request.profile, "runtime": runtime,
+            "stdout": result.get("stdout", ""), "stderr": result.get("stderr", "")}
+    if not VLLM_MANAGER.exists():
+        raise HTTPException(status_code=503, detail=f"vLLM manager not found: {VLLM_MANAGER}")
     registry = _load_vllm_registry()
     profile = (registry.get("profiles") or {}).get(request.profile)
     if not profile:
@@ -315,6 +594,17 @@ def _run_vllm_switch(request: ModelSwitchRequest):
     return {"accepted": True, "profile": request.profile, "runtime": runtime,
         "stdout": (payload.get("stdout") or "")[-4000:],
         "stderr": (payload.get("stderr") or "")[-4000:]}
+
+
+@app.on_event("startup")
+def _sync_vllm_state_on_startup():
+    """Sync gamma client with remote vLLM state on startup."""
+    try:
+        state = _load_vllm_state()
+        if state and state.get("pid"):
+            _apply_vllm_profile_to_runtime(state.get("profile", ""), state=state)
+    except Exception:
+        pass
 
 @app.get("/api/health")
 def health():
@@ -482,6 +772,44 @@ def current_model_profile():
 @app.post("/api/model-profiles/switch")
 def switch_model_profile(request: ModelSwitchRequest):
     return _run_vllm_switch(request)
+
+
+class RuntimeBindRequest(BaseModel):
+    manager_url: str
+    model_base_url: str | None = None
+
+@app.post("/api/model-profiles/bind-runtime")
+def bind_model_runtime(request: RuntimeBindRequest):
+    """Bind Agent runtime to one fixed Manager/model-service pair for this process."""
+    global RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL
+    if not request.manager_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid vLLM manager URL")
+    if request.model_base_url and not request.model_base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid vLLM model URL")
+    previous = (RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL)
+    RUNTIME_VLLM_API_URL = request.manager_url.rstrip("/")
+    RUNTIME_VLLM_BASE_URL = request.model_base_url.rstrip("/") if request.model_base_url else None
+    state = _load_vllm_state()
+    if not state or not state.get("pid"):
+        RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL = previous
+        raise HTTPException(status_code=502, detail="selected vLLM Manager has no active model")
+    runtime = _apply_vllm_profile_to_runtime_from_state()
+    return {"accepted": True, "manager_url": RUNTIME_VLLM_API_URL,
+            "model_base_url": RUNTIME_VLLM_BASE_URL, "runtime": runtime}
+
+@app.post("/api/model-profiles/sync-runtime")
+def sync_model_runtime():
+    """Sync gamma client to the currently bound vLLM model without restarting it."""
+    runtime = _apply_vllm_profile_to_runtime_from_state()
+    return {"accepted": True, "runtime": runtime}
+
+
+def _apply_vllm_profile_to_runtime_from_state():
+    """Read vLLM state and update gamma client. No model lifecycle changes."""
+    registry = _load_vllm_registry()
+    state = _load_vllm_state(registry) or {}
+    profile_id = state.get("profile") or ""
+    return _apply_vllm_profile_to_runtime(profile_id, state=state)
 
 
 
@@ -993,6 +1321,158 @@ def rename_person(person_id: str, payload: dict | None = None):
     return refreshed
 
 
+
+def _seed_face_detect(path: str) -> list[dict]:
+    """Standardised face extraction for identity seeding.
+
+    Flow:
+      1. buffalo_l detection (handles full-body / scene photos)
+      2. If miss: upscale 2x and retry (handles small faces in large images)
+      3. If still miss: whole-image embedding fallback (handles tight face crops)
+
+    Returns a face dict list compatible with seed_person_identity.
+    """
+    faces = pipeline.face.detect(path)
+    if faces:
+        return faces
+
+    if not pipeline.face.identity_configured:
+        return []
+
+    import cv2 as _cv2
+    _img = _cv2.imread(path)
+    if _img is None:
+        return []
+    _h, _w = _img.shape[:2]
+
+    # Step 2: upscale and retry detection for small faces in large images
+    _max_dim = max(_w, _h)
+    if _max_dim > 600:
+        _scale = min(2.0, 1280.0 / _max_dim)
+        if _scale > 1.05:
+            _img_big = _cv2.resize(_img, (int(_w * _scale), int(_h * _scale)),
+                                   interpolation=_cv2.INTER_CUBIC)
+            _tmp_path = path + ".upscaled.jpg"
+            _cv2.imwrite(_tmp_path, _img_big)
+            try:
+                faces = pipeline.face.detect(_tmp_path)
+            finally:
+                import os as _os
+                _os.unlink(_tmp_path)
+            if faces:
+                # Scale bbox coordinates back to original image
+                for f in faces:
+                    f["bbox"] = [v / _scale for v in f["bbox"]]
+                return faces
+
+    # Step 3: whole-image fallback for pre-cropped face photos
+    try:
+        _crop = align_face_crop(_img, [0, 0, _w, _h])
+        _emb = pipeline.face.identity_adapter.embed(_crop)
+        return [{
+            "bbox": [0, 0, float(_w), float(_h)],
+            "confidence": 0.99, "quality": 0.8,
+            "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
+            "landmarks": [], "embedding": _emb.embedding,
+            "embedding_model": pipeline.face.identity_model,
+            "embedding_version": _emb.model_version,
+            "quality_signal": _emb.quality_signal,
+            "pose_bucket": "frontal", "identity_ready": True,
+        }]
+    except Exception:
+        return []
+
+
+@app.post("/api/people/seed", status_code=201)
+async def seed_person_identity(
+    background_tasks: BackgroundTasks,
+    name: str = Form(...),
+    familyRole: str | None = Form(None),
+    aliases: str | None = Form(None),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
+    files: list[UploadFile] = File(...),
+):
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
+    alias_list = [a.strip() for a in (aliases or "").replace("、", ",").split(",") if a.strip()]
+    face_photos = []
+    for upload in files:
+        safe_name = Path(upload.filename or "identity.bin").name
+        asset_id = make_id("asset")
+        destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
+        with destination.open("wb") as output:
+            shutil.copyfileobj(upload.file, output)
+        sha = hashlib.sha256(destination.read_bytes()).hexdigest()
+        meta = {"scope_id": scope, "source_type": "identity_seed", "content_sha256": sha}
+        store.create_asset(asset_id, safe_name, "image", str(destination), upload.content_type, destination.stat().st_size, meta, scope_id=scope)
+        observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
+        store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
+        faces = _seed_face_detect(str(destination))
+        if not faces:
+            continue
+        best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
+        face_photos.append({**best, "asset_id": asset_id, "observation_id": observation["id"]})
+    if not face_photos:
+        raise HTTPException(status_code=422, detail="no detectable faces in uploaded photos")
+    result = store.seed_person_identity(scope, name, (familyRole or "").strip() or None, alias_list, face_photos)
+    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": m_role, "aliases": result["aliases"]}
+
+
+@app.post("/api/people/seed-batch", status_code=201)
+async def seed_persons_batch(
+    background_tasks: BackgroundTasks,
+    manifest: str = Form(...),
+    scopeId: str | None = Form(None),
+    scope_id: str | None = Form(None),
+    files: list[UploadFile] = File(...),
+):
+    import json as _json
+    scope = (scope_id or scopeId or "home-default").strip() or "home-default"
+    members = _json.loads(manifest)
+    results = []
+    for member in members:
+        m_name = (member.get("name") or "").strip()
+        if not m_name:
+            results.append({"name": "", "error": "name is required"})
+            continue
+        _raw_aliases = member.get("aliases") or []
+        if isinstance(_raw_aliases, str):
+            _raw_aliases = _raw_aliases.replace("、", ",").split(",")
+        m_aliases = [a.strip() for a in _raw_aliases if isinstance(a, str) and a.strip()]
+        m_role = (member.get("family_role") or "").strip() or None
+        file_indices = member.get("file_indices") or []
+        member_files = [files[i] for i in file_indices if 0 <= i < len(files)]
+        if not member_files:
+            results.append({"name": m_name, "error": "no photos provided"})
+            continue
+        face_photos = []
+        for upload in member_files:
+            safe_name = Path(upload.filename or "identity.bin").name
+            asset_id = make_id("asset")
+            destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
+            with destination.open("wb") as output:
+                shutil.copyfileobj(upload.file, output)
+            sha = hashlib.sha256(destination.read_bytes()).hexdigest()
+            meta = {"scope_id": scope, "source_type": "identity_seed", "content_sha256": sha}
+            store.create_asset(asset_id, safe_name, "image", str(destination), upload.content_type, destination.stat().st_size, meta, scope_id=scope)
+            observation = store.add_observation(asset_id, {"source_type": "identity_seed", "caption": "", "confidence": 0.0}, scope_id=scope)
+            store.update_asset(asset_id, "processed", {"observation_id": observation["id"]})
+            faces = _seed_face_detect(str(destination))
+            if not faces:
+                continue
+            best = max(faces, key=lambda f: f.get("quality", f.get("confidence", 0)))
+            face_photos.append({**best, "asset_id": asset_id, "observation_id": observation["id"]})
+        if not face_photos:
+            results.append({"name": m_name, "error": "no detectable faces"})
+            continue
+        result = store.seed_person_identity(scope, m_name, m_role, m_aliases, face_photos)
+        results.append({"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": m_role, "aliases": result["aliases"]})
+    return {"results": results}
+
+
 @app.post("/api/persons/{person_id}/reject")
 def reject_person(person_id: str):
     # /api/people returns native person entities; reject must follow that path.
@@ -1217,18 +1697,15 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     runtime_tools.set_conversation_id(conversation_id)
     runtime_tools.register_tools()
     profile_name = (profile_name or os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop")).strip().lower()
+    model_call_metrics = []
+    gamma.get_and_clear_call_metrics()
 
     def chat_fn(messages):
-        payload = {
-            "model": getattr(gamma, "model", "gemma4-12b-it"),
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": 1500,
-        }
-        response = httpx.post(f"{gamma.base_url}/chat/completions", json=payload,
-                              timeout=120)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
+        text = gamma.chat_messages(
+            messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
+        model_call_metrics.extend(gamma.get_and_clear_call_metrics())
+        return text
 
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            scope_id=scope_id, viewer_id=viewer_id,
@@ -1245,6 +1722,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                        selected_handle=selected_asset_handle,
                        selected_result_set_id=selected_result_set_id,
                        conversation_summary=conversation_summary)
+    model_call_metrics.extend(gamma.get_and_clear_call_metrics())
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
     trace = []
@@ -1275,11 +1753,13 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     }
     tool_trace = [
         {"tool": s.get("tool", ""), "status": s.get("status", ""),
-         "latency_s": s.get("latency_s"), "reason": s.get("reason") or ""}
+         "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
+         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
         for s in turn.steps if s.get("type") == "tool"
     ]
     return {
         "answer": turn.final_answer,
+        "model_call_metrics": model_call_metrics,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
         "evidence_status": "tool_loop",
@@ -1670,7 +2150,8 @@ def assistant_response(result):
         result["retrievalTrace"] = []
         # 思考过程对普通用户可见工具名/状态/耗时；参数与 observation 等明细仍仅管理员可见。
         result["toolTrace"] = [
-            {k: v for k, v in (t or {}).items() if k in ("tool", "status", "latency_s")}
+            {k: v for k, v in (t or {}).items()
+             if k in ("tool", "status", "latency_s", "retrieval_timing")}
             for t in (result.get("tool_trace") or [])
         ]
         result.pop("validation", None)
@@ -1715,6 +2196,9 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
             }
         except Exception:
             pass
+        residual_metrics = gamma.get_and_clear_call_metrics()
+        if residual_metrics:
+            result.setdefault("model_call_metrics", []).extend(residual_metrics)
         if conversation_id:
             _TOOL_LOOP_TASK_STATE[conversation_id] = result.get("task_state") or {}
         result = assistant_response(result)
@@ -1871,6 +2355,7 @@ async def import_remote_files(
     scope_id: str | None = Form(None),
     batchId: str | None = Form(None),
     batch_id: str | None = Form(None),
+    deferBatchComplete: bool = Form(False),
 ):
     if not files:
         raise HTTPException(status_code=422, detail="at least one file is required")
@@ -1888,12 +2373,15 @@ async def import_remote_files(
     store.create_memory_space(scope, scope, kind="benchmark")
     store.create_ingest_batch(batch, scope)
     items = []
+    queued_asset_ids = []
     for index, upload in enumerate(files):
         safe_name = Path(upload.filename or f"upload-{index}").name
         destination = MEDIA_DIR / f"{make_id('upload')}_{safe_name}"
         try:
+            save_started = time.perf_counter()
             with destination.open("wb") as output:
                 shutil.copyfileobj(upload.file, output)
+            file_save_seconds = round(time.perf_counter() - save_started, 4)
             capture = _normalized_capture_metadata(per_file[index])
             media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
             if media_type not in {"image", "audio", "video", "text"}:
@@ -1904,11 +2392,14 @@ async def import_remote_files(
                 "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
                 **capture,
             })
+            created = store.update_asset(created["id"], created.get("status") or "queued", {
+                "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
+            })
             deduplicated = created.get("path") != str(destination)
             if deduplicated:
                 destination.unlink(missing_ok=True)
             elif created.get("status") in {"queued", "failed"}:
-                background_tasks.add_task(process_asset, created["id"])
+                queued_asset_ids.append(created["id"])
             items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"], "fileName": created["file_name"], "status": created["status"], "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"), "deduplicated": deduplicated})
         except ValueError as error:
             destination.unlink(missing_ok=True)
@@ -1916,6 +2407,13 @@ async def import_remote_files(
         except Exception as error:
             destination.unlink(missing_ok=True)
             items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
+    if queued_asset_ids:
+        if not deferBatchComplete:
+            store.complete_ingest_batch(batch)
+        background_tasks.add_task(process_ingest_batch, queued_asset_ids, batch)
+    else:
+        store.complete_ingest_batch(batch)
+        background_tasks.add_task(pipeline.finalize_ingest_batch, batch)
     return {"accepted": any(item["accepted"] for item in items), "batch_id": batch, "scope_id": scope, "items": items, "accepted_count": sum(item["accepted"] for item in items), "rejected_count": sum(not item["accepted"] for item in items)}
 
 
@@ -1939,6 +2437,7 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=413, detail=f"too many files matched: {len(candidates)} > {request.max_files}")
     imported = []
     skipped = []
+    queued_asset_ids = []
     for path in candidates:
         metadata = {
             "scope_id": scope,
@@ -1956,7 +2455,11 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
             target = MEDIA_DIR / f"{make_id('import')}_{path.name}"
             shutil.copy2(path, target)
         try:
+            copy_started = time.perf_counter()
             created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
+            created = store.update_asset(created["id"], created.get("status") or "queued", {
+                "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
+            })
         except Exception as error:
             if request.copy_file:
                 target.unlink(missing_ok=True)
@@ -1966,7 +2469,7 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
         if request.copy_file and deduplicated:
             target.unlink(missing_ok=True)
         elif created.get("status") in {"queued", "failed"}:
-            background_tasks.add_task(process_asset, created["id"])
+            queued_asset_ids.append(created["id"])
         imported.append({
             "asset_id": created["id"],
             "file_name": created["file_name"],
@@ -1975,6 +2478,12 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
             "deduplicated": deduplicated,
             "source_path": str(path),
         })
+    if queued_asset_ids:
+        store.complete_ingest_batch(batch_id)
+        background_tasks.add_task(process_ingest_batch, queued_asset_ids, batch_id)
+    else:
+        store.complete_ingest_batch(batch_id)
+        background_tasks.add_task(pipeline.finalize_ingest_batch, batch_id)
     return {
         "accepted": True,
         "scope_id": scope,
@@ -2007,7 +2516,10 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
     if not store.get_ingest_batch(batch_id):
         raise HTTPException(status_code=404, detail="ingest batch not found")
     store.complete_ingest_batch(batch_id)
-    background_tasks.add_task(pipeline.finalize_ingest_batch, batch_id)
+    with batch_worker_lock:
+        worker_active = batch_id in active_batch_workers
+    if not worker_active:
+        background_tasks.add_task(pipeline.finalize_ingest_batch, batch_id)
     return _batch_status(batch_id)
 
 

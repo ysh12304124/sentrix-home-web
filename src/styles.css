@@ -492,6 +492,18 @@ body.admin .admin-only { display: revert; }
 .button.danger { background: #dc2626; color: #fff; border: 1px solid #dc2626; }
 .button.danger:hover { background: #b91c1c; border-color: #b91c1c; }
 
+/* Seed person identity: batch import UI */
+.seed-batch-rows { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; max-height: 340px; overflow-y: auto; }
+.seed-batch-row { display: grid; grid-template-columns: 24px 1fr 100px 1fr auto auto; gap: 8px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.seed-row-num { font-size: 12px; color: var(--muted); text-align: center; font-weight: 600; }
+.seed-batch-row input[type=text], .seed-batch-row input:not([type]) { font-size: 13px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; }
+.seed-batch-row select { font-size: 13px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; }
+.seed-batch-row input[type=file] { font-size: 11px; }
+.seed-result-list { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.seed-result-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 13px; }
+.seed-result-row.error { border-color: #dc2626; background: #fef2f2; }
+.seed-result-row .error-text { color: #dc2626; font-size: 12px; }
+.page-heading-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 /* B3.3 ResultSet delivery card */
 .result-set-card { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfdf8; }
 .result-set-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }

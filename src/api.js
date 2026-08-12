@@ -62,6 +62,8 @@
     resultSetPhoto: (resultSetId, handle, scopeId = "home-default", original = false) => `${configuredBase}/api/assistant/result-set/${encodeURIComponent(resultSetId)}/photo?handle=${encodeURIComponent(handle)}&scope_id=${encodeURIComponent(scopeId)}${original ? "&original=1" : ""}`,
     conversationMessages: (conversationId, limit = 20) => request(`/api/conversation/${encodeURIComponent(conversationId)}/messages?limit=${limit}`),
     conversationTrajectory: (conversationId, limit = 20) => request(`/api/conversation/${encodeURIComponent(conversationId)}/trajectory?limit=${limit}`),
+    seedPerson: (formData) => request("/api/people/seed", { method: "POST", body: formData }),
+    seedBatchPerson: (formData) => request("/api/people/seed-batch", { method: "POST", body: formData }),
     conversations: (scopeId = "") => request(`/api/conversations${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     createConversation: (scopeId = "home-default") => request("/api/conversations", { method: "POST", body: JSON.stringify({ scope_id: scopeId }) }),
     conversation: (id) => request(`/api/conversations/${encodeURIComponent(id)}`),

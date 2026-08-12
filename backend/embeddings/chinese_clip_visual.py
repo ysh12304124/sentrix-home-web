@@ -53,7 +53,15 @@ class ChineseClipVisualEmbedder:
             return None
         try:
             from cn_clip.clip import load_from_name
-            model, preprocess = load_from_name(self.model_name, device=self._device)
+
+            # cn_clip resolves ``model_name`` relative to ``download_root``.
+            # Point it at the configured checkpoint directory so an existing
+            # local weight is loaded without attempting a Hugging Face download.
+            model, preprocess = load_from_name(
+                self.model_name,
+                device=self._device,
+                download_root=str(Path(self.checkpoint).parent),
+            )
             model.eval()
             self._model = model
             self._preprocess = preprocess
