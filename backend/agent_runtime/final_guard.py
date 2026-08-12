@@ -1,12 +1,83 @@
-"""MVP FinalGuard（v2 §17）— 确定性可证明范围。
+"""L1 FinalGuard — 结构性兜底（Phase H H7 拍板后的最小集合）。
 
-检查：权限 / 内部 ID 泄漏 / Tool Result 引用 / 交付一致性（all vs has_more）/
-写授权。人物长总结等多事实 claim 验证后移 A6，不在 MVP。
+设计原则：回答"是否合格"（事实正确性、数字/词语等价、编造/矛盾/漏报）由 L2 模型评审
+（judge.py）判断，L1 不做词语/数字正则的合格性匹配——例如"三个人"与"3"是等价表达，
+不得由死代码判错。
+
+L1 保留的确定性检查分两类：
+1. 纯结构兜底（模型无法兜底）：
+   - Safety Hard Block：权限/范围越权、内部 ID/表结构泄漏、非法写操作（不可放行）。
+   - 模板占位符泄漏：[地点名称]/[数量] 等未填占位直接泄漏给用户。
+   - 未调用任何检索工具却声称"没有找到相关记录"（流程结构错误，必须纠正后重试检索）。
+   - all 请求但结果还有更多（交付不完整）。
+   - 声称全部交付但 delivered 数不足（交付矛盾）。
+2. 最小确定性存在性检查（Truth Guard，可恢复，不是词语等价判断）：
+   - 工具确认存在（total>0 / exists=True）但回答整体否认存在 → omission / exists 矛盾。
+   - 工具确认不存在（total=0 / exists=False）但回答明确断言已交付/找到 → fabrication。
+   这两类是可确定性验证的存在性矛盾（"有结果却说没找到/没结果却说找到"），
+   不涉及"三个人 vs 3"、同义词、日期格式等语义等价——等价性仍全部由 L2 模型判断。
+   诚实的不确定性（"无法确认/还不能确定"）与条件级否认（"没找到能确认爬山
+   的记录"）不算整体否认，不做拦截。
+
+运行时异常/空观察/预算耗尽 → runtime 的 emergency/natural partial 路径，不在本模块。
 """
 
 from __future__ import annotations
 
 import re
+
+from .guard_types import (REVISION_HARD_BLOCK, REVISION_REWRITE_ONLY,
+                          GuardIssue, GuardResult)
+
+# 检索/事实类工具（存在性判断只针对这些工具的结果）
+_RETRIEVAL_TOOLS = {"search_memories", "query_memory_facts", "search_conversation_history",
+                    "get_core_memory", "get_person_memory", "get_result_page"}
+
+# 整体否认存在（带明确宾语/动作）：total>0 / exists=True 时回答却说没找到。
+# 只匹配"明确否认找到照片/记录"这类整体否定，不含"我没去过北京"这类出行否定。
+_DENY_EXISTS = re.compile(
+    r"没(?:有)?找到|未找到|找不到|查无|"
+    r"没有(?:任何|符合|相关|一张|一个|一条|拍到|拍过|去过)?(?:照片|记录|回忆|记忆|相关)", re.I)
+# 只是不确定/hedge，不算整体否认（"无法确认/还不能确定/可能没有"等）
+_HEDGE = re.compile(
+    r"无法确认|不能确认|不确定|还不能|暂时|无法判断|记不清|可能没有|未必|没有完全|不能确定", re.I)
+# 条件级否认："没找到能确认'爬山'的记录"≠"没有找到照片"，不算整体否认
+_CONDITION_LEVEL_DENY = re.compile(
+    r"没(?:有)?找到(?:能|办法|足够|明确|可以){0,2}(?:确认|确定|验证|证实)", re.I)
+# 明确交付/找到断言（total=0 / exists=False 时回答却断言已找到/交付）
+_FOUND_DELIVERY = re.compile(
+    r"(?:已|为)?(?:为您|为你)?找到|已找到|找到了|"
+    r"找到\s*\d+\s*张|这是(?:您|你)要找的|这就是(?:您|你)?要的|"
+    r"有(?:一张|两张|几张|相关|这些)?(?:照片|记录)", re.I)
+# 整句否定门槛：含明确否定词时不视为"断言找到/交付"
+_ANY_DENIAL = re.compile(r"没|未|无|不|无法|尚未", re.I)
+
+
+def _natural_message(code: str, detail: str = "") -> str:
+    """把内部规则码转成用户可读、模型可执行的恢复文案（D4：用户不看到内部规则名）。"""
+    base = {
+        "placeholder_leak": "回答里出现了'地点名称/数量/时间'这类未填写的占位符，必须替换成真实数据或删除",
+        "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
+        "all_requested_but_has_more": "用户要求全部结果，但结果集还有更多未交付。请继续取回剩余结果，或如实说明只交付了部分",
+        "delivery_contradiction": "你的回答声称已经全部交付，但实际没有交付任何结果。请如实说明交付情况",
+        "omission_conflict": "工具确认存在相关结果（total>0），但你的回答却说没有找到。请基于工具结果如实回答存在的情况，不要整体否认",
+        "fabrication_from_empty": "工具确认不存在相关结果（total=0），但你的回答却声称找到了/已交付。请删除没有证据的找到/交付断言",
+        "fact_exists_contradiction": "工具确认存在相关记录，但你的回答却说没有找到。请改为如实说明已确认存在",
+        "fact_exists_contradiction_false": "工具确认不存在相关记录，但你的回答却声称找到了。请删除没有证据的找到断言",
+    }
+    text = base.get(code, f"回答与工具结果不一致（{code}）")
+    if "{expected}" in text:
+        text = text.replace("{expected}", detail or "?")
+    elif detail:
+        text = f"{text}：{detail}"
+    return text
+
+
+def _issue(code: str, detail: str = "", *, revision=REVISION_REWRITE_ONLY,
+           tool_ref=None, trusted_facts=None) -> GuardIssue:
+    return GuardIssue(code=code, message=_natural_message(code, detail),
+                      revision=revision, tool_ref=tool_ref,
+                      trusted_facts=trusted_facts or [])
 
 
 class FinalGuard:
@@ -16,159 +87,93 @@ class FinalGuard:
         self.result_sets = result_sets or {}
 
     def check(self, answer: str, *, task_state=None, delivered_count=None,
-              observation_ids_seen=None) -> list[str]:
-        problems = []
+              observation_ids_seen=None) -> GuardResult:
+        issues: list[GuardIssue] = []
         answer = answer or ""
         task_state = task_state or {}
-        problems.extend(self._check_faithfulness(answer, task_state))
-        # 0. query_memory_facts 事实一致性：final 必须包含工具返回的 value
-        if task_state.get("last_tool") == "query_memory_facts":
-            op = task_state.get("fact_operation")
-            expected = task_state.get("fact_value")
-            if op in {"count", "media"} and isinstance(expected, int):
-                if expected == 0 and re.search(r"没有|未拍|零", answer):
-                    pass
-                elif not re.search(rf"(?<!\d){expected}(?!\d)", answer):
-                    problems.append(f"fact_value_missing:expected={expected}")
-            elif op in {"first", "last", "date"} and isinstance(expected, str):
-                date_part = expected[:10]
-                nums = re.findall(r"\d+", date_part)
-                if nums and not all(self._date_num_ok(n, answer) for n in nums):
-                    problems.append(f"fact_date_missing:expected={date_part}")
-            elif op == "exists":
-                if expected is True and re.search(r"没有|不存在|未找到|没找到", answer):
-                    problems.append("fact_exists_contradiction:expected=True")
-                elif expected is False and re.search(r"有照片|存在|找到", answer):
-                    problems.append("fact_exists_contradiction:expected=False")
-            elif op == "group":
-                problems.extend(self._check_group(answer, task_state))
-        # 1. 内部 ID 泄漏（asset_/obs_/entity_ 前缀 + 内部表名）
-        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_)[a-f0-9]{6,}\b", answer)
-        if leaks:
-            problems.append(f"internal_id_leak:{sorted(set(leaks))[:3]}")
-        if re.search(r"\b(assets|observations|entity_mentions|semantic_claims)\b", answer):
-            problems.append("table_name_leak")
-        # 2. all 请求但交付不完整
+        # G4：安全层独立校验（权限/内部结构/非法写）——任何命中都优先于恢复逻辑
+        issues.extend(self._check_safety(answer, task_state))
+        # 模板占位符泄漏（[地点名称1]/[数量]/[此处填入…店名] 等未填占位）
+        if re.search(r"\[[^\[\]]{0,48}(?:填入|此处|占位|待填|名称|名字|姓名|朋友|数量|时间|地点|内容|数字|照片|记录|店名|电话|价格|日期|金额)[^\[\]]{0,36}\]", answer):
+            issues.append(_issue("placeholder_leak"))
+        # D12：声称"没有找到记录"但本轮从未调用任何检索工具 → 必须纠正后重试检索。
+        tool_results = task_state.get("tool_results") or []
+        if not any((tr.get("tool") or "") in _RETRIEVAL_TOOLS for tr in tool_results)                 and _DENY_EXISTS.search(answer):
+            issues.append(_issue("denial_without_search"))
+        # H7：最小确定性存在性检查（Truth Guard，可恢复）——total 与回答的存在性断言矛盾
+        issues.extend(self._check_existence(answer, task_state))
+        # all 请求但交付不完整
         mode = (task_state or {}).get("result_mode")
         has_more = (task_state or {}).get("has_more")
         if mode == "all" and has_more:
-            problems.append("all_requested_but_has_more")
-        # 3. 声称全部交付但 delivered 数不足
+            issues.append(_issue("all_requested_but_has_more"))
+        # 声称全部交付但 delivered 数不足
         if task_state.get("delivery_state") == "complete" and delivered_count == 0:
-            problems.append("delivery_contradiction")
-        # 4. 明确无证据却给出具体事实
-        if task_state.get("fulfillment") == "empty" and re.search(r"\d+\s*张|第一次|最后一次", answer):
-            problems.append("fabrication_from_empty")
-        # 5. 检索为空却声称找到了照片/记录
-        if task_state.get("fulfillment") == "empty" and not re.search(r"没|未", answer):
-            if re.search(r"找到|为您找到|有.{0,10}(照片|记录)", answer):
-                problems.append("fabrication_from_empty")
-        return problems
+            issues.append(_issue("delivery_contradiction"))
+        return GuardResult(issues)
 
     @staticmethod
-    def _check_faithfulness(answer: str, task_state: dict) -> list[str]:
-        """B2.1 Observation Faithfulness：omission / certainty upgrade / disclosure。"""
-        problems = []
+    def _check_existence(answer: str, task_state: dict) -> list[GuardIssue]:
+        """最小确定性存在性检查：工具确认存在/不存在 vs 回答的整体否认/交付断言。
+
+        只做可确定性验证的存在性矛盾，不判断任何词语等价：
+        - 任一检索工具 total>0 且回答整体否认存在 → omission_conflict
+        - 任一检索工具 total=0 且回答明确断言已找到/交付 → fabrication_from_empty
+        - query_memory_facts exists=True 且回答整体否认 → fact_exists_contradiction
+        - query_memory_facts exists=False 且回答明确断言已找到 → fact_exists_contradiction_false
+        诚实不确定性（hedge）与条件级否认不触发。
+        """
         answer = (answer or "").strip()
-        refs = set(task_state.get("evidence_refs") or [])
-        tool_results = task_state.get("tool_results") or []
-        satisfaction = task_state.get("search_satisfaction")
-        condition_summary = task_state.get("search_condition_summary") or {}
-        denies = bool(__import__("re").search(
-            r"没(?:有)?找到|未找到|不存在|没有(?:任何|符合|相关|一张|一个|一条)?(?:照片|记录|回忆|记忆)|查无|"
-            r"无法看到.{0,6}(?:照片|内容)|看不到任何照片|无法查看(?:照片|内容)|没有(?:可|能看|看过).{0,4}照片", answer))
-        # 1) 有结果却声称没有：非空结果 + 明确否认存在 → omission（与是否引用无关）
-        for tr in tool_results:
-            total = tr.get("total")
-            if total is None:
-                continue
-            if total > 0 and denies and satisfaction != "no_match":
-                problems.append(f"omission_conflict:tool={tr.get('tool')},total={total}")
-            if tr.get("tool_call_id") in refs and total == 0 and not denies:
-                if __import__("re").search(r"找到|为您找到|有.{0,10}(照片|记录)", answer):
-                    problems.append("fabrication_from_empty_ref")
-        inspect_texts = [tr.get("inspect_text") for tr in tool_results
-                         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip()]
-        # 2) candidate_only 声称完全匹配（inspect 复核到具体观察的不算）
-        if satisfaction == "candidate_only" and not inspect_texts:
-            if __import__("re").search(r"确认|确定|就是|肯定是|找到了|确认是", answer) and \
-               not __import__("re").search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据", answer):
-                problems.append("candidate_claimed_as_match")
-        # 3) partial/candidate 必须披露缺口（已通过 inspect 复核到具体观察的除外）
-        if satisfaction in {"partial_support", "candidate_only"} and not inspect_texts:
-            if not __import__("re").search(r"不能确认|无法确认|候选|未确认|不确定|接近|类似|还不能|没有直接证据|还需要|无法完全", answer):
-                problems.append("missing_disclosure")
-        # 4.5) inspect 被拒/无观察却断言视觉细节 → inspection_fabrication
-        inspect_results = [tr for tr in tool_results if tr.get("tool") == "inspect_photo"]
-        for tr in inspect_results:
-            if tr.get("blocked") and not (tr.get("inspect_text") or "").strip():
-                # 无观察时：只有未加不确定措辞的视觉断言才算编造（si07 类已 hedge 的不算）
-                if not __import__("re").search(r"无法确认|不能确认|不确定|无法判断|无法看到|看不清|看不清楚", answer):
-                    if __import__("re").search(
-                            r"桌上(?:放着|放了|摆着|有)|穿着|写着|天气(?:是|为|很)|有(?:雪|猫|小孩)|"
-                            r"是(?:雪|猫|小孩)|(?:外套|衣服|招牌).{0,6}(?:是|穿|写)", answer):
-                        problems.append(f"inspection_fabrication:blocked={tr.get('blocked')}")
-            # 4.6) inspect 有真实观察，但 Agent 却否认看到 → inspect_evidence_contradicted
-            elif (tr.get("inspect_text") or "").strip():
-                obs_text = tr["inspect_text"]
-                if __import__("re").search(r"无法看到|看不到|没有看到任何|无法查看|没有(?:任何|可看)的照片|看不到任何照片", answer):
-                    problems.append("inspect_evidence_contradicted")
-                # 4.7) 观察否定存在，回答却断言存在 → 观察与回答直接矛盾（编造）
-                neg_obs = __import__("re").search(
-                    r"没有(?:出现|看到|找到)?(?:任何|一个|一只)?(?:人|猫|小孩)|没有.{0,6}(?:人|猫|小孩)|无(?:人|猫|小孩)", obs_text)
-                if neg_obs:
-                    # 已 hedge/否定语境（“无法确认有人”“并没有出现人”）不算编造
-                    hedged = __import__("re").search(
-                        r"无法确认|不能确认|不确定|无法判断|无法看到|看不清|看不清楚|没有|并无|未出现|未看到|没看到", answer)
-                    if not hedged:
-                        positive_claim = __import__("re").search(
-                            r"有(?:一个|一位|两只|一只|几位|几个人)?[^，。]{0,8}(?:人|猫|小孩|红衣|红衣服)|"
-                            r"穿着.{0,4}(?:红色|白色|黑色|蓝色|黄色|外套)|看到了?.{0,6}(?:人|猫|小孩)|"
-                            r"确认.{0,8}(?:人|猫|小孩)|"
-                            r"(?:人|猫|小孩|雪|山|外套).{0,4}(?:是|为).{0,4}(?:白色|红色|黑色|蓝色|黄色|绿色|灰色|棕色|粉色|紫色)", answer)
-                        if positive_claim:
-                            problems.append("inspect_observation_contradicted")
-
-        # 4) 条件明确 unknown/contradicted 却升级为 confirmed
-        if condition_summary:
-            unresolved = [k for k, v in condition_summary.items() if v in {"unknown", "contradicted"}]
-            if unresolved and __import__("re").search(r"确认|确定|肯定|就是", answer):
-                problems.append(f"certainty_upgrade:conditions={unresolved[:3]}")
-        return problems
-
-    @staticmethod
-    def _check_group(answer: str, task_state: dict) -> list[str]:
-        """group 结果一致性：回答中的月份必须都在 rows 内；没有任何 row 证据时不得断言具体分组。"""
-        rows = task_state.get("fact_rows") or []
-        group_by = task_state.get("fact_group_by") or "month"
-        if not rows:
+        if not answer:
             return []
-        valid_months = set()
-        labels = set()
-        for row in rows:
-            group = str(row.get("group") or "")
-            labels.add(group)
-            m = re.match(r"\d{4}-(\d{2})", group)
-            if m:
-                valid_months.add(int(m.group(1)))
-        problems = []
-        found_months = [int(x) for x in re.findall(r"(?<!\d)(\d{1,2})月", answer)]
-        if found_months and valid_months:
-            bad = sorted({m for m in found_months if m not in valid_months})
-            if bad:
-                problems.append(f"group_fabrication:months={bad}")
-        if re.search(r"没|未", answer):
-            return problems
-        has_evidence = bool(valid_months & set(found_months)) or any(
-            label and label in answer for label in labels)
-        if not has_evidence and re.search(r"主要|包括|有照片|拍了|月份|地点|地方", answer):
-            problems.append("group_no_evidence")
-        return problems
+        issues: list[GuardIssue] = []
+        tool_results = task_state.get("tool_results") or []
+        # 整体否认（排除 hedge 与条件级否认）
+        denies = bool(_DENY_EXISTS.search(answer))             and not _HEDGE.search(answer)             and not _CONDITION_LEVEL_DENY.search(answer)
+        # 明确交付/找到断言（排除否定句："没有找到"不算）
+        found_claim = bool(_FOUND_DELIVERY.search(answer)) and not _ANY_DENIAL.search(answer)
+
+        retrieval_rows = [tr for tr in tool_results
+                          if (tr.get("tool") or "") in _RETRIEVAL_TOOLS
+                          and tr.get("total") is not None]
+        if any((tr.get("total") or 0) > 0 for tr in retrieval_rows) and denies:
+            issues.append(_issue("omission_conflict",
+                                 f"tool={[tr.get('tool') for tr in retrieval_rows if (tr.get('total') or 0) > 0][:2]}"))
+        if any((tr.get("total") or 0) == 0 for tr in retrieval_rows) and found_claim:
+            issues.append(_issue("fabrication_from_empty",
+                                 f"tool={[tr.get('tool') for tr in retrieval_rows if (tr.get('total') or 0) == 0][:2]}"))
+
+        # query_memory_facts exists 操作的确定性事实
+        if task_state.get("last_tool") == "query_memory_facts"                 and task_state.get("fact_operation") == "exists":
+            expected = task_state.get("fact_value")
+            if expected is True and denies:
+                issues.append(_issue("fact_exists_contradiction", "expected=True"))
+            elif expected is False and found_claim:
+                issues.append(_issue("fact_exists_contradiction_false", "expected=False"))
+        return issues
 
     @staticmethod
-    def _date_num_ok(num: str, answer: str) -> bool:
-        if num in answer:
-            return True
-        if len(num) > 1 and num[0] == "0" and num[1:] in answer:
-            return True
-        return False
+    def _check_safety(answer: str, task_state: dict) -> list[GuardIssue]:
+        """G4 Safety Hard Block：权限/范围越权、内部结构泄漏、非法写操作。
+
+        这一层只处理不可放行的安全边界；命中即 hard_block，不走恢复。
+        当前单 owner 场景下多为防御性规则，保持最小集合。
+        """
+        issues: list[GuardIssue] = []
+        # 内部标识符显式出现在回答里
+        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_|conversation_)[a-f0-9]{6,}\b", answer)
+        if leaks:
+            issues.append(_issue("internal_id_leak", f"{sorted(set(leaks))[:3]}",
+                                 revision=REVISION_HARD_BLOCK))
+        if re.search(r"\b(assets|observations|entity_mentions|semantic_claims|agent_result_sets)\b", answer):
+            issues.append(_issue("table_name_leak", "", revision=REVISION_HARD_BLOCK))
+        # 显式内部字段名（代码级标识符）不应出现在用户可见回答
+        if re.search(r"\b(scope_id|viewer_id|read_write|allowed_tools|max_model_len)\s*[:=]", answer):
+            issues.append(_issue("table_name_leak", "internal_schema", revision=REVISION_HARD_BLOCK))
+        # 越权提示：回答中声称可访问/看到其他相册、他人私有内容（防御性）
+        if re.search(r"别的?相册|他人|别的?人[的]?(?:相册|照片|隐私)|其他用户", answer):
+            issues.append(_issue("viewer_escape", "", revision=REVISION_HARD_BLOCK))
+        # 非法写操作：回答中声称进行了写/删/改（runtime 只读）
+        if re.search(r"(?:已经|帮你|可以)(?:写入|删除|修改|覆盖|清空)(?:了|过)?", answer):
+            issues.append(_issue("write_not_allowed", "", revision=REVISION_HARD_BLOCK))
+        return issues

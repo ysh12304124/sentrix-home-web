@@ -10,3 +10,6 @@ __pycache__/
 
 # macOS AppleDouble resource forks (created by scp from macOS)
 ._*
+
+# stray runtime pid file from xy merge
+.judge.pid

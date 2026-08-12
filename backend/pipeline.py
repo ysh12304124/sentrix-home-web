@@ -18,7 +18,7 @@ ensure_heif_support()
 IMPORT_METADATA_KEYS = {
     "content_sha256", "sha256", "exif", "captured_at", "captured_location",
     "source_owner_id", "source_owner_label", "source_device_id", "source_album_id",
-    "source_confidence", "scope_id", "batch_id", "gps",
+    "source_confidence", "scope_id", "batch_id", "gps", "import_timings",
 }
 
 
@@ -48,8 +48,13 @@ class IngestionPipeline:
         # Import metadata is provenance only. Model hints and benchmark labels
         # must never enter the memory graph through the asset boundary.
         metadata = {key: value for key, value in (metadata or {}).items() if key in IMPORT_METADATA_KEYS}
+        import_timings = dict(metadata.get("import_timings") or {})
+        step_started = time.perf_counter()
         metadata.setdefault("content_sha256", self._sha256(path))
+        import_timings["sha256_seconds"] = round(time.perf_counter() - step_started, 4)
+        step_started = time.perf_counter()
         metadata.setdefault("exif", self._extract_exif(path) if media_type == "image" else {})
+        import_timings["exif_seconds"] = round(time.perf_counter() - step_started, 4)
         existing = self.store.find_asset_by_hash(metadata["content_sha256"], metadata.get("scope_id"))
         if existing:
             return existing
@@ -64,10 +69,14 @@ class IngestionPipeline:
             if not metadata.get("captured_location"):
                 metadata["captured_location"] = f"{float(gps['latitude']):.6f},{float(gps['longitude']):.6f}"
             if "reverse_geocode" not in metadata:
+                step_started = time.perf_counter()
                 location_context = self.geocoder.lookup(gps)
+                import_timings["reverse_geocode_seconds"] = round(time.perf_counter() - step_started, 4)
                 if location_context:
                     metadata["reverse_geocode"] = location_context
-        return self.store.create_asset(
+        metadata["import_timings"] = import_timings
+        step_started = time.perf_counter()
+        created = self.store.create_asset(
             asset_id,
             file_name or path.name,
             media_type,
@@ -77,6 +86,9 @@ class IngestionPipeline:
             metadata,
             scope_id=metadata.get("scope_id"),
         )
+        import_timings["database_create_seconds"] = round(time.perf_counter() - step_started, 4)
+        import_timings["asset_create_seconds"] = round(sum(import_timings.values()), 4)
+        return self.store.update_asset(created["id"], created.get("status") or "queued", {"import_timings": import_timings})
 
     @staticmethod
     def _gps_from_metadata(metadata):
@@ -216,65 +228,168 @@ class IngestionPipeline:
         started_at = time.perf_counter()
         self.store.update_asset(asset_id, "processing", {})
         try:
-            path = asset["path"]
-            captured_at = asset.get("captured_at") or file_time(path)
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sentrix-fast") as executor:
-                face_future = executor.submit(self.face.detect, path)
-                clip_future = executor.submit(self.clip.embed_image, path)
-                faces = face_future.result()
-                clip_embedding = clip_future.result()
-            observation = self.store.add_observation(asset_id, {
-                "source_type": "image_fast_evidence", "caption": "", "captured_at": captured_at,
-                "place": asset.get("captured_location") or "", "confidence": 0.0,
-                "source_owner_id": asset.get("source_owner_id"), "canonical": {"semantic_status": "pending"},
-                "raw": {"fast_evidence": True, "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces]},
-            })
-            self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"]})
-            cluster_ids = []
-            for face in faces:
-                instance = self.store.add_face_instance(asset_id, observation["id"], face)
-                if instance and instance.get("cluster_id"):
-                    cluster_ids.append(instance["cluster_id"])
-            observation = self.store.get_observation(observation["id"])
-            event = self.store.merge_observation_into_event(observation)
-            entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation["id"], event["id"])]
-            self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"], "event_id": event["id"]})
-            return self.store.update_asset(asset_id, "semantic_enriching", {
-                "observation_id": observation["id"], "event_id": event["id"], "cluster_ids": cluster_ids,
-                "entity_ids": entity_ids, "semantic_status": "pending",
-                "fast_processing_seconds": round(time.perf_counter() - started_at, 4),
-            })
+            prepared = self.prepare_fast_image(asset_id)
+            return self.commit_fast_image(asset_id, prepared, started_at=started_at)
         except Exception as error:
             self.store.cleanup_asset_derivatives(asset_id)
             return self.store.update_asset(asset_id, "failed", {"error": str(error)})
 
+    def prepare_fast_image(self, asset_id):
+        """Run face and image embedding inference without writing clustering state."""
+        asset = self.store.get_asset(asset_id)
+        if not asset:
+            raise KeyError(asset_id)
+        if asset.get("media_type") != "image":
+            raise ValueError("fast processing is only available for images")
+        path = asset["path"]
+        started_at = time.perf_counter()
+
+        def timed(callable_):
+            step_started = time.perf_counter()
+            return callable_(), time.perf_counter() - step_started
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sentrix-fast") as executor:
+            face_future = executor.submit(timed, lambda: self.face.detect(path))
+            clip_future = executor.submit(timed, lambda: self.clip.embed_image(path))
+            faces, face_seconds = face_future.result()
+            clip_embedding, clip_seconds = clip_future.result()
+        return {
+            "captured_at": asset.get("captured_at") or file_time(path),
+            "faces": faces,
+            "clip_embedding": clip_embedding,
+            "timings": {
+                "face_detection_seconds": round(face_seconds, 4),
+                "image_clip_seconds": round(clip_seconds, 4),
+                "fast_inference_wall_seconds": round(time.perf_counter() - started_at, 4),
+                "single_image_parallelism": 2,
+            },
+        }
+
+    def commit_fast_image(self, asset_id, prepared, started_at=None):
+        """Commit prepared face/CLIP evidence in deterministic image order."""
+        asset = self.store.get_asset(asset_id)
+        if not asset:
+            raise KeyError(asset_id)
+        started_at = started_at or time.perf_counter()
+        commit_started = time.perf_counter()
+        faces = prepared["faces"]
+        clip_embedding = prepared["clip_embedding"]
+        captured_at = prepared["captured_at"]
+        step_started = time.perf_counter()
+        observation = self.store.add_observation(asset_id, {
+            "source_type": "image_fast_evidence", "caption": "", "captured_at": captured_at,
+            "place": asset.get("captured_location") or "", "confidence": 0.0,
+            "source_owner_id": asset.get("source_owner_id"), "canonical": {"semantic_status": "pending"},
+            "raw": {"fast_evidence": True, "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces]},
+        })
+        observation_write_seconds = time.perf_counter() - step_started
+        step_started = time.perf_counter()
+        self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"]})
+        visual_vector_seconds = time.perf_counter() - step_started
+        step_started = time.perf_counter()
+        cluster_ids = []
+        face_matches = []
+        for face in faces:
+            instance = self.store.add_face_instance(asset_id, observation["id"], face)
+            if instance:
+                if instance.get("cluster_id"):
+                    cluster_ids.append(instance["cluster_id"])
+                face_matches.append({
+                    "face_instance_id": instance.get("id"),
+                    "cluster_id": instance.get("cluster_id"),
+                    "match_score": round(float(instance.get("score") or 0), 4),
+                    "quality": round(float(face.get("quality") or 0), 4),
+                    "identity_eligible": face.get("identity_eligible", True) is not False,
+                })
+        face_clustering_seconds = time.perf_counter() - step_started
+        observation = self.store.get_observation(observation["id"])
+        step_started = time.perf_counter()
+        event = self.store.merge_observation_into_event(observation)
+        event_clustering_seconds = time.perf_counter() - step_started
+        step_started = time.perf_counter()
+        entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation["id"], event["id"])]
+        entity_maintenance_seconds = time.perf_counter() - step_started
+        self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"], "event_id": event["id"]})
+        timings = dict(prepared.get("timings") or {})
+        timings.update({
+            "observation_write_seconds": round(observation_write_seconds, 4),
+            "visual_vector_write_seconds": round(visual_vector_seconds, 4),
+            "face_clustering_seconds": round(face_clustering_seconds, 4),
+            "event_clustering_seconds": round(event_clustering_seconds, 4),
+            "entity_maintenance_seconds": round(entity_maintenance_seconds, 4),
+            "fast_commit_seconds": round(time.perf_counter() - commit_started, 4),
+            "fast_processing_seconds": round(time.perf_counter() - started_at, 4),
+        })
+        return self.store.update_asset(asset_id, "semantic_enriching", {
+            "observation_id": observation["id"], "event_id": event["id"], "cluster_ids": cluster_ids,
+            "entity_ids": entity_ids, "semantic_status": "pending", "face_matches": face_matches,
+            "processing_timings": timings,
+            "fast_processing_seconds": timings["fast_processing_seconds"],
+        })
+
     def enrich_fast_image(self, asset_id, summarize_event=True):
         """Complete an explicitly pending image observation with Gemma semantics."""
+        started_at = time.perf_counter()
+        prepared = self.prepare_semantic_image(asset_id)
+        return self.commit_semantic_image(
+            asset_id, prepared, summarize_event=summarize_event, started_at=started_at)
+
+    def prepare_semantic_image(self, asset_id):
+        """Run VLM and text embedding work without mutating memory state."""
         asset = self.store.get_asset(asset_id)
         metadata = (asset or {}).get("metadata_json") or {}
         if not asset or asset.get("status") != "semantic_enriching" or not metadata.get("observation_id"):
             raise ValueError("asset is not awaiting semantic enrichment")
         started_at = time.perf_counter()
-        observation_id = metadata["observation_id"]
+        vision_started = time.perf_counter()
         analysis = self.gamma.analyze_image(asset["path"], {
             "file_name": asset["file_name"], "captured_at": asset.get("captured_at") or file_time(asset["path"]),
             "captured_location": asset.get("captured_location") or "", "source_owner_id": asset.get("source_owner_id"),
             "location_context": metadata.get("reverse_geocode") or {},
         })
+        vision_seconds = time.perf_counter() - vision_started
         analysis = normalize_semantic_analysis(analysis)
         analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
         analysis["location_context"] = metadata.get("reverse_geocode") or {}
         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
-        observation = self.store.enrich_observation(observation_id, analysis, source="deferred_vision_enrichment")
-        event_id = metadata.get("event_id")
-        entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation_id, event_id)]
-        objects = observation.get("objects") or []
+        objects = analysis.get("objects") or []
         object_text = " ".join(
             item if isinstance(item, str) else " ".join(str(item.get(key, "")) for key in ("label", "primary", "details") if item.get(key))
             for item in objects
         )
-        text = " ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), object_text]))
+        text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text]))
+        embedding_started = time.perf_counter()
         embedding = self.clip.embed_text(text)
+        embedding_seconds = time.perf_counter() - embedding_started
+        return {
+            "analysis": analysis,
+            "embedding": embedding,
+            "timings": {
+                "vlm_image_description_seconds": round(vision_seconds, 4),
+                "text_embedding_seconds": round(embedding_seconds, 4),
+                "semantic_inference_wall_seconds": round(time.perf_counter() - started_at, 4),
+            },
+        }
+
+    def commit_semantic_image(self, asset_id, prepared, summarize_event=False, started_at=None):
+        """Commit prepared semantic data after ordered face/event clustering."""
+        asset = self.store.get_asset(asset_id)
+        metadata = (asset or {}).get("metadata_json") or {}
+        if not asset or asset.get("status") != "semantic_enriching" or not metadata.get("observation_id"):
+            raise ValueError("asset is not awaiting semantic enrichment")
+        started_at = started_at or time.perf_counter()
+        commit_started = time.perf_counter()
+        observation_id = metadata["observation_id"]
+        analysis = prepared["analysis"]
+        step_started = time.perf_counter()
+        observation = self.store.enrich_observation(observation_id, analysis, source="deferred_vision_enrichment")
+        observation_enrichment_seconds = time.perf_counter() - step_started
+        event_id = metadata.get("event_id")
+        step_started = time.perf_counter()
+        entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation_id, event_id)]
+        entity_maintenance_seconds = time.perf_counter() - step_started
+        embedding = prepared["embedding"]
+        step_started = time.perf_counter()
         self.store.upsert_vector("episodic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
         self.store.upsert_vector("semantic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
         if event_id:
@@ -288,9 +403,27 @@ class IngestionPipeline:
                 current_place = str(current.get("place") or "").strip()
                 if current_place in {"", "其他或不确定", "某处", "地点未知", "未标注", "未标注地点", "待判断"}:
                     self.store.update_event(event_id, {"place": display_place})
-            if summarize_event:
-                self.summarize_event(event_id)
-        return self.store.update_asset(asset_id, "processed", {"semantic_status": "complete", "entity_ids": entity_ids, "semantic_enrichment_seconds": round(time.perf_counter() - started_at, 4)})
+        vector_write_seconds = time.perf_counter() - step_started
+        event_summary_seconds = 0.0
+        if event_id and summarize_event:
+            step_started = time.perf_counter()
+            self.summarize_event(event_id)
+            event_summary_seconds = time.perf_counter() - step_started
+        timings = dict(metadata.get("processing_timings") or {})
+        timings.update(prepared.get("timings") or {})
+        timings.update({
+            "observation_enrichment_seconds": round(observation_enrichment_seconds, 4),
+            "semantic_entity_maintenance_seconds": round(entity_maintenance_seconds, 4),
+            "semantic_vector_write_seconds": round(vector_write_seconds, 4),
+            "event_summary_seconds": round(event_summary_seconds, 4),
+            "semantic_commit_seconds": round(time.perf_counter() - commit_started, 4),
+            "semantic_enrichment_seconds": round(time.perf_counter() - started_at, 4),
+        })
+        return self.store.update_asset(asset_id, "processed", {
+            "semantic_status": "complete", "entity_ids": entity_ids,
+            "processing_timings": timings,
+            "semantic_enrichment_seconds": timings["semantic_enrichment_seconds"],
+        })
 
     def summarize_event(self, event_id):
         detail = self.store.get_event_detail(event_id)
