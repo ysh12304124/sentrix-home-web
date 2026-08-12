@@ -9,10 +9,12 @@ recoverable 问题交给 runtime 走"可信事实 + 重写"恢复循环。
 
 from __future__ import annotations
 
+import json
 import re
 
 from .guard_types import (REVISION_HARD_BLOCK, REVISION_REWRITE_ONLY,
-                          GuardIssue, GuardResult)
+                          GuardIssue, GuardResult, SEVERITY_TRUTH,
+                          severity_for_code)
 
 # 显式否认（带宾语），用于 exists=True / 有结果却说没找到
 _DENY_WITH_OBJECT = re.compile(
@@ -27,9 +29,32 @@ _DENY_RECORDS = re.compile(
 # 正向断言找到（exists=False 用），排除 没/未/无 前缀
 _POSITIVE_FOUND = re.compile(
     r"(?<!没)(?<!未)(?<!无)(?:有|找到|存在|拍了?)(?:相关|任何|一些)?(?:的)?(?:照片|记录|回忆|记忆|去)")
-_FOUND_CLAIM = re.compile(r"找到|为您找到|有.{0,10}(照片|记录)")
+_FOUND_CLAIM = re.compile(r"找到|为您找到|(?<!现)(?<!没)(?<!未)(?<!无)有.{0,10}(照片|记录)")
+# 整句否定门槛：含任一否定词时视为未断言“找到/确认”（诚实否认为主）
+_ANY_DENIAL = re.compile(r"没|未|无|不|无法|尚未|谈不上")
+# Phase G G6：肯定性事实断言（工具 total=0 时回答仍断言具体事实 → 编造）
+_AFFIRMATIVE_FACT = re.compile(
+    r"叫[^\s，。！!？?]{1,8}|是[^\s，。！!？?]{1,10}(?:的朋友|的人|的同事|的家人|的同学|的亲戚)"
+    r"|和[^\s，。！!？?]{1,6}(?:一起|同行)|确认是|确定是|就是|价格.{0,6}\d|"
+    r"穿着.{0,8}(?:色|T恤|外套|背心|衬衫)|在(?:照片|画面|图)里.{0,10}是|"
+    r"始建于\d{4}|创始于\d{4}|\d{4}年(?:创办|成立|开业)")
 
 # D1：家庭记忆事实信号（时间/地点/人物/活动/证据词），用于 memory_fact_without_evidence。
+# Phase G：人名断言提取——只抓"同行/身份"语境下对具体人名的强断言（编造拦截）。
+_PERSON_CLAIM = re.compile(
+    r"(?:和|与)\s*([\u4e00-\u9fff]{2,3}?)(?:\s*(?:一起|同行|同去|同游|在|去(?:了|过)?))"
+    r"|(?:朋友|同学|同事|家人|亲戚|熟人|男孩|女孩|儿子|女儿|妻子|老公|老婆|男友|女友|闺女)"
+    r"[^，。！!？?；;]{0,6}(?:是|叫|叫做)\s*([\u4e00-\u9fff]{2,3}?)(?:和([\u4e00-\u9fff]{2,3}))?"
+    r"|(?:一起去|同行|同去)[^，。！!？?]{0,3}(?:是|叫|叫做)\s*([\u4e00-\u9fff]{2,3}?)(?:和([\u4e00-\u9fff]{2,3}))?"
+    r"|(?:叫|叫做)\s*([\u4e00-\u9fff]{2,3})")
+_PERSON_COMMON_NOUNS = {
+    "工友", "朋友", "同学", "同事", "家人", "亲戚", "熟人", "男孩", "女孩", "孩子",
+    "儿子", "女儿", "父母", "爸爸", "妈妈", "大家", "一起", "照片", "画面", "沙雕",
+    "雕塑", "兔子", "表演", "道具", "火把", "菜单", "价格", "颜色", "衣服", "上衣",
+    "游客", "店员",
+}
+_PERSON_PRONOUN_CHARS = set("你我他她这那")
+
 _FAMILY_FACT_RE = re.compile(
     r"\d{4}\s*年|[1-9]?\d\s*月|去年|今年|前年|那年|那天|那次|"
     r"去(?:过|了|玩|到)|到过|去了|在.{0,4}(?:玩|拍|吃|住|度假|旅行|聚会|聚)|"
@@ -65,6 +90,7 @@ def _natural_message(code: str, detail: str = "") -> str:
         "memory_fact_without_evidence": "回答包含了家庭记忆事实，但没有引用任何工具证据（evidence_refs 为空）。请列出你实际引用的工具调用编号；如果没有工具结果支持，如实改为没有找到相关记录",
         "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
         "ocr_value_conflict": "回答里的电话/价格数字与照片文字不一致。请只使用 read_photo_text 实际读到的数字，删除照片文字里没有的数字",
+        "person_fabrication": "回答断言了具体人名，但任何工具观察里都没有这个人名。请删除人名，或如实说明无法确认",
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -75,9 +101,11 @@ def _natural_message(code: str, detail: str = "") -> str:
 
 
 def _issue(code: str, detail: str = "", *, revision=REVISION_REWRITE_ONLY,
-           tool_ref=None, trusted_facts=None) -> GuardIssue:
+           severity: str | None = None, tool_ref=None, trusted_facts=None) -> GuardIssue:
     return GuardIssue(code=code, message=_natural_message(code, detail),
-                      revision=revision, tool_ref=tool_ref,
+                      revision=revision,
+                      severity=severity or severity_for_code(code),
+                      tool_ref=tool_ref,
                       trusted_facts=trusted_facts or [])
 
 
@@ -92,8 +120,11 @@ class FinalGuard:
         issues: list[GuardIssue] = []
         answer = answer or ""
         task_state = task_state or {}
+        # G4：安全层先独立校验（权限/内部结构/非法写）——任何命中都优先于恢复逻辑
+        issues.extend(self._check_safety(answer, task_state))
         issues.extend(self._check_faithfulness(answer, task_state))
         issues.extend(self._check_ocr_hard_values(answer, task_state))
+        issues.extend(self._check_style(answer, task_state))
         # D1：照片/检索类家庭事实回答必须有证据引用（有结果集但 evidence_refs 为空 → recoverable）。
         # 确定性事实操作（query_memory_facts）由上方事实一致性校验兜底，不强制照片引用。
         refs = task_state.get("evidence_refs") or []
@@ -137,15 +168,10 @@ class FinalGuard:
             elif op in {"group", "meal"}:
                 issues.extend(self._check_group(answer, task_state))
         # 0.5 模板占位符泄漏（[地点名称1]/[数量]/[此处填入…店名] 等未填占位）
-        if re.search(r"\[[^\[\]]{0,48}(?:填入|此处|占位|待填|名称|数量|时间|地点|内容|数字|照片|记录|店名|电话|价格|姓名|日期|金额)[^\[\]]{0,36}\]", answer):
+        if re.search(r"\[[^\[\]]{0,48}(?:填入|此处|占位|待填|名称|名字|姓名|朋友|数量|时间|地点|内容|数字|照片|记录|店名|电话|价格|日期|金额)[^\[\]]{0,36}\]", answer):
             issues.append(_issue("placeholder_leak"))
-        # 1. 内部 ID 泄漏（asset_/obs_/entity_ 前缀 + 内部表名）
-        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_|conversation_)[a-f0-9]{6,}\b", answer)
-        if leaks:
-            issues.append(_issue("internal_id_leak", f"{sorted(set(leaks))[:3]}",
-                                 revision=REVISION_HARD_BLOCK))
-        if re.search(r"\b(assets|observations|entity_mentions|semantic_claims)\b", answer):
-            issues.append(_issue("table_name_leak", "", revision=REVISION_HARD_BLOCK))
+        # 0.6 Phase G：断言的人名必须有出处（用户问题/工具观察/最近对话），否则判编造（truth）
+        issues.extend(self._check_person_fabrication(answer, task_state))
         # 2. all 请求但交付不完整
         mode = (task_state or {}).get("result_mode")
         has_more = (task_state or {}).get("has_more")
@@ -162,6 +188,91 @@ class FinalGuard:
             if _FOUND_CLAIM.search(answer):
                 issues.append(_issue("fabrication_from_empty"))
         return GuardResult(issues)
+
+    @staticmethod
+    def _check_person_fabrication(answer: str, task_state: dict) -> list[GuardIssue]:
+        """Phase G：同行/身份语境下断言的具体人名，必须在用户问题、工具观察或最近对话里有出处。
+
+        无任何出处却断言人名 → 编造（truth，可恢复）。观察里通常不直接带人名，
+        因此只拦"强断言"语境，且人名出现在问题/历史/工具文本任一位置即放行。
+        """
+        user_query = str((task_state or {}).get("user_query") or "")
+        history_text = str((task_state or {}).get("history_text") or "")
+        tool_text = "\n".join(
+            json.dumps(tr, ensure_ascii=False)
+            for tr in ((task_state or {}).get("tool_results") or []))
+        names: list[str] = []
+        for m in _PERSON_CLAIM.finditer(answer):
+            for g in m.groups():
+                name = (g or "").strip()
+                if len(name) < 2 or name in _PERSON_COMMON_NOUNS:
+                    continue
+                if any(c in name for c in _PERSON_PRONOUN_CHARS):
+                    continue
+                if re.search(r"[省市县区村镇路街道店园场馆站港]$", name):
+                    continue
+                if name not in names:
+                    names.append(name)
+        issues = []
+        for name in names:
+            if name in user_query or name in tool_text or name in history_text:
+                continue
+            issues.append(_issue("person_fabrication", f"人名「{name}」没有任何检索结果支持"))
+        return issues
+
+    @staticmethod
+    def _check_safety(answer: str, task_state: dict) -> list[GuardIssue]:
+        """G4 Safety Hard Block：权限/范围越权、内部结构泄漏、非法写操作。
+
+        这一层只处理不可放行的安全边界；命中即 hard_block，不走恢复。
+        当前单 owner 场景下多为防御性规则，保持最小集合。
+        """
+        issues: list[GuardIssue] = []
+        scope_id = str((task_state or {}).get("scope_id") or "")
+        viewer_id = str((task_state or {}).get("viewer_id") or "")
+        # 内部标识符显式出现在回答里
+        leaks = re.findall(r"\b(asset_|obs_|entity_|mention_|claim_|turn_|conversation_)[a-f0-9]{6,}\b", answer)
+        if leaks:
+            issues.append(_issue("internal_id_leak", f"{sorted(set(leaks))[:3]}",
+                                 revision=REVISION_HARD_BLOCK))
+        if re.search(r"\b(assets|observations|entity_mentions|semantic_claims|agent_result_sets)\b", answer):
+            issues.append(_issue("table_name_leak", "", revision=REVISION_HARD_BLOCK))
+        # 显式内部字段名（代码级标识符）不应出现在用户可见回答
+        if re.search(r"\b(scope_id|viewer_id|read_write|allowed_tools|max_model_len)\s*[:=]", answer):
+            issues.append(_issue("table_name_leak", "internal_schema", revision=REVISION_HARD_BLOCK))
+        # 越权提示：回答中声称可访问/看到其他相册、他人私有内容（防御性）
+        if re.search(r"别的?相册|他人|别的?人[的]?(?:相册|照片|隐私)|其他用户", answer):
+            issues.append(_issue("viewer_escape", "", revision=REVISION_HARD_BLOCK))
+        # 非法写操作：回答中声称进行了写/删/改（runtime 只读）
+        if re.search(r"(?:已经|帮你|可以)(?:写入|删除|修改|覆盖|清空)(?:了|过)?", answer):
+            issues.append(_issue("write_not_allowed", "", revision=REVISION_HARD_BLOCK))
+        return issues
+
+    @staticmethod
+    def _check_style(answer: str, task_state: dict) -> list[GuardIssue]:
+        """G4 Style Advisory：表达/披露问题——只能建议重写，绝不得 block 事实正确的答案。
+
+        这些规则全部返回 severity=style（由码表推导）。runtime 对 style 只会做一次
+        建议性重写，重写失败或未改变时直接放行原答案。
+        """
+        issues: list[GuardIssue] = []
+        satisfaction = (task_state or {}).get("search_satisfaction")
+        tool_results = (task_state or {}).get("tool_results") or []
+        has_results = any((tr.get("total") or 0) > 0 for tr in tool_results)
+        # 1) 已确认仍过度 hedge：full_support 但整句只有不确定性表述，且无实质事实
+        if satisfaction == "full_support" and has_results:
+            if re.search(r"还不能完全确认|无法完全确认|还不能确定|可能需要再核对", answer) \
+                    and not FinalGuard._has_substantive_fact(answer, task_state):
+                issues.append(_issue("hedge_overuse",
+                                     "工具已经确认了结果，回答应直接给出答案，不要整句只说不确定"))
+        # 2) 检索套话开头：以"找到 N 张候选照片/检索到"开头（非直接回答）
+        if re.match(r"^(?:我|我为您|为您|已经)?(?:找到|检索到|查询到|搜索到)\s*\d+\s*张(?:候选)?照片", answer):
+            issues.append(_issue("not_direct",
+                                 "回答应以用户问题的直接答案开头，不要以检索过程/候选数量开头"))
+        # 3) 结尾套话：把"以上是我目前能确认的部分信息"这类空壳收尾标为 style
+        if re.search(r"以上是我目前能确认的部分信息|以上是目前能确认的部分|以上是我能确认的内容", answer):
+            issues.append(_issue("too_verbose", "回答末尾的'以上是我目前能确认的部分信息'是空壳套话，应删除"))
+        return issues
 
     @staticmethod
     def _has_substantive_fact(answer: str, task_state: dict) -> bool:
@@ -239,7 +350,8 @@ class FinalGuard:
                 issues.append(_issue("omission_conflict",
                                      f"tool={tr.get('tool')},total={total}"))
             if tr.get("tool_call_id") in refs and total == 0 and not denies:
-                if _FOUND_CLAIM.search(answer):
+                if not _ANY_DENIAL.search(answer) \
+                        and (_FOUND_CLAIM.search(answer) or _AFFIRMATIVE_FACT.search(answer)):
                     issues.append(_issue("fabrication_from_empty_ref"))
         inspect_texts = [tr.get("inspect_text") for tr in tool_results
                          if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip()]

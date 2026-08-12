@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import re
 
-from .guard_types import GuardIssue, GuardResult, REVISION_REWRITE_ONLY
+from .guard_types import (GuardIssue, GuardResult, REVISION_REWRITE_ONLY,
+                          SEVERITY_STYLE, SEVERITY_TRUTH)
 
 JUDGE_SYSTEM = """你是 Sentrix 家庭记忆助手的“事实一致性评审”。你的任务是核对模型的最终回答是否忠实于工具观察。
 
@@ -55,6 +56,29 @@ def parse_verdict(raw: str) -> dict | None:
     raw = (raw or "").strip()
     if not raw:
         return None
+
+
+def deterministic_verify(ptype: str, tool_results: list, answer: str) -> bool:
+    """G5：judge claim 是否能由确定性工具证据验证？
+
+    可验证 → 落入 Truth Guard（recoverable）；否则只作为 style/advisory 重写建议。
+    L2 Judge 自己不能 hard block；需要 hard decision 时必须落回确定性证据。
+    """
+    answer = answer or ""
+    if ptype == "omission":
+        # 工具确实返回了结果（total>0 或有观察）且回答否认存在 → 确定性可验证
+        return any((tr.get("total") or 0) > 0 for tr in tool_results or []) \
+            and bool(re.search(r"没有找到|没找到|未找到|不存在|没有相关", answer))
+    if ptype == "fabrication":
+        # 检索为空（total=0）且回答声称找到/有具体事实 → 确定性可验证
+        return any((tr.get("total") or 0) == 0 for tr in tool_results or []) \
+            and bool(re.search(r"找到|有.{0,10}(照片|记录)|确认", answer))
+    if ptype == "certainty_upgrade":
+        # 检索只是 candidate_only 且回答说成确定 → 确定性可验证
+        return any(str(tr.get("satisfaction")) == "candidate_only" for tr in tool_results or []) \
+            and bool(re.search(r"确认|确定是|肯定是|就是", answer))
+    # contradiction / 其他：语义级判断，无确定性证据可对照 → advisory
+    return False
     text = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
     text = re.sub(r"\s*```\s*$", "", text)
     start = text.find("{")
@@ -118,13 +142,22 @@ def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
                                              "评审认为回答与工具观察不一致")
                 if detail:
                     message = f"{message}：{detail}"
+                # G5：可确定性验证的 claim → truth recoverable；否则 style advisory
+                if ptype == "missing_disclosure":
+                    severity = SEVERITY_STYLE
+                elif deterministic_verify(ptype, tool_results, answer):
+                    severity = SEVERITY_TRUTH
+                else:
+                    severity = SEVERITY_STYLE
                 issues.append(GuardIssue(code=f"judge_{ptype}", message=message,
                                          revision=REVISION_REWRITE_ONLY,
+                                         severity=severity,
                                          trusted_facts=list(trusted_facts or [])))
             if not issues:
                 issues.append(GuardIssue(code="judge_unfaithful",
                                          message=_JUDGE_MESSAGE["contradiction"],
                                          revision=REVISION_REWRITE_ONLY,
+                                         severity=SEVERITY_STYLE,
                                          trusted_facts=list(trusted_facts or [])))
             return False, GuardResult(issues)
         return True, GuardResult([])

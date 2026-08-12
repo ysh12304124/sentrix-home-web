@@ -899,7 +899,32 @@ def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
     与 inspect_photo 的分工：inspect_photo 做视觉理解（颜色/物体/场景），
     read_photo_text 做文本读取。内部把照片切成 3x3 tile 放大后交给 VLM OCR，
     避免整图小字被压缩丢失。
+
+    G6：任何未预期异常都降级为 natural partial（status=partial / reason=ocr_failed），
+    绝不让 OCR 失败变成 tool_execution_error 或“这次处理没有完成”式工程错误。
     """
+    try:
+        return _read_photo_text_impl(arguments, context=context)
+    except Exception as exc:
+        try:
+            import sys as _sys
+            print(f"[read_photo_text] ocr_failed fallback: {type(exc).__name__}: {exc}",
+                  file=_sys.stderr)
+        except Exception:
+            pass
+        return {
+            "summary": "这次没能可靠读出照片里的文字。",
+            "full_text": "", "text_regions": [],
+            "certainty": "uncertain",
+            "status": "partial",
+            "reason": "ocr_failed",
+            "persisted": False,
+            "cache_hit": False,
+        }
+
+
+def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> dict:
+    """read_photo_text 实际实现（异常由 _read_photo_text 兜底为 natural partial）。"""
     asset_handle = arguments.get("asset_handle") or ""
     scope_id = (context or {}).get("scope_id") or ""
     task_state = (context or {}).get("task_state") or {}
@@ -940,29 +965,60 @@ def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
     if gamma is None:
         return {"summary": "模型不可用。", "full_text": "", "text_regions": [],
                 "certainty": "uncertain", "persisted": False}
-    # Provider 执行：当前仅 vlm（整图 + 按配置 tile 并行），lightweight 插槽预留。
-    regions = []
-    from concurrent.futures import ThreadPoolExecutor
+    try:
+        # Provider 执行：当前仅 vlm（整图 + 按配置 tile 并行），lightweight 插槽预留。
+        regions = []
+        from concurrent.futures import ThreadPoolExecutor
 
-    def _ocr_once(label, b64):
-        prompt = _OCR_PROMPT_FULL if label == "full_image" else _OCR_PROMPT
+        def _ocr_once(label, b64):
+            prompt = _OCR_PROMPT_FULL if label == "full_image" else _OCR_PROMPT
+            try:
+                raw = gamma.chat(prompt, images=[{"base64": b64, "mime_type": "image/jpeg"}],
+                                 json_mode=False, role="ocr")
+            except Exception as exc:
+                raw = f"__ERROR__ {type(exc).__name__}: {exc}"
+            return label, _clean_ocr_text(raw)
+
+        with open(row["path"], "rb") as fh:
+            full_b64 = base64.b64encode(fh.read()).decode()
+        tiles = []
+        if tile_layout == "3x3":
+            tiles = _tile_images(row["path"], rows=3, cols=3)
+        elif tile_layout == "2x2":
+            tiles = _tile_images(row["path"], rows=2, cols=2)
+        tasks = [("full_image", full_b64)] + tiles
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            results = list(ex.map(lambda item: _ocr_once(*item), tasks))
+        # G6：OCR 全失败（超时/模型不可用/推理错误）→ 显式 partial 语义，不伪装成“照片里没有文字”
+        errors = [text for _, text in results if text.startswith("__ERROR__")]
+        if errors and len(errors) == len(results):
+            timeout_like = any("timeout" in e.lower() or "read" in e.lower() for e in errors)
+            return {
+                "summary": "这次没能可靠读出照片里的文字。",
+                "full_text": "", "text_regions": [],
+                "certainty": "uncertain",
+                "status": "partial",
+                "reason": "ocr_timeout" if timeout_like else "ocr_failed",
+                "persisted": False,
+                "cache_hit": False,
+            }
+    except Exception as exc:
+        # G6：任何未预期 OCR 异常 → 同样降级为 natural partial，绝不暴露工程错误
         try:
-            raw = gamma.chat(prompt, images=[{"base64": b64, "mime_type": "image/jpeg"}],
-                             json_mode=False, role="ocr")
-        except Exception as exc:
-            raw = f"__ERROR__ {exc}"
-        return label, _clean_ocr_text(raw)
-
-    with open(row["path"], "rb") as fh:
-        full_b64 = base64.b64encode(fh.read()).decode()
-    tiles = []
-    if tile_layout == "3x3":
-        tiles = _tile_images(row["path"], rows=3, cols=3)
-    elif tile_layout == "2x2":
-        tiles = _tile_images(row["path"], rows=2, cols=2)
-    tasks = [("full_image", full_b64)] + tiles
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        results = list(ex.map(lambda item: _ocr_once(*item), tasks))
+            import sys as _sys
+            print(f"[read_photo_text] ocr_failed fallback: {type(exc).__name__}: {exc}",
+                  file=_sys.stderr)
+        except Exception:
+            pass
+        return {
+            "summary": "这次没能可靠读出照片里的文字。",
+            "full_text": "", "text_regions": [],
+            "certainty": "uncertain",
+            "status": "partial",
+            "reason": "ocr_failed",
+            "persisted": False,
+            "cache_hit": False,
+        }
     full_clean = ""
     for label, text in results:
         if label == "full_image":

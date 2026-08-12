@@ -1754,6 +1754,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     tool_trace = [
         {"tool": s.get("tool", ""), "status": s.get("status", ""),
          "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
+         "error": s.get("error") or "",
          "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
         for s in turn.steps if s.get("type") == "tool"
     ]

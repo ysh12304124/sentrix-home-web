@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 
 from .budget_manager import BudgetState
+from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
+                         RESOLVE_OCR, RESOLVE_VISUAL)
 from .emergency import render_emergency_summary
 from .final_guard import FinalGuard
 from .judge import judge_faithfulness
@@ -20,6 +23,34 @@ from .profile import get_profile
 from .result_set import TaskState
 from .tool_policy import ToolPolicy
 from .tool_registry import get_tool
+
+
+def _natural_partial(task_state: dict, problems=None) -> str:
+    """G6 Recovery v3 第三层：自然 partial——展示已确认部分与缺口，不猜、不暴露工程错误。"""
+    problems = problems or []
+    issues_text = [str(p) for p in problems]
+    ocr_failed = any("ocr" in p for p in issues_text)
+    if ocr_failed:
+        base = "我找到相关照片了，但这次没能可靠读出里面的文字/数字。原图在下方证据里，你可以直接打开看看。"
+    else:
+        base = "我找到了一些相关记录，但这次没能把你要的信息完全确认出来。"
+    extras: list[str] = []
+    places: list[str] = []
+    for tr in task_state.get("tool_results") or []:
+        if tr.get("tool") == "search_memories":
+            for p in (tr.get("preview") or []) or []:
+                place = str(p.get("place") or "").strip()
+                if len(place) >= 2 and place not in places:
+                    places.append(place)
+        if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
+            extras.append(f"照片复核能看到：{tr['inspect_text'][:80]}")
+        if tr.get("tool") == "read_photo_text" and (tr.get("ocr_text") or "").strip():
+            extras.append(f"照片里读到的文字：{tr['ocr_text'][:80]}")
+    if places:
+        extras.append("能确认的地点：" + "、".join(places[:3]))
+    if extras:
+        base += " " + "；".join(extras[:2]) + "。"
+    return base + "你可以让我继续核对，或换个问法再试。"
 
 
 def _model_visible_observation(observation: dict | None) -> dict:
@@ -168,6 +199,8 @@ class RuntimeTurn:
     task_state: dict = field(default_factory=dict)
     answer_grounding: dict = field(default_factory=dict)
     termination_reason: str = ""
+    ocr_partial: bool = False
+    ocr_partial_reason: str = ""
 
 
 def _trusted_facts(task_state: dict) -> list[str]:
@@ -485,6 +518,8 @@ class AgentRuntime:
         max_visual_retries = 1
         resolution_retries = 0
         max_resolution_retries = 2
+        completion_retries = 0
+        max_completion_retries = 1
         unknown_tool_retries = 0
         max_unknown_tool_retries = 1
         visual_intent = bool(__import__("re").search(
@@ -506,6 +541,8 @@ class AgentRuntime:
             # （同图 OCR 结果已缓存，只有首次需要长预算）
             turn.budget.wall_time_s = max(turn.budget.wall_time_s, 240)
         turn.budget.max_inspections = adaptive_inspections
+        # Phase G G3：Completion State / Gate —— 最小动态 requirements（不重建 Planner）
+        completion = CompletionState(message)
         while True:
             if not turn.budget.can_model_step():
                 turn.status = "partial" if turn.steps else "timeout"
@@ -619,7 +656,48 @@ class AgentRuntime:
                             "请先调用 inspect_photo（asset_handle 用 preview 里的 handle），得到观察后再输出 final。"
                         )})
                     continue
+                # Phase G G3：Completion Gate —— retrieve_evidence / deliver_media 等需求未完成时，
+                # 只告诉模型“任务还没完成”，由模型自己决定下一步 Tool（不重建 Planner）。
+                # 先保存模型产出的 final 文本：gate 后续模型调用失败时也不丢失已产出回答（D12）。
                 turn.final_answer = str(action.get("answer") or "")
+                try:
+                    from .final_writer import naturalize_answer
+                    turn.final_answer = naturalize_answer(turn.final_answer)
+                except Exception:
+                    pass
+                completion.update(task.as_dict())
+                gate_prompted = False
+                for req in completion.blocking():
+                    if req.code == RESOLVE_OCR and _pending_resolution(task):
+                        continue  # 已由上方 recommended_resolution 流程处理
+                    if req.code == RESOLVE_VISUAL and search_has_preview and not inspect_called \
+                            and visual_intent and visual_retries < max_visual_retries:
+                        continue  # 已由上方视觉流程处理
+                    if completion_retries < max_completion_retries \
+                            and turn.budget.can_model_step():
+                        completion_retries += 1
+                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                        if req.code == RETRIEVE_EVIDENCE:
+                            messages.append({"role": "user", "content": (
+                                f"{req.reason} 这是完成回答的必要步骤：请先调用检索工具"
+                                "（search_memories / query_memory_facts / get_core_memory / get_person_memory），"
+                                "拿到工具结果后再输出 final。"
+                            )})
+                        elif req.code == DELIVER_MEDIA:
+                            messages.append({"role": "user", "content": (
+                                f"{req.reason} 请调用 {req.tool}（使用 search_memories 返回的 result_set_id）"
+                                "交付可查看的照片后再输出 final。"
+                            )})
+                        else:
+                            messages.append({"role": "user", "content": (
+                                f"{req.reason} 这是完成回答的必要步骤：你必须立即调用 {req.tool}"
+                                "（asset_handle 用 search_memories 返回的 preview handle，如 photo_1），"
+                                "先拿到实际结果，再基于结果输出 final。"
+                            )})
+                        gate_prompted = True
+                        break
+                if gate_prompted:
+                    continue
                 # Phase F F1：Final Answer Writer——草稿违反 Answer Policy 时用受控事实重写
                 if turn.final_answer and turn.budget.can_model_step():
                     try:
@@ -630,12 +708,16 @@ class AgentRuntime:
                             rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
                             if rewritten and rewritten != turn.final_answer:
                                 turn.steps.append({"type": "writer", "status": "rewritten"})
-                                turn.final_answer = rewritten
+                                turn.final_answer = naturalize_answer(rewritten)
                     except Exception:
                         pass
                 problems = guard.check(
                     turn.final_answer,
                     task_state={
+                        "scope_id": self.scope_id,
+                        "viewer_id": self.viewer_id,
+                        "user_query": message,
+                        "history_text": history,
                         "result_mode": task.result_mode,
                         "has_more": task.has_more,
                         "delivery_state": task.delivery_state,
@@ -677,6 +759,35 @@ class AgentRuntime:
                         turn.steps.append({"type": "judge", "status": "skipped",
                                            "reason": f"model_call_error:{exc}"})
                 if problems:
+                    severity = problems.severity if hasattr(problems, "severity") else "truth"
+                    if severity == "hard_block":
+                        # G4 Safety Hard Block：权限/隐私/内部泄漏/非法写 —— 不可放行、不可恢复
+                        turn.status = "blocked_by_guard"
+                        turn.reason = "hard_block:" + ";".join(problems)
+                        if task.tool_results:
+                            turn.final_answer = render_emergency_summary(
+                                task.as_dict(), reason="回答未通过事实校验")
+                        break
+                    if severity == "style":
+                        # G4 Style Advisory：只做一次建议性重写；重写失败/未改变 → 放行原答案
+                        # （绝不得把事实正确的答案变成 blocked_by_guard）
+                        if turn.final_answer and turn.budget.can_model_step():
+                            try:
+                                from .final_writer import (build_final_context, needs_rewrite,
+                                                          rewrite_final)
+                                fctx = build_final_context(message, task.as_dict())
+                                if needs_rewrite(turn.final_answer, fctx):
+                                    turn.budget.record_model_step()
+                                    rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
+                                    if rewritten and rewritten != turn.final_answer:
+                                        turn.steps.append({"type": "writer",
+                                                           "status": "rewritten_style"})
+                                        turn.final_answer = rewritten
+                            except Exception:
+                                pass
+                        turn.status = "complete"
+                        break
+                    # G4 Truth Recoverable → Recovery v3：rewrite → one tool recovery → natural partial
                     if guard_retries < max_guard_retries and turn.budget.can_model_step():
                         guard_retries += 1
                         self._emit_progress(
@@ -723,17 +834,71 @@ class AgentRuntime:
                         )
                         messages.append({"role": "user", "content": recovery})
                         continue
-                    turn.status = "blocked_by_guard"
-                    turn.reason = ";".join(problems)
-                    if task.tool_results:
-                        turn.final_answer = render_emergency_summary(
-                            task.as_dict(), reason="回答未通过事实校验")
+                    # Recovery v3 第二层：一次工具恢复——仍有证据解析需求未满足且预算允许
+                    recovery_tool = None
+                    if turn.budget.can_tool_call():
+                        completion.update(task.as_dict())
+                        for req in completion.blocking():
+                            if req.code in (RESOLVE_OCR, RESOLVE_VISUAL) and req.tool:
+                                recovery_tool = req.tool
+                                break
+                    if recovery_tool:
+                        preview = (task.result_preview or []) or []
+                        spec = get_tool(recovery_tool)
+                        if spec is not None and preview:
+                            auto_args = {"asset_handle": preview[0]}
+                            if recovery_tool == "read_photo_text":
+                                auto_args["question"] = message
+                            self._emit_progress(
+                                turn, progress_callback, stage="inspecting", status="running",
+                                text=f"正在复核照片 {preview[0]}…" if recovery_tool == "inspect_photo"
+                                else "正在读取照片中的文字…")
+                            auto_decision = policy.execute(spec, auto_args, context={
+                                "scope_id": self.scope_id, "viewer_id": self.viewer_id,
+                                "task_state": task.as_dict(), "history": history,
+                                "conversation_id": self.conversation_id,
+                            })
+                            if auto_decision.allowed:
+                                task.update_from_tool(recovery_tool, auto_args,
+                                                       auto_decision.observation or {})
+                                task.record_tool_result(f"recovery_{recovery_tool}", recovery_tool,
+                                                        auto_decision.observation or {})
+                                completion.update(task.as_dict())
+                                if recovery_tool == "read_photo_text" \
+                                        and (auto_decision.observation or {}).get("status") == "partial":
+                                    turn.ocr_partial = True
+                                    turn.ocr_partial_reason = str(
+                                        auto_decision.observation.get("reason") or "ocr_failed")
+                                messages.append({"role": "assistant",
+                                                 "content": _model_visible_action(action)})
+                                messages.append({"role": "tool",
+                                                 "tool_call_id": f"recovery_{recovery_tool}",
+                                                 "content": json.dumps(
+                                                     _model_visible_observation(
+                                                         auto_decision.observation),
+                                                     ensure_ascii=False)})
+                                messages.append({"role": "user", "content": (
+                                    "我重新读取了一次照片，请基于新的工具观察，直接输出一个修正后的 final。"
+                                )})
+                                continue
+                    # Recovery v3 第三层：natural partial —— 展示已确认部分与缺口，不放错误答案
+                    turn.status = "partial"
+                    turn.reason = "truth_unresolved:" + ";".join(problems[:4])
+                    turn.final_answer = _natural_partial(task.as_dict(), problems)
                     break
                 self._emit_progress(
                     turn, progress_callback,
                     stage="finalizing", status="complete",
                     text="正在整理回答…")
-                turn.status = "complete"
+                # G6：OCR 显式 partial —— 读文字失败且回答如实反映“没读清”时，
+                # 以 natural partial 收尾（status=partial, reason=ocr_timeout），不猜、不暴露工程错误
+                if turn.ocr_partial and re.search(
+                        r"没(?:能|有)?(?:可靠)?读(?:出|到|清)|读不清|看不清|无法读取|没能读出|没有读到|读不出来",
+                        turn.final_answer or ""):
+                    turn.status = "partial"
+                    turn.reason = turn.ocr_partial_reason or "ocr_timeout"
+                else:
+                    turn.status = "complete"
                 break
             if action.get("action") != "tool_call":
                 turn.status = "error"
@@ -830,6 +995,14 @@ class AgentRuntime:
                 break
             task.update_from_tool(tool_name, arguments, result.observation or {})
             task.record_tool_result(tool_call_id, tool_name, result.observation or {})
+            completion.update(task.as_dict())
+            # G6：OCR 显式 partial（超时/失败）→ 记录到 turn，用于最终 natural partial 语义
+            if tool_name == "read_photo_text" and (result.observation or {}).get("status") == "partial":
+                turn.ocr_partial = True
+                turn.ocr_partial_reason = str(result.observation.get("reason") or "ocr_failed")
+                self._emit_progress(
+                    turn, progress_callback, stage="tool_result", status="partial",
+                    text="这次没能可靠读出照片里的文字…")
             if tool_name == "search_memories" and (result.observation or {}).get("can_inspect"):
                 search_has_preview = True
             if tool_name == "inspect_photo":
@@ -840,6 +1013,7 @@ class AgentRuntime:
                 _model_visible_observation(result.observation), ensure_ascii=False)})
 
         turn.task_state = task.as_dict()
+        turn.task_state["completion"] = completion.as_dict()
         turn.answer_grounding = _build_answer_grounding(
             message=message, task=task, selected_handle=selected_handle)
         turn.termination_reason = _classify_termination(turn)
@@ -851,6 +1025,8 @@ def _classify_termination(turn: RuntimeTurn) -> str:
     reason = turn.reason or ""
     if turn.status == "complete":
         return "complete"
+    if turn.reason == "ocr_timeout":
+        return "ocr_timeout"
     if turn.status == "blocked_by_guard" or "guard" in reason:
         return "guard_recovery_exhausted"
     if "unparseable" in reason:

@@ -27,6 +27,14 @@ _HEDGE_WHEN_CONFIRMED_RE = re.compile(r"还不能完全确认|无法完全确认
 _PROMISE_RE = re.compile(r"我(?:可以|能|会)?(?:继续)?(?:帮你|为您)?(?:再)?(?:核对|确认|查看|找)")
 _DENIES_FOUND_RE = re.compile(r"没有找到|没找到|未找到|没有获取到|找不到|不存在相关|没有相关")
 
+# Phase G G7：空壳收尾/套话（自然化时删除，不引入新事实）
+_BOILERPLATE_TAIL_RE = re.compile(
+    r"[。；]?(?:以上是我目前能确认的部分信息|以上是目前能确认的部分|以上是我能确认的内容|"
+    r"以上是能确认的内容|以上是部分确认信息)[。！!]?\s*$")
+_TAIL_JUNK_RE = re.compile(
+    r"[；。](?:找到\s*\d+\s*张接近的照片|部分信息能对上，还有细节不能完全确认|"
+    r"我可以继续帮你核对|目前看起来有\s*\d+\s*张相关照片)[。！!]?\s*$")
+
 _CERTAINTY_LABEL = {
     "full_support": "confirmed",
     "partial_support": "likely",
@@ -139,7 +147,31 @@ def needs_rewrite(answer: str, context: dict) -> bool:
         return True
     if context.get("resolution_state") == "unresolved" and _PROMISE_RE.search(answer):
         return True
+    if _BOILERPLATE_TAIL_RE.search(answer) or _TAIL_JUNK_RE.search(answer):
+        return True
     return False
+
+
+def naturalize_answer(answer: str) -> str:
+    """G7：确定性自然化——删除空壳收尾套话，保留全部实质事实。
+
+    只做删减与标点整理，绝不改写数字/价格/人名/地点等硬值，也不新增内容。
+    """
+    text = (answer or "").strip()
+    if not text:
+        return text
+    # 迭代删除：空壳收尾可能是嵌套的（"…找到 N 张接近的照片。；部分信息能对上。以上是…"）
+    for _ in range(3):
+        new = _BOILERPLATE_TAIL_RE.sub("", text)
+        new = _TAIL_JUNK_RE.sub("", new)
+        new = re.sub(r"(?:^|。)(?:以上是我|以上是|以上是我目前)(?:能确认的|目前能确认的)(?:部分|内容)。?", "", new)
+        if new == text:
+            break
+        text = new
+    text = text.strip().strip("； ")
+    if text and text[-1] not in "。！？!?；":
+        text += "。"
+    return text
 
 
 _WRITER_SYSTEM = (

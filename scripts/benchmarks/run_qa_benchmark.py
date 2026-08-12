@@ -19,6 +19,7 @@
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import re
 import sys
@@ -428,6 +429,36 @@ def main():
     out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # G8：manifest / checksum —— QA 数据集在跑前/跑后必须一致，不一致拒绝 run
+    qa_md5 = hashlib.md5(qa_path.read_bytes()).hexdigest()
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+        expected = manifest.get("qa_checksum_md5")
+        if expected and expected != qa_md5:
+            sys.exit(
+                f"[拒绝] QA manifest 校验失败：当前文件 md5={qa_md5}，"
+                f"manifest 记录={expected}（{manifest.get('qa_file','')}）。"
+                "QA 数据集被修改过，为保持基准可比性已终止。如确需更换数据集，请先更新 manifest.json。")
+    else:
+        manifest = {
+            "qa_file": str(qa_path),
+            "qa_checksum_md5": qa_md5,
+            "cases": len(rows_in),
+            "scope_id": args.scope,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+        print(f"[manifest] 首次运行，已记录 QA 数据集 md5={qa_md5}")
+    # 跑完后再次校验，防止运行期间数据集被改动
+    _after_md5 = hashlib.md5(qa_path.read_bytes()).hexdigest()
+    if _after_md5 != qa_md5:
+        sys.exit(f"[拒绝] QA 文件在运行期间被修改（{qa_md5} -> {_after_md5}），结果作废。")
+
     print("=" * 90)
     print(f"Sentrix QA 自动测评 | base={args.base} scope={args.scope} qa={qa_path}")
     h = health(args.base)
@@ -476,7 +507,8 @@ def main():
     (run_dir / "qa_result.json").write_text(json.dumps(run_payload, ensure_ascii=False, indent=2),
                                             encoding="utf-8")
     run_meta = {"run_id": run_id, "tag": args.tag, "created_at": meta["timestamp"],
-                "note": args.note, "branch_153": "", "profile": (h.get("agent") or {}).get("profile", "")}
+                "note": args.note, "branch_153": "", "profile": (h.get("agent") or {}).get("profile", ""),
+                "qa_file": str(qa_path), "qa_checksum_md5": qa_md5, "cases": len(rows_in)}
     (run_dir / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2),
                                            encoding="utf-8")
     # 最新副本（兼容旧工具）
@@ -490,7 +522,8 @@ def main():
                            {"run_id": run_id, "meta": meta, "summary": summary,
                             "rows": results, "asset_map": asset_map_rev,
                             "tag": args.tag, "note": args.note,
-                            "profile": run_meta["profile"]}, timeout=120)
+                            "profile": run_meta["profile"],
+                            "qa_checksum_md5": qa_md5}, timeout=120)
             uploaded = up.get("status") == "ok"
             print(f"Dashboard 上传: {up.get('status')} ({up.get('run_id')})")
         except Exception as exc:
