@@ -665,13 +665,17 @@ class AgentRuntime:
                 if not problems and task.tool_results and turn.budget.can_model_step():
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
-                    faithful, judge_problems = judge_faithfulness(
-                        self.chat_fn, query=message, tool_results=task.tool_results,
-                        answer=turn.final_answer, trusted_facts=trusted)
-                    turn.steps.append({"type": "judge", "faithful": faithful,
-                                       "problems": list(judge_problems)})
-                    if not faithful:
-                        problems = judge_problems
+                    try:
+                        faithful, judge_problems = judge_faithfulness(
+                            self.chat_fn, query=message, tool_results=task.tool_results,
+                            answer=turn.final_answer, trusted_facts=trusted)
+                        turn.steps.append({"type": "judge", "faithful": faithful,
+                                           "problems": list(judge_problems)})
+                        if not faithful:
+                            problems = judge_problems
+                    except Exception as exc:
+                        turn.steps.append({"type": "judge", "status": "skipped",
+                                           "reason": f"model_call_error:{exc}"})
                 if problems:
                     if guard_retries < max_guard_retries and turn.budget.can_model_step():
                         guard_retries += 1
