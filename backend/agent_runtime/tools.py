@@ -797,12 +797,16 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     gamma = _RUNTIME.get("gamma")
     if gamma is None:
         return {"summary": "模型不可用。", "certainty": "uncertain", "persisted": False}
+    model_call_metrics = []
     try:
         image = {"base64": _base64_image(row["path"]), "mime_type": _mime_for(row["path"])}
         raw = gamma.chat(_INSPECT_PROMPT.format(question=question), images=[image],
                          json_mode=True, role="inspect")
     except Exception as exc:
-        return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False}
+        model_call_metrics = gamma.get_and_clear_call_metrics()
+        return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False,
+                "_model_call_metrics": model_call_metrics}
+    model_call_metrics = gamma.get_and_clear_call_metrics()
     try:
         start, end = raw.find("{"), raw.rfind("}")
         parsed = json.loads(raw[start:end + 1]) if start >= 0 else {}
@@ -816,6 +820,7 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         "confirms_visual_only": True,
         "source": "runtime_visual_inspection",
         "persisted": False,
+        "_model_call_metrics": model_call_metrics,
     }
 
 
@@ -1302,6 +1307,7 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
     if cached is not None:
         hit = dict(cached)
         hit["cache_hit"] = True
+        hit["_model_call_metrics"] = []
         return hit
     gamma = _RUNTIME.get("gamma")
     if gamma is None:
@@ -1315,12 +1321,15 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
 
         def _ocr_once(label, b64):
             prompt = _OCR_PROMPT_FULL if label == "full_image" else _OCR_PROMPT
+            metrics = []
             try:
                 raw = gamma.chat(prompt, images=[{"base64": b64, "mime_type": "image/jpeg"}],
                                  json_mode=False, role="ocr")
             except Exception as exc:
                 raw = f"__ERROR__ {type(exc).__name__}: {exc}"
-            return label, _clean_ocr_text(raw)
+            finally:
+                metrics = gamma.get_and_clear_call_metrics()
+            return label, _clean_ocr_text(raw), metrics
 
         with open(row["path"], "rb") as fh:
             full_b64 = base64.b64encode(fh.read()).decode()
@@ -1332,8 +1341,8 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
         tasks = [("full_image", full_b64)] + tiles
         with ThreadPoolExecutor(max_workers=4) as ex:
             results = list(ex.map(lambda item: _ocr_once(*item), tasks))
-        # G6：OCR 全失败（超时/模型不可用/推理错误）→ 显式 partial 语义，不伪装成“照片里没有文字”
-        errors = [text for _, text in results if text.startswith("__ERROR__")]
+        # G6：OCR 全失败（超时/模型不可用/推理错误）→ 显式 partial 语义，不伪装成"照片里没有文字"
+        errors = [text for _, text, _ in results if text.startswith("__ERROR__")]
         if errors and len(errors) == len(results):
             timeout_like = any("timeout" in e.lower() or "read" in e.lower() for e in errors)
             return {
@@ -1344,6 +1353,7 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
                 "reason": "ocr_timeout" if timeout_like else "ocr_failed",
                 "persisted": False,
                 "cache_hit": False,
+                "_model_call_metrics": [],
             }
     except Exception as exc:
         # G6：任何未预期 OCR 异常 → 同样降级为 natural partial，绝不暴露工程错误
@@ -1361,9 +1371,14 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
             "reason": "ocr_failed",
             "persisted": False,
             "cache_hit": False,
+            "_model_call_metrics": [],
         }
     full_clean = ""
-    for label, text in results:
+    model_call_metrics = []
+    for label, text, metrics in results:
+        for metric in metrics:
+            metric["tool_subtask"] = label
+            model_call_metrics.append(metric)
         if label == "full_image":
             full_clean = text
             continue
@@ -1384,8 +1399,11 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
         "cache_hit": False,
         "vlm_calls": len(tasks),
         "fallback_used": small_attempted,
+        "_model_call_metrics": model_call_metrics,
     }
-    _OCR_CACHE[cache_key] = result
+    cached_result = dict(result)
+    cached_result.pop("_model_call_metrics", None)
+    _OCR_CACHE[cache_key] = cached_result
     record_ocr_telemetry("vlm", time.monotonic() - _vlm_t0, result.get("confidence"),
                          fallback=small_attempted)
     return result

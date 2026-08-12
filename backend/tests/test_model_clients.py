@@ -4,10 +4,47 @@ from unittest.mock import patch
 from pathlib import Path
 import tempfile
 
+import httpx
+
 from backend.model_clients import ContextBudgetExceeded, GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
+from backend.agent_runtime.tool_policy import ToolPolicy
 
 
 class ModelClientTests(unittest.TestCase):
+    def test_tool_policy_preserves_private_model_metrics_for_runtime_extraction(self):
+        payload = {
+            "summary": "done",
+            "_model_call_metrics": [{"role": "inspect", "status": "error"}],
+            "private_value": "hidden",
+        }
+
+        sanitized = ToolPolicy._sanitize(payload, "inspect_photo")
+
+        self.assertEqual(sanitized["_model_call_metrics"], payload["_model_call_metrics"])
+        self.assertNotIn("private_value", sanitized)
+
+    @patch("backend.model_clients.httpx.post")
+    def test_failed_multimodal_call_keeps_error_metrics(self, post):
+        request = httpx.Request("POST", "http://sentrix-vllm/v1/chat/completions")
+        response = httpx.Response(400, request=request)
+        post.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "bad request", request=request, response=response)
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+
+        with self.assertRaises(Exception):
+            client.chat(
+                "看图", [{"base64": "image", "mime_type": "image/jpeg"}],
+                json_mode=True, role="inspect",
+            )
+
+        metrics = client.get_and_clear_call_metrics()
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(metrics[0]["role"], "inspect")
+        self.assertEqual(metrics[0]["status"], "error")
+        self.assertIn("bad request", metrics[0]["error"])
+        self.assertFalse(metrics[0]["streamed"])
+        self.assertIsNotNone(metrics[0]["total_ms"])
+
     def test_chat_messages_caps_output_to_remaining_context(self):
         client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
         with patch.object(client, "_tokenize_for_budget", return_value={

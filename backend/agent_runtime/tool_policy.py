@@ -57,7 +57,7 @@ class ToolPolicy:
         "remaining", "counts", "coverage", "facts", "items", "completeness",
         "unresolved", "delivered", "blocked", "observation", "certainty",
         "confirms_visual_only", "source", "persisted", "question", "asset_handle",
-        "reason", "url", "status",
+        "reason", "url", "status", "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {

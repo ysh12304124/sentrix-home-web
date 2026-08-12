@@ -1763,7 +1763,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                         zh += sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
         return int(zh * 0.7 + (total - zh) * 0.25) + 400
 
-    def chat_fn(messages):
+    def chat_fn(messages, *, call_type="agent", step_id=None):
         max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
         # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
         # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
@@ -1773,9 +1773,15 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                 max_tokens = max(64, room)
         except Exception:
             pass
-        text = gamma.chat_messages(
-            messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
-        model_call_metrics.extend(gamma.get_and_clear_call_metrics())
+        try:
+            text = gamma.chat_messages(
+                messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
+        finally:
+            metrics = gamma.get_and_clear_call_metrics()
+            for metric in metrics:
+                metric["call_type"] = call_type
+                metric["step_id"] = step_id
+            model_call_metrics.extend(metrics)
         return text
 
     _ocr_setting = store.get_setting("ocr.small_enabled", "false").lower() in {"1", "true", "on"}
@@ -1795,7 +1801,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                        selected_handle=selected_asset_handle,
                        selected_result_set_id=selected_result_set_id,
                        conversation_summary=conversation_summary)
-    model_call_metrics.extend(gamma.get_and_clear_call_metrics())
+    residual_metrics = gamma.get_and_clear_call_metrics()
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
     trace = []
@@ -1803,6 +1809,15 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         item = {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
                 "reason": s.get("reason") or "",
                 "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
+        if s.get("step_id"):
+            item["step_id"] = s.get("step_id")
+        if s.get("parent_step_id"):
+            item["parent_step_id"] = s.get("parent_step_id")
+        if s.get("call_type"):
+            item["call_type"] = s.get("call_type")
+        for field in ("trigger", "action", "tool", "answer_preview", "attempt"):
+            if s.get(field) is not None:
+                item[field] = s.get(field)
         if s.get("type") == "judge":
             item["detail"] = {"faithful": s.get("faithful"),
                               "problems": list(s.get("problems") or [])}
@@ -1812,6 +1827,78 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         if isinstance(s.get("arguments"), dict):
             item["args"] = s.get("arguments")
         trace.append(item)
+
+    metrics_by_step = {}
+    unassigned_metrics = []
+    for metric in model_call_metrics:
+        step_id = metric.get("step_id")
+        if step_id:
+            metrics_by_step.setdefault(step_id, []).append(metric)
+        else:
+            unassigned_metrics.append(metric)
+    ordered_metrics = []
+    for step in turn.steps:
+        step_id = step.get("step_id")
+        step_type = step.get("type")
+        for metric in metrics_by_step.pop(step_id, []):
+            metric["call_observation"] = {
+                "kind": metric.get("call_type") or "unknown",
+                "label": {
+                    "agent": "Agent 决策 / 回答",
+                    "recovery": "Agent 恢复调用",
+                    "writer": "最终回答重写",
+                    "faithfulness_judge": "L2 事实一致性检查",
+                }.get(metric.get("call_type"), "模型调用"),
+                "purpose": {
+                    "agent": "选择下一步工具或生成候选回答",
+                    "recovery": "根据运行时纠正信息重新决策或修正回答",
+                    "writer": "基于受控事实调整最终回答的结构和措辞",
+                    "faithfulness_judge": "检查候选回答是否与工具事实一致",
+                }.get(metric.get("call_type"), "执行模型推理"),
+                "trigger": step.get("trigger") or "",
+                "outcome": (
+                    f"决定调用工具 {step.get('tool')}" if step.get("action") == "tool_call"
+                    else "生成候选回答" if step.get("action") == "final"
+                    else f"判定 {'通过' if step.get('faithful') else '未通过'}"
+                    if step_type == "judge" and step.get("faithful") is not None
+                    else f"重写状态：{step.get('status')}" if step_type == "writer"
+                    else f"调用失败：{step.get('reason')}" if step.get("status") == "error"
+                    else "完成模型推理"
+                ),
+                "source": "backend_recorded",
+                "related_tool": step.get("tool") or None,
+            }
+            ordered_metrics.append(metric)
+        if step_type == "tool":
+            internal_metrics = step.get("internal_model_call_metrics") or []
+            for index, metric in enumerate(internal_metrics, 1):
+                metric["call_type"] = "tool_internal"
+                metric["step_id"] = f"{step_id}:model_{index}" if step_id else None
+                metric["parent_step_id"] = step_id
+                subtask = metric.get("tool_subtask")
+                metric["call_observation"] = {
+                    "kind": "tool_internal",
+                    "label": "工具内部模型调用",
+                    "purpose": (
+                        "读取照片中的文字" if step.get("tool") == "read_photo_text"
+                        else "识别照片中的视觉细节"
+                    ),
+                    "trigger": f"工具 {step.get('tool')} 执行内部推理",
+                    "outcome": (
+                        f"调用失败：{metric.get('error') or '未返回结果'}"
+                        if metric.get("status") == "error" else
+                        f"完成 {subtask} 子任务" if subtask else
+                        f"完成 {step.get('tool')} 的模型处理"
+                    ),
+                    "source": "backend_recorded",
+                    "related_tool": step.get("tool") or None,
+                    "parent_step_id": step_id,
+                }
+                ordered_metrics.append(metric)
+    for metrics in metrics_by_step.values():
+        ordered_metrics.extend(metrics)
+    ordered_metrics.extend(unassigned_metrics)
+    ordered_metrics.extend(residual_metrics)
     guard_debug = {
         "status": turn.status,
         "reason": turn.reason or "",
@@ -1824,16 +1911,26 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                    "problems": list(s.get("problems") or [])}
                   for s in turn.steps if s.get("type") == "judge"],
     }
+    # 结构层诊断：从 turn.steps 提炼稳定语义字段，底层实现变化只改此处。
+    _det_step = next((s for s in turn.steps
+                      if s.get("type") == "nucleus" and s.get("status") == "rendered"), None)
+    guard_debug["deterministic_delivery"] = {
+        "rendered": _det_step is not None,
+        "kind": _det_step.get("kind") if _det_step else None,
+    }
     tool_trace = [
         {"tool": s.get("tool", ""), "status": s.get("status", ""),
          "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
          "error": s.get("error") or "",
-         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
+         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing"),
+         "provider": (s.get("observation") or {}).get("provider"),
+         "fallback_used": (s.get("observation") or {}).get("fallback_used"),
+         "step_id": s.get("step_id"), "parent_step_id": s.get("parent_step_id")}
         for s in turn.steps if s.get("type") == "tool"
     ]
     return {
         "answer": turn.final_answer,
-        "model_call_metrics": model_call_metrics,
+        "model_call_metrics": ordered_metrics,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
         "evidence_status": "tool_loop",
@@ -1846,6 +1943,10 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "guard_debug": guard_debug,
         "answer_grounding": turn.answer_grounding,
         "termination_reason": turn.termination_reason,
+        "delivery_status": {
+            "ocr_partial": getattr(turn, "ocr_partial", False),
+            "ocr_partial_reason": getattr(turn, "ocr_partial_reason", "") or None,
+        },
     }
 
 

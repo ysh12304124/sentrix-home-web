@@ -591,6 +591,7 @@ class GammaClient:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        request_started = time.perf_counter()
         try:
             return self._chat_openai_stream(
                 endpoint_base, payload, headers, role, model, json_mode=False,
@@ -610,6 +611,20 @@ class GammaClient:
                     "token_count_source": "vllm_tokenize" if budget else "response_usage",
                 })
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            self._record_call_metrics(role, model, endpoint_base, {
+                "status": "error",
+                "error": str(error),
+                "ttft_ms": None,
+                "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
+                "prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
+                "completion_tokens": None,
+                "tokens_per_second": None,
+                "streamed": True,
+                "requested_max_tokens": requested_max_tokens,
+                "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
+                "max_model_len": int(budget["max_model_len"]) if budget else None,
+                "token_count_source": "vllm_tokenize" if budget else None,
+            })
             raise ModelError(f"gamma request failed: {error}") from error
 
     def _tokenize_for_budget(self, endpoint_base, messages):
@@ -717,6 +732,7 @@ class GammaClient:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        request_started = time.perf_counter()
         try:
             if use_stream:
                 return self._chat_openai_stream(endpoint_base, payload, headers, role, model, json_mode)
@@ -736,6 +752,16 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            self._record_call_metrics(role, model, endpoint_base, {
+                "status": "error",
+                "error": str(error),
+                "ttft_ms": None,
+                "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "tokens_per_second": None,
+                "streamed": use_stream,
+            })
             raise ModelError(f"gamma request failed: {error}") from error
 
     def _chat_openai_stream(self, endpoint_base, payload, headers, role, model, json_mode=False,
