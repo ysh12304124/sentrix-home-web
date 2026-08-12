@@ -1,18 +1,25 @@
 """L1 FinalGuard — 结构性兜底（Phase H H7 拍板后的最小集合）。
 
-设计原则：回答"是否合格"（事实正确性、数字/词语等价、编造/矛盾/漏报）全部由 L2 模型评审
-（judge.py）判断，L1 不再用词语/数字正则做合格性匹配——例如"三个人"与"3"是等价表达，
+设计原则：回答"是否合格"（事实正确性、数字/词语等价、编造/矛盾/漏报）由 L2 模型评审
+（judge.py）判断，L1 不做词语/数字正则的合格性匹配——例如"三个人"与"3"是等价表达，
 不得由死代码判错。
 
-L1 只保留无法靠模型兜底的结构性检查：
-- Safety Hard Block：权限/范围越权、内部 ID/表结构泄漏、非法写操作（不可放行）。
-- 模板占位符泄漏：[地点名称]/[数量] 等未填占位直接泄漏给用户。
-- 未调用任何检索工具却声称"没有找到相关记录"（流程结构错误，必须纠正后重试检索）。
-- all 请求但结果还有更多（交付不完整）。
-- 声称全部交付但 delivered 数不足（交付矛盾）。
+L1 保留的确定性检查分两类：
+1. 纯结构兜底（模型无法兜底）：
+   - Safety Hard Block：权限/范围越权、内部 ID/表结构泄漏、非法写操作（不可放行）。
+   - 模板占位符泄漏：[地点名称]/[数量] 等未填占位直接泄漏给用户。
+   - 未调用任何检索工具却声称"没有找到相关记录"（流程结构错误，必须纠正后重试检索）。
+   - all 请求但结果还有更多（交付不完整）。
+   - 声称全部交付但 delivered 数不足（交付矛盾）。
+2. 最小确定性存在性检查（Truth Guard，可恢复，不是词语等价判断）：
+   - 工具确认存在（total>0 / exists=True）但回答整体否认存在 → omission / exists 矛盾。
+   - 工具确认不存在（total=0 / exists=False）但回答明确断言已交付/找到 → fabrication。
+   这两类是可确定性验证的存在性矛盾（"有结果却说没找到/没结果却说找到"），
+   不涉及"三个人 vs 3"、同义词、日期格式等语义等价——等价性仍全部由 L2 模型判断。
+   诚实的不确定性（"无法确认/还不能确定"）与条件级否认（"没找到能确认爬山
+   的记录"）不算整体否认，不做拦截。
 
-事实性判断（编造/矛盾/漏报/过度声称/缺口披露）→ L2 judge；运行时异常/空观察/预算耗尽
-→ runtime 的 emergency/natural partial 路径，均不在本模块。
+运行时异常/空观察/预算耗尽 → runtime 的 emergency/natural partial 路径，不在本模块。
 """
 
 from __future__ import annotations
@@ -22,10 +29,28 @@ import re
 from .guard_types import (REVISION_HARD_BLOCK, REVISION_REWRITE_ONLY,
                           GuardIssue, GuardResult)
 
-# D12：记录级否认（"没有找到相关记录"），用于"未检索就声称找不到"检查；
-# 不含"我没去过北京"这类出行否定。
-_DENY_RECORDS = re.compile(
-    r"没(?:有)?找到|未找到|找不到|查无|没有(?:任何|符合|相关|一张|一个|一条|拍到|拍过)?(?:照片|记录|回忆|记忆)", re.I)
+# 检索/事实类工具（存在性判断只针对这些工具的结果）
+_RETRIEVAL_TOOLS = {"search_memories", "query_memory_facts", "search_conversation_history",
+                    "get_core_memory", "get_person_memory", "get_result_page"}
+
+# 整体否认存在（带明确宾语/动作）：total>0 / exists=True 时回答却说没找到。
+# 只匹配"明确否认找到照片/记录"这类整体否定，不含"我没去过北京"这类出行否定。
+_DENY_EXISTS = re.compile(
+    r"没(?:有)?找到|未找到|找不到|查无|"
+    r"没有(?:任何|符合|相关|一张|一个|一条|拍到|拍过|去过)?(?:照片|记录|回忆|记忆|相关)", re.I)
+# 只是不确定/hedge，不算整体否认（"无法确认/还不能确定/可能没有"等）
+_HEDGE = re.compile(
+    r"无法确认|不能确认|不确定|还不能|暂时|无法判断|记不清|可能没有|未必|没有完全|不能确定", re.I)
+# 条件级否认："没找到能确认'爬山'的记录"≠"没有找到照片"，不算整体否认
+_CONDITION_LEVEL_DENY = re.compile(
+    r"没(?:有)?找到(?:能|办法|足够|明确|可以){0,2}(?:确认|确定|验证|证实)", re.I)
+# 明确交付/找到断言（total=0 / exists=False 时回答却断言已找到/交付）
+_FOUND_DELIVERY = re.compile(
+    r"(?:已|为)?(?:为您|为你)?找到|已找到|找到了|"
+    r"找到\s*\d+\s*张|这是(?:您|你)要找的|这就是(?:您|你)?要的|"
+    r"有(?:一张|两张|几张|相关|这些)?(?:照片|记录)", re.I)
+# 整句否定门槛：含明确否定词时不视为"断言找到/交付"
+_ANY_DENIAL = re.compile(r"没|未|无|不|无法|尚未", re.I)
 
 
 def _natural_message(code: str, detail: str = "") -> str:
@@ -35,6 +60,10 @@ def _natural_message(code: str, detail: str = "") -> str:
         "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
         "all_requested_but_has_more": "用户要求全部结果，但结果集还有更多未交付。请继续取回剩余结果，或如实说明只交付了部分",
         "delivery_contradiction": "你的回答声称已经全部交付，但实际没有交付任何结果。请如实说明交付情况",
+        "omission_conflict": "工具确认存在相关结果（total>0），但你的回答却说没有找到。请基于工具结果如实回答存在的情况，不要整体否认",
+        "fabrication_from_empty": "工具确认不存在相关结果（total=0），但你的回答却声称找到了/已交付。请删除没有证据的找到/交付断言",
+        "fact_exists_contradiction": "工具确认存在相关记录，但你的回答却说没有找到。请改为如实说明已确认存在",
+        "fact_exists_contradiction_false": "工具确认不存在相关记录，但你的回答却声称找到了。请删除没有证据的找到断言",
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -69,11 +98,10 @@ class FinalGuard:
             issues.append(_issue("placeholder_leak"))
         # D12：声称"没有找到记录"但本轮从未调用任何检索工具 → 必须纠正后重试检索。
         tool_results = task_state.get("tool_results") or []
-        retrieval_tools = {"search_memories", "query_memory_facts", "search_conversation_history",
-                           "get_core_memory", "get_person_memory", "get_result_page"}
-        if not any((tr.get("tool") or "") in retrieval_tools for tr in tool_results) \
-                and _DENY_RECORDS.search(answer):
+        if not any((tr.get("tool") or "") in _RETRIEVAL_TOOLS for tr in tool_results)                 and _DENY_EXISTS.search(answer):
             issues.append(_issue("denial_without_search"))
+        # H7：最小确定性存在性检查（Truth Guard，可恢复）——total 与回答的存在性断言矛盾
+        issues.extend(self._check_existence(answer, task_state))
         # all 请求但交付不完整
         mode = (task_state or {}).get("result_mode")
         has_more = (task_state or {}).get("has_more")
@@ -83,6 +111,46 @@ class FinalGuard:
         if task_state.get("delivery_state") == "complete" and delivered_count == 0:
             issues.append(_issue("delivery_contradiction"))
         return GuardResult(issues)
+
+    @staticmethod
+    def _check_existence(answer: str, task_state: dict) -> list[GuardIssue]:
+        """最小确定性存在性检查：工具确认存在/不存在 vs 回答的整体否认/交付断言。
+
+        只做可确定性验证的存在性矛盾，不判断任何词语等价：
+        - 任一检索工具 total>0 且回答整体否认存在 → omission_conflict
+        - 任一检索工具 total=0 且回答明确断言已找到/交付 → fabrication_from_empty
+        - query_memory_facts exists=True 且回答整体否认 → fact_exists_contradiction
+        - query_memory_facts exists=False 且回答明确断言已找到 → fact_exists_contradiction_false
+        诚实不确定性（hedge）与条件级否认不触发。
+        """
+        answer = (answer or "").strip()
+        if not answer:
+            return []
+        issues: list[GuardIssue] = []
+        tool_results = task_state.get("tool_results") or []
+        # 整体否认（排除 hedge 与条件级否认）
+        denies = bool(_DENY_EXISTS.search(answer))             and not _HEDGE.search(answer)             and not _CONDITION_LEVEL_DENY.search(answer)
+        # 明确交付/找到断言（排除否定句："没有找到"不算）
+        found_claim = bool(_FOUND_DELIVERY.search(answer)) and not _ANY_DENIAL.search(answer)
+
+        retrieval_rows = [tr for tr in tool_results
+                          if (tr.get("tool") or "") in _RETRIEVAL_TOOLS
+                          and tr.get("total") is not None]
+        if any((tr.get("total") or 0) > 0 for tr in retrieval_rows) and denies:
+            issues.append(_issue("omission_conflict",
+                                 f"tool={[tr.get('tool') for tr in retrieval_rows if (tr.get('total') or 0) > 0][:2]}"))
+        if any((tr.get("total") or 0) == 0 for tr in retrieval_rows) and found_claim:
+            issues.append(_issue("fabrication_from_empty",
+                                 f"tool={[tr.get('tool') for tr in retrieval_rows if (tr.get('total') or 0) == 0][:2]}"))
+
+        # query_memory_facts exists 操作的确定性事实
+        if task_state.get("last_tool") == "query_memory_facts"                 and task_state.get("fact_operation") == "exists":
+            expected = task_state.get("fact_value")
+            if expected is True and denies:
+                issues.append(_issue("fact_exists_contradiction", "expected=True"))
+            elif expected is False and found_claim:
+                issues.append(_issue("fact_exists_contradiction_false", "expected=False"))
+        return issues
 
     @staticmethod
     def _check_safety(answer: str, task_state: dict) -> list[GuardIssue]:

@@ -51,14 +51,15 @@ class ExistsRegressionTests(unittest.TestCase):
         self.assertEqual(list(FinalGuard().check(
             "我确认过记录，但没有完全确认时间范围。", task_state=_exists_state(True))), [])
 
-    def test_exists_true_denial_passes_l1(self):
-        # 存在性矛盾交给 L2；L1 不得用"没有找到"正则误伤
+    def test_exists_true_denial_blocked(self):
+        # 确定性存在性矛盾（工具确认存在、回答整体否认）由 L1 Truth Guard 拦截
         problems = FinalGuard().check("没有找到任何相关照片。", task_state=_exists_state(True))
-        self.assertEqual(list(problems), [])
+        self.assertTrue(any("fact_exists_contradiction" in p for p in problems))
+        self.assertEqual(problems.severity, "truth")
 
-    def test_exists_false_assertion_passes_l1(self):
+    def test_exists_false_assertion_blocked(self):
         problems = FinalGuard().check("有照片，我找到了。", task_state=_exists_state(False))
-        self.assertEqual(list(problems), [])
+        self.assertTrue(any("fact_exists_contradiction_false" in p for p in problems))
 
     def test_exists_false_denial_passes(self):
         self.assertEqual(list(FinalGuard().check(
@@ -101,6 +102,8 @@ class PlaceAggregationRegressionTests(unittest.TestCase):
         self.assertEqual(list(problems), [])
 
     def test_place_omission_passes_l1(self):
+        # "没去过任何地方"是出行断言否定（语义级），非"没找到照片"的整体否认；
+        # 由 L2 模型判定，L1 不拦
         problems = FinalGuard().check("去年没有去过任何地方。", task_state=_search_state(
             "full_support", {"杭州": "confirmed"}))
         self.assertEqual(list(problems), [])
@@ -150,21 +153,24 @@ class CandidateUpgradeRegressionTests(unittest.TestCase):
 
 
 class L1StructuralBatteryTests(unittest.TestCase):
-    """L1 结构性电池：只有结构性违规才拦；所有词语/数字合格性场景一律放行。"""
+    """L1 电池：结构性检查 + 最小确定性存在性检查拦截；
+    数字等价/同义词/candidate 升级等语义合格性一律放行（交给 L2）。"""
 
     BATTERY = [
         # (answer, state, expect_blocked)
         ("查过了，2023年5月拍过照片。", _exists_state(True), False),
-        ("没有找到任何相关照片。", _exists_state(True), False),          # 交给 L2
+        ("没有找到任何相关照片。", _exists_state(True), True),          # 存在性矛盾
         ("没有找到相关记录。", _exists_state(False), False),
-        ("有照片，我找到了。", _exists_state(False), False),              # 交给 L2
+        ("有照片，我找到了。", _exists_state(False), True),             # 存在性矛盾
         ("去年去过杭州和绍兴。", {"tool_results": [{"tool": "query_memory_facts", "total": 2}]}, False),
         ("去年去过杭州和拉萨。", {"tool_results": [{"tool": "query_memory_facts", "total": 2}]}, False),
         ("找到几张接近的候选，还不能完全确认。", _search_state("candidate_only", {"爬山": "unknown"}), False),
         ("找到了爬山的照片，确认是。", _search_state("candidate_only", {"爬山": "unknown"}), False),
         ("确认是爬山。", _search_state("candidate_only", {"爬山": "unknown"}, inspect="有积雪"), False),
-        ("没有找到相关照片。", {"tool_results": []}, True),               # denial_without_search
+        ("没有找到相关照片。", {"tool_results": []}, True),             # denial_without_search
         ("地点是[地点名称1]。", {"tool_results": [{"tool": "search_memories", "total": 2}]}, True),  # placeholder
+        ("照片里有三个人。", _search_state("full_support", total=3), False),   # 数字等价不拦
+        ("照片里有三个人。", _search_state("full_support", total=5), False),   # 实质冲突交给 L2
     ]
 
     def test_l1_structural_battery(self):
@@ -211,7 +217,8 @@ class RecoverySuccessMetricsTests(unittest.TestCase):
             turn = self._run(seed, script, question)
             self.assertEqual(turn.status, "complete", f"recovery failed for: {question}")
             judge_steps = [s for s in turn.steps if s.get("type") == "judge"]
-            self.assertGreaterEqual(len(judge_steps), 2)
+            # L1 存在性检查先拦，恢复后 L2 judge 确认忠实
+            self.assertGreaterEqual(len(judge_steps), 1)
             if judge_steps[-1]["faithful"] is True and turn.status == "complete":
                 recovered += 1
         self.assertGreaterEqual(recovered / len(cases), 0.9)

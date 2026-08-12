@@ -99,14 +99,14 @@ class GuardExistsRegressionTests(unittest.TestCase):
         problems = FinalGuard().check("我确认过记录，但没有完全确认时间范围。", task_state=self._state(True))
         self.assertEqual(list(problems), [])
 
-    def test_exists_true_explicit_denial_passes_l1(self):
-        # exists 否认属于事实矛盾，由 L2 模型评审判定；L1 不做"没有找到"词语拦截
+    def test_exists_true_explicit_denial_blocked(self):
+        # 确定性存在性矛盾（工具确认存在、回答整体否认）由 L1 Truth Guard 拦截
         problems = FinalGuard().check("没有找到任何相关照片。", task_state=self._state(True))
-        self.assertEqual(list(problems), [])
+        self.assertTrue(any("fact_exists_contradiction" in p for p in problems))
 
-    def test_exists_false_assertion_passes_l1(self):
+    def test_exists_false_assertion_blocked(self):
         problems = FinalGuard().check("有照片，我找到了。", task_state=self._state(False))
-        self.assertEqual(list(problems), [])
+        self.assertTrue(any("fact_exists_contradiction_false" in p for p in problems))
 
     def test_exists_false_denial_passes(self):
         problems = FinalGuard().check("没有找到相关记录。", task_state=self._state(False))
@@ -337,11 +337,12 @@ class GuardDebugTraceTests(unittest.TestCase):
         store.connection.commit()
         runtime_tools.bind_runtime(store)
         runtime_tools.register_tools()
+        # H7：确定性存在性矛盾（工具 exists=True、回答整体否认）由 L1 Truth Guard
+        # 直接拦截；恢复后重写答案通过 L1，再由 L2 模型评审放行。
         script = [
             '{"action":"tool_call","tool":"query_memory_facts","arguments":'
             '{"operation":"exists","filters":{"time":"2023年5月"}},"public_status":"正在查询…"}',
             '{"action":"final","answer":"没有找到任何相关照片。","evidence_refs":["tool_call_1"]}',
-            '{"faithful": false, "problems": [{"type": "omission", "detail": "工具确认存在相关记录，回答却说没有找到"}], "reason": "存在性矛盾"}',
             '{"action":"final","answer":"2023年5月拍过照片。","evidence_refs":["tool_call_1"]}',
             '{"faithful": true, "problems": []}',
         ]
@@ -354,12 +355,15 @@ class GuardDebugTraceTests(unittest.TestCase):
         self.assertEqual(turn.status, "complete")
         guard_steps = [s for s in turn.steps if s.get("type") == "guard"]
         self.assertGreaterEqual(len(guard_steps), 2)
-        # L1 结构性检查全部 pass；事实矛盾由 L2 judge 拦截
-        self.assertTrue(all(s["status"] == "pass" for s in guard_steps))
+        # 第一轮 final 被 L1 存在性检查确定性拦截（fact_exists_contradiction）
+        self.assertEqual(guard_steps[0]["status"], "fail")
+        self.assertIn("fact_exists_contradiction", guard_steps[0]["codes"])
+        # 恢复后的重写答案通过 L1 结构性检查
+        self.assertEqual(guard_steps[-1]["status"], "pass")
         judge_steps = [s for s in turn.steps if s.get("type") == "judge"]
         self.assertGreaterEqual(len(judge_steps), 1)
-        self.assertFalse(judge_steps[0]["faithful"])
-        self.assertEqual(judge_steps[-1]["faithful"], True)
+        # 重写后 L2 模型评审判定通过，不再误拦正确回答
+        self.assertTrue(judge_steps[-1]["faithful"])
         recovering = [p for p in turn.public_progress if p.get("stage") == "recovering"]
         self.assertEqual(len(recovering), 1)
         # 恢复后的最终回答是可信事实重写，不是失败文案

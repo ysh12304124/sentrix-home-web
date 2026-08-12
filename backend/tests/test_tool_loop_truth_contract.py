@@ -64,10 +64,18 @@ class FaithfulnessGuardTests(unittest.TestCase):
         problems = g.check("找到几张接近的候选，还不能完全确认是爬山合影。", task_state=self._state())
         self.assertEqual(problems, [])
 
-    def test_omission_passes_l1(self):
+    def test_omission_conflict_blocked_by_l1(self):
+        # 最小确定性存在性检查：工具确认存在（total>0）、回答整体否认 → L1 拦截
         g = FinalGuard()
         problems = g.check("我没有找到任何相关照片。", task_state=self._state(
             satisfaction="full_support", conditions={"semantic": "confirmed"}))
+        self.assertIn("omission_conflict", list(problems))
+
+    def test_condition_level_denial_passes_l1(self):
+        # 条件级否认（"没找到能确认爬山的记录"）不是整体否认 → 放行交 L2
+        g = FinalGuard()
+        problems = g.check("我没找到能明确确认爬山的记录。", task_state=self._state(
+            conditions={"爬山": "unknown"}))
         self.assertEqual(list(problems), [])
 
     def test_certainty_upgrade_passes_l1(self):
