@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from backend.agent_runtime.answer_nucleus import build_nucleus
 from decompose_layers import decompose_row, decompose_summary, aggregate_tool_perf
 
 DEFAULT_QA = "/Users/rm001/Downloads/album3/qa/full-album3.jsonl"
@@ -266,12 +267,22 @@ def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total
     score = evidence_score(evidence, qa.get("answer_evidence_image_ids") or [])
     judge = judge_answer(qa["question"], qa.get("answer") or "", answer,
                          qa.get("answerability") == "answerable", judge_base) if judge_enabled else None
+    try:
+        _nuc = build_nucleus(result.get("task_state") or {}, qa.get("question", ""))
+        nucleus = {v.kind: {"value": v.display or str(v.value), "unit": v.unit,
+                            "certainty": v.certainty}
+                   for v in _nuc.values
+                   if v.kind in ("count", "date", "first", "last", "result_total",
+                                 "boolean", "price", "phone", "year")}
+    except Exception:
+        nucleus = {}
     row = {
         "qa_id": qa["qa_id"],
         "question": qa["question"],
         "gold_answer": qa.get("answer", ""),
         "answer": answer,
         "status": status,
+        "nucleus": nucleus,
         "reason": result.get("tool_loop_reason") or "",
         "tools": tools,
         "latency_s": latency,

@@ -77,7 +77,7 @@ class ToolPolicy:
         "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
         "inspect_photo": _DEFAULT_ALLOWED,
         "read_photo_text": _DEFAULT_ALLOWED | {
-            "full_text", "text_regions",
+            "full_text", "text_regions", "confidence", "exact_values", "fallback_used",
         },
         "search_conversation_history": _DEFAULT_ALLOWED | {
             "query", "scope", "matches", "note",

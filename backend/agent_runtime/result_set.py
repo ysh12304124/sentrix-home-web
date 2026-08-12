@@ -215,6 +215,11 @@ class TaskState:
             "recommended_resolution": observation.get("recommended_resolution"),
             "preview": observation.get("preview"),
             "condition_summary": observation.get("condition_summary"),
+            # Phase H H4：OCR 结构化硬值（供 nucleus 提取与 guard 校验）
+            "exact_values": observation.get("exact_values") or [],
+            "provider": observation.get("provider"),
+            "confidence": observation.get("confidence"),
+            "fallback_used": observation.get("fallback_used"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):

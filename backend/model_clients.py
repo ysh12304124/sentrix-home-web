@@ -669,6 +669,13 @@ class GammaClient:
         completion_tokens = None
         with httpx.stream("POST", f"{endpoint_base}/chat/completions",
                            json=payload, headers=headers, timeout=self.timeout) as response:
+            if response.status_code >= 400:
+                try:
+                    import sys as _sys
+                    _body = response.read().decode("utf-8", errors="replace")[:2000]
+                    print(f"[gamma] HTTP {response.status_code} body: {_body}", file=_sys.stderr)
+                except Exception:
+                    pass
             response.raise_for_status()
             for line in response.iter_lines():
                 if not line or not line.startswith("data: "):

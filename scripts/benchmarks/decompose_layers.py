@@ -41,7 +41,45 @@ JARGON_TERMS = [
     "相似匹配", "关键词的相似", "基于关键词", "相似度", "top", "得分",
 ]
 
-_LAYER_ORDER = ["R", "V", "O", "T", "S", "G", "J"]
+_LAYER_ORDER = ["R", "V", "O", "T", "S", "G", "J", "D"]
+
+
+def _decompose_d(row: dict) -> tuple[str, str]:
+    """Phase H — D 层：确定性交付（Deterministic Delivery）。
+
+    基于 run 时快照的 nucleus（result_total/count/date 等硬值）校验 final：
+    - 答案出现与核值不同的数量 → fail
+    - 答案日期与核值日期不同 → fail
+    - 硬值保持 → pass；无核值 → na
+    """
+    nucleus = row.get("nucleus") or {}
+    answer = re.sub(r"\s+", "", row.get("answer") or "" or "")
+    question = row.get("question") or ""
+    if not nucleus:
+        return "na", "无确定性核值"
+    issues: list[str] = []
+    rv = nucleus.get("result_total")
+    if rv:
+        m = re.search(r"(?<!\d)(\d+)\s*张", answer)
+        if m and int(m.group(1)) != int(rv["value"]):
+            issues.append(f"total={rv['value']}但答案={m.group(1)}张")
+    cv = nucleus.get("count")
+    if cv:
+        for m in re.finditer(r"(?<!\d)(\d+)\s*(?:个|条|张)", answer):
+            if int(m.group(1)) != int(cv["value"]):
+                issues.append(f"count={cv['value']}但答案={m.group(1)}")
+                break
+    for kind in ("date", "first", "last"):
+        dv = nucleus.get(kind)
+        if not dv:
+            continue
+        d = str(dv["value"])[:10]
+        m = re.search(r"(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})", answer)
+        if m:
+            got = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+            if got != d:
+                issues.append(f"date={d}但答案={got}")
+    return ("fail", "；".join(issues[:3])) if issues else ("pass", "硬值保持")
 
 
 def _has(tools, names) -> bool:
@@ -171,6 +209,11 @@ def decompose_row(row: dict) -> dict:
     else:
         layers["J"] = "fail"
         detail["J"] = "judge 调用失败"
+
+    # D (Phase H)：确定性交付
+    d_res, d_detail = _decompose_d(row)
+    layers["D"] = d_res
+    detail["D"] = d_detail
 
     primary = next((L for L in _LAYER_ORDER if layers.get(L) == "fail"), None)
     return {"primary": primary or "PASS", "layers": layers, "detail": detail}

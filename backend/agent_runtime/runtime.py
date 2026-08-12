@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass, field
 
 from .budget_manager import BudgetState
+from .answer_nucleus import (build_nucleus, classify_deterministic,
+                             render_simple)
 from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
                          RESOLVE_OCR, RESOLVE_VISUAL)
 from .emergency import render_emergency_summary
@@ -201,6 +203,7 @@ class RuntimeTurn:
     termination_reason: str = ""
     ocr_partial: bool = False
     ocr_partial_reason: str = ""
+    nucleus_injected: bool = False
 
 
 def _trusted_facts(task_state: dict) -> list[str]:
@@ -349,12 +352,14 @@ class AgentRuntime:
     """Thin tool-loop runtime. 模型调用通过传入的 chat_fn 注入。"""
 
     def __init__(self, *, chat_fn, profile_name: str | None = None,
-                 scope_id="home-default", viewer_id="owner", conversation_id=None):
+                 scope_id="home-default", viewer_id="owner", conversation_id=None,
+                 ocr_settings: dict | None = None):
         self.chat_fn = chat_fn
         self.profile = get_profile(profile_name)
         self.scope_id = scope_id
         self.viewer_id = viewer_id
         self.conversation_id = conversation_id
+        self.ocr_settings = ocr_settings or {}
 
     def _tool_descriptions(self) -> str:
         lines = []
@@ -545,12 +550,39 @@ class AgentRuntime:
         completion = CompletionState(message)
         while True:
             if not turn.budget.can_model_step():
+                # Phase H H4：步骤耗尽但 OCR 已读到确定性硬值时，直接渲染交付（不依赖 12B 收尾）
+                if task.tool_results:
+                    try:
+                        nuc = build_nucleus(task.as_dict(), message)
+                        kind = classify_deterministic(message)
+                        simple = render_simple(nuc, kind, message) if kind else None
+                        if simple:
+                            turn.steps.append({"type": "nucleus", "status": "rendered",
+                                               "kind": kind, "value": simple[:40]})
+                            turn.final_answer = simple
+                            turn.status = "complete"
+                            turn.reason = ""
+                            turn.termination_reason = "deterministic_at_step_limit"
+                            break
+                    except Exception:
+                        pass
                 turn.status = "partial" if turn.steps else "timeout"
                 turn.reason = "model step budget exhausted"
                 if task.tool_results:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="预算用尽")
                 break
             turn.budget.record_model_step()
+            # Phase H H-A：确定性硬值约束——工具已确认的数量/日期/OCR 硬值注入，
+            # 禁止 12B 在生成 final 时改写（只注入一次，约束文本很短）。
+            if not turn.nucleus_injected and task.tool_results:
+                try:
+                    nuc = build_nucleus(task.as_dict(), message)
+                    ctext = nuc.constraint_text()
+                    if ctext:
+                        messages.append({"role": "system", "content": ctext})
+                    turn.nucleus_injected = True
+                except Exception:
+                    turn.nucleus_injected = True
             try:
                 raw = self.chat_fn(messages)
             except Exception as exc:
@@ -613,11 +645,28 @@ class AgentRuntime:
                                 "scope_id": self.scope_id, "viewer_id": self.viewer_id,
                                 "task_state": task.as_dict(), "history": history,
                                 "conversation_id": self.conversation_id,
+                                "ocr_settings": self.ocr_settings,
                             })
                             if auto_decision.allowed:
                                 task.update_from_tool(tool_name, auto_args, auto_decision.observation or {})
                                 task.record_tool_result(f"auto_{tool_name}", tool_name,
                                                         auto_decision.observation or {})
+                                # Phase H H-A：自动解析后若已是确定性问题（价格/年份/数量/日期），
+                                # 直接用 Nucleus 渲染，不再消耗模型步骤（12B 常因步骤耗尽无法收尾）。
+                                try:
+                                    if tool_name == "read_photo_text":
+                                        nuc = build_nucleus(task.as_dict(), message)
+                                        kind = classify_deterministic(message)
+                                        simple = render_simple(nuc, kind, message) if kind else None
+                                        if simple:
+                                            turn.steps.append({"type": "nucleus", "status": "rendered",
+                                                               "kind": kind, "value": simple[:40]})
+                                            turn.final_answer = simple
+                                            turn.status = "complete"
+                                            turn.termination_reason = "deterministic_after_auto"
+                                            break
+                                except Exception:
+                                    pass
                                 messages.append({"role": "assistant", "content": _model_visible_action(action)})
                                 messages.append({"role": "tool", "tool_call_id": f"auto_{tool_name}",
                                                  "content": json.dumps(
@@ -665,6 +714,22 @@ class AgentRuntime:
                     turn.final_answer = naturalize_answer(turn.final_answer)
                 except Exception:
                     pass
+                # Phase H H-A：简单确定性问题（数量/日期/布尔）直接按 Nucleus 确定性渲染，
+                # 不再把 total=5 交给 12B 自由改写（reg3 少报根因）。
+                try:
+                    if task.tool_results:
+                        nuc = build_nucleus(task.as_dict(), message)
+                        kind = classify_deterministic(message)
+                        if kind:
+                            simple = render_simple(nuc, kind, message)
+                            if simple:
+                                turn.steps.append({"type": "nucleus", "status": "rendered",
+                                                   "kind": kind, "value": simple[:40]})
+                                turn.final_answer = simple
+                        else:
+                            print(f"[nucleus] kind={kind} no_simple nuc_price={[v.label for v in nuc.all('price')] if nuc else None}", file=__import__("sys").stderr)
+                except Exception as exc:
+                    print(f"[nucleus] render error: {type(exc).__name__}: {exc}", file=__import__("sys").stderr)
                 completion.update(task.as_dict())
                 gate_prompted = False
                 for req in completion.blocking():
@@ -787,6 +852,22 @@ class AgentRuntime:
                                 pass
                         turn.status = "complete"
                         break
+                    # Phase H H4：guard 拦截后若问题可确定性渲染（价格/年份/数量），直接交付硬值
+                    if task.tool_results:
+                        try:
+                            nuc = build_nucleus(task.as_dict(), message)
+                            kind = classify_deterministic(message)
+                            simple = render_simple(nuc, kind, message) if kind else None
+                            if simple:
+                                turn.steps.append({"type": "nucleus", "status": "rendered",
+                                                   "kind": kind, "value": simple[:40]})
+                                turn.final_answer = simple
+                                turn.status = "complete"
+                                turn.reason = ""
+                                turn.termination_reason = "deterministic_after_guard"
+                                break
+                        except Exception:
+                            pass
                     # G4 Truth Recoverable → Recovery v3：rewrite → one tool recovery → natural partial
                     if guard_retries < max_guard_retries and turn.budget.can_model_step():
                         guard_retries += 1
@@ -857,6 +938,7 @@ class AgentRuntime:
                                 "scope_id": self.scope_id, "viewer_id": self.viewer_id,
                                 "task_state": task.as_dict(), "history": history,
                                 "conversation_id": self.conversation_id,
+                                "ocr_settings": self.ocr_settings,
                             })
                             if auto_decision.allowed:
                                 task.update_from_tool(recovery_tool, auto_args,
@@ -968,6 +1050,7 @@ class AgentRuntime:
                 "scope_id": self.scope_id, "viewer_id": self.viewer_id,
                 "task_state": task.as_dict(), "history": history,
                 "conversation_id": self.conversation_id,
+                "ocr_settings": self.ocr_settings,
             })
             latency = round(time.monotonic() - t0, 2)
             result = ToolResult(tool=tool_name,

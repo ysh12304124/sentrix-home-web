@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import re
 
+from .answer_nucleus import build_nucleus, check_nucleus_preservation
+
 from .guard_types import (REVISION_HARD_BLOCK, REVISION_REWRITE_ONLY,
                           GuardIssue, GuardResult, SEVERITY_TRUTH,
                           severity_for_code)
@@ -91,6 +93,8 @@ def _natural_message(code: str, detail: str = "") -> str:
         "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
         "ocr_value_conflict": "回答里的电话/价格数字与照片文字不一致。请只使用 read_photo_text 实际读到的数字，删除照片文字里没有的数字",
         "person_fabrication": "回答断言了具体人名，但任何工具观察里都没有这个人名。请删除人名，或如实说明无法确认",
+        "count_conflict": "工具确认的结果数量是 {expected}，但你的回答写成了别的数字。请改为工具确认的数量",
+        "count_missing": "用户问的是数量，你的回答没有给出工具确认的数量 {expected}"
     }
     text = base.get(code, f"回答与工具结果不一致（{code}）")
     if "{expected}" in text:
@@ -110,6 +114,7 @@ def _issue(code: str, detail: str = "", *, revision=REVISION_REWRITE_ONLY,
 
 
 class FinalGuard:
+    _LABEL_NOISE = __import__("re").compile(r"^[口冷热黑白]+$")
     def __init__(self, *, scope_id="home-default", viewer_id="owner", result_sets=None):
         self.scope_id = scope_id
         self.viewer_id = viewer_id
@@ -172,6 +177,8 @@ class FinalGuard:
             issues.append(_issue("placeholder_leak"))
         # 0.6 Phase G：断言的人名必须有出处（用户问题/工具观察/最近对话），否则判编造（truth）
         issues.extend(self._check_person_fabrication(answer, task_state))
+        # 0.7 Phase H H-A：确定性交付——final 不得改写工具确认的数量/日期（Nucleus 兜底校验）
+        issues.extend(self._check_deterministic_delivery(answer, task_state))
         # 2. all 请求但交付不完整
         mode = (task_state or {}).get("result_mode")
         has_more = (task_state or {}).get("has_more")
@@ -188,6 +195,35 @@ class FinalGuard:
             if _FOUND_CLAIM.search(answer):
                 issues.append(_issue("fabrication_from_empty"))
         return GuardResult(issues)
+
+    @staticmethod
+    def _check_deterministic_delivery(answer: str, task_state: dict) -> list[GuardIssue]:
+        """Phase H H-A：确定性值（数量/日期）防改写兜底。
+
+        简单确定性问题直接渲染（runtime），但复杂回答仍可能被 12B 改写；
+        这里用 Nucleus 硬校验 final：答案出现与核值不同的数量 → count_conflict；
+        问题明确问数量但答案没给核值数量 → count_missing。
+        """
+        if not (answer or "").strip():
+            return []
+        question = str((task_state or {}).get("user_query") or "")
+        issues: list[GuardIssue] = []
+        try:
+            nucleus = build_nucleus(task_state, question)
+            codes = check_nucleus_preservation(answer, nucleus, question)
+        except Exception:
+            return issues
+        for code in codes:
+            if code.startswith("count_conflict"):
+                expected = code.split("expected=")[-1]
+                issues.append(_issue("count_conflict", f"expected={expected}"))
+            elif code.startswith("date_missing"):
+                expected = code.split("expected=")[-1]
+                issues.append(_issue("count_missing" if False else "fact_date_missing",
+                                     f"expected={expected}"))
+            else:
+                issues.append(_issue("count_conflict", detail=code))
+        return issues
 
     @staticmethod
     def _check_person_fabrication(answer: str, task_state: dict) -> list[GuardIssue]:
@@ -311,17 +347,75 @@ class FinalGuard:
         年份/日期/数量可能来自其他可信来源，不做此约束。
         """
         issues = []
-        ocr_texts = [tr.get("ocr_text") or "" for tr in task_state.get("tool_results") or []
-                     if tr.get("tool") == "read_photo_text" and (tr.get("ocr_text") or "").strip()]
+        trs = [tr for tr in task_state.get("tool_results") or []
+               if tr.get("tool") == "read_photo_text"]
+        ocr_texts = [tr.get("ocr_text") or "" for tr in trs
+                     if (tr.get("ocr_text") or "").strip()]
         if not ocr_texts:
             return issues
         ocr_all = "\n".join(ocr_texts)
+        # Phase H H4：合法硬值集合 = 结构化 exact_values ∪ 照片文字（两者任一命中即可放行，
+        # 避免 zoom refine 波动时 exact 缺失 34 却把正确回答误拦）
+        legal_prices = {str(ev.get("value")) for tr in trs
+                        for ev in (tr.get("exact_values") or [])
+                        if ev.get("type") == "price" and ev.get("value")}
+        legal_prices |= {m for m in re.findall(
+            r"(?:¥|￥)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:元|块)", ocr_all)}
+        legal_phones = {str(ev.get("value")) for tr in trs
+                        for ev in (tr.get("exact_values") or [])
+                        if ev.get("type") == "phone" and ev.get("value")}
+        legal_phones |= {m for m in re.findall(r"(?<!\d)\d{7,}(?!\d)", ocr_all)}
         for num in re.findall(r"(?<!\d)\d{7,}(?!\d)", answer):
-            if num not in ocr_all:
+            if num not in legal_phones:
                 issues.append(_issue("ocr_value_conflict", f"电话/长数字 {num} 不在照片文字里"))
         for num in re.findall(r"(\d+(?:\.\d+)?)\s*(?:元|块|¥|￥)", answer):
-            if num not in ocr_all:
+            if num not in legal_prices:
                 issues.append(_issue("ocr_value_conflict", f"价格 {num} 不在照片文字里"))
+        # Phase H H4：价格问题的“问题词-label”校验——问题问 X 的售价，答案里 X 后出现
+        # 的价格必须等于 X 的核值（即使该价格本身的核值 label 是别的词，如汉堡单人套餐 vs 汉堡双人套餐）
+        query = str((task_state or {}).get("user_query") or "")
+        if re.search(r"多少钱|价格|售价|费用", query):
+            qwords = re.findall(r"[\u4e00-\u9fff]{2,8}", query)
+            for tr in trs:
+                for ev in tr.get("exact_values") or []:
+                    label = str(ev.get("label") or "")
+                    if ev.get("type") != "price" or len(label) < 2:
+                        continue
+                    if not any(label == w or label in w or w in label for w in qwords):
+                        continue
+                    if label not in answer:
+                        continue
+                    tail = answer[answer.index(label) + len(label):]
+                    m = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:元|块|¥|￥)", tail)
+                    if m and m.group(1) != str(ev.get("value")):
+                        issues.append(_issue(
+                            "ocr_value_conflict",
+                            f"价格冲突：{label}的核值={ev.get('value')}元，答案写{m.group(1)}元"))
+                        break
+        # Phase H H4：OCR 结构化硬值 + 商品 label —— 答案里出现 label 时价格/年份必须与核值一致
+        for tr in trs:
+            for ev in tr.get("exact_values") or []:
+                label = str(ev.get("label") or "")
+                if len(label) < 2 or FinalGuard._LABEL_NOISE.match(label):
+                    continue
+                value = str(ev.get("value") or "")
+                kind = str(ev.get("type") or "")
+                if not value or not label or label not in answer:
+                    continue
+                if kind == "price":
+                    for m in re.finditer(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:元|块|¥|￥)", answer):
+                        if m.group(1) != value and label in answer[:m.start()]:
+                            issues.append(_issue(
+                                "ocr_value_conflict",
+                                f"价格冲突：照片里{label}的核值={value}元，答案写{m.group(1)}元"))
+                            break
+                elif kind == "year":
+                    for m in re.finditer(r"(?<![\d.])((?:19|20)\d{2})(?![\d年])", answer):
+                        if m.group(1) != value and label in answer[:m.start()]:
+                            issues.append(_issue(
+                                "ocr_value_conflict",
+                                f"年份冲突：照片里{label}的核值={value}年，答案写{m.group(1)}年"))
+                            break
         return issues
 
     @staticmethod

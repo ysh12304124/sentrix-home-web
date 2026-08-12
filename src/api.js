@@ -62,8 +62,6 @@
     resultSetPhoto: (resultSetId, handle, scopeId = "home-default", original = false) => `${configuredBase}/api/assistant/result-set/${encodeURIComponent(resultSetId)}/photo?handle=${encodeURIComponent(handle)}&scope_id=${encodeURIComponent(scopeId)}${original ? "&original=1" : ""}`,
     conversationMessages: (conversationId, limit = 20) => request(`/api/conversation/${encodeURIComponent(conversationId)}/messages?limit=${limit}`),
     conversationTrajectory: (conversationId, limit = 20) => request(`/api/conversation/${encodeURIComponent(conversationId)}/trajectory?limit=${limit}`),
-    seedPerson: (formData) => request("/api/people/seed", { method: "POST", body: formData }),
-    seedBatchPerson: (formData) => request("/api/people/seed-batch", { method: "POST", body: formData }),
     conversations: (scopeId = "") => request(`/api/conversations${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     createConversation: (scopeId = "home-default") => request("/api/conversations", { method: "POST", body: JSON.stringify({ scope_id: scopeId }) }),
     conversation: (id) => request(`/api/conversations/${encodeURIComponent(id)}`),
@@ -101,6 +99,8 @@
       return request("/api/import", { method: "POST", body: form });
     },
     getModelProfiles: () => request("/api/model-profiles"),
+    getOcrSettings: () => request("/api/settings/ocr"),
+    setOcrSettings: (enabled) => request("/api/settings/ocr", { method: "PUT", body: JSON.stringify({ small_ocr_enabled: enabled }) }),
     switchModelProfile: (profile) => request("/api/model-profiles/switch", {
       method: "POST",
       body: JSON.stringify({ profile, wait_ready: true, ready_timeout: 900 }),

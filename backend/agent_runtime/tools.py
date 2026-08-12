@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -825,7 +826,24 @@ _OCR_CACHE: dict[str, tuple[tuple, dict]] = {}  # (asset_id, mtime, provider, ti
 
 # Phase F F5：OCR Provider 抽象（预留 lightweight 插槽，当前只有 VLM）
 # SENTRIX_OCR_PROVIDER=vlm  |  SENTRIX_OCR_TILES=none|2x2|3x3（默认 2x2，提速用）
-_OCR_PROVIDERS: dict[str, str] = {"vlm": "vlm"}
+_OCR_PROVIDERS: dict[str, str] = {"vlm": "vlm", "small": "small"}
+
+_small_ocr_available_cache: bool | None = None
+
+
+def small_ocr_available() -> bool:
+    """RapidOCR (onnxruntime CPU) 是否可导入——零显存、进程内推理。
+
+    结果缓存；首次调用会尝试 import（失败=不可用，不影响 read_photo_text 主路径）。
+    """
+    global _small_ocr_available_cache
+    if _small_ocr_available_cache is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # noqa: F401
+            _small_ocr_available_cache = True
+        except Exception:
+            _small_ocr_available_cache = False
+    return _small_ocr_available_cache
 _OCR_TILE_DEFAULT = "2x2"
 
 
@@ -893,6 +911,282 @@ def _tile_images(path: str, rows: int = 3, cols: int = 3, scale: float = 2.0):
     return tiles
 
 
+# ============ Phase H H2/H4: Small OCR Provider（RapidOCR · CPU · 零显存） ============
+_small_engine = None
+_small_engine_lock = threading.Lock()
+
+
+def _get_small_engine():
+    global _small_engine
+    if _small_engine is None:
+        with _small_engine_lock:
+            if _small_engine is None:
+                from rapidocr_onnxruntime import RapidOCR
+                _small_engine = RapidOCR()
+    return _small_engine
+
+
+def _small_items(result):
+    """RapidOCR result -> [(y0, x0, y1, x1, text, conf)]。"""
+    items = []
+    for box, text, conf in (result or []):
+        if not text or not text.strip():
+            continue
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        items.append((min(ys), min(xs), max(ys), max(xs), str(text).strip(), float(conf or 0)))
+    return items
+
+
+def _small_row_cluster(items, y_tol=26):
+    """按 y 聚类成行（菜单/招牌通常水平成行）。返回 [(y_center, [(x, text, conf)])]。"""
+    rows = []
+    for it in sorted(items, key=lambda t: (t[0], t[1])):
+        yc = (it[0] + it[2]) / 2
+        placed = False
+        for row in rows:
+            if abs(row[0] - yc) <= y_tol:
+                row[1].append((it[1], it[4], it[5]))
+                placed = True
+                break
+        if not placed:
+            rows.append((yc, [(it[1], it[4], it[5])]))
+    return rows
+
+
+_PRICE_RE = re.compile(r"(?:¥|￥)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:元|块)")
+_PHONE_RE = re.compile(r"(?<!\d)(\d{7,12})(?!\d)")
+_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+# 商品 label 提取：排除 OCR 对 checkbox/温度的误读字符
+_LABEL_NOISE = re.compile(r"^[口冷热黑白]+$")
+_LABEL_STOP = {"价格", "单价", "售价", "共计", "合计", "总价", "原价", "现价"}
+
+
+def _small_label_before(line: str, pos: int) -> str:
+    """取价格/年份之前最近的中文商品词作为 label（如 '台式奶茶 口口 ￥10' → 台式奶茶）。"""
+    head = line[:pos]
+    cands = re.findall(r"[\u4e00-\u9fff]{2,8}", head)
+    for cand in reversed(cands):
+        if _LABEL_NOISE.match(cand) or cand in _LABEL_STOP:
+            continue
+        return cand
+    return ""
+
+
+def _small_exact_values(text: str) -> list[dict]:
+    values = []
+    for line in text.splitlines():
+        for m in _PRICE_RE.finditer(line):
+            value = m.group(1) or m.group(2)
+            values.append({"type": "price", "value": value, "unit": "元",
+                           "text": m.group(0).strip(),
+                           "label": _small_label_before(line, m.start())})
+        for m in _YEAR_RE.finditer(line):
+            values.append({"type": "year", "value": m.group(1), "text": m.group(1),
+                           "label": _small_label_before(line, m.start())})
+        for m in _PHONE_RE.finditer(line):
+            values.append({"type": "phone", "value": m.group(1), "text": m.group(1),
+                           "label": _small_label_before(line, m.start())})
+    return values
+
+
+def _rank_exact_values(exact: list[dict], limit: int = 40) -> list[dict]:
+    """带 label 的硬值全部保留（小体积、高价值）；无 label 的按类型排序截断。"""
+    labeled = [ev for ev in exact if (ev.get("label") or "")]
+    rest = [ev for ev in exact if not (ev.get("label") or "")]
+    rest.sort(key=lambda ev: (1 if str(ev.get("type") or "") in ("price", "year") else 0,
+                              0 if str(ev.get("type") or "") == "phone" else 1),
+              reverse=True)
+    return (labeled + rest)[:limit]
+
+
+def _small_vertical_label(items: list, price_item: tuple) -> str:
+    """坐标级 label：价格与其上方/左侧最近的重叠中文词关联（菜单垂直版式）。
+
+    例：'汉堡单人套餐'（y 734-796）正下方的 '￥34'（y 801-856）→ label=汉堡单人套餐。
+    行内 label（_small_exact_values）无法跨行关联，这里补垂直关联。
+    """
+    py0, px0, py1, px1 = price_item[0], price_item[1], price_item[2], price_item[3]
+    best = ""
+    best_dist = 10 ** 9
+    for it in items:
+        y0, x0, y1, x1, text, conf = it
+        if text == price_item[4]:
+            continue
+        if not re.search(r"[\u4e00-\u9fff]{2,}", text):
+            continue
+        overlap = min(px1, x1) - max(px0, x0)
+        if overlap < 8:
+            continue
+        if y1 <= py0 + 4:  # 严格上方
+            dist = py0 - y1
+            if 0 <= dist <= 130 and dist < best_dist:
+                best_dist = dist
+                best = text
+        elif abs((y0 + y1) / 2 - (py0 + py1) / 2) <= 40 and x1 <= px0:  # 同行左侧
+            dist = px0 - x1
+            if dist < best_dist:
+                best_dist = dist
+                best = text
+    return best
+
+
+def _small_exact_values_from_items(items: list, row_text: str = "") -> list[dict]:
+    """从坐标级 items 提取 exact_values：垂直 label 优先，行内 label（行拼接文本）兜底。"""
+    vertical = []
+    for it in items:
+        for m in _PRICE_RE.finditer(it[4]):
+            value = m.group(1) or m.group(2)
+            label = _small_vertical_label(items, it)
+            vertical.append({"type": "price", "value": value, "unit": "元",
+                             "text": m.group(0).strip(), "label": label})
+    inline = _small_exact_values(row_text) if row_text else []
+    merged = list(vertical)
+    for ev in inline:
+        if ev.get("type") != "price":
+            if not any(v.get("type") == ev.get("type") and v["value"] == ev["value"]
+                       for v in merged):
+                merged.append(ev)
+            continue
+        replaced = False
+        for i, v in enumerate(merged):
+            if v.get("type") == "price" and v["value"] == ev["value"] and v["text"] == ev["text"]:
+                if (not v.get("label")) and ev.get("label"):
+                    merged[i] = ev
+                replaced = True
+                break
+        if not replaced:
+            merged.append(ev)
+    return merged
+
+
+def _small_ocr_text_and_values(items):
+    """行聚类 → ocr_text（按行拼接）+ exact_values + 平均置信度。"""
+    rows = _small_row_cluster(items)
+    lines = []
+    for _, cells in sorted(rows, key=lambda r: r[0]):
+        line = " ".join(text for _, text, _ in sorted(cells, key=lambda c: c[0]))
+        lines.append(line)
+    ocr_text = "\n".join(lines)
+    confs = [it[5] for it in items]
+    avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
+    return ocr_text, _small_exact_values_from_items(items, ocr_text), avg_conf
+
+
+def _small_zoom_refine(path: str, items):
+    """对含套餐/价格/饮品等关键词的行区域放大 2x 重识别，补漏检硬值（如菜单价格）。
+
+    H2 spike 验证：全图漏检的“汉堡单人套餐 ￥34”在局部放大后能稳定读出。
+    按行合并裁剪（一行一个 crop，覆盖行内全部文字框，含同行价格），比单框裁剪
+    更稳：价格常落在相邻套餐名称之间，单框 + pad 会漏掉。
+    """
+    _KEYWORD = re.compile(r"套餐|价格|￥|元|汉堡|奶茶|咖啡|可乐|炸鸡|菜单")
+    targets = [it for it in items if _KEYWORD.search(it[4])]
+    if not targets:
+        return None
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        im = Image.open(path)
+        W, H = im.size
+        merged = list(items)
+        engine = _get_small_engine()
+        # 按 y 行聚类 target，每行一个 crop（含行内所有文字框）
+        rows = _small_row_cluster(targets, y_tol=60)
+        for yc, _ in rows[:4]:
+            row_items = [it for it in items if abs((it[0] + it[2]) / 2 - yc) <= 60]
+            if not row_items:
+                continue
+            pad = 60
+            box = (max(0, int(min(it[1] for it in row_items)) - pad),
+                   max(0, int(min(it[0] for it in row_items)) - pad),
+                   min(W, int(max(it[3] for it in row_items)) + pad),
+                   min(H, int(max(it[2] for it in row_items)) + pad))
+            if box[2] - box[0] < 12 or box[3] - box[1] < 12:
+                continue
+            crop = im.crop(box)
+            scale = 2
+            crop = crop.resize((crop.width * scale, crop.height * scale))
+            tmp = f"/tmp/sentrix_ocr_zoom_{os.getpid()}_{int(time.time() * 1000)}.jpg"
+            crop.save(tmp)
+            try:
+                res, _ = engine(tmp)
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            if res:
+                for b, text, conf in res:
+                    by0 = box[1] + b[0][1] / scale
+                    bx0 = box[0] + b[0][0] / scale
+                    by1 = box[1] + b[2][1] / scale
+                    bx1 = box[0] + b[2][0] / scale
+                    merged.append((by0, bx0, by1, bx1, str(text).strip(), float(conf or 0)))
+        dedup = []
+        for it in merged:
+            if not any(abs(it[0] - d[0]) < 12 and abs(it[2] - d[2]) < 12 and it[4] == d[4]
+                       for d in dedup):
+                dedup.append(it)
+        return dedup
+    except Exception:
+        return None
+
+
+def _try_small_ocr(path: str, context: dict | None) -> dict | None:
+    """Small OCR 优先路径：用户开启时使用；无文本/低置信返回 None 让 VLM 接管。
+
+    返回 dict = 直接交付的 observation（provider=small）；None = 走 VLM 主路径。
+    """
+    settings = (context or {}).get("ocr_settings") or {}
+    if not settings.get("small_ocr_enabled"):
+        return None
+    if not small_ocr_available():
+        return None
+    try:
+        engine = _get_small_engine()
+        t0 = time.monotonic()
+        result, _ = engine(path)
+        latency = round(time.monotonic() - t0, 3)
+        items = _small_items(result)
+        if not items:
+            return {
+                "summary": "这次没能可靠读出照片里的文字。",
+                "full_text": "", "text_regions": [],
+                "certainty": "uncertain", "status": "partial", "reason": "ocr_no_text",
+                "provider": "small", "confidence": 0.0, "exact_values": [],
+                "fallback_used": False, "persisted": False, "cache_hit": False,
+                "latency_s": latency,
+            }
+        ocr_text, exact, avg_conf = _small_ocr_text_and_values(items)
+        refined = _small_zoom_refine(path, items)
+        if refined:
+            items = refined
+            ocr_text, exact, avg_conf = _small_ocr_text_and_values(items)
+        if avg_conf < 0.5:
+            return None
+        regions = [{"text": line[:150], "source": "small_ocr"}
+                   for line in ocr_text.splitlines()[:6]]
+        return {
+            "summary": f"已读取 {len(regions)} 个文字区域。",
+            "full_text": ocr_text[:1600],
+            "text_regions": regions[:6],
+            "source": "small_ocr",
+            "provider": "small",
+            "confidence": avg_conf,
+            "exact_values": _rank_exact_values(exact),
+            "fallback_used": False,
+            "certainty": "supported" if regions else "uncertain",
+            "persisted": False,
+            "cache_hit": False,
+            "latency_s": latency,
+        }
+    except Exception:
+        return None
+
+
 def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
     """OCR 专用：读取照片中的文字（菜单/价格/招牌/电话/年份/小字）。
 
@@ -954,11 +1248,15 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
     except Exception:
         _mtime = 0.0
     provider = _ocr_provider()
+    # Phase H H4：Small OCR 优先路由（用户设置 small_ocr_enabled=true 时）
+    small = _try_small_ocr(row["path"], context)
+    if small is not None:
+        return small
     tile_layout = _ocr_tile_layout()
     cache_key = (asset_id, _mtime, provider, tile_layout)
     cached = _OCR_CACHE.get(cache_key)
     if cached is not None:
-        hit = dict(cached[1])
+        hit = dict(cached)
         hit["cache_hit"] = True
         return hit
     gamma = _RUNTIME.get("gamma")
@@ -1025,14 +1323,14 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
             full_clean = text
             continue
         if text and not text.startswith("__ERROR__"):
-            regions.append({"text": text[:200], "source": label})
+            regions.append({"text": text[:150], "source": label})
     if full_clean and not full_clean.startswith("__ERROR__"):
         regions.insert(0, {"text": full_clean[:200], "source": "full_image"})
     full_text = "\n".join(f"[{r['source']}] {r['text']}" for r in regions)
     result = {
         "summary": f"已读取 {len(regions)} 个文字区域。" if regions else "照片中没有识别到文字。",
         "full_text": full_text[:1600],
-        "text_regions": regions[:24],
+        "text_regions": regions[:8],
         "source": "runtime_ocr",
         "provider": provider,
         "tiles": tile_layout,
