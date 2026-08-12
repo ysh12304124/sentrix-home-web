@@ -99,6 +99,7 @@ main{display:flex;flex-direction:column;gap:16px;min-width:0}
       <div class="card"><h3>多 Run 对比（correct / 证据召回 / 平均时延）</h3><canvas class="chart" id="cmpChart"></canvas></div>
       <div class="card" id="decomBox" style="display:none"><h3>分层归因（每题 primary 层：R检索 / V视觉 / O-OCR / T工具序列 / S综合 / G-guard / J-judge）</h3><div id="decomKpi" class="decom-kpi"></div></div>
       <div class="card" id="toolPerfBox" style="display:none"><h3>Tool 性能（p50/p95 来自 tool_trace，OCR provider/cache 来自行级 tool_perf）</h3><div id="toolPerfTable"></div></div>
+      <div class="card" id="ocrBox" style="display:none"><h3>OCR Provider 汇总（Phase H：small vs VLM 使用率 / 延迟 / 置信度 / fallback）</h3><div class="cards" id="ocrKpi"></div></div>
       <div class="card">
         <div class="filters" id="filters">
           <select id="fVerdict"><option value="">全部判定</option></select>
@@ -195,6 +196,7 @@ function renderOverview(){
   $('hdr').textContent = `${state.run.run_id} · ${(state.run.meta||{}).qa_file||''} · ${(state.run.meta||{}).timestamp||''}`;
   renderDecom();
   renderToolPerf();
+  renderOcr();
 }
 function renderDecom(){
   const d = (state.run.summary||{}).decom||{};
@@ -243,6 +245,24 @@ function renderToolPerf(){
       <td>${[...s.providers].join(',')||'—'}</td><td>${[...s.tiles].join(',')||'—'}</td>
       <td>${s.cacheHits}</td><td>${s.vlmCalls}</td></tr>`;
   }).join('') + '</table>';
+}
+function renderOcr(){
+  const o = (state.run.summary||{}).ocr||{};
+  const has = (o.call_total||0) > 0;
+  $('ocrBox').style.display = has ? 'block':'none';
+  if(!has) return;
+  const usage = Object.entries(o.provider_usage||{}).map(([p,n])=>{
+    const pct = Math.round(100*n/o.call_total);
+    return `<span class="ly ${p==='small'?'ly-p':'ly-f'}">${p} ${n} (${pct}%)</span>`;
+  }).join('');
+  $('ocrKpi').innerHTML = `
+    <div class="kpi"><b>${o.call_total}</b><span>OCR 调用</span></div>
+    <div class="kpi"><b>${(o.small_share!=null? Math.round(o.small_share*100)+'%':'—')}</b><span>small 占比</span></div>
+    <div class="kpi"><b>${o.latency_p50_s??'—'}s</b><span>p50 延迟</span></div>
+    <div class="kpi"><b>${o.latency_p95_s??'—'}s</b><span>p95 延迟</span></div>
+    <div class="kpi"><b>${o.confidence_avg??'—'}</b><span>平均置信度</span></div>
+    <div class="kpi"><b>${o.fallback_count}</b><span>fallback</span></div>
+    <div class="kpi"><b>${usage||'—'}</b><span>provider 分布</span></div>`;
 }
 function filteredRows(){
   const rows = state.run.rows||[];

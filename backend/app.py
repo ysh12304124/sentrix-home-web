@@ -783,6 +783,16 @@ def put_ocr_settings(payload: OCRSettingsPayload):
     return _ocr_settings()
 
 
+@app.get("/api/telemetry/ocr")
+def ocr_telemetry():
+    """Phase H H6：OCR provider 使用率/延迟/置信度聚合（dashboard 用）。"""
+    from .agent_runtime.tools import ocr_telemetry_snapshot
+    return {
+        "providers": ocr_telemetry_snapshot(),
+        "small_enabled": _ocr_settings().get("small_ocr_enabled"),
+    }
+
+
 @app.get("/api/model-profiles")
 def model_profiles():
     registry = _load_vllm_registry()

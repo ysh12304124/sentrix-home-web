@@ -824,6 +824,47 @@ _OCR_PROMPT = """请读出这张照片中的全部文字（招牌/菜单/价格/
 _OCR_PROMPT_FULL = """观察这张照片，墙面上有哪些招牌、牌子或文字？请逐条列出文字内容本身（店名、电话、价格、年份、标语等），不要描述人物和场景。看不清的部分不要编造。"""
 _OCR_CACHE: dict[str, tuple[tuple, dict]] = {}  # (asset_id, mtime, provider, tiles) -> result
 
+# Phase H H6：OCR provider 遥测（dashboard 汇总 small/VLM 使用率、延迟、fallback）
+_OCR_TELEMETRY_LOCK = threading.Lock()
+_OCR_TELEMETRY: dict[str, dict] = {
+    "small": {"calls": 0, "latency_sum_s": 0.0, "conf_sum": 0.0, "fallback": 0},
+    "vlm": {"calls": 0, "latency_sum_s": 0.0, "conf_sum": 0.0, "fallback": 0},
+    "errors": 0,
+}
+
+
+def record_ocr_telemetry(provider: str, latency_s: float, confidence: float | None = None,
+                         fallback: bool = False) -> None:
+    with _OCR_TELEMETRY_LOCK:
+        bucket = _OCR_TELEMETRY.get(provider)
+        if bucket is None:
+            bucket = _OCR_TELEMETRY.setdefault(provider, {"calls": 0, "latency_sum_s": 0.0,
+                                                          "conf_sum": 0.0, "fallback": 0})
+        bucket["calls"] += 1
+        bucket["latency_sum_s"] += latency_s
+        if confidence is not None:
+            bucket["conf_sum"] += confidence
+        if fallback:
+            bucket["fallback"] += 1
+            _OCR_TELEMETRY["errors"] += 1
+
+
+def ocr_telemetry_snapshot() -> dict:
+    with _OCR_TELEMETRY_LOCK:
+        out = {}
+        for provider, b in _OCR_TELEMETRY.items():
+            if not isinstance(b, dict):
+                out[provider] = b
+                continue
+            calls = b["calls"]
+            out[provider] = {
+                "calls": calls,
+                "latency_avg_s": round(b["latency_sum_s"] / calls, 3) if calls else None,
+                "confidence_avg": round(b["conf_sum"] / calls, 3) if calls and b["conf_sum"] else None,
+                "fallback": b["fallback"],
+            }
+        return out
+
 # Phase F F5：OCR Provider 抽象（预留 lightweight 插槽，当前只有 VLM）
 # SENTRIX_OCR_PROVIDER=vlm  |  SENTRIX_OCR_TILES=none|2x2|3x3（默认 2x2，提速用）
 _OCR_PROVIDERS: dict[str, str] = {"vlm": "vlm", "small": "small"}
@@ -1169,6 +1210,7 @@ def _try_small_ocr(path: str, context: dict | None) -> dict | None:
             return None
         regions = [{"text": line[:150], "source": "small_ocr"}
                    for line in ocr_text.splitlines()[:6]]
+        record_ocr_telemetry("small", latency, avg_conf)
         return {
             "summary": f"已读取 {len(regions)} 个文字区域。",
             "full_text": ocr_text[:1600],
@@ -1249,6 +1291,8 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
         _mtime = 0.0
     provider = _ocr_provider()
     # Phase H H4：Small OCR 优先路由（用户设置 small_ocr_enabled=true 时）
+    _small_cfg = (context or {}).get("ocr_settings") or {}
+    small_attempted = bool(_small_cfg.get("small_ocr_enabled")) and small_ocr_available()
     small = _try_small_ocr(row["path"], context)
     if small is not None:
         return small
@@ -1263,6 +1307,7 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
     if gamma is None:
         return {"summary": "模型不可用。", "full_text": "", "text_regions": [],
                 "certainty": "uncertain", "persisted": False}
+    _vlm_t0 = time.monotonic()
     try:
         # Provider 执行：当前仅 vlm（整图 + 按配置 tile 并行），lightweight 插槽预留。
         regions = []
@@ -1338,8 +1383,11 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
         "persisted": False,
         "cache_hit": False,
         "vlm_calls": len(tasks),
+        "fallback_used": small_attempted,
     }
     _OCR_CACHE[cache_key] = result
+    record_ocr_telemetry("vlm", time.monotonic() - _vlm_t0, result.get("confidence"),
+                         fallback=small_attempted)
     return result
 
 

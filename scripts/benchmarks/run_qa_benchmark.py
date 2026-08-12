@@ -104,6 +104,68 @@ def hardware(base):
         return {"error": str(exc)}
 
 
+_ROW_OCR_STATS: list[dict] = []
+
+
+def _collect_ocr_stats(result: dict) -> dict:
+    """从单题结果收集 OCR provider 使用情况（供 summary 聚合）。"""
+    stats = {"providers": [], "latency_s": [], "conf": [], "fallback": 0}
+    seen = set()
+    for tr in (result.get("task_state") or {}).get("tool_results") or []:
+        if tr.get("tool") != "read_photo_text":
+            continue
+        key = (tr.get("tool_call_id"), tr.get("provider"))
+        if key in seen:
+            continue
+        seen.add(key)
+        if tr.get("provider"):
+            stats["providers"].append(tr["provider"])
+        if tr.get("confidence") is not None:
+            stats["conf"].append(float(tr["confidence"]))
+        if tr.get("fallback_used"):
+            stats["fallback"] += 1
+    for t in (result.get("tool_trace") or []):
+        if t.get("tool") == "read_photo_text" and t.get("latency_s"):
+            stats["latency_s"].append(float(t["latency_s"]))
+    return stats
+
+
+def _pctile(vals: list, q: float):
+    if not vals:
+        return None
+    a = sorted(vals)
+    i = min(len(a) - 1, max(0, int(round(len(a) * q)) - 1))
+    return round(a[i], 2)
+
+
+def aggregate_ocr_stats() -> dict:
+    """聚合所有题的 OCR provider 使用率 / 延迟分位 / fallback rate。"""
+    prov = {}
+    lat = []
+    conf = []
+    fallback = 0
+    rows_with_ocr = 0
+    for st in _ROW_OCR_STATS:
+        if st["providers"]:
+            rows_with_ocr += 1
+        lat.extend(st["latency_s"])
+        conf.extend(st["conf"])
+        fallback += st["fallback"]
+        for p in st["providers"]:
+            prov[p] = prov.get(p, 0) + 1
+    total = sum(prov.values())
+    return {
+        "rows_with_ocr": rows_with_ocr,
+        "provider_usage": prov,
+        "small_share": round(prov.get("small", 0) / total, 3) if total else None,
+        "latency_p50_s": _pctile(lat, 0.5),
+        "latency_p95_s": _pctile(lat, 0.95),
+        "confidence_avg": round(sum(conf) / len(conf), 3) if conf else None,
+        "fallback_count": fallback,
+        "call_total": total,
+    }
+
+
 def start_turn(base, message, scope_id):
     return http_json("POST", f"{base}/api/assistant/turn",
                      {"message": message, "conversation_id": None,
@@ -242,27 +304,28 @@ def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total
     telemetry = result.get("telemetry") or {}
     if telemetry and result.get("tool_trace"):
         telemetry["tool_trace"] = result.get("tool_trace")
-    # F9：行级 tool_perf（OCR provider / tiles / cache / vlm_calls，来自 task_state.tool_results）
+    # F9：行级 tool_perf（OCR provider / confidence / exact / cache，来自 task_state.tool_results）
     tp = {}
     for tr in (result.get("task_state") or {}).get("tool_results") or []:
         name = tr.get("tool") or ""
-        obs = tr.get("observation") or {}
         if not name:
             continue
-        slot = tp.setdefault(name, {"providers": set(), "tiles": set(), "cache_hits": 0, "vlm_calls": 0})
-        if obs.get("provider"):
-            slot["providers"].add(obs.get("provider"))
-        if obs.get("tiles"):
-            slot["tiles"].add(obs.get("tiles"))
-        if obs.get("cache_hit"):
+        slot = tp.setdefault(name, {"providers": set(), "confidences": [],
+                                    "exact_counts": [], "cache_hits": 0})
+        if tr.get("provider"):
+            slot["providers"].add(tr.get("provider"))
+        if tr.get("confidence") is not None:
+            slot["confidences"].append(round(float(tr["confidence"]), 3))
+        if isinstance(tr.get("exact_values"), list):
+            slot["exact_counts"].append(len(tr["exact_values"]))
+        if tr.get("cache_hit"):
             slot["cache_hits"] += 1
-        if isinstance(obs.get("vlm_calls"), int):
-            slot["vlm_calls"] += obs["vlm_calls"]
     for slot in tp.values():
         slot["providers"] = sorted(slot["providers"])
-        slot["tiles"] = sorted(slot["tiles"])
     if tp:
         telemetry["tool_perf"] = tp
+    # Phase H H6：本行 OCR provider 记录（供 summary 聚合 small/VLM 使用率）
+    _ROW_OCR_STATS.append(_collect_ocr_stats(result))
     evidence = collect_evidence(result, asset_map)
     score = evidence_score(evidence, qa.get("answer_evidence_image_ids") or [])
     judge = judge_answer(qa["question"], qa.get("answer") or "", answer,
@@ -296,6 +359,8 @@ def run_one(qa, base, scope_id, asset_map, judge_base, judge_enabled, idx, total
         "evidence": score,
         "judge": judge,
         "guard_debug": result.get("guard_debug") or {},
+        "ocr_texts": [tr.get("ocr_text") for tr in (result.get("task_state") or {}).get("tool_results") or []
+                      if tr.get("tool") == "read_photo_text" and tr.get("ocr_text")],
         "error": None,
     }
     row["decom"] = decompose_row(row)
@@ -325,6 +390,7 @@ def summarize(rows, health_data):
         "tool_usage": dict(tool_usage),
         "decom": decompose_summary(rows),
         "tool_perf": aggregate_tool_perf(rows),
+        "ocr": aggregate_ocr_stats(),
         "health": health_data,
     }
 

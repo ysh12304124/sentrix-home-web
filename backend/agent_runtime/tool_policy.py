@@ -78,6 +78,7 @@ class ToolPolicy:
         "inspect_photo": _DEFAULT_ALLOWED,
         "read_photo_text": _DEFAULT_ALLOWED | {
             "full_text", "text_regions", "confidence", "exact_values", "fallback_used",
+            "provider", "cache_hit", "tiles", "vlm_calls",
         },
         "search_conversation_history": _DEFAULT_ALLOWED | {
             "query", "scope", "matches", "note",
