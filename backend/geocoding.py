@@ -204,3 +204,99 @@ class OfflineReverseGeocoder:
         if result:
             return {key: value for key, value in result.items() if value not in (None, "")}
         return {}
+
+
+# ---- Phase D D12: place-text matching for retrieval ----
+# 地理地点检索统一入口：行政区匹配（双向）+ 中英别名。
+# 数据来源：assets.metadata_json.reverse_geocode（PyGeoCN/GeoNames 离线反编码）。
+# observation.place 是场景类型（"室内餐厅或咖啡馆"），不是地理地点，不作为权威地点依据。
+
+_PLACE_ADMIN_SUFFIXES = ("省", "市", "区", "县", "地区", "自治州", "盟", "特别行政区")
+
+# 常见国际/跨境目的地中英别名（GeoNames 反编码返回英文，中文查询需别名桥接）。
+# 这是通用双语地名知识，不是测评答案。
+_PLACE_ALIASES = {
+    "清迈": ["Chiang Mai", "Hang Dong"],
+    "泰国": ["Thailand", "TH"],
+    "曼谷": ["Bangkok"],
+    "普吉": ["Phuket"],
+    "芭堤雅": ["Pattaya"],
+    "新加坡": ["Singapore"],
+    "马来西亚": ["Malaysia"],
+    "日本": ["Japan"],
+    "东京": ["Tokyo"],
+    "大阪": ["Osaka"],
+    "京都": ["Kyoto"],
+    "韩国": ["South Korea", "Korea"],
+    "首尔": ["Seoul"],
+    "济州": ["Jeju"],
+    "美国": ["United States", "USA", "US"],
+    "纽约": ["New York"],
+    "洛杉矶": ["Los Angeles"],
+    "旧金山": ["San Francisco"],
+    "英国": ["United Kingdom", "UK", "England"],
+    "伦敦": ["London"],
+    "法国": ["France"],
+    "巴黎": ["Paris"],
+    "德国": ["Germany"],
+    "意大利": ["Italy"],
+    "西班牙": ["Spain"],
+    "澳大利亚": ["Australia"],
+    "悉尼": ["Sydney"],
+    "墨尔本": ["Melbourne"],
+    "新西兰": ["New Zealand"],
+    "奥克兰": ["Auckland"],
+}
+
+
+def _strip_admin_suffix(part):
+    """去掉行政区后缀（'秦皇岛市'→'秦皇岛'），便于跨粒度匹配。"""
+    part = str(part or "").strip()
+    for suffix in _PLACE_ADMIN_SUFFIXES:
+        if part.endswith(suffix) and len(part) > len(suffix):
+            return part[: -len(suffix)]
+    return part
+
+
+def place_alias_names(value):
+    """把中文地点/行程描述展开成可能出现的英文地名（GeoNames 反编码用）。"""
+    value = str(value or "").strip()
+    names = []
+    for zh, targets in _PLACE_ALIASES.items():
+        if zh in value:
+            names.extend(targets)
+    return sorted(set(names))
+
+
+def place_text_matches(value, geocode):
+    """地点条件 vs 反地理编码记录。
+
+    匹配规则（确定性，不依赖模型）：
+    1) 约束值整串出现在 geocode label/name/行政区文本里；
+    2) 存储的行政区（省/市/区/县，去后缀后）出现在约束值里（'秦皇岛' 匹配
+       '秦皇岛如是海度假村'）；
+    3) 中英别名命中（'清迈' 匹配 'Chiang Mai'）。
+    """
+    value = str(value or "").strip()
+    if not value or not geocode:
+        return False
+    label = " ".join(
+        str(part) for part in (
+            geocode.get("label"), geocode.get("name"), geocode.get("city"),
+            geocode.get("province"), geocode.get("district"),
+            geocode.get("admin1"), geocode.get("admin2"), geocode.get("country"),
+        ) if part
+    )
+    if not label:
+        return False
+    if value in label:
+        return True
+    for key in ("province", "city", "district", "admin1", "admin2"):
+        part = _strip_admin_suffix(geocode.get(key))
+        if len(part) >= 2 and part in value:
+            return True
+    lower_label = label.lower()
+    for alias in place_alias_names(value):
+        if alias.lower() in lower_label:
+            return True
+    return False

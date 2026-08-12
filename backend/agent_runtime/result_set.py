@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-RESULT_SET_TTL_S = 30 * 60  # B3.1：ResultSet 内存 TTL 30 分钟
+RESULT_SET_TTL_S = 24 * 60 * 60  # D7：ResultSet TTL 延长到 24h（多轮/跨会话稳定）
 
 
 @dataclass
@@ -58,20 +58,78 @@ class ResultSetStore:
         self.store = store
         self._memory: dict[str, ResultSet] = {}
         self.ttl_s = ttl_s
+        self._ensure_table()
+
+    def _ensure_table(self):
+        try:
+            self.store.connection.executescript(
+                """CREATE TABLE IF NOT EXISTS agent_result_sets (
+                    result_set_id TEXT PRIMARY KEY,
+                    scope_id TEXT NOT NULL,
+                    query TEXT NOT NULL DEFAULT '',
+                    asset_ids_json TEXT NOT NULL DEFAULT '[]',
+                    total INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    expires_at REAL NOT NULL DEFAULT 0
+                );""")
+            self.store.connection.commit()
+        except Exception:
+            pass
 
     def save(self, rs: ResultSet) -> ResultSet:
         if not rs.expires_at:
             rs.expires_at = time.time() + self.ttl_s
         self._memory[rs.result_set_id] = rs
+        self._persist(rs)
         return rs
+
+    def _persist(self, rs: ResultSet):
+        """D7：ResultSet 落库（进程重启后仍可恢复）。"""
+        try:
+            import json as _json
+            self.store.connection.execute(
+                """INSERT OR REPLACE INTO agent_result_sets
+                   (result_set_id, scope_id, query, asset_ids_json, total, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (rs.result_set_id, rs.scope_id, rs.query or "",
+                 _json.dumps(rs.asset_ids or [], ensure_ascii=False),
+                 rs.total, rs.created_at or "", rs.expires_at))
+            self.store.connection.commit()
+        except Exception:
+            pass
+
+    def _load_from_db(self, result_set_id: str) -> ResultSet | None:
+        """从 DB 恢复未过期结果集（内存丢失/重启后）。"""
+        try:
+            import json as _json
+            row = self.store.connection.execute(
+                "SELECT * FROM agent_result_sets WHERE result_set_id = ?",
+                (result_set_id,)).fetchone()
+            if row is None:
+                return None
+            if row["expires_at"] and time.time() > row["expires_at"]:
+                return None
+            asset_ids = _json.loads(row["asset_ids_json"] or "[]")
+            rs = ResultSet(
+                result_set_id=row["result_set_id"], scope_id=row["scope_id"],
+                query=row["query"], asset_ids=list(asset_ids), total=row["total"],
+                created_at=row["created_at"], expires_at=row["expires_at"],
+                shown=min(6, len(asset_ids)),
+            )
+            return rs
+        except Exception:
+            return None
 
     def get(self, result_set_id: str) -> ResultSet | None:
         rs = self._memory.get(result_set_id)
-        if rs is None:
-            return None
-        if rs.expires_at and time.time() > rs.expires_at:
-            self._memory.pop(result_set_id, None)
-            return None
+        if rs is not None:
+            if rs.expires_at and time.time() > rs.expires_at:
+                self._memory.pop(result_set_id, None)
+            else:
+                return rs
+        rs = self._load_from_db(result_set_id)
+        if rs is not None:
+            self._memory[result_set_id] = rs
         return rs
 
     def resolve_handle(self, result_set_id: str, handle: str) -> str | None:
@@ -110,6 +168,7 @@ class TaskState:
     unresolved_conditions: list = field(default_factory=list)
     current_result_set: str | None = None
     selected_asset: str | None = None
+    selected_asset_handle: str | None = None
     delivery_state: str = "not_requested"
     fulfillment: str = "pending"
     result_mode: str | None = None
@@ -128,6 +187,11 @@ class TaskState:
     result_total: int | None = None
     result_remaining: int | None = None
     result_preview: list = field(default_factory=list)
+    # D3：active references（跨轮持续状态）
+    active_person: str | None = None
+    active_event: str | None = None
+    open_questions: list = field(default_factory=list)
+    last_user_goal: str = ""
 
     def record_tool_result(self, tool_call_id: str, tool_name: str, observation: dict):
         self.tool_results.append({
@@ -136,16 +200,32 @@ class TaskState:
             "total": observation.get("total"),
             "satisfaction": observation.get("query_satisfaction"),
             "blocked": observation.get("blocked"),
-            "inspect_text": observation.get("observation"),
+            "inspect_text": observation.get("observation") or observation.get("summary"),
+            "inspect_handle": observation.get("asset_handle"),
+            "confirms_visual_only": observation.get("confirms_visual_only", False),
             "certainty": observation.get("certainty"),
+            "ocr_text": observation.get("full_text") or "",
+            "asset_ids": observation.get("asset_ids"),
             "operation": observation.get("operation"),
             "value": observation.get("value"),
             "rows": observation.get("rows"),
             "answer_type": observation.get("answer_type"),
             "filters_applied": observation.get("filters_applied"),
+            "samples": observation.get("samples"),
+            "recommended_resolution": observation.get("recommended_resolution"),
+            "preview": observation.get("preview"),
+            "condition_summary": observation.get("condition_summary"),
+            # Phase H H4：OCR 结构化硬值（供 nucleus 提取与 guard 校验）
+            "exact_values": observation.get("exact_values") or [],
+            "provider": observation.get("provider"),
+            "confidence": observation.get("confidence"),
+            "fallback_used": observation.get("fallback_used"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):
+        person = (arguments.get("filters") or {}).get("person") or arguments.get("person") or ""
+        if person:
+            self.active_person = person
         if tool_name == "query_memory_facts":
             total = observation.get("total")
             self.fact_total = int(total) if total is not None else None
@@ -186,6 +266,15 @@ class TaskState:
         task.fulfillment = data.get("fulfillment") or "pending"
         task.search_satisfaction = data.get("search_satisfaction")
         task.search_condition_summary = data.get("search_condition_summary") or {}
+        # D12：跨轮续接时恢复结果集预览（显式要图/追问时 grounding 仍能展示证据网格）
+        task.result_preview = data.get("result_preview") or []
+        task.result_total = data.get("result_total")
+        task.result_remaining = data.get("result_remaining")
+        task.selected_asset_handle = data.get("selected_asset_handle")
+        task.active_person = data.get("active_person")
+        task.active_event = data.get("active_event")
+        task.open_questions = data.get("open_questions") or []
+        task.last_user_goal = data.get("last_user_goal") or task.user_goal
         return task
 
     def as_dict(self) -> dict:
@@ -196,6 +285,7 @@ class TaskState:
             "unresolved_conditions": self.unresolved_conditions,
             "current_result_set": self.current_result_set,
             "selected_asset": self.selected_asset,
+            "selected_asset_handle": self.selected_asset_handle,
             "delivery_state": self.delivery_state,
             "fulfillment": self.fulfillment,
             "result_mode": self.result_mode,
@@ -212,4 +302,8 @@ class TaskState:
             "result_remaining": self.result_remaining,
             "result_preview": self.result_preview,
             "tool_results": self.tool_results,
+            "active_person": self.active_person,
+            "active_event": self.active_event,
+            "open_questions": self.open_questions,
+            "last_user_goal": self.last_user_goal,
         }

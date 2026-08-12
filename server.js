@@ -40,13 +40,35 @@ const readRawBody = (req) => new Promise((resolve, reject) => {
 async function proxyBackend(req, res, url) {
   try {
     const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readRawBody(req);
-    const timeoutMs = url.pathname === "/api/model-profiles/switch" ? 1_000_000 : 240_000;
+    const isSse = /text\/event-stream/.test(req.headers.accept || "") || url.pathname.endsWith("/events");
+    const timeoutMs = url.pathname === "/api/model-profiles/switch" ? 1_000_000 : (isSse ? 600_000 : 240_000);
     const response = await fetch(`${backendBaseUrl}${url.pathname}${url.search}`, {
       method: req.method,
       headers: { "content-type": req.headers["content-type"] || "application/json" },
       body,
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (isSse) {
+      // Phase C C13：SSE 必须流式转发（EventSource 需要增量 chunk），不能一次读完。
+      res.writeHead(response.status, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        "x-accel-buffering": "no",
+        connection: "keep-alive",
+      });
+      const reader = response.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+        }
+        res.end();
+      } catch (streamError) {
+        try { res.end(); } catch (_) { /* client closed */ }
+      }
+      return;
+    }
     const payload = await response.arrayBuffer();
     res.writeHead(response.status, { "content-type": response.headers.get("content-type") || "application/json; charset=utf-8", "cache-control": "no-store" });
     res.end(Buffer.from(payload));
@@ -75,7 +97,7 @@ function serveFile(req, res, url) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  if (url.pathname.startsWith("/api/")) return proxyBackend(req, res, url);
+  if (url.pathname.startsWith("/api/") || url.pathname === "/qa") return proxyBackend(req, res, url);
   return serveFile(req, res, url);
 });
 
