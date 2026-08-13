@@ -19,6 +19,7 @@ from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
                          RESOLVE_OCR, RESOLVE_VISUAL)
 from .emergency import render_emergency_summary
 from .final_guard import FinalGuard
+from .intent import multi_image_intent, ocr_intent, visual_intent
 from .judge import judge_faithfulness
 from .time_context import current_time_line
 from .profile import get_profile
@@ -337,32 +338,6 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     }
 
 
-def _capability_note(tool_name: str) -> str:
-    """Phase F F8：从 tool_capability_matrix 读取 capability 级 readiness，注入 Agent 提示。
-
-    只输出关键结论（ready 高置信 / limited 提示），避免上下文膨胀。
-    """
-    try:
-        import json as _json
-        from pathlib import Path as _Path
-        matrix_path = _Path(__file__).resolve().parent.parent.parent / "configs" / "tool_capability_matrix.json"
-        if not matrix_path.is_file():
-            return ""
-        matrix = _json.loads(matrix_path.read_text(encoding="utf-8"))
-        caps = matrix.get(tool_name) or {}
-        notes = []
-        for key, info in (caps or {}).items():
-            status = str(info.get("status") or "")
-            acc = info.get("accuracy")
-            if status == "ready" or status.startswith("ready"):
-                notes.append(f"{key}=ready" + (f"({acc:.2f})" if isinstance(acc, (int, float)) else ""))
-            elif status == "limited":
-                notes.append(f"{key}=limited")
-        return "；".join(notes)
-    except Exception:
-        return ""
-
-
 class AgentRuntime:
     """Thin tool-loop runtime. 模型调用通过传入的 chat_fn 注入。"""
 
@@ -386,6 +361,7 @@ class AgentRuntime:
             return self.chat_fn(messages)
 
     def _tool_descriptions(self) -> str:
+        from .capability import tool_capability_summary
         lines = []
         from .tool_registry import list_tools
         allowed = set(self.profile.tools) if self.profile.tools else None
@@ -394,7 +370,7 @@ class AgentRuntime:
                 continue
             if allowed is not None and spec.name not in allowed:
                 continue
-            capability = _capability_note(spec.name)
+            capability = tool_capability_summary(spec.name)
             lines.append(f"- {spec.name}: {spec.description}"
                          f"{(' 能力=' + capability) if capability else ''}"
                          f" 输入schema={json.dumps(spec.input_schema, ensure_ascii=False)}")
@@ -555,20 +531,14 @@ class AgentRuntime:
         last_model_step_id = None
         next_call_type = "agent"
         next_call_trigger = "用户问题"
-        visual_intent = bool(__import__("re").search(
-            r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|在做什么|"
-            r"有没有|是什么|放着|写了|内容|细节", message))
+        wants_visual = visual_intent(message)
         # Phase E：Adaptive Visual Budget——按问题类型放宽视觉复核预算
-        multi_image_intent = bool(__import__("re").search(
-            r"哪一张|哪张|哪些|哪几张|每一张|逐[一一张]|逐一|对比|还有吗|还有没有|都看|全部|每张|"
-            r"所有照片|哪几张|哪几个|翻看", message))
-        ocr_intent = bool(__import__("re").search(
-            r"菜单|价格|多少钱|售价|招牌|店名|电话|写了什么|什么字|文字|创始于|"
-            r"价位|几块钱|面单|多少钱一份", message))
+        wants_multi = multi_image_intent(message)
+        wants_ocr = ocr_intent(message)
         adaptive_inspections = self.profile.max_inspections
-        if multi_image_intent:
+        if wants_multi:
             adaptive_inspections = max(adaptive_inspections, 4)
-        elif ocr_intent:
+        elif wants_ocr:
             adaptive_inspections = max(adaptive_inspections, 2)
             # read_photo_text 需要整图 + 3x3 tile 多次图片推理，放宽总预算
             # （同图 OCR 结果已缓存，只有首次需要长预算）
@@ -773,7 +743,7 @@ class AgentRuntime:
                         next_call_trigger = f"回答前必须调用 {resolution['tool']}，模型提前结束"
                         continue
                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
-                if search_has_preview and not inspect_called and visual_intent \
+                if search_has_preview and not inspect_called and wants_visual \
                         and visual_retries < max_visual_retries and turn.budget.can_model_step():
                     visual_retries += 1
                     denies_found = bool(__import__("re").search(
@@ -826,7 +796,7 @@ class AgentRuntime:
                     if req.code == RESOLVE_OCR and _pending_resolution(task):
                         continue  # 已由上方 recommended_resolution 流程处理
                     if req.code == RESOLVE_VISUAL and search_has_preview and not inspect_called \
-                            and visual_intent and visual_retries < max_visual_retries:
+                            and wants_visual and visual_retries < max_visual_retries:
                         continue  # 已由上方视觉流程处理
                     if completion_retries < max_completion_retries \
                             and turn.budget.can_model_step():

@@ -18,6 +18,7 @@ import threading
 import time
 from pathlib import Path
 
+from .intent import ocr_intent, visual_intent
 from .tool_registry import ToolSpec, register
 
 _RUNTIME: dict = {}
@@ -605,12 +606,8 @@ def _recommended_resolution(query: str, preview: list, satisfaction: str,
         return {"needed": False, "tool": None,
                 "reason": "" if satisfaction == "full_support" else "没有候选可复核"}
     q = f"{query or ''} {user_goal or ''}"
-    needs_ocr = bool(re.search(
-        r"菜单|价格|多少钱|售价|招牌|店名|电话|写了什么|什么字|文字|创始|价位|"
-        r"几块钱|多少钱一份|数字|号码", q))
-    needs_visual = bool(re.search(
-        r"颜色|穿|衣服|外套|几个|多少人|猫|雪|拿着|道具|火把|有没有|哪[一123]?张|"
-        r"植物|雕塑|场景|内容|细节|在做什么|拍的什么|什么造型|什么样子", q))
+    needs_ocr = ocr_intent(q)
+    needs_visual = visual_intent(q)
     if needs_ocr:
         return {"needed": True, "tool": "read_photo_text",
                 "reason": "问题需要读取照片中的文字/数字，请用 read_photo_text 复核 preview 里的照片"}
