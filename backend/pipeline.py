@@ -211,6 +211,10 @@ class IngestionPipeline:
                 self.store.rebuild_person_memory(asset["source_owner_id"])
             if summarize_event:
                 self.summarize_event(event["id"])
+            try:
+                self.store.auto_confirm_clusters(scope_id)
+            except Exception:
+                pass
             return saved_asset
         except Exception as error:
             self.store.cleanup_asset_derivatives(asset_id)

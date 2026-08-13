@@ -1,5 +1,7 @@
 """Deterministic, quality-aware face clustering primitives."""
 
+from __future__ import annotations
+
 import itertools
 import math
 from dataclasses import dataclass, field
