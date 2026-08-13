@@ -1,4 +1,3 @@
-from __future__ import annotations
 import asyncio
 import json
 import os
@@ -131,6 +130,9 @@ def _allowed_import_roots():
     defaults = [
         DATA_DIR / "imports",
         ROOT / "data" / "imports",
+        Path("/home/asus/data"),
+        Path("/home/asus/datasets"),
+        Path("/home/asus/benchmarks"),
     ]
     values = configured.split(":") if configured else [str(item) for item in defaults]
     roots = []
@@ -420,10 +422,6 @@ def process_ingest_batch(asset_ids, batch_id):
         with batch_worker_lock:
             active_batch_workers.discard(batch_id)
 
-
-
-class SetVLMBackend(BaseModel):
-    backend: str
 
 
 class ModelSwitchRequest(BaseModel):
@@ -730,27 +728,6 @@ def delete_memory_space(scope_id: str):
 
 
 
-@app.get("/api/vlm-backend")
-def vlm_backend():
-    runtime = _current_model_runtime()
-    return {
-        "backend": "vllm",
-        "available_backends": ["vllm"],
-        "profile": runtime.get("profile"),
-        "model": runtime.get("model"),
-        "status": runtime.get("status"),
-        "deprecated": True,
-        "replacement": "/api/model-profiles",
-    }
-
-
-@app.post("/api/vlm-backend")
-def set_vlm_backend(payload: SetVLMBackend):
-    raise HTTPException(
-        status_code=410,
-        detail="VLM backend switching is retired; use POST /api/model-profiles/switch",
-    )
-
 _OCR_SETTING_KEY = "ocr.small_enabled"
 
 
@@ -762,7 +739,7 @@ def _ocr_settings():
         "small_ocr_enabled": enabled,
         "small_ocr_available": available,
         "readiness": "ready" if available else "unavailable",
-        "model": "rapidocr" if available else None,
+        "model": "paddleocr" if available else None,
     }
 
 
@@ -1052,10 +1029,6 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
     if not includePeople:
         values = [item for item in values if item["entity_type"] != "person"]
     for item in values:
-        if item.get("entity_type") == "person":
-            item["is_self"] = bool(store._row("SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'", (item["id"],)))
-        else:
-            item["is_self"] = False
         if item.get("entity_type") == "person" and item.get("status") == "pending":
             item["canonical_name"] = "待命名成员"
             item["family_role"] = None
@@ -1619,11 +1592,11 @@ def face_instance_crop(face_instance_id: str):
     if not instance or not asset_path or not Path(asset_path).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image
 
         ensure_heif_support()
         with Image.open(asset_path) as source:
-            image = ImageOps.exif_transpose(source).convert("RGB")
+            image = source.convert("RGB")
         bbox = instance.get("bbox_json") or []
         if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
             raise ValueError("invalid face bounding box")
@@ -1652,160 +1625,22 @@ def stories():
     return {"stories": store.list_stories()}
 
 
-def _truncate_story_evidence(evidence):
-    """Limit story-evidence size so the LLM prompt stays well under the
-    model's context window (vllm gemma4-12b-it caps at 8192 tokens).
-    Statistics (topPlace/topPerson/objects) are computed from the full
-    evidence; only the LLM-facing copy is trimmed here."""
-    trimmed = []
-    for ev in evidence:
-        event = ev.get("event") or {}
-        observations = []
-        for item in (ev.get("observations") or [])[:6]:
-            observations.append({
-                "id": item.get("id"),
-                "captured_at": item.get("captured_at"),
-                "place": item.get("place"),
-                "caption": (item.get("caption") or "")[:150],
-                "transcript": (item.get("transcript") or "")[:150],
-                "objects": (item.get("objects") or [])[:5],
-                "people": [{"name": p.get("name"), "is_self": p.get("is_self")} for p in (item.get("people") or [])[:4]],
-            })
-        trimmed.append({"event": {
-            "title": (event.get("title") or "")[:80],
-            "summary": (event.get("summary") or "")[:150],
-            "time_start": event.get("time_start"),
-            "place": (event.get("place") or "")[:60],
-        }, "observations": observations})
-    return trimmed
-
 @app.post("/api/stories")
 def create_story(payload: dict):
     event_ids = payload.get("event_ids") or []
     if event_ids and not payload.get("content"):
         evidence = []
-        person_freq = {}
-        self_names = set()
-        place_freq = {}
-        days = set()
-        time_values = []
-        object_set = set()
         for event_id in event_ids:
             detail = store.get_event_detail(event_id)
-            if not detail:
-                continue
-            observations = []
-            for item in detail["observations"]:
-                asset = item.get("asset") or {}
-                people = []
-                for p in (item.get("people") or []):
-                    if not p.get("entity_id"):
-                        continue
-                    is_self = bool(store._row(
-                        "SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'",
-                        (p.get("entity_id"),),
-                    ))
-                    people.append({"name": p.get("name"), "is_self": is_self})
-                    name = p.get("name") or "未知"
-                    person_freq[name] = person_freq.get(name, 0) + 1
-                    if is_self:
-                        self_names.add(name)
-                observations.append({
-                    "id": item.get("id"),
-                    "caption": item.get("caption"),
-                    "transcript": item.get("transcript"),
-                    "captured_at": item.get("captured_at"),
-                    "place": item.get("place"),
-                    "objects": item.get("objects"),
-                    "captured_location": asset.get("captured_location"),
-                    "people": people,
-                })
-                captured = item.get("captured_at")
-                if captured:
-                    days.add(str(captured)[:10])
-                    time_values.append(str(captured))
-                for obj in (item.get("objects") or []):
-                    label = obj if isinstance(obj, str) else (obj.get("label") or obj.get("primary") or "")
-                    if label:
-                        object_set.add(label)
-                location = asset.get("captured_location")
-                if location:
-                    try:
-                        lat, lon = (float(part) for part in str(location).replace(" ", "").split(","))
-                        cluster = f"{round(lat, 1)},{round(lon, 1)}"
-                    except Exception:
-                        cluster = str(location)
-                else:
-                    cluster = item.get("place") or "未知"
-                place_freq[cluster] = place_freq.get(cluster, 0) + 1
-            event_start = (detail["event"] or {}).get("time_start")
-            event_end = (detail["event"] or {}).get("time_end")
-            if event_start:
-                days.add(str(event_start)[:10])
-            if event_end:
-                days.add(str(event_end)[:10])
-            evidence.append({"event": detail["event"], "observations": observations})
-        # 按时间排序:每个事件内observations按captured_at,事件按各自最早时间
-        for ev in evidence:
-            ev["observations"].sort(key=lambda o: str(o.get("captured_at") or ""))
-        evidence.sort(key=lambda ev: str((ev["observations"] or [{}])[0].get("captured_at") or ""))
+            if detail:
+                evidence.append({"event": detail["event"], "observations": [{"id": item["id"], "caption": item.get("caption"), "transcript": item.get("transcript"), "asset_id": item.get("asset_id")} for item in detail["observations"]]})
         if evidence:
-            photo_count = sum(len(ev["observations"]) for ev in evidence)
-            event_count = len(evidence)
-            days_count = len(days)
-            object_count = len(object_set)
-            time_span = f"{min(time_values)[:10]} 至 {max(time_values)[:10]}" if len(time_values) > 1 else (time_values[0][:10] if time_values else "")
-            # topPerson:排除相册主人(我)后的最高频陪伴人物;叙事主语=我+topPerson
-            non_self_freq = {key: value for key, value in person_freq.items() if key not in self_names}
-            top_person = max(non_self_freq, key=non_self_freq.get) if non_self_freq else None
-            subject = f"我和{top_person}" if top_person else "我"
-            # 地点组:GPS聚类给字母标签,附经纬度,不编地名
-            cluster_list = sorted(place_freq.items(), key=lambda item: -item[1])
-            cluster_labels = {}
-            place_lines = []
-            for index, (cluster, count) in enumerate(cluster_list):
-                label = f"地点组{chr(ord('A') + index)}"
-                cluster_labels[cluster] = label
-                place_lines.append(f"{label}(经纬度{cluster},{count}张)")
-            top_label = cluster_labels[cluster_list[0][0]] if cluster_list else ""
-            other_labels = "、".join(cluster_labels[c] for c, _ in cluster_list[1:]) or "无"
-            # 代表事件一句话,给叙事具体画面(防空洞)
-            representative = []
-            for ev in evidence:
-                e = ev["event"] or {}
-                one_line = (e.get("summary") or "").strip() or (e.get("title") or "").strip()
-                if one_line and len(representative) < 3:
-                    representative.append(one_line[:80])
-            stats = (
-                f"时间跨度:{time_span or '未知'};天数:{days_count}天;事件数:{event_count}个;"
-                f"照片数:{photo_count}张;物件数:{object_count}件;"
-                f"地点分布:{'、'.join(place_lines) or '无'};"
-                f"出现最多的地点组(叙述需占约2/3篇幅):{top_label};其他地点组合计约1/3:{other_labels};"
-                f"相册主人(我):{'、'.join(sorted(self_names)) or '无'};陪伴人物:{top_person or '无'}"
-            )
-            prompt = (
-                "根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。\n"
-                "统计概要(系统已算出,仅供叙事参考,不得改动或编造):\n" + stats + "\n"
-                "规则:\n"
-                "1. 严格返回JSON:title、content、outline(数组)。使用中文,content约400字(照片多可略长)。\n"
-                "2. 叙事以" + subject + "为主语主角,第一人称\"我\"。"
-                + ("陪伴人物" + top_person + "与\"我\"是并肩关系,绝不把\"我\"写成\"我与自己相伴\"。"
-                   if top_person else "叙述\"我\"自身的经历,第一人称。") + "\n"
-                "3. 证据中is_self=true的人物=相册主人\"我\"本人,叙事中一律用\"我\"称呼,绝不使用其姓名(如\"zhx\")作为第三人称提及。\n"
-                "4. 出现最多的地点组要占叙事约2/3篇幅,其他地点组合计约1/3。\n"
-                "5. 地点可依据经纬度合理推断城市(如22.5,114.1疑似深圳)并使用,但不得编造未经证据支持的具体地名(商场/餐厅/景点等);若不确定就笼统表述。\n"
-                "6. 严格按时间先后顺序(早→晚)组织叙事,不得倒序或乱序。\n"
-                "7. 参考这些代表性画面,让叙事有具体细节而非统计堆砌:\n"
-                + "\n".join("· " + text for text in representative) + "\n"
-                "证据:" + str(_truncate_story_evidence(evidence))
-            )
-            generated = parse_json_response(gamma.chat(prompt))
-            payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
-            # 方案B:后处理把is_self人物名字替换成"我",防止LLM不服从
-            for name in sorted(self_names):
-                if name and name != "我":
-                    payload["title"] = payload.get("title","").replace("我和"+name, "我").replace(name, "我")
-                    payload["content"] = payload.get("content","").replace("我和"+name, "我").replace(name, "我")
+            prompt = """根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。严格返回 JSON：title、content、outline（数组）。使用中文，content 300 字以内。证据：""" + str(evidence)
+            try:
+                generated = parse_json_response(gamma.chat(prompt))
+                payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
+            except Exception:
+                pass
     return store.create_story(payload)
 
 
