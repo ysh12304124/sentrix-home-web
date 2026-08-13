@@ -511,7 +511,7 @@ class AgentRuntime:
                             text="正在理解你的问题…")
 
         parse_retries = 0
-        max_parse_retries = 2
+        max_parse_retries = 3
         guard_retries = 0
         max_guard_retries = 1
         seen_tool_calls = set()
@@ -595,7 +595,7 @@ class AgentRuntime:
                 if parse_retries < max_parse_retries and turn.budget.can_model_step():
                     parse_retries += 1
                     messages.append({"role": "assistant", "content": raw})
-                    if parse_retries >= 2:
+                    if parse_retries == 2:
                         # D11：第二次恢复——只要求输出最简单的 final（12B 长输出/跑题时最有效）
                         self._emit_progress(
                             turn, progress_callback, stage="recovering", status="running",
@@ -605,6 +605,18 @@ class AgentRuntime:
                             '{"action":"final","answer":"<一句话回答>","evidence_refs":["tool_call_1"]}。'
                             "answer 基于已返回的工具结果用一句自然的话；没有工具结果就如实说没有找到相关记录；"
                             "不要调用任何工具、不要写解释。"
+                        )})
+                    elif parse_retries >= 3:
+                        # 第三次恢复：必须给出明确答案，哪怕确认"现有记录不足以回答"
+                        self._emit_progress(
+                            turn, progress_callback, stage="recovering", status="running",
+                            text="我正在给出一个明确的结论。")
+                        messages.append({"role": "user", "content": (
+                            "你现在必须给出一个明确的 final 答案，不允许再调用工具。"
+                            "如果现有记录足以回答，就直接回答；如果不足以回答，"
+                            '就明确说"现有记录不足以确认"并给出你能确认的部分。'
+                            '只输出 {"action":"final","answer":"<结论>","evidence_refs":[]}，'
+                            "不要 markdown、不要多余文字。"
                         )})
                     else:
                         messages.append({"role": "user", "content": (
