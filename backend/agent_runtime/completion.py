@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .intent import evidence_intent, image_delivery_intent, ocr_intent, visual_intent
+from .intent import (chat_only, evidence_intent, image_delivery_intent,
+                     ocr_intent, visual_intent)
 
 RETRIEVE_EVIDENCE = "retrieve_evidence"
 RESOLVE_VISUAL = "resolve_visual"
@@ -27,7 +28,6 @@ _RETRIEVAL_TOOLS = {
     "get_core_memory", "get_person_memory",
 }
 
-# 纯聊天/通用知识：不需要检索家庭记忆
 @dataclass
 class Requirement:
     code: str
@@ -102,6 +102,10 @@ class CompletionState:
 
     @staticmethod
     def _wants_evidence(message: str) -> bool:
+        if not message:
+            return False
+        if chat_only(message):
+            return False
         return evidence_intent(message)
 
     @staticmethod

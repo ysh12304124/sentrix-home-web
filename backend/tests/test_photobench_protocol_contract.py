@@ -2,7 +2,7 @@ import inspect
 import unittest
 
 from backend import app
-from backend.agent_runtime import runtime, tool_policy
+from backend.agent_runtime import ocr_tool, runtime, tool_policy
 
 
 class PhotoBenchProtocolContractTests(unittest.TestCase):
@@ -20,6 +20,12 @@ class PhotoBenchProtocolContractTests(unittest.TestCase):
         self.assertIn('metric["call_type"] = "tool_internal"', source)
         self.assertIn('metric["parent_step_id"] = step_id', source)
         self.assertIn('step.get("internal_model_call_metrics")', source)
+
+    def test_extracted_ocr_keeps_internal_model_metrics(self):
+        source = inspect.getsource(ocr_tool)
+        self.assertIn("gamma.get_and_clear_call_metrics()", source)
+        self.assertIn('metric["tool_subtask"] = label', source)
+        self.assertIn('cached_result.pop("_model_call_metrics", None)', source)
 
     def test_tool_results_keep_image_ids_and_private_metrics(self):
         allowed = tool_policy.ToolPolicy._TOOL_ALLOWED["search_memories"]
