@@ -1337,6 +1337,60 @@ def create_relationship(payload: dict):
     return value
 
 
+@app.post("/api/relationships/batch", status_code=201)
+def create_relationships_batch(payload: dict):
+    """Idempotently import confirmed person relationships for one memory space."""
+    scope_id = str(payload.get("scope_id") or "").strip()
+    relationships = payload.get("relationships") or []
+    entity_by_name = payload.get("entity_by_name") or {}
+    if not scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    if not isinstance(relationships, list) or not isinstance(entity_by_name, dict):
+        raise HTTPException(status_code=400, detail="relationships and entity_by_name must be structured values")
+
+    def resolve_entity(reference):
+        value = str(reference or "").strip()
+        entity_id = str(entity_by_name.get(value) or value).strip()
+        entity = store.get_entity(entity_id) if entity_id else None
+        if not entity:
+            matched = store.find_confirmed_person_by_name(scope_id, value)
+            entity = store.get_entity(matched["entity_id"]) if matched else None
+        if not entity or entity.get("entity_type") != "person" or entity.get("status") != "confirmed":
+            raise ValueError(f"confirmed person not found: {value}")
+        if (entity.get("scope_id") or "home-default") != scope_id:
+            raise ValueError(f"person belongs to another memory space: {value}")
+        return entity
+
+    results, errors = [], []
+    for index, item in enumerate(relationships):
+        try:
+            if not isinstance(item, dict):
+                raise ValueError("relationship must be an object")
+            subject = resolve_entity(item.get("subject"))
+            object_entity = resolve_entity(item.get("object"))
+            predicate = str(item.get("predicate") or "").strip()
+            if not predicate:
+                raise ValueError("predicate is required")
+            if subject["id"] == object_entity["id"]:
+                raise ValueError("relationship endpoints must be different people")
+            relationship = store.create_relationship(
+                subject["id"], predicate, object_entity["id"], item.get("evidence_ids") or [],
+                float(item.get("confidence", 1.0) or 1.0), "active",
+            )
+            store.maintain_relationship_claim(relationship)
+            results.append(relationship)
+        except (TypeError, ValueError) as error:
+            errors.append({"index": index, "error": str(error)})
+    return {
+        "status": "completed" if not errors else "partial",
+        "requested": len(relationships),
+        "imported": len(results),
+        "failed": len(errors),
+        "relationships": results,
+        "errors": errors,
+    }
+
+
 @app.post("/api/relationships/{relationship_id}/confirm")
 def confirm_relationship(relationship_id: str):
     value = store.confirm_relationship(relationship_id)
@@ -1837,7 +1891,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             item["parent_step_id"] = s.get("parent_step_id")
         if s.get("call_type"):
             item["call_type"] = s.get("call_type")
-        for field in ("trigger", "action", "tool", "answer_preview", "attempt"):
+        for field in ("trigger", "action", "tool", "answer_preview", "attempt",
+                      "turn_outcome", "parse_status", "next_step"):
             if s.get(field) is not None:
                 item[field] = s.get(field)
         if s.get("type") == "judge":
@@ -1863,6 +1918,10 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         step_id = step.get("step_id")
         step_type = step.get("type")
         for metric in metrics_by_step.pop(step_id, []):
+            if step_type == "model":
+                metric["turn_outcome"] = step.get("turn_outcome")
+                metric["parse_status"] = step.get("parse_status")
+                metric["next_step"] = step.get("next_step")
             metric["call_observation"] = {
                 "kind": metric.get("call_type") or "unknown",
                 "label": {
@@ -1879,8 +1938,11 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                 }.get(metric.get("call_type"), "执行模型推理"),
                 "trigger": step.get("trigger") or "",
                 "outcome": (
-                    f"决定调用工具 {step.get('tool')}" if step.get("action") == "tool_call"
-                    else "生成候选回答" if step.get("action") == "final"
+                    f"已解析，准备调用工具 {step.get('tool')}" if step.get("turn_outcome") == "tool_call"
+                    else "已解析，正常输出回答" if step.get("turn_outcome") == "final_answer"
+                    else "JSON 解析失败，触发格式恢复" if step.get("turn_outcome") == "parse_failure"
+                    else "上下文或 token 预检拦截" if step.get("turn_outcome") == "context_blocked"
+                    else "模型请求失败" if step.get("turn_outcome") == "model_error"
                     else f"判定 {'通过' if step.get('faithful') else '未通过'}"
                     if step_type == "judge" and step.get("faithful") is not None
                     else f"重写状态：{step.get('status')}" if step_type == "writer"
@@ -1950,6 +2012,19 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
          "step_id": s.get("step_id"), "parent_step_id": s.get("parent_step_id")}
         for s in turn.steps if s.get("type") == "tool"
     ]
+    agent_model_steps = [s for s in turn.steps if s.get("type") == "model"]
+    final_agent_step = agent_model_steps[-1] if agent_model_steps else {}
+    if turn.termination_reason in {"model_step_limit", "tool_call_limit"}:
+        turn_outcome = "step_limit"
+    elif turn.status == "complete" and turn.final_answer:
+        turn_outcome = "final_answer"
+    else:
+        turn_outcome = final_agent_step.get("turn_outcome") or (
+            "context_blocked" if "context" in str(turn.reason or "").lower()
+            else "parse_failure" if turn.termination_reason == "parse_failure"
+            else "model_error" if turn.status in {"error", "timeout"}
+            else None
+        )
     return {
         "answer": turn.final_answer,
         "model_call_metrics": ordered_metrics,
@@ -1965,6 +2040,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "guard_debug": guard_debug,
         "answer_grounding": turn.answer_grounding,
         "termination_reason": turn.termination_reason,
+        "turn_outcome": turn_outcome,
         "delivery_status": {
             "ocr_partial": getattr(turn, "ocr_partial", False),
             "ocr_partial_reason": getattr(turn, "ocr_partial_reason", "") or None,

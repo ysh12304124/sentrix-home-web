@@ -620,9 +620,17 @@ class AgentRuntime:
             try:
                 raw = self._chat(messages, call_type=call_type, step_id=model_step_id)
             except Exception as exc:
+                error_text = str(exc)
+                outcome = "context_blocked" if any(
+                    marker in error_text.lower()
+                    for marker in ("context", "token budget", "maximum context", "preflight")
+                ) else "model_error"
                 turn.steps.append({"type": "model", "status": "error",
-                                   "reason": str(exc), "step_id": model_step_id,
-                                   "call_type": call_type, "trigger": call_trigger})
+                                   "reason": error_text, "step_id": model_step_id,
+                                   "call_type": call_type, "trigger": call_trigger,
+                                   "turn_outcome": outcome,
+                                   "parse_status": "not_applicable",
+                                   "next_step": "stop"})
                 # D12：恢复/后续模型调用失败时，不丢弃已产出的 final 回答
                 if turn.final_answer:
                     turn.status = "partial"
@@ -633,18 +641,28 @@ class AgentRuntime:
                 break
             model_step = {"type": "model", "raw": (raw or "")[:500],
                           "step_id": model_step_id, "call_type": call_type,
-                          "trigger": call_trigger}
+                          "trigger": call_trigger,
+                          "turn_outcome": None,
+                          "parse_status": "failed",
+                          "next_step": "recovery"}
             turn.steps.append(model_step)
             last_model_step_id = model_step_id
             action = self._parse_action(raw)
             if action is not None:
+                model_step["parse_status"] = "success"
                 model_step["action"] = action.get("action")
                 if action.get("action") == "tool_call":
+                    model_step["turn_outcome"] = "tool_call"
+                    model_step["next_step"] = action.get("tool") or "tool"
                     model_step["tool"] = action.get("tool") or ""
                     model_step["arguments"] = action.get("arguments") or {}
                 elif action.get("action") == "final":
+                    model_step["turn_outcome"] = "final_answer"
+                    model_step["next_step"] = "final_answer"
                     model_step["answer_preview"] = str(action.get("answer") or "")[:300]
             if action is None:
+                model_step["turn_outcome"] = "parse_failure"
+                model_step["parse_status"] = "failed"
                 if parse_retries < max_parse_retries and turn.budget.can_model_step():
                     parse_retries += 1
                     messages.append({"role": "assistant", "content": raw})
