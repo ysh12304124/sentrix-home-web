@@ -12,8 +12,10 @@ CompletionGate 只做两件事：
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
+
+from .intent import (chat_only, evidence_intent, image_delivery_intent,
+                     ocr_intent, visual_intent)
 
 RETRIEVE_EVIDENCE = "retrieve_evidence"
 RESOLVE_VISUAL = "resolve_visual"
@@ -25,29 +27,6 @@ _RETRIEVAL_TOOLS = {
     "search_memories", "query_memory_facts", "search_conversation_history",
     "get_core_memory", "get_person_memory",
 }
-
-# 纯聊天/通用知识：不需要检索家庭记忆
-_CHAT_ONLY_RE = re.compile(
-    r"你好|谢谢|在吗|再见|哈哈|好的|嗯|哦|你是谁|你叫什么|你会什么|帮我写|"
-    r"写一|写个|改一|翻译|解释一下什么是|什么是|怎么用|步骤|教程", re.I)
-# 涉及家庭记忆/照片证据的问题信号
-_EVIDENCE_INTENT_RE = re.compile(
-    r"照片|图片|记录|回忆|拍|合影|去了|在哪里|哪里|什么|谁|多少|几|"
-    r"时间|日期|年份|月份|几号|活动|旅游|旅行|度假|菜单|价格|招牌|店名|"
-    r"电话|穿着|衣服|颜色|天气|沙子|沙雕|人物|家人|地点|城市|哪个|哪张")
-# 视觉细节意图
-_VISUAL_RE = re.compile(
-    r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|"
-    r"在做什么|有没有|是什么|放着|写了|内容|细节|长什么样|什么颜色|什么动物")
-# OCR 文字读取意图
-_OCR_RE = re.compile(
-    r"菜单|价格|多少钱|售价|招牌|店名|电话|写了什么|什么字|文字|创始于|"
-    r"价位|几块钱|面单|多少钱一份|报警电话|多少钱|价格是|上面写了")
-# 明确要求查看/交付照片
-_IMAGE_RE = re.compile(
-    r"给我看看|给我看|发我|发给我|发来|原图|都给我|全部给我|"
-    r"展示|显示(?:一下|给我)?|让我看看|看看(?:这些|照片|图)?|"
-    r"打开(?:照片|图片)|看图|给我图|把.{0,6}(?:照片|图片|图)", re.I)
 
 
 @dataclass
@@ -102,21 +81,21 @@ class CompletionState:
         has_preview = any(
             tr.get("tool") == "search_memories" and (tr.get("preview") or [])
             for tr in tool_results)
-        if has_preview and _VISUAL_RE.search(self.message):
+        if has_preview and visual_intent(self.message):
             self._add(RESOLVE_VISUAL, "复核照片细节", "inspect_photo",
                       "需要调用 inspect_photo 复核预览照片后才能回答视觉细节。",
                       satisfied="inspect_photo" in tools_called)
 
         # 3) resolve_ocr：OCR 意图 或 search 明确推荐 read_photo_text，且尚未调用
-        ocr_intent = bool(_OCR_RE.search(self.message))
+        wants_ocr = ocr_intent(self.message)
         recommended_ocr = self._search_recommends(tool_results, "read_photo_text")
-        if ocr_intent or recommended_ocr:
+        if wants_ocr or recommended_ocr:
             self._add(RESOLVE_OCR, "读取照片文字", "read_photo_text",
                       "需要调用 read_photo_text 读取照片中的文字后，才能回答文字/数字类问题。",
                       satisfied="read_photo_text" in tools_called)
 
         # 4) deliver_media：用户明确要求查看照片，且尚未交付原图
-        if _IMAGE_RE.search(self.message):
+        if image_delivery_intent(self.message):
             delivered = bool(tools_called & {"get_original_photos", "get_result_page"})
             self._add(DELIVER_MEDIA, "交付照片", "get_original_photos",
                       "用户要求查看照片，需要交付原图/可查看的照片。",
@@ -126,9 +105,9 @@ class CompletionState:
     def _wants_evidence(message: str) -> bool:
         if not message:
             return False
-        if _CHAT_ONLY_RE.search(message):
+        if chat_only(message):
             return False
-        return bool(_EVIDENCE_INTENT_RE.search(message))
+        return evidence_intent(message)
 
     @staticmethod
     def _search_recommends(tool_results: list, tool: str) -> bool:
