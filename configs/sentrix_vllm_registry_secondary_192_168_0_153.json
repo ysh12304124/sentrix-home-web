@@ -173,7 +173,7 @@
       "dtype": "bfloat16",
       "quantization": "bitsandbytes",
       "load_format": "bitsandbytes",
-      "gpu_memory_utilization": 0.4,
+      "gpu_memory_utilization": 0.45,
       "max_model_len": 4501,
       "max_num_seqs": 2,
       "tensor_parallel_size": 1,
