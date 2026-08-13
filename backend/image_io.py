@@ -74,11 +74,14 @@ def encode_jpeg_preview(path, *, max_dimension: int = 1600, quality: int = 85) -
     """Decode an image (including HEIC) and return browser-safe JPEG bytes."""
     from io import BytesIO
 
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     ensure_heif_support()
     with Image.open(path) as source:
-        image = source.convert("RGB")
+        # Apply EXIF orientation so oriented photos (HEIC etc.) render upright
+        # in previews instead of laying sideways. Tag-less vertical photos still
+        # need content-based auto-orient (Future_Plans A方案) — not covered here.
+        image = ImageOps.exif_transpose(source).convert("RGB")
         if max(image.size) > max_dimension:
             image.thumbnail((max_dimension, max_dimension))
         output = BytesIO()

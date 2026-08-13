@@ -1,3 +1,5 @@
+img { image-orientation: from-image; }
+
 :root {
   --ink: #151613;
   --muted: #73776e;
@@ -482,6 +484,33 @@ body.admin .admin-only { display: revert; }
   border-radius: 4px;
   align-self: flex-start;
 }
+
+/* ===== 故事报告杂志感 ===== */
+.story-report{background:#fff;border:1px solid #ECE9DF;border-radius:16px;padding:28px 32px;}
+.report-topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:6px;}
+.report-title{font-size:40px;font-weight:800;letter-spacing:-0.02em;line-height:1.15;color:#1c1d19;}
+.report-actions{display:flex;gap:8px;flex:0 0 auto;}
+.report-meta{font-size:20px;font-weight:600;color:#1c1d19;margin:12px 0 6px;letter-spacing:0.01em;}
+.report-capsules{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:22px;}
+.place-capsule{font-size:11px;padding:3px 10px;background:rgba(94,122,24,0.12);color:#5E7A18;border-radius:999px;font-weight:500;}
+.report-body{display:flex;gap:28px;margin-bottom:26px;align-items:flex-start;}
+.report-narrative{flex:1;font-size:16px;line-height:1.7;color:#1c1d19;white-space:pre-wrap;}
+.report-stats{width:280px;flex:0 0 280px;display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.stat-card{background:#F7F6F0;border-radius:14px;padding:14px 16px;}
+.stat-num{font-size:28px;font-weight:800;color:#1c1d19;line-height:1.1;font-variant-numeric:tabular-nums;}
+.stat-label{font-size:11px;color:#9A9486;margin-top:4px;letter-spacing:0.04em;}
+.report-bottom{display:flex;gap:32px;border-top:1px solid #ECE9DF;padding-top:20px;}
+.report-places,.report-people{flex:1;min-width:0;}
+.report-sec-title{font-size:13px;font-weight:700;color:#1c1d19;margin-bottom:14px;letter-spacing:0.02em;}
+.place-bar-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;}
+.place-bar-name{width:76px;font-size:12px;color:#6E6A5E;flex:0 0 76px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.place-bar-bg{flex:1;height:8px;border-radius:999px;background:#ECE9DF;overflow:hidden;}
+.place-bar{height:100%;border-radius:999px;background:#5E7A18;transition:width .4s ease;}
+.place-bar-count{font-size:12px;color:#9A9486;width:26px;text-align:right;font-variant-numeric:tabular-nums;}
+.person-card{display:flex;align-items:center;gap:12px;margin-bottom:12px;}
+.person-avatar{width:40px;height:40px;flex:0 0 40px;border-radius:999px;background:linear-gradient(135deg,#FFD27A,#C7700E);color:#fff;font-size:16px;font-weight:700;display:flex;align-items:center;justify-content:center;}
+.person-name{font-size:14px;font-weight:600;color:#1c1d19;}
+.person-count{font-size:11px;color:#9A9486;margin-top:2px;}
 
 /* Space manager: album list rows + danger button */
 .space-list { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; max-height: 360px; overflow-y: auto; }

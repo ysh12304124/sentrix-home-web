@@ -446,10 +446,6 @@ def process_ingest_batch(asset_ids, batch_id):
 
 
 
-class SetVLMBackend(BaseModel):
-    backend: str
-
-
 class ModelSwitchRequest(BaseModel):
     profile: str
     wait_ready: bool = True
@@ -759,27 +755,6 @@ def delete_memory_space(scope_id: str):
 
 
 
-@app.get("/api/vlm-backend")
-def vlm_backend():
-    runtime = _current_model_runtime()
-    return {
-        "backend": "vllm",
-        "available_backends": ["vllm"],
-        "profile": runtime.get("profile"),
-        "model": runtime.get("model"),
-        "status": runtime.get("status"),
-        "deprecated": True,
-        "replacement": "/api/model-profiles",
-    }
-
-
-@app.post("/api/vlm-backend")
-def set_vlm_backend(payload: SetVLMBackend):
-    raise HTTPException(
-        status_code=410,
-        detail="VLM backend switching is retired; use POST /api/model-profiles/switch",
-    )
-
 _OCR_SETTING_KEY = "ocr.small_enabled"
 
 
@@ -791,7 +766,7 @@ def _ocr_settings():
         "small_ocr_enabled": enabled,
         "small_ocr_available": available,
         "readiness": "ready" if available else "unavailable",
-        "model": "rapidocr" if available else None,
+        "model": "paddleocr" if available else None,
     }
 
 
