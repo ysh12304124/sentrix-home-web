@@ -1793,10 +1793,26 @@ class MemoryStore:
             "visual_event_type": (observation.get("event_type") or "").strip().lower(),
         }
 
-    @staticmethod
-    def _event_display_place(observation):
-        """Return a semantic place label, keeping GPS only on the asset."""
+    def _event_display_place(self, observation):
+        """Return a place label. Prefer the reverse-geocoded place name (省市区) so
+        events/stories show WHERE the photo was taken; fall back to the VLM scene
+        label only when no place name is available."""
         observation = observation or {}
+        # 1) 优先: 坐标反解地名(asset.metadata_json.reverse_geocode) — 回答"在哪拍"
+        asset_id = observation.get("asset_id")
+        if asset_id:
+            asset = self.get_asset(asset_id) or {}
+            metadata = asset.get("metadata_json") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata or "{}")
+                except Exception:
+                    metadata = {}
+            rg = (metadata or {}).get("reverse_geocode") or {}
+            label = str(rg.get("label") or "").strip()
+            if label:
+                return label
+        # 2) 次选: VLM场景标签
         visual_place = str(observation.get("place") or "").strip()
         if visual_place and not DISPLAY_COORDINATE_RE.fullmatch(visual_place):
             return visual_place
@@ -1804,7 +1820,9 @@ class MemoryStore:
         semantic = canonical.get("semantic") if isinstance(canonical.get("semantic"), dict) else {}
         semantic_place = semantic.get("place") if isinstance(semantic.get("place"), dict) else {}
         primary = str(semantic_place.get("primary") or "").strip()
-        return primary if primary and primary != OTHER else ""
+        if primary and primary != OTHER:
+            return primary
+        return ""
 
     def merge_observation_into_event(self, observation):
         candidates = self._event_candidates(observation)
