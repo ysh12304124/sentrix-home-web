@@ -1,97 +1,176 @@
 {
   "inspect_photo": {
     "people_count": {
-      "status": "untested",
-      "accuracy": null,
-      "tested": 0,
-      "passed": 0,
-      "cases": [],
-      "failed": []
+      "status": "limited",
+      "accuracy": 0.682,
+      "support_rate": 0.682,
+      "false_confident_rate": 0.955,
+      "tested": 22,
+      "passed": 15,
+      "failed": 7,
+      "cases": [
+        "2017-11-05 151451.jpg",
+        "2017-11-05 151838.jpg",
+        "2017-11-05 152200.jpg",
+        "2018-02-18 115342.jpg",
+        "2018-02-18 115419.jpg",
+        "2018-02-18 115443.jpg",
+        "2019-01-10 130421.jpg",
+        "2019-01-10 130437.jpg",
+        "2019-01-10 132226.jpg",
+        "IMG_0517.JPG",
+        "IMG_20220623_212500.jpg",
+        "IMG_20220623_212524.jpg",
+        "IMG_20220623_212642.jpg",
+        "IMG_20230806_203916.jpg",
+        "IMG_20230806_204143.jpg",
+        "IMG_20230806_204342.jpg",
+        "IMG_20230806_205755.jpg",
+        "IMG_20230806_205817.jpg",
+        "IMG_6340.JPG",
+        "IMG_6342.JPG",
+        "IMG_8653.JPG",
+        "IMG_8654.JPG"
+      ],
+      "evidence": "inspect_capability_benchmark + L2 eval (gemma4-12b-it)"
     },
     "clothing_color": {
-      "status": "ready",
+      "status": "experimental",
       "accuracy": 1.0,
+      "support_rate": 1.0,
+      "false_confident_rate": 0.0,
       "tested": 2,
       "passed": 2,
+      "failed": 0,
       "cases": [
-        "validation-album3-012-q08",
-        "validation-album3-024-q05"
+        "IMG_20220623_212500.jpg",
+        "IMG_8653.JPG"
       ],
-      "failed": []
+      "evidence": "inspect_capability_benchmark + L2 eval (gemma4-12b-it)"
     },
     "large_object": {
-      "status": "ready",
-      "accuracy": 1.0,
-      "tested": 2,
-      "passed": 2,
+      "status": "limited",
+      "accuracy": 0.636,
+      "support_rate": 0.636,
+      "false_confident_rate": 0.182,
+      "tested": 11,
+      "passed": 7,
+      "failed": 4,
       "cases": [
-        "validation-album3-047-q04",
-        "validation-album3-047-q03"
+        "2017-11-05 150513.jpg",
+        "2017-11-05 151427.jpg",
+        "2017-11-05 155728.jpg",
+        "2018-04-01 210536.jpg",
+        "IMG_20230806_203916.jpg",
+        "IMG_20230806_204143.jpg",
+        "IMG_20230806_204342.jpg",
+        "IMG_20230806_205755.jpg",
+        "IMG_20230806_205817.jpg",
+        "IMG_8653.JPG",
+        "IMG_8654.JPG"
       ],
-      "failed": []
+      "evidence": "inspect_capability_benchmark + L2 eval (gemma4-12b-it)"
     },
     "small_object": {
-      "status": "limited",
-      "accuracy": 0.0,
-      "tested": 1,
-      "passed": 0,
+      "status": "experimental",
+      "accuracy": 0.25,
+      "support_rate": 0.25,
+      "false_confident_rate": 0.5,
+      "tested": 4,
+      "passed": 1,
+      "failed": 3,
       "cases": [
-        "validation-album3-040-q01"
+        "2018-04-01 210440.jpg",
+        "IMG_6328.JPG",
+        "IMG_6340.JPG"
       ],
-      "failed": [
-        "validation-album3-040-q01"
-      ]
+      "evidence": "inspect_capability_benchmark + L2 eval (gemma4-12b-it)"
     },
     "visible_text_short": {
       "status": "limited",
-      "accuracy": 0.0,
-      "tested": 2,
-      "passed": 0,
+      "accuracy": 0.455,
+      "support_rate": 0.455,
+      "false_confident_rate": 0.455,
+      "tested": 11,
+      "passed": 5,
+      "failed": 6,
       "cases": [
-        "validation-album3-012-q03",
-        "validation-album3-024-q02"
+        "2018-02-18 115419.jpg",
+        "2018-03-31 235358.jpg",
+        "2018-03-31 235404.jpg",
+        "IMG_20220623_212642.jpg",
+        "IMG_20220716_141621.jpg",
+        "IMG_20220716_141625.jpg",
+        "IMG_20220731_194746.jpg",
+        "IMG_20220731_194822.jpg",
+        "IMG_6340.JPG",
+        "IMG_8654.JPG"
       ],
-      "failed": [
-        "validation-album3-012-q03",
-        "validation-album3-024-q02"
-      ]
+      "evidence": "inspect_capability_benchmark + L2 eval (gemma4-12b-it)"
     },
     "ocr_number": {
       "status": "limited",
-      "accuracy": 0.4,
+      "accuracy": 0.0,
+      "support_rate": 0.0,
+      "false_confident_rate": 1.0,
       "tested": 5,
-      "passed": 2,
+      "passed": 0,
+      "failed": 5,
       "cases": [
-        "validation-album3-024-q07",
-        "validation-album3-026-q01",
-        "validation-album3-026-q03",
-        "validation-album3-026-q06",
-        "validation-album3-026-q07"
+        "2018-03-31 235358.jpg",
+        "2019-01-10 130421.jpg",
+        "IMG_20220623_212642.jpg",
+        "IMG_20220716_141621.jpg",
+        "IMG_20220716_141625.jpg"
       ],
-      "failed": [
-        "validation-album3-024-q07",
-        "validation-album3-026-q03",
-        "validation-album3-026-q06"
-      ]
+      "evidence": "inspect_capability_benchmark + L2 eval (gemma4-12b-it)"
     },
     "scene": {
-      "status": "untested",
-      "accuracy": null,
-      "tested": 0,
-      "passed": 0,
-      "cases": [],
-      "failed": []
+      "status": "ready",
+      "accuracy": 0.789,
+      "support_rate": 0.789,
+      "false_confident_rate": 0.263,
+      "tested": 19,
+      "passed": 15,
+      "failed": 4,
+      "cases": [
+        "2017-11-05 150513.jpg",
+        "2017-11-05 150755.jpg",
+        "2017-11-05 151427.jpg",
+        "2017-11-05 151451.jpg",
+        "2017-11-05 153809.jpg",
+        "2017-11-05 155728.jpg",
+        "2018-04-01 210440.jpg",
+        "2018-04-01 210536.jpg",
+        "2018-04-01 210547.jpg",
+        "2018-04-01 210550.jpg",
+        "IMG_20220623_212500.jpg",
+        "IMG_20220623_212642.jpg",
+        "IMG_20220716_141621.jpg",
+        "IMG_20220716_141625.jpg",
+        "IMG_20230105_202901.jpg",
+        "IMG_20230806_203916.jpg",
+        "IMG_20230806_204143.jpg",
+        "IMG_6328.JPG",
+        "IMG_6340.JPG"
+      ],
+      "evidence": "inspect_capability_benchmark + L2 eval (gemma4-12b-it)"
     }
   },
   "read_photo_text": {
     "ocr_number": {
-      "status": "ready(需tile)",
-      "accuracy": 0.57,
-      "evidence": "OCR spike: crop/tile 放大后 4/7 读出关键数字(电话/价格/年份)"
+      "status": "limited",
+      "accuracy": 0.667,
+      "tested": 6,
+      "passed": 4,
+      "evidence": "OCR A/B 2026-08-13: small exact=4/6(1974/10/8/电话), VLM exact=3/6; small 延迟1.2s vs VLM 13.5s, 零显存。套餐价格(34/38)两者均未读出。"
     },
     "visible_text_short": {
       "status": "limited",
-      "evidence": "沙雕艺术字/倾斜招牌仍读不出,需要 PaddleOCR 或接受失败"
+      "accuracy": 0.0,
+      "tested": 2,
+      "passed": 0,
+      "evidence": "OCR A/B 2026-08-13: 招牌短文字(大圣葱油拌面) small/VLM 均未读准。"
     }
   },
   "search_memories": {
