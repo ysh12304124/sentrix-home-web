@@ -248,7 +248,7 @@ def _paddle_items(result):
             if not text or not str(text).strip():
                 continue
             poly = polys[i] if i < len(polys) else None
-            if poly:
+            if poly is not None and len(poly) > 0:
                 xs = [p[0] for p in poly]
                 ys = [p[1] for p in poly]
                 y0, y1, x0, x1 = min(ys), max(ys), min(xs), max(xs)
@@ -525,4 +525,3 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
     record_ocr_telemetry("vlm", time.monotonic() - _vlm_t0, result.get("confidence"),
                          fallback=small_attempted)
     return result
-
