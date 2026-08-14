@@ -309,6 +309,11 @@ class MemoryStore:
                 content_sha256 TEXT,
                 captured_at TEXT,
                 captured_location TEXT,
+                parent_asset_id TEXT REFERENCES assets(id),
+                derived_kind TEXT,
+                source_timestamp_sec REAL,
+                source_frame_index INTEGER,
+                source_scene_index INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -352,6 +357,12 @@ class MemoryStore:
                 status TEXT NOT NULL DEFAULT 'active',
                 aggregation_score REAL NOT NULL DEFAULT 0,
                 aggregation_breakdown_json TEXT NOT NULL DEFAULT '{}',
+                source_type TEXT,
+                source_asset_id TEXT REFERENCES assets(id),
+                source_scene_index INTEGER,
+                source_start_sec REAL,
+                source_end_sec REAL,
+                source_metadata_json TEXT NOT NULL DEFAULT '{}',
                 revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -806,6 +817,8 @@ class MemoryStore:
             "batch_id": "TEXT",
             "source_owner_id": "TEXT", "source_owner_label": "TEXT", "source_device_id": "TEXT", "source_album_id": "TEXT",
             "source_confidence": "REAL NOT NULL DEFAULT 0", "content_sha256": "TEXT", "captured_at": "TEXT", "captured_location": "TEXT",
+            "parent_asset_id": "TEXT REFERENCES assets(id)", "derived_kind": "TEXT",
+            "source_timestamp_sec": "REAL", "source_frame_index": "INTEGER", "source_scene_index": "INTEGER",
         })
         self._ensure_columns("observations", {
             "scope_id": "TEXT NOT NULL DEFAULT 'home-default'",
@@ -832,8 +845,20 @@ class MemoryStore:
             "aggregation_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
             "merged_into_event_id": "TEXT", "merge_reason": "TEXT",
             "cover_asset_id": "TEXT", "cover_selection_json": "TEXT NOT NULL DEFAULT '{}'",
+            "source_type": "TEXT", "source_asset_id": "TEXT REFERENCES assets(id)",
+            "source_scene_index": "INTEGER", "source_start_sec": "REAL", "source_end_sec": "REAL",
+            "source_metadata_json": "TEXT NOT NULL DEFAULT '{}'",
             "revision": "INTEGER NOT NULL DEFAULT 1", "created_at": "TEXT", "updated_at": "TEXT",
         })
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_video_keyframe_lineage "
+            "ON assets(parent_asset_id, source_scene_index, source_timestamp_sec) "
+            "WHERE derived_kind = 'video_keyframe'"
+        )
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_video_scene_lineage "
+            "ON events(source_asset_id, source_scene_index) WHERE source_type = 'video_scene'"
+        )
         self._ensure_columns("entities", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("query_gaps", {"scope_id": "TEXT NOT NULL DEFAULT 'home-default'"})
         self._ensure_columns("memory_feedback", {
@@ -1036,12 +1061,15 @@ class MemoryStore:
             """INSERT INTO assets(
                 id, scope_id, batch_id, file_name, media_type, path, mime_type, size_bytes, metadata_json,
                 source_owner_id, source_owner_label, source_device_id, source_album_id, source_confidence,
-                content_sha256, captured_at, captured_location, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                content_sha256, captured_at, captured_location, parent_asset_id, derived_kind,
+                source_timestamp_sec, source_frame_index, source_scene_index, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 asset_id, scope_id, metadata.get("batch_id"), file_name, media_type, path, mime_type, size_bytes, json_value(metadata, {}),
                 metadata.get("source_owner_id"), metadata.get("source_owner_label"), metadata.get("source_device_id"), metadata.get("source_album_id"),
                 float(metadata.get("source_confidence", 0) or 0), metadata.get("content_sha256") or metadata.get("sha256"), metadata.get("captured_at"), metadata.get("captured_location"),
+                metadata.get("parent_asset_id"), metadata.get("derived_kind"), metadata.get("source_timestamp_sec"),
+                metadata.get("source_frame_index"), metadata.get("source_scene_index"),
                 timestamp, timestamp,
             ),
         )
@@ -1106,6 +1134,18 @@ class MemoryStore:
         )
         self.connection.commit()
         return self.get_asset(asset_id)
+
+    def list_derived_assets(self, parent_asset_id, scene_index=None):
+        params = [parent_asset_id]
+        where = "parent_asset_id = ? AND derived_kind = 'video_keyframe'"
+        if scene_index is not None:
+            where += " AND source_scene_index = ?"
+            params.append(int(scene_index))
+        rows = self._rows(
+            f"SELECT * FROM assets WHERE {where} ORDER BY source_scene_index, source_timestamp_sec, source_frame_index",
+            params,
+        )
+        return [self._decode(row, ["metadata_json"]) for row in rows]
 
     def create_ingest_batch(self, batch_id, scope_id="home-default"):
         timestamp = now_iso()
@@ -1851,7 +1891,7 @@ class MemoryStore:
         return self.get_event(event_id)
 
     def get_event(self, event_id):
-        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json", "aggregation_breakdown_json", "cover_selection_json"])
+        row = self._decode(self._row("SELECT * FROM events WHERE id = ?", (event_id,)), ["participants_json", "aggregation_breakdown_json", "cover_selection_json", "source_metadata_json"])
         if row:
             row["participants"] = row.get("participants_json", [])
             row["aggregation_breakdown"] = row.get("aggregation_breakdown_json", {})
@@ -1863,8 +1903,88 @@ class MemoryStore:
             ]
             row["cover_asset_id"] = row.get("cover_asset_id") if row.get("cover_asset_id") in row["asset_ids"] else (row["asset_ids"][0] if row["asset_ids"] else None)
             row["cover_selection"] = row.get("cover_selection_json", {})
+            row["source_metadata"] = row.get("source_metadata_json", {})
+            if row.get("source_type") == "video_scene":
+                row["keyframe_assets"] = [
+                    {key: asset.get(key) for key in (
+                        "id", "file_name", "media_type", "status", "captured_at", "captured_location",
+                        "parent_asset_id", "derived_kind", "source_timestamp_sec", "source_frame_index",
+                        "source_scene_index",
+                    )}
+                    for asset in self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
+                ]
+                source_video = self.get_asset(row.get("source_asset_id")) or {}
+                row["source_video"] = {key: source_video.get(key) for key in (
+                    "id", "file_name", "media_type", "mime_type", "status", "captured_at",
+                    "captured_location", "size_bytes",
+                )}
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
+
+    def create_video_scene_event(self, data):
+        existing = self._row(
+            "SELECT id FROM events WHERE source_type = 'video_scene' AND source_asset_id = ? AND source_scene_index = ?",
+            (data["source_asset_id"], int(data["source_scene_index"])),
+        )
+        if existing:
+            return self.get_event(existing["id"])
+        event_id = data.get("id") or make_id("evt")
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO events(
+                id, scope_id, title, event_type, time_start, time_end, place, activity, summary,
+                participants_json, confidence, status, aggregation_breakdown_json,
+                source_type, source_asset_id, source_scene_index, source_start_sec, source_end_sec,
+                source_metadata_json, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, '视频场景', ?, ?, ?, '视频场景', ?, '[]', ?, 'active', ?,
+                'video_scene', ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (
+                event_id, data.get("scope_id") or "home-default", data.get("title") or "视频场景",
+                data.get("time_start"), data.get("time_end"), data.get("place") or "其他或不确定",
+                data.get("summary") or data.get("title") or "视频场景", float(data.get("confidence", 1.0)),
+                json_value({"forced_video_scene": True}, {}), data["source_asset_id"],
+                int(data["source_scene_index"]), float(data.get("source_start_sec") or 0),
+                float(data.get("source_end_sec") or 0), json_value(data.get("source_metadata"), {}),
+                timestamp, timestamp,
+            ),
+        )
+        self.connection.commit()
+        return self.get_event(event_id)
+
+    def attach_observation_to_event(self, event_id, observation_id):
+        if not self._row("SELECT id FROM events WHERE id = ?", (event_id,)):
+            raise KeyError(event_id)
+        self.connection.execute(
+            "INSERT OR IGNORE INTO event_observations(event_id, observation_id) VALUES (?, ?)",
+            (event_id, observation_id),
+        )
+        self.connection.commit()
+        self.select_event_cover(event_id)
+        self._refresh_event_participants([observation_id])
+        return self.get_event(event_id)
+
+    def list_video_scene_events(self, video_asset_id):
+        rows = self._rows(
+            "SELECT id FROM events WHERE source_type = 'video_scene' AND source_asset_id = ? "
+            "AND status = 'active' ORDER BY source_scene_index",
+            (video_asset_id,),
+        )
+        return [self.get_event(row["id"]) for row in rows]
+
+    def cleanup_video_derivatives(self, video_asset_id):
+        """Delete only derived keyframes/scenes owned by one video for an explicit retry."""
+        derived = self.list_derived_assets(video_asset_id)
+        for asset in derived:
+            self.cleanup_asset_derivatives(asset["id"])
+        self.connection.execute(
+            "DELETE FROM events WHERE source_type = 'video_scene' AND source_asset_id = ?",
+            (video_asset_id,),
+        )
+        self.connection.execute(
+            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind = 'video_keyframe'",
+            (video_asset_id,),
+        )
+        self.connection.commit()
 
     def select_event_cover(self, event_id):
         """Choose an event cover from its own image evidence, without replacing user choice."""
@@ -4591,7 +4711,11 @@ class MemoryStore:
                 if source_owner and source_owner.get("status") == "confirmed":
                     self.upsert_event_participant(row["event_id"], source_owner_id, "captured_by", [observation_id], float(asset.get("source_confidence", 0.5) or 0.5))
                 self.connection.execute("UPDATE events SET participants_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?", (json_value(merged, []), now_iso(), event["id"]))
-                self.refresh_event_summary(row["event_id"])
+                # A WorldMM Scene owns authoritative absolute boundaries and the
+                # original video's GPS/place. Generic image-event refresh may
+                # enrich participants, but must not replace that provenance.
+                if event.get("source_type") != "video_scene":
+                    self.refresh_event_summary(row["event_id"])
 
     def reject_face_cluster(self, cluster_id):
         """Delete a face cluster that is not a person. Confirmed clusters refuse."""

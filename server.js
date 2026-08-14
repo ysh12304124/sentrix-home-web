@@ -42,9 +42,13 @@ async function proxyBackend(req, res, url) {
     const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readRawBody(req);
     const isSse = /text\/event-stream/.test(req.headers.accept || "") || url.pathname.endsWith("/events");
     const timeoutMs = url.pathname === "/api/model-profiles/switch" ? 1_000_000 : (isSse ? 600_000 : 240_000);
+    const requestHeaders = {};
+    for (const name of ["content-type", "accept", "range", "if-range"]) {
+      if (req.headers[name]) requestHeaders[name] = req.headers[name];
+    }
     const response = await fetch(`${backendBaseUrl}${url.pathname}${url.search}`, {
       method: req.method,
-      headers: { "content-type": req.headers["content-type"] || "application/json" },
+      headers: requestHeaders,
       body,
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -70,7 +74,15 @@ async function proxyBackend(req, res, url) {
       return;
     }
     const payload = await response.arrayBuffer();
-    res.writeHead(response.status, { "content-type": response.headers.get("content-type") || "application/json; charset=utf-8", "cache-control": "no-store" });
+    const responseHeaders = {
+      "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    };
+    for (const name of ["accept-ranges", "content-range", "content-length"]) {
+      const value = response.headers.get(name);
+      if (value) responseHeaders[name] = value;
+    }
+    res.writeHead(response.status, responseHeaders);
     res.end(Buffer.from(payload));
   } catch (error) {
     json(res, 502, { error: "Sentrix backend unavailable", detail: error.message });
