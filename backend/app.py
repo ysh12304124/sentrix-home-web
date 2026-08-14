@@ -125,10 +125,6 @@ class IngestBatchCreateRequest(BaseModel):
     source_path: str | None = None
 
 
-class IngestBatchCancelRequest(BaseModel):
-    source: str | None = None
-
-
 def _allowed_import_roots():
     configured = os.getenv("SENTRIX_IMPORT_ALLOWED_ROOTS")
     defaults = [
@@ -291,11 +287,8 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
         "pipeline_metrics": {**limits, "status": "processing", "asset_count": len(asset_ids)}
     })
     try:
-        if (task_store.get_ingest_batch(batch_id) or {}).get("status") == "cancelled":
-            return
         image_ids = []
-        candidate_ids = asset_ids[:limits["effective_workers"]]
-        for asset_id in candidate_ids:
+        for asset_id in asset_ids:
             asset = task_store.get_asset(asset_id) or {}
             if asset.get("media_type") == "image" and asset.get("status") in {"queued", "failed"}:
                 task_store.update_asset(asset_id, "processing", {
@@ -317,8 +310,6 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
                         task_store.cleanup_asset_derivatives(asset_id)
                         task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
 
-        if (task_store.get_ingest_batch(batch_id) or {}).get("status") == "cancelled":
-            return
         semantic_ids = [
             asset_id for asset_id in image_ids
             if (task_store.get_asset(asset_id) or {}).get("status") == "semantic_enriching"
@@ -385,16 +376,9 @@ def process_ingest_batch(asset_ids, batch_id):
     try:
         first = True
         while True:
-            batch = task_store.get_ingest_batch(batch_id) or {}
-            if batch.get("status") == "cancelled":
-                task_store.update_ingest_batch_metadata(batch_id, {
-                    "pipeline_metrics": {"status": "cancelled", "asset_count": len(all_asset_ids),
-                    "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4)}
-                })
-                return
             rows = task_store._rows(
-                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id LIMIT ?",
-                (batch_id, _pipeline_worker_limits()["effective_workers"]),
+                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id",
+                (batch_id,),
             )
             queued_ids = [row["id"] for row in rows]
             if queued_ids:
@@ -411,12 +395,6 @@ def process_ingest_batch(asset_ids, batch_id):
                 break
             time.sleep(0.5)
 
-        if (task_store.get_ingest_batch(batch_id) or {}).get("status") == "cancelled":
-            task_store.update_ingest_batch_metadata(batch_id, {
-                "pipeline_metrics": {"status": "cancelled", "asset_count": len(all_asset_ids),
-                "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4)}
-            })
-            return
         task_store.complete_ingest_batch(batch_id)
         if task_store.claim_ingest_batch_summary(batch_id):
             event_ids = task_store.batch_event_ids(batch_id)
@@ -562,12 +540,7 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
     served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
     with runtime_lock:
         base_url = (state.get("external_url_hint") if state else None) or gamma.base_url
-        new_gamma = GammaClient(
-            base_url=base_url,
-            model=served_name,
-            backend="openai",
-            manager_url=RUNTIME_VLLM_API_URL or VLLM_API_URL,
-        )
+        new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai")
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
     return _current_model_runtime()
@@ -1312,60 +1285,6 @@ def create_relationship(payload: dict):
     return value
 
 
-@app.post("/api/relationships/batch", status_code=201)
-def create_relationships_batch(payload: dict):
-    """Idempotently import confirmed person relationships for one memory space."""
-    scope_id = str(payload.get("scope_id") or "").strip()
-    relationships = payload.get("relationships") or []
-    entity_by_name = payload.get("entity_by_name") or {}
-    if not scope_id:
-        raise HTTPException(status_code=400, detail="scope_id is required")
-    if not isinstance(relationships, list) or not isinstance(entity_by_name, dict):
-        raise HTTPException(status_code=400, detail="relationships and entity_by_name must be structured values")
-
-    def resolve_entity(reference):
-        value = str(reference or "").strip()
-        entity_id = str(entity_by_name.get(value) or value).strip()
-        entity = store.get_entity(entity_id) if entity_id else None
-        if not entity:
-            matched = store.find_confirmed_person_by_name(scope_id, value)
-            entity = store.get_entity(matched["entity_id"]) if matched else None
-        if not entity or entity.get("entity_type") != "person" or entity.get("status") != "confirmed":
-            raise ValueError(f"confirmed person not found: {value}")
-        if (entity.get("scope_id") or "home-default") != scope_id:
-            raise ValueError(f"person belongs to another memory space: {value}")
-        return entity
-
-    results, errors = [], []
-    for index, item in enumerate(relationships):
-        try:
-            if not isinstance(item, dict):
-                raise ValueError("relationship must be an object")
-            subject = resolve_entity(item.get("subject"))
-            object_entity = resolve_entity(item.get("object"))
-            predicate = str(item.get("predicate") or "").strip()
-            if not predicate:
-                raise ValueError("predicate is required")
-            if subject["id"] == object_entity["id"]:
-                raise ValueError("relationship endpoints must be different people")
-            relationship = store.create_relationship(
-                subject["id"], predicate, object_entity["id"], item.get("evidence_ids") or [],
-                float(item.get("confidence", 1.0) or 1.0), "active",
-            )
-            store.maintain_relationship_claim(relationship)
-            results.append(relationship)
-        except (TypeError, ValueError) as error:
-            errors.append({"index": index, "error": str(error)})
-    return {
-        "status": "completed" if not errors else "partial",
-        "requested": len(relationships),
-        "imported": len(results),
-        "failed": len(errors),
-        "relationships": results,
-        "errors": errors,
-    }
-
-
 @app.post("/api/relationships/{relationship_id}/confirm")
 def confirm_relationship(relationship_id: str):
     value = store.confirm_relationship(relationship_id)
@@ -1814,7 +1733,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                         zh += sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
         return int(zh * 0.7 + (total - zh) * 0.25) + 400
 
-    def chat_fn(messages, *, call_type="agent", step_id=None):
+    def chat_fn(messages):
         max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
         # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
         # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
@@ -1824,15 +1743,9 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                 max_tokens = max(64, room)
         except Exception:
             pass
-        try:
-            text = gamma.chat_messages(
-                messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
-        finally:
-            metrics = gamma.get_and_clear_call_metrics()
-            for metric in metrics:
-                metric["call_type"] = call_type
-                metric["step_id"] = step_id
-            model_call_metrics.extend(metrics)
+        text = gamma.chat_messages(
+            messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
+        model_call_metrics.extend(gamma.get_and_clear_call_metrics())
         return text
 
     _ocr_setting = store.get_setting("ocr.small_enabled", "false").lower() in {"1", "true", "on"}
@@ -1852,7 +1765,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                        selected_handle=selected_asset_handle,
                        selected_result_set_id=selected_result_set_id,
                        conversation_summary=conversation_summary)
-    residual_metrics = gamma.get_and_clear_call_metrics()
+    model_call_metrics.extend(gamma.get_and_clear_call_metrics())
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
     trace = []
@@ -1860,16 +1773,6 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         item = {"stage": s.get("type", "step"), "status": s.get("status", "complete"),
                 "reason": s.get("reason") or "",
                 "detail": s.get("tool") or s.get("raw") or s.get("observation") or {}}
-        if s.get("step_id"):
-            item["step_id"] = s.get("step_id")
-        if s.get("parent_step_id"):
-            item["parent_step_id"] = s.get("parent_step_id")
-        if s.get("call_type"):
-            item["call_type"] = s.get("call_type")
-        for field in ("trigger", "action", "tool", "answer_preview", "attempt",
-                      "turn_outcome", "parse_status", "next_step"):
-            if s.get(field) is not None:
-                item[field] = s.get(field)
         if s.get("type") == "judge":
             item["detail"] = {"faithful": s.get("faithful"),
                               "problems": list(s.get("problems") or [])}
@@ -1879,85 +1782,6 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         if isinstance(s.get("arguments"), dict):
             item["args"] = s.get("arguments")
         trace.append(item)
-
-    metrics_by_step = {}
-    unassigned_metrics = []
-    for metric in model_call_metrics:
-        step_id = metric.get("step_id")
-        if step_id:
-            metrics_by_step.setdefault(step_id, []).append(metric)
-        else:
-            unassigned_metrics.append(metric)
-    ordered_metrics = []
-    for step in turn.steps:
-        step_id = step.get("step_id")
-        step_type = step.get("type")
-        for metric in metrics_by_step.pop(step_id, []):
-            if step_type == "model":
-                metric["turn_outcome"] = step.get("turn_outcome")
-                metric["parse_status"] = step.get("parse_status")
-                metric["next_step"] = step.get("next_step")
-            metric["call_observation"] = {
-                "kind": metric.get("call_type") or "unknown",
-                "label": {
-                    "agent": "Agent 决策 / 回答",
-                    "recovery": "Agent 恢复调用",
-                    "writer": "最终回答重写",
-                    "faithfulness_judge": "L2 事实一致性检查",
-                }.get(metric.get("call_type"), "模型调用"),
-                "purpose": {
-                    "agent": "选择下一步工具或生成候选回答",
-                    "recovery": "根据运行时纠正信息重新决策或修正回答",
-                    "writer": "基于受控事实调整最终回答的结构和措辞",
-                    "faithfulness_judge": "检查候选回答是否与工具事实一致",
-                }.get(metric.get("call_type"), "执行模型推理"),
-                "trigger": step.get("trigger") or "",
-                "outcome": (
-                    f"已解析，准备调用工具 {step.get('tool')}" if step.get("turn_outcome") == "tool_call"
-                    else "已解析，正常输出回答" if step.get("turn_outcome") == "final_answer"
-                    else "JSON 解析失败，触发格式恢复" if step.get("turn_outcome") == "parse_failure"
-                    else "上下文或 token 预检拦截" if step.get("turn_outcome") == "context_blocked"
-                    else "模型请求失败" if step.get("turn_outcome") == "model_error"
-                    else f"判定 {'通过' if step.get('faithful') else '未通过'}"
-                    if step_type == "judge" and step.get("faithful") is not None
-                    else f"重写状态：{step.get('status')}" if step_type == "writer"
-                    else f"调用失败：{step.get('reason')}" if step.get("status") == "error"
-                    else "完成模型推理"
-                ),
-                "source": "backend_recorded",
-                "related_tool": step.get("tool") or None,
-            }
-            ordered_metrics.append(metric)
-        if step_type == "tool":
-            internal_metrics = step.get("internal_model_call_metrics") or []
-            for index, metric in enumerate(internal_metrics, 1):
-                metric["call_type"] = "tool_internal"
-                metric["step_id"] = f"{step_id}:model_{index}" if step_id else None
-                metric["parent_step_id"] = step_id
-                subtask = metric.get("tool_subtask")
-                metric["call_observation"] = {
-                    "kind": "tool_internal",
-                    "label": "工具内部模型调用",
-                    "purpose": (
-                        "读取照片中的文字" if step.get("tool") == "read_photo_text"
-                        else "识别照片中的视觉细节"
-                    ),
-                    "trigger": f"工具 {step.get('tool')} 执行内部推理",
-                    "outcome": (
-                        f"调用失败：{metric.get('error') or '未返回结果'}"
-                        if metric.get("status") == "error" else
-                        f"完成 {subtask} 子任务" if subtask else
-                        f"完成 {step.get('tool')} 的模型处理"
-                    ),
-                    "source": "backend_recorded",
-                    "related_tool": step.get("tool") or None,
-                    "parent_step_id": step_id,
-                }
-                ordered_metrics.append(metric)
-    for metrics in metrics_by_step.values():
-        ordered_metrics.extend(metrics)
-    ordered_metrics.extend(unassigned_metrics)
-    ordered_metrics.extend(residual_metrics)
     guard_debug = {
         "status": turn.status,
         "reason": turn.reason or "",
@@ -1970,39 +1794,16 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                    "problems": list(s.get("problems") or [])}
                   for s in turn.steps if s.get("type") == "judge"],
     }
-    # 结构层诊断：从 turn.steps 提炼稳定语义字段，底层实现变化只改此处。
-    _det_step = next((s for s in turn.steps
-                      if s.get("type") == "nucleus" and s.get("status") == "rendered"), None)
-    guard_debug["deterministic_delivery"] = {
-        "rendered": _det_step is not None,
-        "kind": _det_step.get("kind") if _det_step else None,
-    }
     tool_trace = [
         {"tool": s.get("tool", ""), "status": s.get("status", ""),
          "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
          "error": s.get("error") or "",
-         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing"),
-         "provider": (s.get("observation") or {}).get("provider"),
-         "fallback_used": (s.get("observation") or {}).get("fallback_used"),
-         "step_id": s.get("step_id"), "parent_step_id": s.get("parent_step_id")}
+         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
         for s in turn.steps if s.get("type") == "tool"
     ]
-    agent_model_steps = [s for s in turn.steps if s.get("type") == "model"]
-    final_agent_step = agent_model_steps[-1] if agent_model_steps else {}
-    if turn.termination_reason in {"model_step_limit", "tool_call_limit"}:
-        turn_outcome = "step_limit"
-    elif turn.status == "complete" and turn.final_answer:
-        turn_outcome = "final_answer"
-    else:
-        turn_outcome = final_agent_step.get("turn_outcome") or (
-            "context_blocked" if "context" in str(turn.reason or "").lower()
-            else "parse_failure" if turn.termination_reason == "parse_failure"
-            else "model_error" if turn.status in {"error", "timeout"}
-            else None
-        )
     return {
         "answer": turn.final_answer,
-        "model_call_metrics": ordered_metrics,
+        "model_call_metrics": model_call_metrics,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
         "evidence_status": "tool_loop",
@@ -2015,11 +1816,6 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "guard_debug": guard_debug,
         "answer_grounding": turn.answer_grounding,
         "termination_reason": turn.termination_reason,
-        "turn_outcome": turn_outcome,
-        "delivery_status": {
-            "ocr_partial": getattr(turn, "ocr_partial", False),
-            "ocr_partial_reason": getattr(turn, "ocr_partial_reason", "") or None,
-        },
     }
 
 
@@ -2759,14 +2555,6 @@ def ingest_batch(batch_id: str):
     return _batch_status(batch_id)
 
 
-@app.post("/api/ingest-batches/{batch_id}/cancel")
-def cancel_ingest_batch(batch_id: str, request: IngestBatchCancelRequest):
-    if not store.get_ingest_batch(batch_id):
-        raise HTTPException(status_code=404, detail="ingest batch not found")
-    store.cancel_ingest_batch(batch_id, request.source)
-    return _batch_status(batch_id)
-
-
 @app.post("/api/ingest-batches/{batch_id}/complete")
 def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
     if not store.get_ingest_batch(batch_id):
@@ -2832,16 +2620,3 @@ def reject_fact(fact_id: str):
         raise HTTPException(status_code=404, detail="fact not found")
     return store.reject_fact(fact_id)
 
-
-# ============================================================
-# Phase E — QA Dashboard 只读路由（/qa + /api/qa/runs*）
-# 数据目录可用 SENTRIX_QA_DIR 覆盖（默认 <data>/qa_runs）
-# ============================================================
-from .qa_dashboard import register_qa_routes
-
-QA_RUNS_DIR = Path(os.getenv("SENTRIX_QA_DIR", DATA_DIR / "qa_runs"))
-register_qa_routes(
-    app,
-    QA_RUNS_DIR,
-    dashboard_html=ROOT / "scripts" / "benchmarks" / "qa_dashboard.html",
-)

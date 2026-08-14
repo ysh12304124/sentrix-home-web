@@ -2,7 +2,7 @@ node_modules/
 .venv/
 .env
 .DS_Store
-data/
+/data/
 logs/
 .ollama-sentrix/
 __pycache__/
@@ -10,6 +10,3 @@ __pycache__/
 
 # macOS AppleDouble resource forks (created by scp from macOS)
 ._*
-
-# stray runtime pid file from xy merge
-.judge.pid

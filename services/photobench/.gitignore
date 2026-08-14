@@ -1,0 +1,27 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+frontend/node_modules/
+frontend/dist/assets/*.map
+config/custom_judge_prompt.json
+config/judge_providers.json
+
+# Local runtime artifacts and benchmark material are preserved locally but not committed.
+data/*
+!data/.gitkeep
+!data/*/
+data/*/*
+!data/*/manifest.json
+!data/*/qa/
+!data/*/qa/*.jsonl
+results/*
+!results/.gitkeep
+logs/*
+!logs/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+
+.env
+.env.*
+!.env.example

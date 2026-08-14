@@ -70,9 +70,6 @@
     ocrSettings: null,
     modal: null,
     modalHistory: [],
-    storyGenerating: false,
-    storyError: false,
-    storyDraftEventIds: [],
     eventFilter: "all",
     assetFilter: "all",
     assetSort: "newest",
@@ -592,24 +589,7 @@
   }
 
   function storiesView() {
-    const _evtTimes = ((state.stories[0]||{}).event_ids||[]).map(id => (state.events||[]).find(x=>x.id===id)).filter(Boolean).filter(e=>e?.time_start).map(e=>e.time_start).sort();
-    let _spanText = "";
-    if (_evtTimes.length >= 2) { const _d = (new Date(_evtTimes[_evtTimes.length-1]) - new Date(_evtTimes[0])) / 86400000; if (_d > 180) _spanText = "跨越 " + (_d/365).toFixed(1) + " 年"; else if (_d > 30) _spanText = "跨越 " + Math.ceil(_d/30) + " 个月"; else _spanText = "跨越 " + Math.ceil(_d) + " 天"; }
-    const _places = {}; const _people = {};
-    ((state.stories[0]||{}).event_ids||[]).forEach(id => { const ev = (state.events||[]).find(x=>x.id===id); if (!ev) return; if (ev?.place && ev.place !== "其他或不确定") _places[ev.place] = (_places[ev.place]||0)+1; (ev.participants||[]).forEach(p => { const eid = (typeof p === 'object' && p) ? (p.entity_id||null) : null; const ent = eid ? (state.entities||[]).find(e=>e.id===eid) : null; if (ent?.is_self) return; const nm = typeof p === 'string' ? p : (p?.canonical_name || p?.name || "未知"); _people[nm] = (_people[nm]||0)+1; }); });
-    if (state.storyGenerating) {
-      const _ids = state.storyDraftEventIds || [];
-      const _evs = _ids.map(id => (state.events||[]).find(x=>x.id===id)).filter(Boolean);
-      const _days = new Set();
-      _evs.forEach(e => { if (e?.time_start) _days.add(String(e.time_start).slice(0,10)); if (e?.time_end) _days.add(String(e.time_end).slice(0,10)); });
-      const _photos = _evs.reduce((s,e)=>s+((e?.observations||[]).length||((e?.asset_ids||[]).length)||0),0);
-      const _shimmer = (w) => `<div style="height:14px;width:${w};border-radius:6px;background:linear-gradient(90deg,#ecece6,#f6f6f0,#ecece6);background-size:200% 100%;animation:storyShimmer 1.2s infinite;margin-top:8px;"></div>`;
-      const _hint = state.storyError
-        ? "故事生成失败，请稍后重试。"
-        : `AI 正在根据 ${_ids.length} 个事件撰写故事，约需 10-30 秒…`;
-      return `${pageHeader("家庭表达 / 故事工作室", "把真实事件整理成家人愿意一起看的故事。", "故事只引用你选择的事件和证据；标题、章节和内容保存为本地草稿。", `<button class="button primary" data-action="create-story">${icon("＋")}新建故事</button>`)}<style>@keyframes storyShimmer{to{background-position:-200% 0}}</style><section class="story-layout"><div class="story-canvas"><div class="story-canvas-label">${state.storyError ? "生成失败" : "正在生成故事"}</div><div class="story-meta" style="font-size:12px;color:#9A9486;margin:4px 0 12px;letter-spacing:0.5px;">${_days.size} 天 · ${_ids.length} 个事件 · ${_photos} 张照片</div><div style="margin:20px 0 8px;"><div style="height:22px;width:68%;border-radius:6px;background:linear-gradient(90deg,#ecece6,#f6f6f0,#ecece6);background-size:200% 100%;animation:storyShimmer 1.2s infinite;"></div>${_shimmer("94%")}${_shimmer("87%")}${_shimmer("91%")}${_shimmer("60%")}</div><div style="margin-top:18px;font-size:13px;color:#9A9486;">${_hint}${state.storyError ? ` <button class="button primary" data-action="retry-story" style="margin-left:10px;padding:6px 14px;">重试</button>` : ""}</div></div><aside class="story-editor"><div class="panel-title"><span>STORY DRAFTS</span><span class="draft-badge">${state.stories.length} 个</span></div>${state.stories.map((story) => `<div class="chapter"><button class="chapter-open" data-action="edit-story" data-story-id="${escapeHtml(story.id)}"><span>●</span><strong>${escapeHtml(story.title)}</strong>${icon("→", "muted")}</button><button class="icon-button bordered" data-action="delete-story" data-story-id="${escapeHtml(story.id)}" aria-label="删除故事">×</button></div>`).join("")}<button class="button primary full" data-action="create-story">新建本地草稿 ${icon("→")}</button></aside></section>`;
-    }
-    return `${pageHeader("家庭表达 / 故事工作室", "把真实事件整理成家人愿意一起看的故事。", "故事只引用你选择的事件和证据；标题、章节和内容保存为本地草稿。", `<button class="button primary" data-action="create-story">${icon("＋")}新建故事</button>`)}<section class="story-layout">${state.stories.length ? `<div class="story-report"><div class="report-topbar"><div class="report-title">${escapeHtml(state.stories[0].title || "未命名故事")}</div><div class="report-actions"><button class="button ghost" data-action="edit-story" data-story-id="${escapeHtml(state.stories[0].id)}">编辑</button><button class="button primary" data-action="create-story">${icon("＋")}生成</button></div></div><div class="report-meta">${(()=>{const es=(state.stories[0].event_ids||[]).map(id=>(state.events||[]).find(x=>x.id===id)).filter(Boolean);const ds=new Set();es.forEach(e=>{if(e?.time_start)ds.add(String(e.time_start).slice(0,10));if(e?.time_end)ds.add(String(e.time_end).slice(0,10));});return ds.size;})()} 天 · ${(state.stories[0].event_ids||[]).length} 个事件 · ${(state.stories[0].event_ids||[]).reduce((s,eid)=>{const ev=(state.events||[]).find(x=>x.id===eid);return s+((ev?.observations||[]).length||((ev?.asset_ids||[]).length)||0);},0)} 张照片${_spanText ? " · " + _spanText : ""}</div><div class="report-capsules">${Object.entries(_places).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`<span class="place-capsule">${escapeHtml(k)} ${v}</span>`).join("")}</div><div class="report-body"><div class="report-narrative">${escapeHtml(state.stories[0].content || "这个故事还没有内容。")}</div><div class="report-stats"><div class="stat-card"><div class="stat-num">${Object.keys(_places).length}</div><div class="stat-label">场景数</div></div><div class="stat-card"><div class="stat-num">${(state.stories[0].event_ids||[]).reduce((s,eid)=>{const ev=(state.events||[]).find(x=>x.id===eid);return s+((ev?.observations||[]).length||((ev?.asset_ids||[]).length)||0);},0)}</div><div class="stat-label">照片数</div></div><div class="stat-card"><div class="stat-num">${(state.stories[0].event_ids||[]).length}</div><div class="stat-label">事件数</div></div><div class="stat-card"><div class="stat-num">${(()=>{const es=(state.stories[0].event_ids||[]).map(id=>(state.events||[]).find(x=>x.id===id)).filter(Boolean);const ds=new Set();es.forEach(e=>{if(e?.time_start)ds.add(String(e.time_start).slice(0,10));if(e?.time_end)ds.add(String(e.time_end).slice(0,10));});return ds.size;})()}</div><div class="stat-label">天数</div></div></div></div>${Object.keys(_places).length || Object.keys(_people).length ? `<div class="report-bottom">${Object.keys(_places).length ? `<div class="report-places"><div class="report-sec-title">最常去的地方</div>${(()=>{const ps=Object.entries(_places).sort((a,b)=>b[1]-a[1]).slice(0,5);const mx=Math.max(1,...ps.map(x=>x[1]));return ps.map(([k,v])=>`<div class="place-bar-row"><span class="place-bar-name">${escapeHtml(k)}</span><div class="place-bar-bg"><div class="place-bar" style="width:${Math.round(v/mx*100)}%"></div></div><span class="place-bar-count">${v}</span></div>`).join("");})()}</div>` : ''}${Object.keys(_people).length ? `<div class="report-people"><div class="report-sec-title">陪伴你的人</div>${Object.entries(_people).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([k,v])=>`<div class="person-card"><span class="person-avatar">${escapeHtml((k||"?")[0])}</span><div><div class="person-name">${escapeHtml(k)}</div><div class="person-count">${v} 次</div></div></div>`).join("")}</div>` : ''}</div>` : ''}</div><aside class="story-editor"><div class="panel-title"><span>STORY DRAFTS</span><span class="draft-badge">${state.stories.length} 个</span></div>${state.stories.map((story) => `<div class="chapter"><button class="chapter-open" data-action="edit-story" data-story-id="${escapeHtml(story.id)}"><span>●</span><strong>${escapeHtml(story.title)}</strong>${icon("→", "muted")}</button><button class="icon-button bordered" data-action="delete-story" data-story-id="${escapeHtml(story.id)}" aria-label="删除故事">×</button></div>`).join("")}<button class="button primary full" data-action="create-story">新建本地草稿 ${icon("→")}</button></aside></section>` : `<section class="empty-search"><div class="empty-symbol">▤</div><h2>还没有故事草稿</h2><p>先导入并形成事件，再选择真实事件生成故事草稿。</p><button class="button primary" data-action="create-story">${icon("＋")}创建空白故事</button></section>`}`;
+    return `${pageHeader("家庭表达 / 故事工作室", "把真实事件整理成家人愿意一起看的故事。", "故事只引用你选择的事件和证据；标题、章节和内容保存为本地草稿。", `<button class="button primary" data-action="create-story">${icon("＋")}新建故事</button>`)}<section class="story-layout">${state.stories.length ? `<div class="story-canvas"><div class="story-canvas-label">选择一个故事查看</div><div class="story-title">${escapeHtml(state.stories[0].title)}</div><div class="story-caption">${escapeHtml(state.stories[0].content || "这个故事还没有内容。")}</div></div><aside class="story-editor"><div class="panel-title"><span>STORY DRAFTS</span><span class="draft-badge">${state.stories.length} 个</span></div>${state.stories.map((story) => `<div class="chapter"><button class="chapter-open" data-action="edit-story" data-story-id="${escapeHtml(story.id)}"><span>●</span><strong>${escapeHtml(story.title)}</strong>${icon("→", "muted")}</button><button class="icon-button bordered" data-action="delete-story" data-story-id="${escapeHtml(story.id)}" aria-label="删除故事">×</button></div>`).join("")}<button class="button primary full" data-action="create-story">新建本地草稿 ${icon("→")}</button></aside></section>` : `<section class="empty-search"><div class="empty-symbol">▤</div><h2>还没有故事草稿</h2><p>先导入并形成事件，再选择真实事件生成故事草稿。</p><button class="button primary" data-action="create-story">${icon("＋")}创建空白故事</button></section>`}`;
   }
 
   function renderUploadQueue() {
@@ -815,7 +795,7 @@
       const entity = detail.entity;
       const samples = detail.face_samples || [];
       const events = detail.events || [];
-      body = `<div class="modal-kicker">PERSON EVIDENCE</div><div class="profile-heading">${faceAvatar(samples[0]?.id || entity.avatar_face_instance_id, entity.canonical_name, entity.status === "confirmed" ? "green" : "gray")}<div><h2>${escapeHtml(entity.canonical_name)}</h2><p class="modal-lead">${escapeHtml(entity.status === "confirmed" ? "已确认人物，下面是可回看的原始证据。" : "待确认人物候选，先检查人脸样本再命名。")}</p></div></div><div class="detail-facts"><span>状态 · ${escapeHtml(entity.status)}</span><span>人脸样本 · ${samples.length}</span><span>关联事件 · ${events.length}</span></div><div class="section-head"><div><p class="section-kicker">人脸样本</p><h3>用于判断身份的头像证据</h3></div></div><div class="face-evidence-grid">${samples.length ? samples.map((sample) => `<article class="face-evidence-item"><img src="${escapeHtml(sample.crop_url)}" alt="人脸样本" loading="lazy" /><button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">查看原图 ${icon("→")}</button></article>`).join("") : emptyState("没有可用人脸样本", "当前候选没有可回看的 face instance。")}</div><div class="section-head"><div><p class="section-kicker">关联事件</p><h3>该人物出现过的事件</h3></div></div><div class="evidence-list">${events.length ? events.map((event) => `<button class="evidence-main" data-action="open-event" data-event-id="${escapeHtml(event.id)}"><strong>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.summary || "暂无事件摘要")}</p><small>${escapeHtml(formatDateTime(event.time_start))} · ${escapeHtml(event.place || "未标注地点")}</small></button>`).join("") : emptyState("还没有关联事件", "确认后，新的事件观察会继续维护人物画像。")}</div>${entity.status === "confirmed" ? `<div class="modal-actions"><button class="button ghost" data-action="close-modal">关闭</button><button class="button primary" data-action="open-person-profile" data-person-id="${escapeHtml(entity.id)}">查看画像与改名</button></div>` : `<div class="modal-actions"><button class="button ghost" data-action="close-modal">关闭</button><button class="button primary" data-action="confirm-person" data-person-id="${escapeHtml(entity.id)}">确认姓名和关系</button></div>`}`;
+      body = `<div class="modal-kicker">PERSON EVIDENCE</div><div class="profile-heading">${faceAvatar(samples[0]?.id || entity.avatar_face_instance_id, entity.canonical_name, entity.status === "confirmed" ? "green" : "gray")}<div><h2>${escapeHtml(entity.canonical_name)}</h2><p class="modal-lead">${escapeHtml(entity.status === "confirmed" ? "已确认人物，下面是可回看的原始证据。" : "待确认人物候选，先检查人脸样本再命名。")}</p></div></div><div class="detail-facts"><span>状态 · ${escapeHtml(entity.status)}</span><span>人脸样本 · ${samples.length}</span><span>关联事件 · ${events.length}</span></div><div class="section-head"><div><p class="section-kicker">人脸样本</p><h3>用于判断身份的头像证据</h3></div></div><div class="face-evidence-grid">${samples.length ? samples.map((sample) => `<article class="face-evidence-item"><img src="${escapeHtml(sample.crop_url)}" alt="人脸样本" loading="lazy" /><button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">查看原图 ${icon("→")}</button></article>`).join("") : emptyState("没有可用人脸样本", "当前候选没有可回看的 face instance。")}</div><div class="section-head"><div><p class="section-kicker">关联事件</p><h3>该人物出现过的事件</h3></div></div><div class="evidence-list">${events.length ? events.map((event) => `<button class="evidence-main" data-action="open-event" data-event-id="${escapeHtml(event.id)}"><strong>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.summary || "暂无事件摘要")}</p><small>${escapeHtml(formatDateTime(event.time_start))} · ${escapeHtml(event.place || "未标注地点")}</small></button>`).join("") : emptyState("还没有关联事件", "确认后，新的事件观察会继续维护人物画像。")}</div>${entity.status === "confirmed" ? "" : `<div class="modal-actions"><button class="button ghost" data-action="close-modal">关闭</button><button class="button primary" data-action="confirm-person" data-person-id="${escapeHtml(entity.id)}">确认姓名和关系</button></div>`}`;
     } else if (modal.type === "cluster-confirm") {
       const cluster = modal.cluster;
       body = `<form id="modal-form"><div class="modal-kicker">FACE CLUSTER · ${escapeHtml(cluster.id)}</div><h2>确认这个人物实体</h2><p class="modal-lead">这组样本由 153 上的 buffalo_l embedding 聚类得到。确认后，所有样本会统一绑定到同一个实体。</p><div class="cluster-samples modal-samples">${(cluster.samples || []).map((sample) => `<button type="button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">${faceAvatar(sample.id, "人脸样本")}</button>`).join("")}</div><label>姓名或称呼<input name="name" placeholder="例如：妈妈" required /></label><label>家庭角色<select name="family_role"><option value="">暂不确认</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><label>与已确认实体的关系（可选）<select name="relation_target"><option value="">暂不建立关系</option>${state.entities.filter((entity) => entity.status === "confirmed").map((entity) => `<option value="${escapeHtml(entity.id)}">${escapeHtml(entity.canonical_name)}</option>`).join("")}</select></label><label>关系类型（可选）<input name="relation_predicate" placeholder="例如：母亲、父亲、兄弟姐妹" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认并更新记忆</button></div></form>`;
@@ -849,9 +829,8 @@
       const properties = new Map((detail.properties || []).map((item) => [item.property_key, item]));
       const isSelf = Boolean(properties.get("is_self")?.value);
       const relation = properties.get("relation_to_user")?.value || "";
-      const canonicalName = detail.entity?.canonical_name || "";
       const groups = Array.isArray(properties.get("groups")?.value) ? properties.get("groups").value.join("、") : "";
-      body = `<form id="modal-form"><div class="modal-kicker">PERSON PROPERTY EDIT</div><h2>修正人物档案</h2><p class="modal-lead">这些是用户维护字段，会保留版本且不会被模型推断覆盖。</p><label>名字<input name="canonical_name" value="${escapeHtml(canonicalName)}" placeholder="例如：小张、妈妈" /></label><label class="property-toggle"><input type="checkbox" name="is_self" ${isSelf ? "checked" : ""} />这是相册主人</label><label>与相册主人的关系<input name="relation_to_user" value="${escapeHtml(relation)}" placeholder="例如：本人、母亲、同事" /></label><label>所属圈子<input name="groups" value="${escapeHtml(groups)}" placeholder="例如：家人、大学同学" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-person-profile" data-person-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存人物档案</button></div></form>`;
+      body = `<form id="modal-form"><div class="modal-kicker">PERSON PROPERTY EDIT</div><h2>修正人物档案</h2><p class="modal-lead">这些是用户维护字段，会保留版本且不会被模型推断覆盖。</p><label class="property-toggle"><input type="checkbox" name="is_self" ${isSelf ? "checked" : ""} />这是相册主人</label><label>与相册主人的关系<input name="relation_to_user" value="${escapeHtml(relation)}" placeholder="例如：本人、母亲、同事" /></label><label>所属圈子<input name="groups" value="${escapeHtml(groups)}" placeholder="例如：家人、大学同学" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="open-person-profile" data-person-id="${escapeHtml(detail.entity.id)}">取消</button><button type="submit" class="button primary">保存人物档案</button></div></form>`;
     } else if (modal.type === "person-name-edit") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -897,7 +876,7 @@
       body = `<div class="modal-kicker">SEMANTIC ENTITY GROUP</div><div class="profile-heading"><div><h2>${escapeHtml(group.canonical_name || "语义实体组")}</h2><p class="modal-lead">${escapeHtml(semanticSummary(group))}</p></div></div><section class="semantic-detail-section"><p class="section-kicker">语义摘要</p><p>${escapeHtml(semanticSummary(group))}</p></section><section class="semantic-detail-section"><p class="section-kicker">细节语义</p><div class="semantic-detail-tags">${(details.length ? details : ["由图片观察维护"]).map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div></section><section class="semantic-detail-section"><p class="section-kicker">原始证据</p><div class="semantic-evidence-grid">${evidenceRows || emptyState("暂无原始证据", "该组尚未关联可查看的 Observation。")}</div></section><details class="technical-evidence"><summary>查看证据技术信息</summary>${technicalRows || "<p>暂无技术信息</p>"}</details><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
     } else if (modal.type === "story-create" || modal.type === "story-edit") {
       const story = modal.story || {};
-      body = `<form id="modal-form"><div class="modal-kicker">STORY ${modal.type === "story-create" ? "DRAFT" : "EDITOR"}</div><h2>${modal.type === "story-create" ? "创建故事草稿" : "编辑故事"}</h2><label>标题<input name="title" value="${escapeHtml(story.title || "")}" placeholder="留空则AI根据所选事件生成" /></label><label>故事内容<textarea name="content" rows="5">${escapeHtml(story.content || "")}</textarea></label><label>自定义标签<input name="tags" value="${escapeHtml((story.tags||[]).join(", "))}" placeholder="温馨, 搞笑, 感动（逗号分隔）" /></label><div class="story-event-select"><strong>选择事件证据</strong>${state.events.map((event) => `<label><input type="checkbox" name="event_ids" value="${escapeHtml(event.id)}" ${(story.event_ids || []).includes(event.id) ? "checked" : ""} />${escapeHtml(event.title)}</label>`).join("") || `<small>当前没有事件，请先导入资料。</small>`}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">保存故事</button></div></form>`;
+      body = `<form id="modal-form"><div class="modal-kicker">STORY ${modal.type === "story-create" ? "DRAFT" : "EDITOR"}</div><h2>${modal.type === "story-create" ? "创建故事草稿" : "编辑故事"}</h2><label>标题<input name="title" value="${escapeHtml(story.title || "")}" required /></label><label>故事内容<textarea name="content" rows="5">${escapeHtml(story.content || "")}</textarea></label><div class="story-event-select"><strong>选择事件证据</strong>${state.events.map((event) => `<label><input type="checkbox" name="event_ids" value="${escapeHtml(event.id)}" ${(story.event_ids || []).includes(event.id) ? "checked" : ""} />${escapeHtml(event.title)}</label>`).join("") || `<small>当前没有事件，请先导入资料。</small>`}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">保存故事</button></div></form>`;
     } else if (modal.type === "invite") {
       body = modal.invite ? `<div class="modal-kicker">FAMILY SPACE INVITE</div><h2>局域网邀请已生成</h2><p class="modal-lead">这是一个本地邀请 token。当前不会发送到云端或第三方服务。</p><code class="invite-code">${escapeHtml(modal.invite.invite_url)}</code><div class="modal-actions"><button class="button primary" data-action="close-modal">完成</button></div>` : `<form id="modal-form"><div class="modal-kicker">FAMILY SPACE</div><h2>生成家庭成员邀请</h2><label>邀请备注<input name="label" value="家庭成员" required /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">生成邀请</button></div></form>`;
     } else if (modal.type === "command") {
@@ -1494,7 +1473,6 @@
         state.toast = "地点属性已按你的修正保存，并保留版本和证据";
       }
       if (modal.type === "person-property-edit") {
-        await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "canonical_name", String(form.get("canonical_name") || "").trim());
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "is_self", form.get("is_self") === "on");
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "relation_to_user", String(form.get("relation_to_user") || "").trim());
         await window.sentrixApi.setEntityProperty(modal.detail.entity.id, "groups", String(form.get("groups") || "").split(/[、,，]/).map((item) => item.trim()).filter(Boolean));
@@ -1537,29 +1515,8 @@
         await window.sentrixApi.splitFaceCluster(modal.cluster.id, modal.sample.id);
         state.toast = "已拆出新人物簇，原始证据仍保留";
       }
-      if (modal.type === "story-create") {
-        const storyEventIds = form.getAll("event_ids");
-        state.storyGenerating = true;
-        state.storyError = false;
-        state.storyDraftEventIds = storyEventIds;
-        state.modal = null;
-        state.modalHistory = [];
-        state.view = "stories";
-        renderShellNavigation();
-        try {
-          await window.sentrixApi.createStory({ title: form.get("title") || "", content: "", event_ids: storyEventIds, tags: (form.get("tags")||"").split(",").map(s=>s.trim()).filter(Boolean) });
-          await refreshData({ forceRender: true });
-          state.toast = "故事已生成";
-        } catch (error) {
-          state.storyError = true;
-          state.toast = `故事生成失败：${error.message}`;
-        } finally {
-          state.storyGenerating = false;
-          renderShellNavigation();
-        }
-        return;
-      }
-      if (modal.type === "story-edit") await window.sentrixApi.updateStory(modal.story.id, { title: form.get("title"), content: form.get("content"), event_ids: form.getAll("event_ids"), tags: (form.get("tags")||"").split(",").map(s=>s.trim()).filter(Boolean) });
+      if (modal.type === "story-create") await window.sentrixApi.createStory({ title: form.get("title"), content: form.get("content"), event_ids: form.getAll("event_ids") });
+      if (modal.type === "story-edit") await window.sentrixApi.updateStory(modal.story.id, { title: form.get("title"), content: form.get("content"), event_ids: form.getAll("event_ids") });
       if (modal.type === "command") {
         const command = String(form.get("command") || "").trim();
         const target = navItems.find((item) => command.includes(item.label) || command.toLowerCase().includes(item.id));
@@ -1659,24 +1616,6 @@
     if (action === "open-observation") { const observation = await window.sentrixApi.observation(element.dataset.observationId); return openAsset(observation.asset_id); }
     if (action === "create-event") return openModal({ type: "event-create", event: {} });
     if (action === "create-story") return openModal({ type: "story-create", story: {} });
-    if (action === "retry-story") {
-      const ids = state.storyDraftEventIds || [];
-      state.storyGenerating = true;
-      state.storyError = false;
-      renderShellNavigation();
-      try {
-        await window.sentrixApi.createStory({ title: "", content: "", event_ids: ids, tags: [] });
-        await refreshData({ forceRender: true });
-        state.toast = "故事已重新生成";
-      } catch (error) {
-        state.storyError = true;
-        state.toast = `故事生成失败：${error.message}`;
-      } finally {
-        state.storyGenerating = false;
-        renderShellNavigation();
-      }
-      return;
-    }
     if (action === "confirm-trip") { const trip = state.trips.find((item) => item.id === element.dataset.tripId); return trip && openModal({ type: "trip-confirm", trip }); }
     if (action === "reject-trip") { await window.sentrixApi.rejectTrip(element.dataset.tripId); state.toast = "已标记为非行程，原始事件和照片证据仍保留"; return refreshData(); }
     if (action === "edit-story") { const story = state.stories.find((item) => item.id === element.dataset.storyId); return openModal({ type: "story-edit", story }); }
@@ -1715,7 +1654,11 @@
     }
     if (action === "invite") return openModal({ type: "invite" });
     if (action === "open-help") return openModal({ type: "help" });
-    if (action === "open-qa-dashboard") { window.open("/qa", "_blank"); return; }
+    if (action === "open-qa-dashboard") {
+      const benchUrl = `${window.location.protocol}//${window.location.hostname}:8771/`;
+      window.open(benchUrl, "_blank");
+      return;
+    }
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "space-manager" });
     if (action === "ask-delete-space") {
