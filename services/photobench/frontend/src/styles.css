@@ -72,3 +72,18 @@ label,.field-label { display:block; color:var(--muted); font-size:12px; } input[
 @media (max-width:700px){
   .qa-turn-row .answer-side{margin-top:18px}
 }
+
+/* 完整运行时轨迹 / 完整输入输出：长 JSON 横向滚动，不撑破布局 */
+.debug-inline pre,
+.debug-trace-body pre,
+.debug-steps pre,
+.debug-turn pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 8px 9px;
+  border: 1px solid #d9ddea;
+  border-radius: 5px;
+  background: #fff;
+  font: 10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre;
+}
