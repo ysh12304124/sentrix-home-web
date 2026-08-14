@@ -1,6 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const { execFile } = require("node:child_process");
 const { URL } = require("node:url");
 
 const root = __dirname;
@@ -8,6 +9,9 @@ const port = Number(process.env.PORT || 11000);
 // The web portal uses the Agent-capable API as its single authority.
 // Default API is the project-local backend that reads ./data/sentrix.db.
 const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:9598").replace(/\/$/, "");
+const photobenchPort = Number(process.env.PHOTOBENCH_PORT || 8771);
+const photobenchDir = path.join(root, "services", "photobench");
+const photobenchPython = process.env.PHOTOBENCH_PYTHON || "python3";
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -89,6 +93,28 @@ async function proxyBackend(req, res, url) {
   }
 }
 
+
+async function ensurePhotobench(req, res) {
+  const probeUrl = `http://127.0.0.1:${photobenchPort}/api/config`;
+  try {
+    const probe = await fetch(probeUrl, { signal: AbortSignal.timeout(2000) });
+    if (probe.ok) return json(res, 200, { status: "running" });
+  } catch (_) { /* not running yet */ }
+
+  const logFile = path.join(photobenchDir, "logs", "orchestrator.log");
+  const command = `cd '${photobenchDir}' && mkdir -p logs && set -a && . ./.env.local 2>/dev/null; set +a; nohup '${photobenchPython}' backend/benchmark_orchestrator.py --host 0.0.0.0 --port ${photobenchPort} >> '${logFile}' 2>&1 &`;
+  execFile("bash", ["-c", command], () => {});
+
+  for (let i = 0; i < 60; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    try {
+      const probe = await fetch(probeUrl, { signal: AbortSignal.timeout(1500) });
+      if (probe.ok) return json(res, 200, { status: "started" });
+    } catch (_) { /* keep waiting */ }
+  }
+  return json(res, 500, { status: "timeout" });
+}
+
 function serveFile(req, res, url) {
   const requested = url.pathname === "/" ? "/index.html" : url.pathname;
   const filePath = path.normalize(path.join(root, requested));
@@ -109,6 +135,7 @@ function serveFile(req, res, url) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  if (url.pathname === "/api/photobench/ensure") return ensurePhotobench(req, res);
   if (url.pathname.startsWith("/api/") || url.pathname === "/qa") return proxyBackend(req, res, url);
   return serveFile(req, res, url);
 });
