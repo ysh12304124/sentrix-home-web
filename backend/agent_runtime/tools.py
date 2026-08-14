@@ -169,7 +169,7 @@ def _resolve_entity(name, scope_id):
 
 
 # ---- Tool 1: query_memory_facts ----
-_FACT_OPERATIONS = {"count", "exists", "first", "last", "date", "group", "meal"}
+_FACT_OPERATIONS = {"count", "exists", "first", "last", "date", "group", "meal", "list"}
 
 
 def _normalize_fact_arguments(arguments: dict) -> tuple[str, str]:
@@ -190,6 +190,8 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
     filters = arguments.get("filters") or {}
     scope_id = (context or {}).get("scope_id") or ""
     viewer_id = (context or {}).get("viewer_id") or "owner"
+    if operation == "list":
+        return _query_media_list(filters, scope_id=scope_id, viewer_id=viewer_id)
     if operation == "meal":
         # Phase C C5：饮食/活动聚合（事件级去重 + 食物证据分层）
         return _query_meal_evidence(filters, scope_id=scope_id, viewer_id=viewer_id)
@@ -241,6 +243,105 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
                            "全部相关照片都有地点信息。"),
         }
     return out
+
+
+def _query_media_list(filters: dict, *, scope_id="home-default", viewer_id="owner") -> dict:
+    """List actual media assets instead of only counting them.
+
+    The tool contract keeps the model in charge: it receives stable IDs,
+    media_kind, and for keyframes the owning video/time/context.  It can then
+    decide whether to name the videos, deliver the source video, or inspect
+    specific keyframes.
+    """
+    from ..structured_memory import StructuredMemoryExecutor
+
+    store = _RUNTIME.get("store")
+    if store is None:
+        return {"operation": "list", "summary": "记忆库不可用。", "total": 0,
+                "items": [], "coverage": {"complete": False}}
+    draft = _draft_from_filters(filters, answer_type="asset_set")
+    spec = _spec_for(draft, scope_id, viewer_id)
+    executor = StructuredMemoryExecutor(store)
+    media_filter = str((filters or {}).get("media") or "").strip().lower() or None
+    try:
+        assets = executor._matching_assets(draft, spec, limit=500)
+    except Exception:
+        assets = []
+    items = []
+    for row in assets:
+        asset = store.get_asset(row.get("id")) or {}
+        if not asset:
+            continue
+        media_type = asset.get("media_type") or row.get("media_type") or ""
+        derived_kind = asset.get("derived_kind")
+        if derived_kind == "video_keyframe":
+            media_kind = "video_keyframe"
+        elif media_type == "video":
+            media_kind = "video"
+        elif media_type == "image":
+            media_kind = "original_image"
+        else:
+            media_kind = media_type or "unknown"
+        item = {
+            "asset_id": asset.get("id"),
+            "file_name": asset.get("file_name"),
+            "media_type": media_type,
+            "media_kind": media_kind,
+            "derived_kind": derived_kind,
+            "captured_at": asset.get("captured_at") or row.get("captured_at"),
+        }
+        if derived_kind == "video_keyframe":
+            source_video_id = asset.get("parent_asset_id")
+            item["source_video_asset_id"] = source_video_id
+            item["source_timestamp_sec"] = asset.get("source_timestamp_sec")
+            item["source_scene_index"] = asset.get("source_scene_index")
+            source_video = store.get_asset(source_video_id) if source_video_id else None
+            item["source_video_file_name"] = (source_video or {}).get("file_name")
+        if media_type == "video":
+            metadata = asset.get("metadata_json") or {}
+            video_metadata = metadata.get("video_metadata") or {}
+            scenes = store.list_video_scene_events(asset.get("id")) if store.list_video_scene_events else []
+            item["duration_sec"] = video_metadata.get("duration_sec")
+            item["scene_count"] = int(metadata.get("worldmm_scene_count") or len(scenes) or 0)
+            item["keyframe_count"] = int(
+                metadata.get("worldmm_selected_keyframe_count")
+                or metadata.get("worldmm_summary_keyframe_count")
+                or metadata.get("worldmm_keyframe_count")
+                or 0
+            )
+            item["scene_samples"] = []
+            for scene in (scenes or [])[:5]:
+                keyframe_samples = []
+                for frame in (scene.get("keyframe_assets") or [])[:3]:
+                    keyframe_samples.append({
+                        "asset_id": frame.get("id"),
+                        "timestamp_sec": frame.get("source_timestamp_sec"),
+                        "source_scene_index": frame.get("source_scene_index"),
+                    })
+                item["scene_samples"].append({
+                    "scene_id": scene.get("id"),
+                    "title": scene.get("title"),
+                    "start_sec": scene.get("source_start_sec"),
+                    "end_sec": scene.get("source_end_sec"),
+                    "source_scene_index": scene.get("source_scene_index"),
+                    "keyframe_samples": keyframe_samples,
+                })
+        items.append(item)
+    limited = items[:80]
+    return {
+        "operation": "list",
+        "answer_type": "media_list",
+        "value": len(limited),
+        "total": len(items),
+        "items": limited,
+        "has_more": len(items) > len(limited),
+        "media_filter": media_filter,
+        "filters_applied": {
+            "scope_id": scope_id or None,
+            "media": media_filter,
+        },
+        "coverage": {"complete": True},
+    }
 
 
 # ---- Phase C C5：饮食 / 活动证据聚合 ----
@@ -1181,12 +1282,14 @@ def register_tools():
 
     register(ToolSpec(
         name="query_memory_facts",
-        description=("确定性结构化事实查询（数量/存在性/首次/最近/日期/分组/饮食），不要用模型估算。"
+        description=("确定性结构化事实查询（数量/存在性/首次/最近/日期/分组/饮食/媒体列表），不要用模型估算。"
                      "filters.time 原样写相对或具体时间，系统自动换算；不填表示全部。"
                      "group 必须填 group_by（month|place），place 分组需如实说明无地点照片数。"
                      "meal 用于'吃过什么/吃饭'类问题。菜单价格/招牌等视觉文字先用 search_memories 再 read_photo_text，不要用本工具猜。"
+                     "operation=list 用于列出实际媒体（如'相册里所有视频/所有照片'），filters.media 填 video/image/audio/text；"
+                     "返回 items 含视频时长/场景/关键帧来源，不要用 count 回答列表问题。"
                      "filters.place 只填结构化地名（城市/区县/景区/地标），不要把目标/活动/主题当 place；不确定留空。"),
-        input_schema={"operation": "count|exists|first|last|date|group|meal",
+        input_schema={"operation": "count|exists|first|last|date|group|meal|list",
                       "filters": {"time": "去年/这两年/2023年 等相对或具体时间（原样写）",
                                   "person": "", "place": "", "media": "",
                                   "food": "可选：限定某种食物（如'火锅'）"},
