@@ -932,8 +932,12 @@ def dashboard(scope_id: str | None = None):
 
 
 @app.get("/api/events")
-def events(scope_id: str | None = None):
-    return {"events": store.list_events(100, scope_id=scope_id)}
+def events(scope_id: str | None = None, limit: int = 1000):
+    # The timeline needs older events when the user selects a historical date.
+    # Keep a server-side ceiling while avoiding the previous silent 100-event
+    # truncation that hid older video scenes.
+    limit = min(max(int(limit or 1000), 1), 5000)
+    return {"events": store.list_events(limit, scope_id=scope_id)}
 
 
 @app.get("/api/trips")
