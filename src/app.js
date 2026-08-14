@@ -74,6 +74,7 @@
     storyError: false,
     storyDraftEventIds: [],
     eventFilter: "all",
+    eventDate: "",
     assetFilter: "all",
     assetSort: "newest",
     personFilter: "all",
@@ -191,7 +192,10 @@
   }
 
   function filteredEvents() {
-    const source = state.events.map(eventViewModel);
+    let source = state.events.map(eventViewModel);
+    if (state.eventDate) {
+      source = source.filter((event) => [event.time_start, event.time_end].some((value) => String(value || "").slice(0, 10) === state.eventDate));
+    }
     if (state.eventFilter === "all") return source;
     if (state.eventFilter === "people") return source.filter((event) => eventPeople(event).length);
     if (state.eventFilter === "place") return source.filter((event) => event.place);
@@ -587,7 +591,7 @@
   function timelineView() {
     const events = filteredEvents();
     const card = (event) => `<article class="timeline-event ${event.isVideoScene ? "video-scene-event" : ""}"><div class="timeline-marker ${event.tone}"></div><div class="timeline-date">${event.date}<small>${escapeHtml(event.typeLabel)}</small></div><div class="timeline-event-body">${event.isVideoScene ? videoSceneStack(event) : `<div class="event-cover ${event.tone}">${event.coverAssetId ? `<img src="/api/assets/${encodeURIComponent(event.coverAssetId)}/file" alt="${escapeHtml(event.title)}的事件证据" loading="lazy" />` : ""}<div class="event-cover-label">${albumBadge(event.scope_id)}<span>${escapeHtml(event.title)}</span></div><b>${escapeHtml(event.countLabel)}</b></div>`}<div class="timeline-event-copy"><div class="card-top"><span class="event-kind">${escapeHtml(event.isVideoScene ? `视频场景 ${(event.source_scene_index || 0) + 1}` : event.status || "active")}</span><span class="confidence-label">${event.isVideoScene ? escapeHtml(event.sceneRange) : `revision ${event.revision || 1}`}</span></div><h2>${escapeHtml(event.title)}</h2><p>${escapeHtml(event.summary || "暂无事件摘要")}</p><div class="event-facts"><span>${icon("◎")} ${escapeHtml(event.placeLabel)}</span><span>${icon("◷")} ${event.isVideoScene ? `${escapeHtml(event.sceneRange)} · ${escapeHtml(event.countLabel)}` : escapeHtml(event.countLabel)}</span><span>${icon("↗")} ${event.isVideoScene ? "可回到原始视频" : "可回到原始证据"}</span></div><div class="event-actions"><button class="button small ghost" data-action="open-event" data-event-id="${escapeHtml(event.id)}">查看证据</button>${event.isVideoScene ? "" : `<button class="text-button" data-action="edit-event" data-event-id="${escapeHtml(event.id)}">修正事件 ${icon("→")}</button>`}</div></div></div></article>`;
-    return `${pageHeader("记忆组织 / 事件", "家里的时间线，不只是文件列表。", `当前范围：${albumLabel(state.scopeId)}。照片和视频片段按真实拍摄时间统一整理。`, `<button class="button ghost" data-action="create-event">${icon("＋")}新建事件</button>`)}<div class="filter-row"><button class="filter-chip ${state.eventFilter === "all" ? "active" : ""}" data-event-filter="all">全部事件</button><button class="filter-chip ${state.eventFilter === "people" ? "active" : ""}" data-event-filter="people">有人物</button><button class="filter-chip ${state.eventFilter === "place" ? "active" : ""}" data-event-filter="place">有地点</button><span class="filter-spacer"></span><button class="icon-button bordered" data-action="reload" aria-label="刷新时间线">↻</button></div><section class="timeline-layout"><div class="timeline-main">${events.length ? events.map(card).join("") : emptyState("还没有事件", "导入并处理资料后，记忆会自动出现在时间线。", `<button class="button small primary" data-view="imports">${icon("＋")}导入资料</button>`)}</div><aside class="side-inspector"><p class="section-kicker">视频记忆</p><h2>一段视频，也能成为清晰的家庭回忆</h2><p>系统会选出有代表性的画面，按场景整理，并继承拍摄时间与地点。</p><div class="inspector-note">场景图片堆 <strong>已启用</strong><small>展开后可点击画面，直接跳回原视频对应时刻。</small></div></aside></section>`;
+    return `${pageHeader("记忆组织 / 事件", "家里的时间线，不只是文件列表。", `当前范围：${albumLabel(state.scopeId)}。照片和视频片段按真实拍摄时间统一整理。`, `<button class="button ghost" data-action="create-event">${icon("＋")}新建事件</button>`)}<div class="filter-row"><button class="filter-chip ${state.eventFilter === "all" ? "active" : ""}" data-event-filter="all">全部事件</button><button class="filter-chip ${state.eventFilter === "people" ? "active" : ""}" data-event-filter="people">有人物</button><button class="filter-chip ${state.eventFilter === "place" ? "active" : ""}" data-event-filter="place">有地点</button><label class="timeline-date-filter"><span>查看日期</span><input type="date" data-event-date value="${escapeHtml(state.eventDate)}" aria-label="按日期查看时间线" /></label>${state.eventDate ? `<button class="text-button" data-action="clear-event-date">清除日期</button>` : ""}<span class="filter-spacer"></span><button class="icon-button bordered" data-action="reload" aria-label="刷新时间线">↻</button></div><section class="timeline-layout"><div class="timeline-main">${events.length ? events.map(card).join("") : emptyState("这一天还没有事件", "请选择其他日期，或清除日期筛选查看全部记忆。", `<button class="button small ghost" data-action="clear-event-date">查看全部事件</button>`)}</div><aside class="side-inspector"><p class="section-kicker">视频记忆</p><h2>一段视频，也能成为清晰的家庭回忆</h2><p>系统会选出有代表性的画面，按场景整理，并继承拍摄时间与地点。</p><div class="inspector-note">场景图片堆 <strong>已启用</strong><small>展开后可点击画面，直接跳回原视频对应时刻。</small></div></aside></section>`;
   }
 
   function peopleView() {
@@ -1159,6 +1163,8 @@
     document.querySelectorAll("[data-view]").forEach((element) => element.addEventListener("click", () => { navigate(element.dataset.view); }));
     document.querySelectorAll("[data-query]").forEach((element) => element.addEventListener("click", () => { state.query = element.dataset.query; state.view = "search"; renderShellNavigation(); submitSearch(); }));
     document.querySelectorAll("[data-event-filter]").forEach((element) => element.addEventListener("click", () => { state.eventFilter = element.dataset.eventFilter; renderView(); }));
+    const eventDate = document.querySelector("[data-event-date]");
+    if (eventDate) eventDate.addEventListener("change", (event) => { state.eventDate = event.target.value || ""; renderView(); });
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
     document.querySelectorAll("[data-person-filter]").forEach((element) => element.addEventListener("click", () => { state.personFilter = element.dataset.personFilter; renderView(); }));
     const spaceSelect = document.getElementById("space-select");
@@ -1833,6 +1839,7 @@
     if (action === "review-entity-merge-candidate") { const candidate = state.entityMergeCandidates.find((item) => item.id === element.dataset.candidateId); return candidate && openModal({ type: "entity-merge-confirm", candidate }); }
     if (action === "reject-entity-merge-candidate") { await window.sentrixApi.rejectEntityMergeCandidate(element.dataset.candidateId); state.toast = "已保留原有实体，不会再次显示同一归并候选"; return refreshData(); }
     if (action === "reload") return refreshData();
+    if (action === "clear-event-date") { state.eventDate = ""; renderView(); return; }
     if (action === "recheck") { await fetch("/api/maintenance/recheck", { method: "POST" }); state.toast = "已提交失败任务重试"; return refreshData(); }
     if (action === "relationship-graph") { openModal({ type: "loading" }, { push: true }); try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); return openModal({ type: "family-graph", graph }); } catch (error) { state.modal = null; state.toast = `无法读取家庭关系：${error.message}`; return renderShellNavigation(); } }
   }
