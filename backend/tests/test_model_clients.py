@@ -147,7 +147,18 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(payload["model"], "gemma4-12b-it")
         self.assertEqual(payload["max_tokens"], 512)
         self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
         self.assertNotIn("keep_alive", payload)
+
+    @patch("backend.model_clients.GammaClient._tokenize_for_budget", return_value=None)
+    @patch("backend.model_clients.GammaClient._chat_openai_stream", return_value="完成")
+    def test_agent_messages_disable_vllm_thinking_by_default(self, stream, tokenize):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="qwen3.5-4b")
+
+        client.chat_messages([{"role": "user", "content": "测试"}], role="answer")
+
+        payload = stream.call_args.args[1]
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
 
     @patch("backend.model_clients.httpx.post")
     def test_gamma_vllm_multimodal_request_uses_openai_image_content(self, post):

@@ -219,6 +219,12 @@ ROLE_INFERENCE = {
 }
 
 
+def _openai_thinking_kwargs():
+    """Return the vLLM chat-template switch; reasoning is disabled by default."""
+    value = os.getenv("SENTRIX_ENABLE_THINKING", "0").strip().lower()
+    return {"enable_thinking": value in {"1", "true", "yes", "on"}}
+
+
 def build_image_prompt(metadata=None):
     prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
 严格返回简体中文 JSON 对象。place 和 semantic.place.primary 必须只依据图片视觉证据，不能用 GPS 或地点上下文覆盖；地点上下文只能作为候选背景。
@@ -596,6 +602,7 @@ class GammaClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": temperature,
+            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
@@ -732,6 +739,7 @@ class GammaClient:
             "stream": use_stream,
             "stream_options": {"include_usage": True} if use_stream else None,
             "temperature": 0,
+            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
             payload["response_format"] = {"type": "json_object"}
