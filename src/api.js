@@ -19,7 +19,7 @@
     deleteMemorySpace: (scopeId) => request(`/api/memory-spaces/${encodeURIComponent(scopeId)}`, { method: "DELETE" }),
     geoPlaces: (scopeId = "") => request(`/api/geo-places${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     dashboard: (scopeId = "") => request(`/api/dashboard${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
-    events: (scopeId = "") => request(`/api/events${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
+    events: (scopeId = "") => request(`/api/events?limit=1000${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     trips: (scopeId = "", status = "") => request(`/api/trips${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(status ? { status } : {}) }).toString().replace(/^/, "?")}`),
     trip: (id) => request(`/api/trips/${encodeURIComponent(id)}`),
     confirmTrip: (id, payload) => request(`/api/trips/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify(payload) }),

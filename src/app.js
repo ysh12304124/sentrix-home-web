@@ -74,6 +74,7 @@
     storyError: false,
     storyDraftEventIds: [],
     eventFilter: "all",
+    eventDate: "",
     assetFilter: "all",
     assetSort: "newest",
     personFilter: "all",
@@ -191,7 +192,10 @@
   }
 
   function filteredEvents() {
-    const source = state.events.map(eventViewModel);
+    let source = state.events.map(eventViewModel);
+    if (state.eventDate) {
+      source = source.filter((event) => [event.time_start, event.time_end].some((value) => String(value || "").slice(0, 10) === state.eventDate));
+    }
     if (state.eventFilter === "all") return source;
     if (state.eventFilter === "people") return source.filter((event) => eventPeople(event).length);
     if (state.eventFilter === "place") return source.filter((event) => event.place);
@@ -267,22 +271,13 @@
     const sourceAction = evidence.kind === "observation" && evidence.asset_id ? `data-action="open-asset" data-asset-id="${escapeHtml(evidence.asset_id)}"` : evidence.event_id ? `data-action="open-event" data-event-id="${escapeHtml(evidence.event_id)}"` : evidence.kind === "fact" && evidence.evidence_ids?.[0] ? `data-action="open-observation" data-observation-id="${escapeHtml(evidence.evidence_ids[0])}"` : "";
     const title = evidence.kind === "fact" ? `${evidence.subject} ${evidence.predicate} ${evidence.object}` : evidence.summary || evidence.caption || "原始图片证据";
     const text = evidence.kind === "observation" ? evidence.caption || evidence.transcript || "无文字摘要" : evidence.summary || evidence.status || "";
-    const media = evidence.kind === "observation"
-      ? (evidence.asset_id
-        ? `<button class="evidence-media" data-action="open-asset" data-asset-id="${escapeHtml(evidence.asset_id)}" aria-label="打开原始证据">${assetThumb({ id: evidence.asset_id, media_type: evidence.media_type || "image" }, true)}</button>`
-        : evidence.media_url
-          ? evidence.media_type === "video"
-            ? `<video class="evidence-media" src="${escapeHtml(evidence.media_url)}" controls preload="metadata"></video>`
-            : `<a class="evidence-media" href="${escapeHtml(evidence.media_url)}" target="_blank" rel="noopener" aria-label="打开原始证据"><img src="${escapeHtml(evidence.media_url)}" alt="原始证据" loading="lazy" /></a>`
-          : "")
-      : "";
+    const media = evidence.kind === "observation" && evidence.asset_id ? `<button class="evidence-media" data-action="open-asset" data-asset-id="${escapeHtml(evidence.asset_id)}" aria-label="打开原始证据">${assetThumb({ id: evidence.asset_id, media_type: evidence.media_type || "image" }, true)}</button>` : "";
     const assetAction = evidence.kind === "asset" && evidence.id ? `data-action="open-asset" data-asset-id="${escapeHtml(evidence.id)}"` : "";
     const main = sourceAction || assetAction ? `<button class="evidence-main" ${sourceAction || assetAction}><strong>${escapeHtml(title)}</strong><p>${escapeHtml(text)}</p><small>${escapeHtml(evidence.captured_at || evidence.place || evidence.media_type || "证据记录")}</small></button>` : `<div class="evidence-main static"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(text)}</p><small>${escapeHtml(evidence.captured_at || evidence.place || evidence.media_type || "证据记录")}</small></div>`;
-    const sourceVideoButton = evidence.source_video_asset_id ? `<button class="text-button evidence-video-link" data-action="open-asset" data-asset-id="${escapeHtml(evidence.source_video_asset_id)}">打开原视频 ${icon("→")}</button>` : "";
     // RX-6: internal ids and raw JSON only in the admin debug layer.
     const idLine = isAdmin && (evidence.asset_id || evidence.observation_id) ? `<small class="admin-only">${escapeHtml(evidence.asset_id || "")}${evidence.observation_id ? " · " + escapeHtml(evidence.observation_id) : ""}</small>` : "";
     const debugRaw = isAdmin && evidence.raw ? `<details class="admin-only"><summary>查看模型原始 JSON</summary><pre>${escapeHtml(JSON.stringify(evidence.raw, null, 2))}</pre></details>` : "";
-    return `<article class="evidence-card"><div class="evidence-head"><span class="evidence-kind">${evidence.kind === "observation" ? "图片观察" : evidence.kind === "asset" ? "原始资料" : evidence.kind === "fact" ? "人物事实" : "记忆证据"}</span></div>${idLine}${media}${main}${sourceVideoButton}${debugRaw}</article>`;
+    return `<article class="evidence-card"><div class="evidence-head"><span class="evidence-kind">${evidence.kind === "observation" ? "图片观察" : evidence.kind === "asset" ? "原始资料" : evidence.kind === "fact" ? "人物事实" : "记忆证据"}</span></div>${idLine}${media}${main}${debugRaw}</article>`;
   }
 
   function evidenceLayer(title, values) {
@@ -457,11 +452,9 @@
 
   function toolLoopEvidence(result) {
     const samples = [];
-    const taskState = result.task_state || {};
-    for (const tr of taskState.tool_results || []) {
-      const observation = tr.observation || {};
-      const directSamples = observation.samples || tr.samples || [];
-      for (const s of directSamples) {
+    for (const tr of ((result.task_state || {}).tool_results) || []) {
+      const samples = (tr.observation && tr.observation.samples) || tr.samples || [];
+      for (const s of samples) {
         if (!s || !s.asset_id) continue;
         samples.push({
           kind: "observation",
@@ -469,46 +462,13 @@
           media_type: s.media_type || "image",
           caption: s.caption || s.transcript || "",
           captured_at: s.captured_at,
-          source_video_asset_id: s.source_video_asset_id || null,
-          source_timestamp_sec: s.source_timestamp_sec,
-        });
-      }
-      if (tr.tool === "search_memories") {
-        const resultSetId = observation.result_set_id || taskState.current_result_set || "";
-        for (const p of observation.preview || []) {
-          if (!p || !p.handle) continue;
-          samples.push({
-            kind: "observation",
-            id: p.handle,
-            asset_id: "",
-            media_url: resultSetId ? window.sentrixApi.resultSetPhoto(resultSetId, p.handle, state.scopeId) : "",
-            media_kind: p.media_kind || "original_image",
-            source_video_asset_id: p.source_video_asset_id || null,
-            source_timestamp_sec: p.source_timestamp_sec,
-            caption: p.place || "",
-            captured_at: p.captured_at,
-          });
-        }
-      }
-      if (tr.tool === "get_original_photos" && observation.media_type === "video" && observation.url) {
-        samples.push({
-          kind: "observation",
-          id: observation.url,
-          asset_id: "",
-          media_url: observation.url,
-          media_type: "video",
-          media_kind: "source_video",
-          source_video_asset_id: observation.source_video_asset_id || null,
-          source_timestamp_sec: observation.source_timestamp_sec,
-          caption: observation.summary || "",
         });
       }
     }
     const seen = new Set();
     return samples.filter((item) => {
-      const key = item.asset_id || item.id || item.media_url || `${item.kind}-${item.captured_at}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
+      if (seen.has(item.asset_id)) return false;
+      seen.add(item.asset_id);
       return true;
     }).slice(0, 6);
   }
@@ -569,13 +529,6 @@
     const head = totalKnown ? `共 ${total} 张${hasMore ? ` · 还有 ${remaining} 张` : ""}` : "找到一批相关结果";
     const handles = (ts.result_preview || []).slice(0, 6);
     const selected = state.selectedAsset && state.selectedAsset.result_set_id === rid ? state.selectedAsset.handle : "";
-    const previewByHandle = {};
-    for (const tr of (ts.tool_results) || []) {
-      for (const p of ((tr.observation && tr.observation.preview) || [])) {
-        if (p && p.handle && p.source_video_asset_id) previewByHandle[p.handle] = p;
-      }
-    }
-    const selectedSourceVideo = selected ? previewByHandle[selected] : null;
     // C8：本轮的 inspect_photo 复核结果与 handle 对应展示（已复核徽标 + 复核观察）
     const inspectRows = (ts.tool_results || []).filter((tr) => tr.tool === "inspect_photo" && tr.inspect_handle);
     const inspected = new Set(inspectRows.map((tr) => tr.inspect_handle));
@@ -588,9 +541,8 @@
     }).join("")}</div>` : "";
     const inspectBlock = inspectedNotes ? `<div class="result-set-inspect-notes">${inspectedNotes}</div>` : "";
     const originalButton = selected ? `<button class="text-button" data-action="open-selected-original" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(selected)}">查看原图 ${icon("→")}</button>` : "";
-    const sourceVideoButton = selectedSourceVideo ? `<button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(selectedSourceVideo.source_video_asset_id)}">打开原视频 ${icon("→")}</button>` : "";
     const next = hasMore ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
-    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${originalButton}${sourceVideoButton}${next}</section>`;
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${originalButton}${next}</section>`;
   }
 
   function assistantMessage(message) {
@@ -639,7 +591,15 @@
   function timelineView() {
     const events = filteredEvents();
     const card = (event) => `<article class="timeline-event ${event.isVideoScene ? "video-scene-event" : ""}"><div class="timeline-marker ${event.tone}"></div><div class="timeline-date">${event.date}<small>${escapeHtml(event.typeLabel)}</small></div><div class="timeline-event-body">${event.isVideoScene ? videoSceneStack(event) : `<div class="event-cover ${event.tone}">${event.coverAssetId ? `<img src="/api/assets/${encodeURIComponent(event.coverAssetId)}/file" alt="${escapeHtml(event.title)}的事件证据" loading="lazy" />` : ""}<div class="event-cover-label">${albumBadge(event.scope_id)}<span>${escapeHtml(event.title)}</span></div><b>${escapeHtml(event.countLabel)}</b></div>`}<div class="timeline-event-copy"><div class="card-top"><span class="event-kind">${escapeHtml(event.isVideoScene ? `视频场景 ${(event.source_scene_index || 0) + 1}` : event.status || "active")}</span><span class="confidence-label">${event.isVideoScene ? escapeHtml(event.sceneRange) : `revision ${event.revision || 1}`}</span></div><h2>${escapeHtml(event.title)}</h2><p>${escapeHtml(event.summary || "暂无事件摘要")}</p><div class="event-facts"><span>${icon("◎")} ${escapeHtml(event.placeLabel)}</span><span>${icon("◷")} ${event.isVideoScene ? `${escapeHtml(event.sceneRange)} · ${escapeHtml(event.countLabel)}` : escapeHtml(event.countLabel)}</span><span>${icon("↗")} ${event.isVideoScene ? "可回到原始视频" : "可回到原始证据"}</span></div><div class="event-actions"><button class="button small ghost" data-action="open-event" data-event-id="${escapeHtml(event.id)}">查看证据</button>${event.isVideoScene ? "" : `<button class="text-button" data-action="edit-event" data-event-id="${escapeHtml(event.id)}">修正事件 ${icon("→")}</button>`}</div></div></div></article>`;
-    return `${pageHeader("记忆组织 / 事件", "家里的时间线，不只是文件列表。", `当前范围：${albumLabel(state.scopeId)}。照片和视频片段按真实拍摄时间统一整理。`, `<button class="button ghost" data-action="create-event">${icon("＋")}新建事件</button>`)}<div class="filter-row"><button class="filter-chip ${state.eventFilter === "all" ? "active" : ""}" data-event-filter="all">全部事件</button><button class="filter-chip ${state.eventFilter === "people" ? "active" : ""}" data-event-filter="people">有人物</button><button class="filter-chip ${state.eventFilter === "place" ? "active" : ""}" data-event-filter="place">有地点</button><span class="filter-spacer"></span><button class="icon-button bordered" data-action="reload" aria-label="刷新时间线">↻</button></div><section class="timeline-layout"><div class="timeline-main">${events.length ? events.map(card).join("") : emptyState("还没有事件", "导入并处理资料后，记忆会自动出现在时间线。", `<button class="button small primary" data-view="imports">${icon("＋")}导入资料</button>`)}</div><aside class="side-inspector"><p class="section-kicker">视频记忆</p><h2>一段视频，也能成为清晰的家庭回忆</h2><p>系统会选出有代表性的画面，按场景整理，并继承拍摄时间与地点。</p><div class="inspector-note">场景图片堆 <strong>已启用</strong><small>展开后可点击画面，直接跳回原视频对应时刻。</small></div></aside></section>`;
+    const groups = [];
+    const byDate = new Map();
+    events.forEach((event) => {
+      const date = String(event.time_start || "").slice(0, 10) || "unknown";
+      if (!byDate.has(date)) { const group = { date, events: [] }; byDate.set(date, group); groups.push(group); }
+      byDate.get(date).events.push(event);
+    });
+    const groupedTimeline = groups.map((group) => `<details class="timeline-day" open><summary><span>${escapeHtml(group.date === "unknown" ? "未标注日期" : formatDate(group.date))}</span><small>${group.events.length} 个事件</small><b>⌄</b></summary><div class="timeline-day-events">${group.events.map(card).join("")}</div></details>`).join("");
+    return `${pageHeader("记忆组织 / 事件", "家里的时间线，不只是文件列表。", `当前范围：${albumLabel(state.scopeId)}。照片和视频片段按真实拍摄时间统一整理。`, `<button class="button ghost" data-action="create-event">${icon("＋")}新建事件</button>`)}<div class="filter-row"><button class="filter-chip ${state.eventFilter === "all" ? "active" : ""}" data-event-filter="all">全部事件</button><button class="filter-chip ${state.eventFilter === "people" ? "active" : ""}" data-event-filter="people">有人物</button><button class="filter-chip ${state.eventFilter === "place" ? "active" : ""}" data-event-filter="place">有地点</button><label class="timeline-date-filter"><span>查看日期</span><input type="date" data-event-date value="${escapeHtml(state.eventDate)}" aria-label="按日期查看时间线" /></label>${state.eventDate ? `<button class="text-button" data-action="clear-event-date">清除日期</button>` : ""}<span class="filter-spacer"></span><button class="icon-button bordered" data-action="reload" aria-label="刷新时间线">↻</button></div><section class="timeline-layout"><div class="timeline-main">${events.length ? groupedTimeline : emptyState(state.eventDate ? "这一天还没有事件" : "还没有事件", state.eventDate ? "请选择其他日期，或清除日期筛选查看全部记忆。" : "导入并处理资料后，记忆会自动出现在时间线。", state.eventDate ? `<button class="button small ghost" data-action="clear-event-date">查看全部事件</button>` : `<button class="button small primary" data-view="imports">${icon("＋")}导入资料</button>`)}</div><aside class="side-inspector"><p class="section-kicker">视频记忆</p><h2>一段视频，也能成为清晰的家庭回忆</h2><p>系统会选出有代表性的画面，按场景整理，并继承拍摄时间与地点。</p><div class="inspector-note">场景图片堆 <strong>已启用</strong><small>展开后可点击画面，直接跳回原视频对应时刻。</small></div></aside></section>`;
   }
 
   function peopleView() {
@@ -705,14 +665,22 @@
       rejected: "已拒绝",
     }[status] || status || "等待处理");
     const rows = state.queue.slice(0, 20).map((item) => `<div class="queue-row"><span class="queue-type image">图</span><div><strong>${escapeHtml(item.fileName)}</strong><small>${escapeHtml(item.error || statusLabel(item.status))}</small></div><span class="queue-status ${failedStatuses.has(item.status) ? "reserved" : "queued"}">${escapeHtml(statusLabel(item.status))}</span></div>`).join("");
-    return `<section class="content-section upload-progress"><div class="section-head"><div><p class="section-kicker">本次上传</p><h2>${state.queue.length} 张图片</h2></div><span class="result-count">${uploaded} 已上传 · ${active} 进行中 · ${failed} 失败</span></div><div class="health-bar"><i style="width:${progress}%"></i></div><div class="queue-list">${rows}</div>${state.queue.length > 20 ? `<p class="upload-more">仅展示最近20条，完整状态会同步到下方处理任务。</p>` : ""}</section>`;
+    return `<section class="content-section upload-progress"><div class="section-head"><div><p class="section-kicker">本次上传</p><h2>${state.queue.length} 份资料</h2></div><span class="result-count">${uploaded} 已上传 · ${active} 进行中 · ${failed} 失败</span></div><div class="health-bar"><i style="width:${progress}%"></i></div><div class="queue-list">${rows}</div>${state.queue.length > 20 ? `<p class="upload-more">仅展示最近20条，完整状态会同步到下方处理任务。</p>` : ""}</section>`;
   }
 
   function importsView() {
     const videoStatuses = ["video-queued", "video-metadata", "video-keyframe-extracting", "video-scene-importing", "video-processing-failed"];
     const assets = state.assets.filter((asset) => ["queued", "processing", "semantic_enriching", "failed", ...videoStatuses].includes(asset.status));
-    const activeVideo = state.assets.filter((asset) => asset.media_type === "video" && videoStatuses.includes(asset.status) && asset.status !== "video-processing-failed").length;
-      return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "视频会在后台读取拍摄信息、提取关键画面并整理进家庭时间线。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入资料，或点击选择文件</strong><small>可选择文件，或选择图片文件夹（自动导入 JPG/JPEG/PNG/HEIC）</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始证据不会被覆盖</strong><p>每个 Asset 都可以追溯到 Observation 和模型原始 JSON。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${[["接收与去重", `${state.assets.length} 个 Asset`, "done"], ["图片理解", `${state.assets.filter((a) => a.media_type === "image" && a.status === "processed").length} 个已完成 · ${state.assets.filter((a) => a.status === "semantic_enriching").length} 个语义整理中`, "done"], ["音频转写", `${state.assets.filter((a) => a.media_type === "audio").length} 个音频`, "active"], ["事件记忆构建", `${stats().events} 个事件 · ${stats().facts} 条事实`, "active"], ["读取视频元数据", `${state.assets.filter((a) => a.media_type === "video").length} 个视频`, activeVideo ? "active" : "done"], ["关键帧与场景切分", `${state.assets.filter((a) => a.media_type === "video").reduce((sum, item) => sum + Number(item.metadata_json?.worldmm_scene_count || 0), 0)} 个场景`, activeVideo ? "active" : "done"], ["场景图片语义理解", `${state.assets.filter((a) => a.derived_kind === "video_keyframe" && a.status === "processed").length} 张关键帧`, activeVideo ? "active" : "done"]].map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : row[2] === "active" ? "•" : "—"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : row[2] === "active" ? "运行中" : "预留"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}证据</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的 Asset 会显示在这里。")}</div></section>`;
+    const videos = state.assets.filter((asset) => asset.media_type === "video");
+    const activeVideo = videos.filter((asset) => videoStatuses.includes(asset.status) && asset.status !== "video-processing-failed").length;
+    const pipelineRows = [
+      ["接收与去重", `${state.assets.length} 个 Asset`, "done"],
+      ["读取视频元数据", `${videos.length} 个视频`, activeVideo ? "active" : "done"],
+      ["关键帧与场景切分", `${videos.reduce((sum, item) => sum + Number(item.metadata_json?.worldmm_scene_count || 0), 0)} 个场景`, activeVideo ? "active" : "done"],
+      ["场景图片语义理解", `${state.assets.filter((a) => a.derived_kind === "video_keyframe" && a.status === "processed").length} 张关键帧`, activeVideo ? "active" : "done"],
+      ["事件记忆构建", `${stats().events} 个事件 · ${stats().facts} 条事实`, "done"],
+    ];
+    return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "视频会在后台读取拍摄信息、提取关键画面并整理进家庭时间线。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或点击选择文件</strong><small>视频支持 MOV / MP4，并在后台构建场景记忆</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
   }
 
   function ocrSettingsCard() {
@@ -740,7 +708,7 @@
         : face.detectionReady
           ? "人物检测已启用 · AdaFace 未加载，身份向量暂不可用"
           : "人物识别不可用";
-    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label ${routerStatusClass}">${routerStatus}</span></div><label class="model-switcher"><span>主推理</span><select data-action="switch-vlm" ${modelSwitchInFlight ? 'disabled' : ''}>${unmanagedOption}${(router.available_backends || []).map(id => { const info = router.models?.[id] || {}; return `<option value="${escapeHtml(id)}" ${id === router.backend ? 'selected' : ''} ${!info.available ? 'disabled' : ''}>${escapeHtml(info.model || id)}${info.available ? '' : ' · 离线'}${info.loaded ? ' · 当前运行' : ''}</option>` }).join('')}</select><small>${escapeHtml(modelSwitchInFlight ? `正在切换到 ${requestedModelProfile}` : activeModel?.url || router.error || '未托管模型')}</small></label><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${faceStatusText}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频场景记忆 <b>已启用</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}${ocrSettingsCard()}${`<section class="content-section fact-review">`}<div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频场景</span><b>本地 WorldMM 已启用</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div><div><button class="button small ghost" data-action="open-qa-dashboard">查看 QA 测评 Dashboard ${icon("▤")}</button><small>Agent 基准测评与历史 run 对比</small></div></div></div></section>`;
+    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label ${routerStatusClass}">${routerStatus}</span></div><label class="model-switcher"><span>主推理</span><select data-action="switch-vlm" ${modelSwitchInFlight ? 'disabled' : ''}>${unmanagedOption}${(router.available_backends || []).map(id => { const info = router.models?.[id] || {}; return `<option value="${escapeHtml(id)}" ${id === router.backend ? 'selected' : ''} ${!info.available ? 'disabled' : ''}>${escapeHtml(info.model || id)}${info.available ? '' : ' · 离线'}${info.loaded ? ' · 当前运行' : ''}</option>` }).join('')}</select><small>${escapeHtml(modelSwitchInFlight ? `正在切换到 ${requestedModelProfile}` : activeModel?.url || router.error || '未托管模型')}</small></label><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${faceStatusText}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频场景记忆 <b>WorldMM</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}${ocrSettingsCard()}${`<section class="content-section fact-review">`}<div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频场景</span><b>本地 WorldMM 已启用</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div><div><button class="button small ghost" data-action="open-qa-dashboard">查看 QA 测评 Dashboard ${icon("▤")}</button><small>Agent 基准测评与历史 run 对比</small></div></div></div></section>`;
   }
 
   function semanticDetails(group) {
@@ -880,10 +848,10 @@
       const sourceVideo = detail.event.source_video || {};
       const sceneFrames = detail.event.keyframe_assets || [];
       const sceneEvidence = isVideoScene ? `<section class="video-scene-detail"><div class="detail-facts"><span>视频范围 · ${formatVideoTime(detail.event.source_start_sec)}~${formatVideoTime(detail.event.source_end_sec)}</span><span>场景 ${(detail.event.source_scene_index || 0) + 1}</span><span>${sceneFrames.length} 张关键帧</span></div><video id="scene-video-player" controls preload="metadata" src="/api/assets/${encodeURIComponent(detail.event.source_asset_id)}/file"></video><div class="scene-keyframe-grid">${sceneFrames.map((frame) => `<button class="scene-keyframe" data-action="seek-video" data-timestamp-sec="${Number(frame.source_timestamp_sec || 0)}"><img src="/api/assets/${encodeURIComponent(frame.id)}/file" alt="${formatVideoTime(frame.source_timestamp_sec)} 的关键帧" /><strong>${formatVideoTime(frame.source_timestamp_sec)}</strong></button>`).join("")}</div><button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(detail.event.source_asset_id)}">打开原始视频 ${icon("→")}</button></section>` : "";
-      body = `<div class="modal-kicker">${isVideoScene ? "视频场景" : "事件详情"}</div><h2>${escapeHtml(detail.event.title)}</h2><p class="modal-lead">${escapeHtml(detail.event.summary || "暂无摘要")}</p><div class="detail-facts"><span>时间 · ${formatDateTime(detail.event.time_start)}</span><span>地点 · ${escapeHtml(detail.event.place || "未标注")}</span><span>${isVideoScene ? `原视频 · ${escapeHtml(sourceVideo.file_name || "视频证据")}` : `版本 · ${detail.event.revision || 1}`}</span></div>${sceneEvidence}${coverEvidence}<div class="section-head"><div><p class="section-kicker">${isVideoScene ? "记忆内容" : "事件实体"}</p><h3>人物、地点与画面细节</h3></div></div><div class="event-entity-list">${entityRows || emptyState(isVideoScene ? "暂时没有更多细节" : "尚未投影实体", isVideoScene ? "处理新资料后，这里会继续补充。" : "该事件等待 Observation 实体索引。")}</div><div class="section-head"><div><p class="section-kicker">${isVideoScene ? "原始资料" : "原始证据媒体"}</p><h3>${detail.observations.length} 条${isVideoScene ? "画面记录" : "Observation"}</h3></div>${isVideoScene ? "" : `<button class="button small ghost" data-action="edit-event" data-event-id="${escapeHtml(detail.event.id)}">修正事件</button>`}</div><div class="evidence-list event-evidence-list">${detail.observations.length ? detail.observations.map((observation) => evidenceCard({ kind: "observation", id: observation.id, observation_id: observation.id, asset_id: observation.asset_id, file_name: observation.asset?.file_name, media_type: observation.asset?.media_type, captured_at: observation.captured_at, caption: observation.caption, transcript: observation.transcript, raw: observation.raw_json })).join("") : emptyState(isVideoScene ? "没有关联画面" : "没有关联 Observation", "这是一个人工创建的事件。")}</div>${detail.facts?.length ? `<div class="section-head"><div><p class="section-kicker">语义记忆</p><h3>关联事实</h3></div></div><div class="evidence-list">${detail.facts.map((fact) => evidenceCard({ kind: "fact", id: fact.id, subject: fact.subject, predicate: fact.predicate, object: fact.object, status: fact.status, evidence_ids: fact.evidence_ids_json })).join("")}</div>` : ""}`;
+      body = `<div class="modal-kicker">${isVideoScene ? "视频场景" : "事件详情"}</div><h2>${escapeHtml(detail.event.title)}</h2><p class="modal-lead">${escapeHtml(detail.event.summary || "暂无摘要")}</p><div class="detail-facts"><span>时间 · ${formatDateTime(detail.event.time_start)}</span><span>地点 · ${escapeHtml(detail.event.place || "未标注")}</span><span>${isVideoScene ? `原视频 · ${escapeHtml(sourceVideo.file_name || "视频证据")}` : `版本 · ${detail.event.revision || 1}`}</span></div>${sceneEvidence}${coverEvidence}<div class="section-head"><div><p class="section-kicker">记忆内容</p><h3>人物、地点与画面细节</h3></div></div><div class="event-entity-list">${entityRows || emptyState("暂时没有更多细节", "处理新资料后，这里会继续补充。")}</div><div class="section-head"><div><p class="section-kicker">原始资料</p><h3>${detail.observations.length} 条画面记录</h3></div>${isVideoScene ? "" : `<button class="button small ghost" data-action="edit-event" data-event-id="${escapeHtml(detail.event.id)}">修正事件</button>`}</div><div class="evidence-list event-evidence-list">${detail.observations.length ? detail.observations.map((observation) => evidenceCard({ kind: "observation", id: observation.id, observation_id: observation.id, asset_id: observation.asset_id, file_name: observation.asset?.file_name, media_type: observation.asset?.media_type, captured_at: observation.captured_at, caption: observation.caption, transcript: observation.transcript, raw: observation.raw_json })).join("") : emptyState("没有关联画面", "这是一个人工创建的事件。")}</div>${detail.facts?.length ? `<div class="section-head"><div><p class="section-kicker">语义记忆</p><h3>关联事实</h3></div></div><div class="evidence-list">${detail.facts.map((fact) => evidenceCard({ kind: "fact", id: fact.id, subject: fact.subject, predicate: fact.predicate, object: fact.object, status: fact.status, evidence_ids: fact.evidence_ids_json })).join("")}</div>` : ""}`;
     } else if (modal.type === "asset") {
       const asset = modal.asset;
-      body = `<div class="modal-kicker">ORIGINAL EVIDENCE</div><h2>原始${escapeHtml(mediaLabel(asset.media_type))}证据</h2><div class="asset-modal-preview">${asset.media_type === "image" ? `<img src="/api/assets/${encodeURIComponent(asset.id)}/file" alt="原始图片证据" />` : asset.media_type === "audio" ? `<audio controls src="/api/assets/${encodeURIComponent(asset.id)}/file"></audio>` : asset.media_type === "video" ? `<video controls src="/api/assets/${encodeURIComponent(asset.id)}/file"></video>` : `<pre>${escapeHtml(asset.file_name)}</pre>`}</div><div class="detail-facts"><span>类型 · ${escapeHtml(mediaLabel(asset.media_type))}</span><span>状态 · ${escapeHtml(assetStatusLabel(asset.status))}</span><span>大小 · ${asset.size_bytes || 0} bytes</span></div><details class="technical-evidence"><summary>查看资料技术信息</summary><div><span>文件名</span><small>${escapeHtml(asset.file_name)}</small></div><div><span>Asset</span><small>${escapeHtml(asset.id)}</small></div>${asset.media_type === "video" ? `<div><span>视频信息</span><small>${escapeHtml(String((asset.metadata_json?.video_metadata?.duration_sec ?? 0)))} 秒 · ${escapeHtml(String((asset.metadata_json?.video_metadata?.width ?? 0)))}×${escapeHtml(String((asset.metadata_json?.video_metadata?.height ?? 0)))}</small></div>` : ""}</details><div class="section-head"><div><p class="section-kicker">Observation</p><h3>这份资料产生的证据</h3></div></div><div class="evidence-list">${modal.observations.length ? modal.observations.map((observation) => evidenceCard({ kind: "observation", id: observation.id, asset_id: asset.id, file_name: asset.file_name, media_type: asset.media_type, captured_at: observation.captured_at, caption: observation.caption, transcript: observation.transcript, raw: observation.raw_json })).join("") : emptyState("还没有 Observation", "资料正在处理，刷新后查看结果。")}</div>`;
+      body = `<div class="modal-kicker">ORIGINAL EVIDENCE</div><h2>原始${escapeHtml(mediaLabel(asset.media_type))}证据</h2><div class="asset-modal-preview">${asset.media_type === "image" ? `<img src="/api/assets/${encodeURIComponent(asset.id)}/file" alt="原始图片证据" />` : asset.media_type === "audio" ? `<audio controls src="/api/assets/${encodeURIComponent(asset.id)}/file"></audio>` : asset.media_type === "video" ? `<video controls src="/api/assets/${encodeURIComponent(asset.id)}/file"></video>` : `<pre>${escapeHtml(asset.file_name)}</pre>`}</div><div class="detail-facts"><span>类型 · ${escapeHtml(mediaLabel(asset.media_type))}</span><span>状态 · ${escapeHtml(asset.status)}</span><span>大小 · ${asset.size_bytes || 0} bytes</span></div><details class="technical-evidence"><summary>查看资料技术信息</summary><div><span>文件名</span><small>${escapeHtml(asset.file_name)}</small></div><div><span>Asset</span><small>${escapeHtml(asset.id)}</small></div></details><div class="section-head"><div><p class="section-kicker">Observation</p><h3>这份资料产生的证据</h3></div></div><div class="evidence-list">${modal.observations.length ? modal.observations.map((observation) => evidenceCard({ kind: "observation", id: observation.id, asset_id: asset.id, file_name: asset.file_name, media_type: asset.media_type, captured_at: observation.captured_at, caption: observation.caption, transcript: observation.transcript, raw: observation.raw_json })).join("") : emptyState("还没有 Observation", "资料正在处理，刷新后查看结果。")}</div>`;
     } else if (modal.type === "event-edit" || modal.type === "event-create") {
       const event = modal.event || {};
       const coverOptions = (modal.observations || []).map((observation, index) => `<option value="${escapeHtml(observation.asset_id)}" ${observation.asset_id === event.cover_asset_id ? "selected" : ""}>原始证据 ${index + 1}</option>`).join("");
@@ -906,7 +874,7 @@
       body = `<div class="modal-kicker">PERSON EVIDENCE</div><div class="profile-heading">${faceAvatar(samples[0]?.id || entity.avatar_face_instance_id, entity.canonical_name, entity.status === "confirmed" ? "green" : "gray")}<div><h2>${escapeHtml(entity.canonical_name)}</h2><p class="modal-lead">${escapeHtml(entity.status === "confirmed" ? "已确认人物，下面是可回看的原始证据。" : "待确认人物候选，先检查人脸样本再命名。")}</p></div></div><div class="detail-facts"><span>状态 · ${escapeHtml(entity.status)}</span><span>人脸样本 · ${samples.length}</span><span>关联事件 · ${events.length}</span></div><div class="section-head"><div><p class="section-kicker">人脸样本</p><h3>用于判断身份的头像证据</h3></div></div><div class="face-evidence-grid">${samples.length ? samples.map((sample) => `<article class="face-evidence-item"><img src="${escapeHtml(sample.crop_url)}" alt="人脸样本" loading="lazy" /><button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">查看原图 ${icon("→")}</button></article>`).join("") : emptyState("没有可用人脸样本", "当前候选没有可回看的 face instance。")}</div><div class="section-head"><div><p class="section-kicker">关联事件</p><h3>该人物出现过的事件</h3></div></div><div class="evidence-list">${events.length ? events.map((event) => `<button class="evidence-main" data-action="open-event" data-event-id="${escapeHtml(event.id)}"><strong>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.summary || "暂无事件摘要")}</p><small>${escapeHtml(formatDateTime(event.time_start))} · ${escapeHtml(event.place || "未标注地点")}</small></button>`).join("") : emptyState("还没有关联事件", "确认后，新的事件观察会继续维护人物画像。")}</div>${entity.status === "confirmed" ? `<div class="modal-actions"><button class="button ghost" data-action="close-modal">关闭</button><button class="button primary" data-action="open-person-profile" data-person-id="${escapeHtml(entity.id)}">查看画像与改名</button></div>` : `<div class="modal-actions"><button class="button ghost" data-action="close-modal">关闭</button><button class="button primary" data-action="confirm-person" data-person-id="${escapeHtml(entity.id)}">确认姓名和关系</button></div>`}`;
     } else if (modal.type === "cluster-confirm") {
       const cluster = modal.cluster;
-      body = `<form id="modal-form"><div class="modal-kicker">FACE CLUSTER · ${escapeHtml(cluster.id)}</div><h2>确认这个人物实体</h2><p class="modal-lead">这组样本由 153 上的 buffalo_l embedding 聚类得到。确认后，所有样本会统一绑定到同一个实体。</p><div class="cluster-samples modal-samples">${(cluster.samples || []).map((sample) => `<button type="button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">${faceAvatar(sample.id, "人脸样本")}</button>`).join("")}</div><label>姓名或称呼<input name="name" placeholder="例如：妈妈" required /></label><label>家庭角色<select name="family_role"><option value="">暂不确认</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><label>与已确认实体的关系（可选）<select name="relation_target"><option value="">暂不建立关系</option>${state.entities.filter((entity) => entity.status === "confirmed").map((entity) => `<option value="${escapeHtml(entity.id)}">${escapeHtml(entity.canonical_name)}</option>`).join("")}</select></label><label>关系类型（可选）<input name="relation_predicate" placeholder="例如：母亲、父亲、兄弟姐妹" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认并更新记忆</button></div></form>`;
+      body = `<form id="modal-form"><div class="modal-kicker">人物候选</div><h2>确认这个人物实体</h2><p class="modal-lead">这组样本由本机人脸模型自动聚类。确认后，所有样本会统一绑定到同一个实体。</p><div class="cluster-samples modal-samples">${(cluster.samples || []).map((sample) => `<button type="button" data-action="open-asset" data-asset-id="${escapeHtml(sample.asset_id)}">${faceAvatar(sample.id, "人脸样本")}</button>`).join("")}</div><label>姓名或称呼<input name="name" placeholder="例如：妈妈" required /></label><label>家庭角色<select name="family_role"><option value="">暂不确认</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><label>与已确认实体的关系（可选）<select name="relation_target"><option value="">暂不建立关系</option>${state.entities.filter((entity) => entity.status === "confirmed").map((entity) => `<option value="${escapeHtml(entity.id)}">${escapeHtml(entity.canonical_name)}</option>`).join("")}</select></label><label>关系类型（可选）<input name="relation_predicate" placeholder="例如：母亲、父亲、兄弟姐妹" /></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认并更新记忆</button></div></form>`;
     } else if (modal.type === "cluster-merge") {
       const choices = state.clusters.filter((cluster) => cluster.status === "pending" && cluster.id !== modal.cluster.id);
       body = `<form id="modal-form"><div class="modal-kicker">FACE CLUSTER MERGE</div><h2>选择目标人物簇</h2><p class="modal-lead">合并会保留原始样本，并写入人物实体 revision。两个已确认人物不会被合并。</p><label>目标簇<select name="target_cluster_id" required>${choices.map((cluster) => `<option value="${escapeHtml(cluster.id)}">${escapeHtml(cluster.id)} · ${cluster.member_count || 0} 张样本</option>`).join("")}</select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary" ${choices.length ? "" : "disabled"}>合并人物簇</button></div></form>`;
@@ -1050,7 +1018,7 @@
         : `将永久删除此相册的全部内容。`;
       body = `<div class="modal-kicker">DELETE SPACE</div><h2>确认删除相册『${escapeHtml(scopeName)}』?</h2><p class="modal-lead">${summary}<br/><strong>此操作不可撤销,物理文件也会一同清理。</strong></p><div class="modal-actions"><button class="button ghost" data-action="open-space">取消</button><button class="button danger" data-action="confirm-delete-space" data-scope-id="${escapeHtml(scopeId)}" data-scope-name="${escapeHtml(scopeName)}">确认删除</button></div>`;
     } else if (modal.type === "help") {
-      body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本会生成 Observation；视频只建立 Asset。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选和 SQLite 都在 153 本地运行。</span></div></div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
+      body = `<div class="modal-kicker">SENTRIX HOME / HELP</div><h2>当前可用能力</h2><div class="help-list"><div><strong>导入</strong><span>图片、音频、文本和视频关键帧会生成 Observation；视频 Scene 进入家庭时间线。</span></div><div><strong>证据</strong><span>事件和 Agent 回答都能打开 Asset、Observation 和模型原始 JSON。</span></div><div><strong>维护</strong><span>事实冲突进入 pending，确认后旧版本变为 superseded。</span></div><div><strong>隐私</strong><span>原始文件、人物候选、视频场景和 SQLite 都在当前本机运行。</span></div></div><div class="modal-actions"><button class="button primary" data-action="close-modal">关闭</button></div>`;
     }
     root.innerHTML = `<div class="modal-backdrop"><div class="modal-panel"><button class="modal-back" data-action="close-modal" aria-label="返回上一页">${icon("←")}返回</button><button class="modal-close" data-action="close-modal" aria-label="关闭">×</button>${body}</div></div>`;
   }
@@ -1211,6 +1179,8 @@
     document.querySelectorAll("[data-view]").forEach((element) => element.addEventListener("click", () => { navigate(element.dataset.view); }));
     document.querySelectorAll("[data-query]").forEach((element) => element.addEventListener("click", () => { state.query = element.dataset.query; state.view = "search"; renderShellNavigation(); submitSearch(); }));
     document.querySelectorAll("[data-event-filter]").forEach((element) => element.addEventListener("click", () => { state.eventFilter = element.dataset.eventFilter; renderView(); }));
+    const eventDate = document.querySelector("[data-event-date]");
+    if (eventDate) eventDate.addEventListener("change", (event) => { state.eventDate = event.target.value || ""; renderView(); });
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
     document.querySelectorAll("[data-person-filter]").forEach((element) => element.addEventListener("click", () => { state.personFilter = element.dataset.personFilter; renderView(); }));
     const spaceSelect = document.getElementById("space-select");
@@ -1702,6 +1672,8 @@
     if (action === "seek-video") {
       const player = document.getElementById("scene-video-player");
       if (!player) return;
+      // Pause first so seeking is deterministic even when autoplay is blocked
+      // or the browser has only buffered part of the generated MP4 preview.
       const seek = () => { player.pause(); player.currentTime = Number(element.dataset.timestampSec || 0); };
       if (player.readyState >= 1) seek(); else player.addEventListener("loadedmetadata", seek, { once: true });
       return;
@@ -1810,15 +1782,7 @@
     }
     if (action === "invite") return openModal({ type: "invite" });
     if (action === "open-help") return openModal({ type: "help" });
-    if (action === "open-qa-dashboard") {
-      const benchUrl = `${window.location.protocol}//${window.location.hostname}:8771/`;
-      showToast("正在启动评测服务，请稍候…");
-      try {
-        await fetch("/api/photobench/ensure", { method: "POST" });
-      } catch (_) { /* 评测服务不可达时仍打开，让用户看到连接状态 */ }
-      window.open(benchUrl, "_blank");
-      return;
-    }
+    if (action === "open-qa-dashboard") { window.open("/qa", "_blank"); return; }
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "space-manager" });
     if (action === "ask-delete-space") {
@@ -1891,6 +1855,7 @@
     if (action === "review-entity-merge-candidate") { const candidate = state.entityMergeCandidates.find((item) => item.id === element.dataset.candidateId); return candidate && openModal({ type: "entity-merge-confirm", candidate }); }
     if (action === "reject-entity-merge-candidate") { await window.sentrixApi.rejectEntityMergeCandidate(element.dataset.candidateId); state.toast = "已保留原有实体，不会再次显示同一归并候选"; return refreshData(); }
     if (action === "reload") return refreshData();
+    if (action === "clear-event-date") { state.eventDate = ""; renderView(); return; }
     if (action === "recheck") { await fetch("/api/maintenance/recheck", { method: "POST" }); state.toast = "已提交失败任务重试"; return refreshData(); }
     if (action === "relationship-graph") { openModal({ type: "loading" }, { push: true }); try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); return openModal({ type: "family-graph", graph }); } catch (error) { state.modal = null; state.toast = `无法读取家庭关系：${error.message}`; return renderShellNavigation(); } }
   }

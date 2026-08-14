@@ -1,0 +1,44 @@
+{
+  "server": "192.168.0.200",
+  "web_url": "http://192.168.0.200:4174/#/timeline",
+  "video": {
+    "id": "asset_05f8de09ebe4",
+    "file_name": "IMG_3957.MOV",
+    "status": "processed",
+    "size_bytes": 12768501,
+    "captured_at": "2026-08-02T14:55:56+08:00",
+    "captured_location": "22.484600,114.543800",
+    "duration_sec": 11.735,
+    "device": "Apple iPhone 14 Plus"
+  },
+  "gpu_processing": {
+    "worldmm_device": "0",
+    "vlm_device": "cuda:0",
+    "seconds": 27.811,
+    "cpu_offload_seconds": 118.796,
+    "previous_cpu_seconds": 390.356,
+    "scene_count": 1,
+    "keyframe_count": 3,
+    "error": null
+  },
+  "scene": {
+    "id": "evt_5983d6cf8cd2",
+    "title": "海滨漂浮物观察",
+    "source_range_sec": [0.0, 11.735],
+    "absolute_range": [
+      "2026-08-02T14:55:56+08:00",
+      "2026-08-02T14:56:07.735000+08:00"
+    ],
+    "keyframes": [
+      {"id": "asset_6d2b140b65bf", "timestamp_sec": 0.0, "frame_index": 0},
+      {"id": "asset_6d32b9ca87f6", "timestamp_sec": 6.200880681818181, "frame_index": 186},
+      {"id": "asset_e9b51dcf44e9", "timestamp_sec": 11.501633522727273, "frame_index": 345}
+    ]
+  },
+  "browser_verification": {
+    "http_status": 200,
+    "player_duration_sec": 11.748005,
+    "second_keyframe_seek_sec": 6.20088,
+    "player_ready_state": 4
+  }
+}

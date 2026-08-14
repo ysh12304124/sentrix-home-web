@@ -68,6 +68,14 @@ SUPPORTED_IMPORT_SUFFIXES = {
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
 
 
+def _upload_destination(identifier, safe_name, media_type):
+    if media_type == "video":
+        directory = MEDIA_DIR / "videos" / identifier
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"original{Path(safe_name).suffix or '.mp4'}"
+    return MEDIA_DIR / f"{identifier}_{safe_name}"
+
+
 def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_location=None, latitude=None, longitude=None):
     payload = payload if isinstance(payload, dict) else {}
     captured_at = payload.get("capturedAt", payload.get("captured_at", captured_at))
@@ -295,7 +303,7 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
                     "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
                 })
                 image_ids.append(asset_id)
-            elif asset.get("status") in {"queued", "failed"}:
+            elif asset.get("status") in {"queued", "failed", "video-queued"}:
                 process_asset(asset_id)
 
         with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-fast") as executor:
@@ -377,7 +385,7 @@ def process_ingest_batch(asset_ids, batch_id):
         first = True
         while True:
             rows = task_store._rows(
-                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id",
+                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed', 'video-queued') ORDER BY created_at, id",
                 (batch_id,),
             )
             queued_ids = [row["id"] for row in rows]
@@ -642,12 +650,15 @@ def health():
                 agent["capability_matrix"] = {}
     except Exception:
         agent["tools"] = []
+    active_vlm_backend = getattr(gamma, "backend", "vllm")
+    if not isinstance(active_vlm_backend, str):
+        active_vlm_backend = "vllm"
     return {
         "status": "ok",
         "mode": "sentrix-local-backend",
         "agent": agent,
         "models": {
-            "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
+            "vlm": {"active": active_vlm_backend, "name": gamma.model, "endpoint": gamma.base_url},
             "llm": _current_model_runtime(),
             "gamma4_12B": {"name": gamma.model, "endpoint": gamma.base_url},
             "asr": {"name": pipeline.asr.model_name, "vad": pipeline.asr.vad_model, "punc": pipeline.asr.punc_model, "ready": pipeline.asr.error is None, "error": pipeline.asr.error},
@@ -667,7 +678,10 @@ def health():
             "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.evidence_ready, "evidenceReady": pipeline.clip.evidence_ready, "error": pipeline.clip.error},
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
-        "videoExtraction": "reserved",
+        "videoExtraction": {
+            "adapter": "worldmm_keyframe_memory", "status": "available",
+            "package": "tools/video_keyframe/worldmm_keyframe_pipeline.py",
+        },
         "database": store.path,
     }
 
@@ -898,8 +912,12 @@ def dashboard(scope_id: str | None = None):
 
 
 @app.get("/api/events")
-def events(scope_id: str | None = None):
-    return {"events": store.list_events(100, scope_id=scope_id)}
+def events(scope_id: str | None = None, limit: int = 1000):
+    # The timeline needs older events when the user selects a historical date.
+    # Keep a server-side ceiling while avoiding the previous silent 100-event
+    # truncation that hid older video scenes.
+    limit = min(max(int(limit or 1000), 1), 5000)
+    return {"events": store.list_events(limit, scope_id=scope_id)}
 
 
 @app.get("/api/trips")
@@ -941,6 +959,43 @@ def event_detail(event_id: str):
     if not value:
         raise HTTPException(status_code=404, detail="event not found")
     return value
+
+
+@app.get("/api/videos/{asset_id}")
+def video_detail(asset_id: str):
+    value = store.get_asset(asset_id)
+    if not value or value.get("media_type") != "video":
+        raise HTTPException(status_code=404, detail="video asset not found")
+    return {"video": value, "scenes": store.list_video_scene_events(asset_id)}
+
+
+@app.get("/api/videos/{asset_id}/scenes")
+def video_scenes(asset_id: str):
+    value = store.get_asset(asset_id)
+    if not value or value.get("media_type") != "video":
+        raise HTTPException(status_code=404, detail="video asset not found")
+    return {"video_asset_id": asset_id, "scenes": store.list_video_scene_events(asset_id)}
+
+
+@app.get("/api/video-scenes/{scene_id}")
+def video_scene_detail(scene_id: str):
+    value = store.get_event_detail(scene_id)
+    if not value or value["event"].get("source_type") != "video_scene":
+        raise HTTPException(status_code=404, detail="video scene not found")
+    return value
+
+
+@app.post("/api/videos/{asset_id}/reprocess", status_code=202)
+def reprocess_video(asset_id: str, background_tasks: BackgroundTasks):
+    value = store.get_asset(asset_id)
+    if not value or value.get("media_type") != "video":
+        raise HTTPException(status_code=404, detail="video asset not found")
+    store.cleanup_video_derivatives(asset_id)
+    store.update_asset(asset_id, "video-queued", {
+        "video_stage": "video-queued", "error": None, "error_stage": None,
+    })
+    background_tasks.add_task(process_asset, asset_id)
+    return {"accepted": True, "asset_id": asset_id, "status": "video-queued"}
 
 
 @app.post("/api/events")
@@ -1591,6 +1646,13 @@ def asset_file(asset_id: str, original: bool = False):
     path = Path(value["path"]) if value else None
     if not value or not path or not path.is_file():
         raise HTTPException(status_code=404, detail="asset file not found")
+    preview_path = Path((value.get("metadata_json") or {}).get("browser_preview_path") or "")
+    if value.get("media_type") == "video" and not original and preview_path.is_file():
+        return FileResponse(
+            preview_path, media_type="video/mp4",
+            filename=f"{Path(value.get('file_name') or asset_id).stem}-preview.mp4",
+            headers={"Cache-Control": "private, max-age=86400", "X-Sentrix-Source": "browser-preview"},
+        )
     # Keep an escape hatch for downloading the untouched HEIC source.
     if original or not needs_browser_transcode(path, value.get("mime_type")):
         return FileResponse(
@@ -2404,10 +2466,10 @@ async def ingest(
 ):
     safe_name = Path(file.filename or "upload.bin").name
     asset_id = make_id("asset")
-    destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
+    media_type = media_type_from_upload(file.content_type, safe_name)
+    destination = _upload_destination(asset_id, safe_name, media_type)
     with destination.open("wb") as output:
         shutil.copyfileobj(file.file, output)
-    media_type = media_type_from_upload(file.content_type, safe_name)
     mime_type = file.content_type or guess_mime_type(safe_name)
     scope = (scope_id or scopeId or "home-default").strip() or "home-default"
     metadata = {
@@ -2438,8 +2500,10 @@ async def ingest(
         destination.stat().st_size,
         metadata,
     )
+    if media_type == "video":
+        created = store.update_asset(asset_id, "video-queued", {"video_stage": "video-queued"})
     background_tasks.add_task(process_asset, asset_id)
-    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type, "scope_id": scope}
+    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": created["status"], "mediaType": media_type, "scope_id": scope}
 
 
 @app.post("/api/import", status_code=202)
@@ -2476,29 +2540,31 @@ async def import_remote_files(
     queued_asset_ids = []
     for index, upload in enumerate(files):
         safe_name = Path(upload.filename or f"upload-{index}").name
-        destination = MEDIA_DIR / f"{make_id('upload')}_{safe_name}"
+        media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
+        if media_type not in {"image", "audio", "video", "text"}:
+            media_type = media_type_from_upload(upload.content_type, safe_name)
+        destination = _upload_destination(make_id("upload"), safe_name, media_type)
         try:
             save_started = time.perf_counter()
             with destination.open("wb") as output:
                 shutil.copyfileobj(upload.file, output)
             file_save_seconds = round(time.perf_counter() - save_started, 4)
             capture = _normalized_capture_metadata(per_file[index])
-            media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
-            if media_type not in {"image", "audio", "video", "text"}:
-                media_type = "text"
             created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
                 "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
                 "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
                 "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
                 **capture,
             })
+            if media_type == "video" and created.get("path") == str(destination):
+                created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
             created = store.update_asset(created["id"], created.get("status") or "queued", {
                 "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
             })
             deduplicated = created.get("path") != str(destination)
             if deduplicated:
                 destination.unlink(missing_ok=True)
-            elif created.get("status") in {"queued", "failed"}:
+            elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
                 queued_asset_ids.append(created["id"])
             items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"], "fileName": created["file_name"], "status": created["status"], "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"), "deduplicated": deduplicated})
         except ValueError as error:
@@ -2557,6 +2623,8 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
         try:
             copy_started = time.perf_counter()
             created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
+            if created.get("media_type") == "video" and created.get("path") == str(target):
+                created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
             created = store.update_asset(created["id"], created.get("status") or "queued", {
                 "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
             })
@@ -2568,7 +2636,7 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
         deduplicated = created.get("path") != str(target)
         if request.copy_file and deduplicated:
             target.unlink(missing_ok=True)
-        elif created.get("status") in {"queued", "failed"}:
+        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
             queued_asset_ids.append(created["id"])
         imported.append({
             "asset_id": created["id"],
@@ -2625,7 +2693,7 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
 
 @app.post("/api/maintenance/recheck")
 def recheck(background_tasks: BackgroundTasks):
-    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed', 'semantic_enriching') ORDER BY created_at")]
+    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed', 'semantic_enriching', 'video-queued', 'video-processing-failed') ORDER BY created_at")]
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
     return {"accepted": len(assets), "status": "recheck-queued"}
