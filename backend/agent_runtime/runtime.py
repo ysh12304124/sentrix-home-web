@@ -354,13 +354,14 @@ class AgentRuntime:
 
     def __init__(self, *, chat_fn, profile_name: str | None = None,
                  scope_id="home-default", viewer_id="owner", conversation_id=None,
-                 ocr_settings: dict | None = None):
+                 ocr_settings: dict | None = None, include_debug: bool = False):
         self.chat_fn = chat_fn
         self.profile = get_profile(profile_name)
         self.scope_id = scope_id
         self.viewer_id = viewer_id
         self.conversation_id = conversation_id
         self.ocr_settings = ocr_settings or {}
+        self.include_debug = include_debug
 
     def _tool_descriptions(self) -> str:
         lines = []
@@ -628,7 +629,12 @@ class AgentRuntime:
                 turn.status = "error"
                 turn.reason = f"model_call_error: {exc}"
                 break
-            turn.steps.append({"type": "model", "raw": (raw or "")[:500]})
+            model_step = {"type": "model", "raw": (raw or "")[:500]}
+            if self.include_debug:
+                import copy as _copy
+                model_step["raw_full"] = raw
+                model_step["prompt"] = _copy.deepcopy(messages)
+            turn.steps.append(model_step)
             action = self._parse_action(raw)
             if action is None:
                 if parse_retries < max_parse_retries and turn.budget.can_model_step():
@@ -865,11 +871,19 @@ class AgentRuntime:
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                     try:
-                        faithful, judge_problems = judge_faithfulness(
+                        judge_result = judge_faithfulness(
                             self.chat_fn, query=message, tool_results=task.tool_results,
-                            answer=turn.final_answer, trusted_facts=trusted)
-                        turn.steps.append({"type": "judge", "faithful": faithful,
-                                           "problems": list(judge_problems)})
+                            answer=turn.final_answer, trusted_facts=trusted,
+                            include_debug=self.include_debug)
+                        if self.include_debug:
+                            faithful, judge_problems, judge_debug = judge_result
+                        else:
+                            faithful, judge_problems = judge_result
+                        judge_step = {"type": "judge", "faithful": faithful,
+                                      "problems": list(judge_problems)}
+                        if self.include_debug:
+                            judge_step["debug"] = judge_debug
+                        turn.steps.append(judge_step)
                         if not faithful:
                             problems = judge_problems
                     except Exception as exc:
