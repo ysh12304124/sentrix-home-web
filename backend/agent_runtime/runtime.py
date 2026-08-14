@@ -548,6 +548,8 @@ class AgentRuntime:
         search_has_preview = False
         inspect_called = False
         tool_call_seq = 0
+        debug_step_seq = 0
+        last_model_step_id = None
         visual_retries = 0
         max_visual_retries = 1
         resolution_retries = 0
@@ -634,6 +636,11 @@ class AgentRuntime:
                 import copy as _copy
                 model_step["raw_full"] = raw
                 model_step["prompt"] = _copy.deepcopy(messages)
+                step_id = f"step_{debug_step_seq}"
+                debug_step_seq += 1
+                last_model_step_id = step_id
+                model_step["step_id"] = step_id
+                model_step["call_type"] = "agent"
             turn.steps.append(model_step)
             action = self._parse_action(raw)
             if action is None:
@@ -883,6 +890,10 @@ class AgentRuntime:
                                       "problems": list(judge_problems)}
                         if self.include_debug:
                             judge_step["debug"] = judge_debug
+                            step_id = f"step_{debug_step_seq}"
+                            debug_step_seq += 1
+                            judge_step["step_id"] = step_id
+                            judge_step["call_type"] = "faithfulness_judge"
                         turn.steps.append(judge_step)
                         if not faithful:
                             problems = judge_problems
@@ -1136,6 +1147,7 @@ class AgentRuntime:
                 "type": "tool", "tool": tool_name, "arguments": arguments,
                 "status": result.status, "observation": result.observation,
                 "error": result.error, "latency_s": latency,
+                "parent_step_id": last_model_step_id,
             })
             emit_text = public_status
             if tool_name == "inspect_photo" and result.status == "ok":

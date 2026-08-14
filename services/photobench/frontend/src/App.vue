@@ -570,6 +570,59 @@ function runtimeDebugTurns(item) {
   const turns = item?.runtime_turns || [];
   return Array.isArray(turns) ? turns.filter((turn) => turn && Array.isArray(turn.debug_trace)) : [];
 }
+
+function debugTraceForTurn(item, turnIndex) {
+  const turn = runtimeDebugTurns(item).find((t) => Number(t?.index) === Number(turnIndex));
+  return turn?.debug_trace || [];
+}
+
+function debugStepForCall(item, call, callIndexInTurn) {
+  const turnIndex = conversationTurnNumber(call?.conversation_turn);
+  const steps = debugTraceForTurn(item, turnIndex);
+  const ctype = callType(call);
+  const wantType = ctype === "faithfulness_judge" ? "judge" : "model";
+  const candidates = steps.filter((s) => {
+    if (wantType === "judge") return s?.type === "judge";
+    if (wantType === "model") return s?.type === "model" && (s?.call_type || "agent") !== "faithfulness_judge";
+    return false;
+  });
+  return candidates[callIndexInTurn] || null;
+}
+
+function debugStepsForCall(item, call) {
+  const turnIndex = conversationTurnNumber(call?.conversation_turn);
+  const steps = debugTraceForTurn(item, turnIndex);
+  const ctype = callType(call);
+  if (ctype === "faithfulness_judge") return steps.filter((s) => s?.type === "judge");
+  if (ctype === "agent" || ctype === "recovery") {
+    return steps.filter((s) => s?.type === "model" && (s?.call_type || "agent") !== "faithfulness_judge");
+  }
+  return [];
+}
+
+function debugStepForCallInGroup(item, group, call) {
+  const ctype = callType(call);
+  if (ctype === "faithfulness_judge") {
+    const judges = debugStepsForCall(item, call);
+    const index = group.calls.filter((c) => callType(c) === "faithfulness_judge").indexOf(call);
+    return judges[index] || null;
+  }
+  if (ctype === "agent" || ctype === "recovery") {
+    const models = debugStepsForCall(item, call);
+    const index = group.calls.filter((c) => ["agent", "recovery"].includes(callType(c))).indexOf(call);
+    return models[index] || null;
+  }
+  return null;
+}
+
+function debugToolsForCall(item, group, call) {
+  const modelStep = debugStepForCallInGroup(item, group, call);
+  if (!modelStep) return [];
+  const turnIndex = conversationTurnNumber(call?.conversation_turn);
+  const steps = debugTraceForTurn(item, turnIndex);
+  return steps.filter((s) => s?.type === "tool"
+    && String(s?.parent_step_id) === String(modelStep.step_id));
+}
 function attributionSummary(item) {
   const attribution = item?.attribution || {};
   const layers = attribution.layers || {};
@@ -1306,9 +1359,26 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                         <div class="call-node-body">
                           <div class="call-purpose-grid"><span><small>用途</small><b>{{ callTypeDescription(call) }}</b></span><span><small>触发</small><b>{{ callObservation(call).trigger }}</b></span><span><small>结果</small><b>{{ callObservation(call).outcome }}</b></span><span><small>记录来源</small><b>{{ callObservation(call).source }}</b></span></div>
                           <div class="call-budget-line"><span>请求预算</span><b>{{ callBudget(call) }}</b><span v-if="call.step_id">步骤 {{ call.step_id }}</span><span v-if="callObservation(call).relatedTool !== '-'">关联工具 {{ callObservation(call).relatedTool }}</span><span v-if="callObservation(call).parentStep !== '-'">父步骤 {{ callObservation(call).parentStep }}</span></div>
+                          <details v-if="debugStepForCallInGroup(itemDetail(summary), group, call)" class="debug-inline">
+                            <summary>完整输入 / 输出</summary>
+                            <div v-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'model'">
+                              <p class="muted small">完整提示词</p><pre>{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).prompt, null, 2) }}</pre>
+                              <p class="muted small">模型原始回答</p><pre>{{ debugStepForCallInGroup(itemDetail(summary), group, call).raw_full || debugStepForCallInGroup(itemDetail(summary), group, call).raw }}</pre>
+                            </div>
+                            <div v-else-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'judge'">
+                              <p class="muted small">评判结论</p><pre>{{ JSON.stringify({ faithful: debugStepForCallInGroup(itemDetail(summary), group, call).faithful, problems: debugStepForCallInGroup(itemDetail(summary), group, call).problems }, null, 2) }}</pre>
+                              <p class="muted small">评判提示词</p><pre>{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt, null, 2) }}</pre>
+                              <p class="muted small">评判原始回答</p><pre>{{ debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw }}</pre>
+                            </div>
+                          </details>
                           <div v-if="showToolBranch(call) && toolsForGroupedCall(itemDetail(summary), call).length" class="tool-tree">
                             <details v-for="(trace, toolIndex) in toolsForGroupedCall(itemDetail(summary), call)" :key="toolIndex" class="tool-node">
                               <summary><strong>{{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span class="binding-source">{{ toolBindingLabel(trace) }}</span></summary>
+                              <details v-if="debugToolsForCall(itemDetail(summary), group, call)[toolIndex]" class="debug-inline">
+                                <summary>完整工具输入 / 输出</summary>
+                                <p class="muted small">工具输入</p><pre>{{ JSON.stringify(debugToolsForCall(itemDetail(summary), group, call)[toolIndex].arguments, null, 2) }}</pre>
+                                <p class="muted small">工具输出</p><pre>{{ JSON.stringify(debugToolsForCall(itemDetail(summary), group, call)[toolIndex].observation, null, 2) }}</pre>
+                              </details>
                             </details>
                           </div>
                           <p v-else-if="showToolBranch(call)" class="qa-performance-empty">{{ noToolLabel(call) }}</p>
