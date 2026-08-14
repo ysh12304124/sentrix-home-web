@@ -1350,6 +1350,7 @@ class BenchmarkRun:
                     "conversation_id": conversation_id,
                     "context_turn_count": turn_index,
                     "message": message,
+                    "debug_trace": resp.get("debug_trace"),
                     "expected_action": (conversation[turn_index].get("expected_action")
                                         if turn_index < len(conversation) and isinstance(conversation[turn_index], dict)
                                         else row.get("expected_action")),
@@ -1485,6 +1486,7 @@ class BenchmarkRun:
                 "gt_images": gt_images,
                 "judge": judge, "task_judge": task_judge,
                 "task_judges": task_judges, "conversation": turn_records if conversation else [],
+                "runtime_turns": turn_records,
                 "conversation_id": conversation_id if conversation else None,
                 "conversation_turn_count": len(turn_records) if conversation else 1,
                 "conversation_context_mode": "shared_conversation_id" if conversation else "single_turn",
