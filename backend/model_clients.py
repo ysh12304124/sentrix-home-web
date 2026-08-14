@@ -65,6 +65,21 @@ class ModelError(RuntimeError):
     pass
 
 
+class ContextBudgetExceeded(ModelError):
+    pass
+
+
+def _http_error_detail(error, limit=2000):
+    response = getattr(error, "response", None)
+    if response is None:
+        return str(error)
+    try:
+        body = response.text.strip()
+    except Exception:
+        body = ""
+    return f"{error}: {body[:limit]}" if body else str(error)
+
+
 def parse_json_response(value):
     if isinstance(value, dict):
         return value
@@ -352,7 +367,7 @@ class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
-                 repair_model=None, backend=None, api_key=None):
+                 repair_model=None, backend=None, api_key=None, manager_url=None):
         self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
         ollama_fallback_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         if self.backend == "openai":
@@ -368,6 +383,12 @@ class GammaClient:
             self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
             self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        self.manager_url = (
+            manager_url
+            or os.getenv("SENTRIX_VLLM_MANAGER_API")
+            or os.getenv("SENTRIX_VLLM_API_URL")
+            or ""
+        ).strip().rstrip("/")
         self._call_metrics_local = threading.local()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
@@ -537,6 +558,38 @@ class GammaClient:
             return self.chat(prompt, json_mode=False, role=role)
 
         endpoint_base, model = self._endpoint_for(role)
+        requested_max_tokens = int(max_tokens) if max_tokens is not None else None
+        budget = self._tokenize_for_budget(endpoint_base, messages)
+        if budget:
+            prompt_tokens = int(budget["prompt_tokens"])
+            max_model_len = int(budget["max_model_len"])
+            available_output_tokens = max_model_len - prompt_tokens
+            if available_output_tokens < 1:
+                metrics = {
+                    "status": "context_budget_exceeded",
+                    "error": "prompt leaves no room for generation",
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": None,
+                    "requested_max_tokens": requested_max_tokens,
+                    "effective_max_tokens": 0,
+                    "available_output_tokens": max(0, available_output_tokens),
+                    "max_model_len": max_model_len,
+                    "estimated_total_tokens": prompt_tokens + (requested_max_tokens or 0),
+                    "token_count_source": "vllm_tokenize",
+                    "ttft_ms": None,
+                    "total_ms": None,
+                    "tokens_per_second": None,
+                    "streamed": False,
+                }
+                self._record_call_metrics(role, model, endpoint_base, metrics)
+                raise ContextBudgetExceeded(
+                    f"context budget exceeded: prompt_tokens={prompt_tokens}, "
+                    f"max_model_len={max_model_len}")
+            if requested_max_tokens is None:
+                max_tokens = available_output_tokens
+            else:
+                max_tokens = min(requested_max_tokens, available_output_tokens)
+
         payload = {
             "model": model,
             "messages": messages,
@@ -549,11 +602,63 @@ class GammaClient:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        request_started = time.perf_counter()
         try:
             return self._chat_openai_stream(
-                endpoint_base, payload, headers, role, model, json_mode=False)
+                endpoint_base, payload, headers, role, model, json_mode=False,
+                budget_metrics={
+                    "requested_max_tokens": requested_max_tokens,
+                    "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
+                    "available_output_tokens": (
+                        int(budget["max_model_len"]) - int(budget["prompt_tokens"])
+                        if budget else None
+                    ),
+                    "max_model_len": int(budget["max_model_len"]) if budget else None,
+                    "preflight_prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
+                    "estimated_total_tokens": (
+                        int(budget["prompt_tokens"]) + int(max_tokens)
+                        if budget and max_tokens is not None else None
+                    ),
+                    "token_count_source": "vllm_tokenize" if budget else "response_usage",
+                })
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
-            raise ModelError(f"gamma request failed: {error}") from error
+            error_detail = _http_error_detail(error)
+            self._record_call_metrics(role, model, endpoint_base, {
+                "status": "error",
+                "error": error_detail,
+                "ttft_ms": None,
+                "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
+                "prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
+                "completion_tokens": None,
+                "tokens_per_second": None,
+                "streamed": True,
+                "requested_max_tokens": requested_max_tokens,
+                "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
+                "max_model_len": int(budget["max_model_len"]) if budget else None,
+                "token_count_source": "vllm_tokenize" if budget else None,
+            })
+            raise ModelError(f"model request failed: {error_detail}") from error
+
+    def _tokenize_for_budget(self, endpoint_base, messages):
+        """Ask the Manager bound to this endpoint to tokenize with the active model."""
+        manager_url = self.manager_url
+        if not manager_url:
+            return None
+        try:
+            response = httpx.post(
+                f"{manager_url}/tokenize-current",
+                json={"messages": messages, "add_generation_prompt": True},
+                timeout=min(15, self.timeout),
+            )
+            response.raise_for_status()
+            value = response.json()
+            if int(value.get("prompt_tokens") or 0) < 1 or int(value.get("max_model_len") or 0) < 1:
+                raise ValueError("invalid tokenizer budget response")
+            return value
+        except (httpx.HTTPError, ValueError, TypeError) as error:
+            if os.getenv("SENTRIX_TOKEN_BUDGET_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}:
+                raise ModelError(f"token budget preflight failed: {error}") from error
+            return None
 
     def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
@@ -592,7 +697,7 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError) as error:
-            raise ModelError(f"gamma request failed: {error}") from error
+            raise ModelError(f"model request failed: {_http_error_detail(error)}") from error
 
 
     def _record_call_metrics(self, role, model, endpoint, metrics):
@@ -639,6 +744,7 @@ class GammaClient:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        request_started = time.perf_counter()
         try:
             if use_stream:
                 return self._chat_openai_stream(endpoint_base, payload, headers, role, model, json_mode)
@@ -658,9 +764,21 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
-            raise ModelError(f"gamma request failed: {error}") from error
+            error_detail = _http_error_detail(error)
+            self._record_call_metrics(role, model, endpoint_base, {
+                "status": "error",
+                "error": error_detail,
+                "ttft_ms": None,
+                "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "tokens_per_second": None,
+                "streamed": use_stream,
+            })
+            raise ModelError(f"model request failed: {error_detail}") from error
 
-    def _chat_openai_stream(self, endpoint_base, payload, headers, role, model, json_mode=False):
+    def _chat_openai_stream(self, endpoint_base, payload, headers, role, model, json_mode=False,
+                            budget_metrics=None):
         """Streaming variant: buffer chunks, capture TTFT/tokens/throughput."""
         t0 = time.perf_counter()
         first_token_t = None
@@ -707,6 +825,7 @@ class GammaClient:
             "ttft_ms": ttft_ms, "total_ms": total_ms,
             "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "tokens_per_second": tps, "streamed": True,
+            **(budget_metrics or {}),
         })
         self._record_validation_call(role, endpoint_base, model, json_mode, text)
         return text
@@ -740,7 +859,7 @@ class GammaClient:
             "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "320")),
         }
 
-    def _encode_core_image(self, path):
+    def encode_vision_image(self, path):
         """Downsample only the model input; the source asset remains untouched."""
         file_path = Path(path)
         max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "896"))
@@ -759,6 +878,9 @@ class GammaClient:
             encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
             mime_type = guess_mime_type(file_path)
             return encoded, mime_type
+
+    def _encode_core_image(self, path):
+        return self.encode_vision_image(path)
 
     def analyze_image(self, path, metadata=None):
         file_path = Path(path)

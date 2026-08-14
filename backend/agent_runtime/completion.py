@@ -28,7 +28,6 @@ _RETRIEVAL_TOOLS = {
     "get_core_memory", "get_person_memory",
 }
 
-
 @dataclass
 class Requirement:
     code: str

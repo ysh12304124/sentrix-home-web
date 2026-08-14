@@ -751,12 +751,17 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     gamma = _RUNTIME.get("gamma")
     if gamma is None:
         return {"summary": "模型不可用。", "certainty": "uncertain", "persisted": False}
+    model_call_metrics = []
     try:
-        image = {"base64": _base64_image(row["path"]), "mime_type": _mime_for(row["path"])}
+        encoded, mime_type = gamma.encode_vision_image(row["path"])
+        image = {"base64": encoded, "mime_type": mime_type}
         raw = gamma.chat(_INSPECT_PROMPT.format(question=question), images=[image],
                          json_mode=True, role="inspect")
     except Exception as exc:
-        return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False}
+        model_call_metrics = gamma.get_and_clear_call_metrics()
+        return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False,
+                "_model_call_metrics": model_call_metrics}
+    model_call_metrics = gamma.get_and_clear_call_metrics()
     try:
         start, end = raw.find("{"), raw.rfind("}")
         parsed = json.loads(raw[start:end + 1]) if start >= 0 else {}
@@ -770,6 +775,7 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         "confirms_visual_only": True,
         "source": "runtime_visual_inspection",
         "persisted": False,
+        "_model_call_metrics": model_call_metrics,
     }
 # ---- Tool 5: search_conversation_history（D4）----
 def _search_conversation_history(arguments: dict, *, context: dict | None = None) -> dict:

@@ -97,8 +97,10 @@ def parse_verdict(raw: str) -> dict | None:
 
 
 def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
-                       trusted_facts: list[str] | None = None) -> tuple[bool, GuardResult]:
+                       trusted_facts: list[str] | None = None,
+                       step_id: str | None = None) -> tuple[bool, GuardResult]:
     """返回 (faithful, issues)。任何异常/输出不可解析都降级为放行（L1 已兜底结构性问题）。"""
+
     try:
         obs_lines = []
         for tr in tool_results or []:
@@ -121,10 +123,17 @@ def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
             f"可信事实（回答必须与之一致）：\n{facts_block}\n"
             f"模型最终回答：{answer}"
         )
-        raw = chat_fn([
+        messages = [
             {"role": "system", "content": JUDGE_SYSTEM},
             {"role": "user", "content": user},
-        ])
+        ]
+        try:
+            raw = chat_fn(messages, call_type="faithfulness_judge",
+                          step_id=step_id or "faithfulness_judge")
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            raw = chat_fn(messages)
         verdict = parse_verdict(raw)
         if not verdict or "faithful" not in verdict:
             return True, GuardResult([])

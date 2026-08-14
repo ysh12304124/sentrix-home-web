@@ -48,7 +48,8 @@ def chat_only(message: str) -> bool:
 
 
 def evidence_intent(message: str) -> bool:
-    return bool(_EVIDENCE_INTENT_RE.search(message or ""))
+    text = message or ""
+    return not chat_only(text) and bool(_EVIDENCE_INTENT_RE.search(text))
 
 
 def visual_intent(message: str) -> bool:
