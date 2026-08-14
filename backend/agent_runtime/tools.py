@@ -328,9 +328,26 @@ def _query_media_list(filters: dict, *, scope_id="home-default", viewer_id="owne
                 })
         items.append(item)
     limited = items[:80]
+    summary_items = []
+    for item in limited:
+        if item.get("media_kind") == "video":
+            duration = item.get("duration_sec")
+            summary_items.append(
+                f"{item.get('file_name') or '未命名视频'}（时长 {duration if duration is not None else '未知'} 秒，"
+                f"{item.get('scene_count') or 0} 个场景）"
+            )
+        elif item.get("media_kind") == "video_keyframe":
+            source = item.get("source_video_file_name") or "未知视频"
+            ts = item.get("source_timestamp_sec")
+            summary_items.append(
+                f"关键帧 {item.get('file_name') or '未命名关键帧'}（来自 {source} 第 {ts if ts is not None else '未知'} 秒）"
+            )
+        else:
+            summary_items.append(item.get("file_name") or "未命名媒体")
     return {
         "operation": "list",
         "answer_type": "media_list",
+        "summary": "；".join(summary_items[:20]),
         "value": len(limited),
         "total": len(items),
         "items": limited,
