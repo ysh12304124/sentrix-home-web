@@ -64,7 +64,7 @@ class ToolPolicy:
             "operation", "answer_type", "value", "rows", "filters_applied",
             "scanned_observations", "total_meal_observations", "event_count",
             "explicit_foods", "explicit_food_events", "meal_scene_events",
-            "possible_events", "time_range", "rows_truncated", "samples",
+            "possible_events", "time_range", "rows_truncated", "samples", "items",
         },
         "search_memories": _DEFAULT_ALLOWED | {
             "query", "mode", "gaps", "query_satisfaction", "answerability",
