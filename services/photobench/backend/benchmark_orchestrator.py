@@ -2589,6 +2589,35 @@ class OrchestratorRepository:
             result["summary"] = self._effective_summary(state)
             return result
 
+    def export_sft(self, run_id: str) -> dict:
+        """导出全部轨迹（每步模型调用的 prompt -> response）用于轨迹训练。"""
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = run.state if isinstance(run, BenchmarkRun) else run
+            samples = []
+            for item in (state.get("items") or []):
+                qa_id = item.get("qa_id")
+                turns = item.get("runtime_turns") or []
+                for turn in turns:
+                    for step in (turn.get("debug_trace") or []):
+                        if not isinstance(step, dict) or step.get("type") != "model":
+                            continue
+                        prompt = step.get("prompt")
+                        response = step.get("raw_full") or step.get("raw")
+                        if not prompt or not isinstance(response, str) or not response.strip():
+                            continue
+                        messages = list(prompt) if isinstance(prompt, list) else []
+                        messages.append({"role": "assistant", "content": response})
+                        samples.append({
+                            "qa_id": qa_id,
+                            "turn": turn.get("index"),
+                            "step": step.get("status", "complete"),
+                            "messages": messages,
+                        })
+            return {"run_id": run_id, "count": len(samples), "samples": samples}
+
     def get_run_items(self, run_id: str, page: int = 1, page_size: int = 20,
                       search: str = "", score: str = "", task_type: str = "",
                       agent_status: str = "", angle: str = "", difficulty: str = "",
@@ -3449,6 +3478,17 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     answerability=(query.get("answerability") or [""])[0],
                     primary=(query.get("primary") or [""])[0],
                 ))
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))
+                payload = self.repo.export_sft(run_id)
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{run_id}-sft-traces.json"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/judge-prompt"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/judge-prompt"))
