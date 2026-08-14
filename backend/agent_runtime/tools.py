@@ -395,15 +395,22 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
     for i, idx in enumerate(indices):
         a = assets[idx]
         place = ""
+        media_kind = "original_image"
         source_video_asset_id = None
         source_timestamp_sec = None
+        source_scene_index = None
+        source_video_file_name = None
         if store is not None:
             try:
                 asset = store.get_asset(a.get("id")) or {}
                 place = _short_place_label(asset)
                 if asset.get("derived_kind") == "video_keyframe":
+                    media_kind = "video_keyframe"
                     source_video_asset_id = asset.get("parent_asset_id")
                     source_timestamp_sec = asset.get("source_timestamp_sec")
+                    source_scene_index = asset.get("source_scene_index")
+                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+                    source_video_file_name = (source_video or {}).get("file_name")
             except Exception:
                 place = ""
         preview.append({
@@ -411,8 +418,11 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
             "captured_at": a.get("captured_at"),
             "level": "exact",
             "place": place,
+            "media_kind": media_kind,
             "source_video_asset_id": source_video_asset_id,
             "source_timestamp_sec": source_timestamp_sec,
+            "source_scene_index": source_scene_index,
+            "source_video_file_name": source_video_file_name,
             "condition_summary": {},
         })
     total = len(assets)
@@ -491,15 +501,22 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     for i, item in enumerate(assets[:6]):
         handle = f"photo_{i + 1}"
         place = ""
+        media_kind = "original_image"
         source_video_asset_id = None
         source_timestamp_sec = None
+        source_scene_index = None
+        source_video_file_name = None
         if store is not None:
             try:
                 asset = store.get_asset(item.get("asset_id")) or {}
                 place = _short_place_label(asset)
                 if asset.get("derived_kind") == "video_keyframe":
+                    media_kind = "video_keyframe"
                     source_video_asset_id = asset.get("parent_asset_id")
                     source_timestamp_sec = asset.get("source_timestamp_sec")
+                    source_scene_index = asset.get("source_scene_index")
+                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+                    source_video_file_name = (source_video or {}).get("file_name")
             except Exception:
                 place = ""
         preview.append({
@@ -507,8 +524,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "captured_at": item.get("captured_at"),
             "level": item.get("level"),
             "place": place,
+            "media_kind": media_kind,
             "source_video_asset_id": source_video_asset_id,
             "source_timestamp_sec": source_timestamp_sec,
+            "source_scene_index": source_scene_index,
+            "source_video_file_name": source_video_file_name,
             "condition_summary": _condition_summary(item),
         })
     _RUNTIME["last_handles"] = handles
@@ -653,6 +673,22 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     if handle and not asset_id:
         return {"summary": "无法解析选中的照片。", "delivered": 0, "blocked": ["bad_handle"]}
     target = handle if asset_id else (rs.asset_ids[0] if rs.asset_ids else None)
+    store = _RUNTIME.get("store")
+    target_asset = store.get_asset(asset_id or target) if store and (asset_id or target) else None
+    if target_asset and target_asset.get("derived_kind") == "video_keyframe" and target_asset.get("parent_asset_id"):
+        source_video_id = target_asset["parent_asset_id"]
+        return {
+            "summary": "已从结果集授权原始视频交付，来源是关键帧对应的时间点。",
+            "result_set_id": result_set_id,
+            "handle": handle or "first",
+            "delivered": 1,
+            "total": rs.total,
+            "scope_id": rs.scope_id,
+            "url": f"/api/assets/{source_video_id}/file",
+            "media_type": "video",
+            "source_video_asset_id": source_video_id,
+            "source_timestamp_sec": target_asset.get("source_timestamp_sec"),
+        }
     url = ""
     if target:
         url = (f"/api/assistant/result-set/{result_set_id}/photo?handle={target}"

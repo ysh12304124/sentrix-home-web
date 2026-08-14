@@ -4046,8 +4046,10 @@ class MemoryStore:
         asset = self.get_asset(asset_id) or {}
         scope_id = asset.get("scope_id") or "home-default"
         embedding = self._normalise_vector(face.get("embedding"))
-        if not embedding or face.get("identity_ready") is False:
-            return None
+        identity_ready = face.get("identity_ready", True) is not False
+        identity_eligible = face.get("identity_eligible", identity_ready)
+        if not embedding:
+            identity_eligible = False
         pose = [float(value) for value in (face.get("pose") or [])]
         pose_bucket_value = face.get("pose_bucket")
         quality = face.get("quality")
@@ -4066,7 +4068,7 @@ class MemoryStore:
                 pose_bucket_value = pose_bucket(pose)
         embedding_model = str(face.get("embedding_model") or model_name or "unknown")
         embedding_version = str(face.get("embedding_version") or "legacy")
-        identity_eligible = face.get("identity_eligible", True) is not False
+        identity_eligible = bool(identity_eligible)
         if not identity_eligible:
             instance_id = make_id("face")
             self.connection.execute(

@@ -271,7 +271,9 @@
       ? (evidence.asset_id
         ? `<button class="evidence-media" data-action="open-asset" data-asset-id="${escapeHtml(evidence.asset_id)}" aria-label="打开原始证据">${assetThumb({ id: evidence.asset_id, media_type: evidence.media_type || "image" }, true)}</button>`
         : evidence.media_url
-          ? `<a class="evidence-media" href="${escapeHtml(evidence.media_url)}" target="_blank" rel="noopener" aria-label="打开原始证据"><img src="${escapeHtml(evidence.media_url)}" alt="原始证据" loading="lazy" /></a>`
+          ? evidence.media_type === "video"
+            ? `<video class="evidence-media" src="${escapeHtml(evidence.media_url)}" controls preload="metadata"></video>`
+            : `<a class="evidence-media" href="${escapeHtml(evidence.media_url)}" target="_blank" rel="noopener" aria-label="打开原始证据"><img src="${escapeHtml(evidence.media_url)}" alt="原始证据" loading="lazy" /></a>`
           : "")
       : "";
     const assetAction = evidence.kind === "asset" && evidence.id ? `data-action="open-asset" data-asset-id="${escapeHtml(evidence.id)}"` : "";
@@ -480,12 +482,26 @@
             id: p.handle,
             asset_id: "",
             media_url: resultSetId ? window.sentrixApi.resultSetPhoto(resultSetId, p.handle, state.scopeId) : "",
+            media_kind: p.media_kind || "original_image",
             source_video_asset_id: p.source_video_asset_id || null,
             source_timestamp_sec: p.source_timestamp_sec,
             caption: p.place || "",
             captured_at: p.captured_at,
           });
         }
+      }
+      if (tr.tool === "get_original_photos" && observation.media_type === "video" && observation.url) {
+        samples.push({
+          kind: "observation",
+          id: observation.url,
+          asset_id: "",
+          media_url: observation.url,
+          media_type: "video",
+          media_kind: "source_video",
+          source_video_asset_id: observation.source_video_asset_id || null,
+          source_timestamp_sec: observation.source_timestamp_sec,
+          caption: observation.summary || "",
+        });
       }
     }
     const seen = new Set();
