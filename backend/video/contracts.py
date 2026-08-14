@@ -94,7 +94,10 @@ class WorldMMResult:
                     summary = [item for item in payload if isinstance(item, dict)]
             except (OSError, json.JSONDecodeError):
                 summary = []
-        summary_codes = [str(item.get("keyframe_code")) for item in summary if item.get("keyframe_code") in frame_by_code]
+        summary_codes = [
+            str(item.get("keyframe_code")) for item in summary
+            if str(item.get("keyframe_code")) in frame_by_code
+        ]
         candidate_codes = summary_codes or list(frame_by_code)
         try:
             max_keyframes = int(os.getenv("SENTRIX_VIDEO_MAX_KEYFRAMES", "160"))
@@ -112,6 +115,8 @@ class WorldMMResult:
                 for item in summary
             }
             for raw_scene in scenes_payload:
+                if not isinstance(raw_scene, dict):
+                    continue
                 scene_codes = [str(code) for code in (raw_scene.get("keyframe_codes") or []) if str(code) in candidate_codes]
                 if scene_codes:
                     scene_picks.append(max(scene_codes, key=lambda code: score_by_code.get(code, 0.0)))
