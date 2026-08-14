@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep runtime imports reproducible. User-site packages previously injected an
-# incompatible Transformers build into the AdaFace/PyTorch dependency graph.
-export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+# AdaFace checkpoint unpickling needs the user-site transformers package in this
+# runtime.  The incompatible torch<->transformers symbol is now handled inside
+# AdaFaceAdapter._load_model, so hiding user-site packages is no longer needed.
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-0}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ -f "$root/.env" ]]; then
