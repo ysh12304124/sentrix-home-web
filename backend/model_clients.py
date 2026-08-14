@@ -1223,6 +1223,9 @@ class FaceAdapter:
         self.identity_adapter = self._build_identity_adapter()
         self.identity_error = None
         self.identity_runtime_error = None
+        self.identity_fallback = False
+        self.identity_fallback_model = None
+        self.identity_fallback_error = None
         if self.identity_model not in {"none", "legacy", "adaface", "magface"}:
             self.identity_error = f"unsupported face embedding mode: {self.identity_model}"
         elif self.identity_model in {"adaface", "magface"} and not self.identity_adapter.available:
@@ -1244,6 +1247,10 @@ class FaceAdapter:
 
     @property
     def identity_ready(self):
+        if self.identity_model == "none":
+            return False
+        if self.identity_fallback:
+            return True
         return self.identity_configured and self.identity_runtime_error is None
 
     @property
@@ -1280,9 +1287,10 @@ class FaceAdapter:
                         providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
                         kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
                         if self.identity_model in {"adaface", "magface"}:
-                            # AdaFace/MagFace produce the only identity vector. Avoid
-                            # loading buffalo_l recognition and demographic models.
-                            kwargs["allowed_modules"] = ["detection", "landmark_2d_106"]
+                            # AdaFace/MagFace are preferred for identity, but
+                            # buffalo_l recognition is kept as a fallback when
+                            # the preferred identity adapter cannot load or run.
+                            kwargs["allowed_modules"] = ["detection", "landmark_2d_106", "recognition"]
                         if os.getenv("FACE_MODEL_ROOT"):
                             kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
                         self._app = FaceAnalysis(**kwargs)
@@ -1333,10 +1341,8 @@ class FaceAdapter:
                     result["embedding_model"] = self.identity_model
                     result["embedding_version"] = self.identity_adapter.model_version
                     result["identity_ready"] = self.identity_configured
-                    if not self.identity_configured:
-                        result["embedding"] = []
-                        result["identity_error"] = self.identity_error
-                    else:
+                    identity_error = None
+                    if self.identity_configured:
                         try:
                             crop = align_face_crop(image, bbox, result["landmarks"])
                             embedded = self.identity_adapter.embed(crop)
@@ -1348,11 +1354,16 @@ class FaceAdapter:
                             result["identity_eligible"] = result["quality"] >= float(
                                 os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55")
                             )
+                            self.identity_runtime_error = None
+                            self.identity_fallback = False
+                            self.identity_fallback_model = None
+                            self.identity_fallback_error = None
                         except FaceEmbeddingUnavailable as error:
-                            result["embedding"] = []
-                            result["identity_ready"] = False
-                            result["identity_error"] = str(error)
-                            self.identity_runtime_error = str(error)
+                            identity_error = str(error)
+                    else:
+                        identity_error = self.identity_error
+                    if identity_error:
+                        self._apply_identity_fallback(result, identity_error)
                 elif self.identity_model == "legacy":
                     result["embedding_model"] = "buffalo_l"
                     result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
@@ -1361,3 +1372,26 @@ class FaceAdapter:
         except Exception as error:  # Optional model should not block image memory.
             self.error = str(error)
             return []
+
+    def _apply_identity_fallback(self, result, error):
+        """Use InsightFace's loaded buffalo_l vector when the preferred adapter fails."""
+        fallback_embedding = result.get("embedding") or []
+        if not fallback_embedding:
+            result["embedding"] = []
+            result["identity_ready"] = False
+            result["identity_error"] = str(error)
+            self.identity_runtime_error = str(error)
+            return False
+        result["embedding"] = fallback_embedding
+        result["embedding_model"] = "buffalo_l"
+        result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
+        result["identity_ready"] = True
+        result["identity_fallback"] = True
+        result["identity_fallback_model"] = "buffalo_l"
+        result["identity_fallback_error"] = str(error)
+        result["identity_error"] = str(error)
+        self.identity_fallback = True
+        self.identity_fallback_model = "buffalo_l"
+        self.identity_fallback_error = str(error)
+        self.identity_runtime_error = str(error)
+        return True
