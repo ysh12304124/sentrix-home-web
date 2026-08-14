@@ -565,6 +565,11 @@ function itemToolTrace(item) {
     : [];
 }
 function itemDetail(summary) { return qaDetails[summary?.index] || null; }
+
+function runtimeDebugTurns(item) {
+  const turns = item?.runtime_turns || [];
+  return Array.isArray(turns) ? turns.filter((turn) => turn && Array.isArray(turn.debug_trace)) : [];
+}
 function attributionSummary(item) {
   const attribution = item?.attribution || {};
   const layers = attribution.layers || {};
@@ -821,6 +826,11 @@ async function changeQaPageSize() { await loadQaPage(1); }
 async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
 async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
 function resetJudgePrompt() { rejudgePrompt.value = config.value?.judge_prompt || ""; }
+
+function exportSftTraces() {
+  if (!activeRunId.value) return;
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft`, "_blank");
+}
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
   if (!prompt) { window.alert("提示词不能为空"); return; }
@@ -1024,6 +1034,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
       <div class="section-head">
 <h2>{{ modelName(activeRun) }} · {{ albumName(activeRun) }} · {{ qaName(activeRun) }}</h2>
 <span class="phase-status" :class="activeRun.status">{{ statusLabel(activeRun.status) }}</span>
+<button class="btn compact" @click="exportSftTraces">导出全部轨迹(SFT json)</button>
 </div>
       <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}</p>
       <section class="rejudge-card">
@@ -1318,6 +1329,32 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                 </details>
                 <details v-if="guardSummary(itemDetail(summary)).recorded" class="call-node guard-node final-agent-status"><summary><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong><span>{{ completionLabel(itemDetail(summary)) }}</span></summary><div class="guard-grid"><span>运行状态 <b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span>终止原因 <b>{{ guardSummary(itemDetail(summary)).termination || "正常完成" }}</b></span><span>恢复次数 <b>{{ guardSummary(itemDetail(summary)).recoveries }}</b></span><span>运行详情 <b>{{ itemDetail(summary).agent_reason || "-" }}</b></span></div></details>
               </section>
+              <details v-if="runtimeDebugTurns(itemDetail(summary)).length" class="call-node debug-trace-node">
+                <summary><strong>完整运行时轨迹（提示词 / 回答 / 工具输入输出 / 评判）</strong><span>{{ runtimeDebugTurns(itemDetail(summary)).length }} 轮</span></summary>
+                <div class="debug-trace-body">
+                  <details v-for="(turn, turnIndex) in runtimeDebugTurns(itemDetail(summary))" :key="turnIndex" class="debug-turn">
+                    <summary>第 {{ turn.index + 1 }} 轮 · {{ turn.message || "问答" }}</summary>
+                    <div class="debug-steps">
+                      <details v-for="(step, stepIndex) in turn.debug_trace" :key="stepIndex" class="debug-step" :class="'debug-step-' + (step.type || 'step')">
+                        <summary><strong>{{ step.type === 'model' ? '模型步骤' : step.type === 'tool' ? '工具步骤' : step.type === 'judge' ? '评判步骤' : step.type }}</strong><span>{{ step.status || '' }}</span></summary>
+                        <div v-if="step.type === 'model'">
+                          <p class="muted small">提示词</p><pre>{{ JSON.stringify(step.prompt, null, 2) }}</pre>
+                          <p class="muted small">模型回答</p><pre>{{ step.raw_full || step.raw }}</pre>
+                        </div>
+                        <div v-else-if="step.type === 'tool'">
+                          <p class="muted small">工具输入</p><pre>{{ JSON.stringify(step.arguments, null, 2) }}</pre>
+                          <p class="muted small">工具输出</p><pre>{{ JSON.stringify(step.observation, null, 2) }}</pre>
+                        </div>
+                        <div v-else-if="step.type === 'judge'">
+                          <p class="muted small">评判结论</p><pre>{{ JSON.stringify({ faithful: step.faithful, problems: step.problems }, null, 2) }}</pre>
+                          <div v-if="step.debug"><p class="muted small">评判提示词</p><pre>{{ JSON.stringify(step.debug.prompt, null, 2) }}</pre><p class="muted small">评判回答</p><pre>{{ step.debug.raw }}</pre></div>
+                        </div>
+                        <div v-else><pre>{{ JSON.stringify(step, null, 2) }}</pre></div>
+                      </details>
+                    </div>
+                  </details>
+                </div>
+              </details>
               <div class="item-footer"><button class="judge-details-trigger" type="button" @click="openJudgeInput(itemDetail(summary))">JUDGE 模型输入 <span>↗</span></button></div>
               <div class="review-editor"><label>人工复核<select v-model="reviewFor(summary).verdict"><option value="">未复核</option><option value="correct">正确</option><option value="partial">部分正确</option><option value="wrong">错误</option></select></label><input v-model="reviewFor(summary).note" placeholder="复核备注（可选）" /></div>
             </template>
