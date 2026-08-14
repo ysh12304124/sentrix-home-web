@@ -60,7 +60,7 @@ def _model_visible_observation(observation: dict | None) -> dict:
     """Keep tool evidence for planning while excluding telemetry from LLM context."""
     if not isinstance(observation, dict):
         return {}
-    hidden = {"retrieval_timing", "debug", "telemetry", "trace", "_model_call_metrics"}
+    hidden = {"retrieval_timing", "debug", "telemetry", "trace"}
     compact = {key: value for key, value in observation.items() if key not in hidden}
     preview = compact.get("preview")
     if isinstance(preview, list):
@@ -74,21 +74,6 @@ def _model_visible_observation(observation: dict | None) -> dict:
 def _model_visible_action(action: dict) -> str:
     """Feed the parsed action back without model reasoning or prose."""
     return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
-
-
-def _merge_system_constraint(messages: list[dict], constraint: str) -> None:
-    """Keep all system instructions at the beginning for strict chat templates."""
-    if not constraint:
-        return
-    if not messages or messages[0].get("role") != "system":
-        raise ValueError("agent messages must start with a system message")
-    first = messages[0]
-    existing = str(first.get("content") or "").rstrip()
-    messages[0] = {
-        **first,
-        "content": f"{existing}\n\n{constraint}" if existing else constraint,
-    }
-
 
 SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协作完成用户请求。
 
@@ -338,6 +323,32 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     }
 
 
+def _capability_note(tool_name: str) -> str:
+    """Phase F F8：从 tool_capability_matrix 读取 capability 级 readiness，注入 Agent 提示。
+
+    只输出关键结论（ready 高置信 / limited 提示），避免上下文膨胀。
+    """
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        matrix_path = _Path(__file__).resolve().parent.parent.parent / "configs" / "tool_capability_matrix.json"
+        if not matrix_path.is_file():
+            return ""
+        matrix = _json.loads(matrix_path.read_text(encoding="utf-8"))
+        caps = matrix.get(tool_name) or {}
+        notes = []
+        for key, info in (caps or {}).items():
+            status = str(info.get("status") or "")
+            acc = info.get("accuracy")
+            if status == "ready" or status.startswith("ready"):
+                notes.append(f"{key}=ready" + (f"({acc:.2f})" if isinstance(acc, (int, float)) else ""))
+            elif status == "limited":
+                notes.append(f"{key}=limited")
+        return "；".join(notes)
+    except Exception:
+        return ""
+
+
 class AgentRuntime:
     """Thin tool-loop runtime. 模型调用通过传入的 chat_fn 注入。"""
 
@@ -351,17 +362,7 @@ class AgentRuntime:
         self.conversation_id = conversation_id
         self.ocr_settings = ocr_settings or {}
 
-    def _chat(self, messages, *, call_type: str, step_id: str):
-        """Pass observation metadata when supported by the injected client."""
-        try:
-            return self.chat_fn(messages, call_type=call_type, step_id=step_id)
-        except TypeError as exc:
-            if "unexpected keyword argument" not in str(exc):
-                raise
-            return self.chat_fn(messages)
-
     def _tool_descriptions(self) -> str:
-        from .capability import tool_capability_summary
         lines = []
         from .tool_registry import list_tools
         allowed = set(self.profile.tools) if self.profile.tools else None
@@ -370,11 +371,38 @@ class AgentRuntime:
                 continue
             if allowed is not None and spec.name not in allowed:
                 continue
-            capability = tool_capability_summary(spec.name)
+            capability = _capability_note(spec.name)
             lines.append(f"- {spec.name}: {spec.description}"
                          f"{(' 能力=' + capability) if capability else ''}"
                          f" 输入schema={json.dumps(spec.input_schema, ensure_ascii=False)}")
         return "\n".join(lines) or "(无工具)"
+
+
+    def _force_final_once(self, turn, messages: list) -> str | None:
+        """额外一次纯 final：让模型明确给出结论（哪怕"没有答案"），失败返回 None。
+
+        不计入 model_steps（用于预算耗尽后的收尾），但仍受墙钟 final reserve 限制。
+        """
+        if not turn.budget.has_final_reserve():
+            return None
+        try:
+            from .final_writer import naturalize_answer
+            final_messages = list(messages)
+            final_messages.append({"role": "user", "content": (
+                "你现在必须给出一个明确的最终回答，不允许再调用工具。"
+                "如果根据已有工具结果足以回答，就直接回答；如果不足以回答，"
+                "就明确说“现有记录不足以确认”并给出你能确认的部分。"
+                '只输出 {"action":"final","answer":"<结论>","evidence_refs":[]}。'
+            )})
+            raw = self.chat_fn(final_messages)
+            parsed = self._parse_action(raw)
+            if parsed and parsed.get("action") == "final" and (parsed.get("answer") or "").strip():
+                turn.steps.append({"type": "model", "raw": (raw or "")[:500],
+                                   "forced_final": True})
+                return naturalize_answer(parsed["answer"])
+        except Exception:
+            pass
+        return None
 
 
     def _parse_action(self, text: str) -> dict | None:
@@ -527,10 +555,7 @@ class AgentRuntime:
         max_completion_retries = 1
         unknown_tool_retries = 0
         max_unknown_tool_retries = 1
-        model_call_seq = 0
-        last_model_step_id = None
-        next_call_type = "agent"
-        next_call_trigger = "用户问题"
+        forced_final_attempted = False
         wants_visual = visual_intent(message)
         # Phase E：Adaptive Visual Budget——按问题类型放宽视觉复核预算
         wants_multi = multi_image_intent(message)
@@ -564,6 +589,17 @@ class AgentRuntime:
                             break
                     except Exception:
                         pass
+                # Phase H H8：兜底改模型输出——预算耗尽时允许额外一次纯 final（不计入步数，
+                # 只受墙钟限制），让"没有答案"也由模型明确说出，而不是代码拼文案。
+                if not forced_final_attempted:
+                    forced_final_attempted = True
+                    forced = self._force_final_once(turn, messages)
+                    if forced:
+                        turn.final_answer = forced
+                        turn.status = "complete"
+                        turn.reason = ""
+                        turn.termination_reason = "forced_final_at_step_limit"
+                        break
                 turn.status = "partial" if turn.steps else "timeout"
                 turn.reason = "model step budget exhausted"
                 if task.tool_results:
@@ -577,30 +613,13 @@ class AgentRuntime:
                     nuc = build_nucleus(task.as_dict(), message)
                     ctext = nuc.constraint_text()
                     if ctext:
-                        _merge_system_constraint(messages, ctext)
+                        messages.append({"role": "system", "content": ctext})
                     turn.nucleus_injected = True
                 except Exception:
                     turn.nucleus_injected = True
-            model_call_seq += 1
-            model_step_id = f"model_call_{model_call_seq}"
-            call_type = next_call_type
-            next_call_type = "agent"
-            call_trigger = next_call_trigger
-            next_call_trigger = "继续处理当前问题"
             try:
-                raw = self._chat(messages, call_type=call_type, step_id=model_step_id)
+                raw = self.chat_fn(messages)
             except Exception as exc:
-                error_text = str(exc)
-                outcome = "context_blocked" if any(
-                    marker in error_text.lower()
-                    for marker in ("context", "token budget", "maximum context", "preflight")
-                ) else "model_error"
-                turn.steps.append({"type": "model", "status": "error",
-                                   "reason": error_text, "step_id": model_step_id,
-                                   "call_type": call_type, "trigger": call_trigger,
-                                   "turn_outcome": outcome,
-                                   "parse_status": "not_applicable",
-                                   "next_step": "stop"})
                 # D12：恢复/后续模型调用失败时，不丢弃已产出的 final 回答
                 if turn.final_answer:
                     turn.status = "partial"
@@ -609,30 +628,9 @@ class AgentRuntime:
                 turn.status = "error"
                 turn.reason = f"model_call_error: {exc}"
                 break
-            model_step = {"type": "model", "raw": (raw or "")[:500],
-                          "step_id": model_step_id, "call_type": call_type,
-                          "trigger": call_trigger,
-                          "turn_outcome": None,
-                          "parse_status": "failed",
-                          "next_step": "recovery"}
-            turn.steps.append(model_step)
-            last_model_step_id = model_step_id
+            turn.steps.append({"type": "model", "raw": (raw or "")[:500]})
             action = self._parse_action(raw)
-            if action is not None:
-                model_step["parse_status"] = "success"
-                model_step["action"] = action.get("action")
-                if action.get("action") == "tool_call":
-                    model_step["turn_outcome"] = "tool_call"
-                    model_step["next_step"] = action.get("tool") or "tool"
-                    model_step["tool"] = action.get("tool") or ""
-                    model_step["arguments"] = action.get("arguments") or {}
-                elif action.get("action") == "final":
-                    model_step["turn_outcome"] = "final_answer"
-                    model_step["next_step"] = "final_answer"
-                    model_step["answer_preview"] = str(action.get("answer") or "")[:300]
             if action is None:
-                model_step["turn_outcome"] = "parse_failure"
-                model_step["parse_status"] = "failed"
                 if parse_retries < max_parse_retries and turn.budget.can_model_step():
                     parse_retries += 1
                     messages.append({"role": "assistant", "content": raw})
@@ -665,13 +663,17 @@ class AgentRuntime:
                             "请严格只输出一个 JSON 对象（action 只能是 tool_call 或 final），"
                             "不要 markdown、不要多余文字、不要省略结尾的引号或括号。"
                         )})
-                    next_call_type = "recovery"
-                    next_call_trigger = "模型输出无法解析，要求重新输出合法 JSON"
                     continue
                 turn.status = "error"
                 turn.reason = "unparseable_action"
                 turn.termination_reason = "parse_failure"
-                if task.tool_results:
+                forced = self._force_final_once(turn, messages)
+                if forced:
+                    turn.final_answer = forced
+                    turn.status = "complete"
+                    turn.reason = ""
+                    turn.termination_reason = "forced_final_after_parse_failure"
+                elif task.tool_results:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
             if action.get("action") == "final":
@@ -684,8 +686,6 @@ class AgentRuntime:
                         preview = (task.result_preview or []) or []
                         if auto_spec is not None and preview and turn.budget.can_tool_call():
                             tool_name = resolution["tool"]
-                            tool_call_seq += 1
-                            tool_call_id = f"tool_call_{tool_call_seq}"
                             auto_args = {"asset_handle": preview[0]}
                             if tool_name == "read_photo_text":
                                 auto_args["question"] = message
@@ -693,30 +693,16 @@ class AgentRuntime:
                                 turn, progress_callback, stage="inspecting", status="running",
                                 text=f"正在复核照片 {preview[0]}…" if tool_name == "inspect_photo"
                                 else "正在读取照片中的文字…")
-                            auto_t0 = time.monotonic()
                             auto_decision = policy.execute(auto_spec, auto_args, context={
                                 "scope_id": self.scope_id, "viewer_id": self.viewer_id,
                                 "task_state": task.as_dict(), "history": history,
                                 "conversation_id": self.conversation_id,
                                 "ocr_settings": self.ocr_settings,
                             })
-                            auto_latency = round(time.monotonic() - auto_t0, 2)
-                            auto_observation = dict(auto_decision.observation or {})
-                            auto_internal_metrics = auto_observation.pop("_model_call_metrics", [])
-                            turn.steps.append({
-                                "type": "tool", "tool": tool_name, "arguments": auto_args,
-                                "status": "ok" if auto_decision.allowed else "denied",
-                                "observation": auto_observation,
-                                "error": auto_decision.error, "latency_s": auto_latency,
-                                "step_id": tool_call_id,
-                                "parent_step_id": last_model_step_id,
-                                "call_type": "automatic_recovery",
-                                "internal_model_call_metrics": auto_internal_metrics,
-                            })
                             if auto_decision.allowed:
-                                task.update_from_tool(tool_name, auto_args, auto_observation)
-                                task.record_tool_result(tool_call_id, tool_name,
-                                                        auto_observation)
+                                task.update_from_tool(tool_name, auto_args, auto_decision.observation or {})
+                                task.record_tool_result(f"auto_{tool_name}", tool_name,
+                                                        auto_decision.observation or {})
                                 # Phase H H-A：自动解析后若已是确定性问题（价格/年份/数量/日期），
                                 # 直接用 Nucleus 渲染，不再消耗模型步骤（12B 常因步骤耗尽无法收尾）。
                                 try:
@@ -734,13 +720,11 @@ class AgentRuntime:
                                 except Exception:
                                     pass
                                 messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                                messages.append({"role": "tool", "tool_call_id": tool_call_id,
+                                messages.append({"role": "tool", "tool_call_id": f"auto_{tool_name}",
                                                  "content": json.dumps(
                                                      _model_visible_observation(
-                                                         auto_observation),
+                                                         auto_decision.observation),
                                                      ensure_ascii=False)})
-                                next_call_type = "recovery"
-                                next_call_trigger = f"运行时自动执行 {tool_name} 后重新生成回答"
                                 continue
                     elif resolution_retries < max_resolution_retries and turn.budget.can_model_step():
                         resolution_retries += 1
@@ -751,8 +735,6 @@ class AgentRuntime:
                             "（asset_handle 用 preview 里的 handle，例如 photo_1），"
                             "先拿到实际观察，再基于观察输出 final。不调用该工具就无法正确回答。"
                         )})
-                        next_call_type = "recovery"
-                        next_call_trigger = f"回答前必须调用 {resolution['tool']}，模型提前结束"
                         continue
                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
                 if search_has_preview and not inspect_called and wants_visual \
@@ -774,8 +756,6 @@ class AgentRuntime:
                             "search_memories 的 preview 里有可复核的照片（photo_1 等 handle）。"
                             "请先调用 inspect_photo（asset_handle 用 preview 里的 handle），得到观察后再输出 final。"
                         )})
-                    next_call_type = "recovery"
-                    next_call_trigger = "视觉问题已有候选照片，但模型尚未执行 inspect_photo"
                     continue
                 # Phase G G3：Completion Gate —— retrieve_evidence / deliver_media 等需求未完成时，
                 # 只告诉模型“任务还没完成”，由模型自己决定下一步 Tool（不重建 Planner）。
@@ -842,18 +822,9 @@ class AgentRuntime:
                         fctx = build_final_context(message, task.as_dict())
                         if needs_rewrite(turn.final_answer, fctx):
                             turn.budget.record_model_step()
-                            model_call_seq += 1
-                            writer_step_id = f"model_call_{model_call_seq}"
-                            rewritten = rewrite_final(
-                                self._chat, fctx, turn.final_answer, step_id=writer_step_id)
-                            writer_status = "failed" if not rewritten else (
-                                "unchanged" if rewritten == turn.final_answer else "rewritten")
-                            turn.steps.append({"type": "writer", "status": writer_status,
-                                               "step_id": writer_step_id,
-                                               "call_type": "writer",
-                                               "trigger": "候选回答违反最终回答样式策略",
-                                               "answer_preview": str(rewritten or turn.final_answer)[:300]})
+                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
                             if rewritten and rewritten != turn.final_answer:
+                                turn.steps.append({"type": "writer", "status": "rewritten"})
                                 turn.final_answer = naturalize_answer(rewritten)
                     except Exception:
                         pass
@@ -894,27 +865,16 @@ class AgentRuntime:
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                     try:
-                        model_call_seq += 1
-                        judge_step_id = f"model_call_{model_call_seq}"
                         faithful, judge_problems = judge_faithfulness(
-                            self._chat, query=message, tool_results=task.tool_results,
-                            answer=turn.final_answer, trusted_facts=trusted,
-                            step_id=judge_step_id)
+                            self.chat_fn, query=message, tool_results=task.tool_results,
+                            answer=turn.final_answer, trusted_facts=trusted)
                         turn.steps.append({"type": "judge", "faithful": faithful,
-                                           "problems": list(judge_problems),
-                                           "step_id": judge_step_id,
-                                           "call_type": "faithfulness_judge",
-                                           "trigger": "L1 Guard 通过且回答使用了工具事实",
-                                           "attempt": guard_retries + 1})
+                                           "problems": list(judge_problems)})
                         if not faithful:
                             problems = judge_problems
                     except Exception as exc:
                         turn.steps.append({"type": "judge", "status": "skipped",
-                                           "reason": f"model_call_error:{exc}",
-                                           "step_id": judge_step_id,
-                                           "call_type": "faithfulness_judge",
-                                           "trigger": "L1 Guard 通过且回答使用了工具事实",
-                                           "attempt": guard_retries + 1})
+                                           "reason": f"model_call_error:{exc}"})
                 if problems:
                     severity = problems.severity if hasattr(problems, "severity") else "truth"
                     if severity == "hard_block":
@@ -1007,8 +967,6 @@ class AgentRuntime:
                             "'找到 N 张接近的照片；部分信息能对上；我可以继续帮你核对'这类套话。"
                         )
                         messages.append({"role": "user", "content": recovery})
-                        next_call_type = "recovery"
-                        next_call_trigger = "Guard 或 L2 事实一致性检查未通过"
                         continue
                     # Recovery v3 第二层：一次工具恢复——仍有证据解析需求未满足且预算允许
                     recovery_tool = None
@@ -1058,10 +1016,18 @@ class AgentRuntime:
                                     "我重新读取了一次照片，请基于新的工具观察，直接输出一个修正后的 final。"
                                 )})
                                 continue
-                    # Recovery v3 第三层：natural partial —— 展示已确认部分与缺口，不放错误答案
-                    turn.status = "partial"
-                    turn.reason = "truth_unresolved:" + ";".join(problems[:4])
-                    turn.final_answer = _natural_partial(task.as_dict(), problems)
+                    # Recovery v3 第三层：优先让模型明确收尾（哪怕"没有答案"），
+                    # 失败才回退 natural partial 代码文案。
+                    forced = self._force_final_once(turn, messages)
+                    if forced:
+                        turn.final_answer = forced
+                        turn.status = "complete"
+                        turn.reason = ""
+                        turn.termination_reason = "forced_final_after_guard_recovery"
+                    else:
+                        turn.status = "partial"
+                        turn.reason = "truth_unresolved:" + ";".join(problems[:4])
+                        turn.final_answer = _natural_partial(task.as_dict(), problems)
                     break
                 self._emit_progress(
                     turn, progress_callback,
@@ -1109,8 +1075,6 @@ class AgentRuntime:
                             "请换一个动作：如果需要看照片细节请调用 inspect_photo（使用预览里的 handle），"
                             "否则直接输出 final。"
                         )})
-                    next_call_type = "recovery"
-                    next_call_trigger = "模型重复调用了相同工具和参数"
                     continue
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:duplicate_tool_call"
@@ -1130,12 +1094,9 @@ class AgentRuntime:
                         f"工具「{tool_name}」不存在。可用工具只有：{valid}。"
                         "请重新选择一个可用工具，或直接输出 final。"
                     )})
-                    next_call_type = "recovery"
-                    next_call_trigger = f"模型请求了不存在的工具 {tool_name}"
                     continue
                 turn.steps.append({"type": "tool", "tool": tool_name, "status": "error",
-                                   "reason": "unknown_tool", "step_id": tool_call_id,
-                                   "parent_step_id": last_model_step_id})
+                                   "reason": "unknown_tool"})
                 turn.reason = "unknown_tool:" + tool_name
                 turn.termination_reason = "tool_unavailable"
                 break
@@ -1153,18 +1114,14 @@ class AgentRuntime:
                 "ocr_settings": self.ocr_settings,
             })
             latency = round(time.monotonic() - t0, 2)
-            observation = dict(decision.observation or {})
-            internal_model_metrics = observation.pop("_model_call_metrics", [])
             result = ToolResult(tool=tool_name,
                                 status="ok" if decision.allowed else "denied",
-                                observation=observation,
+                                observation=decision.observation,
                                 error=decision.error, latency_s=latency)
             turn.steps.append({
                 "type": "tool", "tool": tool_name, "arguments": arguments,
                 "status": result.status, "observation": result.observation,
                 "error": result.error, "latency_s": latency,
-                "step_id": tool_call_id, "parent_step_id": last_model_step_id,
-                "internal_model_call_metrics": internal_model_metrics,
             })
             emit_text = public_status
             if tool_name == "inspect_photo" and result.status == "ok":
@@ -1198,7 +1155,6 @@ class AgentRuntime:
             messages.append({"role": "assistant", "content": _model_visible_action(action)})
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(
                 _model_visible_observation(result.observation), ensure_ascii=False)})
-            next_call_trigger = f"工具 {tool_name} 返回结果"
 
         turn.task_state = task.as_dict()
         turn.task_state["completion"] = completion.as_dict()
