@@ -286,6 +286,97 @@ class OllamaBackend:
             return []
 
 
+class LocalQwen3VLBackend:
+    """Lazy in-process Qwen3-VL fallback for hosts without a healthy VLM API."""
+
+    name = "qwen3-vl"
+    _load_lock = threading.Lock()
+    _generation_lock = threading.Lock()
+    _shared = {}
+
+    def __init__(self, model_path, device="cpu"):
+        self.model_path = str(Path(model_path).expanduser())
+        self.device = str(device or "cpu").strip().lower()
+
+    @property
+    def endpoint(self):
+        return self.model_path
+
+    @property
+    def model_name(self):
+        return Path(self.model_path).name or "Qwen3-VL"
+
+    def _load(self):
+        key = (self.model_path, self.device)
+        if key in self._shared:
+            return self._shared[key]
+        with self._load_lock:
+            if key in self._shared:
+                return self._shared[key]
+            if not Path(self.model_path).is_dir():
+                raise ModelError(f"Qwen3-VL model path is unavailable: {self.model_path}")
+            try:
+                import torch
+                from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+                load_options = {
+                    "dtype": torch.bfloat16,
+                    "low_cpu_mem_usage": True,
+                }
+                if self.device.startswith("cuda"):
+                    gpu_index = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
+                    load_options.update({
+                        "device_map": "auto",
+                        "max_memory": {
+                            gpu_index: os.getenv("SENTRIX_QWEN3_VL_GPU_MEMORY", "7GiB"),
+                            "cpu": os.getenv("SENTRIX_QWEN3_VL_CPU_MEMORY", "48GiB"),
+                        },
+                    })
+                model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    self.model_path, **load_options,
+                )
+                if not self.device.startswith("cuda"):
+                    model.to(self.device)
+                model.eval()
+                processor = AutoProcessor.from_pretrained(self.model_path)
+            except Exception as error:
+                raise ModelError(f"Qwen3-VL load failed: {error}") from error
+            self._shared[key] = (model, processor)
+            return model, processor
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        try:
+            import torch
+            from PIL import Image
+
+            model, processor = self._load()
+            content = []
+            for item in images or []:
+                image = Image.open(BytesIO(base64.b64decode(item["base64"]))).convert("RGB")
+                content.append({"type": "image", "image": image})
+            content.append({"type": "text", "text": prompt})
+            messages = [{"role": "user", "content": content}]
+            inputs = processor.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True,
+                return_dict=True, return_tensors="pt",
+            ).to(model.device)
+            requested = (vision_options or {}).get("num_predict")
+            if requested is None and role in ROLE_INFERENCE:
+                requested = ROLE_INFERENCE[role]["num_predict"]
+            max_new_tokens = min(1024, max(64, int(requested or 768)))
+            with self._generation_lock, torch.inference_mode():
+                generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            trimmed = [output[len(source):] for source, output in zip(inputs.input_ids, generated)]
+            return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+        except ModelError:
+            raise
+        except Exception as error:
+            raise ModelError(f"Qwen3-VL inference failed: {error}") from error
+
+    def embed_text(self, text):
+        return []
+
+
 class E2BBackend:
     """E2B LoRA backend — local 2B model via E2B server on :8100."""
 
@@ -364,6 +455,11 @@ class GammaClient:
                 or "http://127.0.0.1:8100/v1"
             )
             self._model_setting = model or os.getenv("SENTRIX_VLLM_MODEL") or os.getenv("VLLM_MODEL") or os.getenv("OPENAI_MODEL") or "gemma4-12b-it"
+        elif self.backend == "qwen3-vl":
+            self._base_url_setting = str(
+                base_url or os.getenv("SENTRIX_QWEN3_VL_MODEL_PATH", "")
+            ).strip()
+            self._model_setting = model or Path(self._base_url_setting).name or "Qwen3-VL"
         else:
             self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
             self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
@@ -379,6 +475,10 @@ class GammaClient:
             keep_alive=-1 if str(_init_keep_alive).strip() == "-1" else _init_keep_alive,
         )
         self._e2b = E2BBackend(os.getenv("E2B_BASE_URL"), _init_timeout)
+        self._local_qwen = LocalQwen3VLBackend(
+            self._base_url_setting,
+            os.getenv("SENTRIX_QWEN3_VL_DEVICE", "cpu"),
+        ) if self.backend == "qwen3-vl" else None
         self._store = None
         self._active_cache = None
         self._cache_ts = 0.0
@@ -428,6 +528,8 @@ class GammaClient:
             return "openai"
         if value in {"ollama", "ollama_local"}:
             return "ollama"
+        if value in {"qwen3-vl", "qwen3_vl", "local_qwen3_vl"}:
+            return "qwen3-vl"
         raise ModelError(f"unsupported llm backend: {value}")
 
     @staticmethod
@@ -452,6 +554,8 @@ class GammaClient:
         return "ollama_12b"
 
     def _active(self):
+        if self.backend == "qwen3-vl":
+            return self._local_qwen
         import time
         now = time.monotonic()
         if self._active_cache is not None and (now - self._cache_ts) < self._CACHE_TTL_SECONDS:

@@ -17,7 +17,7 @@
 
 ## 产品定义
 
-Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文本和预留的视频入口
+Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文本和视频
 转化为可回溯原始证据的事件记忆、人物语义记忆和视觉记忆。Cognee 仅提供
 `remember`、`cognify`、`recall`、`improve` 的设计参考，不是运行依赖。
 
@@ -36,7 +36,17 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
    反馈/纠正或澄清，再按需调取分层记忆；只有输出家庭具体事实时才附带来源评分
    与可展开证据。无证据时输出 `gap`/`no_result`，不编造。
 
-## 当前基线（2026-08-10 实测）
+## 当前视频部署（2026-08-13 实测）
+
+- 200 仓库：`/home/sscy/GitHub/hpq/sentrix-home-web-worldmm`
+- Web：`http://192.168.0.200:4174`，代理本部署 API `http://127.0.0.1:8091`
+- 原始数据、派生关键帧、SQLite、WorldMM 输出均在该独立工作副本的 `data/` 下。
+- VLM：进程内惰性加载本机 Qwen3-VL-4B，提供 12 GiB GPU 显存使模型完整驻留；
+  WorldMM 使用 GPU 0。InsightFace、CLIP 保持 CPU，避免影响该机其他现有服务。
+- 真实 `IMG_3957.MOV` 完整 GPU 全流程耗时 27.811 秒（CPU 卸载模式 118.796 秒，
+  原全 CPU 运行 390.356 秒）。
+
+## 历史基线（2026-08-10 实测）
 
 - 153 仓库：`/home/asus/Github/Sentrix-Home-Web`
 - 正式后端提交分支：`psh`
@@ -51,8 +61,9 @@ Sentrix 是本地优先的家庭记忆系统。它将原始图片、音频、文
 - E2B LoRA 服务：`127.0.0.1:8101`（可选，默认不启用）
 - FMA Web：端口 `5173`，与 Sentrix 无关，禁止停止、修改或重启；本次检查未监听
 - 当前数据库：`/home/asus/Github/Sentrix-Home-Web/data/sentrix.db`
-- 视频只保留 `VideoMemoryAdapter` 接口；未实现视频解码、关键帧、时序 Observation、
-  视频向量和视频事件。
+- 2026-08-13 已实现视频链路：真实 ffprobe 元数据、仓库内置 WorldMM-a 关键帧/DMD/Scene、
+  派生图片 Asset、按 Scene 强制绑定的 Event、逐帧绝对拍摄时间、GPS 继承、Timeline
+  图片堆和关键帧回跳原视频。部署在 `192.168.0.200`，未操作旧 153 服务。
 
 ## 模型与运行隔离
 
@@ -168,7 +179,8 @@ Asset -> Observation -> FaceInstance -> PersonAppearanceEvidence -> SemanticClai
    （`15039f0` 起 `/api/ingest` 去重仅限同一相册，禁止跨空间）。
 2. **媒体处理**：图片支持 HEIC；先写入 AdaFace、CLIP、元数据和事件的快速证据，
    再以 896px、禁用思考模式、320 token 的核心中文 JSON 完成语义丰富；音频经 FunASR
-   后走文本分析；文本走同一文本分析路径；视频只返回预留状态。批量导入使用
+   后走文本分析；文本走同一文本分析路径；视频上传立即返回并在后台执行 ffprobe、
+   WorldMM 关键帧/DMD/Scene，再让派生关键帧进入现有图片理解。批量导入使用
    `batch_id`，批次完成且资产终态后再总结事件一次。
 3. **证据规范化**：保存中文规范字段、原始模型 JSON、对象、场景衣物、空间关系、
    OCR、转写、人脸实例和模型版本。
@@ -302,7 +314,8 @@ Asset -> Observation -> FaceInstance -> PersonAppearanceEvidence -> SemanticClai
 - 原始资料、SHA-256 去重、EXIF 时间/GPS/设备回退、相册来源白名单、HEIC 支持、
   文件夹/服务器目录导入与批次导入。
 - `MemorySpace` 隔离的相册导入、查询和网页选择；用户可创建独立相册。
-- 图片、音频、文本 Observation 管线；视频原始 Asset 预留。
+- 图片、音频、文本 Observation 管线；视频保留原始 Asset，并生成可回溯原视频秒数的
+  派生图片 Asset / Observation；一个 WorldMM Scene 固定映射一个 Event。
 - `buffalo_l` 检测、AdaFace 向量、质量/姿态元数据、多原型全局聚类、低质量人脸
   证据化、候选簇确认/拒绝/合并/拆分与审计。
 - 人脸裁剪证据接口与统一头像显示；人物多名称、别名、全局改名、同名自动合并、
@@ -385,7 +398,6 @@ Asset -> Observation -> FaceInstance -> PersonAppearanceEvidence -> SemanticClai
 
 ### P2：明确延后
 
-- 视频解码、关键帧、时序证据、视频向量和视频事件记忆。
 - 主动式家庭建议和会话外长期推荐。
 - MagFace 对比及是否替换 AdaFace 的生产决策。
 - API 与 vLLM/Ollama 的正式托管服务、重启策略、监控和主机级所有权确认。
@@ -443,6 +455,7 @@ git diff --check
 | 2026-08-07 | 人物/地理/检索/vLLM | 多名称与自动合并、PyGeoCN 逆地理、GPS 事件聚类、六路检索 + HNSW ANN、vLLM registry。 |
 | 2026-08-08 | vLLM 生产默认 | `gemma4-12b-it` 在 `8100` 常驻；事件时空加成与视觉地点事件。 |
 | 2026-08-10 | `15039f0` | `/api/ingest` 同一相册内去重；同步项目记忆与 Node 断言。 |
+| 2026-08-13 | WorldMM 视频场景 | `IMG_3957.MOV` 原版算法实测 11.735s / 3 关键帧 / 1 Scene；3 派生 Asset、3 Observation、1 video_scene Event，时间/GPS/原视频秒数链路通过。 |
 
 ## 历史阶段记录（2026-08-03 至 2026-08-05）
 

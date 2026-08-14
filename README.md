@@ -43,9 +43,9 @@ Start the web gateway separately:
 SENTRIX_BACKEND_URL=http://127.0.0.1:8090 PORT=4174 npm run dev
 ```
 
-The deployed interface is `http://192.168.0.153:4174`. Sentrix owns Ollama
-`11435`; shared Ollama `11434` belongs to other projects and must not be
-stopped or reconfigured.
+The WorldMM video-timeline deployment is `http://192.168.0.200:4174` with its
+project-local API on `192.168.0.200:8091`. Existing services and shared model
+processes on that host are not stopped or reconfigured by this deployment.
 
 ## Verify
 
@@ -56,6 +56,11 @@ node --check src/app.js
 node --check src/api.js
 .venv/bin/python -m compileall -q backend scripts
 ```
+
+Video imports require `ffprobe` on `PATH`. The repository vendors the supplied
+WorldMM-a pipeline and its fixed YOLO/Pose weights under `tools/video_keyframe/`;
+runtime tuning uses `SENTRIX_VIDEO_WIDTH`, `SENTRIX_VIDEO_SAMPLE_FPS`,
+`SENTRIX_VIDEO_ANALYSIS_FPS`, and `SENTRIX_VIDEO_DEVICE`.
 
 The maintenance rebuild is intentionally explicit because it replaces derived
 memory data:
