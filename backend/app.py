@@ -2888,17 +2888,3 @@ def reject_fact(fact_id: str):
     if not store.get_fact(fact_id):
         raise HTTPException(status_code=404, detail="fact not found")
     return store.reject_fact(fact_id)
-
-
-# ============================================================
-# Phase E — QA Dashboard 只读路由（/qa + /api/qa/runs*）
-# 数据目录可用 SENTRIX_QA_DIR 覆盖（默认 <data>/qa_runs）
-# ============================================================
-from .qa_dashboard import register_qa_routes
-
-QA_RUNS_DIR = Path(os.getenv("SENTRIX_QA_DIR", DATA_DIR / "qa_runs"))
-register_qa_routes(
-    app,
-    QA_RUNS_DIR,
-    dashboard_html=ROOT / "scripts" / "benchmarks" / "qa_dashboard.html",
-)
