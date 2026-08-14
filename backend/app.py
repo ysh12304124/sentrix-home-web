@@ -1285,6 +1285,55 @@ def create_relationship(payload: dict):
     return value
 
 
+@app.post("/api/relationships/batch")
+def create_relationships_batch(payload: dict):
+    scope_id = str(payload.get("scope_id") or "")
+    entity_by_name = {str(k): str(v) for k, v in (payload.get("entity_by_name") or {}).items()}
+    relationships = payload.get("relationships") or []
+
+    entities = {}
+    for entity in store.list_entities(scope_id=scope_id):
+        name = str(entity.get("canonical_name") or "").strip()
+        if name:
+            entities.setdefault(name, entity)
+        role = str(entity.get("family_role") or "").strip()
+        if role:
+            entities.setdefault(role, entity)
+
+    def resolve_entity(name: str) -> str | None:
+        key = str(name or "").strip()
+        if not key:
+            return None
+        if key in entity_by_name:
+            return entity_by_name[key]
+        entity = entities.get(key)
+        return entity.get("id") if entity else None
+
+    results = []
+    for rel in relationships:
+        subject_name = str(rel.get("subject") or "")
+        object_name = str(rel.get("object") or "")
+        predicate = str(rel.get("predicate") or "")
+        subject_id = resolve_entity(subject_name)
+        object_id = resolve_entity(object_name)
+        if not subject_id or not object_id or not predicate:
+            results.append({"subject": subject_name, "predicate": predicate,
+                            "object": object_name, "error": "unresolved entity"})
+            continue
+        try:
+            value = store.create_relationship(
+                subject_id, predicate, object_id, [],
+                float(rel.get("confidence") or 0.5), "pending")
+            results.append({"subject": subject_name, "predicate": predicate,
+                            "object": object_name,
+                            "id": value.get("id") if isinstance(value, dict) else None})
+        except Exception as exc:
+            results.append({"subject": subject_name, "predicate": predicate,
+                            "object": object_name, "error": str(exc)[:200]})
+    imported = sum(1 for r in results if not r.get("error"))
+    return {"requested": len(relationships), "imported": imported, "results": results}
+
+
 @app.post("/api/relationships/{relationship_id}/confirm")
 def confirm_relationship(relationship_id: str):
     value = store.confirm_relationship(relationship_id)
@@ -2619,4 +2668,3 @@ def reject_fact(fact_id: str):
     if not store.get_fact(fact_id):
         raise HTTPException(status_code=404, detail="fact not found")
     return store.reject_fact(fact_id)
-
