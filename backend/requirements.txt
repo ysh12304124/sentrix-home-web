@@ -20,3 +20,7 @@ reverse_geocoder>=1.5,<2
 # pygeo-cn depends on geopandas -> pandas; keep pandas inside the venv so
 # PYTHONNOUSERSITE=1 does not hide it (user-site installs are disabled).
 pandas>=2.0,<3
+# Vendored WorldMM-a keyframe / DMD / Scene pipeline.
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<5
+ultralytics>=8.3,<9

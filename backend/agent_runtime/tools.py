@@ -395,9 +395,15 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
     for i, idx in enumerate(indices):
         a = assets[idx]
         place = ""
+        source_video_asset_id = None
+        source_timestamp_sec = None
         if store is not None:
             try:
-                place = _short_place_label(store.get_asset(a.get("id")) or {})
+                asset = store.get_asset(a.get("id")) or {}
+                place = _short_place_label(asset)
+                if asset.get("derived_kind") == "video_keyframe":
+                    source_video_asset_id = asset.get("parent_asset_id")
+                    source_timestamp_sec = asset.get("source_timestamp_sec")
             except Exception:
                 place = ""
         preview.append({
@@ -405,6 +411,8 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
             "captured_at": a.get("captured_at"),
             "level": "exact",
             "place": place,
+            "source_video_asset_id": source_video_asset_id,
+            "source_timestamp_sec": source_timestamp_sec,
             "condition_summary": {},
         })
     total = len(assets)
@@ -483,9 +491,15 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     for i, item in enumerate(assets[:6]):
         handle = f"photo_{i + 1}"
         place = ""
+        source_video_asset_id = None
+        source_timestamp_sec = None
         if store is not None:
             try:
-                place = _short_place_label(store.get_asset(item.get("asset_id")) or {})
+                asset = store.get_asset(item.get("asset_id")) or {}
+                place = _short_place_label(asset)
+                if asset.get("derived_kind") == "video_keyframe":
+                    source_video_asset_id = asset.get("parent_asset_id")
+                    source_timestamp_sec = asset.get("source_timestamp_sec")
             except Exception:
                 place = ""
         preview.append({
@@ -493,6 +507,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "captured_at": item.get("captured_at"),
             "level": item.get("level"),
             "place": place,
+            "source_video_asset_id": source_video_asset_id,
+            "source_timestamp_sec": source_timestamp_sec,
             "condition_summary": _condition_summary(item),
         })
     _RUNTIME["last_handles"] = handles

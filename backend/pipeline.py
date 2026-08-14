@@ -26,11 +26,6 @@ def file_time(path):
     return datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc).isoformat()
 
 
-class VideoMemoryAdapter:
-    def reserve(self, asset):
-        return {"status": "video-extraction-reserved", "asset_id": asset["id"], "adapter": "video_memory_adapter"}
-
-
 class IngestionPipeline:
     def __init__(self, store, gamma=None, asr=None, face=None, clip=None, geocoder=None):
         self.store = store
@@ -39,6 +34,7 @@ class IngestionPipeline:
         self.face = face or FaceAdapter()
         self.clip = clip or ClipAdapter()
         self.geocoder = geocoder or OfflineReverseGeocoder()
+        from .video import VideoMemoryAdapter
         self.video_memory_adapter = VideoMemoryAdapter()
 
     def create_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
@@ -153,7 +149,7 @@ class IngestionPipeline:
     def _media_type(self, path):
         return media_type_for_path(path)
 
-    def process(self, asset_id, summarize_event=True):
+    def process(self, asset_id, summarize_event=True, forced_event_id=None):
         asset = self.store.get_asset(asset_id)
         if not asset:
             raise KeyError(asset_id)
@@ -161,8 +157,7 @@ class IngestionPipeline:
             metadata = asset.get("metadata_json") or {}
             return asset
         if asset["media_type"] == "video":
-            result = self.video_memory_adapter.reserve(asset)
-            return self.store.update_asset(asset_id, result["status"], result)
+            return self.video_memory_adapter.process(asset, self)
         self.store.update_asset(asset_id, "processing", {})
         started_at = time.perf_counter()
         try:
@@ -186,7 +181,10 @@ class IngestionPipeline:
             # A matching confirmed face writes an EntityMention above, so it is
             # available as a real identity bridge during this event decision.
             observation = self.store.get_observation(observation["id"])
-            event = self.store.merge_observation_into_event(observation)
+            event = (
+                self.store.attach_observation_to_event(forced_event_id, observation["id"])
+                if forced_event_id else self.store.merge_observation_into_event(observation)
+            )
             entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation["id"], event["id"])]
             # Update the same vector with its final event link after selection.
             self.store.upsert_vector(
