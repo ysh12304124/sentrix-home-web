@@ -101,6 +101,9 @@ class VideoMemoryAdapter:
             store.update_asset(asset_id, stage, {
                 "video_stage": stage, "worldmm_scene_count": len(result.scenes),
                 "worldmm_keyframe_count": result.keyframe_count,
+                "worldmm_full_keyframe_count": result.full_keyframe_count,
+                "worldmm_summary_keyframe_count": result.summary_keyframe_count,
+                "worldmm_selected_keyframe_count": result.selected_keyframe_count,
             })
             scene_ids = []
             keyframe_asset_ids = []
@@ -158,7 +161,11 @@ class VideoMemoryAdapter:
                 "latitude": metadata.latitude, "longitude": metadata.longitude,
                 "location_source": "video_metadata" if metadata.latitude is not None else "upload_metadata",
                 "worldmm_output": str(worldmm_root), "worldmm_scene_count": len(result.scenes),
-                "worldmm_keyframe_count": result.keyframe_count, "video_scene_event_ids": scene_ids,
+                "worldmm_keyframe_count": result.keyframe_count,
+                "worldmm_full_keyframe_count": result.full_keyframe_count,
+                "worldmm_summary_keyframe_count": result.summary_keyframe_count,
+                "worldmm_selected_keyframe_count": result.selected_keyframe_count,
+                "video_scene_event_ids": scene_ids,
                 "derived_keyframe_asset_ids": keyframe_asset_ids, "video_processing_seconds": elapsed,
                 "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "cpu"),
                 "vlm_device": os.getenv("SENTRIX_QWEN3_VL_DEVICE", "cpu"),

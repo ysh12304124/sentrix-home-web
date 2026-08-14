@@ -60,7 +60,11 @@ node --check src/api.js
 Video imports require `ffprobe` on `PATH`. The repository vendors the supplied
 WorldMM-a pipeline and its fixed YOLO/Pose weights under `tools/video_keyframe/`;
 runtime tuning uses `SENTRIX_VIDEO_WIDTH`, `SENTRIX_VIDEO_SAMPLE_FPS`,
-`SENTRIX_VIDEO_ANALYSIS_FPS`, and `SENTRIX_VIDEO_DEVICE`.
+`SENTRIX_VIDEO_ANALYSIS_FPS`, `SENTRIX_VIDEO_DEVICE`, and
+`SENTRIX_VIDEO_MAX_KEYFRAMES`. WorldMM's complete `memory_keyframes` remain
+available in the derived output; Sentrix uses the package's recommended
+`research/summary_keyframes.json` and imports at most the configured number of
+representative frames (160 by default).
 
 The maintenance rebuild is intentionally explicit because it replaces derived
 memory data:
