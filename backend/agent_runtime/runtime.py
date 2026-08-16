@@ -173,6 +173,27 @@ class ToolResult:
     latency_s: float = 0.0
 
 
+
+def _merge_system_constraint(messages: list[dict], constraint: str) -> None:
+    """Keep all system instructions at the beginning for strict chat templates.
+
+    Qwen3.5/3.8 chat templates raise "System message must be at the
+    beginning" when a system message appears mid-conversation, which turns
+    into a 400 from vLLM /tokenize and /chat/completions. Merge later system
+    constraints into the leading system message instead of appending.
+    """
+    if not constraint:
+        return
+    if not messages or messages[0].get("role") != "system":
+        raise ValueError("agent messages must start with a system message")
+    first = messages[0]
+    existing = str(first.get("content") or "").rstrip()
+    messages[0] = {
+        **first,
+        "content": f"{existing}\n\n{constraint}" if existing else constraint,
+    }
+
+
 def _pending_resolution(task) -> dict | None:
     """Phase E §14：Premature Final Guard —— 检索明确要求视觉/OCR 复核但尚未执行时，阻止提前 final。
 
@@ -617,7 +638,7 @@ class AgentRuntime:
                     nuc = build_nucleus(task.as_dict(), message)
                     ctext = nuc.constraint_text()
                     if ctext:
-                        messages.append({"role": "system", "content": ctext})
+                        _merge_system_constraint(messages, ctext)
                     turn.nucleus_injected = True
                 except Exception:
                     turn.nucleus_injected = True
