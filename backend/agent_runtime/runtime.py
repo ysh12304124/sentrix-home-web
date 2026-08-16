@@ -417,11 +417,20 @@ class AgentRuntime:
                 "就明确说“现有记录不足以确认”并给出你能确认的部分。"
                 '只输出 {"action":"final","answer":"<结论>","evidence_refs":[]}。'
             )})
+            if self.include_debug:
+                import copy as _copy
+                _ff_prompt = _copy.deepcopy(final_messages)
+            else:
+                _ff_prompt = None
             raw = self.chat_fn(final_messages)
             parsed = self._parse_action(raw)
             if parsed and parsed.get("action") == "final" and (parsed.get("answer") or "").strip():
-                turn.steps.append({"type": "model", "raw": (raw or "")[:500],
-                                   "forced_final": True})
+                _ff_step = {"type": "model", "raw": (raw or "")[:500],
+                            "call_type": "force_final", "forced_final": True}
+                if _ff_prompt is not None:
+                    _ff_step["prompt"] = _ff_prompt
+                    _ff_step["raw_full"] = raw
+                turn.steps.append(_ff_step)
                 return naturalize_answer(parsed["answer"])
         except Exception:
             pass
@@ -857,9 +866,16 @@ class AgentRuntime:
                         fctx = build_final_context(message, task.as_dict())
                         if needs_rewrite(turn.final_answer, fctx):
                             turn.budget.record_model_step()
-                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
+                            _wr_debug = {} if self.include_debug else None
+                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer,
+                                                      debug_out=_wr_debug)
                             if rewritten and rewritten != turn.final_answer:
-                                turn.steps.append({"type": "writer", "status": "rewritten"})
+                                _wr_step = {"type": "writer", "status": "rewritten",
+                                            "call_type": "writer"}
+                                if _wr_debug:
+                                    _wr_step["prompt"] = _wr_debug.get("messages")
+                                    _wr_step["raw_full"] = rewritten
+                                turn.steps.append(_wr_step)
                                 turn.final_answer = naturalize_answer(rewritten)
                     except Exception:
                         pass

@@ -213,7 +213,8 @@ _WRITER_SYSTEM = (
 )
 
 
-def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = None) -> str | None:
+def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = None,
+                       debug_out: dict | None = None) -> str | None:
     """一次 text-only 重写；失败返回 None（调用方保留草稿）。"""
     payload = {
         "facts": context.get("facts") or [],
@@ -231,8 +232,13 @@ def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = N
             {"role": "system", "content": _WRITER_SYSTEM},
             {"role": "user", "content": user},
         ]
+        if debug_out is not None:
+            import copy as _copy
+            debug_out["messages"] = _copy.deepcopy(messages)
         try:
             raw = chat_fn(messages, call_type="writer", step_id=step_id or "writer")
+            if debug_out is not None:
+                debug_out["raw"] = raw
         except TypeError as exc:
             if "unexpected keyword argument" not in str(exc):
                 raise
