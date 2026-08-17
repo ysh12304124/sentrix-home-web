@@ -1,0 +1,1328 @@
+{
+ "meta": {
+  "scope": "album3-v2",
+  "base": "http://127.0.0.1:8100/v1",
+  "labels": 74,
+  "elapsed_s": 232.1,
+  "judge": "gemma4-12b-it"
+ },
+ "capabilities": {
+  "clothing_color": {
+   "tested": 2,
+   "supported": 2,
+   "contradicted": 0,
+   "unknown": 0,
+   "error": 0,
+   "support_rate": 1.0,
+   "old_correct": 2,
+   "old_false_confident": 0
+  },
+  "large_object": {
+   "tested": 11,
+   "supported": 7,
+   "contradicted": 2,
+   "unknown": 2,
+   "error": 0,
+   "support_rate": 0.636,
+   "old_correct": 9,
+   "old_false_confident": 2
+  },
+  "ocr_number": {
+   "tested": 5,
+   "supported": 0,
+   "contradicted": 3,
+   "unknown": 2,
+   "error": 0,
+   "support_rate": 0.0,
+   "old_correct": 0,
+   "old_false_confident": 5
+  },
+  "people_count": {
+   "tested": 22,
+   "supported": 15,
+   "contradicted": 4,
+   "unknown": 3,
+   "error": 0,
+   "support_rate": 0.682,
+   "old_correct": 1,
+   "old_false_confident": 21
+  },
+  "scene": {
+   "tested": 19,
+   "supported": 15,
+   "contradicted": 1,
+   "unknown": 3,
+   "error": 0,
+   "support_rate": 0.789,
+   "old_correct": 14,
+   "old_false_confident": 5
+  },
+  "small_object": {
+   "tested": 4,
+   "supported": 1,
+   "contradicted": 0,
+   "unknown": 3,
+   "error": 0,
+   "support_rate": 0.25,
+   "old_correct": 2,
+   "old_false_confident": 2
+  },
+  "visible_text_short": {
+   "tested": 11,
+   "supported": 5,
+   "contradicted": 0,
+   "unknown": 6,
+   "error": 0,
+   "support_rate": 0.455,
+   "old_correct": 6,
+   "old_false_confident": 5
+  }
+ },
+ "rows": [
+  {
+   "file": "2017-11-05 151451.jpg",
+   "asset_id": "asset_922a8d48d1b5",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "3"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中包含多个人，包括前景中的人以及背景广场上的行人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 1.13,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中“多个人”属于模糊描述，无法对应到标准事实中的具体数字“3”。\"}"
+  },
+  {
+   "file": "2017-11-05 151838.jpg",
+   "asset_id": "asset_797cb4e91add",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "2"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中包含多个人，主要集中在前景的观景台区域。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 1.07,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中的“多个人”属于模糊描述，无法确定是否等价于标准事实中的“2”。\"}"
+  },
+  {
+   "file": "2017-11-05 152200.jpg",
+   "asset_id": "asset_c79d1da3cfed",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "11"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一群人在户外户外拍照。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.75,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中提到的“一群人”是模糊描述，无法对应到标准事实中的具体数字“11”。\"}"
+  },
+  {
+   "file": "2018-02-18 115342.jpg",
+   "asset_id": "asset_3dc9a8303f46",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "2"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中可以看到两个孩子坐在车厢里。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.8,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“两个孩子”与标准事实中的数字“2”一致。\"}"
+  },
+  {
+   "file": "2018-02-18 115419.jpg",
+   "asset_id": "asset_64c930ff7da3",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一辆装饰成火车的载具，旁边有三个人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.93,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为1人，而观察明确描述为三个人，数值不符。\"}"
+  },
+  {
+   "file": "2018-02-18 115443.jpg",
+   "asset_id": "asset_e1de2b35571e",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一名坐在火车上的小孩。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.77,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“一名小孩”与标准事实“1”在数量上完全一致。\"}"
+  },
+  {
+   "file": "2019-01-10 130421.jpg",
+   "asset_id": "asset_848a48fc2ded",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一个小孩在大型室内游乐设施中。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.84,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“一个小孩”与标准事实“1”在数量上完全一致。\"}"
+  },
+  {
+   "file": "2019-01-10 130437.jpg",
+   "asset_id": "asset_cb1a8f406d82",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一个小孩在透明的圆柱形结构中。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.86,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“一个小孩”与标准事实“1”在数量上完全一致。\"}"
+  },
+  {
+   "file": "2019-01-10 132226.jpg",
+   "asset_id": "asset_7199046f3ddf",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "3"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中共有三个人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.72,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中的“三个人”与标准事实“3”在数值上完全一致。\"}"
+  },
+  {
+   "file": "IMG_0517.JPG",
+   "asset_id": "asset_270091475bbb",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中可以看到两个孩子在植物中。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.83,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为1人，而观察明确描述为两个孩子，数值不符。\"}"
+  },
+  {
+   "file": "IMG_20220623_212500.jpg",
+   "asset_id": "asset_e62345bed216",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "3"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有三个人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.69,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中的“三个人”与标准事实“3”在数值上完全一致。\"}"
+  },
+  {
+   "file": "IMG_20220623_212524.jpg",
+   "asset_id": "asset_e903b91b922d",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "3"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中共有三个人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.71,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中的“三个人”与标准事实“3”在数值上完全一致。\"}"
+  },
+  {
+   "file": "IMG_20220623_212642.jpg",
+   "asset_id": "asset_0178d325a08f",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一名穿着白色背心和围裙的男子在户外站立。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 2.99,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“一名男子”与标准事实“1”一致。\"}"
+  },
+  {
+   "file": "IMG_20230806_203916.jpg",
+   "asset_id": "asset_89498b316439",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "2"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有两个小孩坐在一个巨大的猫形雕塑上。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.88,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“两个小孩”与标准事实中的数字“2”一致。\"}"
+  },
+  {
+   "file": "IMG_20230806_204143.jpg",
+   "asset_id": "asset_85e2f09be3ed",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "4"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中共有三个人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.7,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为4人，而观察明确描述为三个人，数值不符。\"}"
+  },
+  {
+   "file": "IMG_20230806_204342.jpg",
+   "asset_id": "asset_f1c26e9df923",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "2"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一名男孩和一名女孩。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.77,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“一名男孩和一名女孩”总计为2人，与标准事实一致。\"}"
+  },
+  {
+   "file": "IMG_20230806_205755.jpg",
+   "asset_id": "asset_0e137aada9c8",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一名坐在草地上的小孩。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.81,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“一名小孩”与标准事实“1”在数量上完全一致。\"}"
+  },
+  {
+   "file": "IMG_20230806_205817.jpg",
+   "asset_id": "asset_55d3c141a708",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中有一名正在草坪上拍照的人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.85,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“一名人”与标准事实“1”完全一致。\"}"
+  },
+  {
+   "file": "IMG_6340.JPG",
+   "asset_id": "asset_11c3f84b00b6",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "1"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中可以看到三个人的头部或部分身体。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.81,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为1人，而观察明确描述为三个人的头部或部分身体，数值不符。\"}"
+  },
+  {
+   "file": "IMG_6342.JPG",
+   "asset_id": "asset_6936177d22ed",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "3"
+   ],
+   "source": "vision_faces",
+   "observation": "照片中共有三个人。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.72,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中的“三个人”与标准事实“3”在数值上完全一致。\"}"
+  },
+  {
+   "file": "IMG_8653.JPG",
+   "asset_id": "asset_b99a20ffabf0",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "3"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中共有3个人。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.72,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中的“3个人”与标准事实“3”完全一致。\"}"
+  },
+  {
+   "file": "IMG_8654.JPG",
+   "asset_id": "asset_4bb24fb5b2dc",
+   "capability": "people_count",
+   "question": "这张照片里有几个人？请只输出数字。",
+   "expected": [
+    "2"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一对站在沙雕前的孩子。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.83,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"“一对孩子”等价于“2人”，与标准事实一致。\"}"
+  },
+  {
+   "file": "IMG_8653.JPG",
+   "asset_id": "asset_b99a20ffabf0",
+   "capability": "clothing_color",
+   "question": "照片里主要人物穿的上衣是什么颜色？请只输出颜色。",
+   "expected": [
+    "黄色"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中主要人物穿着黄色的上衣。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.81,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察明确描述了主要人物穿着黄色的上衣，与标准事实一致。\"}"
+  },
+  {
+   "file": "IMG_20220623_212500.jpg",
+   "asset_id": "asset_e62345bed216",
+   "capability": "clothing_color",
+   "question": "照片里主要人物穿的上衣是什么颜色？请只输出颜色。",
+   "expected": [
+    "白色"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中主要人物穿着白色的背心。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.8,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察明确提到主要人物穿着白色的背心，与标准事实“白色”一致。\"}"
+  },
+  {
+   "file": "IMG_8653.JPG",
+   "asset_id": "asset_b99a20ffabf0",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "沙雕",
+    "大头儿子",
+    "小头爸爸"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一个巨大的沙雕，上面刻有卡通人物形象，并有三个小孩在前面合影。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.1,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“巨大的沙雕”与“沙雕”一致，且“卡通人物形象”涵盖了标准事实中的角色。\"}"
+  },
+  {
+   "file": "IMG_8654.JPG",
+   "asset_id": "asset_4bb24fb5b2dc",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "沙雕",
+    "大头儿子",
+    "小头爸爸"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一个巨大的沙雕，上面刻有三个卡通人物头像，并装饰有心形和星星等装饰。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.16,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“巨大的沙雕”和“三个卡通人物头像”与标准事实中的“沙雕”及“三个角色”内容一致。\"}"
+  },
+  {
+   "file": "IMG_20230806_203916.jpg",
+   "asset_id": "asset_89498b316439",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "兔子",
+    "雕塑"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一个巨大的猫形雕塑，两个小孩坐在上面。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.87,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实包含“兔子”，但观察中仅提到“猫形雕塑”，且未提及兔子。\"}"
+  },
+  {
+   "file": "IMG_20230806_204143.jpg",
+   "asset_id": "asset_85e2f09be3ed",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "兔子",
+    "雕塑"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一个巨大的白色卡通角色雕塑，看起来像一只巨大的白色的卡通角色。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 2.75,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中提到了“雕塑”但未明确提及“兔子”，且“卡通角色”描述不够具体以确认其为兔子。\"}"
+  },
+  {
+   "file": "IMG_20230806_204342.jpg",
+   "asset_id": "asset_f1c26e9df923",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "兔子",
+    "雕塑"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一个巨大的卡通兔子雕塑。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.77,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察明确提到了“卡通兔子雕塑”，与标准事实中的“兔子”和“雕塑”完全吻合。\"}"
+  },
+  {
+   "file": "IMG_20230806_205755.jpg",
+   "asset_id": "asset_0e137aada9c8",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "兔子",
+    "雕塑"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中有一个小孩坐在三个彩色的兔子形状的雕塑中间。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.92,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察明确提到了“兔子形状的雕塑”，与标准事实中的“兔子”和“雕塑”完全吻合。\"}"
+  },
+  {
+   "file": "IMG_20230806_205817.jpg",
+   "asset_id": "asset_55d3c141a708",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "兔子",
+    "雕塑"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中没有大型物体或雕塑，只有三个较小的、彩色的折纸造型装饰物。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.08,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"观察明确否定了照片中存在雕塑，与标准事实中的“雕塑”冲突。\"}"
+  },
+  {
+   "file": "2017-11-05 150513.jpg",
+   "asset_id": "asset_1035dbfefeb2",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "建筑"
+   ],
+   "source": "db_metadata",
+   "observation": "照片中有一个巨大的、呈圆锥形的石质建筑或雕塑，顶部有水流而侧面有浮雕。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.16,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“建筑”，且描述了其具体的形态和特征。\"}"
+  },
+  {
+   "file": "2017-11-05 151427.jpg",
+   "asset_id": "asset_97a7d1c1a3f7",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "喷泉"
+   ],
+   "source": "db_metadata",
+   "observation": "照片中包含一个大型的喷泉装置和一些高压输电塔。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.93,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“大型的喷泉装置”，与标准事实“喷泉”一致。\"}"
+  },
+  {
+   "file": "2017-11-05 155728.jpg",
+   "asset_id": "asset_32f931bf4efd",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "水坝"
+   ],
+   "source": "db_metadata",
+   "observation": "照片中包含大型的水利工程建筑，如大坝和相关的工业结构。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.93,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“大坝”，与标准事实“水坝”语义一致。\"}"
+  },
+  {
+   "file": "2018-04-01 210536.jpg",
+   "asset_id": "asset_592522be77e0",
+   "capability": "large_object",
+   "question": "照片里有什么大型物体或雕塑？",
+   "expected": [
+    "棕榈树"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含一些大型雕塑和装饰性的人造结构，位于夜晚的户外广场或广场区域。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 1.07,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中仅提到大型雕塑和人造结构，未明确提及或描述棕榈树。\"}"
+  },
+  {
+   "file": "2018-04-01 210440.jpg",
+   "asset_id": "asset_2c69718cfb69",
+   "capability": "small_object",
+   "question": "照片里有什么道具或小物件？",
+   "expected": [
+    "火把",
+    "火"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含火把、火圈（或火圈道具）以及一些用于表演的道具。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.04,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“火把”和“火圈”，直接支持了标准事实中的“火把、火”。\"}"
+  },
+  {
+   "file": "2018-04-01 210440.jpg",
+   "asset_id": "asset_2c69718cfb69",
+   "capability": "small_object",
+   "question": "照片里有什么道具或小物件？",
+   "expected": [
+    "扇形道具",
+    "扇子"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含火把、火圈（或火圈道具）以及一些用于表演的道具。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.89,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中提到的“一些用于表演的道具”含糊且未明确包含“扇形道具”或“扇子”。\"}"
+  },
+  {
+   "file": "IMG_6340.JPG",
+   "asset_id": "asset_11c3f84b00b6",
+   "capability": "small_object",
+   "question": "照片里有什么道具或小物件？",
+   "expected": [
+    "鸟",
+    "斑胸草雀",
+    "白腰文鸟"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中包含有各种用于展示和教育的道具，如带有鸟类名称标签的展示牌、木质围栏、绳索以及用于展示的模拟环境。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 3.38,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察仅描述了展示道具和环境，未提及具体的鸟类种类（如鸟、斑胸草雀、白腰文鸟）。\"}"
+  },
+  {
+   "file": "IMG_6328.JPG",
+   "asset_id": "asset_0de7a9af3147",
+   "capability": "small_object",
+   "question": "照片里有什么道具或小物件？",
+   "expected": [
+    "小动物",
+    "鸟"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中包含一个水族箱，里面有鱼、水草、装饰性的石头和人造植物，水族箱外有两名孩子，其中一个背着一个白色的小背包。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 1.51,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中仅提到鱼、水草和人造植物，未提及鸟或任何小动物。\"}"
+  },
+  {
+   "file": "IMG_20220623_212642.jpg",
+   "asset_id": "asset_0178d325a08f",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "葱油拌面",
+    "报警电话"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含多种文字，包括“花果资源出租电话”、“大兴 烧烤串儿”、“禁止吸烟”以及“请注意...”等。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 1.34,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中列出的文字内容与标准事实中的“葱油拌面”和“报警电话”均不一致，且观察未提及这些内容。\"}"
+  },
+  {
+   "file": "IMG_20220623_212642.jpg",
+   "asset_id": "asset_0178d325a08f",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "禁止吸烟",
+    "NO SMOKING"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中包含多种文字，包括“花果资源出租电话”、“大兴 烧烤串儿”、“禁止吸烟”以及“请注意...”等。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.17,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“禁止吸烟”，与标准事实“禁止吸烟、NO SMOKING”一致。\"}"
+  },
+  {
+   "file": "IMG_20220716_141621.jpg",
+   "asset_id": "asset_0c11c5733574",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "炸鸡",
+    "創始于",
+    "1974"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含了一份包含多种炸鸡和汉堡菜品及其价格的菜单。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.0,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察仅提到菜单包含炸鸡和汉堡，未提及“创始于”或“1974”等具体文字信息。\"}"
+  },
+  {
+   "file": "IMG_20220716_141625.jpg",
+   "asset_id": "asset_92135a92cd44",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "炸鸡",
+    "創始于",
+    "1974"
+   ],
+   "source": "qa_gold",
+   "observation": "",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 85.86,
+   "l2_verdict": "unknown",
+   "l2_reason": "observation 为空/不可用（结构性兜底，不调用模型）"
+  },
+  {
+   "file": "IMG_20220731_194746.jpg",
+   "asset_id": "asset_d520b5b39c4f",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "板面",
+    "羊杂面"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中显示了一家名为“蒲记板面·羊杂面”的餐厅。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.78,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“蒲记板面·羊杂面”，包含了标准事实中的“板面”和“羊杂面”。\"}"
+  },
+  {
+   "file": "IMG_20220731_194822.jpg",
+   "asset_id": "asset_e52f9a8056f0",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "蒲记",
+    "板面"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中包含大量的中文文字，主要涉及菜单上的食物名称（如“猪记板面”、“羊肉面”、“肥肠爆肚面”）及其价格。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.03,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“猪记板面”，与标准事实中的“蒲记、板面”内容一致（“猪记”与“蒲记”在特定语境下可视为对应或包含关系）。\"}"
+  },
+  {
+   "file": "IMG_8654.JPG",
+   "asset_id": "asset_4bb24fb5b2dc",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "大头儿子",
+    "小头爸爸"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中没有可见的文字。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.61,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察仅描述没有文字，未提及或涉及‘大头儿子、小头爸爸’这一内容事实。\"}"
+  },
+  {
+   "file": "IMG_6340.JPG",
+   "asset_id": "asset_11c3f84b00b6",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "斑胸草雀",
+    "白腰文鸟",
+    "Zebra"
+   ],
+   "source": "vision_ocr",
+   "observation": "",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 71.49,
+   "l2_verdict": "unknown",
+   "l2_reason": "observation 为空/不可用（结构性兜底，不调用模型）"
+  },
+  {
+   "file": "2018-02-18 115419.jpg",
+   "asset_id": "asset_64c930ff7da3",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "建文明城"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中有一辆装饰成火车的游乐设施，车身上有“Alice Park Plaza”字样。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.85,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察中仅提到了“Alice Park Plaza”字样，未提及“建文明城”这一内容。\"}"
+  },
+  {
+   "file": "2018-03-31 235358.jpg",
+   "asset_id": "asset_3cc3c0d7aa15",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "Toilets",
+    "洗手间",
+    "VISA"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中包含多处指示牌，包括“Health Control | 检疫检疫”、“VISA on Arrival | 落地签证”、“Toilets | 洗手间”等文字。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.07,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确包含了“VISA on Arrival | 落地签证”和“Toilets | 洗手间”等文字，与标准事实一致。\"}"
+  },
+  {
+   "file": "2018-03-31 235404.jpg",
+   "asset_id": "asset_2b5cb6337df7",
+   "capability": "visible_text_short",
+   "question": "照片里写了什么文字？请列出全部可见文字。",
+   "expected": [
+    "THAI",
+    "PASSPORT",
+    "泰国护照"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中包含多处指示牌，包含泰文和英文，主要涉及“THAI PASSPORT”、“AIR CREW”、“HANDICAP”以及“CHECK-IN COUNTER”等信息。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.14,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“THAI PASSPORT”，与标准事实“泰国护照”一致。\"}"
+  },
+  {
+   "file": "IMG_20220716_141625.jpg",
+   "asset_id": "asset_92135a92cd44",
+   "capability": "ocr_number",
+   "question": "照片里有哪些数字？请列出全部数字。",
+   "expected": [
+    "1974",
+    "34",
+    "10",
+    "8"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含许多用于价格、年份、口味选择和配比的数字。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.74,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察仅泛泛描述了数字的存在及其用途，未提及任何具体的数字内容。\"}"
+  },
+  {
+   "file": "IMG_20220716_141621.jpg",
+   "asset_id": "asset_0c11c5733574",
+   "capability": "ocr_number",
+   "question": "照片里有哪些数字？请列出全部数字。",
+   "expected": [
+    "1974"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含许多用于价格标注的数字，如 12, 20, 10, 15, 18, 22, 19, 25, 30 等。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 1.26,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为1974，而观察中列出的数字均不包含1974，且观察中出现的数字（如12, 20等）与1974不符。\"}"
+  },
+  {
+   "file": "IMG_20220623_212642.jpg",
+   "asset_id": "asset_0178d325a08f",
+   "capability": "ocr_number",
+   "question": "照片里有哪些数字？请列出全部数字。",
+   "expected": [
+    "22048084",
+    "22048085"
+   ],
+   "source": "qa_gold",
+   "observation": "照片中包含多个数字，包括电话号码、价格、日期和各种标识中的数字。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.77,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察仅泛泛描述包含多种数字，未具体列出或确认包含标准事实中的特定数字。\"}"
+  },
+  {
+   "file": "2018-03-31 235358.jpg",
+   "asset_id": "asset_3cc3c0d7aa15",
+   "capability": "ocr_number",
+   "question": "照片里有哪些数字？请列出全部数字。",
+   "expected": [
+    "227"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中没有显示任何数字。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.57,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为数字227，而观察明确描述照片中没有显示任何数字，两者直接矛盾。\"}"
+  },
+  {
+   "file": "2019-01-10 130421.jpg",
+   "asset_id": "asset_848a48fc2ded",
+   "capability": "ocr_number",
+   "question": "照片里有哪些数字？请列出全部数字。",
+   "expected": [
+    "3"
+   ],
+   "source": "vision_ocr",
+   "observation": "照片中没有明显的数字。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.56,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为数字3，而观察明确表示没有明显的数字，且在回答具体问题时未识别出任何数字。\"}"
+  },
+  {
+   "file": "2017-11-05 150513.jpg",
+   "asset_id": "asset_1035dbfefeb2",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "户外",
+    "景区",
+    "建筑"
+   ],
+   "source": "db_metadata",
+   "observation": "这是一个在户外公共空间中，人们聚集在巨大的、具有纪念碑性质的圆柱形建筑或雕塑前的场景。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.89,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中的“户外公共空间”对应“户外”，“巨大的...建筑或雕塑”对应“建筑”，且“公共空间”符合“景区”的语境。\"}"
+  },
+  {
+   "file": "2017-11-05 150755.jpg",
+   "asset_id": "asset_a0a673d6b5b4",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "户外",
+    "城市",
+    "建筑"
+   ],
+   "source": "db_metadata",
+   "observation": "这张照片展示了一个在雾气或烟霾笼罩下的工业或港口景观，可以看到大型建筑、输电塔和远处的山脉。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.98,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“工业或港口景观”及“大型建筑”符合“户外、城市、建筑”的场景描述。\"}"
+  },
+  {
+   "file": "2017-11-05 151427.jpg",
+   "asset_id": "asset_97a7d1c1a3f7",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "户外",
+    "广场",
+    "喷泉"
+   ],
+   "source": "db_metadata",
+   "observation": "一个位于水岸边的公共广场或公园，设有喷泉和人行道，背景可以看到水域和工业设施。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.86,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“公共广场”和“喷泉”与标准事实中的“广场”和“喷泉”一致，且“水岸边”与“户外”环境相符。\"}"
+  },
+  {
+   "file": "2017-11-05 151451.jpg",
+   "asset_id": "asset_922a8d48d1b5",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "户外",
+    "广场",
+    "喷泉"
+   ],
+   "source": "db_metadata",
+   "observation": "这是一个位于城市滨海区域的公共广场或公园，配有喷泉、绿化带和步行道。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 1.03,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“公共广场或公园”包含“广场”，且明确提到了“喷泉”，符合户外场景描述。\"}"
+  },
+  {
+   "file": "2017-11-05 153809.jpg",
+   "asset_id": "asset_24bf70f7e276",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "港口",
+    "码头"
+   ],
+   "source": "db_metadata",
+   "observation": "这是一个繁忙的港口或工业码头，拥有大型起重机、铁路轨道和大型车辆。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.81,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“港口或工业码头”，与标准事实完全一致。\"}"
+  },
+  {
+   "file": "2017-11-05 155728.jpg",
+   "asset_id": "asset_32f931bf4efd",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "水坝",
+    "户外"
+   ],
+   "source": "db_metadata",
+   "observation": "这张照片展示了一个大型水利工程，具体是一个带有大型闸门和配套设施的水坝或水利枢纽。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.88,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察明确提到了“水坝”，且“水利工程”与“户外”场景高度契合。\"}"
+  },
+  {
+   "file": "2018-04-01 210440.jpg",
+   "asset_id": "asset_2c69718cfb69",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "表演",
+    "部落"
+   ],
+   "source": "qa_gold",
+   "observation": "这是一个在夜晚户外举行的，带有蓝色灯光效果的火艺表演或嘉年华活动。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.81,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中的“火艺表演”与标准事实中的“表演”语义一致，且“嘉年华活动”与“部落”场景高度相关。\"}"
+  },
+  {
+   "file": "2018-04-01 210536.jpg",
+   "asset_id": "asset_592522be77e0",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "棕榈树",
+    "植物"
+   ],
+   "source": "qa_gold",
+   "observation": "这是一个夜晚的沙滩或海滨度假地，有棕榈树、灯光装饰和一些人。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.83,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“棕榈树”，且棕榈树属于植物，符合标准事实。\"}"
+  },
+  {
+   "file": "2018-04-01 210547.jpg",
+   "asset_id": "asset_4b275cb5675b",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "表演",
+    "部落"
+   ],
+   "source": "qa_gold",
+   "observation": "这是一个在夜晚被紫色灯光照亮的户外广场或公共空间，有的人在其中活动。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.8,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察仅提到户外广场和人的活动，未提及“表演”或“部落”等具体内容。\"}"
+  },
+  {
+   "file": "2018-04-01 210550.jpg",
+   "asset_id": "asset_15d0f950c4e4",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "表演",
+    "部落"
+   ],
+   "source": "qa_gold",
+   "observation": "这是一个夜晚的户外广场或公共广场，有灯光照明和一些装饰性雕塑。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.78,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察描述了广场和雕塑，但未提及表演或部落相关内容。\"}"
+  },
+  {
+   "file": "IMG_20220623_212500.jpg",
+   "asset_id": "asset_e62345bed216",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "店铺",
+    "室内"
+   ],
+   "source": "qa_gold",
+   "observation": "三名男子在咖啡店或类似的商业空间内合影。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.69,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"“咖啡店”和“商业空间”与“店铺”、“室内”语义一致且符合场景描述。\"}"
+  },
+  {
+   "file": "IMG_20220623_212642.jpg",
+   "asset_id": "asset_0178d325a08f",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "店铺",
+    "室内"
+   ],
+   "source": "qa_gold",
+   "observation": "一名男子在公共厕所外墙前拍照。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.64,
+   "l2_verdict": "contradicted",
+   "l2_reason": "{\"verdict\": \"contradicted\", \"reason\": \"标准事实为‘店铺、室内’，而观察描述为‘公共厕所外墙’，场景描述不一致。\"}"
+  },
+  {
+   "file": "IMG_20220716_141621.jpg",
+   "asset_id": "asset_0c11c5733574",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "菜单",
+    "餐厅",
+    "炸鸡"
+   ],
+   "source": "qa_gold",
+   "observation": "这张照片展示的是一家快餐店（如KFC）的菜单，上面列出了各种炸鸡、汉堡和套餐的名称及价格。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.99,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“快餐店菜单”和“炸鸡”与标准事实中的“菜单、餐厅、炸鸡”完全吻合。\"}"
+  },
+  {
+   "file": "IMG_20220716_141625.jpg",
+   "asset_id": "asset_92135a92cd44",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "菜单",
+    "餐厅",
+    "炸鸡"
+   ],
+   "source": "qa_gold",
+   "observation": "这张照片展示了一家名为“瑞可咖啡”的店铺的菜单，列出了各种咖啡、茶和特色饮品。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.9,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“菜单”和“店铺”，且“瑞可咖啡”作为餐厅/店铺场景与标准事实一致。\"}"
+  },
+  {
+   "file": "IMG_20230806_203916.jpg",
+   "asset_id": "asset_89498b316439",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "公园",
+    "户外",
+    "夜晚"
+   ],
+   "source": "qa_gold",
+   "observation": "两个小孩在户外的一个大型猫形雕塑上拍照。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.68,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“户外”，且“大型猫形雕塑”通常出现在公园等户外场景，符合事实。\"}"
+  },
+  {
+   "file": "IMG_20230806_204143.jpg",
+   "asset_id": "asset_85e2f09be3ed",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "公园",
+    "户外",
+    "夜晚"
+   ],
+   "source": "qa_gold",
+   "observation": "一个家庭在户外夜晚与一个巨大的卡通角色雕塑合影。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.71,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中明确提到了“户外”和“夜晚”，且“家庭”在“户外夜晚”的场景符合“公园”这一环境描述。\"}"
+  },
+  {
+   "file": "IMG_20230105_202901.jpg",
+   "asset_id": "asset_188a38619abd",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "夜晚",
+    "烟花",
+    "火"
+   ],
+   "source": "vision_class",
+   "observation": "一个穿着黄色外套的小孩在夜晚户外拿着烟花或发光物体。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.75,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“夜晚”与标准事实一致，且“拿着烟花或发光物体”涵盖了“烟花”和“火”的特征。\"}"
+  },
+  {
+   "file": "IMG_6340.JPG",
+   "asset_id": "asset_11c3f84b00b6",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "动物园",
+    "鸟"
+   ],
+   "source": "vision_ocr",
+   "observation": "几个孩子在参观一个展示有各种鸟类照片和实物鸟类的展览或科普馆。",
+   "certainty": "supported",
+   "state": "correct",
+   "latency_s": 0.83,
+   "l2_verdict": "supported",
+   "l2_reason": "{\"verdict\": \"supported\", \"reason\": \"观察中提到的“展示有各种鸟类...的展览或科普馆”与“动物园、鸟”的场景描述一致。\"}"
+  },
+  {
+   "file": "IMG_6328.JPG",
+   "asset_id": "asset_0de7a9af3147",
+   "capability": "scene",
+   "question": "这张照片的场景是什么？",
+   "expected": [
+    "动物园",
+    "提示"
+   ],
+   "source": "vision_ocr",
+   "observation": "两个孩子正在观看一个巨大的水族箱或水下景观展示。",
+   "certainty": "supported",
+   "state": "false_confident",
+   "latency_s": 0.73,
+   "l2_verdict": "unknown",
+   "l2_reason": "{\"verdict\": \"unknown\", \"reason\": \"观察描述的是水族箱或水下景观，而标准事实是动物园，两者场景不一致且未提及。\"}"
+  }
+ ]
+}

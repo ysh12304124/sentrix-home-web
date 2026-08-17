@@ -65,10 +65,14 @@ class FaceClusterer:
     member, which prevents single-link bridge chaining.
     """
 
-    def __init__(self, match_threshold=0.30, minimum_quality=0.30, prototype_limit=6):
+    def __init__(self, match_threshold=0.30, minimum_quality=0.30, prototype_limit=6,
+                 match_strategy="all", topk=3, percentile=0.1):
         self.match_threshold = float(match_threshold)
         self.minimum_quality = float(minimum_quality)
         self.prototype_limit = int(prototype_limit)
+        self.match_strategy = str(match_strategy)
+        self.topk = int(topk)
+        self.percentile = float(percentile)
 
     def fit(self, samples):
         clusters = []
@@ -102,14 +106,30 @@ class FaceClusterer:
             protected = {item.protected_cluster for item in cluster.members if item.protected_cluster}
             if sample.protected_cluster and protected and sample.protected_cluster not in protected:
                 continue
-            if sample.pose_bucket == "unknown":
-                if all(cosine(sample.embedding, member.embedding) >= self.match_threshold for member in cluster.members):
-                    return cluster
-            else:
-                same_view = [member for member in cluster.members if member.pose_bucket == sample.pose_bucket]
-                if not same_view or all(cosine(sample.embedding, member.embedding) >= self.match_threshold for member in same_view):
-                    return cluster
+            same_view = self._same_view_members(cluster, sample)
+            if not same_view or self._matches(sample, same_view):
+                return cluster
         return None
+
+    def _same_view_members(self, cluster, sample):
+        if sample.pose_bucket == "unknown":
+            return cluster.members
+        return [member for member in cluster.members if member.pose_bucket == sample.pose_bucket]
+
+    def _matches(self, sample, members):
+        sims = sorted(cosine(sample.embedding, member.embedding) for member in members)
+        threshold = self.match_threshold
+        if self.match_strategy == "p10":
+            if len(sims) <= 2:
+                return sims[0] >= threshold
+            return sims[int(len(sims) * self.percentile)] >= threshold
+        if self.match_strategy == "topk":
+            k = max(1, min(self.topk, len(sims)))
+            top = sims[-k:]
+            return sum(top) / len(top) >= threshold
+        if self.match_strategy == "mean":
+            return sum(sims) / len(sims) >= threshold
+        return sims[0] >= threshold
 
     def _update_prototypes(self, cluster, sample):
         same_view = [item for item in cluster.prototypes if item.pose_bucket == sample.pose_bucket]

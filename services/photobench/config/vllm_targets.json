@@ -1,0 +1,17 @@
+{
+  "default_target_id": "server-153",
+  "targets": {
+    "backend-100": {
+      "label": "100 后端链路（默认）",
+      "manager_url": "http://192.168.0.153:8501",
+      "model_base_url": "http://192.168.0.153:8101/v1",
+      "description": "100 Sentrix 后端固定连接的第二套 vLLM Manager 和模型服务"
+    },
+    "server-153": {
+      "label": "153 产品链路",
+      "manager_url": "http://192.168.0.153:8500",
+      "model_base_url": "http://192.168.0.153:8100/v1",
+      "description": "153 产品后端固定连接的主 vLLM Manager 和模型服务"
+    }
+  }
+}

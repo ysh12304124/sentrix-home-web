@@ -37,6 +37,30 @@ def align_face_crop(image, bbox, landmarks=None):
         raise FaceEmbeddingUnavailable("invalid face bounding box")
     return Image.fromarray(image[top:bottom, left:right][:, :, ::-1])
 
+
+def _laplacian_variance(pil_image):
+    """Grayscale Laplacian variance of an aligned face crop as a sharpness signal."""
+    import cv2
+    import numpy as np
+
+    try:
+        gray = cv2.cvtColor(np.asarray(pil_image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
+def _normalize_sharpness(raw, low=2.5, high=7.0):
+    """Log-compress raw Laplacian variance into 0..1, clipping at the reference bounds.
+
+    low/high are on the log1p scale and should be calibrated against the real
+    face-crop distribution; the defaults assume sharp aligned 112x112 crops.
+    """
+    import math
+
+    value = (math.log1p(max(0.0, raw)) - low) / (high - low)
+    return max(0.0, min(1.0, value))
+
 try:
     import httpx
 except ImportError:  # Keep pure parsing and SQLite tests runnable without optional runtime deps.
@@ -63,6 +87,21 @@ from .semantic_taxonomy import (
 
 class ModelError(RuntimeError):
     pass
+
+
+class ContextBudgetExceeded(ModelError):
+    pass
+
+
+def _http_error_detail(error, limit=2000):
+    response = getattr(error, "response", None)
+    if response is None:
+        return str(error)
+    try:
+        body = response.text.strip()
+    except Exception:
+        body = ""
+    return f"{error}: {body[:limit]}" if body else str(error)
 
 
 def parse_json_response(value):
@@ -204,6 +243,12 @@ ROLE_INFERENCE = {
 }
 
 
+def _openai_thinking_kwargs():
+    """Return the vLLM chat-template switch; reasoning is disabled by default."""
+    value = os.getenv("SENTRIX_ENABLE_THINKING", "0").strip().lower()
+    return {"enable_thinking": value in {"1", "true", "yes", "on"}}
+
+
 def build_image_prompt(metadata=None):
     prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
 严格返回简体中文 JSON 对象。place 和 semantic.place.primary 必须只依据图片视觉证据，不能用 GPS 或地点上下文覆盖；地点上下文只能作为候选背景。
@@ -286,6 +331,97 @@ class OllamaBackend:
             return []
 
 
+class LocalQwen3VLBackend:
+    """Lazy in-process Qwen3-VL fallback for hosts without a healthy VLM API."""
+
+    name = "qwen3-vl"
+    _load_lock = threading.Lock()
+    _generation_lock = threading.Lock()
+    _shared = {}
+
+    def __init__(self, model_path, device="cpu"):
+        self.model_path = str(Path(model_path).expanduser())
+        self.device = str(device or "cpu").strip().lower()
+
+    @property
+    def endpoint(self):
+        return self.model_path
+
+    @property
+    def model_name(self):
+        return Path(self.model_path).name or "Qwen3-VL"
+
+    def _load(self):
+        key = (self.model_path, self.device)
+        if key in self._shared:
+            return self._shared[key]
+        with self._load_lock:
+            if key in self._shared:
+                return self._shared[key]
+            if not Path(self.model_path).is_dir():
+                raise ModelError(f"Qwen3-VL model path is unavailable: {self.model_path}")
+            try:
+                import torch
+                from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+                load_options = {
+                    "dtype": torch.bfloat16,
+                    "low_cpu_mem_usage": True,
+                }
+                if self.device.startswith("cuda"):
+                    gpu_index = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
+                    load_options.update({
+                        "device_map": "auto",
+                        "max_memory": {
+                            gpu_index: os.getenv("SENTRIX_QWEN3_VL_GPU_MEMORY", "7GiB"),
+                            "cpu": os.getenv("SENTRIX_QWEN3_VL_CPU_MEMORY", "48GiB"),
+                        },
+                    })
+                model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    self.model_path, **load_options,
+                )
+                if not self.device.startswith("cuda"):
+                    model.to(self.device)
+                model.eval()
+                processor = AutoProcessor.from_pretrained(self.model_path)
+            except Exception as error:
+                raise ModelError(f"Qwen3-VL load failed: {error}") from error
+            self._shared[key] = (model, processor)
+            return model, processor
+
+    def chat(self, prompt, images=None, vision_options=None, json_mode=True, role=None):
+        try:
+            import torch
+            from PIL import Image
+
+            model, processor = self._load()
+            content = []
+            for item in images or []:
+                image = Image.open(BytesIO(base64.b64decode(item["base64"]))).convert("RGB")
+                content.append({"type": "image", "image": image})
+            content.append({"type": "text", "text": prompt})
+            messages = [{"role": "user", "content": content}]
+            inputs = processor.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True,
+                return_dict=True, return_tensors="pt",
+            ).to(model.device)
+            requested = (vision_options or {}).get("num_predict")
+            if requested is None and role in ROLE_INFERENCE:
+                requested = ROLE_INFERENCE[role]["num_predict"]
+            max_new_tokens = min(1024, max(64, int(requested or 768)))
+            with self._generation_lock, torch.inference_mode():
+                generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            trimmed = [output[len(source):] for source, output in zip(inputs.input_ids, generated)]
+            return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+        except ModelError:
+            raise
+        except Exception as error:
+            raise ModelError(f"Qwen3-VL inference failed: {error}") from error
+
+    def embed_text(self, text):
+        return []
+
+
 class E2BBackend:
     """E2B LoRA backend — local 2B model via E2B server on :8100."""
 
@@ -352,7 +488,7 @@ class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
-                 repair_model=None, backend=None, api_key=None):
+                 repair_model=None, backend=None, api_key=None, manager_url=None):
         self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
         ollama_fallback_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         if self.backend == "openai":
@@ -364,10 +500,21 @@ class GammaClient:
                 or "http://127.0.0.1:8100/v1"
             )
             self._model_setting = model or os.getenv("SENTRIX_VLLM_MODEL") or os.getenv("VLLM_MODEL") or os.getenv("OPENAI_MODEL") or "gemma4-12b-it"
+        elif self.backend == "qwen3-vl":
+            self._base_url_setting = str(
+                base_url or os.getenv("SENTRIX_QWEN3_VL_MODEL_PATH", "")
+            ).strip()
+            self._model_setting = model or Path(self._base_url_setting).name or "Qwen3-VL"
         else:
             self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
             self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        self.manager_url = (
+            manager_url
+            or os.getenv("SENTRIX_VLLM_MANAGER_API")
+            or os.getenv("SENTRIX_VLLM_API_URL")
+            or ""
+        ).strip().rstrip("/")
         self._call_metrics_local = threading.local()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
@@ -379,6 +526,10 @@ class GammaClient:
             keep_alive=-1 if str(_init_keep_alive).strip() == "-1" else _init_keep_alive,
         )
         self._e2b = E2BBackend(os.getenv("E2B_BASE_URL"), _init_timeout)
+        self._local_qwen = LocalQwen3VLBackend(
+            self._base_url_setting,
+            os.getenv("SENTRIX_QWEN3_VL_DEVICE", "cpu"),
+        ) if self.backend == "qwen3-vl" else None
         self._store = None
         self._active_cache = None
         self._cache_ts = 0.0
@@ -428,6 +579,8 @@ class GammaClient:
             return "openai"
         if value in {"ollama", "ollama_local"}:
             return "ollama"
+        if value in {"qwen3-vl", "qwen3_vl", "local_qwen3_vl"}:
+            return "qwen3-vl"
         raise ModelError(f"unsupported llm backend: {value}")
 
     @staticmethod
@@ -452,6 +605,8 @@ class GammaClient:
         return "ollama_12b"
 
     def _active(self):
+        if self.backend == "qwen3-vl":
+            return self._local_qwen
         import time
         now = time.monotonic()
         if self._active_cache is not None and (now - self._cache_ts) < self._CACHE_TTL_SECONDS:
@@ -537,23 +692,108 @@ class GammaClient:
             return self.chat(prompt, json_mode=False, role=role)
 
         endpoint_base, model = self._endpoint_for(role)
+        requested_max_tokens = int(max_tokens) if max_tokens is not None else None
+        budget = self._tokenize_for_budget(endpoint_base, messages)
+        if budget:
+            prompt_tokens = int(budget["prompt_tokens"])
+            max_model_len = int(budget["max_model_len"])
+            available_output_tokens = max_model_len - prompt_tokens
+            if available_output_tokens < 1:
+                metrics = {
+                    "status": "context_budget_exceeded",
+                    "error": "prompt leaves no room for generation",
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": None,
+                    "requested_max_tokens": requested_max_tokens,
+                    "effective_max_tokens": 0,
+                    "available_output_tokens": max(0, available_output_tokens),
+                    "max_model_len": max_model_len,
+                    "estimated_total_tokens": prompt_tokens + (requested_max_tokens or 0),
+                    "token_count_source": "vllm_tokenize",
+                    "ttft_ms": None,
+                    "total_ms": None,
+                    "tokens_per_second": None,
+                    "streamed": False,
+                }
+                self._record_call_metrics(role, model, endpoint_base, metrics)
+                raise ContextBudgetExceeded(
+                    f"context budget exceeded: prompt_tokens={prompt_tokens}, "
+                    f"max_model_len={max_model_len}")
+            if requested_max_tokens is None:
+                max_tokens = available_output_tokens
+            else:
+                max_tokens = min(requested_max_tokens, available_output_tokens)
+
         payload = {
             "model": model,
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": temperature,
+            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        request_started = time.perf_counter()
         try:
             return self._chat_openai_stream(
-                endpoint_base, payload, headers, role, model, json_mode=False)
+                endpoint_base, payload, headers, role, model, json_mode=False,
+                budget_metrics={
+                    "requested_max_tokens": requested_max_tokens,
+                    "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
+                    "available_output_tokens": (
+                        int(budget["max_model_len"]) - int(budget["prompt_tokens"])
+                        if budget else None
+                    ),
+                    "max_model_len": int(budget["max_model_len"]) if budget else None,
+                    "preflight_prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
+                    "estimated_total_tokens": (
+                        int(budget["prompt_tokens"]) + int(max_tokens)
+                        if budget and max_tokens is not None else None
+                    ),
+                    "token_count_source": "vllm_tokenize" if budget else "response_usage",
+                })
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
-            raise ModelError(f"gamma request failed: {error}") from error
+            error_detail = _http_error_detail(error)
+            self._record_call_metrics(role, model, endpoint_base, {
+                "status": "error",
+                "error": error_detail,
+                "ttft_ms": None,
+                "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
+                "prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
+                "completion_tokens": None,
+                "tokens_per_second": None,
+                "streamed": True,
+                "requested_max_tokens": requested_max_tokens,
+                "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
+                "max_model_len": int(budget["max_model_len"]) if budget else None,
+                "token_count_source": "vllm_tokenize" if budget else None,
+            })
+            raise ModelError(f"model request failed: {error_detail}") from error
+
+    def _tokenize_for_budget(self, endpoint_base, messages):
+        """Ask the Manager bound to this endpoint to tokenize with the active model."""
+        manager_url = self.manager_url
+        if not manager_url:
+            return None
+        try:
+            response = httpx.post(
+                f"{manager_url}/tokenize-current",
+                json={"messages": messages, "add_generation_prompt": True},
+                timeout=min(15, self.timeout),
+            )
+            response.raise_for_status()
+            value = response.json()
+            if int(value.get("prompt_tokens") or 0) < 1 or int(value.get("max_model_len") or 0) < 1:
+                raise ValueError("invalid tokenizer budget response")
+            return value
+        except (httpx.HTTPError, ValueError, TypeError) as error:
+            if os.getenv("SENTRIX_TOKEN_BUDGET_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}:
+                raise ModelError(f"token budget preflight failed: {error}") from error
+            return None
 
     def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
@@ -592,7 +832,7 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError) as error:
-            raise ModelError(f"gamma request failed: {error}") from error
+            raise ModelError(f"model request failed: {_http_error_detail(error)}") from error
 
 
     def _record_call_metrics(self, role, model, endpoint, metrics):
@@ -627,6 +867,7 @@ class GammaClient:
             "stream": use_stream,
             "stream_options": {"include_usage": True} if use_stream else None,
             "temperature": 0,
+            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
             payload["response_format"] = {"type": "json_object"}
@@ -639,6 +880,7 @@ class GammaClient:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        request_started = time.perf_counter()
         try:
             if use_stream:
                 return self._chat_openai_stream(endpoint_base, payload, headers, role, model, json_mode)
@@ -658,9 +900,21 @@ class GammaClient:
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
-            raise ModelError(f"gamma request failed: {error}") from error
+            error_detail = _http_error_detail(error)
+            self._record_call_metrics(role, model, endpoint_base, {
+                "status": "error",
+                "error": error_detail,
+                "ttft_ms": None,
+                "total_ms": round((time.perf_counter() - request_started) * 1000, 1),
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "tokens_per_second": None,
+                "streamed": use_stream,
+            })
+            raise ModelError(f"model request failed: {error_detail}") from error
 
-    def _chat_openai_stream(self, endpoint_base, payload, headers, role, model, json_mode=False):
+    def _chat_openai_stream(self, endpoint_base, payload, headers, role, model, json_mode=False,
+                            budget_metrics=None):
         """Streaming variant: buffer chunks, capture TTFT/tokens/throughput."""
         t0 = time.perf_counter()
         first_token_t = None
@@ -707,6 +961,7 @@ class GammaClient:
             "ttft_ms": ttft_ms, "total_ms": total_ms,
             "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "tokens_per_second": tps, "streamed": True,
+            **(budget_metrics or {}),
         })
         self._record_validation_call(role, endpoint_base, model, json_mode, text)
         return text
@@ -740,7 +995,7 @@ class GammaClient:
             "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "320")),
         }
 
-    def _encode_core_image(self, path):
+    def encode_vision_image(self, path):
         """Downsample only the model input; the source asset remains untouched."""
         file_path = Path(path)
         max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "896"))
@@ -759,6 +1014,9 @@ class GammaClient:
             encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
             mime_type = guess_mime_type(file_path)
             return encoded, mime_type
+
+    def _encode_core_image(self, path):
+        return self.encode_vision_image(path)
 
     def analyze_image(self, path, metadata=None):
         file_path = Path(path)
@@ -1089,10 +1347,13 @@ class FaceAdapter:
         self._app = None
         self._load_lock = threading.Lock()
         self.error = None
-        self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "adaface").lower()
+        self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "legacy").lower()
         self.identity_adapter = self._build_identity_adapter()
         self.identity_error = None
         self.identity_runtime_error = None
+        self.identity_fallback = False
+        self.identity_fallback_model = None
+        self.identity_fallback_error = None
         if self.identity_model not in {"none", "legacy", "adaface", "magface"}:
             self.identity_error = f"unsupported face embedding mode: {self.identity_model}"
         elif self.identity_model in {"adaface", "magface"} and not self.identity_adapter.available:
@@ -1114,6 +1375,10 @@ class FaceAdapter:
 
     @property
     def identity_ready(self):
+        if self.identity_model == "none":
+            return False
+        if self.identity_fallback:
+            return True
         return self.identity_configured and self.identity_runtime_error is None
 
     @property
@@ -1150,13 +1415,15 @@ class FaceAdapter:
                         providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
                         kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
                         if self.identity_model in {"adaface", "magface"}:
-                            # AdaFace/MagFace produce the only identity vector. Avoid
-                            # loading buffalo_l recognition and demographic models.
-                            kwargs["allowed_modules"] = ["detection", "landmark_2d_106"]
+                            # AdaFace/MagFace are preferred for identity, but
+                            # buffalo_l recognition is kept as a fallback when
+                            # the preferred identity adapter cannot load or run.
+                            kwargs["allowed_modules"] = ["detection", "landmark_2d_106", "recognition"]
                         if os.getenv("FACE_MODEL_ROOT"):
                             kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
                         self._app = FaceAnalysis(**kwargs)
-                        self._app.prepare(ctx_id=-1, det_size=(640, 640))
+                        det_size = int(os.getenv("FACE_DET_SIZE", "640"))
+                        self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
             import cv2
             import numpy as np
             image = cv2.imread(str(path))
@@ -1173,7 +1440,7 @@ class FaceAdapter:
             faces = self._app.get(image)
             image_height, image_width = image.shape[:2]
             min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
-            min_score = float(os.getenv("FACE_MIN_DETECTION_SCORE", "0.72"))
+            min_score = float(os.getenv("FACE_MIN_DETECTION_SCORE", "0.5"))
             results = []
             for face in faces:
                 bbox = [float(item) for item in face.bbox]
@@ -1186,16 +1453,25 @@ class FaceAdapter:
                 # Identity candidacy is deliberately stricter than face evidence.
                 # A weak/small face stays attached to the observation but cannot
                 # create a noisy pending person cluster.
-                sharpness = 0.0
-                quality = compute_face_quality(score, area_ratio, sharpness, getattr(face, "pose", []))
+                pose = [float(item) for item in getattr(face, "pose", [])] if getattr(face, "pose", None) is not None else []
+                landmarks = [[float(value) for value in point] for point in getattr(face, "kps", [])] if getattr(face, "kps", None) is not None else []
+                try:
+                    face_crop = align_face_crop(image, bbox, landmarks)
+                    raw_sharpness = _laplacian_variance(face_crop)
+                except Exception:
+                    face_crop = None
+                    raw_sharpness = 0.0
+                sharpness = _normalize_sharpness(raw_sharpness)
+                quality = compute_face_quality(score, area_ratio, sharpness, pose)
                 results.append({
                     "bbox": bbox,
                     "confidence": score,
                     "quality": quality,
                     "area_ratio": area_ratio,
                     "sharpness": sharpness,
-                    "pose": [float(item) for item in getattr(face, "pose", [])] if getattr(face, "pose", None) is not None else [],
-                    "landmarks": [[float(value) for value in point] for point in getattr(face, "kps", [])] if getattr(face, "kps", None) is not None else [],
+                    "raw_sharpness": raw_sharpness,
+                    "pose": pose,
+                    "landmarks": landmarks,
                     "embedding": face.embedding.tolist() if getattr(face, "embedding", None) is not None else [],
                 })
                 result = results[-1]
@@ -1203,31 +1479,62 @@ class FaceAdapter:
                     result["embedding_model"] = self.identity_model
                     result["embedding_version"] = self.identity_adapter.model_version
                     result["identity_ready"] = self.identity_configured
-                    if not self.identity_configured:
-                        result["embedding"] = []
-                        result["identity_error"] = self.identity_error
-                    else:
+                    identity_error = None
+                    if self.identity_configured:
                         try:
-                            crop = align_face_crop(image, bbox, result["landmarks"])
+                            crop = face_crop if face_crop is not None else align_face_crop(image, bbox, result["landmarks"])
                             embedded = self.identity_adapter.embed(crop)
                             result["embedding"] = embedded.embedding
                             result["embedding_version"] = embedded.model_version
                             result["quality_signal"] = embedded.quality_signal
                             # AdaFace norm is stored as provenance, not treated as
                             # a 0..10 score. It must not saturate all sample quality.
-                            result["identity_eligible"] = result["quality"] >= float(
-                                os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55")
+                            result["identity_eligible"] = (
+                                result["quality"] >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
+                                and score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
                             )
+                            self.identity_runtime_error = None
+                            self.identity_fallback = False
+                            self.identity_fallback_model = None
+                            self.identity_fallback_error = None
                         except FaceEmbeddingUnavailable as error:
-                            result["embedding"] = []
-                            result["identity_ready"] = False
-                            result["identity_error"] = str(error)
-                            self.identity_runtime_error = str(error)
+                            identity_error = str(error)
+                    else:
+                        identity_error = self.identity_error
+                    if identity_error:
+                        self._apply_identity_fallback(result, identity_error)
                 elif self.identity_model == "legacy":
                     result["embedding_model"] = "buffalo_l"
                     result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
                     result["identity_ready"] = True
+                    result["identity_eligible"] = (
+                        result["quality"] >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
+                        and score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
+                    )
             return results
         except Exception as error:  # Optional model should not block image memory.
             self.error = str(error)
             return []
+
+    def _apply_identity_fallback(self, result, error):
+        """Use InsightFace's loaded buffalo_l vector when the preferred adapter fails."""
+        fallback_embedding = result.get("embedding") or []
+        if not fallback_embedding:
+            result["embedding"] = []
+            result["identity_ready"] = False
+            result["identity_error"] = str(error)
+            self.identity_runtime_error = str(error)
+            return False
+        result["embedding"] = fallback_embedding
+        result["embedding_model"] = "buffalo_l"
+        result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
+        result["identity_ready"] = True
+        result["identity_fallback"] = True
+        result["identity_fallback_model"] = "buffalo_l"
+        result["identity_fallback_error"] = str(error)
+        result["identity_error"] = str(error)
+        self.identity_fallback = True
+        self.identity_fallback_model = "buffalo_l"
+        self.identity_fallback_error = str(error)
+        self.identity_runtime_error = str(error)
+        return True

@@ -4,10 +4,113 @@ from unittest.mock import patch
 from pathlib import Path
 import tempfile
 
-from backend.model_clients import GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
+import httpx
+from PIL import Image
+
+from backend.model_clients import ContextBudgetExceeded, GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
+from backend.agent_runtime.tool_policy import ToolPolicy
 
 
 class ModelClientTests(unittest.TestCase):
+    def test_tool_policy_preserves_private_model_metrics_for_runtime_extraction(self):
+        payload = {
+            "summary": "done",
+            "_model_call_metrics": [{"role": "inspect", "status": "error"}],
+            "private_value": "hidden",
+        }
+
+        sanitized = ToolPolicy._sanitize(payload, "inspect_photo")
+
+        self.assertEqual(sanitized["_model_call_metrics"], payload["_model_call_metrics"])
+        self.assertNotIn("private_value", sanitized)
+
+    @patch("backend.model_clients.httpx.post")
+    def test_failed_multimodal_call_keeps_error_metrics(self, post):
+        request = httpx.Request("POST", "http://sentrix-vllm/v1/chat/completions")
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"error": {"message": "Input length (11888) exceeds maximum context length (4501)."}},
+        )
+        post.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "bad request", request=request, response=response)
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+
+        with self.assertRaisesRegex(Exception, "model request failed"):
+            client.chat(
+                "看图", [{"base64": "image", "mime_type": "image/jpeg"}],
+                json_mode=True, role="inspect",
+            )
+
+        metrics = client.get_and_clear_call_metrics()
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(metrics[0]["role"], "inspect")
+        self.assertEqual(metrics[0]["status"], "error")
+        self.assertIn("bad request", metrics[0]["error"])
+        self.assertIn("11888", metrics[0]["error"])
+        self.assertFalse(metrics[0]["streamed"])
+        self.assertIsNotNone(metrics[0]["total_ms"])
+
+    def test_vision_image_encoding_downsamples_without_modifying_source(self):
+        client = GammaClient()
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image_file:
+            source = Image.new("RGB", (4032, 3024), color=(100, 120, 140))
+            source.save(image_file.name, format="JPEG")
+            original_bytes = Path(image_file.name).read_bytes()
+
+            encoded, mime_type = client.encode_vision_image(image_file.name)
+
+            decoded_path = Path(image_file.name).with_suffix(".decoded.jpg")
+            try:
+                import base64
+                decoded_path.write_bytes(base64.b64decode(encoded))
+                with Image.open(decoded_path) as resized:
+                    self.assertEqual(resized.size, (896, 672))
+            finally:
+                decoded_path.unlink(missing_ok=True)
+            self.assertEqual(mime_type, "image/jpeg")
+            self.assertEqual(Path(image_file.name).read_bytes(), original_bytes)
+
+    def test_chat_messages_caps_output_to_remaining_context(self):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        with patch.object(client, "_tokenize_for_budget", return_value={
+            "prompt_tokens": 4401, "max_model_len": 4501,
+        }), patch.object(client, "_chat_openai_stream", return_value="ok") as stream:
+            result = client.chat_messages(
+                [{"role": "user", "content": "test"}],
+                role="tool_loop", max_tokens=384,
+            )
+
+        self.assertEqual(result, "ok")
+        payload = stream.call_args.args[1]
+        self.assertEqual(payload["max_tokens"], 100)
+        self.assertEqual(stream.call_args.kwargs["budget_metrics"]["estimated_total_tokens"], 4501)
+
+    def test_chat_messages_blocks_prompt_that_fills_context(self):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        with patch.object(client, "_tokenize_for_budget", return_value={
+            "prompt_tokens": 4501, "max_model_len": 4501,
+        }), patch.object(client, "_chat_openai_stream") as stream:
+            with self.assertRaises(ContextBudgetExceeded):
+                client.chat_messages(
+                    [{"role": "user", "content": "test"}],
+                    role="tool_loop", max_tokens=384,
+                )
+
+        stream.assert_not_called()
+        metrics = client.get_and_clear_call_metrics()
+        self.assertEqual(metrics[0]["status"], "context_budget_exceeded")
+        self.assertEqual(metrics[0]["prompt_tokens"], 4501)
+        self.assertEqual(metrics[0]["estimated_total_tokens"], 4885)
+
+    def test_token_budget_uses_runtime_bound_manager(self):
+        client = GammaClient(
+            base_url="http://sentrix-vllm/v1",
+            model="test-model",
+            manager_url="http://manager-8500/",
+        )
+        self.assertEqual(client.manager_url, "http://manager-8500")
+
     def test_parses_json_inside_markdown_fence(self):
         result = parse_json_response('```json\n{"caption":"公园"}\n```')
         self.assertEqual(result["caption"], "公园")
@@ -44,7 +147,18 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(payload["model"], "gemma4-12b-it")
         self.assertEqual(payload["max_tokens"], 512)
         self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
         self.assertNotIn("keep_alive", payload)
+
+    @patch("backend.model_clients.GammaClient._tokenize_for_budget", return_value=None)
+    @patch("backend.model_clients.GammaClient._chat_openai_stream", return_value="完成")
+    def test_agent_messages_disable_vllm_thinking_by_default(self, stream, tokenize):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="qwen3.5-4b")
+
+        client.chat_messages([{"role": "user", "content": "测试"}], role="answer")
+
+        payload = stream.call_args.args[1]
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
 
     @patch("backend.model_clients.httpx.post")
     def test_gamma_vllm_multimodal_request_uses_openai_image_content(self, post):

@@ -19,6 +19,11 @@ import time
 from pathlib import Path
 
 from .tool_registry import ToolSpec, register
+from .capability import tool_capability_summary
+from .intent import ocr_intent, visual_intent
+from .ocr_tool import (_read_photo_text, ocr_telemetry_snapshot,
+                       record_ocr_telemetry, small_ocr_available)
+from .ocr_tool import bind_ocr_runtime
 
 _RUNTIME: dict = {}
 
@@ -30,6 +35,7 @@ def bind_runtime(store, *, gamma=None, embedding_router=None, retrieval_config=N
     _RUNTIME["embedding_router"] = embedding_router
     _RUNTIME["retrieval_config"] = retrieval_config
     _RUNTIME["result_sets"] = ResultSetStore(store)
+    bind_ocr_runtime(_RUNTIME)
 
 
 def set_conversation_id(conversation_id):
@@ -163,7 +169,7 @@ def _resolve_entity(name, scope_id):
 
 
 # ---- Tool 1: query_memory_facts ----
-_FACT_OPERATIONS = {"count", "exists", "first", "last", "date", "group", "meal"}
+_FACT_OPERATIONS = {"count", "exists", "first", "last", "date", "group", "meal", "list"}
 
 
 def _normalize_fact_arguments(arguments: dict) -> tuple[str, str]:
@@ -184,6 +190,8 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
     filters = arguments.get("filters") or {}
     scope_id = (context or {}).get("scope_id") or ""
     viewer_id = (context or {}).get("viewer_id") or "owner"
+    if operation == "list":
+        return _query_media_list(filters, scope_id=scope_id, viewer_id=viewer_id)
     if operation == "meal":
         # Phase C C5：饮食/活动聚合（事件级去重 + 食物证据分层）
         return _query_meal_evidence(filters, scope_id=scope_id, viewer_id=viewer_id)
@@ -237,30 +245,129 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
     return out
 
 
+def _query_media_list(filters: dict, *, scope_id="home-default", viewer_id="owner") -> dict:
+    """List actual media assets instead of only counting them.
+
+    The tool contract keeps the model in charge: it receives stable IDs,
+    media_kind, and for keyframes the owning video/time/context.  It can then
+    decide whether to name the videos, deliver the source video, or inspect
+    specific keyframes.
+    """
+    from ..structured_memory import StructuredMemoryExecutor
+
+    store = _RUNTIME.get("store")
+    if store is None:
+        return {"operation": "list", "summary": "记忆库不可用。", "total": 0,
+                "items": [], "coverage": {"complete": False}}
+    draft = _draft_from_filters(filters, answer_type="asset_set")
+    spec = _spec_for(draft, scope_id, viewer_id)
+    executor = StructuredMemoryExecutor(store)
+    media_filter = str((filters or {}).get("media") or "").strip().lower() or None
+    try:
+        assets = executor._matching_assets(draft, spec, limit=500)
+    except Exception:
+        assets = []
+    items = []
+    for row in assets:
+        asset = store.get_asset(row.get("id")) or {}
+        if not asset:
+            continue
+        media_type = asset.get("media_type") or row.get("media_type") or ""
+        derived_kind = asset.get("derived_kind")
+        if derived_kind == "video_keyframe":
+            media_kind = "video_keyframe"
+        elif media_type == "video":
+            media_kind = "video"
+        elif media_type == "image":
+            media_kind = "original_image"
+        else:
+            media_kind = media_type or "unknown"
+        item = {
+            "asset_id": asset.get("id"),
+            "file_name": asset.get("file_name"),
+            "media_type": media_type,
+            "media_kind": media_kind,
+            "derived_kind": derived_kind,
+            "captured_at": asset.get("captured_at") or row.get("captured_at"),
+        }
+        if derived_kind == "video_keyframe":
+            source_video_id = asset.get("parent_asset_id")
+            item["source_video_asset_id"] = source_video_id
+            item["source_timestamp_sec"] = asset.get("source_timestamp_sec")
+            item["source_scene_index"] = asset.get("source_scene_index")
+            source_video = store.get_asset(source_video_id) if source_video_id else None
+            item["source_video_file_name"] = (source_video or {}).get("file_name")
+        if media_type == "video":
+            metadata = asset.get("metadata_json") or {}
+            video_metadata = metadata.get("video_metadata") or {}
+            scenes = store.list_video_scene_events(asset.get("id")) if store.list_video_scene_events else []
+            item["duration_sec"] = video_metadata.get("duration_sec")
+            item["scene_count"] = int(metadata.get("worldmm_scene_count") or len(scenes) or 0)
+            item["keyframe_count"] = int(
+                metadata.get("worldmm_selected_keyframe_count")
+                or metadata.get("worldmm_summary_keyframe_count")
+                or metadata.get("worldmm_keyframe_count")
+                or 0
+            )
+            item["scene_samples"] = []
+            for scene in (scenes or [])[:5]:
+                keyframe_samples = []
+                for frame in (scene.get("keyframe_assets") or [])[:3]:
+                    keyframe_samples.append({
+                        "asset_id": frame.get("id"),
+                        "timestamp_sec": frame.get("source_timestamp_sec"),
+                        "source_scene_index": frame.get("source_scene_index"),
+                    })
+                item["scene_samples"].append({
+                    "scene_id": scene.get("id"),
+                    "title": scene.get("title"),
+                    "start_sec": scene.get("source_start_sec"),
+                    "end_sec": scene.get("source_end_sec"),
+                    "source_scene_index": scene.get("source_scene_index"),
+                    "keyframe_samples": keyframe_samples,
+                })
+        items.append(item)
+    limited = items[:80]
+    summary_items = []
+    for item in limited:
+        if item.get("media_kind") == "video":
+            duration = item.get("duration_sec")
+            summary_items.append(
+                f"{item.get('file_name') or '未命名视频'}（时长 {duration if duration is not None else '未知'} 秒，"
+                f"{item.get('scene_count') or 0} 个场景）"
+            )
+        elif item.get("media_kind") == "video_keyframe":
+            source = item.get("source_video_file_name") or "未知视频"
+            ts = item.get("source_timestamp_sec")
+            summary_items.append(
+                f"关键帧 {item.get('file_name') or '未命名关键帧'}（来自 {source} 第 {ts if ts is not None else '未知'} 秒）"
+            )
+        else:
+            summary_items.append(item.get("file_name") or "未命名媒体")
+    return {
+        "operation": "list",
+        "answer_type": "media_list",
+        "summary": "；".join(summary_items[:20]),
+        "value": len(limited),
+        "total": len(items),
+        "items": limited,
+        "has_more": len(items) > len(limited),
+        "media_filter": media_filter,
+        "filters_applied": {
+            "scope_id": scope_id or None,
+            "media": media_filter,
+        },
+        "coverage": {"complete": True},
+    }
+
+
 # ---- Phase C C5：饮食 / 活动证据聚合 ----
 
-_FOOD_WORDS = (
-    "火锅|烧烤|烤肉|烤鸭|蛋糕|面条|米饭|炒饭|饺子|包子|馒头|汤|菜|水果|咖啡|茶|奶茶|"
-    "啤酒|红酒|饮料|零食|冰淇淋|披萨|汉堡|寿司|刺身|拉面|意面|牛排|炸鸡|烤鱼|鱼|虾|"
-    "螃蟹|蛋|面包|饼干|巧克力|甜品|粥|米粉|肠粉|点心|卤味|麻辣烫|串串|小龙虾|牛蛙|"
-    "鸡翅|薯条|玉米|沙拉|三明治|煎饼|油条|豆浆|酸奶|牛奶|糖果|坚果|炒面|凉皮|饺子|"
-    "hotpot|bbq|barbecue|cake|noodles|rice|dumpling|pizza|burger|sushi|steak|"
-    "fried chicken|bread|dessert|salad|sandwich|fruit|coffee|tea|milk|ice cream|wine|beer"
-)
 _MEAL_ACTIVITY = (
     "吃|餐|饭|聚餐|火锅|烧烤|早餐|午餐|晚餐|夜宵|宴|宴请|下厨|做饭|煮|炒|煎|蒸|烤|"
     "dining|dinner|lunch|breakfast|eating|meal|bbq|hotpot|cook|cooking|party"
 )
-_FOOD_RE = None
 _MEAL_ACTIVITY_RE = None
-
-
-def _food_re():
-    global _FOOD_RE
-    if _FOOD_RE is None:
-        import re as _re
-        _FOOD_RE = _re.compile(r"(" + _FOOD_WORDS + r")", _re.I)
-    return _FOOD_RE
 
 
 def _meal_activity_re():
@@ -271,24 +378,12 @@ def _meal_activity_re():
     return _MEAL_ACTIVITY_RE
 
 
-def _match_foods(text: str) -> list[str]:
-    """从文本里找出命中的食物词（去重、保持出现顺序）。"""
-    if not text:
-        return []
-    found, seen = [], set()
-    for m in _food_re().finditer(text):
-        word = m.group(1).strip().lower()
-        if word and word not in seen:
-            seen.add(word)
-            found.append(word)
-    return found
-
-
 def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="owner") -> dict:
-    """Phase C C5：饮食/活动聚合。
+    """饮食/活动聚合（简化版）。
 
-    数据源分层：objects_json（VLM 物体标签）> caption/ocr（显式食物词）> activity/event_type（用餐场景）。
-    事件级去重：同一 event 的多张照片只算一次用餐；无事件关联的观察按单条计。
+    食物来自数据层已产出的 objects_json（VLM 物体标签），不再用死代码食物词表
+    去匹配 caption/ocr；“是不是用餐场景”由 activity/event_type/caption 判断。
+    事件级去重：同一 event 的多张照片只算一次用餐。
     """
     from ..structured_memory import StructuredMemoryExecutor
     store = _RUNTIME.get("store")
@@ -314,7 +409,7 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
         params.append(end)
     rows = store._rows(
         "SELECT o.id AS observation_id, o.asset_id, o.activity, o.event_type, o.caption, "
-        "o.ocr_text, o.objects_json, a.captured_at FROM observations o "
+        "o.objects_json, a.captured_at FROM observations o "
         "JOIN assets a ON a.id = o.asset_id WHERE " + " AND ".join(clauses) +
         " ORDER BY a.captured_at", params)
 
@@ -327,50 +422,36 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
     def _event_key(observation_id):
         return obs_to_event.get(observation_id) or f"obs:{observation_id}"
 
-    explicit_by_event: dict[str, set[str]] = {}
-    meal_scene_by_event: dict[str, str] = {}
-    possible_by_event: dict[str, set[str]] = {}
+    foods_by_event: dict[str, set[str]] = {}
     meal_observation_ids: list[str] = []
+    meal_events_without_food = 0
     for row in rows:
+        activity = str(row["activity"] or "")
+        event_type = str(row["event_type"] or "")
+        caption = str(row["caption"] or "")
+        if not _meal_activity_re().search(" ".join([activity, event_type, caption])):
+            continue
+        meal_observation_ids.append(row["observation_id"])
         objects = []
         try:
             objects = json.loads(row["objects_json"] or "[]")
         except Exception:
             objects = []
-        object_text = " ".join(str(o) for o in objects if isinstance(o, str))
-        caption = str(row["caption"] or "")
-        ocr = str(row["ocr_text"] or "")
-        activity = str(row["activity"] or "")
-        event_type = str(row["event_type"] or "")
-        blob = " ".join([object_text, caption, ocr])
-        foods = _match_foods(blob)
+        objs = [str(o).strip() for o in objects if isinstance(o, str) and str(o).strip()]
         if food_hint:
-            foods = [f for f in foods if food_hint in f]
-            if not foods:
-                continue
-        is_meal_scene = bool(_meal_activity_re().search(" ".join([activity, event_type, caption])))
-        key = _event_key(row["observation_id"])
-        if foods:
-            explicit_by_event.setdefault(key, set()).update(foods)
-            meal_observation_ids.append(row["observation_id"])
-        elif is_meal_scene:
-            meal_scene_by_event.setdefault(key, activity or event_type or caption[:40])
-            meal_observation_ids.append(row["observation_id"])
+            objs = [o for o in objs if food_hint in o.lower()]
+        if objs:
+            foods_by_event.setdefault(_event_key(row["observation_id"]), set()).update(objs)
         else:
-            # caption/ocr 出现"吃了/喝了/点了"等弱用餐语境 → possible 层
-            if _meal_activity_re().search(caption + " " + ocr):
-                possible_by_event.setdefault(key, set()).update(
-                    _match_foods(caption + " " + ocr) or [caption[:40]])
-                meal_observation_ids.append(row["observation_id"])
+            meal_events_without_food += 1
 
     food_counts: dict[str, int] = {}
-    for foods in explicit_by_event.values():
+    for foods in foods_by_event.values():
         for food in foods:
             food_counts[food] = food_counts.get(food, 0) + 1
     top_foods = [{"food": food, "events": count}
                  for food, count in sorted(food_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
-    total_events = len({_event_key(r["observation_id"]) for r in rows})
     meal_event_keys = {_event_key(oid) for oid in meal_observation_ids}
     meal_samples = []
     for r in rows[:3]:
@@ -378,7 +459,7 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
             "asset_id": r.get("asset_id"),
             "captured_at": r.get("captured_at"),
             "media_type": "image",
-            "caption": (r.get("caption") or r.get("ocr_text") or "")[:120],
+            "caption": (r.get("caption") or "")[:120],
         })
     return {
         "operation": "meal",
@@ -391,16 +472,14 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
         "total_meal_observations": len(meal_observation_ids),
         "event_count": len(meal_event_keys),
         "explicit_foods": top_foods[:20],
-        "explicit_food_events": len(explicit_by_event),
-        "meal_scene_events": len(meal_scene_by_event),
-        "possible_events": len(possible_by_event),
+        "events_without_food_label": meal_events_without_food,
         "filters_applied": {"scope_id": scope_id or None,
                             "time_range": {"start": start, "end": end} if (start or end) else None,
                             "food_hint": food_hint or None},
         "coverage": {
             "complete": True,
-            "disclosure": ("其中一部分用餐场景只能确认'在吃饭'，不能确认具体菜品。"
-                           if meal_scene_by_event or possible_by_event else
+            "disclosure": ("其中一部分用餐记录能确认'在吃饭'，但照片物体标签里没有具体菜品。"
+                           if meal_events_without_food else
                            "已识别的用餐记录都有明确的食物线索。"),
         },
     }
@@ -434,9 +513,22 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
     for i, idx in enumerate(indices):
         a = assets[idx]
         place = ""
+        media_kind = "original_image"
+        source_video_asset_id = None
+        source_timestamp_sec = None
+        source_scene_index = None
+        source_video_file_name = None
         if store is not None:
             try:
-                place = _short_place_label(store.get_asset(a.get("id")) or {})
+                asset = store.get_asset(a.get("id")) or {}
+                place = _short_place_label(asset)
+                if asset.get("derived_kind") == "video_keyframe":
+                    media_kind = "video_keyframe"
+                    source_video_asset_id = asset.get("parent_asset_id")
+                    source_timestamp_sec = asset.get("source_timestamp_sec")
+                    source_scene_index = asset.get("source_scene_index")
+                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+                    source_video_file_name = (source_video or {}).get("file_name")
             except Exception:
                 place = ""
         preview.append({
@@ -444,6 +536,11 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
             "captured_at": a.get("captured_at"),
             "level": "exact",
             "place": place,
+            "media_kind": media_kind,
+            "source_video_asset_id": source_video_asset_id,
+            "source_timestamp_sec": source_timestamp_sec,
+            "source_scene_index": source_scene_index,
+            "source_video_file_name": source_video_file_name,
             "condition_summary": {},
         })
     total = len(assets)
@@ -522,9 +619,22 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     for i, item in enumerate(assets[:6]):
         handle = f"photo_{i + 1}"
         place = ""
+        media_kind = "original_image"
+        source_video_asset_id = None
+        source_timestamp_sec = None
+        source_scene_index = None
+        source_video_file_name = None
         if store is not None:
             try:
-                place = _short_place_label(store.get_asset(item.get("asset_id")) or {})
+                asset = store.get_asset(item.get("asset_id")) or {}
+                place = _short_place_label(asset)
+                if asset.get("derived_kind") == "video_keyframe":
+                    media_kind = "video_keyframe"
+                    source_video_asset_id = asset.get("parent_asset_id")
+                    source_timestamp_sec = asset.get("source_timestamp_sec")
+                    source_scene_index = asset.get("source_scene_index")
+                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+                    source_video_file_name = (source_video or {}).get("file_name")
             except Exception:
                 place = ""
         preview.append({
@@ -532,6 +642,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "captured_at": item.get("captured_at"),
             "level": item.get("level"),
             "place": place,
+            "media_kind": media_kind,
+            "source_video_asset_id": source_video_asset_id,
+            "source_timestamp_sec": source_timestamp_sec,
+            "source_scene_index": source_scene_index,
+            "source_video_file_name": source_video_file_name,
             "condition_summary": _condition_summary(item),
         })
     _RUNTIME["last_handles"] = handles
@@ -561,7 +676,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
 
 
 def _short_place_label(asset: dict) -> str:
-    """从资产反地理编码取短地点标签（'秦皇岛市昌黎县' / 'Chiang Mai'），供 preview 证据展示。"""
+    """从资产反地理编码取短地点标签（城市/区县名），供 preview 证据展示。"""
     import json as _json
     metadata = asset.get("metadata_json") or {}
     if isinstance(metadata, str):
@@ -605,12 +720,8 @@ def _recommended_resolution(query: str, preview: list, satisfaction: str,
         return {"needed": False, "tool": None,
                 "reason": "" if satisfaction == "full_support" else "没有候选可复核"}
     q = f"{query or ''} {user_goal or ''}"
-    needs_ocr = bool(re.search(
-        r"菜单|价格|多少钱|售价|招牌|店名|电话|写了什么|什么字|文字|创始|价位|"
-        r"几块钱|多少钱一份|数字|号码", q))
-    needs_visual = bool(re.search(
-        r"颜色|穿|衣服|外套|几个|多少人|猫|雪|拿着|道具|火把|有没有|哪[一123]?张|"
-        r"植物|雕塑|场景|内容|细节|在做什么|拍的什么|什么造型|什么样子", q))
+    needs_ocr = ocr_intent(q)
+    needs_visual = visual_intent(q)
     if needs_ocr:
         return {"needed": True, "tool": "read_photo_text",
                 "reason": "问题需要读取照片中的文字/数字，请用 read_photo_text 复核 preview 里的照片"}
@@ -680,6 +791,22 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     if handle and not asset_id:
         return {"summary": "无法解析选中的照片。", "delivered": 0, "blocked": ["bad_handle"]}
     target = handle if asset_id else (rs.asset_ids[0] if rs.asset_ids else None)
+    store = _RUNTIME.get("store")
+    target_asset = store.get_asset(asset_id or target) if store and (asset_id or target) else None
+    if target_asset and target_asset.get("derived_kind") == "video_keyframe" and target_asset.get("parent_asset_id"):
+        source_video_id = target_asset["parent_asset_id"]
+        return {
+            "summary": "已从结果集授权原始视频交付，来源是关键帧对应的时间点。",
+            "result_set_id": result_set_id,
+            "handle": handle or "first",
+            "delivered": 1,
+            "total": rs.total,
+            "scope_id": rs.scope_id,
+            "url": f"/api/assets/{source_video_id}/file",
+            "media_type": "video",
+            "source_video_asset_id": source_video_id,
+            "source_timestamp_sec": target_asset.get("source_timestamp_sec"),
+        }
     url = ""
     if target:
         url = (f"/api/assistant/result-set/{result_set_id}/photo?handle={target}"
@@ -791,18 +918,20 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     if not row or not row["path"] or not Path(row["path"]).is_file():
         return {"summary": "照片文件不可用。", "certainty": "uncertain", "persisted": False,
                 "blocked": ["file_unavailable"]}
-    row = store.connection.execute("SELECT path FROM assets WHERE id = ?", (asset_id,)).fetchone()
-    if not row or not row["path"] or not Path(row["path"]).is_file():
-        return {"summary": "照片文件不可用。", "certainty": "uncertain", "persisted": False}
     gamma = _RUNTIME.get("gamma")
     if gamma is None:
         return {"summary": "模型不可用。", "certainty": "uncertain", "persisted": False}
+    model_call_metrics = []
     try:
-        image = {"base64": _base64_image(row["path"]), "mime_type": _mime_for(row["path"])}
+        encoded, mime_type = gamma.encode_vision_image(row["path"])
+        image = {"base64": encoded, "mime_type": mime_type}
         raw = gamma.chat(_INSPECT_PROMPT.format(question=question), images=[image],
                          json_mode=True, role="inspect")
     except Exception as exc:
-        return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False}
+        model_call_metrics = gamma.get_and_clear_call_metrics()
+        return {"summary": f"图片复核失败：{exc}", "certainty": "uncertain", "persisted": False,
+                "_model_call_metrics": model_call_metrics}
+    model_call_metrics = gamma.get_and_clear_call_metrics()
     try:
         start, end = raw.find("{"), raw.rfind("}")
         parsed = json.loads(raw[start:end + 1]) if start >= 0 else {}
@@ -816,581 +945,8 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
         "confirms_visual_only": True,
         "source": "runtime_visual_inspection",
         "persisted": False,
+        "_model_call_metrics": model_call_metrics,
     }
-
-
-# ---- Tool 4b: read_photo_text（Phase E：OCR 专用 Tool）----
-_OCR_PROMPT = """请读出这张照片中的全部文字（招牌/菜单/价格/数字/电话/年份/小字）。只输出文字内容本身，不要描述图片、不要评价。如果完全看不清就输出空字符串。"""
-_OCR_PROMPT_FULL = """观察这张照片，墙面上有哪些招牌、牌子或文字？请逐条列出文字内容本身（店名、电话、价格、年份、标语等），不要描述人物和场景。看不清的部分不要编造。"""
-_OCR_CACHE: dict[str, tuple[tuple, dict]] = {}  # (asset_id, mtime, provider, tiles) -> result
-
-# Phase H H6：OCR provider 遥测（dashboard 汇总 small/VLM 使用率、延迟、fallback）
-_OCR_TELEMETRY_LOCK = threading.Lock()
-_OCR_TELEMETRY: dict[str, dict] = {
-    "small": {"calls": 0, "latency_sum_s": 0.0, "conf_sum": 0.0, "fallback": 0},
-    "vlm": {"calls": 0, "latency_sum_s": 0.0, "conf_sum": 0.0, "fallback": 0},
-    "errors": 0,
-}
-
-
-def record_ocr_telemetry(provider: str, latency_s: float, confidence: float | None = None,
-                         fallback: bool = False) -> None:
-    with _OCR_TELEMETRY_LOCK:
-        bucket = _OCR_TELEMETRY.get(provider)
-        if bucket is None:
-            bucket = _OCR_TELEMETRY.setdefault(provider, {"calls": 0, "latency_sum_s": 0.0,
-                                                          "conf_sum": 0.0, "fallback": 0})
-        bucket["calls"] += 1
-        bucket["latency_sum_s"] += latency_s
-        if confidence is not None:
-            bucket["conf_sum"] += confidence
-        if fallback:
-            bucket["fallback"] += 1
-            _OCR_TELEMETRY["errors"] += 1
-
-
-def ocr_telemetry_snapshot() -> dict:
-    with _OCR_TELEMETRY_LOCK:
-        out = {}
-        for provider, b in _OCR_TELEMETRY.items():
-            if not isinstance(b, dict):
-                out[provider] = b
-                continue
-            calls = b["calls"]
-            out[provider] = {
-                "calls": calls,
-                "latency_avg_s": round(b["latency_sum_s"] / calls, 3) if calls else None,
-                "confidence_avg": round(b["conf_sum"] / calls, 3) if calls and b["conf_sum"] else None,
-                "fallback": b["fallback"],
-            }
-        return out
-
-# Phase F F5：OCR Provider 抽象（预留 lightweight 插槽，当前只有 VLM）
-# SENTRIX_OCR_PROVIDER=vlm  |  SENTRIX_OCR_TILES=none|2x2|3x3（默认 2x2，提速用）
-_OCR_PROVIDERS: dict[str, str] = {"vlm": "vlm", "small": "small"}
-
-_small_ocr_available_cache: bool | None = None
-
-
-def small_ocr_available() -> bool:
-    """RapidOCR (onnxruntime CPU) 是否可导入——零显存、进程内推理。
-
-    结果缓存；首次调用会尝试 import（失败=不可用，不影响 read_photo_text 主路径）。
-    """
-    global _small_ocr_available_cache
-    if _small_ocr_available_cache is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR  # noqa: F401
-            _small_ocr_available_cache = True
-        except Exception:
-            _small_ocr_available_cache = False
-    return _small_ocr_available_cache
-_OCR_TILE_DEFAULT = "2x2"
-
-
-def _ocr_provider() -> str:
-    return os.getenv("SENTRIX_OCR_PROVIDER", "vlm").strip().lower() or "vlm"
-
-
-def _ocr_tile_layout() -> str:
-    layout = os.getenv("SENTRIX_OCR_TILES", _OCR_TILE_DEFAULT).strip().lower()
-    return layout if layout in {"none", "2x2", "3x3"} else _OCR_TILE_DEFAULT
-
-
-def _clean_ocr_text(raw) -> str:
-    """清洗 12B OCR 输出：去掉 thought/code block/JSON 包装与重复行，只保留文字。"""
-    if not raw:
-        return ""
-    text = str(raw).strip()
-    text = re.sub(r"```(?:json|JSON)?", "", text)
-    text = re.sub(r"^\s*thought\s*", "", text, flags=re.I)
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            for key in ("text", "ocr", "content", "result"):
-                val = obj.get(key)
-                if isinstance(val, str):
-                    text = val.strip()
-                    break
-            else:
-                return ""
-    except (TypeError, ValueError):
-        pass
-    seen, lines = set(), []
-    for line in text.splitlines():
-        s = line.strip()
-        if s and s not in seen:
-            seen.add(s)
-            lines.append(s)
-    return "\n".join(lines)[:1200]
-
-
-def _tile_images(path: str, rows: int = 3, cols: int = 3, scale: float = 2.0):
-    """把图片切成 rows*cols 个 tile，每块放大 scale 倍，返回 [(label, base64), ...]。"""
-    try:
-        from io import BytesIO
-        from PIL import Image
-    except Exception:
-        return []
-    try:
-        img = Image.open(path)
-    except Exception:
-        return []
-    w, h = img.size
-    tiles = []
-    tw, th = max(1, w // cols), max(1, h // rows)
-    for r in range(rows):
-        for c in range(cols):
-            box = (c * tw, r * th, min(w, (c + 1) * tw), min(h, (r + 1) * th))
-            tile = img.crop(box)
-            if scale != 1.0:
-                tile = tile.resize((int(tile.width * scale), int(tile.height * scale)),
-                                   Image.LANCZOS)
-            buf = BytesIO()
-            tile.convert("RGB").save(buf, "JPEG", quality=92)
-            tiles.append((f"tile_r{r}c{c}", base64.b64encode(buf.getvalue()).decode()))
-    return tiles
-
-
-# ============ Phase H H2/H4: Small OCR Provider（RapidOCR · CPU · 零显存） ============
-_small_engine = None
-_small_engine_lock = threading.Lock()
-
-
-def _get_small_engine():
-    global _small_engine
-    if _small_engine is None:
-        with _small_engine_lock:
-            if _small_engine is None:
-                from rapidocr_onnxruntime import RapidOCR
-                _small_engine = RapidOCR()
-    return _small_engine
-
-
-def _small_items(result):
-    """RapidOCR result -> [(y0, x0, y1, x1, text, conf)]。"""
-    items = []
-    for box, text, conf in (result or []):
-        if not text or not text.strip():
-            continue
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
-        items.append((min(ys), min(xs), max(ys), max(xs), str(text).strip(), float(conf or 0)))
-    return items
-
-
-def _small_row_cluster(items, y_tol=26):
-    """按 y 聚类成行（菜单/招牌通常水平成行）。返回 [(y_center, [(x, text, conf)])]。"""
-    rows = []
-    for it in sorted(items, key=lambda t: (t[0], t[1])):
-        yc = (it[0] + it[2]) / 2
-        placed = False
-        for row in rows:
-            if abs(row[0] - yc) <= y_tol:
-                row[1].append((it[1], it[4], it[5]))
-                placed = True
-                break
-        if not placed:
-            rows.append((yc, [(it[1], it[4], it[5])]))
-    return rows
-
-
-_PRICE_RE = re.compile(r"(?:¥|￥)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:元|块)")
-_PHONE_RE = re.compile(r"(?<!\d)(\d{7,12})(?!\d)")
-_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
-# 商品 label 提取：排除 OCR 对 checkbox/温度的误读字符
-_LABEL_NOISE = re.compile(r"^[口冷热黑白]+$")
-_LABEL_STOP = {"价格", "单价", "售价", "共计", "合计", "总价", "原价", "现价"}
-
-
-def _small_label_before(line: str, pos: int) -> str:
-    """取价格/年份之前最近的中文商品词作为 label（如 '台式奶茶 口口 ￥10' → 台式奶茶）。"""
-    head = line[:pos]
-    cands = re.findall(r"[\u4e00-\u9fff]{2,8}", head)
-    for cand in reversed(cands):
-        if _LABEL_NOISE.match(cand) or cand in _LABEL_STOP:
-            continue
-        return cand
-    return ""
-
-
-def _small_exact_values(text: str) -> list[dict]:
-    values = []
-    for line in text.splitlines():
-        for m in _PRICE_RE.finditer(line):
-            value = m.group(1) or m.group(2)
-            values.append({"type": "price", "value": value, "unit": "元",
-                           "text": m.group(0).strip(),
-                           "label": _small_label_before(line, m.start())})
-        for m in _YEAR_RE.finditer(line):
-            values.append({"type": "year", "value": m.group(1), "text": m.group(1),
-                           "label": _small_label_before(line, m.start())})
-        for m in _PHONE_RE.finditer(line):
-            values.append({"type": "phone", "value": m.group(1), "text": m.group(1),
-                           "label": _small_label_before(line, m.start())})
-    return values
-
-
-def _rank_exact_values(exact: list[dict], limit: int = 40) -> list[dict]:
-    """带 label 的硬值全部保留（小体积、高价值）；无 label 的按类型排序截断。"""
-    labeled = [ev for ev in exact if (ev.get("label") or "")]
-    rest = [ev for ev in exact if not (ev.get("label") or "")]
-    rest.sort(key=lambda ev: (1 if str(ev.get("type") or "") in ("price", "year") else 0,
-                              0 if str(ev.get("type") or "") == "phone" else 1),
-              reverse=True)
-    return (labeled + rest)[:limit]
-
-
-def _small_vertical_label(items: list, price_item: tuple) -> str:
-    """坐标级 label：价格与其上方/左侧最近的重叠中文词关联（菜单垂直版式）。
-
-    例：'汉堡单人套餐'（y 734-796）正下方的 '￥34'（y 801-856）→ label=汉堡单人套餐。
-    行内 label（_small_exact_values）无法跨行关联，这里补垂直关联。
-    """
-    py0, px0, py1, px1 = price_item[0], price_item[1], price_item[2], price_item[3]
-    best = ""
-    best_dist = 10 ** 9
-    for it in items:
-        y0, x0, y1, x1, text, conf = it
-        if text == price_item[4]:
-            continue
-        if not re.search(r"[\u4e00-\u9fff]{2,}", text):
-            continue
-        overlap = min(px1, x1) - max(px0, x0)
-        if overlap < 8:
-            continue
-        if y1 <= py0 + 4:  # 严格上方
-            dist = py0 - y1
-            if 0 <= dist <= 130 and dist < best_dist:
-                best_dist = dist
-                best = text
-        elif abs((y0 + y1) / 2 - (py0 + py1) / 2) <= 40 and x1 <= px0:  # 同行左侧
-            dist = px0 - x1
-            if dist < best_dist:
-                best_dist = dist
-                best = text
-    return best
-
-
-def _small_exact_values_from_items(items: list, row_text: str = "") -> list[dict]:
-    """从坐标级 items 提取 exact_values：垂直 label 优先，行内 label（行拼接文本）兜底。"""
-    vertical = []
-    for it in items:
-        for m in _PRICE_RE.finditer(it[4]):
-            value = m.group(1) or m.group(2)
-            label = _small_vertical_label(items, it)
-            vertical.append({"type": "price", "value": value, "unit": "元",
-                             "text": m.group(0).strip(), "label": label})
-    inline = _small_exact_values(row_text) if row_text else []
-    merged = list(vertical)
-    for ev in inline:
-        if ev.get("type") != "price":
-            if not any(v.get("type") == ev.get("type") and v["value"] == ev["value"]
-                       for v in merged):
-                merged.append(ev)
-            continue
-        replaced = False
-        for i, v in enumerate(merged):
-            if v.get("type") == "price" and v["value"] == ev["value"] and v["text"] == ev["text"]:
-                if (not v.get("label")) and ev.get("label"):
-                    merged[i] = ev
-                replaced = True
-                break
-        if not replaced:
-            merged.append(ev)
-    return merged
-
-
-def _small_ocr_text_and_values(items):
-    """行聚类 → ocr_text（按行拼接）+ exact_values + 平均置信度。"""
-    rows = _small_row_cluster(items)
-    lines = []
-    for _, cells in sorted(rows, key=lambda r: r[0]):
-        line = " ".join(text for _, text, _ in sorted(cells, key=lambda c: c[0]))
-        lines.append(line)
-    ocr_text = "\n".join(lines)
-    confs = [it[5] for it in items]
-    avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
-    return ocr_text, _small_exact_values_from_items(items, ocr_text), avg_conf
-
-
-def _small_zoom_refine(path: str, items):
-    """对含套餐/价格/饮品等关键词的行区域放大 2x 重识别，补漏检硬值（如菜单价格）。
-
-    H2 spike 验证：全图漏检的“汉堡单人套餐 ￥34”在局部放大后能稳定读出。
-    按行合并裁剪（一行一个 crop，覆盖行内全部文字框，含同行价格），比单框裁剪
-    更稳：价格常落在相邻套餐名称之间，单框 + pad 会漏掉。
-    """
-    _KEYWORD = re.compile(r"套餐|价格|￥|元|汉堡|奶茶|咖啡|可乐|炸鸡|菜单")
-    targets = [it for it in items if _KEYWORD.search(it[4])]
-    if not targets:
-        return None
-    try:
-        from PIL import Image
-    except Exception:
-        return None
-    try:
-        im = Image.open(path)
-        W, H = im.size
-        merged = list(items)
-        engine = _get_small_engine()
-        # 按 y 行聚类 target，每行一个 crop（含行内所有文字框）
-        rows = _small_row_cluster(targets, y_tol=60)
-        for yc, _ in rows[:4]:
-            row_items = [it for it in items if abs((it[0] + it[2]) / 2 - yc) <= 60]
-            if not row_items:
-                continue
-            pad = 60
-            box = (max(0, int(min(it[1] for it in row_items)) - pad),
-                   max(0, int(min(it[0] for it in row_items)) - pad),
-                   min(W, int(max(it[3] for it in row_items)) + pad),
-                   min(H, int(max(it[2] for it in row_items)) + pad))
-            if box[2] - box[0] < 12 or box[3] - box[1] < 12:
-                continue
-            crop = im.crop(box)
-            scale = 2
-            crop = crop.resize((crop.width * scale, crop.height * scale))
-            tmp = f"/tmp/sentrix_ocr_zoom_{os.getpid()}_{int(time.time() * 1000)}.jpg"
-            crop.save(tmp)
-            try:
-                res, _ = engine(tmp)
-            finally:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-            if res:
-                for b, text, conf in res:
-                    by0 = box[1] + b[0][1] / scale
-                    bx0 = box[0] + b[0][0] / scale
-                    by1 = box[1] + b[2][1] / scale
-                    bx1 = box[0] + b[2][0] / scale
-                    merged.append((by0, bx0, by1, bx1, str(text).strip(), float(conf or 0)))
-        dedup = []
-        for it in merged:
-            if not any(abs(it[0] - d[0]) < 12 and abs(it[2] - d[2]) < 12 and it[4] == d[4]
-                       for d in dedup):
-                dedup.append(it)
-        return dedup
-    except Exception:
-        return None
-
-
-def _try_small_ocr(path: str, context: dict | None) -> dict | None:
-    """Small OCR 优先路径：用户开启时使用；无文本/低置信返回 None 让 VLM 接管。
-
-    返回 dict = 直接交付的 observation（provider=small）；None = 走 VLM 主路径。
-    """
-    settings = (context or {}).get("ocr_settings") or {}
-    if not settings.get("small_ocr_enabled"):
-        return None
-    if not small_ocr_available():
-        return None
-    try:
-        engine = _get_small_engine()
-        t0 = time.monotonic()
-        result, _ = engine(path)
-        latency = round(time.monotonic() - t0, 3)
-        items = _small_items(result)
-        if not items:
-            return {
-                "summary": "这次没能可靠读出照片里的文字。",
-                "full_text": "", "text_regions": [],
-                "certainty": "uncertain", "status": "partial", "reason": "ocr_no_text",
-                "provider": "small", "confidence": 0.0, "exact_values": [],
-                "fallback_used": False, "persisted": False, "cache_hit": False,
-                "latency_s": latency,
-            }
-        ocr_text, exact, avg_conf = _small_ocr_text_and_values(items)
-        refined = _small_zoom_refine(path, items)
-        if refined:
-            items = refined
-            ocr_text, exact, avg_conf = _small_ocr_text_and_values(items)
-        if avg_conf < 0.5:
-            return None
-        regions = [{"text": line[:150], "source": "small_ocr"}
-                   for line in ocr_text.splitlines()[:6]]
-        record_ocr_telemetry("small", latency, avg_conf)
-        return {
-            "summary": f"已读取 {len(regions)} 个文字区域。",
-            "full_text": ocr_text[:1600],
-            "text_regions": regions[:6],
-            "source": "small_ocr",
-            "provider": "small",
-            "confidence": avg_conf,
-            "exact_values": _rank_exact_values(exact),
-            "fallback_used": False,
-            "certainty": "supported" if regions else "uncertain",
-            "persisted": False,
-            "cache_hit": False,
-            "latency_s": latency,
-        }
-    except Exception:
-        return None
-
-
-def _read_photo_text(arguments: dict, *, context: dict | None = None) -> dict:
-    """OCR 专用：读取照片中的文字（菜单/价格/招牌/电话/年份/小字）。
-
-    与 inspect_photo 的分工：inspect_photo 做视觉理解（颜色/物体/场景），
-    read_photo_text 做文本读取。内部把照片切成 3x3 tile 放大后交给 VLM OCR，
-    避免整图小字被压缩丢失。
-
-    G6：任何未预期异常都降级为 natural partial（status=partial / reason=ocr_failed），
-    绝不让 OCR 失败变成 tool_execution_error 或“这次处理没有完成”式工程错误。
-    """
-    try:
-        return _read_photo_text_impl(arguments, context=context)
-    except Exception as exc:
-        try:
-            import sys as _sys
-            print(f"[read_photo_text] ocr_failed fallback: {type(exc).__name__}: {exc}",
-                  file=_sys.stderr)
-        except Exception:
-            pass
-        return {
-            "summary": "这次没能可靠读出照片里的文字。",
-            "full_text": "", "text_regions": [],
-            "certainty": "uncertain",
-            "status": "partial",
-            "reason": "ocr_failed",
-            "persisted": False,
-            "cache_hit": False,
-        }
-
-
-def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> dict:
-    """read_photo_text 实际实现（异常由 _read_photo_text 兜底为 natural partial）。"""
-    asset_handle = arguments.get("asset_handle") or ""
-    scope_id = (context or {}).get("scope_id") or ""
-    task_state = (context or {}).get("task_state") or {}
-    if not asset_handle:
-        preview = (task_state.get("result_preview") or []) or []
-        if preview:
-            asset_handle = preview[0]
-    asset_id = None
-    result_set_id = task_state.get("current_result_set")
-    rs_store = _RUNTIME.get("result_sets")
-    if result_set_id and rs_store is not None:
-        asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
-    if not asset_id:
-        asset_id = _handle_to_asset_id(asset_handle)
-    store = _RUNTIME.get("store")
-    if not asset_id or store is None:
-        return {"summary": "无法定位照片。", "full_text": "", "text_regions": [],
-                "certainty": "uncertain", "persisted": False}
-    row = store.connection.execute("SELECT path FROM assets WHERE id = ?", (asset_id,)).fetchone()
-    if not row or not row["path"] or not Path(row["path"]).is_file():
-        return {"summary": "照片文件不可用。", "full_text": "", "text_regions": [],
-                "certainty": "uncertain", "persisted": False}
-    # Phase F F5：cache key v2 = (asset_id, mtime, provider, tile_layout)
-    # 换 provider / tile 策略后旧结果自动失效，不会读到过期 OCR。
-    try:
-        _mtime = Path(row["path"]).stat().st_mtime
-    except Exception:
-        _mtime = 0.0
-    provider = _ocr_provider()
-    # Phase H H4：Small OCR 优先路由（用户设置 small_ocr_enabled=true 时）
-    _small_cfg = (context or {}).get("ocr_settings") or {}
-    small_attempted = bool(_small_cfg.get("small_ocr_enabled")) and small_ocr_available()
-    small = _try_small_ocr(row["path"], context)
-    if small is not None:
-        return small
-    tile_layout = _ocr_tile_layout()
-    cache_key = (asset_id, _mtime, provider, tile_layout)
-    cached = _OCR_CACHE.get(cache_key)
-    if cached is not None:
-        hit = dict(cached)
-        hit["cache_hit"] = True
-        return hit
-    gamma = _RUNTIME.get("gamma")
-    if gamma is None:
-        return {"summary": "模型不可用。", "full_text": "", "text_regions": [],
-                "certainty": "uncertain", "persisted": False}
-    _vlm_t0 = time.monotonic()
-    try:
-        # Provider 执行：当前仅 vlm（整图 + 按配置 tile 并行），lightweight 插槽预留。
-        regions = []
-        from concurrent.futures import ThreadPoolExecutor
-
-        def _ocr_once(label, b64):
-            prompt = _OCR_PROMPT_FULL if label == "full_image" else _OCR_PROMPT
-            try:
-                raw = gamma.chat(prompt, images=[{"base64": b64, "mime_type": "image/jpeg"}],
-                                 json_mode=False, role="ocr")
-            except Exception as exc:
-                raw = f"__ERROR__ {type(exc).__name__}: {exc}"
-            return label, _clean_ocr_text(raw)
-
-        with open(row["path"], "rb") as fh:
-            full_b64 = base64.b64encode(fh.read()).decode()
-        tiles = []
-        if tile_layout == "3x3":
-            tiles = _tile_images(row["path"], rows=3, cols=3)
-        elif tile_layout == "2x2":
-            tiles = _tile_images(row["path"], rows=2, cols=2)
-        tasks = [("full_image", full_b64)] + tiles
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            results = list(ex.map(lambda item: _ocr_once(*item), tasks))
-        # G6：OCR 全失败（超时/模型不可用/推理错误）→ 显式 partial 语义，不伪装成“照片里没有文字”
-        errors = [text for _, text in results if text.startswith("__ERROR__")]
-        if errors and len(errors) == len(results):
-            timeout_like = any("timeout" in e.lower() or "read" in e.lower() for e in errors)
-            return {
-                "summary": "这次没能可靠读出照片里的文字。",
-                "full_text": "", "text_regions": [],
-                "certainty": "uncertain",
-                "status": "partial",
-                "reason": "ocr_timeout" if timeout_like else "ocr_failed",
-                "persisted": False,
-                "cache_hit": False,
-            }
-    except Exception as exc:
-        # G6：任何未预期 OCR 异常 → 同样降级为 natural partial，绝不暴露工程错误
-        try:
-            import sys as _sys
-            print(f"[read_photo_text] ocr_failed fallback: {type(exc).__name__}: {exc}",
-                  file=_sys.stderr)
-        except Exception:
-            pass
-        return {
-            "summary": "这次没能可靠读出照片里的文字。",
-            "full_text": "", "text_regions": [],
-            "certainty": "uncertain",
-            "status": "partial",
-            "reason": "ocr_failed",
-            "persisted": False,
-            "cache_hit": False,
-        }
-    full_clean = ""
-    for label, text in results:
-        if label == "full_image":
-            full_clean = text
-            continue
-        if text and not text.startswith("__ERROR__"):
-            regions.append({"text": text[:150], "source": label})
-    if full_clean and not full_clean.startswith("__ERROR__"):
-        regions.insert(0, {"text": full_clean[:200], "source": "full_image"})
-    full_text = "\n".join(f"[{r['source']}] {r['text']}" for r in regions)
-    result = {
-        "summary": f"已读取 {len(regions)} 个文字区域。" if regions else "照片中没有识别到文字。",
-        "full_text": full_text[:1600],
-        "text_regions": regions[:8],
-        "source": "runtime_ocr",
-        "provider": provider,
-        "tiles": tile_layout,
-        "certainty": "supported" if regions else "uncertain",
-        "persisted": False,
-        "cache_hit": False,
-        "vlm_calls": len(tasks),
-        "fallback_used": small_attempted,
-    }
-    _OCR_CACHE[cache_key] = result
-    record_ocr_telemetry("vlm", time.monotonic() - _vlm_t0, result.get("confidence"),
-                         fallback=small_attempted)
-    return result
-
-
 # ---- Tool 5: search_conversation_history（D4）----
 def _search_conversation_history(arguments: dict, *, context: dict | None = None) -> dict:
     """检索历史对话：current（当前会话）/ recent（最近会话）/ all（全部历史会话）。"""
@@ -1729,34 +1285,39 @@ _INSPECT_PROMPT = """观察这张照片，输出 JSON：
 问题：{question}"""
 
 
+
+def _cap_hint(tool: str) -> str:
+    """能力实测提示：无数据返回空串，不改变工具合同。"""
+    try:
+        hint = tool_capability_summary(tool)
+        return ("\n" + hint) if hint else ""
+    except Exception:
+        return ""
+
+
 def register_tools():
+
     register(ToolSpec(
         name="query_memory_facts",
-        description=("确定性结构化事实查询，不要用模型估算。"
-                     "operation=count(数量)/exists(是否存在)/first(首次出现时间)/last(最近出现时间)/date/group(分组)/meal(饮食与用餐场景)。"
-                     "filters.time 写用户原话里的相对时间（如'去年'、'这两年'、'去年春天'、'上个月'）或具体时间，系统会自动换算，不要自己估算年份；"
-                     "不加 time 表示全部。operation=group 时必须填 group_by（month 或 place，缺省 month）；group_by=place 会返回地点覆盖情况"
-                     "（known_location_assets/unknown_location_assets），回答必须如实说明还有多少照片没有可靠地点。"
-                     "operation=meal 用于'吃过什么/吃饭/火锅'类问题，会做事件级去重并返回 explicit_foods/meal_scene_events/possible_events 分层证据。"
-                     "本工具只做聚合型确定性事实；菜单价格/招牌文字/售价/店里写了什么等视觉或 OCR 细节，"
-                     "必须先 search_memories 找到照片再 inspect_photo 复核，不要用本工具猜测。"
-                     "注意：filters.place 只能填结构化地点名（城市/区县/景区/地标等实际地名）；不要把要找的目标名称、活动、主题当作 place"
-                     "（如'沙雕'是主题不是地点）。不确定时留空。"),
-        input_schema={"operation": "count|exists|first|last|date|group|meal",
+        description=("确定性结构化事实查询（数量/存在性/首次/最近/日期/分组/饮食/媒体列表），不要用模型估算。"
+                     "filters.time 原样写相对或具体时间，系统自动换算；不填表示全部。"
+                     "group 必须填 group_by（month|place），place 分组需如实说明无地点照片数。"
+                     "meal 用于'吃过什么/吃饭'类问题。菜单价格/招牌等视觉文字先用 search_memories 再 read_photo_text，不要用本工具猜。"
+                     "operation=list 用于列出实际媒体（如'相册里所有视频/所有照片'），filters.media 填 video/image/audio/text；"
+                     "返回 items 含视频时长/场景/关键帧来源，不要用 count 回答列表问题。"
+                     "filters.place 只填结构化地名（城市/区县/景区/地标），不要把目标/活动/主题当 place；不确定留空。"),
+        input_schema={"operation": "count|exists|first|last|date|group|meal|list",
                       "filters": {"time": "去年/这两年/2023年 等相对或具体时间（原样写）",
                                   "person": "", "place": "", "media": "",
-                                  "food": "可选：限定某种食物（如'火锅'）"},
+                                  "food": "可选：限定某种食物（如火锅等具体菜名）"},
                       "group_by": "month|place"},
         executor=_query_memory_facts, read_write="read", cost_class="cheap", readiness="ready",
     ))
     register(ToolSpec(
         name="search_memories",
-        description=("检索家庭记忆：找照片、视觉语义（衣着/颜色/物体/场景）、混合查询。返回结果集摘要。"
-                     "用户提到时间时必须把时间原样写进 filters.time（如'2024年'、'去年'、'去年春天'），"
-                     "不要只放在 query 文本里；query 只写场景/人物/物体描述（若忘记填 filters.time，系统会自动从 query 提取时间）。"
-                     "filters.place 填结构化地点名（城市/区县/景区/地标），系统会按行政区匹配照片的 GPS 反地理编码"
-                     "（如'秦皇岛如是海度假村'也能匹配'河北省秦皇岛市昌黎县'的照片，'清迈'能匹配英文'Chiang Mai'）。"
-                     "不要把要找的目标名称、活动、主题当作 place（如'沙雕'是主题不是地点）。不确定时留空。"),
+        description=("检索照片（人/物/场景/衣着/颜色）。返回结果集摘要。"
+                     "时间必须写 filters.time（'2024年'/'去年'等），系统会自动从 query 提取漏填的时间。"
+                     "filters.place 只填结构化地名（城市/区县/景区/地标），不要把目标/活动/主题当 place；不确定留空。"),
         input_schema={"query": "", "mode": "best|all|representative",
                       "filters": {"time": "", "place": "", "person": ""}},
         executor=_search_memories, read_write="read", cost_class="medium", readiness="ready",
@@ -1776,7 +1337,8 @@ def register_tools():
     ))
     register(ToolSpec(
         name="inspect_photo",
-        description="复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。昂贵，默认每轮最多 1 次。",
+        description=("复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。昂贵，默认每轮最多 1 次。"
+                     + _cap_hint("inspect_photo")),
         input_schema={"asset_handle": "", "question": ""},
         executor=_inspect_photo, read_write="read", cost_class="expensive", readiness="ready",
     ))
@@ -1785,7 +1347,8 @@ def register_tools():
         description=("读取照片中的文字内容（菜单/价格/招牌/店名/电话/年份/小字）。"
                      "适用于'多少钱/价格/售价/店名/招牌/电话/写了什么/什么字/创始于哪一年'等需要看照片文字的题；"
                      "内部会把照片切块放大后 OCR。asset_handle 用 search_memories preview 里的 handle，可省略（默认预览第一张）。"
-                     "昂贵，每轮最多 1 次。"),
+                     "昂贵，每轮最多 1 次。"
+                     + _cap_hint("read_photo_text")),
         input_schema={"asset_handle": "", "question": ""},
         executor=_read_photo_text, read_write="read", cost_class="expensive", readiness="ready",
     ))
@@ -1801,7 +1364,7 @@ def register_tools():
     register(ToolSpec(
         name="get_core_memory",
         description=("读取长期家庭记忆（已确认人物/家庭角色/关系/偏好等）。"
-                     "subject 填人物名（如'明哥'）；topic 填话题关键词（如'西湖'）；都不填返回优先级最高的卡片。"
+                     "subject 填人物名（如某人的称呼）；topic 填话题关键词（如某个话题词）；都不填返回优先级最高的卡片。"
                      "每条记忆带 truth_status（confirmed_fact/user_stated/agent_inference/observed_pattern），"
                      "agent_inference 不能说成 confirmed。"),
         input_schema={"subject": "", "topic": "", "limit": 5},

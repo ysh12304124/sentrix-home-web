@@ -115,6 +115,28 @@ def build_final_context(message: str, task: dict) -> dict:
                     f"{f.get('food')}({f.get('events')}次)" for f in foods[:10]),
                 "certainty": "confirmed", "source": "facts",
             })
+    if op == "list":
+        for tr in task.get("tool_results") or []:
+            if tr.get("tool") != "query_memory_facts":
+                continue
+            for item in (tr.get("items") or [])[:12]:
+                file_name = item.get("file_name") or "未命名媒体"
+                if item.get("media_kind") == "video":
+                    duration = item.get("duration_sec")
+                    scenes = item.get("scene_count") or 0
+                    facts.append({
+                        "value": f"视频：{file_name}（时长 {duration or '未知'} 秒，{scenes} 个场景）",
+                        "certainty": "confirmed",
+                        "source": "facts",
+                    })
+                elif item.get("media_kind") == "video_keyframe":
+                    source = item.get("source_video_file_name") or "未知视频"
+                    ts = item.get("source_timestamp_sec")
+                    facts.append({
+                        "value": f"关键帧：{file_name}，来自视频 {source} 的 {ts if ts is not None else '未知'} 秒处",
+                        "certainty": "confirmed",
+                        "source": "facts",
+                    })
     rows = task.get("fact_rows") or []
     if rows:
         facts.append({
@@ -191,7 +213,8 @@ _WRITER_SYSTEM = (
 )
 
 
-def rewrite_final(chat_fn, context: dict, draft: str) -> str | None:
+def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = None,
+                       debug_out: dict | None = None) -> str | None:
     """一次 text-only 重写；失败返回 None（调用方保留草稿）。"""
     payload = {
         "facts": context.get("facts") or [],
@@ -205,10 +228,21 @@ def rewrite_final(chat_fn, context: dict, draft: str) -> str | None:
         "\n\n请直接输出最终回答文本。"
     )
     try:
-        raw = chat_fn([
+        messages = [
             {"role": "system", "content": _WRITER_SYSTEM},
             {"role": "user", "content": user},
-        ])
+        ]
+        if debug_out is not None:
+            import copy as _copy
+            debug_out["messages"] = _copy.deepcopy(messages)
+        try:
+            raw = chat_fn(messages, call_type="writer", step_id=step_id or "writer")
+            if debug_out is not None:
+                debug_out["raw"] = raw
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            raw = chat_fn(messages)
     except Exception:
         return None
     text = str(raw or "").strip()

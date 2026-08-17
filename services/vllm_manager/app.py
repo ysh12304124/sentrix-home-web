@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -118,6 +119,50 @@ def _vllm_runtime_metrics(port: int) -> dict:
     except Exception as exc:
         metrics["error"] = str(exc)
     return metrics
+
+
+def _latest_memory_profile(log_path: str | None) -> dict:
+    """Parse absolute vLLM memory components from the latest successful startup."""
+    if not log_path:
+        return {}
+    path = Path(log_path)
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return {"error": str(exc), "log_path": str(path)}
+    kv_pattern = re.compile(r"Available KV cache memory:\s*(-?[0-9.]+)\s*GiB")
+    profile_pattern = re.compile(
+        r"Actual usage is\s*([0-9.]+)\s*GiB for weight,\s*"
+        r"([0-9.]+)\s*GiB for peak activation,\s*"
+        r"(-?[0-9.]+)\s*GiB for non-torch memory, and\s*"
+        r"([0-9.]+)\s*GiB for CUDAGraph memory.*?"
+        r"Current kv cache memory in use is\s*([0-9.]+)\s*GiB"
+    )
+    token_pattern = re.compile(r"GPU KV cache size:\s*([0-9,]+)\s*tokens")
+    result = {"log_path": str(path)}
+    for line in reversed(lines):
+        if "GPU KV cache size:" in line and "kv_cache_capacity_tokens" not in result:
+            match = token_pattern.search(line)
+            if match:
+                result["kv_cache_capacity_tokens"] = int(match.group(1).replace(",", ""))
+        if "Actual usage is" in line and "weight_gib" not in result:
+            match = profile_pattern.search(line)
+            if match:
+                weight, activation, non_torch, cuda_graph, kv = map(float, match.groups())
+                result.update({
+                    "weight_gib": weight,
+                    "peak_activation_gib": activation,
+                    "non_torch_gib": non_torch,
+                    "cuda_graph_gib": cuda_graph,
+                    "kv_cache_capacity_gib": kv,
+                })
+        if "Available KV cache memory:" in line and "available_kv_cache_gib" not in result:
+            match = kv_pattern.search(line)
+            if match:
+                result["available_kv_cache_gib"] = float(match.group(1))
+        if "weight_gib" in result and "kv_cache_capacity_tokens" in result:
+            break
+    return result
 
 
 @app.get("/state")
@@ -401,6 +446,7 @@ def process_memory():
             "configured_max_model_len": state.get("max_model_len"),
             "configured_max_num_seqs": state.get("max_num_seqs"),
             "configured_default_max_tokens": state.get("default_max_tokens"),
+            "memory_profile": _latest_memory_profile(state.get("log_path")),
             "vllm_metrics": _vllm_runtime_metrics(int(state.get("port") or 8100)),
         }
     except subprocess.TimeoutExpired:

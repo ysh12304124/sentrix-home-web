@@ -188,6 +188,132 @@ class FaceEmbeddingContractTests(unittest.TestCase):
         self.assertEqual(results[0]["embedding_version"], "ada-test")
         self.assertEqual(results[0]["quality_signal"], 7.5)
 
+    def test_face_adapter_falls_back_to_buffalo_l_when_adaface_fails(self):
+        class FakeDetection:
+            bbox = [0, 0, 60, 60]
+            det_score = 0.95
+            pose = [0, 0, 0]
+            kps = []
+
+            class Embedding:
+                @staticmethod
+                def tolist():
+                    return [0.0, 1.0]
+
+            embedding = Embedding()
+
+        class FakeApp:
+            def prepare(self, **kwargs):
+                return None
+
+            def get(self, image):
+                return [FakeDetection()]
+
+        class FakeIdentity:
+            model_version = "ada-test"
+            available = True
+
+            def embed(self, crop):
+                raise FaceEmbeddingUnavailable("unable to load AdaFace: import failure")
+
+        class FakeImage:
+            shape = (64, 64, 3)
+
+            def __getitem__(self, key):
+                return self
+
+        class FakeCv2:
+            @staticmethod
+            def imread(path):
+                return FakeImage()
+
+        adapter = FaceAdapter.__new__(FaceAdapter)
+        adapter.enabled = True
+        adapter._app = FakeApp()
+        adapter.error = None
+        adapter.identity_model = "adaface"
+        adapter.identity_adapter = FakeIdentity()
+        adapter.identity_error = None
+        adapter.identity_runtime_error = None
+        adapter.identity_fallback = False
+        adapter.identity_fallback_model = None
+        adapter.identity_fallback_error = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = f"{directory}/face.jpg"
+            open(image_path, "wb").close()
+            with patch.dict(os.environ, {"FACE_MIN_SIZE": "1"}), patch.dict(
+                sys.modules, {"cv2": FakeCv2()}
+            ), patch("backend.model_clients.align_face_crop", return_value="aligned"):
+                results = adapter.detect(image_path)
+
+        self.assertTrue(results)
+        self.assertEqual(results[0]["embedding"], [0.0, 1.0])
+        self.assertEqual(results[0]["embedding_model"], "buffalo_l")
+        self.assertTrue(results[0]["identity_ready"])
+        self.assertTrue(results[0]["identity_fallback"])
+        self.assertTrue(adapter.identity_fallback)
+        self.assertEqual(adapter.identity_fallback_model, "buffalo_l")
+
+    def test_face_adapter_without_fallback_vector_remains_unavailable(self):
+        class FakeDetection:
+            bbox = [0, 0, 60, 60]
+            det_score = 0.95
+            pose = [0, 0, 0]
+            kps = []
+            embedding = None
+
+        class FakeApp:
+            def prepare(self, **kwargs):
+                return None
+
+            def get(self, image):
+                return [FakeDetection()]
+
+        class FakeIdentity:
+            model_version = "ada-test"
+            available = True
+
+            def embed(self, crop):
+                raise FaceEmbeddingUnavailable("unable to load AdaFace: import failure")
+
+        class FakeImage:
+            shape = (64, 64, 3)
+
+            def __getitem__(self, key):
+                return self
+
+        class FakeCv2:
+            @staticmethod
+            def imread(path):
+                return FakeImage()
+
+        adapter = FaceAdapter.__new__(FaceAdapter)
+        adapter.enabled = True
+        adapter._app = FakeApp()
+        adapter.error = None
+        adapter.identity_model = "adaface"
+        adapter.identity_adapter = FakeIdentity()
+        adapter.identity_error = None
+        adapter.identity_runtime_error = None
+        adapter.identity_fallback = False
+        adapter.identity_fallback_model = None
+        adapter.identity_fallback_error = None
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = f"{directory}/face.jpg"
+            open(image_path, "wb").close()
+            with patch.dict(os.environ, {"FACE_MIN_SIZE": "1"}), patch.dict(
+                sys.modules, {"cv2": FakeCv2()}
+            ), patch("backend.model_clients.align_face_crop", return_value="aligned"):
+                results = adapter.detect(image_path)
+
+        self.assertTrue(results)
+        self.assertEqual(results[0]["embedding"], [])
+        self.assertFalse(results[0]["identity_ready"])
+        self.assertFalse(adapter.identity_fallback)
+        self.assertIn("unable to load AdaFace", results[0]["identity_error"])
+
     def test_face_adapter_limits_insightface_modules_when_adaface_owns_identity(self):
         calls = {}
 
@@ -215,7 +341,7 @@ class FaceEmbeddingContractTests(unittest.TestCase):
         with patch.dict(sys.modules, {"insightface.app": type("App", (), {"FaceAnalysis": FakeAnalysis})(), "cv2": FakeCv2()}):
             adapter.detect("unused.jpg")
 
-        self.assertEqual(calls["allowed_modules"], ["detection", "landmark_2d_106"])
+        self.assertEqual(calls["allowed_modules"], ["detection", "landmark_2d_106", "recognition"])
         self.assertEqual(calls["providers"], ["CUDAExecutionProvider", "CPUExecutionProvider"])
 
     def test_face_adapter_passes_five_point_landmarks_to_alignment(self):
@@ -298,8 +424,10 @@ class FaceEmbeddingContractTests(unittest.TestCase):
                 {"bbox": [1, 2, 30, 40], "embedding": [], "confidence": 0.95, "identity_ready": False},
             )
 
-            self.assertIsNone(saved)
-            self.assertEqual(store.count("face_instances"), 0)
+            self.assertIsNotNone(saved)
+            self.assertIsNone(saved["cluster_id"])
+            self.assertEqual(saved["embedding"], [])
+            self.assertEqual(store.count("face_instances"), 1)
             self.assertEqual(store.count("face_clusters"), 0)
             store.close()
 

@@ -114,6 +114,31 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
                 return str(candidate)
         return None
 
+    @staticmethod
+    def _patch_torch_transform_get_item_to_index():
+        """Keep torch 2.5.1 compatible with transformers 5.x during torch.load.
+
+        AdaFace checkpoints unpickle a PyTorch Lightning class.  Importing
+        torchmetrics in that unpickle path imports a recent transformers, which
+        on torch <2.6 tries to import ``TransformGetItemToIndex`` from a private
+        Dynamo module.  The symbol is only used as a context manager for a
+        vmap path that the AdaFace loader never exercises, so a no-op context
+        manager is sufficient to deserialize the checkpoint without changing
+        the installed torch or transformers packages.
+        """
+        import contextlib
+
+        try:
+            module = __import__(
+                "torch._dynamo._trace_wrapped_higher_order_op",
+                fromlist=["TransformGetItemToIndex"],
+            )
+            if not hasattr(module, "TransformGetItemToIndex"):
+                module.TransformGetItemToIndex = contextlib.nullcontext
+        except Exception:
+            # Older/newer torch layouts may not need this compatibility shim.
+            pass
+
     def _load_model(self):
         if self._model is not None:
             return self._model
@@ -124,6 +149,8 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
         try:
             import sys
             import torch
+
+            self._patch_torch_transform_get_item_to_index()
 
             repo_root = self._repository_root()
             if repo_root and repo_root not in sys.path:
