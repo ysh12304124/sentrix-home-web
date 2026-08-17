@@ -1782,7 +1782,15 @@
     }
     if (action === "invite") return openModal({ type: "invite" });
     if (action === "open-help") return openModal({ type: "help" });
-    if (action === "open-qa-dashboard") { window.open("/qa", "_blank"); return; }
+    if (action === "open-qa-dashboard") {
+      const benchUrl = `${window.location.protocol}//${window.location.hostname}:8771/`;
+      showToast("正在启动评测服务，请稍候…");
+      try {
+        await fetch("/api/photobench/ensure", { method: "POST" });
+      } catch (_) { /* 评测服务不可达时仍打开，让用户看到连接状态 */ }
+      window.open(benchUrl, "_blank");
+      return;
+    }
     if (action === "command") return openModal({ type: "command" });
     if (action === "open-space") return openModal({ type: "space-manager" });
     if (action === "ask-delete-space") {
