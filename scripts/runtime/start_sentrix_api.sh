@@ -59,7 +59,7 @@ export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/asus/.cache/cli
 # visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
 export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"
 export SENTRIX_TEXT_EMBEDDER="${SENTRIX_TEXT_EMBEDDER:-clip}"
-export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-adaface}"
+export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-legacy}"
 export ADAFACE_DEVICE="${ADAFACE_DEVICE:-cpu}"
 export ADAFACE_MODEL_PATH="${ADAFACE_MODEL_PATH:-/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt}"
 export ADAFACE_REPO_ROOT="${ADAFACE_REPO_ROOT:-/home/asus/models/AdaFace}"

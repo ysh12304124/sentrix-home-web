@@ -37,6 +37,30 @@ def align_face_crop(image, bbox, landmarks=None):
         raise FaceEmbeddingUnavailable("invalid face bounding box")
     return Image.fromarray(image[top:bottom, left:right][:, :, ::-1])
 
+
+def _laplacian_variance(pil_image):
+    """Grayscale Laplacian variance of an aligned face crop as a sharpness signal."""
+    import cv2
+    import numpy as np
+
+    try:
+        gray = cv2.cvtColor(np.asarray(pil_image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
+def _normalize_sharpness(raw, low=2.5, high=7.0):
+    """Log-compress raw Laplacian variance into 0..1, clipping at the reference bounds.
+
+    low/high are on the log1p scale and should be calibrated against the real
+    face-crop distribution; the defaults assume sharp aligned 112x112 crops.
+    """
+    import math
+
+    value = (math.log1p(max(0.0, raw)) - low) / (high - low)
+    return max(0.0, min(1.0, value))
+
 try:
     import httpx
 except ImportError:  # Keep pure parsing and SQLite tests runnable without optional runtime deps.
@@ -1323,7 +1347,7 @@ class FaceAdapter:
         self._app = None
         self._load_lock = threading.Lock()
         self.error = None
-        self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "adaface").lower()
+        self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "legacy").lower()
         self.identity_adapter = self._build_identity_adapter()
         self.identity_error = None
         self.identity_runtime_error = None
@@ -1398,7 +1422,8 @@ class FaceAdapter:
                         if os.getenv("FACE_MODEL_ROOT"):
                             kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
                         self._app = FaceAnalysis(**kwargs)
-                        self._app.prepare(ctx_id=-1, det_size=(640, 640))
+                        det_size = int(os.getenv("FACE_DET_SIZE", "640"))
+                        self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
             import cv2
             import numpy as np
             image = cv2.imread(str(path))
@@ -1415,7 +1440,7 @@ class FaceAdapter:
             faces = self._app.get(image)
             image_height, image_width = image.shape[:2]
             min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
-            min_score = float(os.getenv("FACE_MIN_DETECTION_SCORE", "0.72"))
+            min_score = float(os.getenv("FACE_MIN_DETECTION_SCORE", "0.5"))
             results = []
             for face in faces:
                 bbox = [float(item) for item in face.bbox]
@@ -1428,16 +1453,25 @@ class FaceAdapter:
                 # Identity candidacy is deliberately stricter than face evidence.
                 # A weak/small face stays attached to the observation but cannot
                 # create a noisy pending person cluster.
-                sharpness = 0.0
-                quality = compute_face_quality(score, area_ratio, sharpness, getattr(face, "pose", []))
+                pose = [float(item) for item in getattr(face, "pose", [])] if getattr(face, "pose", None) is not None else []
+                landmarks = [[float(value) for value in point] for point in getattr(face, "kps", [])] if getattr(face, "kps", None) is not None else []
+                try:
+                    face_crop = align_face_crop(image, bbox, landmarks)
+                    raw_sharpness = _laplacian_variance(face_crop)
+                except Exception:
+                    face_crop = None
+                    raw_sharpness = 0.0
+                sharpness = _normalize_sharpness(raw_sharpness)
+                quality = compute_face_quality(score, area_ratio, sharpness, pose)
                 results.append({
                     "bbox": bbox,
                     "confidence": score,
                     "quality": quality,
                     "area_ratio": area_ratio,
                     "sharpness": sharpness,
-                    "pose": [float(item) for item in getattr(face, "pose", [])] if getattr(face, "pose", None) is not None else [],
-                    "landmarks": [[float(value) for value in point] for point in getattr(face, "kps", [])] if getattr(face, "kps", None) is not None else [],
+                    "raw_sharpness": raw_sharpness,
+                    "pose": pose,
+                    "landmarks": landmarks,
                     "embedding": face.embedding.tolist() if getattr(face, "embedding", None) is not None else [],
                 })
                 result = results[-1]
@@ -1448,15 +1482,16 @@ class FaceAdapter:
                     identity_error = None
                     if self.identity_configured:
                         try:
-                            crop = align_face_crop(image, bbox, result["landmarks"])
+                            crop = face_crop if face_crop is not None else align_face_crop(image, bbox, result["landmarks"])
                             embedded = self.identity_adapter.embed(crop)
                             result["embedding"] = embedded.embedding
                             result["embedding_version"] = embedded.model_version
                             result["quality_signal"] = embedded.quality_signal
                             # AdaFace norm is stored as provenance, not treated as
                             # a 0..10 score. It must not saturate all sample quality.
-                            result["identity_eligible"] = result["quality"] >= float(
-                                os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55")
+                            result["identity_eligible"] = (
+                                result["quality"] >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
+                                and score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
                             )
                             self.identity_runtime_error = None
                             self.identity_fallback = False
@@ -1472,6 +1507,10 @@ class FaceAdapter:
                     result["embedding_model"] = "buffalo_l"
                     result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
                     result["identity_ready"] = True
+                    result["identity_eligible"] = (
+                        result["quality"] >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
+                        and score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
+                    )
             return results
         except Exception as error:  # Optional model should not block image memory.
             self.error = str(error)
