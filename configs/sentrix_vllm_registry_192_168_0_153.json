@@ -128,7 +128,7 @@
       "default_max_tokens": 1501
     },
     "qwen3.5-0.8b-it-lora": {
-      "model": "/home/asus/models/Qwen3.5-0.8B",
+      "model": "/home/asus/models/Qwen3.5-0.8b-lora",
       "served_model_name": "qwen3.5-0.8b-lora",
       "dtype": "bfloat16",
       "gpu_memory_utilization": 0.45,
@@ -136,24 +136,20 @@
       "max_num_seqs": 2,
       "tensor_parallel_size": 1,
       "trust_remote_code": true,
-      "enable_lora": true,
-      "max_lora_rank": 64,
-      "lora_modules": [
-        {
-          "name": "qwen3.5-lora",
-          "path": "/home/asus/models/qwen3.5-lora"
-        }
-      ],
-      "notes": "Placeholder profile. Update model and lora path after the Qwen3.5 base/adapter are copied to the host.",
-      "default_max_tokens": 1501
+      "notes": "Full Qwen3.5-0.8B model checkpoint from /home/asus/models/Qwen3.5-0.8b-lora; served as a standalone BF16 profile (not a PEFT adapter).",
+      "default_max_tokens": 1501,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0
     },
     "qwen3.5-4b": {
       "model": "/home/asus/models/Qwen3.5-4B",
       "served_model_name": "qwen3.5-4b",
       "dtype": "bfloat16",
-      "quantization": "bitsandbytes",
-      "load_format": "bitsandbytes",
-      "gpu_memory_utilization": 0.45,
+      "gpu_memory_utilization": 0.46,
       "max_model_len": 4501,
       "max_num_seqs": 2,
       "tensor_parallel_size": 1,
