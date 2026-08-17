@@ -676,7 +676,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
 
 
 def _short_place_label(asset: dict) -> str:
-    """从资产反地理编码取短地点标签（'秦皇岛市昌黎县' / 'Chiang Mai'），供 preview 证据展示。"""
+    """从资产反地理编码取短地点标签（城市/区县名），供 preview 证据展示。"""
     import json as _json
     metadata = asset.get("metadata_json") or {}
     if isinstance(metadata, str):
@@ -1309,7 +1309,7 @@ def register_tools():
         input_schema={"operation": "count|exists|first|last|date|group|meal|list",
                       "filters": {"time": "去年/这两年/2023年 等相对或具体时间（原样写）",
                                   "person": "", "place": "", "media": "",
-                                  "food": "可选：限定某种食物（如'火锅'）"},
+                                  "food": "可选：限定某种食物（如火锅等具体菜名）"},
                       "group_by": "month|place"},
         executor=_query_memory_facts, read_write="read", cost_class="cheap", readiness="ready",
     ))
@@ -1364,7 +1364,7 @@ def register_tools():
     register(ToolSpec(
         name="get_core_memory",
         description=("读取长期家庭记忆（已确认人物/家庭角色/关系/偏好等）。"
-                     "subject 填人物名（如'明哥'）；topic 填话题关键词（如'西湖'）；都不填返回优先级最高的卡片。"
+                     "subject 填人物名（如某人的称呼）；topic 填话题关键词（如某个话题词）；都不填返回优先级最高的卡片。"
                      "每条记忆带 truth_status（confirmed_fact/user_stated/agent_inference/observed_pattern），"
                      "agent_inference 不能说成 confirmed。"),
         input_schema={"subject": "", "topic": "", "limit": 5},

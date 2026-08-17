@@ -247,13 +247,27 @@ function conversationContextLabel(turn, index) {
 function turnScore(score) {
   return [0, 1, 2].includes(score) ? `${score} 分` : "不适用";
 }
+function albumLocalUrl(fileName) {
+  const album = activeRun.value?.album_id || "";
+  return (album && fileName) ? `/api/albums/${encodeURIComponent(album)}/photos/${encodeURIComponent(fileName)}` : "";
+}
+function decorateImages(list) {
+  return (list || []).map((img) => {
+    if (img?.media_url) return img;
+    const parts = (img?.image_id || "").split("/");
+    const album = parts.length === 2 ? parts[0] : (activeRun.value?.album_id || "");
+    const file = parts.length === 2 ? parts[1] : (img?.file_name || "");
+    const local = (album && file) ? `/api/albums/${encodeURIComponent(album)}/photos/${encodeURIComponent(file)}` : "";
+    return local ? { ...img, media_url: local } : img;
+  });
+}
 function itemImages(item, gt = false) {
   if (gt) {
-    if (item.gt_images?.length) return item.gt_images;
+    if (item.gt_images?.length) return decorateImages(item.gt_images);
     return (item.retrieval_image_ids || []).map((id) => ({ image_id: id, file_name: id.split("/").pop(), matched: (item.matched_file_names || []).includes(id.split("/").pop()) }));
   }
-  if (item.predicted_images?.length) return item.predicted_images;
-  return (item.predicted_file_names || []).map((file_name) => ({ file_name }));
+  if (item.predicted_images?.length) return decorateImages(item.predicted_images);
+  return (item.predicted_file_names || []).map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
 }
 function isDirectEvidence(item, imageId) {
   return (item?.answer_evidence_image_ids || []).includes(imageId)
@@ -880,9 +894,12 @@ async function selectRun(run) { activeRunId.value = run.run_id; await loadActive
 async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
 function resetJudgePrompt() { rejudgePrompt.value = config.value?.judge_prompt || ""; }
 
+const exportScoreFilter = ref("all");
+const deleteScopeAfterRun = ref(false);
 function exportSftTraces() {
   if (!activeRunId.value) return;
-  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft`, "_blank");
+  const filter = exportScoreFilter.value === "all" ? "" : `?min_score=${exportScoreFilter.value}`;
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft${filter}`, "_blank");
 }
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
@@ -911,7 +928,7 @@ async function startSuite() {
   if (!selectedModels.size) { window.alert("请至少选择一个模型"); return; }
   suiteRunning.value = true;
   try {
-   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: selectedQa.value, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, vllm_target_id: vllmTargetId.value });
+   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: selectedQa.value, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: deleteScopeAfterRun.value });
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -1030,6 +1047,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 </label>
 </div>
       <div class="actions">
+<label class="check"><input type="checkbox" v-model="deleteScopeAfterRun" :disabled="suiteRunning || hasRunning" />完成后删除相册</label>
 <button class="btn" :disabled="suiteRunning || hasRunning" @click="startSuite">{{ hasRunning ? '已有任务运行中' : '启动评测' }}</button>
 <button class="btn warn" :disabled="!hasRunning" @click="stopSuite">停止全部</button>
 <button class="btn ghost" @click="loadProfiles">刷新模型列表</button>
@@ -1087,7 +1105,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
       <div class="section-head">
 <h2>{{ modelName(activeRun) }} · {{ albumName(activeRun) }} · {{ qaName(activeRun) }}</h2>
 <span class="phase-status" :class="activeRun.status">{{ statusLabel(activeRun.status) }}</span>
-<button class="btn compact" @click="exportSftTraces">导出全部轨迹(SFT json)</button>
+<span class="field-label">导出轨迹</span>
+<select v-model="exportScoreFilter" class="input compact">
+  <option value="all">全部</option>
+  <option value="1">1 分及以上</option>
+  <option value="2">2 分</option>
+</select>
+<button class="btn compact" @click="exportSftTraces">导出 SFT json</button>
 </div>
       <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}</p>
       <section class="rejudge-card">

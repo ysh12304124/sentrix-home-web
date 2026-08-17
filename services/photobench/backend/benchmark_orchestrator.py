@@ -813,7 +813,7 @@ class BenchmarkRun:
                  qa_set: str, sentrix_url: str, judge_url: str, vllm_api_url: str,
                  vllm_target_id: str, vllm_model_base_url: str, results_root: Path,
                  judge_system_prompt: str = JUDGE_PROMPT, judge_model: str = JUDGE_MODEL,
-                 judge_api_key: str = JUDGE_API_KEY):
+                 judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False):
         self.run_id = run_id
         self.album_id = album_id
         self.manifest = manifest
@@ -832,6 +832,7 @@ class BenchmarkRun:
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
         self.results_root = results_root
         self.lock = threading.RLock()
+        self.delete_scope_after_run = bool(delete_scope_after_run)
 
         album_base = BENCHMARK_DATA_ROOT / album_id
         self.album_dir = album_base
@@ -847,6 +848,7 @@ class BenchmarkRun:
             "qa_set": qa_set,
             "judge_model": judge_model,
             "judge_url": self.judge_url,
+            "delete_scope_after_run": self.delete_scope_after_run,
             "vllm_target_id": vllm_target_id,
             "vllm_manager_url": vllm_api_url,
             "vllm_model_base_url": vllm_model_base_url,
@@ -1013,6 +1015,30 @@ class BenchmarkRun:
             self.state["finished_at"] = now_iso()
             with self.lock:
                 self.persist()
+            if self.delete_scope_after_run:
+                self._cleanup_scope()
+
+    def _cleanup_scope(self):
+        """Delete the PhotoBench-created memory space after the run finishes."""
+        scope_id = self.state.get("scope_id")
+        if not scope_id:
+            self.state["scope_cleanup"] = {"status": "skipped", "reason": "no_scope_id"}
+            return
+        try:
+            result = request_json(
+                f"{self.sentrix_url}/api/memory-spaces/{quote(scope_id)}",
+                method="DELETE", timeout=180,
+            )
+            self.state["scope_cleanup"] = {
+                "status": "deleted", "scope_id": scope_id,
+                "removed": (result or {}).get("removed") or {},
+            }
+        except Exception as exc:
+            self.state["scope_cleanup"] = {
+                "status": "failed", "scope_id": scope_id, "error": str(exc),
+            }
+        with self.lock:
+            self.persist()
 
     # ---- Phase implementations ----
 
@@ -2589,8 +2615,11 @@ class OrchestratorRepository:
             result["summary"] = self._effective_summary(state)
             return result
 
-    def export_sft(self, run_id: str) -> dict:
-        """导出全部轨迹（每步模型调用的 prompt -> response）用于轨迹训练。"""
+    def export_sft(self, run_id: str, min_score: int | None = None) -> dict:
+        """导出轨迹（每步模型调用的 prompt -> response）用于轨迹训练。
+
+        min_score: None 导出全部；1 只导出答案评分 >=1 的题目；2 只导出评分 =2 的题目。
+        """
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
@@ -2598,6 +2627,10 @@ class OrchestratorRepository:
             state = run.state if isinstance(run, BenchmarkRun) else run
             samples = []
             for item in (state.get("items") or []):
+                if min_score is not None:
+                    item_score = (item.get("judge") or {}).get("score")
+                    if item_score is None or item_score < min_score:
+                        continue
                 qa_id = item.get("qa_id")
                 turns = item.get("runtime_turns") or []
                 for turn in turns:
@@ -2616,7 +2649,8 @@ class OrchestratorRepository:
                             "step": step.get("status", "complete"),
                             "messages": messages,
                         })
-            return {"run_id": run_id, "count": len(samples), "samples": samples}
+            return {"run_id": run_id, "count": len(samples), "samples": samples,
+                    "min_score": min_score, "filtered": min_score is not None}
 
     def get_run_items(self, run_id: str, page: int = 1, page_size: int = 20,
                       search: str = "", score: str = "", task_type: str = "",
@@ -3325,6 +3359,7 @@ class OrchestratorRepository:
         target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
         vllm_api_url = str(target["manager_url"])
         vllm_model_base_url = str(target["model_base_url"])
+        delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
         dirty_statuses = {"running", "pending", "cancelling"}
         with self.lock:
             busy = [
@@ -3352,6 +3387,7 @@ class OrchestratorRepository:
                     results_root=self.results_root,
                     judge_system_prompt=load_custom_judge_prompt() or JUDGE_PROMPT,
                     judge_model=judge_model, judge_api_key=judge_api_key_suite,
+                    delete_scope_after_run=delete_scope_after_run,
                 )
                 self.runs[run_id] = run
                 created_runs.append(run_id)
@@ -3359,7 +3395,10 @@ class OrchestratorRepository:
 
         def _run_sequentially():
             for rid in created_runs:
-                run = self.runs[rid]
+                run = self.runs.get(rid)
+                if run is None or not isinstance(run, BenchmarkRun):
+                    print(f"[suite] run {rid} not found in registry; skipping", flush=True)
+                    continue
                 if run._cancel.is_set() or run.state.get("status") == "cancelled":
                     continue
                 run.execute()
@@ -3481,7 +3520,10 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))
-                payload = self.repo.export_sft(run_id)
+                _q = parse_qs(parsed.query)
+                _raw = (_q.get("min_score") or [""])[0]
+                min_score = int(_raw) if _raw in {"1", "2"} else None
+                payload = self.repo.export_sft(run_id, min_score=min_score)
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")

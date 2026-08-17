@@ -200,6 +200,26 @@
       "mm_processor_cache_gb": 0,
       "notes": "Qwen3-VL-4B-Instruct. bf16 native weights ~8.4GB.",
       "default_max_tokens": 1501
+    },
+    "qwen3.8-27b-bnb4": {
+      "model": "/home/asus/models/Qwen3.8-27B",
+      "served_model_name": "qwen3.8-27b-bnb4",
+      "dtype": "bfloat16",
+      "quantization": "bitsandbytes",
+      "load_format": "bitsandbytes",
+      "gpu_memory_utilization": 0.93,
+      "max_model_len": 4501,
+      "max_num_seqs": 1,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 1
+      },
+      "mm_processor_cache_gb": 0,
+      "default_max_tokens": 1501,
+      "notes": "Qwen3.8-27B bitsandbytes 4-bit single-GPU profile; max_num_seqs=1 due to 24G budget (weights 18.2G + fp32 GDN state per seq); validated 2026-08-16."
     }
   }
 }
