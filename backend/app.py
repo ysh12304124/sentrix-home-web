@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -52,8 +53,8 @@ app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 maintenance_lock = threading.Lock()
 runtime_lock = threading.Lock()
-pipeline_commit_lock = threading.Lock()
 batch_worker_lock = threading.Lock()
+db_write_lock = threading.RLock()
 active_batch_workers = set()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
@@ -66,6 +67,31 @@ SUPPORTED_IMPORT_SUFFIXES = {
     ".txt", ".md", ".json",
 }
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
+
+
+@contextlib.contextmanager
+def db_write_guard(label: str = "db-write", timeout: float = 120.0):
+    """Serialize SQLite writes across the request store and background worker stores.
+
+    Background pipeline workers own separate sqlite3 connections (see process_asset),
+    while import endpoints write through the request-scoped ``store``.  SQLite WAL
+    allows only one writer, so all write transactions must be serialized in-process.
+    A timed acquire turns a silent deadlock into an actionable failure instead of
+    hanging the request forever.
+    """
+    started = time.perf_counter()
+    if not db_write_lock.acquire(timeout=timeout):
+        raise RuntimeError(
+            f"timed out acquiring SQLite write lock ({label}) after {timeout:.0f}s; "
+            "a concurrent writer is stuck"
+        )
+    try:
+        waited = time.perf_counter() - started
+        if waited > 0.5:
+            print(f"[db-write-lock] {label} waited {waited:.2f}s", flush=True)
+        yield
+    finally:
+        db_write_lock.release()
 
 
 def _upload_destination(identifier, safe_name, media_type):
@@ -291,17 +317,19 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
     )
     limits = _pipeline_worker_limits()
     started_at = time.perf_counter()
-    task_store.update_ingest_batch_metadata(batch_id, {
-        "pipeline_metrics": {**limits, "status": "processing", "asset_count": len(asset_ids)}
-    })
+    with db_write_guard("ingest-group-start"):
+        task_store.update_ingest_batch_metadata(batch_id, {
+            "pipeline_metrics": {**limits, "status": "processing", "asset_count": len(asset_ids)}
+        })
     try:
         image_ids = []
         for asset_id in asset_ids:
             asset = task_store.get_asset(asset_id) or {}
             if asset.get("media_type") == "image" and asset.get("status") in {"queued", "failed"}:
-                task_store.update_asset(asset_id, "processing", {
-                    "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
-                })
+                with db_write_guard("ingest-group-mark-processing"):
+                    task_store.update_asset(asset_id, "processing", {
+                        "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
+                    })
                 image_ids.append(asset_id)
             elif asset.get("status") in {"queued", "failed", "video-queued"}:
                 process_asset(asset_id)
@@ -311,10 +339,10 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
             for asset_id in image_ids:
                 try:
                     prepared = futures[asset_id].result()
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-fast"):
                         task_pipeline.commit_fast_image(asset_id, prepared)
                 except Exception as error:
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-fast-error"):
                         task_store.cleanup_asset_derivatives(asset_id)
                         task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
 
@@ -327,10 +355,10 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
             for asset_id in semantic_ids:
                 try:
                     prepared = futures[asset_id].result()
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-semantic"):
                         task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
                 except Exception as error:
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-semantic-error"):
                         task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic"})
 
         if finalize_batch:
@@ -359,14 +387,16 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
             "stage_timings": _pipeline_timing_summary(task_store, asset_ids),
             "total_wall_seconds": round(time.perf_counter() - started_at, 4),
         }
-        task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
+        with db_write_guard("ingest-group-metrics"):
+            task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
     except Exception as error:
-        task_store.update_ingest_batch_metadata(batch_id, {
-            "pipeline_metrics": {
-                **limits, "status": "failed", "asset_count": len(asset_ids),
-                "total_wall_seconds": round(time.perf_counter() - started_at, 4), "error": str(error),
-            }
-        })
+        with db_write_guard("ingest-group-metrics-error"):
+            task_store.update_ingest_batch_metadata(batch_id, {
+                "pipeline_metrics": {
+                    **limits, "status": "failed", "asset_count": len(asset_ids),
+                    "total_wall_seconds": round(time.perf_counter() - started_at, 4), "error": str(error),
+                }
+            })
         raise
     finally:
         task_store.close()
@@ -403,15 +433,19 @@ def process_ingest_batch(asset_ids, batch_id):
                 break
             time.sleep(0.5)
 
-        task_store.complete_ingest_batch(batch_id)
-        if task_store.claim_ingest_batch_summary(batch_id):
+        with db_write_guard("ingest-batch-complete"):
+            task_store.complete_ingest_batch(batch_id)
+        with db_write_guard("ingest-batch-claim"):
+            claimed = task_store.claim_ingest_batch_summary(batch_id)
+        if claimed:
             event_ids = task_store.batch_event_ids(batch_id)
             limits = _pipeline_worker_limits()
             summary_started = time.perf_counter()
             with ThreadPoolExecutor(max_workers=limits["event_summary_workers"], thread_name_prefix="sentrix-event-summary") as executor:
                 event_results = list(executor.map(_summarize_event_worker, event_ids))
             summary_wall_seconds = round(time.perf_counter() - summary_started, 4)
-            task_store.finish_ingest_batch(batch_id)
+            with db_write_guard("ingest-batch-finish"):
+                task_store.finish_ingest_batch(batch_id)
             metrics = {
                 **limits, "status": "completed", "asset_count": len(all_asset_ids),
                 "image_count": len(all_asset_ids), "event_count": len(event_ids),
@@ -421,9 +455,11 @@ def process_ingest_batch(asset_ids, batch_id):
                 "stage_timings": _pipeline_timing_summary(task_store, all_asset_ids),
                 "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4),
             }
-            task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
+            with db_write_guard("ingest-batch-metrics"):
+                task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
     except Exception as error:
-        task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": {"status": "failed", "error": str(error)}})
+        with db_write_guard("ingest-batch-metrics-error"):
+            task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": {"status": "failed", "error": str(error)}})
         raise
     finally:
         task_store.close()
@@ -2534,8 +2570,9 @@ async def import_remote_files(
     per_file = per_file or [{} for _ in files]
     scope = (scope_id or scopeId or "home-default").strip() or "home-default"
     batch = (batch_id or batchId or make_id("batch")).strip()
-    store.create_memory_space(scope, scope, kind="benchmark")
-    store.create_ingest_batch(batch, scope)
+    with db_write_guard("import-remote-init"):
+        store.create_memory_space(scope, scope, kind="benchmark")
+        store.create_ingest_batch(batch, scope)
     items = []
     queued_asset_ids = []
     for index, upload in enumerate(files):
@@ -2550,17 +2587,18 @@ async def import_remote_files(
                 shutil.copyfileobj(upload.file, output)
             file_save_seconds = round(time.perf_counter() - save_started, 4)
             capture = _normalized_capture_metadata(per_file[index])
-            created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
-                "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
-                "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
-                "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
-                **capture,
-            })
-            if media_type == "video" and created.get("path") == str(destination):
-                created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
-            created = store.update_asset(created["id"], created.get("status") or "queued", {
-                "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
-            })
+            with db_write_guard("import-remote-file"):
+                created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
+                    "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
+                    "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
+                    "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
+                    **capture,
+                })
+                if media_type == "video" and created.get("path") == str(destination):
+                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                created = store.update_asset(created["id"], created.get("status") or "queued", {
+                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
+                })
             deduplicated = created.get("path") != str(destination)
             if deduplicated:
                 destination.unlink(missing_ok=True)
@@ -2591,8 +2629,9 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="source_path not found")
     scope = (request.scope_id or "home-default").strip() or "home-default"
     batch_id = (request.batch_id or make_id("batch")).strip()
-    store.create_memory_space(scope, scope, kind="benchmark", source_path=str(source))
-    store.create_ingest_batch(batch_id, scope)
+    with db_write_guard("import-directory-init"):
+        store.create_memory_space(scope, scope, kind="benchmark", source_path=str(source))
+        store.create_ingest_batch(batch_id, scope)
     if source.is_file():
         candidates = [source]
     else:
@@ -2622,12 +2661,13 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
             shutil.copy2(path, target)
         try:
             copy_started = time.perf_counter()
-            created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
-            if created.get("media_type") == "video" and created.get("path") == str(target):
-                created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
-            created = store.update_asset(created["id"], created.get("status") or "queued", {
-                "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
-            })
+            with db_write_guard("import-directory-file"):
+                created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
+                if created.get("media_type") == "video" and created.get("path") == str(target):
+                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                created = store.update_asset(created["id"], created.get("status") or "queued", {
+                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
+                })
         except Exception as error:
             if request.copy_file:
                 target.unlink(missing_ok=True)
@@ -2669,8 +2709,9 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
 def create_ingest_batch(request: IngestBatchCreateRequest):
     scope = (request.scope_id or "home-default").strip() or "home-default"
     batch_id = (request.batch_id or make_id("batch")).strip()
-    store.create_memory_space(scope, request.name or scope, kind=request.kind or "benchmark", source_path=request.source_path)
-    store.create_ingest_batch(batch_id, scope)
+    with db_write_guard("ingest-batch-create"):
+        store.create_memory_space(scope, request.name or scope, kind=request.kind or "benchmark", source_path=request.source_path)
+        store.create_ingest_batch(batch_id, scope)
     return _batch_status(batch_id)
 
 
@@ -2683,7 +2724,8 @@ def ingest_batch(batch_id: str):
 def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
     if not store.get_ingest_batch(batch_id):
         raise HTTPException(status_code=404, detail="ingest batch not found")
-    store.complete_ingest_batch(batch_id)
+    with db_write_guard("ingest-batch-complete-endpoint"):
+        store.complete_ingest_batch(batch_id)
     with batch_worker_lock:
         worker_active = batch_id in active_batch_workers
     if not worker_active:
