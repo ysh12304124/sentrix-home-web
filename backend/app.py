@@ -1566,8 +1566,9 @@ def asset_file(asset_id: str, original: bool = False):
     path = Path(value["path"]) if value else None
     if not value or not path or not path.is_file():
         raise HTTPException(status_code=404, detail="asset file not found")
-    # Keep an escape hatch for downloading the untouched HEIC source.
-    if original or not needs_browser_transcode(path, value.get("mime_type")):
+    # Keep an escape hatch for downloading the untouched original file.
+    mime = (value.get("mime_type") or "").split(";", 1)[0].strip().lower()
+    if original or not mime.startswith("image/"):
         return FileResponse(
             path,
             media_type=value.get("mime_type") or "application/octet-stream",
