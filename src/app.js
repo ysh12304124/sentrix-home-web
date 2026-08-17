@@ -252,7 +252,7 @@
     // RX-6: internal ids and raw JSON only in the admin debug layer.
     const idLine = isAdmin && (evidence.asset_id || evidence.observation_id) ? `<small class="admin-only">${escapeHtml(evidence.asset_id || "")}${evidence.observation_id ? " · " + escapeHtml(evidence.observation_id) : ""}</small>` : "";
     const debugRaw = isAdmin && evidence.raw ? `<details class="admin-only"><summary>查看模型原始 JSON</summary><pre>${escapeHtml(JSON.stringify(evidence.raw, null, 2))}</pre></details>` : "";
-    return `<article class="evidence-card"><div class="evidence-head"><span class="evidence-kind">${evidence.kind === "observation" ? "图片观察" : evidence.kind === "asset" ? "原始资料" : evidence.kind === "fact" ? "人物事实" : "记忆证据"}</span></div>${idLine}${media}${main}${debugRaw}</article>`;
+    return `<article class="evidence-card"><div class="evidence-head"><span class="evidence-kind">${evidence.kind === "observation" ? "图片观察" : evidence.kind === "asset" ? "原始资料" : evidence.kind === "fact" ? "人物事实" : "记忆证据"}</span></div>${idLine}${media}${main}${evidence.file_name ? `<small class="evidence-filename">${escapeHtml(evidence.file_name)}</small>` : ""}${debugRaw}</article>`;
   }
 
   function evidenceLayer(title, values) {
