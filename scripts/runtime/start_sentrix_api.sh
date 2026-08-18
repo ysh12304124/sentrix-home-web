@@ -30,13 +30,18 @@ runtime_dirs=()
 while IFS= read -r directory; do
   runtime_dirs+=("$directory")
 done < <(find "$site_packages/nvidia" -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
+# GPU face detection (RetinaFace + buffalo_l onnxruntime CUDA) needs cudnn/cublas
+# shipped in the stmem conda env; the project .venv does not vendor nvidia libs.
+while IFS= read -r directory; do
+  runtime_dirs+=("$directory")
+done < <(find /home/asus/miniconda3/envs/stmem/lib/python3.10/site-packages/nvidia -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
 
 if ((${#runtime_dirs[@]})); then
   runtime_path="$(IFS=:; echo "${runtime_dirs[*]}")"
   export LD_LIBRARY_PATH="${runtime_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-export FACE_PROVIDERS="${FACE_PROVIDERS:-CPUExecutionProvider}"
+export FACE_PROVIDERS="${FACE_PROVIDERS:-CUDAExecutionProvider,CPUExecutionProvider}"
 export SENTRIX_LLM_BACKEND="${SENTRIX_LLM_BACKEND:-vllm}"
 export SENTRIX_VLLM_BASE_URL="${SENTRIX_VLLM_BASE_URL:-http://127.0.0.1:8100/v1}"
 export SENTRIX_VLLM_MODEL="${SENTRIX_VLLM_MODEL:-gemma4-12b-it}"
@@ -59,10 +64,6 @@ export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/asus/.cache/cli
 # visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
 export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"
 export SENTRIX_TEXT_EMBEDDER="${SENTRIX_TEXT_EMBEDDER:-clip}"
-export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-legacy}"
-export ADAFACE_DEVICE="${ADAFACE_DEVICE:-cpu}"
-export ADAFACE_MODEL_PATH="${ADAFACE_MODEL_PATH:-/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt}"
-export ADAFACE_REPO_ROOT="${ADAFACE_REPO_ROOT:-/home/asus/models/AdaFace}"
 
 # --- Phase 0-8 + 2R feature flags (default on for production) ---
 export SENTRIX_THIN_AGENT_V1="${SENTRIX_THIN_AGENT_V1:-1}"
@@ -111,19 +112,6 @@ if [[ "$SENTRIX_IMAGE_EMBEDDER" == "chinese_clip" ]]; then
   fi
 fi
 
-if [[ "$FACE_EMBEDDING_MODE" == "adaface" ]]; then
-  if [[ ! -f "$ADAFACE_MODEL_PATH" ]]; then
-    echo "AdaFace checkpoint is unavailable: $ADAFACE_MODEL_PATH" >&2
-    exit 1
-  fi
-  if [[ ! -f "$ADAFACE_REPO_ROOT/net.py" ]]; then
-    echo "AdaFace repository is unavailable: $ADAFACE_REPO_ROOT/net.py" >&2
-    exit 1
-  fi
-  if ! "$python_bin" -c 'import pytorch_lightning, torchmetrics' >/dev/null 2>&1; then
-    echo "AdaFace Python dependencies are unavailable; install backend/requirements.txt" >&2
-    exit 1
-  fi
-fi
+# Face identity embedding is fixed to buffalo_l (w600k_r50); AdaFace is removed.
 
 exec "$python_bin" -m uvicorn backend.app:app --host "${SENTRIX_API_HOST:-0.0.0.0}" --port "$port"

@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 
-from .face_embeddings import AdaFaceAdapter, FaceEmbeddingUnavailable, MagFaceAdapter, compute_face_quality
+from .face_embeddings import FaceEmbeddingUnavailable, compute_face_quality
 from .geocoding import format_gps_prefix
 
 
@@ -1348,39 +1348,21 @@ class FaceAdapter:
         self._load_lock = threading.Lock()
         self._retina = None
         self.error = None
-        self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "legacy").lower()
-        self.identity_adapter = self._build_identity_adapter()
+        self.identity_model = "legacy"
+        self.identity_adapter = None
         self.identity_error = None
         self.identity_runtime_error = None
         self.identity_fallback = False
         self.identity_fallback_model = None
         self.identity_fallback_error = None
-        if self.identity_model not in {"none", "legacy", "adaface", "magface"}:
-            self.identity_error = f"unsupported face embedding mode: {self.identity_model}"
-        elif self.identity_model in {"adaface", "magface"} and not self.identity_adapter.available:
-            self.identity_error = f"{self.identity_model} checkpoint is unavailable"
-
-    def _build_identity_adapter(self):
-        if self.identity_model == "adaface":
-            return AdaFaceAdapter()
-        if self.identity_model == "magface":
-            return MagFaceAdapter(
-                model_version=os.getenv("MAGFACE_MODEL_VERSION", "unconfigured"),
-                backend=None,
-            )
-        return None
 
     @property
     def identity_configured(self):
-        return self.identity_model == "legacy" or bool(self.identity_adapter and self.identity_adapter.available)
+        return True
 
     @property
     def identity_ready(self):
-        if self.identity_model == "none":
-            return False
-        if self.identity_fallback:
-            return True
-        return self.identity_configured and self.identity_runtime_error is None
+        return True
 
     @property
     def ready(self):
@@ -1408,23 +1390,6 @@ class FaceAdapter:
         if not self.enabled:
             return []
         try:
-            if self._app is None:
-                with getattr(self, "_load_lock", threading.Lock()):
-                    if self._app is None:
-                        self._configure_onnx_runtime_libraries()
-                        from insightface.app import FaceAnalysis
-                        providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
-                        kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
-                        if self.identity_model in {"adaface", "magface"}:
-                            # AdaFace/MagFace are preferred for identity, but
-                            # buffalo_l recognition is kept as a fallback when
-                            # the preferred identity adapter cannot load or run.
-                            kwargs["allowed_modules"] = ["detection", "landmark_2d_106", "recognition"]
-                        if os.getenv("FACE_MODEL_ROOT"):
-                            kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
-                        self._app = FaceAnalysis(**kwargs)
-                        det_size = int(os.getenv("FACE_DET_SIZE", "640"))
-                        self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
             import cv2
             import numpy as np
             image = cv2.imread(str(path))
@@ -1438,109 +1403,10 @@ class FaceAdapter:
                     image = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
             if image is None:
                 return []
-            if os.getenv("FACE_DETECTOR", "scrfd") == "retinaface_tiled":
-                return self._detect_retina_tiled(image)
-            faces = self._app.get(image)
-            image_height, image_width = image.shape[:2]
-            min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
-            min_score = float(os.getenv("FACE_MIN_DETECTION_SCORE", "0.5"))
-            results = []
-            for face in faces:
-                bbox = [float(item) for item in face.bbox]
-                width = max(0.0, bbox[2] - bbox[0])
-                height = max(0.0, bbox[3] - bbox[1])
-                score = float(face.det_score)
-                if score < min_score or min(width, height) < min_size:
-                    continue
-                area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
-                # Identity candidacy is deliberately stricter than face evidence.
-                # A weak/small face stays attached to the observation but cannot
-                # create a noisy pending person cluster.
-                pose = [float(item) for item in getattr(face, "pose", [])] if getattr(face, "pose", None) is not None else []
-                landmarks = [[float(value) for value in point] for point in getattr(face, "kps", [])] if getattr(face, "kps", None) is not None else []
-                try:
-                    face_crop = align_face_crop(image, bbox, landmarks)
-                    raw_sharpness = _laplacian_variance(face_crop)
-                except Exception:
-                    face_crop = None
-                    raw_sharpness = 0.0
-                sharpness = _normalize_sharpness(raw_sharpness)
-                quality = compute_face_quality(score, area_ratio, sharpness, pose)
-                results.append({
-                    "bbox": bbox,
-                    "confidence": score,
-                    "quality": quality,
-                    "area_ratio": area_ratio,
-                    "sharpness": sharpness,
-                    "raw_sharpness": raw_sharpness,
-                    "pose": pose,
-                    "landmarks": landmarks,
-                    "embedding": face.embedding.tolist() if getattr(face, "embedding", None) is not None else [],
-                })
-                result = results[-1]
-                if self.identity_model in {"adaface", "magface"}:
-                    result["embedding_model"] = self.identity_model
-                    result["embedding_version"] = self.identity_adapter.model_version
-                    result["identity_ready"] = self.identity_configured
-                    identity_error = None
-                    if self.identity_configured:
-                        try:
-                            crop = face_crop if face_crop is not None else align_face_crop(image, bbox, result["landmarks"])
-                            embedded = self.identity_adapter.embed(crop)
-                            result["embedding"] = embedded.embedding
-                            result["embedding_version"] = embedded.model_version
-                            result["quality_signal"] = embedded.quality_signal
-                            # AdaFace norm is stored as provenance, not treated as
-                            # a 0..10 score. It must not saturate all sample quality.
-                            result["identity_eligible"] = (
-                                result["quality"] >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
-                                and score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
-                            )
-                            self.identity_runtime_error = None
-                            self.identity_fallback = False
-                            self.identity_fallback_model = None
-                            self.identity_fallback_error = None
-                        except FaceEmbeddingUnavailable as error:
-                            identity_error = str(error)
-                    else:
-                        identity_error = self.identity_error
-                    if identity_error:
-                        self._apply_identity_fallback(result, identity_error)
-                elif self.identity_model == "legacy":
-                    result["embedding_model"] = "buffalo_l"
-                    result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
-                    result["identity_ready"] = True
-                    result["identity_eligible"] = (
-                        result["quality"] >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
-                        and score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
-                    )
-            return results
+            return self._detect_retina_tiled(image)
         except Exception as error:  # Optional model should not block image memory.
             self.error = str(error)
             return []
-
-    def _apply_identity_fallback(self, result, error):
-        """Use InsightFace's loaded buffalo_l vector when the preferred adapter fails."""
-        fallback_embedding = result.get("embedding") or []
-        if not fallback_embedding:
-            result["embedding"] = []
-            result["identity_ready"] = False
-            result["identity_error"] = str(error)
-            self.identity_runtime_error = str(error)
-            return False
-        result["embedding"] = fallback_embedding
-        result["embedding_model"] = "buffalo_l"
-        result["embedding_version"] = os.getenv("FACE_MODEL_NAME", "buffalo_l")
-        result["identity_ready"] = True
-        result["identity_fallback"] = True
-        result["identity_fallback_model"] = "buffalo_l"
-        result["identity_fallback_error"] = str(error)
-        result["identity_error"] = str(error)
-        self.identity_fallback = True
-        self.identity_fallback_model = "buffalo_l"
-        self.identity_fallback_error = str(error)
-        self.identity_runtime_error = str(error)
-        return True
 
     def _detect_retina_tiled(self, image):
         """RetinaFace tiled detection + buffalo_l sub-crop alignment/embedding.
