@@ -4294,7 +4294,7 @@ class MemoryStore:
         for row in rows:
             row["reviewable"] = row.get("status") != "rejected" and int(row.get("member_count", 0) or 0) > 0
             row["single_sample"] = row.get("status") == "pending" and int(row.get("member_count", 0) or 0) <= 1
-            row["samples"] = self._rows("""SELECT fi.id, fi.asset_id, fi.observation_id, fi.bbox_json, fi.detection_confidence, a.file_name, a.media_type
+            row["samples"] = self._rows("""SELECT fi.id, fi.asset_id, fi.observation_id, fi.bbox_json, fi.detection_confidence, fi.quality, a.file_name, a.media_type
                 FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE fi.cluster_id = ? ORDER BY fi.created_at DESC LIMIT 12""", (row["id"],))
         return rows
 
