@@ -306,7 +306,8 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
                 except Exception as error:
                     with pipeline_commit_lock:
                         task_store.cleanup_asset_derivatives(asset_id)
-                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
+                        _retries = int(((task_store.get_asset(asset_id) or {}).get("metadata_json") or {}).get("retry_count") or 0) + 1
+                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast", "retry_count": _retries})
 
         semantic_ids = [
             asset_id for asset_id in image_ids
@@ -321,7 +322,8 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
                         task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
                 except Exception as error:
                     with pipeline_commit_lock:
-                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic"})
+                        _retries = int(((task_store.get_asset(asset_id) or {}).get("metadata_json") or {}).get("retry_count") or 0) + 1
+                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic", "retry_count": _retries})
 
         if finalize_batch:
             task_store.complete_ingest_batch(batch_id)
@@ -375,10 +377,17 @@ def process_ingest_batch(asset_ids, batch_id):
         first = True
         while True:
             rows = task_store._rows(
-                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id",
+                """SELECT id, status, metadata_json FROM assets
+                   WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id""",
                 (batch_id,),
             )
-            queued_ids = [row["id"] for row in rows]
+            # Retry cap: stop picking up failed assets after 3 attempts so a
+            # persistent failure (e.g. LLM endpoint down) cannot loop forever.
+            queued_ids = [
+                row["id"] for row in rows
+                if row["status"] != "failed"
+                or int((json.loads(row.get("metadata_json") or "{}") or {}).get("retry_count") or 0) < 3
+            ]
             if queued_ids:
                 all_asset_ids.extend(item for item in queued_ids if item not in all_asset_ids)
                 _process_ingest_asset_group(queued_ids, batch_id, finalize_batch=False)
