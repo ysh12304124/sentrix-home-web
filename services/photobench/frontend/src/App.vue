@@ -1423,14 +1423,14 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                           <div class="call-budget-line"><span>请求预算</span><b>{{ callBudget(call) }}</b><span v-if="call.step_id">步骤 {{ call.step_id }}</span><span v-if="callObservation(call).relatedTool !== '-'">关联工具 {{ callObservation(call).relatedTool }}</span><span v-if="callObservation(call).parentStep !== '-'">父步骤 {{ callObservation(call).parentStep }}</span></div>
                           <details v-if="debugStepForCallInGroup(itemDetail(summary), group, call)" class="debug-inline">
                             <summary>完整输入 / 输出</summary>
-                            <div v-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'model'">
+                            <div v-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'judge' || debugStepForCallInGroup(itemDetail(summary), group, call).call_type === 'faithfulness_judge'">
+                              <p class="muted small">评判结论</p><pre>{{ JSON.stringify({ faithful: debugStepForCallInGroup(itemDetail(summary), group, call).faithful, problems: debugStepForCallInGroup(itemDetail(summary), group, call).problems }, null, 2) }}</pre>
+                              <p v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt" class="muted small">评判提示词</p><pre v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt">{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt, null, 2) }}</pre>
+                              <p v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw" class="muted small">评判原始回答</p><pre v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw">{{ debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw }}</pre>
+                            </div>
+                            <div v-else>
                               <p class="muted small">完整提示词</p><pre>{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).prompt, null, 2) }}</pre>
                               <p class="muted small">模型原始回答</p><pre>{{ debugStepForCallInGroup(itemDetail(summary), group, call).raw_full || debugStepForCallInGroup(itemDetail(summary), group, call).raw }}</pre>
-                            </div>
-                            <div v-else-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'judge'">
-                              <p class="muted small">评判结论</p><pre>{{ JSON.stringify({ faithful: debugStepForCallInGroup(itemDetail(summary), group, call).faithful, problems: debugStepForCallInGroup(itemDetail(summary), group, call).problems }, null, 2) }}</pre>
-                              <p class="muted small">评判提示词</p><pre>{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt, null, 2) }}</pre>
-                              <p class="muted small">评判原始回答</p><pre>{{ debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw }}</pre>
                             </div>
                           </details>
                           <div v-if="showToolBranch(call) && toolsForGroupedCall(itemDetail(summary), call).length" class="tool-tree">
