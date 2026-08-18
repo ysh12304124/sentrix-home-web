@@ -2296,6 +2296,9 @@ class BenchmarkRun:
                 if agent_wall_times else None,
             "agent_loop_calls_mean": round(sum(agent_loop_counts) / len(agent_loop_counts), 3)
                 if agent_loop_counts else None,
+            "agent2_trace": summarize_agent2_trace([
+                turn for item in items for turn in (item.get("runtime_turns") or [item])
+            ]),
         }
 
     @staticmethod
