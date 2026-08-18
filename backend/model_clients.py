@@ -1347,6 +1347,7 @@ class FaceAdapter:
         self._app = None
         self._load_lock = threading.Lock()
         self._retina = None
+        self._recognition_session = None
         self.error = None
         self.identity_model = "legacy"
         self.identity_adapter = None
@@ -1408,6 +1409,32 @@ class FaceAdapter:
             self.error = str(error)
             return []
 
+    def _load_buffalo_recognition(self):
+        """Load buffalo_l recognition (w600k_r50) for RetinaFace-only fallback."""
+        try:
+            import onnxruntime
+            model_root = os.getenv("FACE_MODEL_ROOT", os.path.expanduser("~/.insightface/models"))
+            model_path = os.path.join(model_root, os.getenv("FACE_MODEL_NAME", "buffalo_l"), "w600k_r50.onnx")
+            if not os.path.isfile(model_path):
+                return None
+            providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
+            return onnxruntime.InferenceSession(model_path, providers=providers)
+        except Exception:
+            return None
+
+    def _recognition_embed(self, crop):
+        try:
+            import numpy as np
+            crop = crop.resize((112, 112))
+            image = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            blob = ((image - 127.5) / 128.0).transpose(2, 0, 1)[None, ...]
+            output = self._recognition_session.run(
+                None, {self._recognition_session.get_inputs()[0].name: blob}
+            )[0]
+            return [float(value) for value in output[0]]
+        except Exception:
+            return []
+
     def _detect_retina_tiled(self, image):
         """RetinaFace tiled detection + buffalo_l sub-crop alignment/embedding.
 
@@ -1422,6 +1449,8 @@ class FaceAdapter:
             if self._retina is None:
                 self._retina = RetinaFaceTiledDetector()
                 self._ensure_face_analysis()
+                if self._recognition_session is None:
+                    self._recognition_session = self._load_buffalo_recognition()
             if self._app is None:
                 return []
             detections = self._retina.detect(image)
@@ -1434,11 +1463,44 @@ class FaceAdapter:
                 height = max(0.0, bbox[3] - bbox[1])
                 if min(width, height) < min_size:
                     continue
+                score = float(det["confidence"])
                 sub = self._expand_crop(image, bbox)
                 if sub is None:
                     continue
                 sub_faces = self._app.get(sub)
                 if not sub_faces:
+                    # SCRFD sub-crop misses the smallest faces; fall back to
+                    # RetinaFace bbox + landmark alignment so the face survives.
+                    try:
+                        crop = align_face_crop(image, bbox, det["landmarks"])
+                        raw_sharpness = _laplacian_variance(crop)
+                    except Exception:
+                        crop = None
+                        raw_sharpness = 0.0
+                    sharpness = _normalize_sharpness(raw_sharpness)
+                    embedding = self._recognition_embed(crop) if crop is not None and self._recognition_session is not None else []
+                    if not embedding:
+                        continue
+                    area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
+                    quality = compute_face_quality(score, area_ratio, sharpness, [])
+                    results.append({
+                        "bbox": bbox,
+                        "confidence": score,
+                        "quality": quality,
+                        "area_ratio": area_ratio,
+                        "sharpness": sharpness,
+                        "raw_sharpness": raw_sharpness,
+                        "pose": [],
+                        "landmarks": det["landmarks"],
+                        "embedding": embedding,
+                        "embedding_model": "buffalo_l",
+                        "embedding_version": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
+                        "identity_ready": bool(embedding),
+                        "identity_eligible": (
+                            score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
+                            and quality >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
+                        ),
+                    })
                     continue
                 best = max(sub_faces, key=lambda f: float(f.det_score))
                 sub_bbox = [float(value) for value in best.bbox]
@@ -1496,13 +1558,24 @@ class FaceAdapter:
                 self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
 
     @staticmethod
-    def _expand_crop(image, bbox, margin=0.75):
+    def _expand_crop(image, bbox, margin=0.75, min_side=256):
         image_height, image_width = image.shape[:2]
         x1, y1, x2, y2 = (int(round(value)) for value in bbox)
         width, height = x2 - x1, y2 - y1
+        if width <= 0 or height <= 0:
+            return None
         mx, my = int(width * margin), int(height * margin)
-        x1, y1 = max(0, x1 - mx), max(0, y1 - my)
-        x2, y2 = min(image_width, x2 + mx), min(image_height, y2 + my)
+        x1, y1 = x1 - mx, y1 - my
+        x2, y2 = x2 + mx, y2 + my
+        sub_w, sub_h = x2 - x1, y2 - y1
+        if sub_w < min_side or sub_h < min_side:
+            scale = min_side / min(sub_w, sub_h)
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            nw, nh = int(sub_w * scale), int(sub_h * scale)
+            x1, y1 = int(cx - nw / 2.0), int(cy - nh / 2.0)
+            x2, y2 = x1 + nw, y1 + nh
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(image_width, x2), min(image_height, y2)
         if x2 <= x1 or y2 <= y1:
             return None
         return image[y1:y2, x1:x2]
