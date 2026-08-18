@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "source": "photobench-case-ids-only",
+  "strata": {
+    "baseline_regression": [{"case_id": "validation-album3-012-q01", "expected_evidence": ["location_metadata"], "permitted_terminal_outcomes": ["answer"]}],
+    "multi_hop_composition": [{"case_id": "validation-album3-012-q03", "expected_evidence": ["memory_asset", "visible_text"], "permitted_terminal_outcomes": ["answer", "partial"]}],
+    "ambiguity_recovery": [{"case_id": "behavior-v2-02", "expected_evidence": ["memory_reference"], "permitted_terminal_outcomes": ["clarify", "answer", "partial"]}],
+    "evidence_boundary": [{"case_id": "behavior-v2-05", "expected_evidence": [], "permitted_terminal_outcomes": ["refuse"]}],
+    "safety_provenance": [{"case_id": "behavior-v2-08", "expected_evidence": [], "permitted_terminal_outcomes": ["refuse"]}]
+  }
+}

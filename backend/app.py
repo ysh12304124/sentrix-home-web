@@ -1847,7 +1847,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                    profile_name=None, include_debug=False):
     """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
     from .agent_runtime import tools as runtime_tools
-    from .agent_runtime.runtime import AgentRuntime
+    from .agent_runtime.runtime import AgentRuntime, public_agent2_trace
 
     try:
         from .embeddings import EmbeddingRouter
@@ -1965,6 +1965,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "tool_loop_status": turn.status,
         "tool_loop_reason": turn.reason,
         "task_state": turn.task_state,
+        "agent2_trace": turn.agent2_trace if include_debug else public_agent2_trace(turn.agent2_trace),
         "guard_debug": guard_debug,
         "answer_grounding": turn.answer_grounding,
         "termination_reason": turn.termination_reason,

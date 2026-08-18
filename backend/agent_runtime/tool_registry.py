@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .task_state import EVIDENCE_TYPES
+
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -23,6 +25,37 @@ class ToolSpec:
     readiness: str = "ready"          # ready | limited | blocked
     version: str = "1"
     readiness_reason: str = ""
+    produces_evidence: tuple[str, ...] = ()
+    cannot_establish: tuple[str, ...] = ()
+    budget_unit: str = "call"
+
+    def __post_init__(self):
+        produced = tuple(self.produces_evidence)
+        prohibited = tuple(self.cannot_establish)
+        unknown = (set(produced) | set(prohibited)) - EVIDENCE_TYPES
+        if unknown:
+            raise ValueError(f"unsupported evidence type: {sorted(unknown)[0]}")
+        overlap = set(produced) & set(prohibited)
+        if overlap:
+            raise ValueError(f"evidence contract overlap: {sorted(overlap)[0]}")
+        if self.budget_unit not in {"call", "image", "media_second"}:
+            raise ValueError(f"unsupported budget unit: {self.budget_unit}")
+
+    def can_satisfy(self, evidence_type: str) -> bool:
+        return evidence_type in self.produces_evidence
+
+    def as_contract(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "read_write": self.read_write,
+            "scope_required": self.scope_required,
+            "cost_class": self.cost_class,
+            "budget_unit": self.budget_unit,
+            "readiness": self.readiness,
+            "produces_evidence": list(self.produces_evidence),
+            "cannot_establish": list(self.cannot_establish),
+        }
 
 
 _TOOL_SPECS: dict[str, ToolSpec] = {}

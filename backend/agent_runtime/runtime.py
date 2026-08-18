@@ -224,11 +224,71 @@ class RuntimeTurn:
     status: str = "pending"   # complete | partial | timeout | error
     reason: str = ""
     task_state: dict = field(default_factory=dict)
+    # Agent 2 shadow state stays separate from the legacy conversational TaskState.
+    agent2_trace: dict = field(default_factory=dict)
     answer_grounding: dict = field(default_factory=dict)
     termination_reason: str = ""
     ocr_partial: bool = False
     ocr_partial_reason: str = ""
     nucleus_injected: bool = False
+
+
+def public_agent2_trace(trace: dict | None) -> dict:
+    """Return benchmark-safe Agent 2 telemetry without scope or asset references."""
+    trace = trace or {}
+    requirements = ((trace.get("task_state") or {}).get("requirements") or [])
+    status_counts: dict[str, int] = {}
+    public_requirements = []
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            continue
+        status = str(requirement.get("status") or "open")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        public_requirements.append({
+            "id": str(requirement.get("id") or ""),
+            "evidence_type": str(requirement.get("evidence_type") or ""),
+            "status": status,
+        })
+    entries = ((trace.get("evidence_ledger") or {}).get("entries") or [])
+    partial_entries = sum(
+        1 for entry in entries
+        if isinstance(entry, dict)
+        and int((entry.get("coverage") or {}).get("processed") or 0)
+        < int((entry.get("coverage") or {}).get("requested") or 0)
+    )
+    return {
+        "requirements": public_requirements,
+        "requirement_status_counts": status_counts,
+        "evidence_coverage": {"entries": len(entries), "partial_entries": partial_entries},
+        "planner_decisions": list(trace.get("planner_decisions") or []),
+        "terminal_reason": str(trace.get("terminal_reason") or ""),
+        "budget_outcome": dict(trace.get("budget_outcome") or {}),
+    }
+
+
+def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
+                                tool_call_id: str, input_refs=(), provenance_refs=()) -> bool:
+    """Record one compatible produced evidence type for a shadow tool call."""
+    from .evidence_ledger import Coverage, LedgerEntry
+
+    pending = [state for state in task_state.requirements.values()
+               if state.status == "open" and spec.can_satisfy(state.requirement.evidence_type)]
+    if not pending:
+        return False
+    requirement = pending[0]
+    requirement_type = requirement.requirement.evidence_type
+    task_state.mark_running(requirement.requirement.id)
+    evidence_ledger.append(LedgerEntry(
+        tool_call_id=tool_call_id,
+        capability=spec.name,
+        evidence_type=requirement_type,
+        input_refs=tuple(str(ref) for ref in input_refs),
+        provenance_refs=tuple(str(ref) for ref in provenance_refs),
+        certainty="supported",
+        coverage=Coverage(requested=1, processed=1),
+    ))
+    task_state.mark_satisfied(requirement.requirement.id, evidence_refs=(tool_call_id,))
+    return True
 
 
 def _trusted_facts(task_state: dict) -> list[str]:
@@ -535,6 +595,31 @@ class AgentRuntime:
         policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget,
                             allowed_tools=set(self.profile.tools) if self.profile.tools else None)
         task = TaskState.from_dict(task_state, user_goal=message)
+        agent2_task_state = None
+        agent2_evidence_ledger = None
+        if self.profile.features.get("agent2_shadow"):
+            # Shadow planning is intentionally observational: invalid plans fall
+            # through to the unchanged legacy loop and never choose a tool here.
+            from .evidence_ledger import EvidenceLedger
+            from .goal_planner import GoalPlanner
+            from .task_state import TaskState as Agent2TaskState
+
+            planner_result = GoalPlanner(chat_fn=self.chat_fn).declare(
+                message, scope_id=self.scope_id, history=history)
+            decision = {"kind": "declare"}
+            if planner_result.ok:
+                agent2_task_state = Agent2TaskState.from_declaration(planner_result.declaration)
+                agent2_evidence_ledger = EvidenceLedger(scope_id=self.scope_id)
+                decision["status"] = "accepted"
+                turn.agent2_trace = {
+                    "task_declaration": planner_result.declaration.as_dict(),
+                    "task_state": agent2_task_state.as_dict(),
+                    "evidence_ledger": agent2_evidence_ledger.as_dict(),
+                    "planner_decisions": [decision],
+                }
+            else:
+                decision.update({"status": "fallback", "reason": planner_result.fallback_reason})
+                turn.agent2_trace = {"planner_decisions": [decision]}
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
         system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
                                         current_time=current_time_line())
@@ -1205,6 +1290,15 @@ class AgentRuntime:
                 break
             task.update_from_tool(tool_name, arguments, result.observation or {})
             task.record_tool_result(tool_call_id, tool_name, result.observation or {})
+            if agent2_task_state is not None and agent2_evidence_ledger is not None:
+                input_refs = tuple(
+                    str(value) for key, value in arguments.items()
+                    if key in {"asset_handle", "result_set_id", "handle"} and value
+                )
+                record_agent2_tool_evidence(
+                    agent2_task_state, agent2_evidence_ledger, spec,
+                    tool_call_id=tool_call_id, input_refs=input_refs,
+                )
             completion.update(task.as_dict())
             # G6：OCR 显式 partial（超时/失败）→ 记录到 turn，用于最终 natural partial 语义
             if tool_name == "read_photo_text" and (result.observation or {}).get("status") == "partial":
@@ -1227,6 +1321,12 @@ class AgentRuntime:
         turn.answer_grounding = _build_answer_grounding(
             message=message, task=task, selected_handle=selected_handle)
         turn.termination_reason = _classify_termination(turn)
+        if turn.agent2_trace:
+            if agent2_task_state is not None and agent2_evidence_ledger is not None:
+                turn.agent2_trace["task_state"] = agent2_task_state.as_dict()
+                turn.agent2_trace["evidence_ledger"] = agent2_evidence_ledger.as_dict()
+            turn.agent2_trace["terminal_reason"] = "shadow_only"
+            turn.agent2_trace["budget_outcome"] = turn.budget.as_dict()
         return turn
 
 

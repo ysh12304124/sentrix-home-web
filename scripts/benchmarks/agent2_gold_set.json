@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "description": "Requirement Gold Set (12 benchmark cases) defining explicit task goals, minimal requirements, accepted evidence types, expected terminal outcomes, and unmet reasons",
+  "cases": [
+    {
+      "case_id": "gold-album3-01",
+      "query": "我们在牛排餐厅吃的那顿饭花了多少钱？",
+      "scope_id": "album3",
+      "goal": "determine the steak meal price at the restaurant",
+      "minimal_requirements": [
+        {"id": "restaurant_photo", "evidence_type": "memory_asset", "description": "find photo of steak dinner"},
+        {"id": "steak_price", "evidence_type": "visible_text", "description": "read price on receipt or menu", "parent_id": "restaurant_photo"}
+      ],
+      "accepted_evidence_types": ["memory_asset", "visible_text"],
+      "expected_capabilities": ["search_memories", "read_photo_text"],
+      "expected_terminal_outcome": "answered",
+      "possible_unmet_reasons": ["no_matching_evidence", "budget_exhausted"]
+    },
+    {
+      "case_id": "gold-album3-02",
+      "query": "这张照片里妈妈穿的衣服是什么颜色？",
+      "scope_id": "album3",
+      "goal": "determine mother clothing color in the referenced photo",
+      "minimal_requirements": [
+        {"id": "referenced_photo", "evidence_type": "memory_asset", "description": "find target photo"},
+        {"id": "clothing_color", "evidence_type": "visual_observation", "description": "inspect clothing color", "parent_id": "referenced_photo"}
+      ],
+      "accepted_evidence_types": ["memory_asset", "visual_observation"],
+      "expected_capabilities": ["search_memories", "inspect_photo"],
+      "expected_terminal_outcome": "answered",
+      "possible_unmet_reasons": ["no_matching_evidence", "evidence_incompatible"]
+    },
+    {
+      "case_id": "gold-album3-03",
+      "query": "照片里那个人叫什么名字？",
+      "scope_id": "album3",
+      "goal": "identify person in the photo",
+      "minimal_requirements": [
+        {"id": "target_photo", "evidence_type": "memory_asset", "description": "find photo"},
+        {"id": "person_id", "evidence_type": "confirmed_identity", "description": "confirm person identity", "parent_id": "target_photo"}
+      ],
+      "accepted_evidence_types": ["memory_asset", "confirmed_identity"],
+      "expected_capabilities": ["search_memories", "get_person_memory"],
+      "expected_terminal_outcome": "unsupported_clarified",
+      "possible_unmet_reasons": ["no_matching_evidence", "inherently_unanswerable"]
+    },
+    {
+      "case_id": "gold-album3-04",
+      "query": "我们在海边拍的所有照片有哪些？",
+      "scope_id": "album3",
+      "goal": "retrieve all seaside photos",
+      "minimal_requirements": [
+        {"id": "seaside_assets", "evidence_type": "memory_asset", "description": "retrieve photos with seaside location/tag"}
+      ],
+      "accepted_evidence_types": ["memory_asset"],
+      "expected_capabilities": ["search_memories", "get_result_page"],
+      "expected_terminal_outcome": "answered",
+      "possible_unmet_reasons": ["budget_exhausted"]
+    },
+    {
+      "case_id": "gold-album3-05",
+      "query": "2024年我们总共去过几次北京？",
+      "scope_id": "album3",
+      "goal": "count trips to Beijing in 2024",
+      "minimal_requirements": [
+        {"id": "beijing_trip_count", "evidence_type": "structured_fact", "description": "query count of events in Beijing in 2024"},
+        {"id": "trip_time", "evidence_type": "temporal_metadata", "description": "verify 2024 time range"}
+      ],
+      "accepted_evidence_types": ["structured_fact", "temporal_metadata"],
+      "expected_capabilities": ["query_memory_facts"],
+      "expected_terminal_outcome": "answered",
+      "possible_unmet_reasons": ["no_matching_evidence"]
+    },
+    {
+      "case_id": "gold-album3-06",
+      "query": "我之前是不是跟你说过我最喜欢的菜是红烧肉？",
+      "scope_id": "album3",
+      "goal": "verify user statement in conversation history",
+      "minimal_requirements": [
+        {"id": "user_statement_history", "evidence_type": "user_statement", "description": "search history for user preference statement"}
+      ],
+      "accepted_evidence_types": ["user_statement"],
+      "expected_capabilities": ["search_conversation_history"],
+      "expected_terminal_outcome": "answered",
+      "possible_unmet_reasons": ["no_matching_evidence"]
+    }
+  ]
+}

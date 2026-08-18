@@ -64,7 +64,10 @@ EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
 
 def _load_judge_providers():
     try:
-        value = json.loads(JUDGE_PROVIDERS_PATH.read_text(encoding="utf-8"))
+        config_path = JUDGE_PROVIDERS_PATH
+        if not config_path.exists():
+            config_path = config_path.with_name("judge_providers.example.json")
+        value = json.loads(config_path.read_text(encoding="utf-8"))
         providers = value.get("providers") or {}
         default_id = str(value.get("default_provider_id") or next(iter(providers), ""))
         if default_id not in providers:
@@ -247,6 +250,62 @@ def atomic_json(path: Path, value) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def summarize_agent2_trace(runtime_turns: list[dict]) -> dict:
+    """Aggregate optional Agent 2 telemetry while keeping historical runs valid."""
+    decisions = []
+    statuses: dict[str, int] = {}
+    terminal_reasons: dict[str, int] = {}
+    budget_outcomes = []
+    entries = 0
+    partial_entries = 0
+    available = False
+    for turn in runtime_turns or []:
+        trace = turn.get("agent2_trace") if isinstance(turn, dict) else None
+        if not isinstance(trace, dict) or not trace:
+            continue
+        available = True
+        decisions.extend(item for item in trace.get("planner_decisions") or [] if isinstance(item, dict))
+        status_counts = trace.get("requirement_status_counts") or {}
+        if not status_counts:
+            for requirement in ((trace.get("task_state") or {}).get("requirements") or []):
+                if isinstance(requirement, dict) and requirement.get("status"):
+                    status = str(requirement["status"])
+                    status_counts[status] = status_counts.get(status, 0) + 1
+        for status, count in status_counts.items():
+            try:
+                statuses[str(status)] = statuses.get(str(status), 0) + int(count)
+            except (TypeError, ValueError):
+                continue
+        coverage = trace.get("evidence_coverage") or {}
+        if not coverage:
+            ledger_entries = ((trace.get("evidence_ledger") or {}).get("entries") or [])
+            coverage = {
+                "entries": len(ledger_entries),
+                "partial_entries": sum(
+                    1 for entry in ledger_entries if isinstance(entry, dict)
+                    and int((entry.get("coverage") or {}).get("processed") or 0)
+                    < int((entry.get("coverage") or {}).get("requested") or 0)
+                ),
+            }
+        entries += int(coverage.get("entries") or 0)
+        partial_entries += int(coverage.get("partial_entries") or 0)
+        reason = str(trace.get("terminal_reason") or "")
+        if reason:
+            terminal_reasons[reason] = terminal_reasons.get(reason, 0) + 1
+        budget = trace.get("budget_outcome")
+        if isinstance(budget, dict):
+            budget_outcomes.append(dict(budget))
+    return {
+        "available": available,
+        "planner_decision_count": len(decisions),
+        "planner_fallback_count": sum(1 for item in decisions if item.get("status") == "fallback"),
+        "requirement_status_counts": statuses,
+        "evidence_coverage": {"entries": entries, "partial_entries": partial_entries},
+        "terminal_reasons": terminal_reasons,
+        "budget_outcomes": budget_outcomes,
+    }
 
 
 def load_custom_judge_prompt() -> str | None:
@@ -1381,6 +1440,7 @@ class BenchmarkRun:
                                         if turn_index < len(conversation) and isinstance(conversation[turn_index], dict)
                                         else row.get("expected_action")),
                     "answer": str(resp.get("answer") or ""),
+                    "agent2_trace": resp.get("agent2_trace") or resp.get("agent2Trace") or {},
                     "agent_status": resp.get("tool_loop_status") or (resp.get("telemetry") or {}).get("status"),
                     "termination_reason": resp.get("termination_reason") or resp.get("terminationReason") or "",
                     "turn_outcome": resp.get("turn_outcome") or _derive_turn_outcome(resp),
@@ -1530,6 +1590,7 @@ class BenchmarkRun:
                 "agent_status": resp.get("tool_loop_status") or (resp.get("telemetry") or {}).get("status"),
                 "agent_reason": resp.get("tool_loop_reason") or (resp.get("telemetry") or {}).get("reason") or "",
                 "answer_grounding": resp.get("answer_grounding") or resp.get("answerGrounding") or {},
+                "agent2_trace": summarize_agent2_trace(turn_records),
                 "timing_breakdown": timing_breakdown,
             })
             item["delivery_status"] = resp.get("delivery_status") or {}

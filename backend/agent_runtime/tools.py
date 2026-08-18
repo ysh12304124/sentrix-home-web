@@ -1312,6 +1312,7 @@ def register_tools():
                                   "food": "可选：限定某种食物（如火锅等具体菜名）"},
                       "group_by": "month|place"},
         executor=_query_memory_facts, read_write="read", cost_class="cheap", readiness="ready",
+        produces_evidence=("structured_fact", "temporal_metadata", "location_metadata"),
     ))
     register(ToolSpec(
         name="search_memories",
@@ -1321,12 +1322,14 @@ def register_tools():
         input_schema={"query": "", "mode": "best|all|representative",
                       "filters": {"time": "", "place": "", "person": ""}},
         executor=_search_memories, read_write="read", cost_class="medium", readiness="ready",
+        produces_evidence=("memory_asset", "memory_reference"),
     ))
     register(ToolSpec(
         name="get_original_photos",
         description="交付当前结果集/选中照片的原图。",
         input_schema={"result_set_id": "", "handle": ""},
         executor=_get_original_photos, read_write="read", cost_class="cheap", readiness="limited",
+        produces_evidence=("memory_asset",),
         readiness_reason="ResultSetStore 就绪后完整可用（A4）",
     ))
     register(ToolSpec(
@@ -1334,13 +1337,15 @@ def register_tools():
         description="查看 search_memories 结果集的下一页/指定页。result_set_id 用 search_memories 返回的，page 从 1 开始。",
         input_schema={"result_set_id": "", "page": 1, "page_size": 6},
         executor=_get_result_page, read_write="read", cost_class="cheap", readiness="ready",
+        produces_evidence=("memory_asset",),
     ))
     register(ToolSpec(
         name="inspect_photo",
-        description=("复核已检索照片的视觉细节（物体/衣着/文字/场景）。asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。昂贵，默认每轮最多 1 次。"
+        description=("复核已检索照片的视觉细节（物体/衣着/颜色/场景）。asset_handle 使用 search_memories preview 里的 handle（photo_1…），可省略（默认用预览第一张）。昂贵，默认每轮最多 1 次。"
                      + _cap_hint("inspect_photo")),
         input_schema={"asset_handle": "", "question": ""},
         executor=_inspect_photo, read_write="read", cost_class="expensive", readiness="ready",
+        produces_evidence=("visual_observation",), budget_unit="image",
     ))
     register(ToolSpec(
         name="read_photo_text",
@@ -1351,6 +1356,7 @@ def register_tools():
                      + _cap_hint("read_photo_text")),
         input_schema={"asset_handle": "", "question": ""},
         executor=_read_photo_text, read_write="read", cost_class="expensive", readiness="ready",
+        produces_evidence=("visible_text",), budget_unit="image",
     ))
     register(ToolSpec(
         name="search_conversation_history",
@@ -1360,6 +1366,7 @@ def register_tools():
         input_schema={"query": "", "scope": "current|recent|all_user_conversations",
                       "conversation_id": ""},
         executor=_search_conversation_history, read_write="read", cost_class="cheap", readiness="ready",
+        produces_evidence=("user_statement",),
     ))
     register(ToolSpec(
         name="get_core_memory",
@@ -1369,6 +1376,7 @@ def register_tools():
                      "agent_inference 不能说成 confirmed。"),
         input_schema={"subject": "", "topic": "", "limit": 5},
         executor=_get_core_memory, read_write="read", cost_class="cheap", readiness="ready",
+        produces_evidence=("confirmed_identity", "user_statement"),
     ))
     register(ToolSpec(
         name="get_person_memory",
@@ -1379,4 +1387,5 @@ def register_tools():
                      "性格等主观问题：照片无法确认时回答 insufficient evidence。"),
         input_schema={"person": "", "operation": "overview|first_occurrence|last_occurrence|common_places|co_occurrence|events"},
         executor=_get_person_memory, read_write="read", cost_class="cheap", readiness="ready",
+        produces_evidence=("confirmed_identity", "structured_fact", "location_metadata"),
     ))
