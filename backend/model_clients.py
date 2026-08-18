@@ -1346,6 +1346,7 @@ class FaceAdapter:
         self.enabled = os.getenv("FACE_ENABLED", "true").lower() in {"1", "true", "yes"}
         self._app = None
         self._load_lock = threading.Lock()
+        self._retina = None
         self.error = None
         self.identity_model = os.getenv("FACE_EMBEDDING_MODE", "legacy").lower()
         self.identity_adapter = self._build_identity_adapter()
@@ -1437,6 +1438,8 @@ class FaceAdapter:
                     image = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
             if image is None:
                 return []
+            if os.getenv("FACE_DETECTOR", "scrfd") == "retinaface_tiled":
+                return self._detect_retina_tiled(image)
             faces = self._app.get(image)
             image_height, image_width = image.shape[:2]
             min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
@@ -1538,3 +1541,102 @@ class FaceAdapter:
         self.identity_fallback_error = str(error)
         self.identity_runtime_error = str(error)
         return True
+
+    def _detect_retina_tiled(self, image):
+        """RetinaFace tiled detection + buffalo_l sub-crop alignment/embedding.
+
+        RetinaFace finds faces (including small ones SCRFD misses), then each
+        bbox is expanded and re-detected by the buffalo_l FaceAnalysis on the
+        sub-image, where the face is large enough for reliable 5-point landmarks
+        and the recognition embedding. This avoids RetinaFace's unreliable
+        landmark geometry at small scales.
+        """
+        try:
+            from .face_detector import RetinaFaceTiledDetector
+            if self._retina is None:
+                self._retina = RetinaFaceTiledDetector()
+                self._ensure_face_analysis()
+            if self._app is None:
+                return []
+            detections = self._retina.detect(image)
+            image_height, image_width = image.shape[:2]
+            min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
+            results = []
+            for det in detections:
+                bbox = [float(value) for value in det["bbox"]]
+                width = max(0.0, bbox[2] - bbox[0])
+                height = max(0.0, bbox[3] - bbox[1])
+                if min(width, height) < min_size:
+                    continue
+                sub = self._expand_crop(image, bbox)
+                if sub is None:
+                    continue
+                sub_faces = self._app.get(sub)
+                if not sub_faces:
+                    continue
+                best = max(sub_faces, key=lambda f: float(f.det_score))
+                sub_bbox = [float(value) for value in best.bbox]
+                landmarks = [[float(value) for value in point] for point in best.kps] if getattr(best, "kps", None) is not None else []
+                embedding = best.embedding.tolist() if getattr(best, "embedding", None) is not None else []
+                score = float(best.det_score)
+                area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
+                pose = [float(value) for value in best.pose] if getattr(best, "pose", None) is not None else []
+                try:
+                    crop = align_face_crop(sub, sub_bbox, landmarks)
+                    raw_sharpness = _laplacian_variance(crop)
+                except Exception:
+                    raw_sharpness = 0.0
+                sharpness = _normalize_sharpness(raw_sharpness)
+                quality = compute_face_quality(score, area_ratio, sharpness, pose)
+                results.append({
+                    "bbox": bbox,
+                    "confidence": score,
+                    "quality": quality,
+                    "area_ratio": area_ratio,
+                    "sharpness": sharpness,
+                    "raw_sharpness": raw_sharpness,
+                    "pose": pose,
+                    "landmarks": landmarks,
+                    "embedding": embedding,
+                    "embedding_model": "buffalo_l",
+                    "embedding_version": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
+                    "identity_ready": bool(embedding),
+                    "identity_eligible": (
+                        score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
+                        and quality >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
+                    ),
+                })
+            return results
+        except Exception as error:
+            self.error = str(error)
+            return []
+
+    def _ensure_face_analysis(self):
+        """Load the buffalo_l FaceAnalysis used for sub-crop alignment/embedding."""
+        if self._app is not None:
+            return
+        with getattr(self, "_load_lock", threading.Lock()):
+            if self._app is None:
+                self._configure_onnx_runtime_libraries()
+                from insightface.app import FaceAnalysis
+                providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
+                kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
+                if self.identity_model in {"adaface", "magface"}:
+                    kwargs["allowed_modules"] = ["detection", "landmark_2d_106", "recognition"]
+                if os.getenv("FACE_MODEL_ROOT"):
+                    kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
+                self._app = FaceAnalysis(**kwargs)
+                det_size = int(os.getenv("FACE_DET_SIZE", "640"))
+                self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
+
+    @staticmethod
+    def _expand_crop(image, bbox, margin=0.75):
+        image_height, image_width = image.shape[:2]
+        x1, y1, x2, y2 = (int(round(value)) for value in bbox)
+        width, height = x2 - x1, y2 - y1
+        mx, my = int(width * margin), int(height * margin)
+        x1, y1 = max(0, x1 - mx), max(0, y1 - my)
+        x2, y2 = min(image_width, x2 + mx), min(image_height, y2 + my)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return image[y1:y2, x1:x2]
