@@ -1512,7 +1512,13 @@ class FaceAdapter:
                 embedding = best.embedding.tolist() if getattr(best, "embedding", None) is not None else []
                 score = float(best.det_score)
                 agreed = self._bbox_agreement(bbox, scrfd_bbox)
-                sane = self._landmark_sanity(det["landmarks"], bbox)
+                # Use SCRFD's own (reliable) landmarks, not RetinaFace's, whose
+                # geometry is unreliable even on large faces.
+                scrfd_landmarks = [
+                    [float(point[0]) + sub_x, float(point[1]) + sub_y]
+                    for point in best.kps
+                ] if getattr(best, "kps", None) is not None else []
+                sane = self._landmark_sanity(scrfd_landmarks, bbox) if scrfd_landmarks else False
                 validity = "verified" if (score >= verified_scrfd_score and agreed and sane) else "uncertain"
                 area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
                 pose = [float(value) for value in best.pose] if getattr(best, "pose", None) is not None else []
