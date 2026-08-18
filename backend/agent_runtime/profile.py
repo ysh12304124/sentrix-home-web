@@ -72,8 +72,8 @@ PROFILES = {
 
 
 def active_profile() -> str:
-    return os.getenv("SENTRIX_AGENT_PROFILE", "tool_loop").strip().lower()
+    return os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow").strip().lower()
 
 
 def get_profile(name: str | None = None) -> ProfileConfig:
-    return PROFILES.get(name or active_profile(), PROFILES["tool_loop"])
+    return PROFILES.get(name or active_profile(), PROFILES["goal_driven_shadow"])
