@@ -1423,6 +1423,40 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                 </details>
                 <details v-if="guardSummary(itemDetail(summary)).recorded" class="call-node guard-node final-agent-status"><summary><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong><span>{{ completionLabel(itemDetail(summary)) }}</span></summary><div class="guard-grid"><span>运行状态 <b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span>终止原因 <b>{{ guardSummary(itemDetail(summary)).termination || "正常完成" }}</b></span><span>恢复次数 <b>{{ guardSummary(itemDetail(summary)).recoveries }}</b></span><span>运行详情 <b>{{ itemDetail(summary).agent_reason || "-" }}</b></span></div></details>
               </section>
+                            <!-- Agent 2.0 目标与证据账本轨迹 -->
+              <details v-if="itemDetail(summary)?.agent2_trace && Object.keys(itemDetail(summary).agent2_trace).length" class="call-node agent2-trace-node">
+                <summary><strong>Agent 2.0 目标驱动与证据账本（TaskState / EvidenceLedger）</strong><span>{{ (itemDetail(summary).agent2_trace?.evidence_ledger?.entries || []).length }} 条证据</span></summary>
+                <div class="debug-trace-body">
+                  <div v-if="itemDetail(summary).agent2_trace?.task_declaration" class="call-node-body">
+                    <p class="muted small"><strong>规划目标 (Goal)：</strong> {{ itemDetail(summary).agent2_trace.task_declaration.goal }}</p>
+                    <p class="muted small"><strong>空间作用域 (Scope)：</strong> {{ itemDetail(summary).agent2_trace.task_declaration.scope_id }}</p>
+                  </div>
+                  <div v-if="itemDetail(summary).agent2_trace?.task_state?.requirements" class="call-node-body">
+                    <p class="muted small"><strong>证据需求分解 (Requirements)：</strong></p>
+                    <table class="history-table" style="margin-top: 6px;">
+                      <thead><tr><th>ID</th><th>证据类型</th><th>状态</th><th>证据引用</th><th>未满足原因</th></tr></thead>
+                      <tbody>
+                        <tr v-for="(req, rIdx) in itemDetail(summary).agent2_trace.task_state.requirements" :key="rIdx">
+                          <td>{{ req.id }}</td>
+                          <td><code>{{ req.evidence_type }}</code></td>
+                          <td><span :class="req.status === 'satisfied' ? 'tag-green' : req.status === 'partially_supported' ? 'tag-yellow' : 'tag-muted'">{{ req.status }}</span></td>
+                          <td>{{ (req.evidence_refs || []).join(', ') || '-' }}</td>
+                          <td><span v-if="req.unmet_reason" class="tag-red">{{ req.unmet_reason }}</span><span v-else>-</span></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div v-if="itemDetail(summary).agent2_trace?.evidence_ledger?.entries?.length" class="call-node-body">
+                    <p class="muted small"><strong>证据账本记录 (Evidence Ledger Entries)：</strong></p>
+                    <pre>{{ JSON.stringify(itemDetail(summary).agent2_trace.evidence_ledger.entries, null, 2) }}</pre>
+                  </div>
+                  <div v-if="itemDetail(summary).agent2_trace?.planner_decisions?.length" class="call-node-body">
+                    <p class="muted small"><strong>规划决策 (Planner Decisions)：</strong></p>
+                    <pre>{{ JSON.stringify(itemDetail(summary).agent2_trace.planner_decisions, null, 2) }}</pre>
+                  </div>
+                </div>
+              </details>
+
               <details v-if="runtimeDebugTurns(itemDetail(summary)).length" class="call-node debug-trace-node">
                 <summary><strong>完整运行时轨迹（提示词 / 回答 / 工具输入输出 / 评判）</strong><span>{{ runtimeDebugTurns(itemDetail(summary)).length }} 轮</span></summary>
                 <div class="debug-trace-body">
