@@ -261,12 +261,23 @@ def summarize_agent2_trace(runtime_turns: list[dict]) -> dict:
     entries = 0
     partial_entries = 0
     available = False
+    last_task_declaration = None
+    last_task_state = None
+    last_evidence_ledger = None
+
     for turn in runtime_turns or []:
         trace = turn.get("agent2_trace") if isinstance(turn, dict) else None
         if not isinstance(trace, dict) or not trace:
             continue
         available = True
         decisions.extend(item for item in trace.get("planner_decisions") or [] if isinstance(item, dict))
+        if trace.get("task_declaration"):
+            last_task_declaration = trace.get("task_declaration")
+        if trace.get("task_state"):
+            last_task_state = trace.get("task_state")
+        if trace.get("evidence_ledger"):
+            last_evidence_ledger = trace.get("evidence_ledger")
+
         status_counts = trace.get("requirement_status_counts") or {}
         if not status_counts:
             for requirement in ((trace.get("task_state") or {}).get("requirements") or []):
@@ -297,7 +308,7 @@ def summarize_agent2_trace(runtime_turns: list[dict]) -> dict:
         budget = trace.get("budget_outcome")
         if isinstance(budget, dict):
             budget_outcomes.append(dict(budget))
-    return {
+    res = {
         "available": available,
         "planner_decision_count": len(decisions),
         "planner_fallback_count": sum(1 for item in decisions if item.get("status") == "fallback"),
@@ -306,6 +317,15 @@ def summarize_agent2_trace(runtime_turns: list[dict]) -> dict:
         "terminal_reasons": terminal_reasons,
         "budget_outcomes": budget_outcomes,
     }
+    if last_task_declaration:
+        res["task_declaration"] = last_task_declaration
+    if last_task_state:
+        res["task_state"] = last_task_state
+    if last_evidence_ledger:
+        res["evidence_ledger"] = last_evidence_ledger
+    if decisions:
+        res["planner_decisions"] = decisions
+    return res
 
 
 def load_custom_judge_prompt() -> str | None:

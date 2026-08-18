@@ -604,8 +604,10 @@ class AgentRuntime:
             from .goal_planner import GoalPlanner
             from .task_state import TaskState as Agent2TaskState
 
+            planner_step_id = "planner_step_0"
             planner_result = GoalPlanner(chat_fn=self.chat_fn).declare(
-                message, scope_id=self.scope_id, history=history)
+                message, scope_id=self.scope_id, history=history,
+                include_debug=self.include_debug, step_id=planner_step_id)
             decision = {"kind": "declare"}
             if planner_result.ok:
                 agent2_task_state = Agent2TaskState.from_declaration(planner_result.declaration)
@@ -620,6 +622,18 @@ class AgentRuntime:
             else:
                 decision.update({"status": "fallback", "reason": planner_result.fallback_reason})
                 turn.agent2_trace = {"planner_decisions": [decision]}
+
+            planner_step = {
+                "type": "planner",
+                "status": "complete" if planner_result.ok else "fallback",
+                "call_type": "planner",
+                "step_id": planner_step_id,
+                "raw": (planner_result.raw or "")[:500],
+            }
+            if self.include_debug and planner_result.prompt:
+                planner_step["prompt"] = planner_result.prompt
+                planner_step["raw_full"] = planner_result.raw
+            turn.steps.append(planner_step)
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
         system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
                                         current_time=current_time_line())
@@ -738,8 +752,17 @@ class AgentRuntime:
                     turn.nucleus_injected = True
                 except Exception:
                     turn.nucleus_injected = True
+            step_id = f"step_{debug_step_seq}" if self.include_debug else None
+            if self.include_debug:
+                debug_step_seq += 1
+                last_model_step_id = step_id
             try:
-                raw = self.chat_fn(messages)
+                import inspect
+                sig = inspect.signature(self.chat_fn)
+                if "call_type" in sig.parameters:
+                    raw = self.chat_fn(messages, call_type="agent", step_id=step_id)
+                else:
+                    raw = self.chat_fn(messages)
             except Exception as exc:
                 # D12：恢复/后续模型调用失败时，不丢弃已产出的 final 回答
                 if turn.final_answer:
@@ -754,9 +777,6 @@ class AgentRuntime:
                 import copy as _copy
                 model_step["raw_full"] = raw
                 model_step["prompt"] = _copy.deepcopy(messages)
-                step_id = f"step_{debug_step_seq}"
-                debug_step_seq += 1
-                last_model_step_id = step_id
                 model_step["step_id"] = step_id
                 model_step["call_type"] = "agent"
             turn.steps.append(model_step)

@@ -276,6 +276,7 @@ class MemoryStore:
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'household',
+                include_in_people INTEGER NOT NULL DEFAULT 1,
                 source_path TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL,
@@ -507,6 +508,7 @@ class MemoryStore:
                 embedding_model TEXT NOT NULL DEFAULT 'unknown',
                 embedding_version TEXT NOT NULL DEFAULT 'unknown',
                 embedding_quality_signal REAL NOT NULL DEFAULT 0,
+                validity TEXT NOT NULL DEFAULT 'uncertain',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS face_prototypes (
@@ -916,6 +918,9 @@ class MemoryStore:
             """
         )
         self.connection.commit()
+        self._ensure_columns("memory_spaces", {"include_in_people": "INTEGER NOT NULL DEFAULT 1"})
+        self._ensure_columns("face_instances", {"validity": "TEXT NOT NULL DEFAULT 'uncertain'"})
+        self._migrate_evaluation_spaces()
         self._migrate_legacy_persons()
 
     def _ensure_columns(self, table, columns):
@@ -980,6 +985,20 @@ class MemoryStore:
         if violations:
             raise RuntimeError("face instance migration produced foreign-key violations")
 
+    def _migrate_evaluation_spaces(self):
+        """One-time backfill: evaluation/benchmark spaces never appear in people views.
+
+        Later spaces are flagged via include_in_people at creation time; this
+        backfill covers the historical PhotoBench/photobench/e2b spaces by name
+        so the people view is not polluted by benchmark face clusters.
+        """
+        self.connection.execute(
+            """UPDATE memory_spaces SET include_in_people = 0
+            WHERE name LIKE 'PhotoBench%' OR name LIKE 'photobench%'
+            OR id LIKE '%_e2b' OR id LIKE 'photobench%'"""
+        )
+        self.connection.commit()
+
     def _migrate_legacy_persons(self):
         """Keep the first prototype's person candidates visible in the native entity view."""
         rows = self._rows("SELECT * FROM persons")
@@ -999,11 +1018,11 @@ class MemoryStore:
             raise ValueError("unsupported table")
         return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
-    def create_memory_space(self, scope_id, name, kind="household", source_path=None):
+    def create_memory_space(self, scope_id, name, kind="household", source_path=None, include_in_people=True):
         timestamp = now_iso()
         self.connection.execute(
-            """INSERT INTO memory_spaces(id, name, kind, source_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO memory_spaces(id, name, kind, include_in_people, source_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
             name = CASE
                 WHEN memory_spaces.name IS NULL OR trim(memory_spaces.name) = ''
@@ -1012,8 +1031,9 @@ class MemoryStore:
                 ELSE memory_spaces.name
             END,
             kind = excluded.kind,
+            include_in_people = excluded.include_in_people,
             source_path = excluded.source_path, updated_at = excluded.updated_at""",
-            (scope_id, name, kind, source_path, timestamp, timestamp),
+            (scope_id, name, kind, int(bool(include_in_people)), source_path, timestamp, timestamp),
         )
         self.connection.commit()
         return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
@@ -3332,7 +3352,12 @@ class MemoryStore:
 
     def list_entities(self, status=None, scope_id=None, public=True):
         params = [status] if status else []
-        where = "WHERE status = ?" if status else "WHERE status NOT IN ('rejected', 'superseded')"
+        excluded = "(SELECT id FROM memory_spaces WHERE include_in_people = 0)"
+        where = (
+            "WHERE status = ? AND scope_id NOT IN " + excluded
+            if status
+            else "WHERE status NOT IN ('rejected', 'superseded') AND scope_id NOT IN " + excluded
+        )
         if scope_id:
             where += " AND scope_id = ?"
             params.append(scope_id)
@@ -4068,20 +4093,21 @@ class MemoryStore:
                 pose_bucket_value = pose_bucket(pose)
         embedding_model = str(face.get("embedding_model") or model_name or "unknown")
         embedding_version = str(face.get("embedding_version") or "legacy")
-        identity_eligible = bool(identity_eligible)
+        validity = str(face.get("face_validity") or "verified")
+        identity_eligible = bool(identity_eligible) and validity == "verified"
         if not identity_eligible:
             instance_id = make_id("face")
             self.connection.execute(
                 """INSERT INTO face_instances(
                     id, asset_id, observation_id, cluster_id, bbox_json, embedding_json,
                     detection_confidence, quality, pose_json, area_ratio, sharpness,
-                    pose_bucket, embedding_model, embedding_version, embedding_quality_signal, created_at
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pose_bucket, embedding_model, embedding_version, embedding_quality_signal, validity, created_at
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     instance_id, asset_id, observation_id, json_value(face.get("bbox"), []), json_value(embedding, []),
                     float(face.get("confidence", 0) or 0), float(quality or 0), json_value(pose, []), float(face.get("area_ratio", 0) or 0),
                     float(face.get("sharpness", 0) or 0), str(pose_bucket_value or "unknown"), embedding_model, embedding_version,
-                    float(face.get("quality_signal", 0) or 0), now_iso(),
+                    float(face.get("quality_signal", 0) or 0), validity, now_iso(),
                 ),
             )
             self.connection.commit()
@@ -4121,13 +4147,13 @@ class MemoryStore:
             """INSERT INTO face_instances(
                 id, asset_id, observation_id, cluster_id, bbox_json, embedding_json,
                 detection_confidence, quality, pose_json, area_ratio, sharpness,
-                pose_bucket, embedding_model, embedding_version, embedding_quality_signal, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                pose_bucket, embedding_model, embedding_version, embedding_quality_signal, validity, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 instance_id, asset_id, observation_id, best["id"], json_value(face.get("bbox"), []), json_value(embedding, []),
                 float(face.get("confidence", 0) or 0), float(quality or 0), json_value(pose, []), float(face.get("area_ratio", 0) or 0),
                 float(face.get("sharpness", 0) or 0), str(pose_bucket_value or "unknown"), embedding_model, embedding_version,
-                float(face.get("quality_signal", 0) or 0), now_iso(),
+                float(face.get("quality_signal", 0) or 0), validity, now_iso(),
             ),
         )
         self._refresh_face_prototypes(best["id"])
@@ -4190,7 +4216,8 @@ class MemoryStore:
             """SELECT fi.id, fi.cluster_id, fi.embedding_json, fi.quality, fi.detection_confidence,
             fi.pose_bucket, fi.embedding_model, fi.embedding_version
             FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
-            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL AND fi.quality >= ?"""
+            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL AND fi.quality >= ?
+            AND fi.validity = 'verified'"""
             + (" AND a.scope_id = ?" if scope_id else ""),
             (minimum_quality, scope_id) if scope_id else (minimum_quality,),
         )
@@ -4288,9 +4315,16 @@ class MemoryStore:
 
     def list_face_clusters(self, status=None):
         params = [status] if status else []
-        where = "WHERE fc.status = ?" if status else "WHERE fc.status != 'rejected'"
+        where = (
+            "WHERE fc.status = ? AND ms.include_in_people = 1"
+            if status
+            else "WHERE fc.status != 'rejected' AND ms.include_in_people = 1"
+        )
         rows = self._rows(f"""SELECT fc.*, e.canonical_name, e.family_role, e.status AS entity_status
-            FROM face_clusters fc LEFT JOIN entities e ON e.id = fc.entity_id {where} ORDER BY fc.updated_at DESC""", params)
+            FROM face_clusters fc
+            LEFT JOIN entities e ON e.id = fc.entity_id
+            JOIN memory_spaces ms ON ms.id = fc.scope_id
+            {where} ORDER BY fc.updated_at DESC""", params)
         for row in rows:
             row["reviewable"] = row.get("status") != "rejected" and int(row.get("member_count", 0) or 0) > 0
             row["single_sample"] = row.get("status") == "pending" and int(row.get("member_count", 0) or 0) <= 1

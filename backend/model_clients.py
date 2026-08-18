@@ -1436,13 +1436,13 @@ class FaceAdapter:
             return []
 
     def _detect_retina_tiled(self, image):
-        """RetinaFace tiled detection + buffalo_l sub-crop alignment/embedding.
+        """RetinaFace tiled detection + SCRFD validity gate.
 
-        RetinaFace finds faces (including small ones SCRFD misses), then each
-        bbox is expanded and re-detected by the buffalo_l FaceAnalysis on the
-        sub-image, where the face is large enough for reliable 5-point landmarks
-        and the recognition embedding. This avoids RetinaFace's unreliable
-        landmark geometry at small scales.
+        RetinaFace finds face candidates (high recall), then buffalo_l SCRFD on
+        an expanded sub-crop is the secondary verifier. Only candidates that are
+        confirmed by SCRFD with a high score AND a consistent bbox AND sane
+        landmark geometry become VERIFIED (eligible to seed a person cluster).
+        Everything else is kept as evidence only (UNCERTAIN) or dropped.
         """
         try:
             from .face_detector import RetinaFaceTiledDetector
@@ -1456,6 +1456,7 @@ class FaceAdapter:
             detections = self._retina.detect(image)
             image_height, image_width = image.shape[:2]
             min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
+            verified_scrfd_score = float(os.getenv("FACE_VERIFIED_SCRFD_SCORE", "0.5"))
             results = []
             for det in detections:
                 bbox = [float(value) for value in det["bbox"]]
@@ -1464,13 +1465,14 @@ class FaceAdapter:
                 if min(width, height) < min_size:
                     continue
                 score = float(det["confidence"])
-                sub = self._expand_crop(image, bbox)
+                sub, sub_x, sub_y = self._expand_crop(image, bbox)
                 if sub is None:
                     continue
                 sub_faces = self._app.get(sub)
                 if not sub_faces:
-                    # SCRFD sub-crop misses the smallest faces; fall back to
-                    # RetinaFace bbox + landmark alignment so the face survives.
+                    # SCRFD finds no face here -> UNCERTAIN evidence only, never a
+                    # cluster seed. RetinaFace landmark alignment is too unreliable
+                    # to hand this candidate clustering rights.
                     try:
                         crop = align_face_crop(image, bbox, det["landmarks"])
                         raw_sharpness = _laplacian_variance(crop)
@@ -1496,17 +1498,22 @@ class FaceAdapter:
                         "embedding_model": "buffalo_l",
                         "embedding_version": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
                         "identity_ready": bool(embedding),
-                        "identity_eligible": (
-                            score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
-                            and quality >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
-                        ),
+                        "face_validity": "uncertain",
+                        "identity_eligible": False,
                     })
                     continue
                 best = max(sub_faces, key=lambda f: float(f.det_score))
                 sub_bbox = [float(value) for value in best.bbox]
+                scrfd_bbox = [
+                    sub_bbox[0] + sub_x, sub_bbox[1] + sub_y,
+                    sub_bbox[2] + sub_x, sub_bbox[3] + sub_y,
+                ]
                 landmarks = [[float(value) for value in point] for point in best.kps] if getattr(best, "kps", None) is not None else []
                 embedding = best.embedding.tolist() if getattr(best, "embedding", None) is not None else []
                 score = float(best.det_score)
+                agreed = self._bbox_agreement(bbox, scrfd_bbox)
+                sane = self._landmark_sanity(det["landmarks"], bbox)
+                validity = "verified" if (score >= verified_scrfd_score and agreed and sane) else "uncertain"
                 area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
                 pose = [float(value) for value in best.pose] if getattr(best, "pose", None) is not None else []
                 try:
@@ -1529,8 +1536,9 @@ class FaceAdapter:
                     "embedding_model": "buffalo_l",
                     "embedding_version": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
                     "identity_ready": bool(embedding),
+                    "face_validity": validity,
                     "identity_eligible": (
-                        score >= float(os.getenv("FACE_IDENTITY_MIN_DET_SCORE", "0.72"))
+                        validity == "verified"
                         and quality >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
                     ),
                 })
@@ -1538,6 +1546,55 @@ class FaceAdapter:
         except Exception as error:
             self.error = str(error)
             return []
+
+    @staticmethod
+    def _bbox_agreement(retina_bbox, scrfd_bbox, center_ratio=1.0, iou_threshold=0.05):
+        """RetinaFace and SCRFD must roughly agree on where the face is.
+
+        Center-only check: the SCRFD face centre must lie within one retina box
+        diagonal of the retina centre. IoU is a weak floor. This is deliberately
+        loose because on small faces the two detectors produce differently-sized
+        boxes (SCRFD re-runs on an upscaled sub-crop), so strict IoU kills real
+        small faces.
+        """
+        rw = max(1.0, retina_bbox[2] - retina_bbox[0])
+        rh = max(1.0, retina_bbox[3] - retina_bbox[1])
+        rcx = (retina_bbox[0] + retina_bbox[2]) / 2.0
+        rcy = (retina_bbox[1] + retina_bbox[3]) / 2.0
+        scx = (scrfd_bbox[0] + scrfd_bbox[2]) / 2.0
+        scy = (scrfd_bbox[1] + scrfd_bbox[3]) / 2.0
+        center_dist = ((rcx - scx) ** 2 + (rcy - scy) ** 2) ** 0.5
+        if center_dist > (rw ** 2 + rh ** 2) ** 0.5 * center_ratio:
+            return False
+        ix1 = max(retina_bbox[0], scrfd_bbox[0])
+        iy1 = max(retina_bbox[1], scrfd_bbox[1])
+        ix2 = min(retina_bbox[2], scrfd_bbox[2])
+        iy2 = min(retina_bbox[3], scrfd_bbox[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_r = rw * rh
+        area_s = max(1.0, scrfd_bbox[2] - scrfd_bbox[0]) * max(1.0, scrfd_bbox[3] - scrfd_bbox[1])
+        iou = inter / max(1e-9, area_r + area_s - inter)
+        return iou >= iou_threshold
+
+    @staticmethod
+    def _landmark_sanity(landmarks, bbox, min_eye_ratio=0.1):
+        """Loose sanity that the landmarks look like a face, not a pretty face."""
+        if not landmarks or len(landmarks) < 5:
+            return False
+        bbox_w = max(1.0, bbox[2] - bbox[0])
+        bbox_h = max(1.0, bbox[3] - bbox[1])
+        if bbox_w < 64 or bbox_h < 64:
+            return True  # too small for geometry checks; trust the detectors
+        eye_dist = ((landmarks[0][0] - landmarks[1][0]) ** 2 + (landmarks[0][1] - landmarks[1][1]) ** 2) ** 0.5
+        if eye_dist < bbox_w * min_eye_ratio:
+            return False
+        pad_x = bbox_w * 0.2
+        pad_y = bbox_h * 0.2
+        inside = sum(
+            1 for x, y in landmarks
+            if (bbox[0] - pad_x) <= x <= (bbox[2] + pad_x) and (bbox[1] - pad_y) <= y <= (bbox[3] + pad_y)
+        )
+        return inside >= 3
 
     def _ensure_face_analysis(self):
         """Load the buffalo_l FaceAnalysis used for sub-crop alignment/embedding."""
@@ -1563,7 +1620,7 @@ class FaceAdapter:
         x1, y1, x2, y2 = (int(round(value)) for value in bbox)
         width, height = x2 - x1, y2 - y1
         if width <= 0 or height <= 0:
-            return None
+            return None, 0, 0
         mx, my = int(width * margin), int(height * margin)
         x1, y1 = x1 - mx, y1 - my
         x2, y2 = x2 + mx, y2 + my
@@ -1577,5 +1634,5 @@ class FaceAdapter:
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(image_width, x2), min(image_height, y2)
         if x2 <= x1 or y2 <= y1:
-            return None
-        return image[y1:y2, x1:x2]
+            return None, 0, 0
+        return image[y1:y2, x1:x2], x1, y1

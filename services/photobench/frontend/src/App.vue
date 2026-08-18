@@ -522,6 +522,7 @@ function callType(call) {
 function callTypeLabel(call) {
   if (call?.call_observation?.label) return call.call_observation.label;
   return ({
+    planner: "Agent 2.0 目标分解与规划",
     agent: "Agent 决策 / 回答",
     recovery: "Agent 恢复调用",
     writer: "最终回答重写",
@@ -533,6 +534,7 @@ function callTypeLabel(call) {
 function callTypeDescription(call) {
   if (call?.call_observation?.purpose) return call.call_observation.purpose;
   return ({
+    planner: "解析用户目标并声明最小充分证据需求（TaskState/EvidenceLedger）",
     agent: "模型选择工具或直接生成回答",
     recovery: "由解析失败、重复工具或 Guard 纠正触发",
     writer: "仅按受控事实重写最终回答，不调用工具",
@@ -542,7 +544,7 @@ function callTypeDescription(call) {
   })[callType(call)] || "后端记录的模型调用类型";
 }
 function showToolBranch(call) {
-  return !["writer", "faithfulness_judge", "tool_internal"].includes(callType(call));
+  return !["planner", "writer", "faithfulness_judge", "tool_internal"].includes(callType(call));
 }
 function noToolLabel(call) {
   if (callType(call) === "agent") return "该调用直接生成回答，未触发工具。";
@@ -615,18 +617,30 @@ function debugStepsForCall(item, call) {
 }
 
 function debugStepForCallInGroup(item, group, call) {
+  const turnIndex = conversationTurnNumber(call?.conversation_turn);
+  const steps = debugTraceForTurn(item, turnIndex);
+  if (call?.step_id) {
+    const matched = steps.find((s) => s?.step_id === call.step_id);
+    if (matched) return matched;
+  }
   const ctype = callType(call);
+  if (ctype === "planner") {
+    return steps.find((s) => s?.type === "planner" || s?.call_type === "planner") || null;
+  }
   if (ctype === "faithfulness_judge") {
-    const judges = debugStepsForCall(item, call);
+    const judges = steps.filter((s) => s?.type === "judge" || s?.call_type === "faithfulness_judge");
     const index = group.calls.filter((c) => callType(c) === "faithfulness_judge").indexOf(call);
     return judges[index] || null;
   }
   if (ctype === "agent" || ctype === "recovery") {
-    const models = debugStepsForCall(item, call);
+    const models = steps.filter((s) => s?.type === "model" && s?.call_type !== "faithfulness_judge" && s?.call_type !== "planner");
     const index = group.calls.filter((c) => ["agent", "recovery"].includes(callType(c))).indexOf(call);
     return models[index] || null;
   }
-  return null;
+  // Fallback match by index if legacy
+  const index = group.calls.indexOf(call);
+  const models = steps.filter((s) => s?.type === "model" || s?.type === "planner" || s?.type === "judge");
+  return models[index] || null;
 }
 
 function debugToolsForCall(item, group, call) {
@@ -637,6 +651,30 @@ function debugToolsForCall(item, group, call) {
   return steps.filter((s) => s?.type === "tool"
     && String(s?.parent_step_id) === String(modelStep.step_id));
 }
+function getAgent2Trace(item) {
+  if (!item) return null;
+  if (item.agent2_trace && (item.agent2_trace.task_declaration || item.agent2_trace.task_state || item.agent2_trace.evidence_ledger)) {
+    return item.agent2_trace;
+  }
+  const turns = item.runtime_turns || item.conversation || [];
+  for (const t of turns) {
+    if (t?.agent2_trace && (t.agent2_trace.task_declaration || t.agent2_trace.task_state || t.agent2_trace.evidence_ledger)) {
+      return t.agent2_trace;
+    }
+  }
+  return item.agent2_trace || null;
+}
+function getAgent2Requirements(item) {
+  const trace = getAgent2Trace(item);
+  if (!trace) return [];
+  return trace.task_state?.requirements || trace.task_declaration?.requirements || trace.requirements || [];
+}
+function getAgent2LedgerEntries(item) {
+  const trace = getAgent2Trace(item);
+  if (!trace) return [];
+  return trace.evidence_ledger?.entries || [];
+}
+
 function attributionSummary(item) {
   const attribution = item?.attribution || {};
   const layers = attribution.layers || {};
@@ -1424,35 +1462,36 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                 <details v-if="guardSummary(itemDetail(summary)).recorded" class="call-node guard-node final-agent-status"><summary><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong><span>{{ completionLabel(itemDetail(summary)) }}</span></summary><div class="guard-grid"><span>运行状态 <b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span>终止原因 <b>{{ guardSummary(itemDetail(summary)).termination || "正常完成" }}</b></span><span>恢复次数 <b>{{ guardSummary(itemDetail(summary)).recoveries }}</b></span><span>运行详情 <b>{{ itemDetail(summary).agent_reason || "-" }}</b></span></div></details>
               </section>
                             <!-- Agent 2.0 目标与证据账本轨迹 -->
-              <details v-if="itemDetail(summary)?.agent2_trace && Object.keys(itemDetail(summary).agent2_trace).length" class="call-node agent2-trace-node">
-                <summary><strong>Agent 2.0 目标驱动与证据账本（TaskState / EvidenceLedger）</strong><span>{{ (itemDetail(summary).agent2_trace?.evidence_ledger?.entries || []).length }} 条证据</span></summary>
+              <details v-if="getAgent2Trace(itemDetail(summary))" class="call-node agent2-trace-node">
+                <summary><strong>Agent 2.0 目标驱动与证据账本（TaskState / EvidenceLedger）</strong><span>{{ getAgent2LedgerEntries(itemDetail(summary)).length }} 条证据 · {{ getAgent2Requirements(itemDetail(summary)).length }} 项需求</span></summary>
                 <div class="debug-trace-body">
-                  <div v-if="itemDetail(summary).agent2_trace?.task_declaration" class="call-node-body">
-                    <p class="muted small"><strong>规划目标 (Goal)：</strong> {{ itemDetail(summary).agent2_trace.task_declaration.goal }}</p>
-                    <p class="muted small"><strong>空间作用域 (Scope)：</strong> {{ itemDetail(summary).agent2_trace.task_declaration.scope_id }}</p>
+                  <div v-if="getAgent2Trace(itemDetail(summary))?.task_declaration" class="call-node-body">
+                    <p class="muted small"><strong>规划目标 (Goal)：</strong> {{ getAgent2Trace(itemDetail(summary)).task_declaration.goal }}</p>
+                    <p class="muted small"><strong>空间作用域 (Scope)：</strong> {{ getAgent2Trace(itemDetail(summary)).task_declaration.scope_id }}</p>
                   </div>
-                  <div v-if="itemDetail(summary).agent2_trace?.task_state?.requirements" class="call-node-body">
+                  <div v-if="getAgent2Requirements(itemDetail(summary)).length" class="call-node-body">
                     <p class="muted small"><strong>证据需求分解 (Requirements)：</strong></p>
                     <table class="history-table" style="margin-top: 6px;">
-                      <thead><tr><th>ID</th><th>证据类型</th><th>状态</th><th>证据引用</th><th>未满足原因</th></tr></thead>
+                      <thead><tr><th>ID</th><th>证据类型</th><th>状态</th><th>描述</th><th>证据引用</th><th>未满足原因</th></tr></thead>
                       <tbody>
-                        <tr v-for="(req, rIdx) in itemDetail(summary).agent2_trace.task_state.requirements" :key="rIdx">
+                        <tr v-for="(req, rIdx) in getAgent2Requirements(itemDetail(summary))" :key="rIdx">
                           <td>{{ req.id }}</td>
                           <td><code>{{ req.evidence_type }}</code></td>
                           <td><span :class="req.status === 'satisfied' ? 'tag-green' : req.status === 'partially_supported' ? 'tag-yellow' : 'tag-muted'">{{ req.status }}</span></td>
+                          <td>{{ req.description || '-' }}</td>
                           <td>{{ (req.evidence_refs || []).join(', ') || '-' }}</td>
                           <td><span v-if="req.unmet_reason" class="tag-red">{{ req.unmet_reason }}</span><span v-else>-</span></td>
                         </tr>
                       </tbody>
                     </table>
                   </div>
-                  <div v-if="itemDetail(summary).agent2_trace?.evidence_ledger?.entries?.length" class="call-node-body">
+                  <div v-if="getAgent2LedgerEntries(itemDetail(summary)).length" class="call-node-body">
                     <p class="muted small"><strong>证据账本记录 (Evidence Ledger Entries)：</strong></p>
-                    <pre>{{ JSON.stringify(itemDetail(summary).agent2_trace.evidence_ledger.entries, null, 2) }}</pre>
+                    <pre>{{ JSON.stringify(getAgent2LedgerEntries(itemDetail(summary)), null, 2) }}</pre>
                   </div>
-                  <div v-if="itemDetail(summary).agent2_trace?.planner_decisions?.length" class="call-node-body">
+                  <div v-if="getAgent2Trace(itemDetail(summary))?.planner_decisions?.length" class="call-node-body">
                     <p class="muted small"><strong>规划决策 (Planner Decisions)：</strong></p>
-                    <pre>{{ JSON.stringify(itemDetail(summary).agent2_trace.planner_decisions, null, 2) }}</pre>
+                    <pre>{{ JSON.stringify(getAgent2Trace(itemDetail(summary)).planner_decisions, null, 2) }}</pre>
                   </div>
                 </div>
               </details>
