@@ -1297,9 +1297,9 @@ def _analyze_confirmed_person_appearance(person_id: str):
         if not instance or not Path(instance["asset_path"]).is_file():
             continue
         try:
-            from PIL import Image
+            from PIL import Image, ImageOps
 
-            image = Image.open(instance["asset_path"]).convert("RGB")
+            image = ImageOps.exif_transpose(Image.open(instance["asset_path"])).convert("RGB")
             crop, crop_bbox = expanded_person_crop(image, instance.get("bbox_json") or [])
             with tempfile.NamedTemporaryFile(suffix=".jpg", dir=DATA_DIR, delete=False) as temporary:
                 crop.save(temporary, format="JPEG", quality=90)
@@ -1742,11 +1742,13 @@ def face_instance_crop(face_instance_id: str):
     if not instance or not asset_path or not Path(asset_path).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         ensure_heif_support()
         with Image.open(asset_path) as source:
-            image = source.convert("RGB")
+            # cv2.imread (used by detection) applies EXIF orientation, so bbox is
+            # stored in oriented coordinates; transpose here to keep crops aligned.
+            image = ImageOps.exif_transpose(source).convert("RGB")
         bbox = instance.get("bbox_json") or []
         if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
             raise ValueError("invalid face bounding box")

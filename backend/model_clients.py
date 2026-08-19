@@ -1397,11 +1397,13 @@ class FaceAdapter:
             if image is None:
                 # Apple HEIC/HEIF and some PNGs are unreadable by OpenCV alone.
                 from .image_io import ensure_heif_support
-                from PIL import Image
+                from PIL import Image, ImageOps
 
                 ensure_heif_support()
                 with Image.open(path) as pil_image:
-                    image = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+                    # cv2.imread applies EXIF orientation on the JPEG path; transpose
+                    # here so HEIC/HEIF detections share the same oriented bbox space.
+                    image = cv2.cvtColor(np.array(ImageOps.exif_transpose(pil_image).convert("RGB")), cv2.COLOR_RGB2BGR)
             if image is None:
                 return []
             return self._detect_retina_tiled(image)

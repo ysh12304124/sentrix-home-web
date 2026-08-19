@@ -12,6 +12,12 @@
       "manager_url": "http://192.168.0.153:8500",
       "model_base_url": "http://192.168.0.153:8100/v1",
       "description": "153 产品后端固定连接的主 vLLM Manager 和模型服务"
+    },
+    "szu-via-mac": {
+      "label": "学校算力中心 4090（经 mac 隧道 192.168.1.65）",
+      "manager_url": "http://192.168.1.65:18500",
+      "model_base_url": "http://192.168.1.65:18100/v1",
+      "description": "学校 vllm_manager + vllm，SSH 反向隧道经 mac 中转"
     }
   }
 }
