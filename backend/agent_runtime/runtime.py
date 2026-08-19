@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 
 from .budget_manager import BudgetState
+from .jit_prompt import build_jit_system_prompt
 from .answer_nucleus import (build_nucleus, classify_deterministic,
                              render_simple)
 from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
@@ -650,8 +651,18 @@ class AgentRuntime:
                 planner_step["raw_full"] = planner_result.raw
             turn.steps.append(planner_step)
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
-        system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
-                                        current_time=current_time_line())
+        is_candidate_mode = bool(self.profile.features.get("agent2_candidate"))
+        if is_candidate_mode and agent2_task_state is not None:
+            system = build_jit_system_prompt(
+                task_state=agent2_task_state,
+                current_time_str=current_time_line(),
+                tool_results=task.tool_results,
+                preview_handles=task.result_preview,
+                is_candidate=True,
+            )
+        else:
+            system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
+                                            current_time=current_time_line())
         messages = [{"role": "system", "content": system}]
         if task.current_result_set:
             # B3.1：跨 turn 续接同一结果集，让模型知道当前可分页的结果集
@@ -843,6 +854,16 @@ class AgentRuntime:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
             if action.get("action") == "final":
+                # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
+                if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
+                    open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
+                    if open_ev_types and turn.budget.can_model_step():
+                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                        messages.append({"role": "user", "content": (
+                            "你尚未检索相册，禁止直接猜测回答。请先调用 search_memories 检索相关照片。"
+                        )})
+                        continue
+
                 # Phase E §14：Premature Final Guard —— recommended_resolution 要求继续证据解析
                 resolution = _pending_resolution(task)
                 if resolution:
@@ -1347,6 +1368,15 @@ class AgentRuntime:
             if tool_name == "inspect_photo":
                 inspect_called = True
             # Observation 进入下一步模型上下文
+            # Candidate 模式下根据最新 TaskState 动态更新首条 JIT System Prompt
+            if is_candidate_mode and agent2_task_state is not None:
+                messages[0]["content"] = build_jit_system_prompt(
+                    task_state=agent2_task_state,
+                    current_time_str=current_time_line(),
+                    tool_results=task.tool_results,
+                    preview_handles=task.result_preview,
+                    is_candidate=True,
+                )
             messages.append({"role": "assistant", "content": _model_visible_action(action)})
             messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(
                 _model_visible_observation(result.observation), ensure_ascii=False)})
