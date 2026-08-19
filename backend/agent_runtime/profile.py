@@ -23,6 +23,18 @@ class ProfileConfig:
 
 
 PROFILES = {
+    "goal_driven_candidate": ProfileConfig(
+        name="goal_driven_candidate",
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
+               "inspect_photo", "read_photo_text", "search_conversation_history"),
+        max_model_steps=8,
+        max_tool_calls=6,
+        max_inspections=1,
+        wall_time_s=60.0,
+        final_reserve_s=10.0,
+        features={"rx": True, "tool_loop": True, "conversation_store": True,
+                  "agent2_shadow": True, "agent2_candidate": True},
+    ),
     "goal_driven_shadow": ProfileConfig(
         name="goal_driven_shadow",
         tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
@@ -72,8 +84,8 @@ PROFILES = {
 
 
 def active_profile() -> str:
-    return os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow").strip().lower()
+    return os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate").strip().lower()
 
 
 def get_profile(name: str | None = None) -> ProfileConfig:
-    return PROFILES.get(name or active_profile(), PROFILES["goal_driven_shadow"])
+    return PROFILES.get(name or active_profile(), PROFILES["goal_driven_candidate"])

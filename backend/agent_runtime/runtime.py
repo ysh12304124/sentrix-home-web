@@ -1345,7 +1345,10 @@ class AgentRuntime:
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 turn.agent2_trace["task_state"] = agent2_task_state.as_dict()
                 turn.agent2_trace["evidence_ledger"] = agent2_evidence_ledger.as_dict()
-            turn.agent2_trace["terminal_reason"] = "shadow_only"
+            if self.profile.features.get("agent2_candidate"):
+                turn.agent2_trace["terminal_reason"] = "candidate_closure" if turn.status == "complete" else "candidate_partial"
+            else:
+                turn.agent2_trace["terminal_reason"] = "shadow_only"
             turn.agent2_trace["budget_outcome"] = turn.budget.as_dict()
         return turn
 

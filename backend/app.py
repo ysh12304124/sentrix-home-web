@@ -650,7 +650,7 @@ def _sync_vllm_state_on_startup():
 def health():
     # Phase C C12：profile manifest 作为运维真实来源
     agent = {
-        "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow").strip().lower(),
+        "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate").strip().lower(),
         "runtime": "tool_loop",
     }
     try:
@@ -1862,7 +1862,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                                retrieval_config=retrieval_config)
     runtime_tools.set_conversation_id(conversation_id)
     runtime_tools.register_tools()
-    profile_name = (profile_name or os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow")).strip().lower()
+    profile_name = (profile_name or os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate")).strip().lower()
     model_call_metrics = []
     gamma.get_and_clear_call_metrics()
 
@@ -2206,7 +2206,7 @@ def _record_turn_conversation(message, request, result, turn_id=""):
             for s in steps if _public_progress_text(s)
         ]
         conversation_store.save_trajectory(
-            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow"),
+            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate"),
             steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent"),
                                  "telemetry": result.get("telemetry") or {}},
             public_progress=public_progress, scope_id=scope_id,
@@ -2480,7 +2480,7 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
         try:
             trace = result.get("retrieval_trace") or []
             result["telemetry"] = {
-                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow"),
+                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate"),
                 "status": result.get("tool_loop_status"),
                 "reason": result.get("tool_loop_reason"),
                 "termination_reason": result.get("termination_reason"),
