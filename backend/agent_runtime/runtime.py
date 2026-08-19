@@ -268,28 +268,166 @@ def public_agent2_trace(trace: dict | None) -> dict:
 
 
 def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
-                                tool_call_id: str, input_refs=(), provenance_refs=()) -> bool:
-    """Record one compatible produced evidence type for a shadow tool call."""
+                                tool_call_id: str, input_refs=(), provenance_refs=(),
+                                observation: dict | None = None) -> bool:
+    """Record rich, scope-bound evidence produced by one capability call.
+
+    ``observation`` is optional for backwards compatibility with the original
+    shadow tests. When present, one call may produce multiple evidence types and
+    bind each type to every compatible requirement.
+    """
     from .evidence_ledger import Coverage, LedgerEntry
 
-    pending = [state for state in task_state.requirements.values()
-               if state.status == "open" and spec.can_satisfy(state.requirement.evidence_type)]
-    if not pending:
-        return False
-    requirement = pending[0]
-    requirement_type = requirement.requirement.evidence_type
-    task_state.mark_running(requirement.requirement.id)
-    evidence_ledger.append(LedgerEntry(
-        tool_call_id=tool_call_id,
-        capability=spec.name,
-        evidence_type=requirement_type,
-        input_refs=tuple(str(ref) for ref in input_refs),
-        provenance_refs=tuple(str(ref) for ref in provenance_refs),
-        certainty="supported",
-        coverage=Coverage(requested=1, processed=1),
-    ))
-    task_state.mark_satisfied(requirement.requirement.id, evidence_refs=(tool_call_id,))
-    return True
+    observation = observation or {}
+    input_refs = tuple(str(ref) for ref in input_refs if ref)
+    provenance_refs = tuple(str(ref) for ref in provenance_refs if ref)
+    if not observation:
+        pending = [state for state in task_state.requirements.values()
+                   if state.status == "open" and spec.can_satisfy(state.requirement.evidence_type)]
+        if not pending:
+            return False
+        requirement = pending[0]
+        task_state.mark_running(requirement.requirement.id)
+        evidence_ledger.append(LedgerEntry(
+            tool_call_id=tool_call_id,
+            capability=spec.name,
+            evidence_type=requirement.requirement.evidence_type,
+            input_refs=input_refs,
+            provenance_refs=provenance_refs,
+            certainty="supported",
+            coverage=Coverage(requested=1, processed=1),
+            requirement_refs=(requirement.requirement.id,),
+            provenance_scope_id=evidence_ledger.scope_id,
+        ))
+        task_state.mark_satisfied(requirement.requirement.id, evidence_refs=(tool_call_id,))
+        return True
+
+    confidence = _evidence_confidence(observation)
+    preview = observation.get("preview") or []
+    asset_ids = tuple(str(value) for value in observation.get("asset_ids") or [] if value)
+    all_provenance = tuple(dict.fromkeys((*provenance_refs, *asset_ids)))
+    requested = max(1, int(observation.get("total") or len(preview) or 1))
+    processed = min(requested, len(preview) or (1 if observation else 0))
+    if spec.name not in {"search_memories", "get_result_page"}:
+        requested, processed = 1, 1
+    coverage = Coverage(requested=requested, processed=processed)
+    evidence_rows: list[dict] = []
+
+    if spec.name in {"search_memories", "get_result_page"}:
+        assets = [{
+            "handle": item.get("handle"),
+            "captured_at": item.get("captured_at"),
+            "place": item.get("place"),
+            "asset": asset_ids[index] if index < len(asset_ids) else "",
+        } for index, item in enumerate(preview) if isinstance(item, dict)]
+        if assets or asset_ids:
+            evidence_rows.append({
+                "evidence_type": "memory_asset",
+                "value": {"result_set_id": observation.get("result_set_id"), "assets": assets,
+                           "asset_ids": list(asset_ids)},
+                "subject": str(observation.get("query") or "记忆照片"),
+                "asset_id": asset_ids[0] if len(asset_ids) == 1 else "",
+            })
+        places = [item for item in assets if item.get("place")]
+        if places:
+            evidence_rows.append({
+                "evidence_type": "location_metadata",
+                "value": [{"asset": item.get("asset") or item.get("handle"),
+                           "value": item.get("place")} for item in places],
+                "subject": "照片地点",
+            })
+        dates = [item for item in assets if item.get("captured_at")]
+        if dates:
+            evidence_rows.append({
+                "evidence_type": "temporal_metadata",
+                "value": [{"asset": item.get("asset") or item.get("handle"),
+                           "value": item.get("captured_at")} for item in dates],
+                "subject": "照片拍摄时间",
+            })
+    elif spec.name == "inspect_photo":
+        value = observation.get("observation") or observation.get("scene") or observation.get("summary")
+        if value:
+            evidence_rows.append({"evidence_type": "visual_observation", "value": value,
+                                  "subject": str(observation.get("question") or "照片视觉细节"),
+                                  "asset_id": str(observation.get("asset_handle") or (input_refs[0] if input_refs else ""))})
+    elif spec.name == "read_photo_text":
+        value = observation.get("full_text") or observation.get("exact_values") or observation.get("text")
+        if value:
+            evidence_rows.append({"evidence_type": "visible_text", "value": value,
+                                  "subject": str(observation.get("question") or "照片文字"),
+                                  "asset_id": str(observation.get("asset_handle") or (input_refs[0] if input_refs else ""))})
+    elif spec.name == "query_memory_facts":
+        value = observation.get("value")
+        if value is None:
+            value = observation.get("rows") or observation.get("items") or observation.get("summary")
+        if value is not None:
+            evidence_rows.append({"evidence_type": "structured_fact", "value": value,
+                                  "subject": str(observation.get("operation") or "结构化记忆事实")})
+        if observation.get("operation") in {"date", "first", "last"} and observation.get("value") is not None:
+            evidence_rows.append({"evidence_type": "temporal_metadata", "value": observation.get("value"),
+                                  "subject": str(observation.get("operation"))})
+        if observation.get("group_by") == "place" or observation.get("common_places"):
+            value = observation.get("rows") or observation.get("common_places")
+            if value:
+                evidence_rows.append({"evidence_type": "location_metadata", "value": value,
+                                      "subject": "结构化地点事实"})
+
+    covered_types = {row["evidence_type"] for row in evidence_rows}
+    generic_value = (observation.get("value") or observation.get("summary") or
+                     observation.get("matches") or observation.get("cards") or
+                     observation.get("events") or observation.get("items"))
+    for evidence_type in spec.produces_evidence:
+        if evidence_type not in covered_types and generic_value is not None:
+            evidence_rows.append({"evidence_type": evidence_type, "value": generic_value,
+                                  "subject": spec.name})
+
+    recorded = False
+    for row in evidence_rows:
+        evidence_type = row["evidence_type"]
+        refs = tuple(state.requirement.id for state in task_state.requirements.values()
+                     if state.requirement.evidence_type == evidence_type)
+        try:
+            evidence_ledger.append(LedgerEntry(
+                tool_call_id=tool_call_id,
+                capability=spec.name,
+                evidence_type=evidence_type,
+                input_refs=input_refs,
+                provenance_refs=all_provenance,
+                certainty=str(observation.get("certainty") or "supported"),
+                coverage=coverage,
+                provenance_scope_id=evidence_ledger.scope_id,
+                subject=str(row.get("subject") or ""),
+                asset_id=str(row.get("asset_id") or ""),
+                extracted_value=row.get("value"),
+                confidence=confidence,
+                requirement_refs=refs,
+            ))
+        except ValueError as exc:
+            if "duplicate tool call" in str(exc):
+                continue
+            raise
+        recorded = True
+        for state in task_state.requirements.values():
+            if state.requirement.evidence_type != evidence_type:
+                continue
+            if state.status == "open":
+                task_state.mark_running(state.requirement.id)
+            if state.status == "running":
+                if coverage.is_partial:
+                    task_state.mark_partially_supported(state.requirement.id, evidence_refs=(tool_call_id,))
+                else:
+                    task_state.mark_satisfied(state.requirement.id, evidence_refs=(tool_call_id,))
+    return recorded
+
+
+def _evidence_confidence(observation: dict) -> float | None:
+    value = observation.get("confidence")
+    if isinstance(value, dict):
+        value = value.get("score") or value.get("value")
+    try:
+        return max(0.0, min(1.0, float(value))) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _trusted_facts(task_state: dict) -> list[str]:
@@ -406,6 +544,14 @@ def _build_answer_grounding(*, message: str, task: TaskState,
         "result_set_id": task.current_result_set,
         "explicit_image_request": explicit_image,
     }
+
+
+def _agent2_answer_context_ready(task_state, answer_context: dict) -> bool:
+    """Return true when the planner's evidence requirements are closed enough to write."""
+    if not answer_context.get("facts"):
+        return False
+    states = getattr(task_state, "requirements", {}).values()
+    return all(state.status in {"satisfied", "partially_supported"} for state in states)
 
 
 def _capability_note(tool_name: str) -> str:
@@ -732,7 +878,43 @@ class AgentRuntime:
         turn.budget.max_inspections = adaptive_inspections
         # Phase G G3：Completion State / Gate —— 最小动态 requirements（不重建 Planner）
         completion = CompletionState(message)
+        answer_context_enabled = is_candidate_mode and (
+            self.profile.features.get("agent2_answer_context") or
+            os.getenv("SENTRIX_AGENT2_ANSWER_CONTEXT", "").strip().lower() in {"1", "true", "on"}
+        )
+        answer_context = None
+        answer_writer_pending = False
+        answer_writer_messages = None
         while True:
+            if answer_writer_pending and answer_writer_messages:
+                if not turn.budget.can_model_step():
+                    answer_writer_pending = False
+                else:
+                    turn.budget.record_model_step()
+                    try:
+                        raw_writer = self.chat_fn(
+                            answer_writer_messages,
+                            call_type="writer",
+                            step_id="answer_writer",
+                        ) or ""
+                        from .final_writer import clean_writer_output
+                        turn.final_answer = clean_writer_output(raw_writer)
+                        turn.steps.append({
+                            "type": "writer",
+                            "status": "generated",
+                            "call_type": "writer",
+                            "step_id": "answer_writer",
+                            "raw": raw_writer[:500],
+                            **({"prompt": answer_writer_messages, "raw_full": raw_writer}
+                               if self.include_debug else {}),
+                        })
+                        turn.status = "complete" if turn.final_answer else "partial"
+                        turn.reason = "" if turn.final_answer else "empty_answer_writer"
+                        break
+                    except Exception as exc:
+                        turn.steps.append({"type": "writer", "status": "failed",
+                                           "call_type": "writer", "reason": str(exc)})
+                        answer_writer_pending = False
             if not turn.budget.can_model_step():
                 # Phase H H4：步骤耗尽但 OCR 已读到确定性硬值时，直接渲染交付（不依赖 12B 收尾）
                 if task.tool_results:
@@ -1354,7 +1536,18 @@ class AgentRuntime:
                 record_agent2_tool_evidence(
                     agent2_task_state, agent2_evidence_ledger, spec,
                     tool_call_id=tool_call_id, input_refs=input_refs,
+                    provenance_refs=input_refs,
+                    observation=result.observation or {},
                 )
+                if answer_context_enabled:
+                    from .final_writer import build_answer_writer_messages
+                    answer_context = agent2_evidence_ledger.build_answer_context(
+                        message, agent2_task_state)
+                    turn.agent2_trace["answer_context"] = answer_context
+                    if _agent2_answer_context_ready(agent2_task_state, answer_context):
+                        answer_writer_messages = build_answer_writer_messages(
+                            message, answer_context)
+                        answer_writer_pending = True
             completion.update(task.as_dict())
             # G6：OCR 显式 partial（超时/失败）→ 记录到 turn，用于最终 natural partial 语义
             if tool_name == "read_photo_text" and (result.observation or {}).get("status") == "partial":

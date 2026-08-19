@@ -213,6 +213,43 @@ _WRITER_SYSTEM = (
 )
 
 
+def build_answer_writer_messages(message: str, answer_context: dict) -> list[dict]:
+    """Build the existing writer's minimal evidence-only answer prompt."""
+    payload = {
+        "facts": answer_context.get("facts") or [],
+        "unknowns": answer_context.get("unknowns") or [],
+        "conflicts": answer_context.get("conflicts") or [],
+    }
+    system = _WRITER_SYSTEM + (
+        "\n8. 下面的事实材料是唯一可用证据，只输出最终回答文本，不要输出 JSON、工具调用、"
+        "证据编号或内部字段名。\n"
+    )
+    user = (
+        "用户问题：\n" + str(message or "") +
+        "\n\n最小答案材料：\n" + json.dumps(payload, ensure_ascii=False, default=str) +
+        "\n\n请直接回答用户问题。只能使用 facts；unknowns 必须如实保留；"
+        "conflicts 不得自行选择其一。"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def clean_writer_output(raw: str) -> str:
+    """Remove presentation wrappers while preserving the writer's facts."""
+    text = str(raw or "").strip()
+    text = re.sub(r"^```(?:json|text)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and parsed.get("answer"):
+            text = str(parsed["answer"]).strip()
+    except Exception:
+        pass
+    return naturalize_answer(text.strip().strip('"'))
+
+
 def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = None,
                        debug_out: dict | None = None) -> str | None:
     """一次 text-only 重写；失败返回 None（调用方保留草稿）。"""

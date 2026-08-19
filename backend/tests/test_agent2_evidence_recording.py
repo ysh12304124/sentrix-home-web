@@ -41,6 +41,39 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
         self.assertEqual(task.requirement("text").status, "open")
         self.assertEqual(ledger.entries, [])
 
+    def test_observation_can_bind_multiple_requirements_from_one_search(self):
+        task = TaskState.from_declaration(TaskDeclaration(
+            goal="find the dated place photo", scope_id="album1",
+            requirements=(
+                EvidenceRequirement(id="asset", evidence_type="memory_asset"),
+                EvidenceRequirement(id="place", evidence_type="location_metadata"),
+                EvidenceRequirement(id="date", evidence_type="temporal_metadata"),
+            ),
+        ))
+        ledger = EvidenceLedger(scope_id="album1")
+        spec = ToolSpec(name="search_memories", description="search", input_schema={},
+                        executor=_execute, produces_evidence=("memory_asset", "memory_reference"))
+
+        recorded = record_agent2_tool_evidence(
+            task, ledger, spec, tool_call_id="tool_call_1",
+            input_refs=("photo_1",), observation={
+                "result_set_id": "result_1",
+                "total": 1,
+                "asset_ids": ["asset_1"],
+                "preview": [{"handle": "photo_1", "place": "秦皇岛", "captured_at": "2019-07-22"}],
+                "query": "沙雕合影",
+                "certainty": "supported",
+            })
+
+        self.assertTrue(recorded)
+        self.assertEqual({entry.evidence_type for entry in ledger.entries}, {
+            "memory_asset", "location_metadata", "temporal_metadata",
+        })
+        self.assertEqual(task.requirement("asset").status, "satisfied")
+        self.assertEqual(task.requirement("place").status, "satisfied")
+        self.assertEqual(task.requirement("date").status, "satisfied")
+        self.assertEqual(set(ledger.entries[0].requirement_refs), {"asset"})
+
 
 if __name__ == "__main__":
     unittest.main()

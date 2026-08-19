@@ -76,6 +76,60 @@ class EvidenceLedgerTests(unittest.TestCase):
 
         self.assertEqual(restored.as_dict(), ledger.as_dict())
 
+    def test_build_answer_context_keeps_bound_facts_and_unknowns(self):
+        from backend.agent_runtime.task_state import EvidenceRequirement, TaskDeclaration, TaskState
+
+        task = TaskState.from_declaration(TaskDeclaration(
+            goal="find the place and sign",
+            scope_id="album1",
+            requirements=(
+                EvidenceRequirement(id="place", evidence_type="location_metadata", description="place"),
+                EvidenceRequirement(id="sign", evidence_type="visible_text", description="sign"),
+            ),
+        ))
+        ledger = EvidenceLedger(scope_id="album1")
+        ledger.append(LedgerEntry(
+            tool_call_id="call_search",
+            capability="search_memories",
+            evidence_type="location_metadata",
+            input_refs=("photo_1",),
+            provenance_refs=("asset_1",),
+            extracted_value="秦皇岛如是海度假村",
+            confidence=0.96,
+            requirement_refs=("place",),
+            provenance_scope_id="album1",
+        ))
+
+        context = ledger.build_answer_context("where and what sign", task)
+
+        self.assertEqual(context["facts"][0]["value"], "秦皇岛如是海度假村")
+        self.assertEqual(context["facts"][0]["requirement_refs"], ["place"])
+        self.assertEqual(context["unknowns"][0]["requirement_id"], "sign")
+        self.assertEqual(context["conflicts"], [])
+
+    def test_build_answer_context_preserves_same_asset_conflict(self):
+        ledger = EvidenceLedger(scope_id="album1")
+        for call_id, value in (("call_1", "ABC"), ("call_2", "ABD")):
+            ledger.append(LedgerEntry(
+                tool_call_id=call_id,
+                capability="read_photo_text",
+                evidence_type="visible_text",
+                input_refs=("photo_1",),
+                provenance_refs=("photo_1",),
+                subject="sign",
+                asset_id="photo_1",
+                extracted_value=value,
+                requirement_refs=("sign",),
+                provenance_scope_id="album1",
+            ))
+
+        context = ledger.build_answer_context("what does the sign say", {
+            "requirements": [{"id": "sign", "evidence_type": "visible_text", "status": "open"}],
+        })
+
+        self.assertEqual(len(context["conflicts"]), 1)
+        self.assertEqual(set(context["conflicts"][0]["values"]), {"ABC", "ABD"})
+
 
 if __name__ == "__main__":
     unittest.main()
