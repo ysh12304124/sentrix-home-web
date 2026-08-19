@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import re
 import sqlite3
 import threading
@@ -4291,12 +4292,71 @@ class MemoryStore:
                 (timestamp, cluster_id),
             )
         self._sync_face_entity_statuses(timestamp)
+        attached = self._attach_uncertain_faces(scope_id)
         self.connection.commit()
         return {
             "instances": len(instances), "clusters": len(result.clusters),
             "threshold": threshold, "minimum_quality": minimum_quality,
             "noise": sum(1 for cluster in result.clusters if cluster.noise),
+            "attached_uncertain": attached,
         }
+
+    def _attach_uncertain_faces(self, scope_id=None):
+        """P0-c: attach uncertain evidence faces to strong verified clusters when
+        their embedding is highly similar to a cluster representative. This
+        recovers small/ambiguous real faces without ever creating a new cluster
+        from an uncertain candidate."""
+        threshold = float(os.getenv("FACE_ATTACH_THRESHOLD", "0.75"))
+        if threshold <= 0:
+            return 0
+        scope_filter = " AND a.scope_id = ?" if scope_id else ""
+        scope_param = (scope_id,) if scope_id else ()
+        rows = self._rows(
+            """SELECT fi.id, fi.embedding_json, a.scope_id
+            FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
+            WHERE fi.validity = 'uncertain' AND fi.embedding_json != '[]' AND fi.cluster_id IS NULL"""
+            + scope_filter,
+            scope_param,
+        )
+        attached = 0
+        affected = set()
+        for row in rows:
+            embedding = json.loads(row["embedding_json"] or "[]")
+            if not embedding:
+                continue
+            target = self._find_attach_cluster(embedding, row["scope_id"], threshold)
+            if target:
+                self.connection.execute(
+                    "UPDATE face_instances SET cluster_id = ? WHERE id = ?", (target, row["id"])
+                )
+                affected.add(target)
+                attached += 1
+        for cluster_id in affected:
+            count = self._row("SELECT COUNT(*) AS c FROM face_instances WHERE cluster_id = ?", (cluster_id,))
+            self.connection.execute(
+                "UPDATE face_clusters SET member_count = ? WHERE id = ?", (count["c"], cluster_id)
+            )
+            self._refresh_face_prototypes(cluster_id)
+        return attached
+
+    def _find_attach_cluster(self, embedding, scope_id, threshold):
+        clusters = self._rows(
+            """SELECT c.id, c.representative_embedding_json, c.member_count
+            FROM face_clusters c
+            WHERE c.scope_id = ? AND c.status IN ('pending', 'confirmed') AND c.member_count >= 2""",
+            (scope_id,),
+        )
+        best_id = None
+        best_cos = 0.0
+        for cluster in clusters:
+            representative = json.loads(cluster["representative_embedding_json"] or "[]")
+            if not representative or len(representative) != len(embedding):
+                continue
+            cos = self._cosine(embedding, representative)
+            if cos > best_cos:
+                best_cos = cos
+                best_id = cluster["id"]
+        return best_id if best_cos >= threshold else None
 
     def _sync_face_entity_statuses(self, timestamp=None):
         """Hide pending entities whose candidate face clusters were retired."""

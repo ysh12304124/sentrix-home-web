@@ -15,9 +15,22 @@ from .planner_contracts import parse_planner_action
 from .task_state import TaskDeclaration
 
 
-_DECLARATION_PROMPT = """You are planning a family-memory task. Return exactly one JSON object:
-{{"action":"declare","declaration":{{"goal":"...","scope_id":"{scope_id}","requirements":[{{"id":"...","evidence_type":"...","description":"..."}}]}}}}
-Declare only evidence needed to answer the request. Evidence types are: structured_fact, memory_asset, memory_reference, visual_observation, visible_text, temporal_metadata, location_metadata, confirmed_identity, user_statement, transcript. Do not call tools, invent assets, use SQL, or answer the user."""
+_DECLARATION_PROMPT = """你正在规划一项家庭记忆任务。只返回一个 JSON 对象，格式如下：
+{{"action":"declare","declaration":{{"goal":"<用户目标>","scope_id":"{scope_id}","requirements":[{{"id":"req_1","evidence_type":"<证据类型>","description":"<证据描述>"}}]}}}}
+仅声明回答用户请求所必需的最小证据需求。
+可选的证据类型（evidence_type）包括：
+- memory_asset：相册照片/视频等媒体实体资产
+- visible_text：照片/招牌/菜单/账单中直接可见的文字或数字
+- visual_observation：照片中的视觉细节（如衣服颜色、物品、人物动作等）
+- temporal_metadata：拍摄时间或日期元数据
+- location_metadata：拍摄地点、城市或地标元数据
+- confirmed_identity：确认人物身份或家庭成员关系
+- structured_fact：数据库结构化统计事实（如计数、分组、最早/最近等）
+- memory_reference：记忆引用或历史记录
+- user_statement：用户显式声明的信息
+- transcript：音频或视频转录文本
+
+不要调用工具，不要编造不存在的资产，不要输出 SQL，不要直接回答用户。"""
 
 
 @dataclass(frozen=True)
