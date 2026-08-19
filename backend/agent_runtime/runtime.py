@@ -509,8 +509,23 @@ class AgentRuntime:
                 parsed = json.loads(candidate)
             except Exception:
                 continue
-            if isinstance(parsed, dict) and parsed.get("action") in ("tool_call", "final"):
-                return parsed
+            if isinstance(parsed, dict):
+                act = parsed.get("action")
+                if act in ("tool_call", "final"):
+                    return parsed
+                # 兼容 0.8B 等小模型把工具名直接写在 action 字段的情况（如 {"action":"search_memories", "filters":...}）
+                if act in ("search_memories", "query_memory_facts", "inspect_photo", "read_photo_text", "get_result_page", "get_original_photos", "search_conversation_history", "get_core_memory", "get_person_memory"):
+                    tool_name = act
+                    args = {k: v for k, v in parsed.items() if k not in ("action", "public_status")}
+                    # 如果有 arguments 嵌套则展开
+                    if isinstance(args.get("arguments"), dict):
+                        args = args["arguments"]
+                    return {
+                        "action": "tool_call",
+                        "tool": tool_name,
+                        "arguments": args,
+                        "public_status": parsed.get("public_status") or f"正在调用 {tool_name}"
+                    }
         return None
 
     @staticmethod
