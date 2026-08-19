@@ -1456,7 +1456,8 @@ class FaceAdapter:
             detections = self._retina.detect(image)
             image_height, image_width = image.shape[:2]
             min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
-            verified_scrfd_score = float(os.getenv("FACE_VERIFIED_SCRFD_SCORE", "0.5"))
+            verified_scrfd_score = float(os.getenv("FACE_VERIFIED_SCRFD_SCORE", "0.7"))
+            verified_min_area = float(os.getenv("FACE_VERIFIED_MIN_AREA", "0.003"))
             results = []
             for det in detections:
                 bbox = [float(value) for value in det["bbox"]]
@@ -1519,7 +1520,10 @@ class FaceAdapter:
                     for point in best.kps
                 ] if getattr(best, "kps", None) is not None else []
                 sane = self._landmark_sanity(scrfd_landmarks, bbox) if scrfd_landmarks else False
-                validity = "verified" if (score >= verified_scrfd_score and agreed and sane) else "uncertain"
+                area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
+                validity = "verified" if (
+                    score >= verified_scrfd_score and agreed and sane and area_ratio >= verified_min_area
+                ) else "uncertain"
                 area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
                 pose = [float(value) for value in best.pose] if getattr(best, "pose", None) is not None else []
                 try:
