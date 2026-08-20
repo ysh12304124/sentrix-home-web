@@ -170,7 +170,7 @@ class IngestionPipeline:
             observation = self.store.add_observation(asset_id, result)
             # Event selection needs the image vector before an event exists.
             self.store.upsert_vector(
-                "visual", "asset", asset_id, result.get("clip_embedding"), self.clip.model_name,
+                "visual", "asset", asset_id, result.get("clip_embedding"), getattr(self.clip, "visual_model_name", self.clip.model_name),
                 {"observation_id": observation["id"]},
             )
             cluster_ids = []
@@ -188,7 +188,7 @@ class IngestionPipeline:
             entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation["id"], event["id"])]
             # Update the same vector with its final event link after selection.
             self.store.upsert_vector(
-                "visual", "asset", asset_id, result.get("clip_embedding"), self.clip.model_name,
+                "visual", "asset", asset_id, result.get("clip_embedding"), getattr(self.clip, "visual_model_name", self.clip.model_name),
                 {"observation_id": observation["id"], "event_id": event["id"]},
             )
             fact_text = " ".join(f"{item.get('subject', '')} {item.get('predicate', '')} {item.get('object', '')}" for item in result.get("facts", []))
@@ -286,7 +286,7 @@ class IngestionPipeline:
         })
         observation_write_seconds = time.perf_counter() - step_started
         step_started = time.perf_counter()
-        self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"]})
+        self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, getattr(self.clip, "visual_model_name", self.clip.model_name), {"observation_id": observation["id"]})
         visual_vector_seconds = time.perf_counter() - step_started
         step_started = time.perf_counter()
         cluster_ids = []
@@ -311,7 +311,7 @@ class IngestionPipeline:
         step_started = time.perf_counter()
         entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation["id"], event["id"])]
         entity_maintenance_seconds = time.perf_counter() - step_started
-        self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, self.clip.model_name, {"observation_id": observation["id"], "event_id": event["id"]})
+        self.store.upsert_vector("visual", "asset", asset_id, clip_embedding, getattr(self.clip, "visual_model_name", self.clip.model_name), {"observation_id": observation["id"], "event_id": event["id"]})
         timings = dict(prepared.get("timings") or {})
         timings.update({
             "observation_write_seconds": round(observation_write_seconds, 4),
@@ -557,7 +557,7 @@ class IngestionPipeline:
         }
         analysis["source_type"] = "image"
         analysis["face_candidates"] = faces
-        analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates", "location_context"}}, "location_context": metadata["location_context"], "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face_detector": "buffalo_l", "face_embedding": sorted({face.get("embedding_model", "unknown") for face in faces}), "image_embedding": self.clip.model_name}}
+        analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates", "location_context"}}, "location_context": metadata["location_context"], "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face_detector": "buffalo_l", "face_embedding": sorted({face.get("embedding_model", "unknown") for face in faces}), "image_embedding": getattr(self.clip, "visual_model_name", self.clip.model_name)}}
         return analysis
 
     def _audio_observation(self, asset):

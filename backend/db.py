@@ -6,6 +6,7 @@ import threading
 import uuid
 from collections import Counter
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from .geocoding import format_gps_prefix
 from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
@@ -1123,6 +1124,21 @@ class MemoryStore:
         self.connection.commit()
         return self.get_asset(asset_id)
 
+    def update_asset_file(self, asset_id, path, *, file_name=None, mime_type=None, size_bytes=None, content_sha256=None):
+        """Update the stored media identity after an in-place video compaction."""
+        current = self.get_asset(asset_id) or {}
+        self.connection.execute(
+            """UPDATE assets SET path = ?, file_name = ?, mime_type = ?, size_bytes = ?,
+               content_sha256 = ?, updated_at = ? WHERE id = ?""",
+            (
+                str(path), file_name or current.get("file_name"), mime_type or current.get("mime_type"),
+                int(size_bytes if size_bytes is not None else current.get("size_bytes") or 0),
+                content_sha256 or current.get("content_sha256"), now_iso(), asset_id,
+            ),
+        )
+        self.connection.commit()
+        return self.get_asset(asset_id)
+
     def create_ingest_batch(self, batch_id, scope_id="home-default"):
         timestamp = now_iso()
         self.connection.execute(
@@ -1895,7 +1911,7 @@ class MemoryStore:
             row["cover_selection"] = row.get("cover_selection_json", {})
             row["source_metadata"] = row.get("source_metadata_json", {})
             if row.get("source_type") == "video_scene":
-                row["keyframe_assets"] = [
+                derived_keyframes = [
                     {key: asset.get(key) for key in (
                         "id", "file_name", "media_type", "status", "captured_at", "captured_location",
                         "parent_asset_id", "derived_kind", "source_timestamp_sec", "source_frame_index",
@@ -1904,10 +1920,47 @@ class MemoryStore:
                     for asset in self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
                 ]
                 source_video = self.get_asset(row.get("source_asset_id")) or {}
+                package = (source_video.get("metadata_json") or {}).get("keyframe_video_package") or {}
+                if not derived_keyframes and package:
+                    frame_map = {}
+                    try:
+                        frame_map = json.loads(Path(str(package.get("frame_map_path"))).read_text(encoding="utf-8"))
+                        mapped_frames = frame_map.get("frames") if isinstance(frame_map, dict) else frame_map
+                    except (OSError, ValueError, TypeError):
+                        mapped_frames = []
+                    mapped_frames = mapped_frames if isinstance(mapped_frames, list) else []
+                    if len(mapped_frames) > 80:
+                        stride = len(mapped_frames) / 80
+                        mapped_frames = [mapped_frames[min(int(index * stride), len(mapped_frames) - 1)] for index in range(80)]
+                    scene_start = float(row.get("source_start_sec") or 0)
+                    scene_end = float(row.get("source_end_sec") or float("inf"))
+                    encoded_fps = float(package.get("encoded_fps") or (frame_map.get("encoded_fps") if isinstance(frame_map, dict) else 0) or 25)
+                    derived_keyframes = []
+                    for ordinal, frame in enumerate(mapped_frames):
+                        if not isinstance(frame, dict):
+                            continue
+                        timestamp = float(frame.get("source_timestamp_sec", frame.get("timestamp_sec", 0)) or 0)
+                        if timestamp < scene_start - 0.001 or timestamp > scene_end + 0.001:
+                            continue
+                        encoded_index = int(frame.get("encoded_frame_index", ordinal) or 0)
+                        derived_keyframes.append({
+                            "id": f"{source_video.get('id')}:frame:{encoded_index}",
+                            "file_name": f"keyframe-{encoded_index:06d}",
+                            "media_type": "video-frame", "status": "processed",
+                            "parent_asset_id": source_video.get("id"), "derived_kind": "video_keyframe",
+                            "source_timestamp_sec": timestamp,
+                            "source_frame_index": int(frame.get("source_frame_index", 0) or 0),
+                            "encoded_frame_index": encoded_index,
+                            "encoded_fps": encoded_fps,
+                            "source_scene_index": row.get("source_scene_index"),
+                        })
+                row["keyframe_assets"] = derived_keyframes
                 row["source_video"] = {key: source_video.get(key) for key in (
                     "id", "file_name", "media_type", "mime_type", "status", "captured_at",
                     "captured_location", "size_bytes",
                 )}
+                row["source_video"]["keyframe_video"] = bool(package)
+                row["source_video"]["keyframe_video_encoded_fps"] = float(package.get("encoded_fps") or 25) if package else 0
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
 
@@ -1925,7 +1978,7 @@ class MemoryStore:
 
     def list_derived_assets(self, parent_asset_id, scene_index=None):
         params = [parent_asset_id]
-        where = "parent_asset_id = ? AND derived_kind = 'video_keyframe'"
+        where = "parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')"
         if scene_index is not None:
             where += " AND source_scene_index = ?"
             params.append(int(scene_index))
@@ -1983,7 +2036,7 @@ class MemoryStore:
             (video_asset_id,),
         )
         self.connection.execute(
-            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind = 'video_keyframe'",
+            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')",
             (video_asset_id,),
         )
         self.connection.commit()

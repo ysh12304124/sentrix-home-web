@@ -66,6 +66,10 @@
     stories: [],
     trips: [],
     health: null,
+    performance: null,
+    queryPerformance: [],
+    latestQueryPerformanceId: "",
+    queryImageStartedAt: 0,
     vlmBackendOptions: null,
     ocrSettings: null,
     modal: null,
@@ -105,6 +109,11 @@
     { id: "library", icon: "▦", label: "资料库" },
     { id: "stories", icon: "▶", label: "故事工作室" },
     { id: "imports", icon: "↓", label: "导入队列" },
+  ];
+
+  const systemNavItems = [
+    { id: "performance", icon: "◫", label: "视频分析性能" },
+    { id: "settings", icon: "◌", label: "设备与隐私" },
   ];
 
   function escapeHtml(value) {
@@ -233,7 +242,7 @@
 
   function videoSceneStack(event) {
     const frames = (event.keyframe_assets || []).slice(0, 4);
-    return `<div class="video-scene-cover ${event.tone}"><div class="scene-frame-stack">${frames.map((frame, index) => `<img src="/api/assets/${encodeURIComponent(frame.id)}/file" alt="视频场景关键帧 ${index + 1}" loading="lazy" style="--stack-index:${index}" />`).join("")}</div><div class="event-cover-label">${albumBadge(event.scope_id)}<span>${escapeHtml(event.title)}</span></div><b>${frames.length || (event.observation_ids || []).length} 张关键帧</b></div>`;
+    return `<div class="video-scene-cover ${event.tone}"><div class="scene-frame-stack">${frames.map((frame, index) => { const source = frame.media_type === "video-frame" ? `/api/assets/${encodeURIComponent(event.source_asset_id)}/file#t=${Number(frame.encoded_frame_index || 0) / Number(frame.encoded_fps || 25)}` : `/api/assets/${encodeURIComponent(frame.id)}/file`; const visual = frame.media_type === "video-frame" ? `<video muted playsinline preload="metadata" src="${source}"></video>` : `<img src="${source}" alt="视频场景关键帧 ${index + 1}" loading="lazy" />`; return `<span class="scene-frame" style="--stack-index:${index}">${visual}</span>`; }).join("")}</div><div class="event-cover-label">${albumBadge(event.scope_id)}<span>${escapeHtml(event.title)}</span></div><b>${frames.length || (event.observation_ids || []).length} 张关键帧</b></div>`;
   }
 
   function faceAvatar(faceInstanceId, label = "?", tone = "gray") {
@@ -255,8 +264,8 @@
     const activeSpace = visibleSpaces().find((space) => space.id === state.scopeId) || visibleSpaces()[0];
     const spaceOptions = visibleSpaces().map((space) => `<option value="${escapeHtml(space.id)}" ${space.id === state.scopeId ? "selected" : ""}>${escapeHtml(space.name || space.id)}</option>`).join("");
     const activeScopeLabel = activeSpace?.kind === "all" ? "三相册合并视图" : "独立相册空间";
-    const currentLabel = state.view === "settings" ? "设备与隐私" : (navItems.find((item) => item.id === state.view)?.label || "");
-    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><label class="space-switcher"><span class="avatar tiny">S</span><span><b>当前相册</b><select id="space-select" aria-label="切换全部相册或独立相册">${spaceOptions}</select><small>${escapeHtml(activeScopeLabel)}</small></span></label><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav"><button class="nav-item ${state.view === "settings" ? "active" : ""}" data-view="settings">${icon("◌")}<span>设备与隐私</span></button><button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button><button class="nav-item" data-action="open-qa-dashboard">${icon("▤")}<span>QA 测评</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs">${state.view !== "overview" ? `<button class="crumb-back" data-action="back">${icon("←")}返回</button><b>/</b>` : ""}<button data-action="home">Sentrix Home</button>${currentLabel ? `<b>/</b><strong>${escapeHtml(currentLabel)}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>${escapeHtml(activeSpace?.name || "全部相册")}</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
+    const currentLabel = [...navItems, ...systemNavItems].find((item) => item.id === state.view)?.label || "";
+    app.innerHTML = `<aside class="sidebar"><div class="brand-lockup"><span class="brand-mark">S</span><div><strong>Sentrix</strong><small>Home Memory</small></div></div><label class="space-switcher"><span class="avatar tiny">S</span><span><b>当前相册</b><select id="space-select" aria-label="切换全部相册或独立相册">${spaceOptions}</select><small>${escapeHtml(activeScopeLabel)}</small></span></label><div class="side-label">家庭记忆</div><nav class="main-nav">${navItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}</nav><div class="side-label lower">空间与系统</div><nav class="main-nav">${systemNavItems.map((item) => `<button class="nav-item ${state.view === item.id ? "active" : ""}" data-view="${item.id}">${icon(item.icon)}<span>${item.label}</span></button>`).join("")}<button class="nav-item" data-action="open-help">${icon("?")}<span>使用帮助</span></button><button class="nav-item" data-action="open-qa-dashboard">${icon("▤")}<span>QA 测评</span></button></nav><div class="sidebar-footer"><div class="local-pulse"><i></i><span>${state.backendError ? "本地服务不可用" : "本地 AI 正常运行"}</span></div><small>Sentrix Home · 0.2.0</small></div></aside><main class="main-content"><header class="topbar"><div class="breadcrumbs">${state.view !== "overview" ? `<button class="crumb-back" data-action="back">${icon("←")}返回</button><b>/</b>` : ""}<button data-action="home">Sentrix Home</button>${currentLabel ? `<b>/</b><strong>${escapeHtml(currentLabel)}</strong>` : ""}</div><div class="top-actions"><button class="icon-button" data-action="command" aria-label="打开命令搜索">⌘</button><button class="top-user" data-action="open-space"><span class="avatar tiny">S</span><span>${escapeHtml(activeSpace?.name || "全部相册")}</span>${icon("⌄", "muted")}</button></div></header><div id="view-root" class="view-root"></div></main><div id="toast-root" aria-live="polite"></div><div id="modal-root"></div>`;
     renderView();
   }
 
@@ -298,7 +307,7 @@
         ? aspects.map(escapeHtml).join(" · ")
         : (item.captured_at || item.caption || "可回看的原始证据");
       const dup = item.near_duplicate_size > 1 ? `<small class="image-dup">另有 ${item.near_duplicate_size - 1} 张相似照片</small>` : "";
-      return `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
+      return `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" data-performance-image="1" data-query-performance-run-id="${escapeHtml(state.latestQueryPerformanceId)}" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
     }).join("");
     return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关图片</p><h3>${images.length} 张</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
   }
@@ -683,6 +692,151 @@
     return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "视频会在后台读取拍摄信息、提取关键画面并整理进家庭时间线。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或点击选择文件</strong><small>视频支持 MOV / MP4，并在后台构建场景记忆</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
   }
 
+  function performanceBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) return "暂无";
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+
+  function performanceSeconds(value) {
+    const seconds = Number(value);
+    return Number.isFinite(seconds) && seconds >= 0 ? `${seconds.toFixed(seconds >= 100 ? 1 : 2)} 秒` : "暂无";
+  }
+
+  function performancePercent(value, inverse = false) {
+    const ratio = Number(value);
+    if (!Number.isFinite(ratio)) return "暂无";
+    return `${Math.max(0, Math.min(100, ratio * 100)).toFixed(1)}%${inverse ? " 保留" : ""}`;
+  }
+
+  function queryTimingNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : 0;
+  }
+
+  function queryTimings(result) {
+    const timings = [];
+    const seen = new Set();
+    const add = (value) => {
+      if (!value || typeof value !== "object") return;
+      const signature = JSON.stringify(value);
+      if (seen.has(signature)) return;
+      seen.add(signature);
+      timings.push(value);
+    };
+    const rootTiming = result?.retrieval_timing || result?.retrievalTiming;
+    if (rootTiming) add(rootTiming);
+    else (result?.retrievalTrace || result?.retrieval_trace || []).forEach((item) => add(item?.retrieval_timing || item?.retrievalTiming));
+    if (!rootTiming) (result?.toolTrace || result?.tool_trace || []).forEach((item) => add(item?.retrieval_timing || item?.retrievalTiming));
+    let retrievalMs = queryTimingNumber(result?.retrieval_latency_ms || result?.retrieval_ms);
+    let candidateCount = queryTimingNumber(result?.candidate_count || result?.candidates_count);
+    if (!candidateCount && result?.retrieval && typeof result.retrieval === "object") {
+      candidateCount = Object.values(result.retrieval).reduce((sum, value) => sum + queryTimingNumber(value), 0);
+    }
+    const channels = {};
+    timings.forEach((timing) => {
+      const channelValues = timing.channels || timing.channel_timings || {};
+      Object.entries(channelValues).forEach(([name, raw]) => {
+        const value = typeof raw === "object" ? (raw.elapsed_ms ?? raw.latency_ms ?? raw.ms ?? raw.seconds * 1000) : raw;
+        if (Number.isFinite(Number(value))) channels[name] = (channels[name] || 0) + Number(value);
+        if (typeof raw === "object") candidateCount = Math.max(candidateCount, queryTimingNumber(raw.candidate_count || raw.candidates));
+      });
+      retrievalMs += queryTimingNumber(timing.total_ms || timing.retrieval_ms || timing.fusion_ms);
+      candidateCount = Math.max(candidateCount, queryTimingNumber(timing.candidate_count || timing.candidates || timing.total_candidates));
+    });
+    const telemetry = result?.telemetry || result?.telemetry_metrics || {};
+    const totalMs = queryTimingNumber(result?.total_latency_ms || result?.response_latency_ms || telemetry.total_ms || (Number(telemetry.latency_s) * 1000));
+    const modelLedgerMs = (result?.model_call_metrics || []).reduce((sum, item) => sum + queryTimingNumber(item?.latency_ms || item?.duration_ms), 0);
+    const modelMs = queryTimingNumber(result?.model_latency_ms || result?.model_ms || telemetry.model_ms || telemetry.model_latency_ms) || modelLedgerMs || Math.max(0, totalMs - retrievalMs);
+    return { retrieval_ms: retrievalMs || null, model_ms: modelMs || null, total_ms: totalMs || null, candidates: candidateCount || null, channels };
+  }
+
+  function loadStoredQueryPerformance() {
+    if (state.queryPerformance.length || !window.localStorage) return;
+    try {
+      const rows = JSON.parse(window.localStorage.getItem("sentrix.queryPerformance") || "[]");
+      if (Array.isArray(rows)) state.queryPerformance = rows.slice(-40);
+    } catch (_) { state.queryPerformance = []; }
+  }
+
+  function saveQueryPerformance() {
+    try { window.localStorage?.setItem("sentrix.queryPerformance", JSON.stringify(state.queryPerformance.slice(-40))); } catch (_) { /* storage is optional */ }
+  }
+
+  function recordQueryPerformance(query, result, totalMs) {
+    const timing = queryTimings(result || {});
+    const id = `query-${Date.now()}`;
+    state.latestQueryPerformanceId = id;
+    state.queryImageStartedAt = performance.now();
+    state.queryPerformance.push({
+      id, query: String(query || "").slice(0, 120), created_at: new Date().toISOString(),
+      total_ms: Math.round(totalMs || timing.total_ms || 0), retrieval_ms: timing.retrieval_ms,
+      model_ms: timing.model_ms, image_load_ms: null, candidates: timing.candidates, channels: timing.channels,
+    });
+    state.queryPerformance = state.queryPerformance.slice(-40);
+    saveQueryPerformance();
+  }
+
+  function bindQueryImageTiming() {
+    const runId = state.latestQueryPerformanceId;
+    if (!runId) return;
+    const images = document.querySelectorAll(`img[data-performance-image][data-query-performance-run-id="${runId}"]`);
+    images.forEach((image) => {
+      if (image.dataset.performanceBound) return;
+      image.dataset.performanceBound = "1";
+      const finish = () => {
+        const row = state.queryPerformance.find((item) => item.id === runId);
+        if (!row) return;
+        const elapsed = Math.max(0, performance.now() - state.queryImageStartedAt);
+        row.image_load_ms = Math.round(Math.max(Number(row.image_load_ms) || 0, elapsed));
+        saveQueryPerformance();
+      };
+      image.addEventListener("load", finish, { once: true });
+      if (image.complete && image.naturalWidth) finish();
+    });
+  }
+
+  function performanceValueMs(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? `${number.toFixed(number >= 1000 ? 0 : 1)} ms` : "暂无";
+  }
+
+  function performanceCard(label, value, note, tone = "") {
+    return `<article class="performance-card ${tone}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(note || "")}</small></article>`;
+  }
+
+  function performanceView() {
+    loadStoredQueryPerformance();
+    const data = state.performance || {};
+    const summary = data.summary || {};
+    const videos = data.videos || [];
+    const latest = state.queryPerformance[state.queryPerformance.length - 1];
+    const channels = latest?.channels || {};
+    const queryRows = state.queryPerformance.slice().reverse().slice(0, 12);
+    const extraction = performanceSeconds(summary.extraction_seconds);
+    const memory = performanceSeconds(summary.memory_build_seconds);
+    const videoCards = [
+      performanceCard("压缩率", performancePercent(summary.compression_ratio), `${performanceBytes(summary.original_bytes)} → ${performanceBytes(summary.keyframe_bytes)}`, "accent"),
+      performanceCard("关键帧提取时间", extraction, videos.some((item) => item.extraction_source?.includes("未拆分")) ? "部分视频为处理总耗时" : "已记录视频提取阶段"),
+      performanceCard("记忆构建时间", memory, `${summary.scene_count || 0} 个场景 · ${summary.keyframe_count || 0} 张关键帧`),
+      performanceCard("视频数量", String(summary.video_count || 0), "当前相册范围"),
+    ].join("");
+    const videoRows = videos.length ? videos.map((video) => `<tr><td><strong>${escapeHtml(video.file_name)}</strong><small>${escapeHtml(video.format || "未知格式")}</small></td><td>${video.keyframe_count || 0} / ${video.scene_count || 0}</td><td>${performanceBytes(video.original_bytes)}</td><td>${performanceBytes(video.keyframe_bytes)}</td><td>${performancePercent(video.compression_ratio)}</td><td>${performanceSeconds(video.extraction_seconds)}<small>${escapeHtml(video.extraction_source || "")}</small></td><td>${performanceSeconds(video.memory_build_seconds)}</td></tr>`).join("") : `<tr><td colspan="7">${emptyState("暂无视频分析数据", "完成一次视频导入后，这里会显示真实的关键帧、压缩和记忆构建耗时。")}</td></tr>`;
+    const qaCards = [
+      performanceCard("总响应耗时", performanceValueMs(latest?.total_ms), "从浏览器发起问答到收到回答"),
+      performanceCard("检索耗时", performanceValueMs(latest?.retrieval_ms), "语义、事件、视觉等通道"),
+      performanceCard("模型回答耗时", performanceValueMs(latest?.model_ms), "后端返回的模型阶段或总耗时扣除检索"),
+      performanceCard("图片加载耗时", performanceValueMs(latest?.image_load_ms), "首屏相关图片加载完成"),
+      performanceCard("候选数量", latest?.candidates == null ? "暂无" : String(latest.candidates), "本轮检索候选"),
+    ].join("");
+    const channelRows = Object.entries(channels).length ? Object.entries(channels).map(([name, value]) => `<div class="performance-channel"><span>${escapeHtml(name)}</span><b>${performanceValueMs(value)}</b><i><em style="width:${Math.min(100, Math.max(4, Number(value) / Math.max(...Object.values(channels), 1) * 100))}%"></em></i></div>`).join("") : `<p class="performance-muted">完成一次家庭记忆助手问答后显示各检索通道耗时。</p>`;
+    const queryTable = queryRows.length ? queryRows.map((row) => `<tr><td>${escapeHtml(row.query || "未命名问题")}<small>${escapeHtml(formatDateTime(row.created_at))}</small></td><td>${performanceValueMs(row.total_ms)}</td><td>${performanceValueMs(row.retrieval_ms)}</td><td>${performanceValueMs(row.model_ms)}</td><td>${performanceValueMs(row.image_load_ms)}</td><td>${row.candidates == null ? "暂无" : row.candidates}</td></tr>`).join("") : `<tr><td colspan="6">${emptyState("暂无问答测量", "到“家庭记忆助手”完成一次问答后，这里会自动记录浏览器侧真实耗时。")}</td></tr>`;
+    return `${pageHeader("性能 / 视频与问答", "看清每一段记忆是怎样被整理和找回的。", "视频分析数据来自本地 Asset 与导入批次；问答数据在当前浏览器中逐次记录，不会上传到外部服务。", `<button class="button ghost" data-action="reload">${icon("↻")}刷新性能</button>`)}<section class="content-section performance-section"><div class="section-head"><div><p class="section-kicker">视频分析性能</p><h2>压缩、提取与记忆构建</h2></div><span class="result-count">${escapeHtml(albumLabel(state.scopeId))}</span></div><div class="performance-grid">${videoCards}</div><div class="performance-table-wrap"><table class="performance-table"><thead><tr><th>视频</th><th>关键帧 / 场景</th><th>原视频</th><th>关键帧证据</th><th>压缩率</th><th>提取时间</th><th>记忆构建</th></tr></thead><tbody>${videoRows}</tbody></table></div></section><section class="content-section performance-section"><div class="section-head"><div><p class="section-kicker">QA / 检索性能</p><h2>一次回答的端到端链路</h2></div><span class="result-count">${latest ? escapeHtml(formatDateTime(latest.created_at)) : "尚未测量"}</span></div><div class="performance-grid qa-performance-grid">${qaCards}</div><div class="performance-channel-list"><div class="section-head"><div><p class="section-kicker">各通道耗时</p><h3>最近一次问答</h3></div></div>${channelRows}</div><div class="performance-table-wrap"><table class="performance-table"><thead><tr><th>问题</th><th>总响应</th><th>检索</th><th>模型回答</th><th>图片加载</th><th>候选</th></tr></thead><tbody>${queryTable}</tbody></table></div><p class="performance-note">说明：总响应耗时由浏览器实测；检索和模型阶段优先使用后端 telemetry，后端未拆分时会显示可用的估算来源。刷新页面不会清除记录，清理浏览器站点数据才会清除本机测量历史。</p></section>`;
+  }
+
   function ocrSettingsCard() {
     const ocr = state.ocrSettings || {};
     const available = ocr.small_ocr_available === true;
@@ -824,11 +978,47 @@
 
   function renderView() {
     const root = document.getElementById("view-root");
-    const views = { overview, search: searchView, timeline: timelineView, people: peopleView, knowledge: semanticKnowledgeView, library: libraryView, stories: storiesView, imports: importsView, settings: settingsView };
+    const views = { overview, search: searchView, timeline: timelineView, people: peopleView, knowledge: semanticKnowledgeView, library: libraryView, stories: storiesView, imports: importsView, performance: performanceView, settings: settingsView };
     root.innerHTML = state.loading ? emptyState("正在读取本地记忆", "正在加载 Asset、Observation、Event、Fact 和故事。") : views[state.view]();
     renderModal();
     bindViewEvents();
+    bindQueryImageTiming();
+    hydrateKeyframeCanvases();
     if (state.toast) showToast(state.toast);
+  }
+
+  function hydrateKeyframeCanvases() {
+    const player = document.getElementById("scene-video-player");
+    const canvases = Array.from(document.querySelectorAll("[data-keyframe-canvas]"));
+    if (!player || !canvases.length) return;
+    const originalTime = Number(player.currentTime || 0);
+    let index = 0;
+    const onSeeked = () => {
+      const canvas = canvases[index - 1];
+      if (canvas && player.videoWidth && player.videoHeight) {
+        const context = canvas.getContext("2d");
+        const scale = Math.min(canvas.width / player.videoWidth, canvas.height / player.videoHeight);
+        const width = player.videoWidth * scale;
+        const height = player.videoHeight * scale;
+        context.fillStyle = "#111";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(player, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+      }
+      drawNext();
+    };
+    const drawNext = () => {
+      const canvas = canvases[index++];
+      if (!canvas) {
+        player.removeEventListener("seeked", onSeeked);
+        if (Number.isFinite(originalTime)) player.currentTime = originalTime;
+        return;
+      }
+      player.currentTime = Number(canvas.dataset.encodedFrameIndex || 0) / Number(canvas.dataset.encodedFps || 25);
+    };
+    player.pause();
+    player.addEventListener("seeked", onSeeked);
+    if (player.readyState >= 1) drawNext();
+    else player.addEventListener("loadedmetadata", drawNext, { once: true });
   }
 
   function renderModal() {
@@ -847,7 +1037,9 @@
       const isVideoScene = detail.event.source_type === "video_scene";
       const sourceVideo = detail.event.source_video || {};
       const sceneFrames = detail.event.keyframe_assets || [];
-      const sceneEvidence = isVideoScene ? `<section class="video-scene-detail"><div class="detail-facts"><span>视频范围 · ${formatVideoTime(detail.event.source_start_sec)}~${formatVideoTime(detail.event.source_end_sec)}</span><span>场景 ${(detail.event.source_scene_index || 0) + 1}</span><span>${sceneFrames.length} 张关键帧</span></div><video id="scene-video-player" controls preload="metadata" src="/api/assets/${encodeURIComponent(detail.event.source_asset_id)}/file"></video><div class="scene-keyframe-grid">${sceneFrames.map((frame) => `<button class="scene-keyframe" data-action="seek-video" data-timestamp-sec="${Number(frame.source_timestamp_sec || 0)}"><img src="/api/assets/${encodeURIComponent(frame.id)}/file" alt="${formatVideoTime(frame.source_timestamp_sec)} 的关键帧" /><strong>${formatVideoTime(frame.source_timestamp_sec)}</strong></button>`).join("")}</div><button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(detail.event.source_asset_id)}">打开原始视频 ${icon("→")}</button></section>` : "";
+      const keyframeVideo = Boolean(sourceVideo.keyframe_video);
+      const webpMemory = detail.event.source_metadata?.memory_image_format === "webp" || sceneFrames.some((frame) => /\.webp$/i.test(frame.file_name || ""));
+      const sceneEvidence = isVideoScene ? `<section class="video-scene-detail"><div class="detail-facts"><span>视频范围 · ${formatVideoTime(detail.event.source_start_sec)}~${formatVideoTime(detail.event.source_end_sec)}</span><span>场景 ${(detail.event.source_scene_index || 0) + 1}</span><span>${sceneFrames.length} 张关键帧</span>${webpMemory ? "<span>WebP 记忆帧</span>" : keyframeVideo ? "<span>无 JPEG · 视频帧映射</span>" : ""}</div><video id="scene-video-player" controls preload="metadata" src="/api/assets/${encodeURIComponent(detail.event.source_asset_id)}/file"></video><div class="scene-keyframe-grid">${sceneFrames.map((frame) => { const encoded = frame.media_type === "video-frame" ? `data-encoded-frame-index="${Number(frame.encoded_frame_index || 0)}" data-encoded-fps="${Number(frame.encoded_fps || sourceVideo.keyframe_video_encoded_fps || 25)}"` : ""; const visual = frame.media_type === "video-frame" ? `<canvas class="scene-keyframe-canvas" width="320" height="180" data-keyframe-canvas ${encoded}></canvas>` : `<img src="/api/assets/${encodeURIComponent(frame.id)}/file" alt="${formatVideoTime(frame.source_timestamp_sec)} 的关键帧" />`; return `<button class="scene-keyframe" data-action="seek-video" data-timestamp-sec="${Number(frame.source_timestamp_sec || 0)}" ${encoded}>${visual}<strong>${formatVideoTime(frame.source_timestamp_sec)}</strong></button>`; }).join("")}</div><button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(detail.event.source_asset_id)}">打开关键帧视频 ${icon("→")}</button></section>` : "";
       body = `<div class="modal-kicker">${isVideoScene ? "视频场景" : "事件详情"}</div><h2>${escapeHtml(detail.event.title)}</h2><p class="modal-lead">${escapeHtml(detail.event.summary || "暂无摘要")}</p><div class="detail-facts"><span>时间 · ${formatDateTime(detail.event.time_start)}</span><span>地点 · ${escapeHtml(detail.event.place || "未标注")}</span><span>${isVideoScene ? `原视频 · ${escapeHtml(sourceVideo.file_name || "视频证据")}` : `版本 · ${detail.event.revision || 1}`}</span></div>${sceneEvidence}${coverEvidence}<div class="section-head"><div><p class="section-kicker">记忆内容</p><h3>人物、地点与画面细节</h3></div></div><div class="event-entity-list">${entityRows || emptyState("暂时没有更多细节", "处理新资料后，这里会继续补充。")}</div><div class="section-head"><div><p class="section-kicker">原始资料</p><h3>${detail.observations.length} 条画面记录</h3></div>${isVideoScene ? "" : `<button class="button small ghost" data-action="edit-event" data-event-id="${escapeHtml(detail.event.id)}">修正事件</button>`}</div><div class="evidence-list event-evidence-list">${detail.observations.length ? detail.observations.map((observation) => evidenceCard({ kind: "observation", id: observation.id, observation_id: observation.id, asset_id: observation.asset_id, file_name: observation.asset?.file_name, media_type: observation.asset?.media_type, captured_at: observation.captured_at, caption: observation.caption, transcript: observation.transcript, raw: observation.raw_json })).join("") : emptyState("没有关联画面", "这是一个人工创建的事件。")}</div>${detail.facts?.length ? `<div class="section-head"><div><p class="section-kicker">语义记忆</p><h3>关联事实</h3></div></div><div class="evidence-list">${detail.facts.map((fact) => evidenceCard({ kind: "fact", id: fact.id, subject: fact.subject, predicate: fact.predicate, object: fact.object, status: fact.status, evidence_ids: fact.evidence_ids_json })).join("")}</div>` : ""}`;
     } else if (modal.type === "asset") {
       const asset = modal.asset;
@@ -1098,10 +1290,11 @@
       if (!state.scopeInitialized) {
         const storedScopeId = window.localStorage?.getItem("sentrix.scopeId") || "";
         const storedSpace = state.spaces.find((space) => space.id === storedScopeId);
-        // The web portal should open on the complete benchmark corpus. A
-        // legacy household selection is intentionally migrated to all albums;
-        // users can still choose an individual benchmark space explicitly.
-        state.scopeId = storedSpace?.kind === "benchmark" ? storedSpace.id : "";
+        // Keep the timeline scoped to the fresh v2 package by default.  The
+        // previous all-albums default mixed legacy QA imports with the new
+        // package and made video scenes look duplicated or out of context.
+        const latestSpace = state.spaces.find((space) => space.id === "hippo-latest-BpVmNB3eKdM");
+        state.scopeId = storedSpace?.id?.startsWith("hippo-latest-") ? storedSpace.id : (latestSpace?.id || "");
         state.scopeInitialized = true;
       } else if (state.scopeId && state.spaces.length && !state.spaces.some((space) => space.id === state.scopeId)) {
         state.scopeId = "";
@@ -1137,7 +1330,12 @@
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
         state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
         state.entityGroups = calls[12].status === "fulfilled" ? calls[12].value.groups || [] : [];
-        state.geoPlaces = calls[13].status === "fulfilled" ? calls[13].value.places || [] : [];
+    state.geoPlaces = calls[13].status === "fulfilled" ? calls[13].value.places || [] : [];
+    try {
+      state.performance = await window.sentrixApi.performance(scopeId);
+    } catch (_) {
+      state.performance = null;
+    }
     const failed = calls.find((call) => call.status === "rejected");
     state.backendError = failed ? "本地后端暂时不可用，当前页面只显示已读取到的真实数据。" : "";
     state.loading = false;
@@ -1176,6 +1374,8 @@
   }
 
   function bindViewEvents() {
+    const keyframePackageInput = document.getElementById("file-input");
+    if (keyframePackageInput && !keyframePackageInput.accept.includes(".json")) keyframePackageInput.accept += ",.json,application/json";
     document.querySelectorAll("[data-view]").forEach((element) => element.addEventListener("click", () => { navigate(element.dataset.view); }));
     document.querySelectorAll("[data-query]").forEach((element) => element.addEventListener("click", () => { state.query = element.dataset.query; state.view = "search"; renderShellNavigation(); submitSearch(); }));
     document.querySelectorAll("[data-event-filter]").forEach((element) => element.addEventListener("click", () => { state.eventFilter = element.dataset.eventFilter; renderView(); }));
@@ -1227,18 +1427,21 @@
     const input = document.getElementById("search-input");
     state.query = input ? input.value.trim() : state.query.trim();
     if (!state.query) return;
+    const queryText = state.query;
+    const queryStartedAt = performance.now();
     state.view = "search";
-    state.assistantMessages.push({ role: "user", text: state.query });
+    state.assistantMessages.push({ role: "user", text: queryText });
     state.searchLoading = true;
     state.liveProgress = [];
     renderShellNavigation();
     try {
-      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
+      const { result, conversationId } = await runAssistantTurn(queryText, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
       state.conversationId = conversationId;
       state.searchResult = result;
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
     }
+    recordQueryPerformance(queryText, state.searchResult, performance.now() - queryStartedAt);
     state.assistantMessages.push({ role: "steward", result: state.searchResult });
     state.query = "";
     state.searchLoading = false;
@@ -1674,7 +1877,13 @@
       if (!player) return;
       // Pause first so seeking is deterministic even when autoplay is blocked
       // or the browser has only buffered part of the generated MP4 preview.
-      const seek = () => { player.pause(); player.currentTime = Number(element.dataset.timestampSec || 0); };
+      const seek = () => {
+        player.pause();
+        const encoded = element.dataset.encodedFrameIndex;
+        player.currentTime = encoded !== undefined
+          ? Number(encoded) / Number(element.dataset.encodedFps || 25)
+          : Number(element.dataset.timestampSec || 0);
+      };
       if (player.readyState >= 1) seek(); else player.addEventListener("loadedmetadata", seek, { once: true });
       return;
     }
@@ -1869,7 +2078,7 @@
   }
 
   const initialHash = window.location.hash.replace(/^#\/?/, "");
-  if (initialHash && (navItems.some((item) => item.id === initialHash) || initialHash === "settings")) {
+  if (initialHash && ([...navItems, ...systemNavItems].some((item) => item.id === initialHash))) {
     state.view = initialHash;
   }
   shell();
@@ -1880,7 +2089,7 @@
   refreshData();
   window.addEventListener("hashchange", () => {
     const hashView = window.location.hash.replace(/^#\/?/, "");
-    if (hashView && hashView !== state.view && (navItems.some((item) => item.id === hashView) || hashView === "settings")) {
+    if (hashView && hashView !== state.view && ([...navItems, ...systemNavItems].some((item) => item.id === hashView))) {
       state.view = hashView;
       state.modal = null;
       state.modalHistory = [];

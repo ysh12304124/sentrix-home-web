@@ -1239,6 +1239,16 @@ class ClipAdapter:
         self._load_lock = threading.Lock()
         self.error = None
         self.device = os.getenv("CLIP_DEVICE", "auto")
+        self._visual_embedder = None
+        self.visual_model_name = self.model_name
+        if os.getenv("SENTRIX_IMAGE_EMBEDDER", "clip").strip().lower() == "chinese_clip":
+            try:
+                from .embeddings.chinese_clip_visual import ChineseClipVisualEmbedder
+
+                self._visual_embedder = ChineseClipVisualEmbedder(device=self.device)
+                self.visual_model_name = self._visual_embedder.model_id
+            except Exception as error:
+                self.error = str(error)
         # A randomly initialized model must never be used as retrieval evidence.
         self.weights_ready = bool(self.checkpoint) or os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() in {"1", "true", "yes"}
 
@@ -1283,6 +1293,11 @@ class ClipAdapter:
                 return None, None
 
     def embed_image(self, path):
+        if self._visual_embedder is not None:
+            vector = self._visual_embedder.embed_image(path)
+            if not vector:
+                self.error = getattr(self._visual_embedder, "_error", None) or "Chinese-CLIP image embedding failed"
+            return vector
         model, preprocess = self._load()
         if model is None:
             return []

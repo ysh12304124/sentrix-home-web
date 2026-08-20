@@ -14,6 +14,7 @@
 
   window.sentrixApi = {
     health: () => request("/api/health"),
+    performance: (scopeId = "") => request(`/api/performance${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     memorySpaces: () => request("/api/memory-spaces"),
     createMemorySpace: (name) => request("/api/memory-spaces", { method: "POST", body: JSON.stringify({ name }) }),
     deleteMemorySpace: (scopeId) => request(`/api/memory-spaces/${encodeURIComponent(scopeId)}`, { method: "DELETE" }),
