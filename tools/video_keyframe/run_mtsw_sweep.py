@@ -39,6 +39,7 @@ def load_states(path: Path):
             appearance_embedding=list(item.get("appearance_embedding") or []),
             sharpness=float(item.get("sharpness") or 0),
             phash=str(item.get("phash") or ""),
+            black_frame=bool(item.get("black_frame", False)),
         ))
     return states
 

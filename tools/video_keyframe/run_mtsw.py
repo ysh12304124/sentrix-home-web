@@ -294,7 +294,7 @@ def main():
     Path(args.output).mkdir(parents=True, exist_ok=True)
     state_cache = []
     for state in states:
-        state_cache.append({"frame_index": state.frame_index, "timestamp": state.timestamp, "image_path": state.image_path, "objects": state.objects, "people": state.people, "pose_state": state.pose_state, "scene_embedding": state.scene_embedding, "appearance_embedding": state.appearance_embedding, "sharpness": state.sharpness, "phash": state.phash})
+        state_cache.append({"frame_index": state.frame_index, "timestamp": state.timestamp, "image_path": state.image_path, "objects": state.objects, "people": state.people, "pose_state": state.pose_state, "scene_embedding": state.scene_embedding, "appearance_embedding": state.appearance_embedding, "sharpness": state.sharpness, "phash": state.phash, "black_frame": state.black_frame})
     Path(args.output, "state_cache.json").write_text(json.dumps({"cache_version": "mtsw-state-v1", "method_version": MTSW_METHOD_VERSION, "states": state_cache}, ensure_ascii=False), encoding="utf-8")
     selected_asset_ids = {}
     dense_runtime = {"dense_decode_seconds": 0.0, "dense_decode_windows": len(result["transitions"]), "dense_decode_backend": "not_run", "webp_write_seconds": 0.0}

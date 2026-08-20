@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 
-MTSW_METHOD_VERSION = "keyframe-hybrid-v2.3-mtsw"
+MTSW_METHOD_VERSION = "keyframe-hybrid-v2.3.2-merge"
 MTSW_CACHE_VERSION = "mtsw-state-v1"
 MTSW_CONFIG = {
     "scan_fps": 2.0,
@@ -48,6 +48,13 @@ MTSW_CONFIG = {
     "object_weight": 0.15,
     "pose_weight": 0.15,
     "appearance_weight": 0.10,
+    "event_merge_threshold": 0.20,
+    "event_merge_gap_sec": 20.0,
+    "event_max_duration_sec": 600.0,
+    "person_duplicate_phash_distance": 16,
+    "person_duplicate_visual_similarity": 0.88,
+    "black_mean_threshold": 24.0,
+    "black_p95_threshold": 55.0,
 }
 
 
@@ -169,6 +176,7 @@ class FrameState:
     scene_embedding: list = field(default_factory=list)
     appearance_embedding: list = field(default_factory=list)
     sharpness: float = 0.0
+    black_frame: bool = False
     phash: str = ""
     change_score: float = 0.0
     z_score: float = 0.0
@@ -243,6 +251,8 @@ class MTSWEngine:
                     state.phash = _phash(state.image)
                 if not state.sharpness:
                     state.sharpness = _sharpness(state.image)
+                gray = cv2.cvtColor(state.image, cv2.COLOR_BGR2GRAY)
+                state.black_frame = float(gray.mean()) < float(self.config["black_mean_threshold"]) and float(np.percentile(gray, 95)) < float(self.config["black_p95_threshold"])
 
     def _difference(self, previous, current):
         previous_interactions = {(item.get("object"), item.get("relation")) for item in previous.interactions}
@@ -305,14 +315,14 @@ class MTSWEngine:
             state = by_index.get(transition["frame_index"])
             if not state:
                 continue
-            for candidate in (state, self._nearest(states, state.timestamp - self.config["dense_before_sec"]), self._nearest(states, state.timestamp + self.config["dense_after_sec"])):
+            for candidate in (state if not state.black_frame else None, self._nearest_usable(states, state.timestamp - self.config["dense_before_sec"]), self._nearest_usable(states, state.timestamp + self.config["dense_after_sec"]), self._nearest_usable(states, state.timestamp)):
                 if candidate and candidate not in selected:
                     candidate.selected = True
                     if candidate is not state and not candidate.selection_reason:
                         candidate.selection_reason = ["pre_state" if candidate.timestamp < state.timestamp else "post_state"]
                     selected.append(candidate)
         if not selected:
-            anchor = max(states, key=lambda item: item.sharpness)
+            anchor = max([item for item in states if not item.black_frame] or states, key=lambda item: item.sharpness)
             anchor.selected, anchor.selection_reason = True, ["initial_state"]
             selected = [anchor]
         return sorted(selected, key=lambda item: item.timestamp)
@@ -321,18 +331,23 @@ class MTSWEngine:
     def _nearest(states, timestamp):
         return min(states, key=lambda item: abs(item.timestamp - timestamp)) if states else None
 
+    @staticmethod
+    def _nearest_usable(states, timestamp):
+        usable = [item for item in states if not item.black_frame and abs(item.timestamp - timestamp) <= 3.0]
+        return min(usable, key=lambda item: abs(item.timestamp - timestamp)) if usable else None
+
     def deduplicate(self, selected):
         kept, cases = [], []
         for state in selected:
-            duplicate = next((item for item in reversed(kept) if abs(item.timestamp - state.timestamp) <= 8.0 and (_phash_distance(item.phash, state.phash) <= int(self.config["phash_max_distance"]) or _cosine(item.scene_embedding, state.scene_embedding) >= float(self.config["visual_similarity"])) and item.state_signature == state.state_signature), None)
+            duplicate = next((item for item in reversed(kept) if abs(item.timestamp - state.timestamp) <= 8.0 and ((_phash_distance(item.phash, state.phash) <= int(self.config["phash_max_distance"]) or _cosine(item.scene_embedding, state.scene_embedding) >= float(self.config["visual_similarity"])) and item.state_signature == state.state_signature or (item.person_count > 0 and item.person_count == state.person_count and item.pose_state == state.pose_state and item.interactions == state.interactions and _phash_distance(item.phash, state.phash) <= int(self.config["person_duplicate_phash_distance"]) and _cosine(item.appearance_embedding, state.appearance_embedding) >= float(self.config["person_duplicate_visual_similarity"])))), None)
             if duplicate:
                 if state.sharpness > duplicate.sharpness:
                     duplicate.duplicate_of = state.duplicate_of or duplicate.frame_index
                     kept.remove(duplicate); kept.append(state)
-                    cases.append({"kept": state.frame_index, "removed": duplicate.frame_index, "reason": "state_duplicate_replaced_by_sharper"})
+                    cases.append({"kept": state.frame_index, "removed": duplicate.frame_index, "reason": "person_duplicate_replaced_by_sharper" if state.person_count else "state_duplicate_replaced_by_sharper"})
                 else:
                     state.selected = False; state.duplicate_of = str(duplicate.frame_index)
-                    cases.append({"kept": duplicate.frame_index, "removed": state.frame_index, "reason": "state_duplicate"})
+                    cases.append({"kept": duplicate.frame_index, "removed": state.frame_index, "reason": "person_duplicate" if state.person_count else "state_duplicate"})
                 continue
             kept.append(state)
         return sorted(kept, key=lambda item: item.timestamp), cases
@@ -345,8 +360,8 @@ class MTSWEngine:
             current = events[-1]
             previous = current["members"][-1]
             gap = state.timestamp - previous.timestamp
-            continuity = 0.45 * _jaccard(previous.object_labels, state.object_labels) + 0.35 * (1.0 if previous.person_count == state.person_count else 0.0) + 0.20 * _cosine(previous.appearance_embedding, state.appearance_embedding)
-            if gap <= float(self.config["bridge_max_time_gap_sec"]) and continuity >= 0.35 and (state.timestamp - current["members"][0].timestamp) <= 300:
+            continuity = 0.25 * _jaccard(previous.object_labels, state.object_labels) + 0.40 * (1.0 if previous.person_count == state.person_count else 0.0) + 0.35 * _cosine(previous.appearance_embedding, state.appearance_embedding)
+            if gap <= float(self.config["event_merge_gap_sec"]) and continuity >= float(self.config["event_merge_threshold"]) and (state.timestamp - current["members"][0].timestamp) <= float(self.config["event_max_duration_sec"]):
                 current["members"].append(state); current["states"].append(state.state_signature)
             else:
                 events.append({"event_index": len(events), "members": [state], "states": [state.state_signature]})
@@ -386,6 +401,9 @@ class MTSWEngine:
             "bridge_candidates": len(bridge_cases), "bridge_accepted": sum(1 for item in bridge_cases if item["accepted"]),
             "evidence_retention": 1.0,
             "information_density": round(sum(1 for item in selected if item.selection_reason) / max(1, len(selected)), 6),
+            "black_frames_in_scan": sum(1 for item in states if item.black_frame),
+            "black_frames_selected": sum(1 for item in selected if item.black_frame),
+            "person_duplicates_removed": sum(1 for item in dedup_cases if "person_duplicate" in item["reason"]),
         }
 
 
