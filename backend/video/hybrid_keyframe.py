@@ -7,6 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 
 def _value(item, key, default=""):
     return item.get(key, default) if isinstance(item, dict) else default
@@ -19,13 +22,44 @@ def _labels(row):
             label = _value(item, "label") or _value(item, "name") or (item if isinstance(item, str) else "")
             if str(label).strip():
                 values.append(str(label).strip().lower())
+    event_label = str(row.get("event_label") or "").strip().lower()
+    if event_label:
+        values.append(event_label)
     return set(values)
+
+
+_MEAL_LABELS = {
+    "eat", "eating", "dining", "meal", "food", "吃饭", "用餐", "进食", "就餐",
+    "吃东西", "吃饭场景",
+}
+_CONVERSATION_LABELS = {
+    "talk", "talking", "speak", "speaking", "conversation", "chat", "discussion",
+    "交谈", "说话", "聊天", "对话", "交流",
+}
+
+
+def _is_meal(row):
+    return bool(_labels(row) & _MEAL_LABELS)
+
+
+def _is_conversation(row):
+    labels = _labels(row)
+    return bool(labels & _CONVERSATION_LABELS) or ("person" in labels and any(
+        token in str(row.get("event_label") or "").lower() for token in _CONVERSATION_LABELS
+    ))
 
 
 def _similar(left, right):
     a, b = _labels(left), _labels(right)
     if not a or not b:
         return False
+    # Sustained meals are one semantic state even when the detector changes
+    # between bowl/plate/food.  Conversations can also span long intervals;
+    # visual diversity is preserved later by _choose_representatives().
+    if _is_meal(left) and _is_meal(right):
+        return True
+    if _is_conversation(left) and _is_conversation(right) and "person" in a and "person" in b:
+        return True
     overlap = len(a & b) / max(1, len(a | b))
     anchor = bool(a & b) and (("person" in a and "person" in b) or len(a & b) >= 2)
     return overlap >= 0.45 and anchor
@@ -36,7 +70,72 @@ def _valid_image(row):
     return path if path.is_file() else None
 
 
-def _merge_frames(frames, max_duration=45.0, max_gap=0.75):
+def _info_score(row):
+    labels = _labels(row)
+    confidence = 0.0
+    for key in ("objects", "actions", "expressions"):
+        for item in row.get(key) or []:
+            try:
+                confidence += float(_value(item, "confidence", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    # More independent semantic labels and confident detections are a better
+    # proxy for information density than frame position.  WebP size is only a
+    # small tie-breaker so it cannot select a noisy frame by itself.
+    return 2.0 * len(labels) + confidence + min(1.0, float(row.get("webp_bytes") or 0) / 250000.0)
+
+
+def _visual_signature(path):
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return None
+    image = cv2.resize(image, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32)
+    return (image - image.mean()) / max(float(image.std()), 1.0)
+
+
+def _visual_distance(left, right):
+    a = _visual_signature(left)
+    b = _visual_signature(right)
+    if a is None or b is None:
+        return 1.0
+    return float(np.mean(np.abs(a - b)))
+
+
+def _choose_representatives(valid, group):
+    """Keep the most informative frame plus visually different evidence.
+
+    A sustained meal is intentionally represented by one frame.  For other
+    long events, the cap grows with duration and selected frames must be both
+    semantically informative and visually different.
+    """
+    if not valid:
+        return []
+    if all(_is_meal(row) for row in group if row):
+        return [max(valid, key=_info_score)]
+    start = float(group[0].get("event_start_sec", group[0].get("source_timestamp_sec", 0)) or 0)
+    end = float(group[-1].get("event_end_sec", group[-1].get("source_timestamp_sec", start)) or start)
+    duration = max(0.0, end - start)
+    max_count = min(8, max(3, int(np.ceil(duration / 30.0))))
+    min_gap = max(2.0, min(12.0, duration / max_count / 2.0))
+    ranked = sorted(valid, key=_info_score, reverse=True)
+    chosen = []
+    for row in ranked:
+        timestamp = float(row.get("source_timestamp_sec", row.get("event_start_sec", 0)) or 0)
+        if any(abs(timestamp - float(item.get("source_timestamp_sec", item.get("event_start_sec", 0)) or 0)) < min_gap for item in chosen):
+            continue
+        path = _valid_image(row)
+        if path is None or all(_visual_distance(path, _valid_image(item)) >= 0.08 for item in chosen):
+            chosen.append(row)
+        if len(chosen) >= max_count:
+            break
+    if not chosen:
+        chosen = [max(valid, key=_info_score)]
+    best = max(chosen, key=_info_score)
+    ordered = sorted(chosen, key=lambda row: float(row.get("source_timestamp_sec", row.get("event_start_sec", 0)) or 0))
+    return [best] + [row for row in ordered if row is not best]
+
+
+def _merge_frames(frames, max_duration=180.0, max_gap=20.0):
     ordered = sorted(frames, key=lambda row: float(row.get("event_start_sec", row.get("source_timestamp_sec", 0)) or 0))
     groups = []
     for frame in ordered:
@@ -69,7 +168,8 @@ def _merge_frames(frames, max_duration=45.0, max_gap=0.75):
             valid.append(row)
         if not valid:
             continue
-        representative = valid[0]
+        representatives = _choose_representatives(valid, group)
+        representative = representatives[0]
         objects = []
         actions = []
         expressions = []
@@ -85,11 +185,14 @@ def _merge_frames(frames, max_duration=45.0, max_gap=0.75):
             "start_sec": min(float(row.get("event_start_sec", row.get("source_timestamp_sec", 0)) or 0) for row in group),
             "end_sec": max(float(row.get("event_end_sec", row.get("source_timestamp_sec", 0)) or 0) for row in group),
             "representative": representative,
+            "representatives": representatives,
             "objects": objects,
             "actions": actions,
             "expressions": expressions,
             "source_frame_count": len(group),
             "duplicate_frame_count": duplicate_count,
+            "visual_duplicate_count": max(0, len(valid) - len(representatives)),
+            "memory_keyframe_count": len(representatives),
         })
     return result
 
@@ -130,7 +233,7 @@ def run(video_path, output_dir, video_id):
         "keyframe_extraction_untouched_by_memory_merge": True,
         "source_frame_count": len(frames), "merged_event_count": len(merged),
         "events_merged_away": len(frames) - len(merged),
-        "duplicate_frames_removed": sum(item["duplicate_frame_count"] for item in merged),
+        "duplicate_frames_removed": sum(item["duplicate_frame_count"] + item.get("visual_duplicate_count", 0) for item in merged),
         "missing_representative_images": sum(not _valid_image(item["representative"]) for item in merged),
         "image_integrity_passed": all(_valid_image(item["representative"]) for item in merged),
         "source_stats": str(output / "stats.json"),

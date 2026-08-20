@@ -201,7 +201,8 @@ class VideoMemoryAdapter:
         scene_ids = []
         keyframe_asset_ids = []
         for scene_index, item in enumerate(merged):
-            representative = item["representative"]
+            representatives = list(item.get("representatives") or [item["representative"]])
+            representative = representatives[0]
             target = Path(str(representative["webp_path"])).resolve()
             if not target.is_file():
                 raise RuntimeError(f"WebP representative is missing: {target}")
@@ -211,7 +212,7 @@ class VideoMemoryAdapter:
             event = store.create_video_scene_event({
                 "scope_id": asset.get("scope_id"),
                 "title": f"{'事件' if item['actions'] else '场景'}：{(item['actions'] or item['objects'] or ['场景'])[0]}",
-                "summary": f"{start_sec:.1f}s~{end_sec:.1f}s；合并 {item['source_frame_count']} 个片段，保留代表帧 1 张",
+                "summary": f"{start_sec:.1f}s~{end_sec:.1f}s；合并 {item['source_frame_count']} 个片段，保留信息帧 {len(representatives)} 张",
                 "time_start": _captured_at(captured_at, start_sec), "time_end": _captured_at(captured_at, end_sec),
                 "place": location_label, "source_asset_id": asset_id, "source_scene_index": scene_index,
                 "source_start_sec": start_sec, "source_end_sec": end_sec,
@@ -219,31 +220,35 @@ class VideoMemoryAdapter:
                     "keyframe_algorithm": manifest["method"], "memory_event_merge": True,
                     "memory_duplicate_frame_removal": True, "source_event_ids": item["source_event_ids"],
                     "source_frame_count": item["source_frame_count"], "duplicate_frame_count": item["duplicate_frame_count"],
-                    "memory_keyframe_count": 1, "semantic_labels": labels[:80],
+                    "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
                     "image_path": str(target), "location_source": "video_metadata",
                 },
             })
             scene_ids.append(event["id"])
-            keyframe_id = make_id("asset")
-            provenance = {
-                "scope_id": asset.get("scope_id"), "batch_id": asset.get("batch_id"),
-                "parent_asset_id": asset_id, "derived_kind": "video_keyframe_webp",
-                "source_timestamp_sec": float(representative.get("source_timestamp_sec", start_sec) or start_sec),
-                "source_frame_index": int(representative.get("source_frame_index", 0) or 0),
-                "captured_at": _captured_at(captured_at, start_sec), "captured_location": asset.get("captured_location"),
-                "source_device_id": metadata.device or asset.get("source_device_id"),
-                "latitude": metadata.latitude, "longitude": metadata.longitude,
-                "content_sha256": _sha256(target), "location_source": "video_metadata",
-                "keyframe_algorithm": manifest["method"], "memory_event_merge": True,
-                "source_event_ids": item["source_event_ids"], "worldmm_semantics": {
-                    "objects": item["objects"], "actions": item["actions"], "expressions": item["expressions"],
-                }, "reverse_geocode": reverse_geocode,
-            }
-            store.create_asset(keyframe_id, target.name, "image", str(target), "image/webp", target.stat().st_size, provenance, scope_id=asset.get("scope_id"))
-            processed = pipeline.process(keyframe_id, summarize_event=False, forced_event_id=event["id"])
-            if processed.get("status") != "processed":
-                raise RuntimeError(f"WebP keyframe processing failed: {keyframe_id}")
-            keyframe_asset_ids.append(keyframe_id)
+            for evidence_index, representative in enumerate(representatives):
+                target = Path(str(representative["webp_path"])).resolve()
+                keyframe_id = make_id("asset")
+                provenance = {
+                    "scope_id": asset.get("scope_id"), "batch_id": asset.get("batch_id"),
+                    "parent_asset_id": asset_id, "derived_kind": "video_keyframe_webp",
+                    "source_timestamp_sec": float(representative.get("source_timestamp_sec", start_sec) or start_sec),
+                    "source_frame_index": int(representative.get("source_frame_index", 0) or 0),
+                    "source_scene_index": scene_index, "evidence_index": evidence_index,
+                    "captured_at": _captured_at(captured_at, float(representative.get("source_timestamp_sec", start_sec) or start_sec)), "captured_location": asset.get("captured_location"),
+                    "source_device_id": metadata.device or asset.get("source_device_id"),
+                    "latitude": metadata.latitude, "longitude": metadata.longitude,
+                    "content_sha256": _sha256(target), "location_source": "video_metadata",
+                    "keyframe_algorithm": manifest["method"], "memory_event_merge": True,
+                    "memory_duplicate_frame_removal": True,
+                    "source_event_ids": item["source_event_ids"], "worldmm_semantics": {
+                        "objects": item["objects"], "actions": item["actions"], "expressions": item["expressions"],
+                    }, "reverse_geocode": reverse_geocode,
+                }
+                store.create_asset(keyframe_id, target.name, "image", str(target), "image/webp", target.stat().st_size, provenance, scope_id=asset.get("scope_id"))
+                processed = pipeline.process(keyframe_id, summarize_event=False, forced_event_id=event["id"])
+                if processed.get("status") != "processed":
+                    raise RuntimeError(f"WebP keyframe processing failed: {keyframe_id}")
+                keyframe_asset_ids.append(keyframe_id)
             pipeline.summarize_event(event["id"])
         elapsed = round(time.perf_counter() - started, 3)
         return store.update_asset(asset_id, "processed", {
@@ -251,8 +256,8 @@ class VideoMemoryAdapter:
             "latitude": metadata.latitude, "longitude": metadata.longitude,
             "location_source": "video_metadata" if metadata.latitude is not None else "upload_metadata",
             "worldmm_output": str(output), "keyframe_algorithm": manifest["method"],
-            "worldmm_scene_count": len(merged), "worldmm_keyframe_count": len(merged),
-            "worldmm_full_keyframe_count": len(frames), "worldmm_selected_keyframe_count": len(merged),
+            "worldmm_scene_count": len(merged), "worldmm_keyframe_count": sum(item.get("memory_keyframe_count", 1) for item in merged),
+            "worldmm_full_keyframe_count": len(frames), "worldmm_selected_keyframe_count": sum(item.get("memory_keyframe_count", 1) for item in merged),
             "video_scene_event_ids": scene_ids, "derived_keyframe_asset_ids": keyframe_asset_ids,
             "video_processing_seconds": elapsed, "memory_event_merge": True,
             "memory_duplicate_frame_removal": True, "memory_image_integrity_passed": True,
