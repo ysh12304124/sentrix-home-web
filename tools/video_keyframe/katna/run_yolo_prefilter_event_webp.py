@@ -96,24 +96,28 @@ def merge_memory_segments(segments, max_duration_sec=300.0):
     if not segments:
         return []
     merged = [list(segments[0])]
-    force_boundary = [False]
     for segment in segments[1:]:
         previous = merged[-1]
         duration = float(segment[-1]["timestamp"]) - float(previous[0]["timestamp"])
-        segment_duration = float(segment[-1]["timestamp"]) - float(segment[0]["timestamp"])
-        previous_labels = set().union(*(_meaningful_sample_labels(item) for item in previous)) - _STATIC_MERGE_LABELS
-        segment_labels = set().union(*(_meaningful_sample_labels(item) for item in segment)) - _STATIC_MERGE_LABELS
-        short_related_closeup = segment_duration <= 6.0 and bool(previous_labels & segment_labels)
-        if force_boundary[-1]:
-            merged.append(list(segment))
-            force_boundary.append(False)
-        elif duration <= max_duration_sec and (short_related_closeup or _memory_merge_compatible(previous, segment)):
+        if duration <= max_duration_sec and _memory_merge_compatible(previous, segment):
             previous.extend(segment)
-            force_boundary[-1] = short_related_closeup
         else:
             merged.append(list(segment))
-            force_boundary.append(False)
-    return merged
+
+    # A final short close-up can be a detail of the preceding memory (for
+    # example a grill close-up after a poolside barbecue). Apply this once to
+    # already-final groups so it cannot alter or propagate the main merge.
+    result = []
+    for group in merged:
+        group_duration = float(group[-1]["timestamp"]) - float(group[0]["timestamp"])
+        group_labels = set().union(*(_meaningful_sample_labels(item) for item in group)) - _STATIC_MERGE_LABELS
+        if result and group_duration <= 6.0:
+            previous_labels = set().union(*(_meaningful_sample_labels(item) for item in result[-1])) - _STATIC_MERGE_LABELS
+            if previous_labels & group_labels:
+                result[-1].extend(group)
+                continue
+        result.append(group)
+    return result
 
 
 def _signature(semantic):
