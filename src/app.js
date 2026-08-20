@@ -177,8 +177,17 @@
   function visibleSpaces() {
     return [
       { id: "", name: "全部相册", kind: "all" },
-      ...state.spaces.filter((space) => space.kind === "benchmark"),
+      // Method runs are real benchmark albums even when an older import
+      // created the memory space with kind=household.  Keeping them visible
+      // is required for the method switch to stay scoped to its own result.
+      ...state.spaces.filter((space) => space.kind === "benchmark" || /-(?:mtsw|eventagg)$/.test(space.id || "")),
     ];
+  }
+
+  function methodScopeId(method) {
+    const suffix = method === "mtsw" ? "-mtsw" : method === "eventagg" ? "-eventagg" : "";
+    if (!suffix) return "";
+    return state.spaces.find((space) => String(space.id || "").endsWith(suffix))?.id || "";
   }
 
   function albumBadge(scopeId) {
@@ -1315,8 +1324,9 @@
         // Keep the timeline scoped to the fresh v2 package by default.  The
         // previous all-albums default mixed legacy QA imports with the new
         // package and made video scenes look duplicated or out of context.
-        const latestSpace = state.spaces.find((space) => space.id === "hippo-latest-BpVmNB3eKdM");
-        state.scopeId = storedSpace?.id?.startsWith("hippo-latest-") ? storedSpace.id : (latestSpace?.id || "");
+        const latestSpace = methodScopeId(state.timelineMethod) || state.spaces.find((space) => space.id === "hippo-latest-BpVmNB3eKdM")?.id || "";
+        state.scopeId = storedSpace?.id ? storedSpace.id : latestSpace;
+        if (state.scopeId) window.localStorage?.setItem("sentrix.scopeId", state.scopeId);
         state.scopeInitialized = true;
       } else if (state.scopeId && state.spaces.length && !state.spaces.some((space) => space.id === state.scopeId)) {
         state.scopeId = "";
@@ -1406,7 +1416,20 @@
     document.querySelectorAll("[data-view]").forEach((element) => element.addEventListener("click", () => { navigate(element.dataset.view); }));
     document.querySelectorAll("[data-query]").forEach((element) => element.addEventListener("click", () => { state.query = element.dataset.query; state.view = "search"; renderShellNavigation(); submitSearch(); }));
     document.querySelectorAll("[data-event-filter]").forEach((element) => element.addEventListener("click", () => { state.eventFilter = element.dataset.eventFilter; renderView(); }));
-    document.querySelectorAll("[data-timeline-method]").forEach((element) => element.addEventListener("click", async () => { state.timelineMethod = element.dataset.timelineMethod; window.localStorage?.setItem("sentrix.timelineMethod", state.timelineMethod); await refreshData({ forceRender: true }); }));
+    document.querySelectorAll("[data-timeline-method]").forEach((element) => element.addEventListener("click", async () => {
+      state.timelineMethod = element.dataset.timelineMethod;
+      window.localStorage?.setItem("sentrix.timelineMethod", state.timelineMethod);
+      // Each comparison method has its own album/run.  Switching methods
+      // must never leave the page on the all-albums view, otherwise legacy
+      // scenes and the selected method appear duplicated together.
+      const methodScope = methodScopeId(state.timelineMethod);
+      if (methodScope) {
+        state.scopeId = methodScope;
+        window.localStorage?.setItem("sentrix.scopeId", state.scopeId);
+      }
+      state.eventDate = "";
+      await refreshData({ forceRender: true });
+    }));
     const eventDate = document.querySelector("[data-event-date]");
     if (eventDate) eventDate.addEventListener("change", (event) => { state.eventDate = event.target.value || ""; renderView(); });
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
