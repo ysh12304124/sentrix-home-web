@@ -1273,6 +1273,7 @@
   }
 
   let refreshInFlight = false;
+  let refreshQueued = false;
   let modelSwitchInFlight = false;
   let requestedModelProfile = "";
 
@@ -1310,7 +1311,13 @@
   }
 
   async function refreshData(options = {}) {
-    if (refreshInFlight) return;
+    if (refreshInFlight) {
+      // A method/scope click can happen while the initial page load is still
+      // reading the API. Replay one refresh after the current request so the
+      // new scope label cannot remain beside the old event array.
+      refreshQueued = true;
+      return;
+    }
     refreshInFlight = true;
     const silent = options.silent === true;
     state.loading = !silent;
@@ -1381,6 +1388,10 @@
       else renderShellNavigation();
     }
     refreshInFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      await refreshData({ forceRender: true });
+    }
   }
 
   function renderShellNavigation() { shell(); }

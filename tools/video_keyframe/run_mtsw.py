@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -271,6 +272,7 @@ def main():
     parser.add_argument("--scan-fps", type=float, default=2.0)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--z-threshold", type=float, default=1.7)
+    parser.add_argument("--run-id", default="", help="历史运行标识；不填则生成新的历史运行，不覆盖旧运行")
     parser.add_argument("--dry-db", action="store_true")
     args = parser.parse_args()
     started = time.perf_counter()
@@ -323,7 +325,7 @@ def main():
         for state in result["selected"]:
             selected_asset_ids[state.frame_index] = by_path.get(str(Path(state.image_path).resolve()), make_id("mtsw"))
     runtime = {**source_runtime, **dense_runtime, "total_wall_seconds": round(time.perf_counter() - started, 4), "vlm_calls": 0, "llm_calls": 0}
-    run_id = f"mtsw_{args.media_id}_{'ablation' if args.semantic else 'full'}"
+    run_id = args.run_id or f"mtsw_{args.media_id}_{'ablation' if args.semantic else 'full'}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     if not args.dry_db:
         events, metrics = _store_run(store, asset, args.scope_id, result, Path(args.output), run_id, selected_asset_ids, runtime)
         result["events"] = events
