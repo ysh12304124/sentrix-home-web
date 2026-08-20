@@ -95,23 +95,25 @@ def merge_memory_segments(segments, max_duration_sec=300.0):
     """Merge in source order before any full-resolution image is written."""
     if not segments:
         return []
-    merged_groups = [[list(segments[0])]]
+    merged = [list(segments[0])]
+    force_boundary = [False]
     for segment in segments[1:]:
-        group = merged_groups[-1]
-        previous = group[-1]
-        duration = float(segment[-1]["timestamp"]) - float(group[0][0]["timestamp"])
+        previous = merged[-1]
+        duration = float(segment[-1]["timestamp"]) - float(previous[0]["timestamp"])
         segment_duration = float(segment[-1]["timestamp"]) - float(segment[0]["timestamp"])
         previous_labels = set().union(*(_meaningful_sample_labels(item) for item in previous)) - _STATIC_MERGE_LABELS
         segment_labels = set().union(*(_meaningful_sample_labels(item) for item in segment)) - _STATIC_MERGE_LABELS
         short_related_closeup = segment_duration <= 6.0 and bool(previous_labels & segment_labels)
-        if duration <= max_duration_sec and (short_related_closeup or _memory_merge_compatible(previous, segment)):
-            group.append(list(segment))
+        if force_boundary[-1]:
+            merged.append(list(segment))
+            force_boundary.append(False)
+        elif duration <= max_duration_sec and (short_related_closeup or _memory_merge_compatible(previous, segment)):
+            previous.extend(segment)
+            force_boundary[-1] = short_related_closeup
         else:
-            merged_groups.append([list(segment)])
-    return [
-        [sample for segment in group for sample in segment]
-        for group in merged_groups
-    ]
+            merged.append(list(segment))
+            force_boundary.append(False)
+    return merged
 
 
 def _signature(semantic):
