@@ -269,7 +269,9 @@ def main():
     parser.add_argument("--semantic")
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache-dir", default="/ssd/sscy/eventagg-cache/embeddings")
-    parser.add_argument("--scan-fps", type=float, default=2.0)
+    # Frozen production default: inspect one frame every 100 ms (10 FPS).
+    # The dense NVDEC pass still decodes only the selected target windows.
+    parser.add_argument("--scan-fps", type=float, default=10.0)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--z-threshold", type=float, default=1.7)
     parser.add_argument("--run-id", default="", help="历史运行标识；不填则生成新的历史运行，不覆盖旧运行")
