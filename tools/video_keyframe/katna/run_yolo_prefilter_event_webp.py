@@ -41,6 +41,7 @@ _LOW_INFO_ACTIONS = {
     "standing", "sitting", "raising hand", "stand", "sit", "walking",
     "走路", "站立", "坐着", "抬手", "挥手", "举手",
 }
+_STATIC_MERGE_LABELS = {"person", "chair", "couch", "bed", "potted plant", "vase", "tv"}
 
 
 def _meaningful_sample_labels(sample):
@@ -98,7 +99,11 @@ def merge_memory_segments(segments, max_duration_sec=300.0):
     for segment in segments[1:]:
         previous = merged[-1]
         duration = float(segment[-1]["timestamp"]) - float(previous[0]["timestamp"])
-        if duration <= max_duration_sec and _memory_merge_compatible(previous, segment):
+        segment_duration = float(segment[-1]["timestamp"]) - float(segment[0]["timestamp"])
+        previous_labels = set().union(*(_meaningful_sample_labels(item) for item in previous)) - _STATIC_MERGE_LABELS
+        segment_labels = set().union(*(_meaningful_sample_labels(item) for item in segment)) - _STATIC_MERGE_LABELS
+        short_related_closeup = segment_duration <= 6.0 and bool(previous_labels & segment_labels)
+        if duration <= max_duration_sec and (short_related_closeup or _memory_merge_compatible(previous, segment)):
             previous.extend(segment)
         else:
             merged.append(list(segment))

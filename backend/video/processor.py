@@ -281,7 +281,22 @@ class VideoMemoryAdapter:
                         continue
                     if selected_index not in normalized_indices:
                         normalized_indices.append(selected_index)
-                selected_indices = (normalized_indices or [fallback_index])[:3]
+                event_duration = max(0.0, end_sec - start_sec)
+                max_persistent = 1 if event_duration < 12.0 else 2 if event_duration < 90.0 else 3
+                min_persistent = 1 if event_duration < 45.0 else 2 if event_duration < 150.0 else 3
+                selected_indices = (normalized_indices or [fallback_index])[:max_persistent]
+                evidence_times = [
+                    float(value.get("source_timestamp_sec", start_sec) or start_sec)
+                    for value in evidence_records
+                ]
+                while len(selected_indices) < min(min_persistent, len(evidence_paths)):
+                    candidates = [index for index in range(len(evidence_paths)) if index not in selected_indices]
+                    if not candidates:
+                        break
+                    selected_indices.append(max(
+                        candidates,
+                        key=lambda index: min(abs(evidence_times[index] - evidence_times[chosen]) for chosen in selected_indices),
+                    ))
                 # Read every chosen image before overwriting the old primary;
                 # the previous primary may itself be retained as a support.
                 selected_payloads = [evidence_paths[index].read_bytes() for index in selected_indices]
