@@ -14,13 +14,14 @@
 
   window.sentrixApi = {
     health: () => request("/api/health"),
-    performance: (scopeId = "") => request(`/api/performance${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
+    performance: (scopeId = "", method = "baseline") => request(`/api/performance?${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(method ? { method } : {}) }).toString()}`),
     memorySpaces: () => request("/api/memory-spaces"),
     createMemorySpace: (name) => request("/api/memory-spaces", { method: "POST", body: JSON.stringify({ name }) }),
     deleteMemorySpace: (scopeId) => request(`/api/memory-spaces/${encodeURIComponent(scopeId)}`, { method: "DELETE" }),
     geoPlaces: (scopeId = "") => request(`/api/geo-places${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     dashboard: (scopeId = "") => request(`/api/dashboard${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
-    events: (scopeId = "") => request(`/api/events?limit=1000${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ""}`),
+    events: (scopeId = "", method = "baseline") => request(`/api/events?${new URLSearchParams({ limit: "1000", ...(scopeId ? { scope_id: scopeId } : {}), ...(method ? { method } : {}) }).toString()}`),
+    methodRuns: (scopeId = "", mediaId = "", methodVersion = "") => request(`/api/method-runs?${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(mediaId ? { media_id: mediaId } : {}), ...(methodVersion ? { method_version: methodVersion } : {}) }).toString()}`),
     trips: (scopeId = "", status = "") => request(`/api/trips${new URLSearchParams({ ...(scopeId ? { scope_id: scopeId } : {}), ...(status ? { status } : {}) }).toString().replace(/^/, "?")}`),
     trip: (id) => request(`/api/trips/${encodeURIComponent(id)}`),
     confirmTrip: (id, payload) => request(`/api/trips/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify(payload) }),

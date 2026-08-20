@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -222,6 +223,11 @@ class VideoMemoryAdapter:
                     pipeline.summarize_event(event["id"])
 
             elapsed = round(time.perf_counter() - started, 3)
+            eventagg_metadata = {}
+            if os.getenv("SENTRIX_VIDEO_METHOD", "hybrid_v2").strip().lower() in {"hybrid_v2.1_eventagg", "eventagg", "eventagg_v21"}:
+                eventagg_metadata = self._build_eventagg_index(
+                    asset, result, keyframe_asset_ids, pipeline, captured_at,
+                )
             return store.update_asset(asset_id, "processed", {
                 "video_stage": "processed", "video_metadata": metadata.as_dict(),
                 "latitude": metadata.latitude, "longitude": metadata.longitude,
@@ -240,6 +246,7 @@ class VideoMemoryAdapter:
                 "vlm_device": os.getenv("SENTRIX_QWEN3_VL_DEVICE", "cpu"),
                 "semantic_fallback_count": semantic_fallback_count,
                 "semantic_fallback_enabled": os.getenv("SENTRIX_VIDEO_SEMANTIC_FALLBACK", "0").lower() in {"1", "true", "yes", "on"},
+                **eventagg_metadata,
                 "error_stage": None, "error": None, "retryable": True,
             })
         except Exception as error:
@@ -247,6 +254,57 @@ class VideoMemoryAdapter:
                 "video_stage": stage, "error_stage": stage, "error": f"{type(error).__name__}: {error}",
                 "retryable": True, "video_processing_seconds": round(time.perf_counter() - started, 3),
             })
+
+    def _build_eventagg_index(self, asset, result, keyframe_asset_ids, pipeline, captured_at):
+        """Build the v2.1 event index after v2.0 evidence has been persisted.
+
+        This post-layer is intentionally additive: baseline video_scene events,
+        WebP assets and observations remain available for rollback.  A failure
+        records ``eventagg_status=failed`` and leaves the baseline usable.
+        """
+        started = time.perf_counter()
+        from .event_aggregator import EVENTAGG_METHOD_VERSION, DINOEmbedder, EventAggregator
+
+        data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
+        semantic_path = Path(str((result.manifest or {}).get("semantic") or ""))
+        if not semantic_path.is_file():
+            return {"eventagg_status": "failed", "eventagg_fallback": "baseline", "eventagg_error": "semantic.json missing"}
+        package = json.loads(semantic_path.read_text(encoding="utf-8"))
+        frame_assets = [pipeline.store.get_asset(item) for item in keyframe_asset_ids]
+        records = EventAggregator.records_from_package(package, frame_assets)
+        cache_dir = Path(os.getenv("SENTRIX_EVENTAGG_CACHE", str(data_root / "cache" / "eventagg")))
+        embedder = DINOEmbedder(cache_dir=cache_dir, device=os.getenv("SENTRIX_EVENTAGG_DEVICE"))
+        embeddings, embedding_metrics = embedder.embed(asset["id"], records, int(os.getenv("SENTRIX_EVENTAGG_BATCH_SIZE", "16")))
+        for record in records:
+            record.visual_embedding = embeddings.get(record.frame_id, [])
+        threshold = float(os.getenv("SENTRIX_EVENTAGG_MERGE_THRESHOLD", "0.68"))
+        aggregator = EventAggregator({"merge_threshold": threshold}, cache_dir=cache_dir)
+        groups, metrics = aggregator.aggregate(records, asset["id"], threshold=threshold)
+        metrics.update(embedding_metrics)
+        metrics["baseline_scene_count"] = len(keyframe_asset_ids)
+        metrics["eventagg_wall_seconds"] = round(time.perf_counter() - started, 4)
+        run_id = f"eventagg_{asset['id']}_upload"
+        events = []
+        for group in groups:
+            data = EventAggregator.group_to_dict(group)
+            data["event_id"] = f"{run_id}_{data['event_id'].rsplit('_', 1)[-1]}"
+            data["start_time"] = _captured_at(captured_at, data["start_sec"])
+            data["end_time"] = _captured_at(captured_at, data["end_sec"])
+            data["member_frames"] = [
+                {"frame_id": item.frame_id, "timestamp_sec": item.timestamp, "frame_hash": item.frame_hash}
+                for item in group.members
+            ]
+            events.append(data)
+        pipeline.store.replace_eventagg_run(
+            run_id, asset["id"], asset.get("scope_id") or "home-default", EVENTAGG_METHOD_VERSION,
+            events, metrics, {**aggregator.config, "cache_dir": str(cache_dir)},
+        )
+        return {
+            "eventagg_status": "completed", "eventagg_fallback": None,
+            "eventagg_run_id": run_id, "eventagg_event_count": len(events),
+            "eventagg_metrics": metrics, "eventagg_memory_build_seconds": metrics["eventagg_wall_seconds"],
+            "eventagg_method_version": EVENTAGG_METHOD_VERSION,
+        }
 
     def _persist_semantic_fallback(self, asset_id, event_id, frame, pipeline, error_text):
         """Persist detector semantics when the optional VLM is unavailable.

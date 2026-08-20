@@ -114,7 +114,7 @@ class WorldMMAdapter:
 
     def run(self, video_path, video_id, output_dir):
         method = os.getenv("SENTRIX_VIDEO_METHOD", "hybrid_v2").strip().lower()
-        if method in {"hybrid", "hybrid_v2", "current"}:
+        if method in {"hybrid", "hybrid_v2", "hybrid_v2.1_eventagg", "eventagg", "eventagg_v21", "current"}:
             return self._run_hybrid(video_path, video_id, output_dir)
         return self._run_legacy(video_path, video_id, output_dir)
 

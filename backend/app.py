@@ -32,6 +32,7 @@ from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, 
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
 from .worldmm_memory import WorldMMMemory, worldmm_artifact_path
+from .video.event_aggregator import EVENTAGG_METHOD_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -848,10 +849,19 @@ def health():
 
 
 @app.get("/api/performance")
-def performance(scope_id: str | None = None):
+def performance(scope_id: str | None = None, method: str = "baseline"):
     """Video and browser-side QA performance data for the local dashboard."""
     try:
-        return _video_performance((scope_id or "").strip() or None)
+        scope = (scope_id or "").strip() or None
+        payload = _video_performance(scope)
+        runs = store.list_method_runs(scope_id=scope, method_version=EVENTAGG_METHOD_VERSION)
+        payload["method_comparison"] = {
+            "baseline_method": "keyframe-hybrid-v2.0.0",
+            "eventagg_method": EVENTAGG_METHOD_VERSION,
+            "runs": runs,
+            "selected_method": "eventagg" if str(method).lower() in {"eventagg", "eventagg_v21"} else "baseline",
+        }
+        return payload
     except Exception as error:
         # Keep this observability endpoint non-fatal for the rest of the app.
         raise HTTPException(status_code=500, detail=f"performance summary failed: {error}") from error
@@ -1083,12 +1093,23 @@ def dashboard(scope_id: str | None = None):
 
 
 @app.get("/api/events")
-def events(scope_id: str | None = None, limit: int = 1000):
+def events(scope_id: str | None = None, limit: int = 1000, method: str = "baseline", run_id: str | None = None):
     # The timeline needs older events when the user selects a historical date.
     # Keep a server-side ceiling while avoiding the previous silent 100-event
     # truncation that hid older video scenes.
     limit = min(max(int(limit or 1000), 1), 5000)
-    return {"events": store.list_events(limit, scope_id=scope_id)}
+    if str(method or "baseline").lower() in {"eventagg", "eventagg_v21", EVENTAGG_METHOD_VERSION.lower()}:
+        if not run_id:
+            runs = store.list_method_runs(scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
+            preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
+            run_id = (preferred or (runs[0] if runs else {})).get("run_id")
+        return {"events": store.list_eventagg_events(run_id=run_id, scope_id=scope_id)[:limit], "method": EVENTAGG_METHOD_VERSION, "run_id": run_id}
+    return {"events": store.list_events(limit, scope_id=scope_id), "method": "baseline"}
+
+
+@app.get("/api/method-runs")
+def method_runs(scope_id: str | None = None, media_id: str | None = None, method_version: str | None = None):
+    return {"runs": store.list_method_runs(media_id=media_id, scope_id=scope_id, method_version=method_version)}
 
 
 @app.get("/api/trips")
@@ -1128,6 +1149,8 @@ def reject_trip(trip_id: str):
 def event_detail(event_id: str):
     value = store.get_event_detail(event_id)
     if not value:
+        value = store.get_eventagg_event_detail(event_id)
+    if not value:
         raise HTTPException(status_code=404, detail="event not found")
     return value
 
@@ -1146,6 +1169,17 @@ def video_scenes(asset_id: str):
     if not value or value.get("media_type") != "video":
         raise HTTPException(status_code=404, detail="video asset not found")
     return {"video_asset_id": asset_id, "scenes": store.list_video_scene_events(asset_id)}
+
+
+@app.get("/api/videos/{asset_id}/eventagg")
+def video_eventagg(asset_id: str, run_id: str | None = None):
+    if not store.get_asset(asset_id):
+        raise HTTPException(status_code=404, detail="video asset not found")
+    if not run_id:
+        runs = store.list_method_runs(media_id=asset_id, method_version=EVENTAGG_METHOD_VERSION)
+        preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
+        run_id = (preferred or (runs[0] if runs else {})).get("run_id")
+    return {"video_asset_id": asset_id, "method": EVENTAGG_METHOD_VERSION, "run_id": run_id, "events": store.list_eventagg_events(run_id=run_id, media_id=asset_id)}
 
 
 @app.get("/api/video-scenes/{scene_id}")
