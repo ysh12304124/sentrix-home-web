@@ -32,6 +32,10 @@ _MEAL_LABELS = {
     "eat", "eating", "dining", "meal", "food", "吃饭", "用餐", "进食", "就餐",
     "吃东西", "吃饭场景",
 }
+_MEAL_OBJECTS = {
+    "dining table", "bowl", "plate", "pizza", "donut", "food", "fork", "knife",
+    "cup", "orange", "sandwich", "cake", "bottle",
+}
 _CONVERSATION_LABELS = {
     "talk", "talking", "speak", "speaking", "conversation", "chat", "discussion",
     "交谈", "说话", "聊天", "对话", "交流",
@@ -39,7 +43,13 @@ _CONVERSATION_LABELS = {
 
 
 def _is_meal(row):
-    return bool(_labels(row) & _MEAL_LABELS)
+    labels = _labels(row)
+    if labels & _MEAL_LABELS:
+        return True
+    # The detector often reports the tableware/food but not the verb "eating".
+    # Two meal-context objects plus a person is a safer sustained-meal signal
+    # than treating every person-only conversation as a meal.
+    return "person" in labels and len(labels & _MEAL_OBJECTS) >= 2
 
 
 def _is_conversation(row):
