@@ -197,6 +197,7 @@ class EvidenceRetrievalKernel:
                 "invoked": True,
                 "candidate_count": len(channel_hits[retriever.name]),
                 "status": channel_status,
+                "backend": getattr(retriever, "backend_used", None),
                 "latency_ms": round((time.monotonic() - channel_started) * 1000, 1),
                 "embedding_ms": round(sum(event.get("latency_ms", 0) for event in embedding_events), 1),
                 "embedding_events": embedding_events,

@@ -12,6 +12,7 @@ validation applies just like the visual channel.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 from ..retrieval_ann import create_index
@@ -34,6 +35,7 @@ class TextAnnRetriever:
         self._indices = {}
         self._load_failed = None
         self._status = "uninitialized"
+        self.backend_used = "hnswlib"
 
     @property
     def status(self):
@@ -72,6 +74,8 @@ class TextAnnRetriever:
         if not vector:
             return []
         scope = filters.scope_ids[0] if filters.scope_ids and not filters.all_authorized else None
+        if os.getenv("SENTRIX_VECTOR_BACKEND", "sqlite").strip().lower() == "qdrant":
+            return self._retrieve_qdrant(vector, scope, limit)
         candidates: dict[str, tuple[float, int, dict]] = {}
         for space in self.spaces:
             index = self._load_index(space)
@@ -114,3 +118,35 @@ class TextAnnRetriever:
                           "model_id": getattr(self.embedding_router.text, "model_id", None)},
             ))
         return hits
+
+    def _retrieve_qdrant(self, vector, scope, limit):
+        model_id = getattr(self.embedding_router.text, "model_id", None)
+        candidates = {}
+        for space in self.spaces:
+            rows = self.store.search_vectors(
+                space, vector, limit=max(limit * 4, limit),
+                scope_id=scope, model_name=model_id,
+            )
+            for row in rows:
+                metadata = row.get("metadata_json") or {}
+                asset_id = metadata.get("asset_id")
+                if not asset_id:
+                    continue
+                current = candidates.get(asset_id)
+                if current is None or row["score"] > current[0]:
+                    candidates[asset_id] = (float(row["score"]), row, space)
+        status = self.store.vector_search_status()
+        self.backend_used = status.get("active_backend") or status.get("backend") or "qdrant"
+        if not candidates:
+            self._status = "no_candidates"
+            return []
+        self._status = "ready"
+        ranked = sorted(candidates.items(), key=lambda item: item[1][0], reverse=True)[:limit]
+        return [CandidateHit(
+            asset_id=asset_id, retriever=self.name, raw_score=score,
+            score_kind="cosine_similarity", higher_is_better=True,
+            rank=rank + 1, source_id=row.get("source_id") or asset_id,
+            source_revision=(row.get("metadata_json") or {}).get("revision"),
+            metadata={"scope_id": row.get("scope_id"), "spaces": [space],
+                      "model_id": row.get("model_name"), "backend": self.backend_used},
+        ) for rank, (asset_id, (score, row, space)) in enumerate(ranked)]

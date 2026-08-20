@@ -22,7 +22,7 @@ class ClipTextQueryEmbedder:
 
     @property
     def dimension(self):
-        return 512
+        return int(getattr(self._clip, "embedding_dimension", 512))
 
     @property
     def available(self):
