@@ -1119,21 +1119,13 @@ def events(scope_id: str | None = None, limit: int = 1000, method: str = "baseli
     if method_name in {"eventagg", "eventagg_v21", EVENTAGG_METHOD_VERSION.lower()}:
         if not run_id:
             runs = store.list_method_runs(scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
-            if not runs and scope_id:
-                mtsw_runs = store.list_method_runs(scope_id=scope_id, method_version=MTSW_METHOD_VERSION)
-                media_ids = {run.get("media_id") for run in mtsw_runs if run.get("media_id")}
-                runs = [item for media_id in media_ids for item in store.list_method_runs(media_id=media_id, method_version=EVENTAGG_METHOD_VERSION)]
             preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
             run_id = (preferred or (runs[0] if runs else {})).get("run_id")
-        events = store.list_eventagg_events(run_id=run_id, scope_id=scope_id)
-        if not events and run_id:
-            events = store.list_eventagg_events(run_id=run_id)
+        if not run_id:
+            return {"events": [], "method": EVENTAGG_METHOD_VERSION, "run_id": None}
+        events = store.list_eventagg_events(run_id=run_id, scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
         return {"events": events[:limit], "method": EVENTAGG_METHOD_VERSION, "run_id": run_id}
     baseline_events = store.list_events(limit, scope_id=scope_id)
-    if not baseline_events and scope_id:
-        mtsw_runs = store.list_method_runs(scope_id=scope_id, method_version=MTSW_METHOD_VERSION)
-        media_ids = {run.get("media_id") for run in mtsw_runs if run.get("media_id")}
-        baseline_events = [event for media_id in media_ids for event in store.list_video_scene_events(media_id)][:limit]
     return {"events": baseline_events, "method": "baseline"}
 
 

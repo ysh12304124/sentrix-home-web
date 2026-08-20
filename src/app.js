@@ -32,7 +32,7 @@
     };
   }
 
-  const timelineSelectionVersion = "mtsw-10fps";
+  const timelineSelectionVersion = "mtsw-10fps-clean";
   const shouldMigrateTimelineSelection = window.localStorage?.getItem("sentrix.timelineSelectionVersion") !== timelineSelectionVersion;
 
   const state = {
