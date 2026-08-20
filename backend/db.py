@@ -1946,7 +1946,9 @@ class MemoryStore:
 
     def list_derived_assets(self, parent_asset_id, scene_index=None):
         params = [parent_asset_id]
-        where = "parent_asset_id = ? AND derived_kind = 'video_keyframe'"
+        # Support both the legacy image keyframes and the current WebP
+        # keyframes produced by the hybrid extraction pipeline.
+        where = "parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')"
         if scene_index is not None:
             where += " AND source_scene_index = ?"
             params.append(int(scene_index))
