@@ -713,7 +713,11 @@ def health():
             },
             "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.evidence_ready, "evidenceReady": pipeline.clip.evidence_ready, "error": pipeline.clip.error},
         },
-        "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
+        "memory": {
+            "mode": "sentrix-native",
+            "vectorSpaces": ["episodic", "semantic", "visual"],
+            "vectorIndex": store.vector_search_status(),
+        },
         "videoExtraction": {
             "adapter": "hybrid_webp_memory", "status": "available",
             "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
@@ -1855,7 +1859,10 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         from .embeddings import EmbeddingRouter
         from .model_clients import ClipAdapter
         from .retrieval import RetrievalConfig
-        embedding_router = EmbeddingRouter.from_clip(ClipAdapter())
+        # Reuse the ingestion pipeline's lazy CLIP instance.  Constructing a
+        # fresh adapter per turn reloads a multi-GB checkpoint before every
+        # Qdrant query and hides the actual sub-millisecond index latency.
+        embedding_router = EmbeddingRouter.from_clip(pipeline.clip)
         retrieval_config = RetrievalConfig()
     except Exception:
         embedding_router = None
