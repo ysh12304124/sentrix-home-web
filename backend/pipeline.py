@@ -149,7 +149,7 @@ class IngestionPipeline:
     def _media_type(self, path):
         return media_type_for_path(path)
 
-    def process(self, asset_id, summarize_event=True, forced_event_id=None):
+    def process(self, asset_id, summarize_event=True, forced_event_id=None, image_analysis=None):
         asset = self.store.get_asset(asset_id)
         if not asset:
             raise KeyError(asset_id)
@@ -162,7 +162,7 @@ class IngestionPipeline:
         started_at = time.perf_counter()
         try:
             if asset["media_type"] == "image":
-                result = self._image_observation(asset)
+                result = self._image_observation(asset, precomputed_analysis=image_analysis)
             elif asset["media_type"] == "audio":
                 result = self._audio_observation(asset)
             else:
@@ -508,7 +508,7 @@ class IngestionPipeline:
             self.summarize_event(event_id)
         return self.store.finish_ingest_batch(batch_id)
 
-    def _image_observation(self, asset):
+    def _image_observation(self, asset, precomputed_analysis=None):
         path = asset["path"]
         captured_at = asset.get("captured_at") or file_time(path)
         metadata = {
@@ -527,7 +527,15 @@ class IngestionPipeline:
         # Model adapters do not write to MemoryStore. Keep SQLite writes and
         # event selection on this caller thread after all three complete.
         parallel = os.getenv("SENTRIX_PARALLEL_IMAGE_ANALYSIS", "true").lower() in {"1", "true", "yes"}
-        if parallel:
+        if precomputed_analysis is not None:
+            analysis = dict(precomputed_analysis)
+            vision_seconds = float(analysis.pop("_vision_seconds", 0.0) or 0.0)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sentrix-image") as executor:
+                face_future = executor.submit(timed, lambda: self.face.detect(path))
+                clip_future = executor.submit(timed, lambda: self.clip.embed_image(path))
+                faces, face_seconds = face_future.result()
+                clip_embedding, clip_seconds = clip_future.result()
+        elif parallel:
             with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sentrix-image") as executor:
                 vision_future = executor.submit(timed, lambda: self.gamma.analyze_image(path, metadata))
                 face_future = executor.submit(timed, lambda: self.face.detect(path))
@@ -555,7 +563,7 @@ class IngestionPipeline:
             key: analysis.get(key)
             for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
         }
-        analysis["source_type"] = "image"
+        analysis["source_type"] = "video_event" if precomputed_analysis is not None else "image"
         analysis["face_candidates"] = faces
         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates", "location_context"}}, "location_context": metadata["location_context"], "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face_detector": "buffalo_l", "face_embedding": sorted({face.get("embedding_model", "unknown") for face in faces}), "image_embedding": self.clip.model_name}}
         return analysis

@@ -216,6 +216,7 @@ class MemoryStore:
 
     def __init__(self, path):
         self.path = str(path)
+        self._last_vector_search = {"backend": "sqlite", "error": None}
         self.connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
@@ -1916,13 +1917,22 @@ class MemoryStore:
             row["cover_selection"] = row.get("cover_selection_json", {})
             row["source_metadata"] = row.get("source_metadata_json", {})
             if row.get("source_type") == "video_scene":
+                derived_assets = self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
+                # WebP imports created before scene_index was persisted still
+                # belong to this event through event_observations.  Keep them
+                # visible while new imports use the indexed fast path above.
+                if not derived_assets:
+                    derived_assets = [
+                        self.get_asset(asset_id) for asset_id in row.get("asset_ids", [])
+                        if (self.get_asset(asset_id) or {}).get("derived_kind") == "video_keyframe_webp"
+                    ]
                 row["keyframe_assets"] = [
                     {key: asset.get(key) for key in (
                         "id", "file_name", "media_type", "status", "captured_at", "captured_location",
                         "parent_asset_id", "derived_kind", "source_timestamp_sec", "source_frame_index",
                         "source_scene_index",
                     )}
-                    for asset in self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
+                    for asset in derived_assets if asset
                 ]
                 source_video = self.get_asset(row.get("source_asset_id")) or {}
                 row["source_video"] = {key: source_video.get(key) for key in (
@@ -1946,7 +1956,9 @@ class MemoryStore:
 
     def list_derived_assets(self, parent_asset_id, scene_index=None):
         params = [parent_asset_id]
-        where = "parent_asset_id = ? AND derived_kind = 'video_keyframe'"
+        # Support both the legacy image keyframes and the current WebP
+        # keyframes produced by the hybrid extraction pipeline.
+        where = "parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')"
         if scene_index is not None:
             where += " AND source_scene_index = ?"
             params.append(int(scene_index))
@@ -2004,7 +2016,7 @@ class MemoryStore:
             (video_asset_id,),
         )
         self.connection.execute(
-            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind = 'video_keyframe'",
+            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')",
             (video_asset_id,),
         )
         self.connection.commit()
@@ -3028,16 +3040,57 @@ class MemoryStore:
             (make_id("vec"), metadata["scope_id"], space, source_type, source_id, json_value(values, []), model_name, json_value(metadata, {}), timestamp, timestamp),
         )
         self.connection.commit()
-        return self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
+        row = self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is not None:
+                accelerator.upsert(
+                    row_id=row["id"], scope_id=row["scope_id"], space=space,
+                    source_type=source_type, source_id=source_id, vector=values,
+                    model_name=model_name, metadata=metadata,
+                    created_at=row["created_at"], updated_at=row["updated_at"],
+                )
+        except Exception:
+            # Qdrant is a derived acceleration layer.  SQLite commit above is
+            # authoritative and must never be rolled back by index failure.
+            pass
+        return row
 
-    def search_vectors(self, space, vector, limit=10, scope_id=None):
+    def search_vectors(self, space, vector, limit=10, scope_id=None, model_name=None):
         query = self._normalise_vector(vector)
+        if not query:
+            return []
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is not None:
+                accelerated = accelerator.search(
+                    space=space, vector=query, limit=limit,
+                    scope_id=scope_id, model_name=model_name,
+                )
+                if accelerated:
+                    self._last_vector_search = {"backend": "qdrant", "error": None}
+                    return accelerated
+        except Exception as error:
+            self._last_vector_search = {
+                "backend": "sqlite_fallback",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        return self.search_vectors_sqlite(space, query, limit=limit, scope_id=scope_id,
+                                          model_name=model_name, normalized=True)
+
+    def search_vectors_sqlite(self, space, vector, limit=10, scope_id=None,
+                              model_name=None, normalized=False):
+        query = list(vector or []) if normalized else self._normalise_vector(vector)
         if not query:
             return []
         results = []
         rows = self._rows(
-            "SELECT * FROM memory_vectors WHERE space = ?" + (" AND scope_id = ?" if scope_id else ""),
-            (space, scope_id) if scope_id else (space,),
+            "SELECT * FROM memory_vectors WHERE space = ?"
+            + (" AND scope_id = ?" if scope_id else "")
+            + (" AND model_name = ?" if model_name else ""),
+            tuple([space] + ([scope_id] if scope_id else []) + ([model_name] if model_name else [])),
         )
         for row in rows:
             try:
@@ -3048,7 +3101,35 @@ class MemoryStore:
             result = self._decode(row, ["metadata_json"])
             result["score"] = score
             results.append(result)
+        if self._last_vector_search.get("backend") != "sqlite_fallback":
+            self._last_vector_search = {"backend": "sqlite", "error": None}
         return sorted(results, key=lambda item: item["score"], reverse=True)[:max(1, limit)]
+
+    def vector_search_status(self):
+        status = dict(self._last_vector_search)
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is not None:
+                status.update(accelerator.collection_stats())
+                status["active_backend"] = self._last_vector_search.get("backend")
+        except Exception as error:
+            status.setdefault("error", f"{type(error).__name__}: {error}")
+        return status
+
+    def has_vector_model(self, space, model_name, dimension=None):
+        row = self._row(
+            "SELECT vector_json FROM memory_vectors WHERE space = ? AND model_name = ? LIMIT 1",
+            (space, model_name),
+        )
+        if not row:
+            return False
+        if dimension is None:
+            return True
+        try:
+            return len(json.loads(row["vector_json"] or "[]")) == int(dimension)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
 
     def create_entity(self, name, entity_type="person", status="pending", family_role=None, confidence=0.0, summary="", scope_id="home-default"):
         entity_id = make_id("entity")
