@@ -2015,7 +2015,7 @@ class MemoryStore:
             (video_asset_id,),
         )
         self.connection.execute(
-            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind = 'video_keyframe'",
+            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')",
             (video_asset_id,),
         )
         self.connection.commit()
