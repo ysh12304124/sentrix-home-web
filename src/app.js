@@ -32,6 +32,9 @@
     };
   }
 
+  const timelineSelectionVersion = "mtsw-10fps";
+  const shouldMigrateTimelineSelection = window.localStorage?.getItem("sentrix.timelineSelectionVersion") !== timelineSelectionVersion;
+
   const state = {
     view: "overview",
     query: "",
@@ -68,7 +71,7 @@
     health: null,
     performance: null,
     methodRuns: [],
-    timelineMethod: window.localStorage?.getItem("sentrix.timelineMethod") || "eventagg",
+    timelineMethod: shouldMigrateTimelineSelection ? "mtsw" : (window.localStorage?.getItem("sentrix.timelineMethod") || "eventagg"),
     queryPerformance: [],
     latestQueryPerformanceId: "",
     queryImageStartedAt: 0,
@@ -1343,7 +1346,11 @@
         // previous all-albums default mixed legacy QA imports with the new
         // package and made video scenes look duplicated or out of context.
         const latestSpace = methodScopeId(state.timelineMethod) || state.spaces.find((space) => space.id === "hippo-latest-BpVmNB3eKdM")?.id || "";
-        state.scopeId = storedSpace?.id ? storedSpace.id : latestSpace;
+        state.scopeId = shouldMigrateTimelineSelection ? latestSpace : (storedSpace?.id ? storedSpace.id : latestSpace);
+        if (shouldMigrateTimelineSelection) {
+          window.localStorage?.setItem("sentrix.timelineMethod", state.timelineMethod);
+          window.localStorage?.setItem("sentrix.timelineSelectionVersion", timelineSelectionVersion);
+        }
         if (state.scopeId) window.localStorage?.setItem("sentrix.scopeId", state.scopeId);
         state.scopeInitialized = true;
       } else if (state.scopeId && state.spaces.length && !state.spaces.some((space) => space.id === state.scopeId)) {
