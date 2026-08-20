@@ -37,6 +37,24 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+_LOW_INFO_ACTIONS = {
+    "standing", "sitting", "raising hand", "stand", "sit", "walking", "走路",
+    "站立", "坐着", "抬手", "挥手", "举手",
+}
+
+
+def _event_title(item):
+    actions = [str(value) for value in item.get("actions") or []
+               if str(value).strip().lower() not in _LOW_INFO_ACTIONS]
+    objects = [str(value) for value in item.get("objects") or []
+               if str(value).strip().lower() not in {"person", "chair", "couch", "bed", "potted plant", "vase"}]
+    if actions:
+        return f"事件：{actions[0]}"
+    if objects:
+        return f"场景：{objects[0]}"
+    return "视频片段"
+
+
 def _browser_preview(video_path, target, codec):
     if str(codec or "").lower() in {"h264", "avc1"}:
         return None
@@ -211,7 +229,7 @@ class VideoMemoryAdapter:
             labels = list(dict.fromkeys(item["objects"] + item["actions"] + item["expressions"]))
             event = store.create_video_scene_event({
                 "scope_id": asset.get("scope_id"),
-                "title": f"{'事件' if item['actions'] else '场景'}：{(item['actions'] or item['objects'] or ['场景'])[0]}",
+                "title": _event_title(item),
                 "summary": f"{start_sec:.1f}s~{end_sec:.1f}s；合并 {item['source_frame_count']} 个片段，保留信息帧 {len(representatives)} 张",
                 "time_start": _captured_at(captured_at, start_sec), "time_end": _captured_at(captured_at, end_sec),
                 "place": location_label, "source_asset_id": asset_id, "source_scene_index": scene_index,

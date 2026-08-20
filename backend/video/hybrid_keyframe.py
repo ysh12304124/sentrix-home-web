@@ -40,6 +40,11 @@ _CONVERSATION_LABELS = {
     "talk", "talking", "speak", "speaking", "conversation", "chat", "discussion",
     "交谈", "说话", "聊天", "对话", "交流",
 }
+_LOW_INFO_ACTIONS = {
+    "standing", "sitting", "raising hand", "stand", "sit", "walking", "走路",
+    "站立", "坐着", "抬手", "挥手", "举手",
+}
+_STATIC_CONTEXT_OBJECTS = {"person", "chair", "couch", "bed", "potted plant", "vase"}
 
 
 def _is_meal(row):
@@ -59,25 +64,43 @@ def _is_conversation(row):
     ))
 
 
+def _meaningful_labels(row):
+    labels = _labels(row)
+    return labels - _LOW_INFO_ACTIONS
+
+
+def _person_signature(row):
+    people = []
+    for item in row.get("objects") or []:
+        label = str(_value(item, "label") or "").lower()
+        if label != "person":
+            continue
+        bbox = _value(item, "bbox", []) or []
+        if len(bbox) != 4:
+            continue
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        people.append(((x1 + x2) / 2, (y1 + y2) / 2, max(0.0, x2 - x1), max(0.0, y2 - y1)))
+    return sorted(people)
+
+
+def _person_change(left, right):
+    a, b = _person_signature(left), _person_signature(right)
+    if not a or not b:
+        return 1.0 if a != b else 0.0
+    count_change = abs(len(a) - len(b)) / max(len(a), len(b), 1)
+    paired = []
+    for first, second in zip(a, b):
+        position = min(1.0, float(np.linalg.norm(np.subtract(first[:2], second[:2]))) / 0.7)
+        size = min(1.0, float(np.mean(np.abs(np.subtract(first[2:], second[2:])))) / 0.7)
+        paired.append(0.7 * position + 0.3 * size)
+    return min(1.0, 0.6 * count_change + 0.4 * (sum(paired) / max(1, len(paired))))
+
+
 def _similar(left, right):
     a, b = _labels(left), _labels(right)
     if not a or not b:
         return False
-    # Sustained meals are one semantic state even when the detector changes
-    # between bowl/plate/food.  Conversations can also span long intervals;
-    # visual diversity is preserved later by _choose_representatives().
-    if _is_meal(left) and _is_meal(right):
-        return True
-    if _is_conversation(left) and _is_conversation(right) and "person" in a and "person" in b:
-        return True
-    # General long-form rule: repeated people in the same visual environment
-    # may be split into many short detector spans, but belong to one memory
-    # event. Representative selection below still keeps different views.
-    if "person" in a and "person" in b and _same_background(left, right):
-        return True
-    overlap = len(a & b) / max(1, len(a | b))
-    anchor = bool(a & b) and (("person" in a and "person" in b) or len(a & b) >= 2)
-    return overlap >= 0.45 and anchor
+    return _merge_compatible(left, right)
 
 
 def _valid_image(row):
@@ -137,6 +160,41 @@ def _same_background(left, right):
     return a is not None and b is not None and float(np.mean(np.abs(a - b))) <= 0.18
 
 
+def _background_relation(left, right):
+    left_path, right_path = _valid_image(left), _valid_image(right)
+    if left_path is None or right_path is None:
+        return "environment_change"
+    a, b = _background_signature(left_path), _background_signature(right_path)
+    if a is None or b is None:
+        return "environment_change"
+    border_distance = float(np.mean(np.abs(a - b)))
+    if border_distance > 0.30:
+        return "environment_change"
+    full_distance = _visual_distance(left_path, right_path)
+    return "same_view" if full_distance < 0.45 else "same_environment_view_change"
+
+
+def _merge_compatible(left, right):
+    a, b = _labels(left), _labels(right)
+    if not a or not b:
+        return False
+    relation = _background_relation(left, right)
+    person_present = "person" in a and "person" in b
+    person_delta = _person_change(left, right)
+    meaningful_left = _meaningful_labels(left)
+    meaningful_right = _meaningful_labels(right)
+    overlap = len(meaningful_left & meaningful_right) / max(1, len(meaningful_left | meaningful_right))
+    if relation == "environment_change":
+        return False
+    if person_present and person_delta <= 0.48:
+        # Same view can carry a long conversation; a viewpoint change can too
+        # when the meaningful subject remains stable. Low-value actions never
+        # participate in this decision.
+        return relation == "same_view" or overlap >= 0.12
+    anchor = bool(meaningful_left & meaningful_right) and (person_present or len(meaningful_left & meaningful_right) >= 2)
+    return anchor and overlap >= 0.35
+
+
 def _choose_representatives(valid, group):
     """Keep the most informative frame plus visually different evidence.
 
@@ -146,6 +204,10 @@ def _choose_representatives(valid, group):
     """
     if not valid:
         return []
+    content_labels = set().union(*(_meaningful_labels(row) for row in group)) - _STATIC_CONTEXT_OBJECTS
+    largest_person_change = max((_person_change(group[0], row) for row in group[1:]), default=0.0)
+    if not content_labels and largest_person_change < 0.25:
+        return [max(valid, key=_info_score)]
     if all(_is_meal(row) for row in group if row):
         return [max(valid, key=_info_score)]
     start = float(group[0].get("event_start_sec", group[0].get("source_timestamp_sec", 0)) or 0)
