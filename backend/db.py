@@ -2166,7 +2166,7 @@ class MemoryStore:
         rows = self._rows(f"SELECT * FROM method_runs WHERE {' AND '.join(where)} ORDER BY created_at DESC", params)
         return [self._decode(row, ["config_json", "metrics_json"]) for row in rows]
 
-    def list_eventagg_events(self, run_id=None, media_id=None, scope_id=None):
+    def list_eventagg_events(self, run_id=None, media_id=None, scope_id=None, method_version=None):
         where, params = ["1=1"], []
         if run_id:
             where.append("run_id = ?"); params.append(run_id)
@@ -2174,6 +2174,8 @@ class MemoryStore:
             where.append("media_id = ?"); params.append(media_id)
         if scope_id:
             where.append("scope_id = ?"); params.append(scope_id)
+        if method_version:
+            where.append("method_version = ?"); params.append(method_version)
         rows = self._rows(f"SELECT * FROM event_aggregate_events WHERE {' AND '.join(where)} ORDER BY start_sec, source_index", params)
         result = []
         for row in rows:

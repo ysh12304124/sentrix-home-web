@@ -33,6 +33,7 @@ from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
 from .worldmm_memory import WorldMMMemory, worldmm_artifact_path
 from .video.event_aggregator import EVENTAGG_METHOD_VERSION
+from .video.mtsw import MTSW_METHOD_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -854,12 +855,22 @@ def performance(scope_id: str | None = None, method: str = "baseline"):
     try:
         scope = (scope_id or "").strip() or None
         payload = _video_performance(scope)
-        runs = store.list_method_runs(scope_id=scope, method_version=EVENTAGG_METHOD_VERSION)
+        runs = store.list_method_runs(scope_id=scope)
+        if runs:
+            media_ids = {run.get("media_id") for run in runs if run.get("media_id")}
+            runs = [item for media_id in media_ids for item in store.list_method_runs(media_id=media_id)]
         payload["method_comparison"] = {
             "baseline_method": "keyframe-hybrid-v2.0.0",
             "eventagg_method": EVENTAGG_METHOD_VERSION,
+            "mtsw_method": MTSW_METHOD_VERSION,
+            "references": [{
+                "method_version": "keyframe-hybrid-v2.0.0",
+                "label": "Baseline v2.0",
+                "status": "frozen_reference",
+                "metrics_json": {"keyframes": 180, "events": 180, "total_wall_seconds": 293.26, "extraction_seconds": 77.827},
+            }],
             "runs": runs,
-            "selected_method": "eventagg" if str(method).lower() in {"eventagg", "eventagg_v21"} else "baseline",
+            "selected_method": "mtsw" if str(method).lower() in {"mtsw", "mtsw_v23", MTSW_METHOD_VERSION.lower()} else "eventagg" if str(method).lower() in {"eventagg", "eventagg_v21"} else "baseline",
         }
         return payload
     except Exception as error:
@@ -1098,13 +1109,32 @@ def events(scope_id: str | None = None, limit: int = 1000, method: str = "baseli
     # Keep a server-side ceiling while avoiding the previous silent 100-event
     # truncation that hid older video scenes.
     limit = min(max(int(limit or 1000), 1), 5000)
-    if str(method or "baseline").lower() in {"eventagg", "eventagg_v21", EVENTAGG_METHOD_VERSION.lower()}:
+    method_name = str(method or "baseline").lower()
+    if method_name in {"mtsw", "mtsw_v23", MTSW_METHOD_VERSION.lower()}:
+        method_version = MTSW_METHOD_VERSION
+        if not run_id:
+            runs = store.list_method_runs(scope_id=scope_id, method_version=method_version)
+            run_id = runs[0]["run_id"] if runs else None
+        return {"events": store.list_eventagg_events(run_id=run_id, scope_id=scope_id, method_version=method_version)[:limit], "method": method_version, "run_id": run_id}
+    if method_name in {"eventagg", "eventagg_v21", EVENTAGG_METHOD_VERSION.lower()}:
         if not run_id:
             runs = store.list_method_runs(scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
+            if not runs and scope_id:
+                mtsw_runs = store.list_method_runs(scope_id=scope_id, method_version=MTSW_METHOD_VERSION)
+                media_ids = {run.get("media_id") for run in mtsw_runs if run.get("media_id")}
+                runs = [item for media_id in media_ids for item in store.list_method_runs(media_id=media_id, method_version=EVENTAGG_METHOD_VERSION)]
             preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
             run_id = (preferred or (runs[0] if runs else {})).get("run_id")
-        return {"events": store.list_eventagg_events(run_id=run_id, scope_id=scope_id)[:limit], "method": EVENTAGG_METHOD_VERSION, "run_id": run_id}
-    return {"events": store.list_events(limit, scope_id=scope_id), "method": "baseline"}
+        events = store.list_eventagg_events(run_id=run_id, scope_id=scope_id)
+        if not events and run_id:
+            events = store.list_eventagg_events(run_id=run_id)
+        return {"events": events[:limit], "method": EVENTAGG_METHOD_VERSION, "run_id": run_id}
+    baseline_events = store.list_events(limit, scope_id=scope_id)
+    if not baseline_events and scope_id:
+        mtsw_runs = store.list_method_runs(scope_id=scope_id, method_version=MTSW_METHOD_VERSION)
+        media_ids = {run.get("media_id") for run in mtsw_runs if run.get("media_id")}
+        baseline_events = [event for media_id in media_ids for event in store.list_video_scene_events(media_id)][:limit]
+    return {"events": baseline_events, "method": "baseline"}
 
 
 @app.get("/api/method-runs")
@@ -1180,6 +1210,16 @@ def video_eventagg(asset_id: str, run_id: str | None = None):
         preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
         run_id = (preferred or (runs[0] if runs else {})).get("run_id")
     return {"video_asset_id": asset_id, "method": EVENTAGG_METHOD_VERSION, "run_id": run_id, "events": store.list_eventagg_events(run_id=run_id, media_id=asset_id)}
+
+
+@app.get("/api/videos/{asset_id}/mtsw")
+def video_mtsw(asset_id: str, run_id: str | None = None):
+    if not store.get_asset(asset_id):
+        raise HTTPException(status_code=404, detail="video asset not found")
+    if not run_id:
+        runs = store.list_method_runs(media_id=asset_id, method_version=MTSW_METHOD_VERSION)
+        run_id = runs[0]["run_id"] if runs else None
+    return {"video_asset_id": asset_id, "method": MTSW_METHOD_VERSION, "run_id": run_id, "events": store.list_eventagg_events(run_id=run_id, media_id=asset_id, method_version=MTSW_METHOD_VERSION)}
 
 
 @app.get("/api/video-scenes/{scene_id}")

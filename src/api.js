@@ -29,6 +29,7 @@
     event: (id) => request(`/api/events/${encodeURIComponent(id)}`),
     video: (id) => request(`/api/videos/${encodeURIComponent(id)}`),
     videoScenes: (id) => request(`/api/videos/${encodeURIComponent(id)}/scenes`),
+    videoMtsw: (id) => request(`/api/videos/${encodeURIComponent(id)}/mtsw`),
     reprocessVideo: (id) => request(`/api/videos/${encodeURIComponent(id)}/reprocess`, { method: "POST" }),
     createEvent: (payload) => request("/api/events", { method: "POST", body: JSON.stringify(payload) }),
     updateEvent: (id, payload) => request(`/api/events/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(payload) }),
