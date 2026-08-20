@@ -402,6 +402,15 @@ def _pick_evidence_candidates(candidates, segment):
     target_count = min(target_count, len(pool))
     primary = max(pool, key=lambda item: _candidate_information(item, segment))
     chosen = [primary]
+    if duration >= 30.0:
+        edge_span = max(1, len(segment) // 5)
+        edge_anchors = [
+            max(segment[:edge_span], key=lambda item: _candidate_information(item, segment)),
+            max(segment[-edge_span:], key=lambda item: _candidate_information(item, segment)),
+        ]
+        for anchor in edge_anchors:
+            if _frame_index(anchor) not in {_frame_index(value) for value in chosen}:
+                chosen.append(anchor)
     while len(chosen) < target_count:
         best = None
         best_score = -1.0
