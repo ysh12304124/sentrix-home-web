@@ -289,6 +289,10 @@ class VideoMemoryAdapter:
                     float(value.get("source_timestamp_sec", start_sec) or start_sec)
                     for value in evidence_records
                 ]
+                if event_duration >= 45.0 and len(evidence_paths) >= 2:
+                    edge_indices = [0, len(evidence_paths) - 1]
+                    middle_choices = [index for index in selected_indices if index not in edge_indices]
+                    selected_indices = edge_indices + middle_choices[:max(0, max_persistent - 2)]
                 while len(selected_indices) < min(min_persistent, len(evidence_paths)):
                     candidates = [index for index in range(len(evidence_paths)) if index not in selected_indices]
                     if not candidates:
@@ -297,6 +301,7 @@ class VideoMemoryAdapter:
                         candidates,
                         key=lambda index: min(abs(evidence_times[index] - evidence_times[chosen]) for chosen in selected_indices),
                     ))
+                selected_indices = sorted(selected_indices, key=lambda index: evidence_times[index])
                 # Read every chosen image before overwriting the old primary;
                 # the previous primary may itself be retained as a support.
                 selected_payloads = [evidence_paths[index].read_bytes() for index in selected_indices]
