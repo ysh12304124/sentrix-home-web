@@ -196,41 +196,10 @@ def _merge_compatible(left, right):
 
 
 def _choose_representatives(valid, group):
-    """Keep the most informative frame plus visually different evidence.
-
-    A sustained meal is intentionally represented by one frame.  For other
-    long events, the cap grows with duration and selected frames must be both
-    semantically informative and visually different.
-    """
+    """Keep exactly one highest-information frame for each merged event."""
     if not valid:
         return []
-    content_labels = set().union(*(_meaningful_labels(row) for row in group)) - _STATIC_CONTEXT_OBJECTS
-    largest_person_change = max((_person_change(group[0], row) for row in group[1:]), default=0.0)
-    if not content_labels and largest_person_change < 0.25:
-        return [max(valid, key=_info_score)]
-    if all(_is_meal(row) for row in group if row):
-        return [max(valid, key=_info_score)]
-    start = float(group[0].get("event_start_sec", group[0].get("source_timestamp_sec", 0)) or 0)
-    end = float(group[-1].get("event_end_sec", group[-1].get("source_timestamp_sec", start)) or start)
-    duration = max(0.0, end - start)
-    max_count = min(8, max(3, int(np.ceil(duration / 30.0))))
-    min_gap = max(2.0, min(12.0, duration / max_count / 2.0))
-    ranked = sorted(valid, key=_info_score, reverse=True)
-    chosen = []
-    for row in ranked:
-        timestamp = float(row.get("source_timestamp_sec", row.get("event_start_sec", 0)) or 0)
-        if any(abs(timestamp - float(item.get("source_timestamp_sec", item.get("event_start_sec", 0)) or 0)) < min_gap for item in chosen):
-            continue
-        path = _valid_image(row)
-        if path is None or all(_visual_distance(path, _valid_image(item)) >= 0.08 for item in chosen):
-            chosen.append(row)
-        if len(chosen) >= max_count:
-            break
-    if not chosen:
-        chosen = [max(valid, key=_info_score)]
-    best = max(chosen, key=_info_score)
-    ordered = sorted(chosen, key=lambda row: float(row.get("source_timestamp_sec", row.get("event_start_sec", 0)) or 0))
-    return [best] + [row for row in ordered if row is not best]
+    return [max(valid, key=_info_score)]
 
 
 def _merge_frames(frames, max_duration=300.0, max_gap=30.0):
