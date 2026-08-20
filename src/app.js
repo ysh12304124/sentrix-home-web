@@ -148,6 +148,11 @@
     return event.participants || event.participants_json || [];
   }
 
+  function isMtswMethodVersion(value) {
+    const version = String(value || "").toLowerCase();
+    return version.includes("mtsw") || version === "keyframe-hybrid-v2.3.2-merge";
+  }
+
   function eventViewModel(event, index = 0) {
     const rolePeople = (event.participant_roles || []).map((person) => person.person_name).filter(Boolean);
     const people = (rolePeople.length ? rolePeople : eventPeople(event)).map((person) => typeof person === "string" ? person : person.name || person.display_name).filter(Boolean);
@@ -161,8 +166,8 @@
       countLabel: `${event.frame_count || (event.observation_ids || []).length || (event.asset_ids || []).length} 项证据`,
       isVideoScene: event.source_type === "video_scene" || event.source_type === "video_eventagg",
       isVideoEventAgg: event.source_type === "video_eventagg",
-      isMtswEvent: String(event.method_version || "").includes("mtsw"),
-      videoMethodLabel: String(event.method_version || "").includes("mtsw") ? "MTSW v2.3.2" : "EventAgg v2.1",
+      isMtswEvent: isMtswMethodVersion(event.method_version),
+      videoMethodLabel: isMtswMethodVersion(event.method_version) ? "MTSW v2.3.2" : "EventAgg v2.1",
       sceneRange: `${formatVideoTime(event.source_start_sec)}~${formatVideoTime(event.source_end_sec)}`,
       sceneDuration: Math.max(0, Number(event.source_end_sec || 0) - Number(event.source_start_sec || 0)),
       tone: ["mint", "peach", "blue", "lime", "lavender"][index % 5],
@@ -216,6 +221,12 @@
 
   function filteredEvents() {
     let source = state.events.map(eventViewModel);
+    // The API normally scopes this already. Keep a render-time guard because
+    // an older in-flight response can otherwise repaint legacy video_scene
+    // rows after the user has selected MTSW.
+    if (state.timelineMethod === "mtsw") {
+      source = source.filter((event) => event.scope_id === state.scopeId && event.source_type === "video_eventagg" && event.isMtswEvent);
+    }
     if (state.eventDate) {
       source = source.filter((event) => [event.time_start, event.time_end].some((value) => String(value || "").slice(0, 10) === state.eventDate));
     }
