@@ -196,6 +196,8 @@ class VideoMemoryAdapter:
                 "error_stage": None, "error": None, "retryable": True,
             })
         except Exception as error:
+            data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
+            shutil.rmtree(data_root / "derived" / "video" / asset_id / "hybrid-webp" / "vlm-evidence", ignore_errors=True)
             return store.update_asset(asset_id, "video-processing-failed", {
                 "video_stage": stage, "error_stage": stage, "error": f"{type(error).__name__}: {error}",
                 "retryable": True, "video_processing_seconds": round(time.perf_counter() - started, 3),
@@ -218,6 +220,8 @@ class VideoMemoryAdapter:
         })
         scene_ids = []
         keyframe_asset_ids = []
+        event_vlm_seconds = 0.0
+        transient_vlm_frame_count = 0
         for scene_index, item in enumerate(merged):
             representatives = list(item.get("representatives") or [item["representative"]])
             representative = representatives[0]
@@ -227,6 +231,45 @@ class VideoMemoryAdapter:
             start_sec = float(item["start_sec"])
             end_sec = float(item["end_sec"])
             labels = list(dict.fromkeys(item["objects"] + item["actions"] + item["expressions"]))
+            evidence_paths = [
+                Path(str(value.get("webp_path") or "")).resolve()
+                for value in representative.get("vlm_evidence") or []
+                if value.get("webp_path") and Path(str(value.get("webp_path"))).is_file()
+            ]
+            if target not in evidence_paths:
+                evidence_paths.insert(0, target)
+            evidence_paths = evidence_paths[:5]
+            transient_vlm_frame_count += len(evidence_paths)
+            vlm_started = time.perf_counter()
+            try:
+                if hasattr(pipeline.gamma, "analyze_video_event"):
+                    event_analysis = pipeline.gamma.analyze_video_event(
+                        evidence_paths,
+                        {
+                            "source_video": asset.get("file_name"),
+                            "start_sec": start_sec, "end_sec": end_sec,
+                            "evidence_timestamps_sec": [
+                                float(value.get("source_timestamp_sec", start_sec) or start_sec)
+                                for value in representative.get("vlm_evidence") or []
+                            ][:5],
+                            "captured_at": _captured_at(captured_at, start_sec),
+                            "captured_location": location_label,
+                        },
+                        {
+                            "objects": item["objects"], "actions": item["actions"],
+                            "expressions": item["expressions"],
+                            "timeline": item.get("yolo_timeline") or [],
+                        },
+                    )
+                else:
+                    event_analysis = pipeline.gamma.analyze_image(target)
+            finally:
+                for evidence_path in evidence_paths:
+                    if evidence_path != target and evidence_path.is_file():
+                        evidence_path.unlink()
+            vision_seconds = time.perf_counter() - vlm_started
+            event_vlm_seconds += vision_seconds
+            event_analysis["_vision_seconds"] = round(vision_seconds, 4)
             event = store.create_video_scene_event({
                 "scope_id": asset.get("scope_id"),
                 "title": _event_title(item),
@@ -239,6 +282,8 @@ class VideoMemoryAdapter:
                     "memory_duplicate_frame_removal": True, "source_event_ids": item["source_event_ids"],
                     "source_frame_count": item["source_frame_count"], "duplicate_frame_count": item["duplicate_frame_count"],
                     "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
+                    "vlm_evidence_count": len(evidence_paths),
+                    "vlm_evidence_persisted": 1,
                     "image_path": str(target), "location_source": "video_metadata",
                 },
             })
@@ -263,11 +308,15 @@ class VideoMemoryAdapter:
                     }, "reverse_geocode": reverse_geocode,
                 }
                 store.create_asset(keyframe_id, target.name, "image", str(target), "image/webp", target.stat().st_size, provenance, scope_id=asset.get("scope_id"))
-                processed = pipeline.process(keyframe_id, summarize_event=False, forced_event_id=event["id"])
+                processed = pipeline.process(
+                    keyframe_id, summarize_event=False, forced_event_id=event["id"],
+                    image_analysis=event_analysis,
+                )
                 if processed.get("status") != "processed":
                     raise RuntimeError(f"WebP keyframe processing failed: {keyframe_id}")
                 keyframe_asset_ids.append(keyframe_id)
             pipeline.summarize_event(event["id"])
+        shutil.rmtree(output / "vlm-evidence", ignore_errors=True)
         elapsed = round(time.perf_counter() - started, 3)
         return store.update_asset(asset_id, "processed", {
             "video_stage": "processed", "video_metadata": metadata.as_dict(),
@@ -279,6 +328,9 @@ class VideoMemoryAdapter:
             "video_scene_event_ids": scene_ids, "derived_keyframe_asset_ids": keyframe_asset_ids,
             "video_processing_seconds": elapsed, "memory_event_merge": True,
             "memory_duplicate_frame_removal": True, "memory_image_integrity_passed": True,
+            "event_vlm_seconds": round(event_vlm_seconds, 3),
+            "transient_vlm_frame_count": transient_vlm_frame_count,
+            "persistent_keyframe_count": len(keyframe_asset_ids),
             "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "0"), "vlm_device": "per-keyframe-pipeline",
             "error_stage": None, "error": None, "retryable": True,
         })

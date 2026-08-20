@@ -15,6 +15,12 @@ def _value(item, key, default=""):
     return item.get(key, default) if isinstance(item, dict) else default
 
 
+def _label_strings(values):
+    return list(dict.fromkeys(
+        str(value).strip() for value in values if value is not None and str(value).strip()
+    ))
+
+
 def _labels(row):
     values = []
     for key in ("objects", "actions", "expressions"):
@@ -294,12 +300,40 @@ def run(video_path, output_dir, video_id):
         if not row.get("webp_path"):
             event_id = row.get("event_id")
             row["webp_path"] = str(output / "webp" / f"event_{event_id}.webp")
-    merged = _merge_frames(frames)
+    # The extractor has already merged source-order events before NVDEC and
+    # writes exactly one WebP for each final event.  Do not create a second,
+    # image-level merge pass here.
+    merged = []
+    for row in frames:
+        objects = _label_strings(row.get("event_objects") or [
+            _value(item, "label") for item in row.get("objects") or []
+        ])
+        actions = _label_strings(row.get("event_actions") or [
+            _value(item, "label") for item in row.get("actions") or []
+        ])
+        expressions = _label_strings([
+            _value(item, "label") for item in row.get("expressions") or []
+        ])
+        merged.append({
+            "event_id": str(row.get("event_id") or ""),
+            "source_event_ids": [str(row.get("event_id") or "")],
+            "start_sec": float(row.get("event_start_sec", row.get("source_timestamp_sec", 0)) or 0),
+            "end_sec": float(row.get("event_end_sec", row.get("source_timestamp_sec", 0)) or 0),
+            "representative": row, "representatives": [row],
+            "objects": objects, "actions": actions, "expressions": expressions,
+            "yolo_timeline": list(row.get("yolo_timeline") or []),
+            "source_frame_count": int(row.get("source_frame_count") or 1),
+            "duplicate_frame_count": 0, "visual_duplicate_count": 0,
+            "memory_keyframe_count": 1,
+        })
+    stats = json.loads((output / "stats.json").read_text(encoding="utf-8"))
     manifest = {
-        "method": "yolo10_batch_targeted_katna_nvdec_webp_v2",
-        "keyframe_extraction_untouched_by_memory_merge": True,
+        "method": "yolo10_premerge_targeted_katna_nvdec_single_webp_v3",
+        "event_merge_before_image_write": True,
+        "keyframe_extraction_untouched_by_memory_merge": False,
         "source_frame_count": len(frames), "merged_event_count": len(merged),
-        "events_merged_away": len(frames) - len(merged),
+        "preliminary_event_count": int(stats.get("preliminary_event_count") or len(merged)),
+        "events_merged_away": max(0, int(stats.get("preliminary_event_count") or len(merged)) - len(merged)),
         "duplicate_frames_removed": sum(item["duplicate_frame_count"] + item.get("visual_duplicate_count", 0) for item in merged),
         "missing_representative_images": sum(not _valid_image(item["representative"]) for item in merged),
         "image_integrity_passed": all(_valid_image(item["representative"]) for item in merged),

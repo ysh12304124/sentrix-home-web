@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""YOLO/Pose prefilter -> targeted Katna -> one WebP/VLM frame per event.
+"""YOLO/Pose prefilter -> event merge -> transient multi-frame VLM package.
 
 The coarse pass samples the video without writing images.  Stable intervals are
 represented by semantic spans and one anchor; only change windows are sent to
 the Katna quality gate.  The output is a keyframe package consumed by the
-normal WebP memory importer.
+normal WebP memory importer. Only one representative WebP is persisted.
 """
 
 from __future__ import annotations
@@ -35,6 +35,74 @@ def _labels(semantic):
         if label:
             values.append(label)
     return tuple(sorted(set(values)))
+
+
+_LOW_INFO_ACTIONS = {
+    "standing", "sitting", "raising hand", "stand", "sit", "walking",
+    "走路", "站立", "坐着", "抬手", "挥手", "举手",
+}
+
+
+def _meaningful_sample_labels(sample):
+    return set(sample.get("labels") or ()) - _LOW_INFO_ACTIONS
+
+
+def _person_count(sample):
+    return sum(
+        1 for item in sample.get("semantic", {}).get("detections") or []
+        if str(_value(item, "label") or "").strip().lower() == "person"
+    )
+
+
+def _segment_background(segment):
+    if not segment:
+        return None
+    anchors = [segment[0], segment[len(segment) // 2], segment[-1]]
+    values = [item.get("background") for item in anchors if item.get("background") is not None]
+    return np.median(np.stack(values), axis=0) if values else None
+
+
+def _segment_visual(segment):
+    if not segment:
+        return None
+    return segment[len(segment) // 2].get("visual")
+
+
+def _memory_merge_compatible(left, right):
+    left_background = _segment_background(left)
+    right_background = _segment_background(right)
+    if left_background is None or right_background is None:
+        return False
+    border_distance = float(np.mean(np.abs(left_background - right_background)))
+    if border_distance > 0.30:
+        return False
+    left_visual, right_visual = _segment_visual(left), _segment_visual(right)
+    full_distance = 1.0 if left_visual is None or right_visual is None else float(np.mean(np.abs(left_visual - right_visual)))
+    same_view = full_distance < 0.22
+    left_labels = set().union(*(_meaningful_sample_labels(item) for item in left))
+    right_labels = set().union(*(_meaningful_sample_labels(item) for item in right))
+    overlap = len(left_labels & right_labels) / max(1, len(left_labels | right_labels))
+    left_people = int(np.median([_person_count(item) for item in left]))
+    right_people = int(np.median([_person_count(item) for item in right]))
+    repeated_people = left_people > 0 and right_people > 0 and abs(left_people - right_people) <= 1
+    if repeated_people:
+        return same_view or overlap >= 0.12
+    return bool(left_labels & right_labels) and overlap >= 0.35
+
+
+def merge_memory_segments(segments, max_duration_sec=300.0):
+    """Merge in source order before any full-resolution image is written."""
+    if not segments:
+        return []
+    merged = [list(segments[0])]
+    for segment in segments[1:]:
+        previous = merged[-1]
+        duration = float(segment[-1]["timestamp"]) - float(previous[0]["timestamp"])
+        if duration <= max_duration_sec and _memory_merge_compatible(previous, segment):
+            previous.extend(segment)
+        else:
+            merged.append(list(segment))
+    return merged
 
 
 def _signature(semantic):
@@ -132,6 +200,7 @@ def coarse_scan(video, analyzer, scan_fps, width, batch_size=16):
                 "frame_index": item["frame_index"], "timestamp": item["timestamp"], "semantic": semantic,
                 "labels": list(_labels(semantic)), "signature": _signature(semantic),
                 "change": round(change, 4), "sharpness": round(_sharpness(item["frame"]), 4),
+                "visual": item["visual"], "background": item["background"],
             })
             previous_gray = item["gray"]
         pending.clear()
@@ -151,7 +220,15 @@ def coarse_scan(video, analyzer, scan_fps, width, batch_size=16):
                 scale = width / frame.shape[1]
                 frame = cv2.resize(frame, (width, max(1, round(frame.shape[0] * scale))), interpolation=cv2.INTER_AREA)
             gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (96, 54), interpolation=cv2.INTER_AREA)
-            pending.append({"frame": frame, "gray": gray, "frame_index": index, "timestamp": index / fps})
+            visual = cv2.resize(gray, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+            background = np.concatenate([
+                visual[:4].reshape(-1), visual[-4:].reshape(-1),
+                visual[:, :5].reshape(-1), visual[:, -5:].reshape(-1),
+            ])
+            pending.append({
+                "frame": frame, "gray": gray, "visual": visual, "background": background,
+                "frame_index": index, "timestamp": index / fps,
+            })
             if len(pending) >= max(1, int(batch_size)):
                 flush_batch()
     finally:
@@ -263,12 +340,72 @@ def _gpu_decode_target_frames(video, target_frames, width, height, fps, workers=
             yield future.result()
 
 
-def _pick_candidate(candidates, segment):
-    if not candidates:
-        return max(segment, key=lambda item: item["sharpness"])
-    first, last = segment[0]["timestamp"], segment[-1]["timestamp"]
-    inside = [item for item in candidates if first - 1.0 <= item.timestamp <= last + 1.0]
-    return max(inside or candidates, key=_quality_key)
+def _frame_index(candidate):
+    return int(candidate.frame_index) if hasattr(candidate, "frame_index") else int(candidate["frame_index"])
+
+
+def _timestamp(candidate):
+    return float(candidate.timestamp) if hasattr(candidate, "timestamp") else float(candidate["timestamp"])
+
+
+def _candidate_sample(candidate, segment):
+    index = _frame_index(candidate)
+    return min(segment, key=lambda item: abs(int(item["frame_index"]) - index))
+
+
+def _candidate_information(candidate, segment):
+    nearest = _candidate_sample(candidate, segment)
+    semantic = nearest.get("semantic") or {}
+    labels = _meaningful_sample_labels(nearest)
+    confidence = sum(float(_value(item, "confidence", 0) or 0) for item in semantic.get("detections") or [])
+    sharpness = _quality_key(candidate)[0] if hasattr(candidate, "image") else float(nearest.get("sharpness") or 0)
+    return 2.0 * len(labels) + confidence + min(2.0, math.log1p(max(0.0, sharpness)) / 4.0)
+
+
+def _candidate_visual(candidate, segment):
+    if hasattr(candidate, "image"):
+        gray = cv2.cvtColor(candidate.image, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    return _candidate_sample(candidate, segment).get("visual")
+
+
+def _pick_evidence_candidates(candidates, segment):
+    """Select 3-5 diverse transient VLM frames and one primary frame."""
+    first, last = float(segment[0]["timestamp"]), float(segment[-1]["timestamp"])
+    inside = [item for item in candidates if first - 1.0 <= _timestamp(item) <= last + 1.0]
+    # Add source-order anchors so stable events and the beginning/end of long
+    # events are represented even when Katna only returns motion windows.
+    anchor_count = min(12, max(3, int(math.ceil(max(0.0, last - first) / 20.0)) + 2))
+    anchor_positions = np.linspace(0, len(segment) - 1, anchor_count).astype(int)
+    pool = inside + [segment[int(position)] for position in anchor_positions]
+    unique = {}
+    for item in pool:
+        unique.setdefault(_frame_index(item), item)
+    pool = list(unique.values())
+    duration = max(0.0, last - first)
+    target_count = 3 if duration < 45.0 else 4 if duration < 150.0 else 5
+    target_count = min(target_count, len(pool))
+    primary = max(pool, key=lambda item: _candidate_information(item, segment))
+    chosen = [primary]
+    while len(chosen) < target_count:
+        best = None
+        best_score = -1.0
+        for item in pool:
+            if _frame_index(item) in {_frame_index(value) for value in chosen}:
+                continue
+            visual = _candidate_visual(item, segment)
+            visual_distance = min(
+                float(np.mean(np.abs(visual - _candidate_visual(value, segment))))
+                for value in chosen if visual is not None and _candidate_visual(value, segment) is not None
+            ) if visual is not None else 0.0
+            temporal_distance = min(abs(_timestamp(item) - _timestamp(value)) for value in chosen) / max(duration, 1.0)
+            score = _candidate_information(item, segment) + 5.0 * visual_distance + 2.0 * temporal_distance
+            if score > best_score:
+                best, best_score = item, score
+        if best is None:
+            break
+        chosen.append(best)
+    return primary, sorted(chosen, key=_timestamp)
 
 
 def main():
@@ -313,6 +450,8 @@ def main():
     )
     coarse_seconds = time.perf_counter() - coarse_started
     segments = merge_segments(segments, args.merge_max_sec)
+    preliminary_event_count = len(segments)
+    segments = merge_memory_segments(segments)
     unstable_segments, motion_threshold = select_unstable_segments(
         segments, args.katna_unstable_percentile,
     )
@@ -330,25 +469,31 @@ def main():
     events = []
     frame_records = []
     for event_index, segment in enumerate(segments, 1):
-        segment_candidates = [item for item in selected if segment[0]["frame_index"] - 1 <= item.frame_index <= segment[-1]["frame_index"] + 1]
-        representative = _pick_candidate(segment_candidates, segment)
-        if hasattr(representative, "frame_index"):
-            rep_index = int(representative.frame_index)
-            rep_timestamp = float(representative.timestamp)
-        else:
-            rep_index = int(representative["frame_index"])
-            rep_timestamp = float(representative["timestamp"])
+        representative, evidence = _pick_evidence_candidates(selected, segment)
+        rep_index = _frame_index(representative)
+        rep_timestamp = _timestamp(representative)
         action_labels = Counter(str(_value(item, "label") or "") for sample in segment for item in sample["semantic"].get("actions") or [])
         object_labels = Counter(str(_value(item, "label") or "") for sample in segment for item in sample["semantic"].get("detections") or [])
         actions = [label for label, _ in action_labels.most_common(8) if label]
         objects = [label for label, _ in object_labels.most_common(20) if label]
         kind = "event" if actions else "scene"
         event_id = f"event_{event_index:05d}"
+        yolo_timeline = []
+        previous_labels = None
+        timeline_stride = max(1, int(math.ceil(len(segment) / 40.0)))
+        for sample_index, sample in enumerate(segment):
+            labels = list(sample.get("labels") or [])
+            if sample_index % timeline_stride == 0 or labels != previous_labels or sample_index == len(segment) - 1:
+                yolo_timeline.append({"sec": round(float(sample["timestamp"]), 2), "labels": labels[:12]})
+            previous_labels = labels
+        if len(yolo_timeline) > 80:
+            yolo_timeline = [yolo_timeline[int(position)] for position in np.linspace(0, len(yolo_timeline) - 1, 80)]
         summary = {
             "event_id": event_id, "kind": kind,
             "label": actions[0] if actions else (objects[0] if objects else "场景"),
             "start_sec": float(segment[0]["timestamp"]), "end_sec": float(segment[-1]["timestamp"]),
             "sample_count": len(segment), "objects": objects, "actions": actions,
+            "yolo_timeline": yolo_timeline,
             "semantic_substitution": True,
             "substituted_sample_count": max(0, len(segment) - 1),
         }
@@ -358,7 +503,14 @@ def main():
             "encoded_frame_index": event_index - 1, "source_frame_index": rep_index,
             "source_timestamp_sec": rep_timestamp, "event_id": event_id,
             "event_start_sec": summary["start_sec"], "event_end_sec": summary["end_sec"],
+            "source_frame_count": summary["sample_count"],
             "event_kind": kind, "event_label": summary["label"],
+            "event_objects": objects, "event_actions": actions,
+            "yolo_timeline": yolo_timeline,
+            "vlm_evidence": [
+                {"source_frame_index": _frame_index(item), "source_timestamp_sec": _timestamp(item)}
+                for item in evidence
+            ],
             "objects": [item if isinstance(item, dict) else {"label": item.label, "confidence": item.confidence, "bbox": item.bbox, "source": item.source, "track_id": item.track_id} for item in semantic.get("detections") or []],
             "actions": [dict(item) if isinstance(item, dict) else {"label": _value(item, "label", ""), "confidence": _value(item, "confidence", 0), "source": _value(item, "source", "pose")} for item in semantic.get("actions") or []],
             "expressions": [dict(item) if isinstance(item, dict) else {"label": _value(item, "label", ""), "confidence": _value(item, "confidence", 0), "source": _value(item, "source", "expression")} for item in semantic.get("expressions") or []],
@@ -370,30 +522,44 @@ def main():
     # second OpenCV scan used only for WebP writing.
     webp_dir = args.output / "webp"
     webp_dir.mkdir(parents=True, exist_ok=True)
+    for stale in webp_dir.glob("event_*.webp"):
+        stale.unlink()
+    evidence_dir = args.output / "vlm-evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    for stale in evidence_dir.glob("*.webp"):
+        stale.unlink()
     wanted = {}
-    for item in frame_records:
-        wanted.setdefault(item["source_frame_index"], []).append(item)
+    for record in frame_records:
+        for evidence_index, evidence in enumerate(record["vlm_evidence"]):
+            wanted.setdefault(evidence["source_frame_index"], []).append((record, evidence, evidence_index))
     target_decode_started = time.perf_counter()
     decoded_targets = 0
     for index, frame in _gpu_decode_target_frames(
         args.video, wanted.keys(), source_width, source_height, fps, args.target_decode_workers,
     ):
-        records = wanted.pop(index, None)
-        if records is None:
+        targets = wanted.pop(index, None)
+        if targets is None:
             continue
-        decoded_targets += len(records)
-        for record in records:
-            final_semantic = analyzer.analyze(frame)
-            record["objects"] = [item if isinstance(item, dict) else {"label": item.label, "confidence": item.confidence, "bbox": item.bbox, "source": item.source, "track_id": item.track_id} for item in final_semantic.get("detections") or []]
-            record["actions"] = [dict(item) if isinstance(item, dict) else {"label": _value(item, "label", ""), "confidence": _value(item, "confidence", 0), "source": _value(item, "source", "pose")} for item in final_semantic.get("actions") or []]
-            record["expressions"] = [dict(item) if isinstance(item, dict) else {"label": _value(item, "label", ""), "confidence": _value(item, "confidence", 0), "source": _value(item, "source", "expression")} for item in final_semantic.get("expressions") or []]
-            target = webp_dir / f"event_{record['event_id']}.webp"
-            encoded, buffer = cv2.imencode(".webp", frame, [cv2.IMWRITE_WEBP_QUALITY, args.webp_quality])
-            if not encoded:
-                raise RuntimeError(f"WebP encoding failed at {index}")
+        decoded_targets += len(targets)
+        final_semantic = analyzer.analyze(frame)
+        encoded, buffer = cv2.imencode(".webp", frame, [cv2.IMWRITE_WEBP_QUALITY, args.webp_quality])
+        if not encoded:
+            raise RuntimeError(f"WebP encoding failed at {index}")
+        for record, evidence, evidence_index in targets:
+            is_primary = index == int(record["source_frame_index"])
+            target = (
+                webp_dir / f"event_{record['event_id']}.webp"
+                if is_primary else evidence_dir / f"{record['event_id']}_{evidence_index:02d}.webp"
+            )
             target.write_bytes(buffer.tobytes())
-            record["webp_path"] = str(target)
-            record["webp_bytes"] = target.stat().st_size
+            evidence["webp_path"] = str(target)
+            evidence["webp_bytes"] = target.stat().st_size
+            if is_primary:
+                record["objects"] = [item if isinstance(item, dict) else {"label": item.label, "confidence": item.confidence, "bbox": item.bbox, "source": item.source, "track_id": item.track_id} for item in final_semantic.get("detections") or []]
+                record["actions"] = [dict(item) if isinstance(item, dict) else {"label": _value(item, "label", ""), "confidence": _value(item, "confidence", 0), "source": _value(item, "source", "pose")} for item in final_semantic.get("actions") or []]
+                record["expressions"] = [dict(item) if isinstance(item, dict) else {"label": _value(item, "label", ""), "confidence": _value(item, "confidence", 0), "source": _value(item, "source", "expression")} for item in final_semantic.get("expressions") or []]
+                record["webp_path"] = str(target)
+                record["webp_bytes"] = target.stat().st_size
     target_decode_seconds = time.perf_counter() - target_decode_started
     if wanted:
         raise RuntimeError(f"missing representative frames: {sum(len(items) for items in wanted.values())}")
@@ -416,7 +582,11 @@ def main():
         "katna_unstable_segment_count": len(unstable_segments),
         "katna_motion_threshold": motion_threshold,
         "katna_window_count": len(katna_windows),
+        "preliminary_event_count": preliminary_event_count,
         "event_count": len(events), "memory_frames": len(frame_records),
+        "event_merge_before_image_write": True,
+        "transient_vlm_frames": sum(len(item.get("vlm_evidence") or []) for item in frame_records),
+        "persistent_webp_frames": len(frame_records),
         "katna_candidate_count": len(candidates), "katna_targeted_candidate_count": len(targeted),
         "katna_selected_count": len(selected), "semantic_substituted_samples": sum(item["substituted_sample_count"] for item in events),
         "katna_scan_fps": args.katna_scan_fps,
@@ -426,7 +596,7 @@ def main():
         "gpu_target_decode_frames": decoded_targets,
         "full_resolution_refinement": "removed; KATNA quality gate selects non-motion representatives",
         "katna_selection": katna_detail,
-        "implementation": "yolo_prefilter_nvdec_katna_event_webp_v2",
+        "implementation": "yolo_prefilter_premerge_nvdec_single_event_webp_v3",
         "total_sec": round(time.perf_counter() - started, 3),
     }
     (args.output / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
