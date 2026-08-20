@@ -70,6 +70,11 @@ def _similar(left, right):
         return True
     if _is_conversation(left) and _is_conversation(right) and "person" in a and "person" in b:
         return True
+    # General long-form rule: repeated people in the same visual environment
+    # may be split into many short detector spans, but belong to one memory
+    # event. Representative selection below still keeps different views.
+    if "person" in a and "person" in b and _same_background(left, right):
+        return True
     overlap = len(a & b) / max(1, len(a | b))
     anchor = bool(a & b) and (("person" in a and "person" in b) or len(a & b) >= 2)
     return overlap >= 0.45 and anchor
@@ -111,6 +116,27 @@ def _visual_distance(left, right):
     return float(np.mean(np.abs(a - b)))
 
 
+def _background_signature(path):
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+    image = cv2.resize(image, (32, 18), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    # People and foreground actions change most in the centre. The border is
+    # a lightweight fingerprint for conversations in one room.
+    return np.concatenate([
+        image[:4].reshape(-1), image[-4:].reshape(-1),
+        image[:, :5].reshape(-1), image[:, -5:].reshape(-1),
+    ])
+
+
+def _same_background(left, right):
+    left_path, right_path = _valid_image(left), _valid_image(right)
+    if left_path is None or right_path is None:
+        return False
+    a, b = _background_signature(left_path), _background_signature(right_path)
+    return a is not None and b is not None and float(np.mean(np.abs(a - b))) <= 0.18
+
+
 def _choose_representatives(valid, group):
     """Keep the most informative frame plus visually different evidence.
 
@@ -145,7 +171,7 @@ def _choose_representatives(valid, group):
     return [best] + [row for row in ordered if row is not best]
 
 
-def _merge_frames(frames, max_duration=180.0, max_gap=20.0):
+def _merge_frames(frames, max_duration=300.0, max_gap=30.0):
     ordered = sorted(frames, key=lambda row: float(row.get("event_start_sec", row.get("source_timestamp_sec", 0)) or 0))
     groups = []
     for frame in ordered:
