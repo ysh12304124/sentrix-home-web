@@ -270,22 +270,37 @@ class VideoMemoryAdapter:
                 else:
                     event_analysis = pipeline.gamma.analyze_image(target)
                 fallback_index = evidence_paths.index(target) if target in evidence_paths else 0
-                try:
-                    selected_index = int(event_analysis.pop("representative_index", fallback_index))
-                except (TypeError, ValueError):
-                    selected_index = fallback_index
-                selected_index = max(0, min(len(evidence_paths) - 1, selected_index))
-                selected_path = evidence_paths[selected_index]
-                selected_record = evidence_records[selected_index]
-                if selected_path != target:
-                    shutil.copy2(selected_path, target)
-                representative["source_timestamp_sec"] = float(
-                    selected_record.get("source_timestamp_sec", representative.get("source_timestamp_sec", start_sec)) or start_sec
-                )
-                representative["source_frame_index"] = int(
-                    selected_record.get("source_frame_index", representative.get("source_frame_index", 0)) or 0
-                )
-                representative["vlm_selected_evidence_index"] = selected_index
+                selected_indices = event_analysis.pop("representative_indices", None)
+                if not isinstance(selected_indices, list):
+                    selected_indices = [event_analysis.pop("representative_index", fallback_index)]
+                normalized_indices = []
+                for value in selected_indices:
+                    try:
+                        selected_index = max(0, min(len(evidence_paths) - 1, int(value)))
+                    except (TypeError, ValueError):
+                        continue
+                    if selected_index not in normalized_indices:
+                        normalized_indices.append(selected_index)
+                selected_indices = (normalized_indices or [fallback_index])[:3]
+                # Read every chosen image before overwriting the old primary;
+                # the previous primary may itself be retained as a support.
+                selected_payloads = [evidence_paths[index].read_bytes() for index in selected_indices]
+                representatives = []
+                for ordinal, (selected_index, payload) in enumerate(zip(selected_indices, selected_payloads)):
+                    selected_record = dict(evidence_records[selected_index])
+                    persistent_target = target if ordinal == 0 else target.with_name(
+                        f"{target.stem}_support_{ordinal:02d}{target.suffix}"
+                    )
+                    persistent_target.write_bytes(payload)
+                    selected_record.update({
+                        "webp_path": str(persistent_target), "webp_bytes": len(payload),
+                        "vlm_selected_evidence_index": selected_index,
+                    })
+                    representatives.append(selected_record)
+                representative = representatives[0]
+                item["representatives"] = representatives
+                item["representative"] = representative
+                item["memory_keyframe_count"] = len(representatives)
             finally:
                 for evidence_path in evidence_paths:
                     if evidence_path != target and evidence_path.is_file():
@@ -306,8 +321,10 @@ class VideoMemoryAdapter:
                     "source_frame_count": item["source_frame_count"], "duplicate_frame_count": item["duplicate_frame_count"],
                     "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
                     "vlm_evidence_count": len(evidence_paths),
-                    "vlm_evidence_persisted": 1,
-                    "vlm_selected_evidence_index": representative.get("vlm_selected_evidence_index", 0),
+                    "vlm_evidence_persisted": len(representatives),
+                    "vlm_selected_evidence_indices": [
+                        value.get("vlm_selected_evidence_index", 0) for value in representatives
+                    ],
                     "image_path": str(target), "location_source": "video_metadata",
                 },
             })
@@ -348,7 +365,8 @@ class VideoMemoryAdapter:
             "location_source": "video_metadata" if metadata.latitude is not None else "upload_metadata",
             "worldmm_output": str(output), "keyframe_algorithm": manifest["method"],
             "worldmm_scene_count": len(merged), "worldmm_keyframe_count": sum(item.get("memory_keyframe_count", 1) for item in merged),
-            "worldmm_full_keyframe_count": len(frames), "worldmm_selected_keyframe_count": sum(item.get("memory_keyframe_count", 1) for item in merged),
+            "worldmm_full_keyframe_count": transient_vlm_frame_count,
+            "worldmm_selected_keyframe_count": len(keyframe_asset_ids),
             "video_scene_event_ids": scene_ids, "derived_keyframe_asset_ids": keyframe_asset_ids,
             "video_processing_seconds": elapsed, "memory_event_merge": True,
             "memory_duplicate_frame_removal": True, "memory_image_integrity_passed": True,

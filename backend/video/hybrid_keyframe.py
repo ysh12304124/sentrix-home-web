@@ -328,7 +328,7 @@ def run(video_path, output_dir, video_id):
         })
     stats = json.loads((output / "stats.json").read_text(encoding="utf-8"))
     manifest = {
-        "method": "yolo10_premerge_targeted_katna_nvdec_single_webp_v3",
+        "method": "yolo10_premerge_katna_nvdec_multivlm_adaptive_webp_v4",
         "event_merge_before_image_write": True,
         "keyframe_extraction_untouched_by_memory_merge": False,
         "source_frame_count": len(frames), "merged_event_count": len(merged),

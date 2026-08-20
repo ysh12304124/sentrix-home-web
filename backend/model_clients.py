@@ -1068,8 +1068,8 @@ class GammaClient:
             raise ValueError("video event analysis requires at least one evidence image")
         prompt = """你是家庭视频事件观察器。输入是同一连续事件中按时间顺序排列的3至5张临时证据图。
 综合全部图片和YOLO时间序列语义，描述事件期间可验证的人物、物品、环境与活动变化；不能只描述第一张或最后一张，不能猜测姓名或关系。忽略单纯的站立、坐着、抬手等低信息动作，除非它们对事件变化不可缺少。
-caption 和 activity 必须由其中一张图片直接支持，不得选择已经离开该活动的画面作为代表。必须返回 representative_index，表示最能直接证明 caption 和 activity 的图片序号，从0开始且不得超出图片数量。
-严格返回简体中文 JSON：caption（20字内）、activity（15字内）、place（10字内）、scene_type、semantic、people（最多4项）、objects（最多8项）、clothing（最多4项）、emotions（最多4项）、spatial_relations（最多6项）、ocr_text（40字内）、event_type、facts（最多2项）、representative_index（整数）。
+caption 和 activity 必须由选中的证据图片直接支持，不得描述已经离开画面的活动。返回 representative_indices：能够覆盖 caption、activity 和事件中不同阶段的最小图片序号集合，从0开始，最多3张。单一活动或相似画面只能选1张；只有出现不同地点、不同活动阶段且单图无法覆盖时才选2至3张，例如“泳池环境”和“烧烤操作”应各选一张。禁止选择重复画面。
+严格返回简体中文 JSON：caption（20字内）、activity（15字内）、place（10字内）、scene_type、semantic、people（最多4项）、objects（最多8项）、clothing（最多4项）、emotions（最多4项）、spatial_relations（最多6项）、ocr_text（40字内）、event_type、facts（最多2项）、representative_indices（整数数组，1至3项）。
 图片顺序和事件上下文：""" + json.dumps({
             "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
         }, ensure_ascii=False)
@@ -1082,11 +1082,18 @@ caption 和 activity 必须由其中一张图片直接支持，不得选择已�
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
         normalize_analysis_fields(parsed)
         parsed = normalize_semantic_analysis(parsed)
-        try:
-            representative_index = int(parsed.get("representative_index", 0))
-        except (TypeError, ValueError):
-            representative_index = 0
-        parsed["representative_index"] = max(0, min(len(images) - 1, representative_index))
+        raw_indices = parsed.get("representative_indices")
+        if not isinstance(raw_indices, list):
+            raw_indices = [parsed.get("representative_index", 0)]
+        representative_indices = []
+        for value in raw_indices:
+            try:
+                index = max(0, min(len(images) - 1, int(value)))
+            except (TypeError, ValueError):
+                continue
+            if index not in representative_indices:
+                representative_indices.append(index)
+        parsed["representative_indices"] = (representative_indices or [0])[:3]
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
         parsed["model"] = self.model
         parsed["video_event_evidence_count"] = len(images)
