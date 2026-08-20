@@ -231,14 +231,20 @@ class VideoMemoryAdapter:
             start_sec = float(item["start_sec"])
             end_sec = float(item["end_sec"])
             labels = list(dict.fromkeys(item["objects"] + item["actions"] + item["expressions"]))
-            evidence_paths = [
-                Path(str(value.get("webp_path") or "")).resolve()
-                for value in representative.get("vlm_evidence") or []
+            evidence_records = [
+                value for value in representative.get("vlm_evidence") or []
                 if value.get("webp_path") and Path(str(value.get("webp_path"))).is_file()
-            ]
+            ][:5]
+            evidence_paths = [Path(str(value["webp_path"])).resolve() for value in evidence_records]
             if target not in evidence_paths:
                 evidence_paths.insert(0, target)
+                evidence_records.insert(0, {
+                    "webp_path": str(target),
+                    "source_timestamp_sec": representative.get("source_timestamp_sec", start_sec),
+                    "source_frame_index": representative.get("source_frame_index", 0),
+                })
             evidence_paths = evidence_paths[:5]
+            evidence_records = evidence_records[:5]
             transient_vlm_frame_count += len(evidence_paths)
             vlm_started = time.perf_counter()
             try:
@@ -263,6 +269,23 @@ class VideoMemoryAdapter:
                     )
                 else:
                     event_analysis = pipeline.gamma.analyze_image(target)
+                fallback_index = evidence_paths.index(target) if target in evidence_paths else 0
+                try:
+                    selected_index = int(event_analysis.pop("representative_index", fallback_index))
+                except (TypeError, ValueError):
+                    selected_index = fallback_index
+                selected_index = max(0, min(len(evidence_paths) - 1, selected_index))
+                selected_path = evidence_paths[selected_index]
+                selected_record = evidence_records[selected_index]
+                if selected_path != target:
+                    shutil.copy2(selected_path, target)
+                representative["source_timestamp_sec"] = float(
+                    selected_record.get("source_timestamp_sec", representative.get("source_timestamp_sec", start_sec)) or start_sec
+                )
+                representative["source_frame_index"] = int(
+                    selected_record.get("source_frame_index", representative.get("source_frame_index", 0)) or 0
+                )
+                representative["vlm_selected_evidence_index"] = selected_index
             finally:
                 for evidence_path in evidence_paths:
                     if evidence_path != target and evidence_path.is_file():
@@ -284,6 +307,7 @@ class VideoMemoryAdapter:
                     "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
                     "vlm_evidence_count": len(evidence_paths),
                     "vlm_evidence_persisted": 1,
+                    "vlm_selected_evidence_index": representative.get("vlm_selected_evidence_index", 0),
                     "image_path": str(target), "location_source": "video_metadata",
                 },
             })

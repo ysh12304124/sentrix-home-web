@@ -1068,7 +1068,8 @@ class GammaClient:
             raise ValueError("video event analysis requires at least one evidence image")
         prompt = """你是家庭视频事件观察器。输入是同一连续事件中按时间顺序排列的3至5张临时证据图。
 综合全部图片和YOLO时间序列语义，描述事件期间可验证的人物、物品、环境与活动变化；不能只描述第一张或最后一张，不能猜测姓名或关系。忽略单纯的站立、坐着、抬手等低信息动作，除非它们对事件变化不可缺少。
-严格返回简体中文 JSON：caption（20字内）、activity（15字内）、place（10字内）、scene_type、semantic、people（最多4项）、objects（最多8项）、clothing（最多4项）、emotions（最多4项）、spatial_relations（最多6项）、ocr_text（40字内）、event_type、facts（最多2项）。
+caption 和 activity 必须由其中一张图片直接支持，不得选择已经离开该活动的画面作为代表。必须返回 representative_index，表示最能直接证明 caption 和 activity 的图片序号，从0开始且不得超出图片数量。
+严格返回简体中文 JSON：caption（20字内）、activity（15字内）、place（10字内）、scene_type、semantic、people（最多4项）、objects（最多8项）、clothing（最多4项）、emotions（最多4项）、spatial_relations（最多6项）、ocr_text（40字内）、event_type、facts（最多2项）、representative_index（整数）。
 图片顺序和事件上下文：""" + json.dumps({
             "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
         }, ensure_ascii=False)
@@ -1081,6 +1082,11 @@ class GammaClient:
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
         normalize_analysis_fields(parsed)
         parsed = normalize_semantic_analysis(parsed)
+        try:
+            representative_index = int(parsed.get("representative_index", 0))
+        except (TypeError, ValueError):
+            representative_index = 0
+        parsed["representative_index"] = max(0, min(len(images) - 1, representative_index))
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
         parsed["model"] = self.model
         parsed["video_event_evidence_count"] = len(images)
