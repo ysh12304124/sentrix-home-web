@@ -3660,19 +3660,80 @@ class MemoryStore:
             where += " AND scope_id = ?"
             params.append(scope_id)
         entities = self._rows(f"SELECT * FROM entities {where} ORDER BY updated_at DESC", params)
+        if entities:
+            self._decorate_entities(entities, [entity["id"] for entity in entities])
+        return [self.public_entity(entity) for entity in entities] if public else entities
+
+    def _decorate_entities(self, entities, ids):
+        """Fill derived per-entity fields with batched queries instead of N+1 lookups."""
+        placeholders = ",".join("?" * len(ids))
+        cluster_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"SELECT entity_id, COUNT(*) AS c FROM face_clusters WHERE entity_id IN ({placeholders}) GROUP BY entity_id", ids
+            )
+        }
+        cluster_rows_by_entity = {}
+        for row in self._rows(
+            f"SELECT entity_id, member_count, confidence, status FROM face_clusters WHERE entity_id IN ({placeholders})", ids
+        ):
+            cluster_rows_by_entity.setdefault(row["entity_id"], []).append(row)
+        photo_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"""SELECT fc.entity_id, COUNT(DISTINCT a.id) AS c FROM face_instances fi
+                JOIN face_clusters fc ON fc.id = fi.cluster_id JOIN assets a ON a.id = fi.asset_id
+                WHERE fc.entity_id IN ({placeholders}) AND fc.status != 'rejected' GROUP BY fc.entity_id""", ids
+            )
+        }
+        mention_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"SELECT entity_id, COUNT(*) AS c FROM entity_mentions WHERE entity_id IN ({placeholders}) GROUP BY entity_id", ids
+            )
+        }
+        evidence_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"SELECT entity_id, COUNT(*) AS c FROM entity_observations WHERE entity_id IN ({placeholders}) GROUP BY entity_id", ids
+            )
+        }
+        relationship_counts = {}
+        for row in self._rows(
+            f"""SELECT subject_entity_id AS eid, COUNT(*) AS c FROM relationships
+            WHERE subject_entity_id IN ({placeholders}) AND status != 'retracted' GROUP BY subject_entity_id""", ids
+        ):
+            relationship_counts[row["eid"]] = relationship_counts.get(row["eid"], 0) + row["c"]
+        for row in self._rows(
+            f"""SELECT object_entity_id AS eid, COUNT(*) AS c FROM relationships
+            WHERE object_entity_id IN ({placeholders}) AND status != 'retracted' GROUP BY object_entity_id""", ids
+        ):
+            relationship_counts[row["eid"]] = relationship_counts.get(row["eid"], 0) + row["c"]
+        avatars = {
+            row["entity_id"]: row["id"] for row in self._rows(
+                f"""SELECT entity_id, id FROM (
+                    SELECT fc.entity_id, fi.id,
+                           ROW_NUMBER() OVER (PARTITION BY fc.entity_id ORDER BY fi.detection_confidence DESC, fi.created_at ASC) AS rn
+                    FROM face_instances fi JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    WHERE fc.entity_id IN ({placeholders}) AND fc.status != 'rejected'
+                ) WHERE rn = 1""", ids
+            )
+        }
+        previews = {
+            row["entity_id"]: row for row in self._rows(
+                f"""SELECT entity_id, asset_id, file_name, media_type FROM (
+                    SELECT eob.entity_id, a.id AS asset_id, a.file_name, a.media_type,
+                           ROW_NUMBER() OVER (PARTITION BY eob.entity_id ORDER BY o.captured_at DESC, o.id DESC) AS rn
+                    FROM entity_observations eob JOIN observations o ON o.id = eob.observation_id
+                    JOIN assets a ON a.id = o.asset_id
+                    WHERE eob.entity_id IN ({placeholders})
+                ) WHERE rn = 1""", ids
+            )
+        }
         for entity in entities:
-            entity["cluster_count"] = self.connection.execute("SELECT COUNT(*) FROM face_clusters WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
-            entity["photo_count"] = self.connection.execute(
-                """SELECT COUNT(DISTINCT a.id) FROM face_instances fi
-                JOIN face_clusters fc ON fc.id = fi.cluster_id
-                JOIN assets a ON a.id = fi.asset_id
-                WHERE fc.entity_id = ? AND fc.status != 'rejected'""",
-                (entity["id"],),
-            ).fetchone()[0]
-            entity["mention_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_mentions WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
-            entity["evidence_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_observations WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
-            entity["relationship_count"] = self.connection.execute("SELECT COUNT(*) FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'", (entity["id"], entity["id"])).fetchone()[0]
-            cluster_rows = self._rows("SELECT member_count, confidence, status FROM face_clusters WHERE entity_id = ?", (entity["id"],))
+            entity_id = entity["id"]
+            entity["cluster_count"] = cluster_counts.get(entity_id, 0)
+            entity["photo_count"] = photo_counts.get(entity_id, 0)
+            entity["mention_count"] = mention_counts.get(entity_id, 0)
+            entity["evidence_count"] = evidence_counts.get(entity_id, 0)
+            entity["relationship_count"] = relationship_counts.get(entity_id, 0)
+            cluster_rows = cluster_rows_by_entity.get(entity_id, [])
             if entity["entity_type"] == "person":
                 entity["reviewable"] = entity["status"] == "confirmed" or any(
                     row["status"] != "rejected" and int(row.get("member_count", 0) or 0) > 0
@@ -3683,23 +3744,12 @@ class MemoryStore:
                 )
             else:
                 entity["reviewable"] = entity["evidence_count"] > 0
-            avatar = self._row(
-                """SELECT fi.id FROM face_instances fi JOIN face_clusters fc ON fc.id = fi.cluster_id
-                WHERE fc.entity_id = ? AND fc.status != 'rejected' ORDER BY fi.detection_confidence DESC, fi.created_at ASC LIMIT 1""",
-                (entity["id"],),
-            )
-            entity["avatar_face_instance_id"] = avatar["id"] if avatar else None
-            preview = self._row(
-                """SELECT a.id AS asset_id, a.file_name, a.media_type
-                FROM entity_observations eob JOIN observations o ON o.id = eob.observation_id
-                JOIN assets a ON a.id = o.asset_id
-                WHERE eob.entity_id = ? ORDER BY o.captured_at DESC, o.id DESC LIMIT 1""",
-                (entity["id"],),
-            )
+            entity["avatar_face_instance_id"] = avatars.get(entity_id)
+            preview = previews.get(entity_id)
             entity["preview_asset_id"] = preview["asset_id"] if preview else None
             entity["preview_file_name"] = preview["file_name"] if preview else None
             entity["preview_media_type"] = preview["media_type"] if preview else None
-        return [self.public_entity(entity) for entity in entities] if public else entities
+        return entities
 
     def _semantic_entity_key(self, entity_type, name, entity=None):
         """Return an explainable semantic concept for automatic grouping."""
