@@ -1196,8 +1196,8 @@ class BenchmarkRun:
                 state = {}
                 if time.monotonic() >= deadline:
                     return exc
-            served = state.get("served_model_name") or state.get("profile")
-            if served and served == self.model_profile:
+            served_names = {state.get("profile"), state.get("served_model_name")}
+            if self.model_profile in served_names:
                 base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
                 root = base.rstrip("/").removesuffix("/v1")
                 probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
