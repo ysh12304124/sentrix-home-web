@@ -5,6 +5,8 @@ tuned against the same `album3-max` evidence without touching the import path.
 """
 
 import math
+import tempfile
+from pathlib import Path
 
 STAGES = (
     "rank_people",
@@ -106,6 +108,45 @@ def select_representatives(candidates, vector_by_asset, limit=12,
             "event_coverage": event_counts.get(item.get("event_id"), 0),
         }
     return selected
+
+
+def compose_person_collage(paths, refs, cell_size=224, columns=4):
+    """Compose representative photos into a single labelled collage.
+
+    The VLM image-per-prompt budget is small (gemma4-12b-it allows 5), but a
+    person graph inference must see every core person at once. Compositing the
+    per-person representative photos into one collage keeps a single prompt
+    within the image budget while preserving the P01..P10 label mapping.
+    """
+    from PIL import Image, ImageDraw, ImageOps
+
+    thumbs = []
+    for path in paths[:12]:
+        try:
+            with Image.open(path) as source:
+                thumb = ImageOps.exif_transpose(source).convert("RGB")
+                thumb.thumbnail((cell_size, cell_size))
+                thumbs.append(thumb)
+        except Exception:
+            continue
+    if not thumbs:
+        return None
+    columns = max(1, min(columns, len(thumbs)))
+    rows = math.ceil(len(thumbs) / columns)
+    cell_w = max(thumb.width for thumb in thumbs)
+    cell_h = max(thumb.height for thumb in thumbs)
+    canvas = Image.new("RGB", (columns * cell_w, rows * cell_h), "white")
+    draw = ImageDraw.Draw(canvas)
+    for index, thumb in enumerate(thumbs):
+        x = (index % columns) * cell_w
+        y = (index // columns) * cell_h
+        canvas.paste(thumb, (x, y))
+        label = refs[index] if index < len(refs) else f"P{index + 1:02d}"
+        draw.text((x + 3, y + 3), label, fill="red")
+    temp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    canvas.save(temp.name, "JPEG", quality=90)
+    temp.close()
+    return temp.name
 
 
 class PersonInsightService:
@@ -249,11 +290,22 @@ class PersonInsightService:
         events = store._rows(
             "SELECT id, place, activity, time_start FROM events WHERE scope_id = ?", (scope_id,)
         )
-        paths = []
+        seen = set()
+        collage_sources = []
         for selection in state.get("selections") or []:
+            person_id = selection["person_id"]
+            if person_id in seen:
+                continue
+            seen.add(person_id)
             asset = store.get_asset(selection["asset_id"])
             if asset and asset.get("path"):
-                paths.append(asset["path"])
+                collage_sources.append((asset["path"], ref_map.get(person_id, "")))
+        collage_path = None
+        if collage_sources:
+            collage_path = compose_person_collage(
+                [path for path, _ in collage_sources],
+                [ref for _, ref in collage_sources],
+            )
         graph_payload = {
             "people": [ref_map[item["person_id"]] for item in core],
             "events": [
@@ -264,7 +316,13 @@ class PersonInsightService:
             "moments": [],
             "devices": {},
         }
-        result = self.gamma.infer_person_graph(paths, graph_payload)
+        try:
+            result = self.gamma.infer_person_graph(
+                [collage_path] if collage_path else [], graph_payload
+            )
+        finally:
+            if collage_path:
+                Path(collage_path).unlink(missing_ok=True)
         role_rows = []
         for role in result.get("roles") or []:
             person_id = rev_ref.get(str(role.get("person_ref") or ""))
