@@ -1521,6 +1521,17 @@ class BenchmarkRun:
         qa_concurrency = self._resolve_qa_concurrency()
         with self.lock:
             self.state["qa_concurrency"] = qa_concurrency
+        total_qa = len(self.qa_rows)
+
+        def record_qa_progress():
+            done = len(self.state.get("items") or [])
+            submitted = getattr(self, "_qa_submitted", 0)
+            self._record_phase("qa_eval", "progress", {
+                "total": total_qa, "completed": done,
+                "in_flight": max(0, submitted - done),
+                "qa_concurrency": qa_concurrency,
+            })
+
         if qa_concurrency <= 1:
             for row in self.qa_rows:
                 if self._cancel.is_set():
@@ -1528,12 +1539,15 @@ class BenchmarkRun:
                 item = self._evaluate_one(row, assets_by_name)
                 with self.lock:
                     self.state["items"].append(item)
+                    self._qa_submitted = len(self.state["items"])
+                    record_qa_progress()
                     self.persist()
         else:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=qa_concurrency, thread_name_prefix="qa-eval") as executor:
                 future_map = {executor.submit(self._evaluate_one, row, assets_by_name): index
                               for index, row in enumerate(self.qa_rows)}
+                self._qa_submitted = total_qa
                 for future in concurrent.futures.as_completed(future_map):
                     index = future_map[future]
                     try:
@@ -1542,6 +1556,7 @@ class BenchmarkRun:
                         item = {"index": index, "error": repr(exc), "failed": True}
                     with self.lock:
                         self.state["items"].append({**item, "_index": index})
+                        record_qa_progress()
                         self.persist()
             with self.lock:
                 self.state["items"].sort(key=lambda it: it.get("_index", 0))

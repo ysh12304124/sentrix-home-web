@@ -866,7 +866,13 @@ function phaseSummary(key, phase) {
   }
   if (key === "photo_import") return `导入 ${phase.accepted_count ?? 0}/${phase.total_photos ?? "?"} 张 · ${fmtSeconds(phaseSeconds(phase, "upload_seconds"))}`;
   if (key === "pipeline_processing" && phase.progress) return `${phase.progress.processed || 0}/${phase.progress.total || 0} 资产完成 · ${phase.progress.failed || 0} 失败 · 阶段墙钟 ${fmtSeconds(phaseSeconds(phase))}`;
-  if (key === "qa_eval") return `${activeRun.value?.item_count || 0} 题 · ${fmtSeconds(phaseSeconds(phase))}`;
+  if (key === "qa_eval") {
+    const p = phase.progress;
+    if (p && (p.completed != null || p.in_flight != null)) {
+      return `完成 ${p.completed ?? 0}/${p.total ?? "?"} · 在途 ${p.in_flight ?? 0}${p.qa_concurrency > 1 ? ` · 并发 ${p.qa_concurrency}` : ""} · ${fmtSeconds(phaseSeconds(phase))}`;
+    }
+    return `${activeRun.value?.item_count || 0} 题 · ${fmtSeconds(phaseSeconds(phase))}`;
+  }
   const elapsed = phaseSeconds(phase);
   if (elapsed != null) return `耗时 ${fmtSeconds(elapsed)}`;
   return "";
