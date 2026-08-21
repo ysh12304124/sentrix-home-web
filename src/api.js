@@ -109,5 +109,14 @@
       method: "POST",
       body: JSON.stringify({ profile, wait_ready: true, ready_timeout: 900 }),
     }),
+    personInsights: (scopeId = "") => request(`/api/person-insights${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
+    startPersonInsightRun: (payload) => request("/api/person-insight-runs", { method: "POST", body: JSON.stringify(payload) }),
+    personInsightRun: (id) => request(`/api/person-insight-runs/${encodeURIComponent(id)}`),
+    decidePersonRole: (personId, payload) => request(`/api/people/${encodeURIComponent(personId)}/role-decision`, { method: "POST", body: JSON.stringify(payload) }),
+    savePersonName: (personId, name) => request(`/api/people/${encodeURIComponent(personId)}/name`, { method: "PATCH", body: JSON.stringify({ name }) }),
+    decideRelationshipHypothesis: (id, payload) => request(`/api/relationship-hypotheses/${encodeURIComponent(id)}/decision`, { method: "POST", body: JSON.stringify(payload) }),
+    personPortrait: (personId) => request(`/api/people/${encodeURIComponent(personId)}/portrait`),
+    sendPortraitFeedback: (personId, payload) => request(`/api/people/${encodeURIComponent(personId)}/portrait-feedback`, { method: "POST", body: JSON.stringify(payload) }),
+    updatePortrait: (personId, payload) => request(`/api/people/${encodeURIComponent(personId)}/portrait`, { method: "PATCH", body: JSON.stringify(payload) }),
   };
 })();

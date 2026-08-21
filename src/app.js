@@ -55,6 +55,7 @@
     events: [],
     assets: [],
     persons: [],
+    personInsights: null,
     entities: [],
     entityGroups: [],
     geoPlaces: [],
@@ -623,7 +624,28 @@
       const profileLine = person.confirmed && profileText ? `<small class="person-profile-line" title="${escapeHtml(profileText)}">${escapeHtml(profileText)}</small>` : "";
       return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${profileLine}${caution}<div class="person-stats">${person.confirmed ? `<span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>✓</strong> 已确认</span>` : `<span><strong>${person.cluster_count || 0}</strong> 个人物簇</span><span>待确认</span>`}</div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? `<button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(person.id)}">画像</button>` : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`}</div></article>`;
     };
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会折叠在下方，仍可展开查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div>${batchCandidates.length >= 2 ? `<div class="people-banner"><div><strong>我在照片里发现了 ${batchCandidates.length} 个常出现的人</strong><small>先给他们命名并设定家庭角色，系统会在此基础上持续积累每个人的记忆和关系。</small></div><button class="button primary" data-action="batch-confirm">${icon("＋")}批量命名</button></div>` : ""}<section class="people-grid">${primary.length ? primary.map((person, index) => personCard(person, index)).join("") : emptyState(singles.length ? "没有待确认的多人物簇" : "还没有人物候选", singles.length ? "单样本候选折叠在下方，可能是小脸或误检。" : "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", singles.length ? "" : `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>${singles.length ? `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">单张样本（${singles.length}）· 可能是小脸或误检，展开后谨慎确认</summary><div class="people-grid" style="margin-top:12px;">${singles.map((person, index) => personCard(person, primary.length + index)).join("")}</div></details>` : ""}`;
+    const insightRoleOptions = ["本人", "父亲", "母亲", "配偶", "孩子", "祖父母", "兄弟姐妹", "其他亲属", "朋友", "同事", "同学", "邻居", "照护者", "老师", "亲友", "访客", "一次性人物", "无法判断"];
+    const insightRoleSelect = (item) => `<select class="insight-role-select" aria-label="建议角色">${insightRoleOptions.map((role) => `<option ${(item.family_role || "") === role ? "selected" : ""}>${escapeHtml(role)}</option>`).join("")}</select>`;
+    const insightPersonCard = (item) => {
+      const displayName = item.display_name || "未命名成员";
+      const topRole = item.role_candidates && item.role_candidates[0];
+      const roleLine = topRole ? `${topRole.role} · ${Math.round((topRole.confidence || 0) * 100)}%` : "角色待定";
+      const portraitText = item.portrait && item.portrait.portrait_text ? item.portrait.portrait_text : "";
+      const portraitLine = portraitText ? `<small class="person-profile-line" title="${escapeHtml(portraitText)}">${escapeHtml(portraitText.length > 60 ? portraitText.slice(0, 60) + "…" : portraitText)}</small>` : "";
+      return `<article class="person-card insight-card"><div class="person-head">${faceAvatar(item.avatar_face_instance_id || "", displayName, item.identity_state === "stable" ? "green" : "gray")}<span class="${item.identity_state === "stable" ? "confirmed" : "needs-label"}">${item.identity_state === "stable" ? "✓ 已确认" : "待确认"}</span></div><h2>${escapeHtml(displayName)}</h2><p>${escapeHtml(item.role_state === "confirmed" ? (item.family_role || "角色已确认") : `系统建议 · ${roleLine}`)}</p>${portraitLine}<div class="person-stats"><span><strong>${item.date_count || 0}</strong> 天</span><span><strong>${item.event_count || 0}</strong> 个事件</span></div><div class="insight-field">${insightRoleSelect(item)}</div><input class="insight-name-input" placeholder="填写姓名（可不填）" /><div class="insight-actions"><button class="button small primary" data-action="confirm-suggested-role" data-person-id="${escapeHtml(item.person_id)}">确认角色</button><button class="button small ghost" data-action="save-person-name" data-person-id="${escapeHtml(item.person_id)}">保存姓名</button><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="like">像他</button><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="dislike">不像他</button><button class="button small ghost" data-action="edit-portrait" data-person-id="${escapeHtml(item.person_id)}">编辑画像</button><button class="button small ghost" data-action="lock-portrait" data-person-id="${escapeHtml(item.person_id)}">锁定</button><button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(item.person_id)}">历史版本</button></div></article>`;
+    };
+    const insights = state.personInsights;
+    const tiers = (insights && insights.tiers) || { core: [], common: [], incidental: [] };
+    const insightSection = (title, people, folded) => {
+      if (!people || !people.length) return "";
+      const cards = people.map(insightPersonCard).join("");
+      if (folded) return `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">${title}（${people.length}）</summary><div class="people-grid" style="margin-top:12px;">${cards}</div></details>`;
+      return `<section class="insight-tier"><h3 class="insight-tier-title">${title}</h3><div class="people-grid">${cards}</div></section>`;
+    };
+    const relHypotheses = (insights && insights.relationship_hypotheses) || [];
+    const suggestedRelHtml = relHypotheses.length ? `<section class="insight-tier"><h3 class="insight-tier-title">系统建议的关系</h3><div class="suggested-relations">${relHypotheses.map((rel) => `<div class="suggested-relation"><span class="suggestion-badge">系统建议</span><span>${escapeHtml(rel.subject_person_id)} → ${escapeHtml(rel.predicate)} → ${escapeHtml(rel.object_person_id)}</span><button class="button small primary" data-action="confirm-relationship-hypothesis" data-hypothesis-id="${escapeHtml(rel.id)}">确认</button><button class="button small ghost" data-action="reject-relationship-hypothesis" data-hypothesis-id="${escapeHtml(rel.id)}">拒绝</button></div>`).join("")}</div></section>` : "";
+    const insightsHtml = insights ? `${insightSection("系统认为最重要的人", tiers.core)}${insightSection("其他常见人物", tiers.common)}${insightSection("一次性或低证据人物", tiers.incidental, true)}${suggestedRelHtml}` : "";
+    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会折叠在下方，仍可展开查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}${insightsHtml}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div>${batchCandidates.length >= 2 ? `<div class="people-banner"><div><strong>我在照片里发现了 ${batchCandidates.length} 个常出现的人</strong><small>先给他们命名并设定家庭角色，系统会在此基础上持续积累每个人的记忆和关系。</small></div><button class="button primary" data-action="batch-confirm">${icon("＋")}批量命名</button></div>` : ""}<section class="people-grid">${primary.length ? primary.map((person, index) => personCard(person, index)).join("") : emptyState(singles.length ? "没有待确认的多人物簇" : "还没有人物候选", singles.length ? "单样本候选折叠在下方，可能是小脸或误检。" : "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", singles.length ? "" : `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>${singles.length ? `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">单张样本（${singles.length}）· 可能是小脸或误检，展开后谨慎确认</summary><div class="people-grid" style="margin-top:12px;">${singles.map((person, index) => personCard(person, primary.length + index)).join("")}</div></details>` : ""}`;
   }
 
   function knowledgeView() {
@@ -1155,7 +1177,7 @@
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
           window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId), window.sentrixApi.entityGroups(scopeId),
-          window.sentrixApi.geoPlaces(scopeId),
+          window.sentrixApi.geoPlaces(scopeId), window.sentrixApi.personInsights(scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -1178,6 +1200,7 @@
     state.entities = calls[6].status === "fulfilled" ? calls[6].value.entities || [] : [];
     state.clusters = calls[7].status === "fulfilled" ? calls[7].value.clusters || [] : [];
     state.relationships = calls[8].status === "fulfilled" ? calls[8].value.relationships || [] : [];
+    state.personInsights = calls[13].status === "fulfilled" ? calls[13].value : null;
         state.knowledge = calls[9].status === "fulfilled" ? calls[9].value : { profiles: [], claims: [] };
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
         state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
@@ -1828,6 +1851,77 @@
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
+    if (action === "confirm-suggested-role") {
+      const card = element.closest(".insight-card");
+      const role = card ? card.querySelector(".insight-role-select").value : "";
+      if (!role) { state.toast = "请选择角色"; return renderShellNavigation(); }
+      try {
+        const personId = element.dataset.personId;
+        const insights = state.personInsights;
+        const tierItem = ((insights && insights.tiers && insights.tiers.core) || []).concat((insights && insights.tiers && insights.tiers.common) || [], (insights && insights.tiers && insights.tiers.incidental) || []).find((item) => item.person_id === personId);
+        const hypothesisId = tierItem && tierItem.role_candidates && tierItem.role_candidates[0] ? tierItem.role_candidates[0].id : "";
+        await window.sentrixApi.decidePersonRole(personId, { hypothesis_id: hypothesisId, decision: "confirm", role, is_self: false });
+        state.toast = `已确认角色：${role}`;
+        return refreshData();
+      } catch (error) { state.toast = `角色确认失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "save-person-name") {
+      const card = element.closest(".insight-card");
+      const name = card ? (card.querySelector(".insight-name-input").value || "").trim() : "";
+      if (!name) { state.toast = "请先填写姓名"; return renderShellNavigation(); }
+      try {
+        await window.sentrixApi.savePersonName(element.dataset.personId, name);
+        state.toast = `已保存姓名：${name}`;
+        return refreshData();
+      } catch (error) { state.toast = `姓名保存失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "portrait-feedback") {
+      try {
+        const portrait = await window.sentrixApi.personPortrait(element.dataset.personId);
+        const revisionId = portrait.active ? portrait.active.id : (portrait.revisions && portrait.revisions[0] && portrait.revisions[0].id);
+        const verdict = element.dataset.verdict === "like" ? "像他" : "不像他";
+        if (revisionId) await window.sentrixApi.sendPortraitFeedback(element.dataset.personId, { revision_id: revisionId, verdict, note: "" });
+        state.toast = verdict === "像他" ? "已标记：像他" : "已标记：不像他";
+        return refreshData();
+      } catch (error) { state.toast = `画像反馈失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "edit-portrait") {
+      const personId = element.dataset.personId;
+      const insights = state.personInsights;
+      const tierItem = ((insights && insights.tiers && insights.tiers.core) || []).concat((insights && insights.tiers && insights.tiers.common) || [], (insights && insights.tiers && insights.tiers.incidental) || []).find((item) => item.person_id === personId);
+      const currentText = tierItem && tierItem.portrait ? tierItem.portrait.portrait_text : "";
+      const edited = window.prompt("修订画像正文（保存为你的用户版本）", currentText);
+      if (edited === null) return;
+      try {
+        const portrait = await window.sentrixApi.personPortrait(personId);
+        await window.sentrixApi.updatePortrait(personId, { revision_id: portrait.active ? portrait.active.id : "", portrait_text: edited, locked: false });
+        state.toast = "画像已更新为你的版本";
+        return refreshData();
+      } catch (error) { state.toast = `画像修订失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "lock-portrait") {
+      try {
+        const portrait = await window.sentrixApi.personPortrait(element.dataset.personId);
+        if (!portrait.active) { state.toast = "还没有可锁定的画像"; return renderShellNavigation(); }
+        await window.sentrixApi.updatePortrait(element.dataset.personId, { revision_id: portrait.active.id, portrait_text: portrait.active.portrait_text, locked: true });
+        state.toast = "画像已锁定，后台刷新不会覆盖";
+        return refreshData();
+      } catch (error) { state.toast = `锁定失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "confirm-relationship-hypothesis") {
+      try {
+        await window.sentrixApi.decideRelationshipHypothesis(element.dataset.hypothesisId, { decision: "confirm" });
+        state.toast = "关系建议已确认并进入正式关系";
+        return refreshData();
+      } catch (error) { state.toast = `关系确认失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "reject-relationship-hypothesis") {
+      try {
+        await window.sentrixApi.decideRelationshipHypothesis(element.dataset.hypothesisId, { decision: "reject" });
+        state.toast = "已拒绝该关系建议";
+        return refreshData();
+      } catch (error) { state.toast = `关系拒绝失败：${error.message}`; return renderShellNavigation(); }
+    }
     if (action === "batch-confirm") { const candidates = state.persons.filter((person) => !person.confirmed && !person.single_sample).sort((a, b) => (b.photo_count || 0) - (a.photo_count || 0)); return openModal({ type: "batch-person", candidates }); }
     if (action === "add-batch-relation") {
       const list = document.querySelector(".batch-relation-list");

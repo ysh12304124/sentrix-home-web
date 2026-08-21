@@ -583,3 +583,9 @@ details.agent-trace-box > div { display: flex; flex-direction: column; gap: 6px;
 .batch-relation-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }.batch-relation-row { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; align-items: center; }.batch-relation-row select { margin-top: 0; }
 .person-profile-line { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: var(--muted); font-size: 10px; line-height: 1.5; margin: 6px 0 0; }
 .profile-note { margin: 10px 0 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--soft, #f4f6f0); color: var(--ink); font-size: 12px; line-height: 1.6; }
+.insight-tier { margin-top: 18px; }.insight-tier-title { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+.insight-card .insight-field { margin-top: 8px; }.insight-role-select { width: 100%; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel, #fff); color: inherit; font: inherit; }
+.insight-name-input { width: 100%; margin-top: 6px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel, #fff); color: inherit; font: inherit; box-sizing: border-box; }
+.insight-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.suggested-relations { display: grid; gap: 8px; }.suggested-relation { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px dashed var(--line); border-radius: 10px; flex-wrap: wrap; }.suggested-relation span { font-size: 12px; }
+.suggestion-badge { font-size: 11px; color: var(--accent, #2f6fed); background: color-mix(in srgb, var(--accent, #2f6fed) 12%, transparent); padding: 2px 8px; border-radius: 999px; }
