@@ -646,6 +646,22 @@ def _sync_vllm_state_on_startup():
     except Exception:
         pass
 
+def _video_extraction_status():
+    algorithm = os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm").strip().lower()
+    if algorithm == "hybrid_webp":
+        return {
+            "adapter": "hybrid_webp_memory", "algorithm": algorithm, "status": "available",
+            "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
+            "sampleFps": os.getenv("SENTRIX_VIDEO_SAMPLE_FPS", "10"),
+            "yoloBatch": os.getenv("SENTRIX_VIDEO_YOLO_BATCH_SIZE", "16"),
+            "targetDecode": "NVDEC", "memoryMerge": True, "duplicateFrameRemoval": True,
+        }
+    return {
+        "adapter": "worldmm_keyframe_memory", "algorithm": "worldmm", "status": "available",
+        "package": "tools/video_keyframe/worldmm_keyframe_pipeline.py",
+    }
+
+
 @app.get("/api/health")
 def health():
     # Phase C C12：profile manifest 作为运维真实来源
@@ -714,10 +730,7 @@ def health():
             "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.evidence_ready, "evidenceReady": pipeline.clip.evidence_ready, "error": pipeline.clip.error},
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
-        "videoExtraction": {
-            "adapter": "worldmm_keyframe_memory", "status": "available",
-            "package": "tools/video_keyframe/worldmm_keyframe_pipeline.py",
-        },
+        "videoExtraction": _video_extraction_status(),
         "database": store.path,
     }
 

@@ -1916,13 +1916,22 @@ class MemoryStore:
             row["cover_selection"] = row.get("cover_selection_json", {})
             row["source_metadata"] = row.get("source_metadata_json", {})
             if row.get("source_type") == "video_scene":
+                derived_assets = self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
+                # WebP imports created before scene_index was persisted still
+                # belong to this event through event_observations.  Keep them
+                # visible while new imports use the indexed fast path above.
+                if not derived_assets:
+                    derived_assets = [
+                        self.get_asset(asset_id) for asset_id in row.get("asset_ids", [])
+                        if (self.get_asset(asset_id) or {}).get("derived_kind") == "video_keyframe_webp"
+                    ]
                 row["keyframe_assets"] = [
                     {key: asset.get(key) for key in (
                         "id", "file_name", "media_type", "status", "captured_at", "captured_location",
                         "parent_asset_id", "derived_kind", "source_timestamp_sec", "source_frame_index",
                         "source_scene_index",
                     )}
-                    for asset in self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
+                    for asset in derived_assets if asset
                 ]
                 source_video = self.get_asset(row.get("source_asset_id")) or {}
                 row["source_video"] = {key: source_video.get(key) for key in (
@@ -1946,7 +1955,9 @@ class MemoryStore:
 
     def list_derived_assets(self, parent_asset_id, scene_index=None):
         params = [parent_asset_id]
-        where = "parent_asset_id = ? AND derived_kind = 'video_keyframe'"
+        # Support both the legacy image keyframes and the current WebP
+        # keyframes produced by the hybrid extraction pipeline.
+        where = "parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')"
         if scene_index is not None:
             where += " AND source_scene_index = ?"
             params.append(int(scene_index))
@@ -2004,7 +2015,7 @@ class MemoryStore:
             (video_asset_id,),
         )
         self.connection.execute(
-            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind = 'video_keyframe'",
+            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')",
             (video_asset_id,),
         )
         self.connection.commit()
