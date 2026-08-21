@@ -2472,7 +2472,11 @@ class BenchmarkRun:
         agent_throughput_ms = None
         timelines = [(item.get("timing_breakdown") or {}).get("timeline") or {} for item in items]
         spans = [(tl.get("started_at_epoch"), tl.get("judge_started_at_epoch"), tl.get("judge_finished_at_epoch")) for tl in timelines]
-        ends = [s[0] + float((item.get("timing_breakdown") or {}).get("wall_clock_ms") or 0) / 1000 for s, item in zip(spans, items)]
+        ends = []
+        for s, item in zip(spans, items):
+            wall_ms = (item.get("timing_breakdown") or {}).get("wall_clock_ms")
+            if isinstance(s[0], (int, float)) and isinstance(wall_ms, (int, float)):
+                ends.append(s[0] + float(wall_ms) / 1000)
         if spans and all(isinstance(s[0], (int, float)) for s in spans):
             wall_start = min(s[0] for s in spans)
             wall_end = max(e for e in ends if isinstance(e, (int, float)))
