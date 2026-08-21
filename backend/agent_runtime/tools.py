@@ -730,21 +730,22 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         if extracted:
             filters["time"] = extracted
     scope_id = (context or {}).get("scope_id") or ""
-    # P2: Canonical Retrieval Intent（candidate）—— 从用户原问题确定性提取结构化约束，
-    # 强信号（时间+地点）时覆盖 LLM 构建的 filters 并走确定性元数据路径，消除 paraphrase 漂移。
+    # P2 v2: Canonical Retrieval Intent（fusion candidate）—— 从用户原问题确定性提取结构化
+    # 约束，强信号（时间+地点）时作为 filters 增强 hybrid 检索（保留语义 query），消除 paraphrase 漂移。
     if _canonical_search_enabled():
         from .canonical_intent import extract_constraints
         user_message = ((context or {}).get("task_state") or {}).get("user_goal") or arguments.get("query") or ""
 
         ci = extract_constraints(user_message, _RUNTIME.get("store"), scope_id)
         if ci.get("strong"):
+            # P2 v2 Fusion：canonical 结构化约束作为 filters 增强，保留 hybrid 语义 query，
+            # 避免 v1 空 query 走纯元数据路径丢失 OCR/关键词召回。
             if ci.get("time"):
                 filters["time"] = ci["time"]
             if ci.get("place"):
                 filters["place"] = ci["place"]
             if ci.get("person"):
                 filters["person"] = ci["person"]
-            query = ""
     # W2.3：多轮引用消解 —— 引用类 query 先解析到已有 current_result_set，不重新全库搜索。
     # 引用标记在用户原话（task_state.user_goal）里，search query 是 LLM 提取后的内容，故两者都检测。
     _user_msg = ((context or {}).get("task_state") or {}).get("user_goal") or ""

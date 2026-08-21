@@ -1311,6 +1311,18 @@ class ClipAdapter:
     def evidence_ready(self):
         return self.enabled and self.weights_ready and self.error is None
 
+    @property
+    def embedding_dimension(self):
+        configured = os.getenv("CLIP_EMBED_DIM")
+        if configured:
+            return int(configured)
+        normalized = str(self.model_name or "").lower().replace("_", "-")
+        if "vit-h-14" in normalized:
+            return 1024
+        if "vit-l-14" in normalized:
+            return 768
+        return 512
+
     def _device(self, torch):
         requested = str(self.device or "auto").strip().lower()
         if requested == "auto":

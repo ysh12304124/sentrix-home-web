@@ -216,6 +216,7 @@ class MemoryStore:
 
     def __init__(self, path):
         self.path = str(path)
+        self._last_vector_search = {"backend": "sqlite", "error": None}
         self.connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
@@ -3094,16 +3095,73 @@ class MemoryStore:
             (make_id("vec"), metadata["scope_id"], space, source_type, source_id, json_value(values, []), model_name, json_value(metadata, {}), timestamp, timestamp),
         )
         self.connection.commit()
-        return self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
+        row = self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is not None:
+                accelerator.upsert(
+                    row_id=row["id"], scope_id=row["scope_id"], space=space,
+                    source_type=source_type, source_id=source_id, vector=values,
+                    model_name=model_name, metadata=metadata,
+                    created_at=row["created_at"], updated_at=row["updated_at"],
+                )
+        except Exception:
+            # Qdrant is a derived acceleration layer.  SQLite commit above is
+            # authoritative and must never be rolled back by index failure.
+            pass
+        return row
 
-    def search_vectors(self, space, vector, limit=10, scope_id=None):
+    def search_vectors(self, space, vector, limit=10, scope_id=None, model_name=None):
         query = self._normalise_vector(vector)
+        if not query:
+            return []
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is not None:
+                accelerated = accelerator.search(
+                    space=space, vector=query, limit=max(limit * 4, limit),
+                    scope_id=scope_id, model_name=model_name,
+                )
+                if accelerated:
+                    row_ids = [item.get("id") for item in accelerated if item.get("id")]
+                    placeholders = ",".join("?" for _ in row_ids)
+                    current_ids = {
+                        row["id"] for row in self._rows(
+                            f"SELECT id FROM memory_vectors WHERE id IN ({placeholders})", row_ids
+                        )
+                    } if row_ids else set()
+                    if len(current_ids) != len(accelerated):
+                        self._last_vector_search = {
+                            "backend": "sqlite_fallback",
+                            "error": "qdrant returned stale points",
+                        }
+                        return self.search_vectors_sqlite(
+                            space, query, limit=limit, scope_id=scope_id,
+                            model_name=model_name, normalized=True,
+                        )
+                    self._last_vector_search = {"backend": "qdrant", "error": None}
+                    return accelerated[:max(1, limit)]
+        except Exception as error:
+            self._last_vector_search = {
+                "backend": "sqlite_fallback",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        return self.search_vectors_sqlite(space, query, limit=limit, scope_id=scope_id,
+                                          model_name=model_name, normalized=True)
+
+    def search_vectors_sqlite(self, space, vector, limit=10, scope_id=None,
+                              model_name=None, normalized=False):
+        query = list(vector or []) if normalized else self._normalise_vector(vector)
         if not query:
             return []
         results = []
         rows = self._rows(
-            "SELECT * FROM memory_vectors WHERE space = ?" + (" AND scope_id = ?" if scope_id else ""),
-            (space, scope_id) if scope_id else (space,),
+            "SELECT * FROM memory_vectors WHERE space = ?"
+            + (" AND scope_id = ?" if scope_id else "")
+            + (" AND model_name = ?" if model_name else ""),
+            tuple([space] + ([scope_id] if scope_id else []) + ([model_name] if model_name else [])),
         )
         for row in rows:
             try:
@@ -3114,7 +3172,35 @@ class MemoryStore:
             result = self._decode(row, ["metadata_json"])
             result["score"] = score
             results.append(result)
+        if self._last_vector_search.get("backend") != "sqlite_fallback":
+            self._last_vector_search = {"backend": "sqlite", "error": None}
         return sorted(results, key=lambda item: item["score"], reverse=True)[:max(1, limit)]
+
+    def vector_search_status(self):
+        status = dict(self._last_vector_search)
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is not None:
+                status.update(accelerator.collection_stats())
+                status["active_backend"] = self._last_vector_search.get("backend")
+        except Exception as error:
+            status.setdefault("error", f"{type(error).__name__}: {error}")
+        return status
+
+    def has_vector_model(self, space, model_name, dimension=None):
+        row = self._row(
+            "SELECT vector_json FROM memory_vectors WHERE space = ? AND model_name = ? LIMIT 1",
+            (space, model_name),
+        )
+        if not row:
+            return False
+        if dimension is None:
+            return True
+        try:
+            return len(json.loads(row["vector_json"] or "[]")) == int(dimension)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
 
     def create_entity(self, name, entity_type="person", status="pending", family_role=None, confidence=0.0, summary="", scope_id="home-default"):
         entity_id = make_id("entity")
