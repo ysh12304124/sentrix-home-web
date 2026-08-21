@@ -632,7 +632,7 @@
       const roleLine = topRole ? `${topRole.role} · ${Math.round((topRole.confidence || 0) * 100)}%` : "角色待定";
       const portraitText = item.portrait && item.portrait.portrait_text ? item.portrait.portrait_text : "";
       const portraitLine = portraitText ? `<small class="person-profile-line" title="${escapeHtml(portraitText)}">${escapeHtml(portraitText.length > 60 ? portraitText.slice(0, 60) + "…" : portraitText)}</small>` : "";
-      return `<article class="person-card insight-card"><div class="person-head">${faceAvatar(item.avatar_face_instance_id || "", displayName, item.identity_state === "stable" ? "green" : "gray")}<span class="${item.identity_state === "stable" ? "confirmed" : "needs-label"}">${item.identity_state === "stable" ? "✓ 已确认" : "待确认"}</span></div><h2>${escapeHtml(displayName)}</h2><p>${escapeHtml(item.role_state === "confirmed" ? (item.family_role || "角色已确认") : `系统建议 · ${roleLine}`)}</p>${portraitLine}<div class="person-stats"><span><strong>${item.date_count || 0}</strong> 天</span><span><strong>${item.event_count || 0}</strong> 个事件</span></div><div class="insight-field">${insightRoleSelect(item)}</div><input class="insight-name-input" placeholder="填写姓名（可不填）" /><div class="insight-actions"><button class="button small primary" data-action="confirm-suggested-role" data-person-id="${escapeHtml(item.person_id)}">确认角色</button><button class="button small ghost" data-action="save-person-name" data-person-id="${escapeHtml(item.person_id)}">保存姓名</button><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="like">像他</button><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="dislike">不像他</button><button class="button small ghost" data-action="edit-portrait" data-person-id="${escapeHtml(item.person_id)}">编辑画像</button><button class="button small ghost" data-action="lock-portrait" data-person-id="${escapeHtml(item.person_id)}">锁定</button><button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(item.person_id)}">历史版本</button></div></article>`;
+      return `<article class="person-card insight-card"><div class="person-head">${faceAvatar(item.avatar_face_instance_id || "", displayName, item.identity_state === "stable" ? "green" : "gray")}<span class="${item.identity_state === "stable" ? "confirmed" : "needs-label"}">${item.identity_state === "stable" ? "✓ 已确认" : "待确认"}</span></div><h2>${escapeHtml(displayName)}</h2><p>${escapeHtml(item.role_state === "confirmed" ? (item.family_role || "角色已确认") : `系统建议 · ${roleLine}`)}</p>${portraitLine}<div class="person-stats"><span><strong>${item.date_count || 0}</strong> 天</span><span><strong>${item.event_count || 0}</strong> 个事件</span></div><div class="person-actions"><button class="button small primary" data-action="open-person-insight" data-person-id="${escapeHtml(item.person_id)}">查看 / 处理</button></div></article>`;
     };
     const insights = state.personInsights;
     const tiers = (insights && insights.tiers) || { core: [], common: [], incidental: [] };
@@ -914,6 +914,15 @@
       const batchRelationRow = `<div class="batch-relation-row"><select name="rel_subject"><option value="">成员 A</option>${batchMemberOptions}</select><select name="rel_predicate"><option value="">关系</option>${batchRelationPresets}</select><select name="rel_object"><option value="">成员 B</option>${batchMemberOptions}</select><button type="button" class="text-button" data-action="remove-batch-relation">×</button></div>`;
       const batchCandidateRows = candidates.map((candidate, index) => `<div class="batch-person-row"><div class="batch-person-avatar">${faceAvatar(candidate.avatar_face_instance_id, `成员 ${index + 1}`)}</div><div class="batch-person-fields"><span class="batch-person-label">成员 ${index + 1} · 出现在 ${candidate.photo_count || 0} 张照片</span><div class="batch-person-inputs"><label>姓名或称呼<input name="name_${index}" placeholder="例如：妈妈" /></label><label>家庭角色<select name="role_${index}"><option value="">暂不确认</option>${batchRoleOptions}</select></label></div></div></div>`).join("");
       body = `<form id="modal-form"><div class="modal-kicker">BATCH IDENTITY</div><h2>认识一下照片里的人</h2><p class="modal-lead">为每个常出现的人填姓名和家庭角色；留空则暂不确认。填完后可建立他们之间的关系。</p><div class="batch-person-list">${batchCandidateRows}</div><div class="section-head"><div><p class="section-kicker">人物关系</p><h3>他们之间是什么关系（可选）</h3></div><button type="button" class="button small ghost" data-action="add-batch-relation">${icon("＋")}添加关系</button></div><div class="batch-relation-list">${batchRelationRow}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">批量确认并建立关系</button></div></form>`;
+    } else if (modal.type === "person-insight") {
+      const item = modal.item || {};
+      const roleOptions = ["本人", "父亲", "母亲", "配偶", "孩子", "祖父母", "兄弟姐妹", "其他亲属", "朋友", "同事", "同学", "邻居", "照护者", "老师", "亲友", "访客", "一次性人物", "无法判断"];
+      const roleSelect = `<select class="insight-role-select">${roleOptions.map((role) => `<option ${(item.family_role || "") === role ? "selected" : ""}>${escapeHtml(role)}</option>`).join("")}</select>`;
+      const candidateLine = (item.role_candidates || []).map((candidate) => `${escapeHtml(candidate.role)} ${Math.round((candidate.confidence || 0) * 100)}%`).join("、");
+      const portrait = item.portrait || {};
+      const portraitText = portrait.portrait_text || "还没有生成画像。";
+      const lockedBadge = portrait.status === "user_locked" ? `<span class="suggestion-badge">已锁定</span>` : "";
+      body = `<div class="modal-kicker">PERSON INSIGHT</div><h2>${escapeHtml(item.display_name || "未命名成员")}</h2><p class="modal-lead">${escapeHtml(item.role_state === "confirmed" ? (item.family_role || "角色已确认") : (candidateLine ? `系统建议角色：${candidateLine}` : "系统正在推断角色"))} · ${item.date_count || 0} 天 / ${item.event_count || 0} 个事件</p><div class="section-head"><div><p class="section-kicker">鲜活画像</p><h3>${lockedBadge}当前画像</h3></div></div><div class="profile-note">${escapeHtml(portraitText)}</div><div class="insight-actions"><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="like">像他</button><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="dislike">不像他</button><button class="button small ghost" data-action="edit-portrait" data-person-id="${escapeHtml(item.person_id)}">编辑画像</button><button class="button small ghost" data-action="lock-portrait" data-person-id="${escapeHtml(item.person_id)}">锁定</button><button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(item.person_id)}">历史版本</button></div><div class="section-head"><div><p class="section-kicker">身份确认</p><h3>角色与姓名可独立维护</h3></div></div><div class="insight-field"><label>建议角色${roleSelect}</label></div><button class="button small primary" data-action="confirm-suggested-role" data-person-id="${escapeHtml(item.person_id)}">确认角色</button><div class="insight-field" style="margin-top:10px;"><label>姓名<input class="insight-name-input" value="${escapeHtml(item.name_state === "confirmed" ? (item.display_name || "") : "")}" placeholder="填写姓名（可不填）" /></label></div><button class="button small primary" data-action="save-person-name" data-person-id="${escapeHtml(item.person_id)}">保存姓名</button>`;
     } else if (modal.type === "person-evidence") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -1851,8 +1860,15 @@
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
+    if (action === "open-person-insight") {
+      const personId = element.dataset.personId;
+      const insights = state.personInsights;
+      const tierItem = ((insights && insights.tiers && insights.tiers.core) || []).concat((insights && insights.tiers && insights.tiers.common) || [], (insights && insights.tiers && insights.tiers.incidental) || []).find((item) => item.person_id === personId);
+      if (!tierItem) { state.toast = "人物数据已变化，请刷新"; return renderShellNavigation(); }
+      return openModal({ type: "person-insight", item: tierItem });
+    }
     if (action === "confirm-suggested-role") {
-      const card = element.closest(".insight-card");
+      const card = element.closest(".modal-panel");
       const role = card ? card.querySelector(".insight-role-select").value : "";
       if (!role) { state.toast = "请选择角色"; return renderShellNavigation(); }
       try {
@@ -1866,7 +1882,7 @@
       } catch (error) { state.toast = `角色确认失败：${error.message}`; return renderShellNavigation(); }
     }
     if (action === "save-person-name") {
-      const card = element.closest(".insight-card");
+      const card = element.closest(".modal-panel");
       const name = card ? (card.querySelector(".insight-name-input").value || "").trim() : "";
       if (!name) { state.toast = "请先填写姓名"; return renderShellNavigation(); }
       try {
