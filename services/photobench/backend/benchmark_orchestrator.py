@@ -518,7 +518,11 @@ def upload_files(url: str, fields: dict, files: list[tuple[str, str, bytes]], ti
         return json.loads(resp.read())
 
 
-def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -> dict:
+class RunCancelledError(RuntimeError):
+    """Raised when the orchestrator cancels while waiting on a remote call."""
+
+
+def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, cancelled=None) -> dict:
     """Resolve the asynchronous Sentrix assistant-turn response when necessary."""
     turn_id = response.get("turn_id")
     if not turn_id or response.get("status") not in {"running", "pending"}:
@@ -527,6 +531,8 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -
     deadline = time.monotonic() + timeout
     poll_url = f"{base_url.rstrip('/')}/api/assistant/turn/{quote(str(turn_id))}"
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            raise RunCancelledError(f"run cancelled while waiting for assistant turn {turn_id}")
         state = request_json(poll_url, timeout=min(30, max(1, int(deadline - time.monotonic()))))
         status = str(state.get("status") or "").lower()
         if status in {"complete", "completed", "done", "success"}:
@@ -1020,8 +1026,27 @@ class BenchmarkRun:
         else:
             self.state["status"] = "cancelling"
         self._cancel_remote_batch(source)
+        self._reclaim_vllm_after_cancel()
         with self.lock:
             self.persist()
+
+    def _reclaim_vllm_after_cancel(self) -> None:
+        """Best-effort: terminate a vLLM instance this run started (loading or serving).
+
+        Without this, cancelling during model_deploy leaves the load running on the
+        GPU and the manager keeps serving a model nobody asked for.
+        """
+        try:
+            state = request_json(f"{self.vllm_api_url}/state", timeout=5) or {}
+        except Exception:
+            return
+        run_scope_models = state.get("profile")
+        if run_scope_models and run_scope_models == self.model_profile:
+            try:
+                request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+                self.state["cancel_vllm_stopped"] = now_iso()
+            except Exception as exc:
+                self.state["cancel_vllm_stop_error"] = str(exc)[:300]
 
     def _cancel_remote_batch(self, source: str) -> None:
         batch_id = self.state.get("batch_id")
@@ -1107,6 +1132,10 @@ class BenchmarkRun:
                 self.state["status"] = "cancelled"
             else:
                 self.state["status"] = "completed"
+        except RunCancelledError:
+            if self._current_phase:
+                self._record_phase(self._current_phase, "status", "cancelled")
+            self.state["status"] = "cancelled"
         except Exception as e:
             if self._current_phase:
                 self._record_phase(self._current_phase, "status", "failed")
@@ -1154,6 +1183,61 @@ class BenchmarkRun:
 
     # ---- Phase implementations ----
 
+    def _wait_model_ready(self, ready_timeout: int = 600, health_timeout: int = 180):
+        """Poll manager state + model endpoint until ready; cancel stops the load."""
+        deadline = time.monotonic() + ready_timeout
+        while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                self._stop_managed_vllm()
+                return RunCancelledError("cancelled while loading model")
+            try:
+                state = request_json(f"{self.vllm_api_url}/state", timeout=10) or {}
+            except Exception as exc:
+                state = {}
+                if time.monotonic() >= deadline:
+                    return exc
+            served = state.get("served_model_name") or state.get("profile")
+            if served and served == self.model_profile:
+                base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
+                root = base.rstrip("/").removesuffix("/v1")
+                probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
+                if probe is None:
+                    return None
+            if self._cancel.wait(2):
+                self._stop_managed_vllm()
+                return RunCancelledError("cancelled while loading model")
+        return TimeoutError(f"model not ready within {ready_timeout}s")
+
+    def _probe_model_endpoint(self, state: dict, model_api_root: str, timeout: int = 180, once: bool = False):
+        """Return None when the model endpoint answers; keep retrying until deadline."""
+        deadline = time.monotonic() + timeout
+        health_error = None
+        while True:
+            if self._cancel.is_set():
+                return RunCancelledError("cancelled during model health check")
+            try:
+                request_json(f"{model_api_root}/v1/chat/completions",
+                              {"model": state.get("served_model_name", self.model_profile),
+                               "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                              "POST", 30)
+                return None
+            except Exception as exc:
+                health_error = exc
+                if once or time.monotonic() >= deadline:
+                    if once:
+                        return health_error
+                    raise RuntimeError(
+                        f"vLLM model endpoint did not become ready within {timeout}s: {health_error}"
+                    ) from exc
+                if self._cancel.wait(2):
+                    return RunCancelledError("cancelled during model health check")
+
+    def _stop_managed_vllm(self):
+        try:
+            request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+        except Exception:
+            pass
+
     def _phase_model_deploy(self):
         self._phase_start("model_deploy")
         t0 = time.perf_counter()
@@ -1166,7 +1250,8 @@ class BenchmarkRun:
         t_stop = time.perf_counter() - t_stop0
 
         # 1b. Cooldown — give 153 GPU time to free VRAM before next load
-        time.sleep(5)
+        if self._cancel.wait(5):
+            raise RunCancelledError("cancelled during cooldown")
 
         # 2. Start (load to VRAM) — exponential backoff retry on transient 502/timeout
         backoff_schedule = [10, 30, 60, 180]  # seconds between attempts
@@ -1174,45 +1259,41 @@ class BenchmarkRun:
         t_load0 = time.perf_counter()
         start_error = None
         for attempt in range(max_attempts):
+            if self._cancel.is_set():
+                raise RunCancelledError("cancelled before model start")
             try:
+                # Fire-and-poll: wait_ready=false returns immediately after spawn;
+                # readiness is tracked below with cancel-aware polling so a stop
+                # request can terminate a half-loaded model instead of blocking.
                 request_json(f"{self.vllm_api_url}/start",
-                              {"profile": self.model_profile, "wait_ready": True, "ready_timeout": 600},
-                              "POST", 700)
-                start_error = None
-                break
+                              {"profile": self.model_profile, "wait_ready": False},
+                              "POST", 120)
+                start_error = self._wait_model_ready()
+                if start_error is None:
+                    break
+            except RunCancelledError:
+                raise
             except Exception as exc:
                 start_error = exc
-                if attempt < max_attempts - 1:
-                    wait = backoff_schedule[attempt]
-                    time.sleep(wait)
+            if attempt < max_attempts - 1:
+                wait = backoff_schedule[attempt]
+                if self._cancel.wait(wait):
+                    raise RunCancelledError("cancelled during start backoff")
         if start_error is not None:
             raise RuntimeError(
                 f"vLLM /start failed after {max_attempts} attempts: {start_error}"
             ) from start_error
         t_load = time.perf_counter() - t_load0
 
-        # 3. Health check
+        # 3. Health check (cancel-aware)
         state = request_json(f"{self.vllm_api_url}/state", timeout=10)
         port = state.get("port", 8105)
         base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
         t_health0 = time.perf_counter()
-        health_deadline = time.monotonic() + 180
-        health_error = None
-        while True:
-            try:
-                request_json(f"{model_api_root}/v1/chat/completions",
-                              {"model": state.get("served_model_name", self.model_profile),
-                               "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                              "POST", 30)
-                break
-            except Exception as exc:
-                health_error = exc
-                if time.monotonic() >= health_deadline:
-                    raise RuntimeError(
-                        f"vLLM model endpoint did not become ready within 180s: {health_error}"
-                    ) from exc
-                time.sleep(2)
+        health_error = self._probe_model_endpoint(state, model_api_root)
+        if health_error is not None:
+            raise health_error
         t_health = time.perf_counter() - t_health0
 
         # 4. Sync .100 Sentrix gamma client to the new model (no restart)
@@ -1514,7 +1595,8 @@ class BenchmarkRun:
                     "message": message, "scope_id": self.state["scope_id"],
                     "conversation_id": conversation_id, "viewer_id": "owner", "include_debug": True,
                 }, "POST", 300)
-                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900)
+                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900,
+                                               cancelled=self._cancel.is_set)
                 turn_metrics = resp.get("model_call_metrics", [])
                 turn_trace = resp.get("retrieval_trace") or resp.get("retrievalTrace") or []
                 turn_tools = resp.get("tool_trace") or resp.get("toolTrace") or []
