@@ -1544,9 +1544,19 @@ class BenchmarkRun:
                     self.persist()
         else:
             import concurrent.futures
+            # Warmup probe: run the first question alone so any cold-start effect
+            # (fresh vLLM instance, freshly restarted backend) is absorbed by one
+            # question instead of multiplying across the whole concurrent batch.
+            first_item = self._evaluate_one(self.qa_rows[0], assets_by_name)
+            with self.lock:
+                self.state["items"].append({**first_item, "_index": 0})
+                self._qa_submitted = 1
+                record_qa_progress()
+                self.persist()
+            remaining = list(enumerate(self.qa_rows))[1:]
             with concurrent.futures.ThreadPoolExecutor(max_workers=qa_concurrency, thread_name_prefix="qa-eval") as executor:
                 future_map = {executor.submit(self._evaluate_one, row, assets_by_name): index
-                              for index, row in enumerate(self.qa_rows)}
+                              for index, row in remaining}
                 self._qa_submitted = total_qa
                 for future in concurrent.futures.as_completed(future_map):
                     index = future_map[future]
