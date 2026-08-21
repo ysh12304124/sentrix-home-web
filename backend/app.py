@@ -786,8 +786,8 @@ _OCR_SETTING_KEY = "ocr.small_enabled"
 
 def _ocr_settings():
     from .agent_runtime.tools import small_ocr_available
-    enabled = store.get_setting(_OCR_SETTING_KEY, "false").lower() in {"1", "true", "on"}
     available = small_ocr_available()
+    enabled = store.get_setting(_OCR_SETTING_KEY, "true" if available else "false").lower() in {"1", "true", "on"}
     return {
         "small_ocr_enabled": enabled,
         "small_ocr_available": available,
@@ -1939,7 +1939,9 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             model_call_metrics.extend(metrics)
         return text
 
-    _ocr_setting = store.get_setting("ocr.small_enabled", "false").lower() in {"1", "true", "on"}
+    from .agent_runtime.tools import small_ocr_available
+    _ocr_setting = store.get_setting(
+        "ocr.small_enabled", "true" if small_ocr_available() else "false").lower() in {"1", "true", "on"}
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            ocr_settings={"small_ocr_enabled": _ocr_setting},
                            scope_id=scope_id, viewer_id=viewer_id,
