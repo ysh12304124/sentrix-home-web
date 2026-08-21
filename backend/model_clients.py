@@ -1120,6 +1120,47 @@ metadata: {json.dumps(metadata or {}, ensure_ascii=False)}"""
         parsed["model"] = self.model
         return parsed
 
+    def write_person_portrait(self, pack, role="writer"):
+        """Generate a hedged, evidence-bound living portrait from a bounded pack."""
+        from .person_portraits import PERSON_PORTRAIT_PROMPT, normalize_writer_output
+
+        prompt = PERSON_PORTRAIT_PROMPT + "\n证据包：" + json.dumps(pack, ensure_ascii=False)
+        parsed = parse_json_response(self.chat(prompt, json_mode=True, role=role))
+        return normalize_writer_output(parsed)
+
+    def infer_person_graph(self, paths, graph_payload, role="verify"):
+        """Infer album owner, roles and relationships from anonymized person refs."""
+        from .person_graph import PERSON_GRAPH_PROMPT, normalize_person_graph
+
+        images = []
+        for path in list(paths or [])[:12]:
+            encoded, mime_type = self.encode_vision_image(Path(path))
+            images.append({"base64": encoded, "mime_type": mime_type})
+        prompt = PERSON_GRAPH_PROMPT + "\n匿名人物与证据：" + json.dumps(
+            graph_payload or {}, ensure_ascii=False
+        )
+        parsed = parse_json_response(self.chat(
+            prompt, images, self._core_vision_options(), role=role,
+        ))
+        people = list(graph_payload.get("people") or []) if isinstance(graph_payload, dict) else []
+        return normalize_person_graph(parsed, people)
+
+    def analyze_person_moments(self, path, labels, context=None):
+        """Extract evidence-bound person moments from a numbered preview image."""
+        from .person_moments import PERSON_MOMENT_PROMPT, normalize_person_moments
+
+        encoded, mime_type = self.encode_vision_image(path)
+        prompt = PERSON_MOMENT_PROMPT
+        if context:
+            prompt += "\n图片上下文：" + json.dumps(context, ensure_ascii=False)
+        parsed = parse_json_response(self.chat(
+            prompt,
+            [{"base64": encoded, "mime_type": mime_type}],
+            vision_options=self._core_vision_options(),
+            role="verify",
+        ))
+        return {"moments": normalize_person_moments(parsed, labels)}
+
     def analyze_person_appearance(self, path, metadata=None):
         """Extract clothing only for the person represented by a body crop."""
         file_path = Path(path)

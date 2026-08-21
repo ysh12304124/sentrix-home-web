@@ -329,6 +329,51 @@ class ModelClientTests(unittest.TestCase):
         self.assertNotRegex(result["summary"], r"30\.2458|120\.2989|坐标")
         self.assertIn("餐厅", result["summary"])
 
+    def test_analyze_person_moments_uses_verify_role_and_disables_thinking(self):
+        client = GammaClient(backend="vllm")
+        captured = {}
+
+        def fake_chat(prompt, images=None, vision_options=None, json_mode=True, role=None):
+            captured["role"] = role
+            captured["vision_options"] = vision_options
+            return json.dumps({"moments": [{
+                "label": "P1", "action_text": "抱着孩子", "interaction_labels": [],
+                "interaction_text": "", "participation_style": "照顾",
+                "visible_affect": "微笑", "social_role_cues": [],
+                "narrative_note": "", "confidence": 0.8,
+            }]})
+
+        with tempfile.TemporaryDirectory() as td:
+            image_path = f"{td}/preview.jpg"
+            Image.new("RGB", (100, 80), "white").save(image_path)
+            with patch.object(client, "chat", side_effect=fake_chat):
+                result = client.analyze_person_moments(
+                    image_path, ["P1"], {"asset_id": "a1"}
+                )
+        self.assertEqual(captured["role"], "verify")
+        self.assertFalse(captured["vision_options"]["think"])
+        self.assertEqual(result["moments"][0]["label"], "P1")
+        self.assertEqual(result["moments"][0]["action_text"], "抱着孩子")
+
+    def test_write_person_portrait_forwards_repair_role(self):
+        client = GammaClient(backend="vllm")
+        captured = {}
+
+        def fake_chat(prompt, images=None, vision_options=None, json_mode=True, role=None):
+            captured["role"] = role
+            return json.dumps({
+                "portrait_text": "从照片看，这位家庭成员常常把大家聚在一起，反复照顾孩子。",
+                "themes": [{
+                    "title": "把大家聚在一起", "summary": "常见于聚会",
+                    "evidence_refs": [{"kind": "person_moment", "id": "moment_x"}],
+                }],
+            })
+
+        with patch.object(client, "chat", side_effect=fake_chat):
+            result = client.write_person_portrait({"person": {"id": "p1"}}, role="repair")
+        self.assertEqual(captured["role"], "repair")
+        self.assertIn("portrait_text", result)
+
 
 if __name__ == "__main__":
     unittest.main()
