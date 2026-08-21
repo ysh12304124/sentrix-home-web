@@ -58,6 +58,7 @@
     confirmRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/confirm`, { method: "POST" }),
     retractRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/retract`, { method: "POST" }),
     confirmPerson: (id, name, familyRole = "") => request(`/api/persons/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify({ name, family_role: familyRole }) }),
+    batchConfirmPeople: (items) => request("/api/people/batch-confirm", { method: "POST", body: JSON.stringify({ items }) }),
     renamePerson: (id, payload) => request(`/api/people/${encodeURIComponent(id)}/rename`, { method: "POST", body: JSON.stringify(payload) }),
     assistantTurnAsync: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner", selectedAsset = null) => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, selected_asset_handle: (selectedAsset && selectedAsset.handle) || null, selected_result_set_id: (selectedAsset && selectedAsset.result_set_id) || null, viewer_id: viewerId || "owner" }) }),
     assistantTurnPoll: (turnId) => request(`/api/assistant/turn/${encodeURIComponent(turnId)}`),

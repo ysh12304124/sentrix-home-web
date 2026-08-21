@@ -26,7 +26,7 @@ PROFILES = {
     "goal_driven_candidate": ProfileConfig(
         name="goal_driven_candidate",
         tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
-               "inspect_photo", "read_photo_text", "search_conversation_history"),
+               "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,
         max_inspections=1,
@@ -38,7 +38,7 @@ PROFILES = {
     "goal_driven_shadow": ProfileConfig(
         name="goal_driven_shadow",
         tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
-               "inspect_photo", "read_photo_text", "search_conversation_history"),
+               "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,
         max_inspections=1,
@@ -50,7 +50,7 @@ PROFILES = {
     "tool_loop_shadow": ProfileConfig(
         name="tool_loop_shadow",
         tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
-               "inspect_photo", "read_photo_text", "search_conversation_history"),
+               "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=6,
         max_tool_calls=4,
         max_inspections=1,
@@ -61,7 +61,7 @@ PROFILES = {
     "tool_loop": ProfileConfig(
         name="tool_loop",
         tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
-               "inspect_photo", "read_photo_text", "search_conversation_history"),
+               "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,
         max_inspections=1,

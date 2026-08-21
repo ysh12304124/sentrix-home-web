@@ -57,7 +57,7 @@ class ToolPolicy:
         "remaining", "counts", "coverage", "facts", "items", "completeness",
         "unresolved", "delivered", "blocked", "observation", "certainty",
         "confirms_visual_only", "source", "persisted", "question", "asset_handle",
-        "reason", "url", "status", "_model_call_metrics",
+        "reason", "url", "status", "family_role", "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
@@ -91,6 +91,11 @@ class ToolPolicy:
             "event_count", "entity_binding_coverage", "first_occurrence",
             "last_occurrence", "common_places", "co_occurrence", "events",
             "representative_events", "insufficient_evidence", "note",
+        },
+        "get_person_profile": _DEFAULT_ALLOWED | {
+            "person", "readiness", "insufficient_evidence", "note",
+            "preference_summary", "relationships", "patterns",
+            "recent_events", "claims", "profile_text",
         },
     }
 

@@ -587,6 +587,138 @@ def _extract_time_from_query(query: str) -> str | None:
     return None
 
 
+def _canonical_search_enabled() -> bool:
+    from .canonical_intent import canonical_enabled
+    return canonical_enabled()
+
+
+def _event_resolution(question: str, store, scope_id: str) -> dict | None:
+    """W2.4：多轮引用解析到 Event（turn-0 无结果集时的二级锚）。
+
+    从问题提取时间/人物/活动线索，在 events 表里召回候选（用 time/participants/place/activity，
+    不只看 title），单候选高置信时返回其资产，否则 None（交回普通检索/澄清）。
+    """
+    from .canonical_intent import extract_time
+    if store is None or not scope_id:
+        return None
+    t = extract_time(question)
+    # 直接查 entities 表解析人物（绕过 list_entities 的 include_in_people 过滤，benchmark scope 也能用）
+    persons = []
+    try:
+        for ent in store.connection.execute(
+                "SELECT id, canonical_name, family_role FROM entities "
+                "WHERE scope_id=? AND entity_type='person' AND status='confirmed'",
+                (scope_id,)).fetchall():
+            for alias in (ent["canonical_name"], ent["family_role"]):
+                if alias and alias != "自己" and alias in question:
+                    persons.append(ent["id"])
+                    break
+    except Exception:
+        pass
+    try:
+        rows = store.connection.execute(
+            "SELECT id,title,place,activity,participants_json,substr(time_start,1,10) AS ts,"
+            "substr(time_start,1,7) AS ym FROM events "
+            "WHERE scope_id=? AND status NOT IN ('rejected','superseded','merged')", (scope_id,)).fetchall()
+    except Exception:
+        return None
+    scored = []
+    for r in rows:
+        score = 0
+        if t:
+            if r["ts"] and r["ts"].startswith(t[:10]):
+                score += 3
+            elif r["ym"] and r["ym"].startswith(t[:7]):
+                score += 2
+        for pid in persons:
+            if str(pid) in (r["participants_json"] or ""):
+                score += 3
+        # 数据驱动的文本重叠：问题与事件 title/place/activity 的中文子串匹配（不硬编码任何关键词）
+        hay = " ".join(str(x) for x in (r["title"], r["place"], r["activity"]) if x)
+        overlap = 0
+        for length in (4, 3, 2):
+            ngrams = {hay[i:i + length] for i in range(max(0, len(hay) - length + 1))
+                      if len(hay[i:i + length]) == length and not any(c.isdigit() for c in hay[i:i + length])}
+            for ng in ngrams:
+                if ng in question:
+                    overlap += 1
+                    break
+        score += min(overlap, 2)
+        if score:
+            scored.append((score, r["id"], r["title"]))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    top, second = scored[0], scored[1] if len(scored) > 1 else None
+    # 单候选高置信，或多候选但第一明显领先
+    if top[0] >= 2 and (second is None or top[0] - second[0] >= 1):
+        eid = top[1]
+        assets = store.connection.execute(
+            "SELECT DISTINCT a.id FROM assets a JOIN observations o ON o.asset_id=a.id "
+            "JOIN event_observations eo ON eo.observation_id=o.id WHERE eo.event_id=? "
+            "AND a.scope_id=?", (eid, scope_id)).fetchall()
+        asset_ids = [a["id"] for a in assets]
+        if asset_ids:
+            return {"event_id": eid, "event_title": top[2], "asset_ids": asset_ids[:50]}
+    return None
+
+
+_REFERENT_MARKERS = ("就是", "那次", "这次", "刚才", "上次", "那个", "这个", "那一次", "这一次")
+
+
+def _is_referent_query(query: str) -> bool:
+    """W2.3：判断是否为多轮引用类 query（指代上一次的实体/结果集，而非全新检索）。"""
+    q = (query or "").strip()
+    if not q:
+        return False
+    return any(m in q for m in _REFERENT_MARKERS)
+
+
+def _search_from_prior_result_set(prior_rs, scope_id: str) -> dict | None:
+    """W2.3：基于已有 ResultSet 构建检索响应（不重新全库搜索）。"""
+    if prior_rs is None:
+        return None
+    asset_ids = list(prior_rs.asset_ids or [])
+    store = _RUNTIME.get("store")
+    preview = []
+    handles = prior_rs.handles() if hasattr(prior_rs, "handles") else {}
+    for i, aid in enumerate(asset_ids[:6]):
+        handle = f"photo_{i + 1}"
+        place = ""
+        captured_at = None
+        if store is not None:
+            try:
+                asset = store.get_asset(aid) or {}
+                captured_at = asset.get("captured_at")
+                place = _short_place_label(asset)
+            except Exception:
+                pass
+        preview.append({"handle": handle, "captured_at": captured_at, "level": "exact",
+                        "place": place, "media_kind": "original_image", "condition_summary": {}})
+    _RUNTIME["last_handles"] = handles
+    return {
+        "result_set_id": prior_rs.result_set_id,
+        "query": f"(引用已有结果集 {prior_rs.result_set_id})",
+        "mode": "best",
+        "total": len(asset_ids),
+        "asset_ids": asset_ids[:50],
+        "evidence_count": len(asset_ids),
+        "preview": preview,
+        "has_more": len(asset_ids) > len(preview),
+        "remaining": max(0, len(asset_ids) - len(preview)),
+        "completeness": "complete",
+        "gaps": [],
+        "query_satisfaction": "full_support" if asset_ids else "no_match",
+        "answerability": "full" if asset_ids else "none",
+        "condition_summary": {},
+        "can_inspect": len(preview) > 0,
+        "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
+        "recommended_resolution": _recommended_resolution("(引用已有结果集)", preview,
+                                                          "full_support" if asset_ids else "no_match"),
+        "reference_resolution": True,
+    }
+
+
 def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     query = arguments.get("query") or ""
     mode = arguments.get("mode") or "best"
@@ -598,6 +730,44 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         if extracted:
             filters["time"] = extracted
     scope_id = (context or {}).get("scope_id") or ""
+    # P2: Canonical Retrieval Intent（candidate）—— 从用户原问题确定性提取结构化约束，
+    # 强信号（时间+地点）时覆盖 LLM 构建的 filters 并走确定性元数据路径，消除 paraphrase 漂移。
+    if _canonical_search_enabled():
+        from .canonical_intent import extract_constraints
+        user_message = ((context or {}).get("task_state") or {}).get("user_goal") or arguments.get("query") or ""
+
+        ci = extract_constraints(user_message, _RUNTIME.get("store"), scope_id)
+        if ci.get("strong"):
+            if ci.get("time"):
+                filters["time"] = ci["time"]
+            if ci.get("place"):
+                filters["place"] = ci["place"]
+            if ci.get("person"):
+                filters["person"] = ci["person"]
+            query = ""
+    # W2.3：多轮引用消解 —— 引用类 query 先解析到已有 current_result_set，不重新全库搜索。
+    # 引用标记在用户原话（task_state.user_goal）里，search query 是 LLM 提取后的内容，故两者都检测。
+    _user_msg = ((context or {}).get("task_state") or {}).get("user_goal") or ""
+    if _is_referent_query(query) or _is_referent_query(_user_msg):
+        prior_rs_id = ((context or {}).get("task_state") or {}).get("current_result_set")
+        prior_rs = None
+        if prior_rs_id:
+            rs_store = _RUNTIME.get("result_sets")
+            if rs_store is not None and hasattr(rs_store, "get"):
+                try:
+                    prior_rs = rs_store.get(prior_rs_id)
+                except Exception:
+                    prior_rs = None
+        anchored = _search_from_prior_result_set(prior_rs, scope_id)
+        if anchored is not None:
+            return anchored
+        # W2.4：turn-0 无结果集时，引用解析到 Event（二级锚）
+        ev = _event_resolution(_user_msg, _RUNTIME.get("store"), scope_id)
+        if ev:
+            _ns = type("RS", (), {})()
+            _ns.asset_ids = ev["asset_ids"]
+            _ns.result_set_id = "event_" + ev["event_id"]
+            return _search_from_prior_result_set(_ns, scope_id)
     viewer_id = (context or {}).get("viewer_id") or "owner"
     draft = _draft_from_filters({**filters, "query": query}, answer_type="asset_set")
     draft.result_requirement = {"mode": mode}
@@ -1295,6 +1465,60 @@ def _cap_hint(tool: str) -> str:
         return ""
 
 
+def person_profile_summary(person: str, scope_id: str = "") -> str:
+    """Compact Chinese profile summary for a confirmed person; '' when unavailable."""
+    try:
+        ent = _resolve_person_entity(person, scope_id)
+        store = _RUNTIME.get("store")
+        if ent is None or store is None:
+            return ""
+        digest = store.person_profile_digest(ent["id"], scope_id)
+        if not digest or not digest.get("summary_zh"):
+            return ""
+        lines = []
+        if digest.get("family_role"):
+            lines.append(f"家庭角色：{digest['family_role']}")
+        if digest.get("relationships"):
+            lines.append("关系：" + "、".join(f"{r.get('other_name')}（{r.get('predicate')}）" for r in digest["relationships"]))
+        if digest.get("preference_summary_zh"):
+            lines.append(digest["preference_summary_zh"])
+        titles = [e.get("title") or "" for e in (digest.get("recent_events") or []) if e.get("title")]
+        if titles:
+            lines.append("近期事件：" + "、".join(titles))
+        return "；".join(lines) or digest.get("summary_zh")
+    except Exception:
+        return ""
+
+
+def _get_person_profile(arguments: dict, *, context: dict | None = None) -> dict:
+    person = (arguments.get("person") or "").strip()
+    scope_id = (context or {}).get("scope_id") or ""
+    ent = _resolve_person_entity(person, scope_id)
+    if ent is None:
+        return {"person": person, "readiness": "limited", "insufficient_evidence": True,
+                "summary": f"没有找到已确认人物「{person}」的画像。",
+                "note": "人物未确认或数据不足时返回 limited，不编造。"}
+    store = _RUNTIME.get("store")
+    digest = store.person_profile_digest(ent["id"], scope_id) if store else None
+    if not digest or not digest.get("summary_zh"):
+        return {"person": person, "readiness": "limited", "insufficient_evidence": True,
+                "summary": f"「{person}」暂无足够的人物画像数据。",
+                "note": "画像数据不足时返回 limited，不编造。"}
+    return {
+        "person": digest.get("person"),
+        "family_role": digest.get("family_role") or "",
+        "readiness": "ready",
+        "summary": digest.get("summary_zh") or "",
+        "preference_summary": digest.get("preference_summary_zh") or "",
+        "relationships": digest.get("relationships") or [],
+        "patterns": digest.get("patterns") or [],
+        "recent_events": digest.get("recent_events") or [],
+        "claims": digest.get("claims") or [],
+        "profile_text": person_profile_summary(person, scope_id),
+        "note": "画像来自已确认人物的语义记忆；性格等无法由证据确认的问题应回答 insufficient evidence。",
+    }
+
+
 def register_tools():
 
     register(ToolSpec(
@@ -1350,7 +1574,7 @@ def register_tools():
     register(ToolSpec(
         name="read_photo_text",
         description=("读取照片中的文字内容（菜单/价格/招牌/店名/电话/年份/小字）。"
-                     "适用于'多少钱/价格/售价/店名/招牌/电话/写了什么/什么字/创始于哪一年'等需要看照片文字的题；"
+                     "适用于'多少钱/价格/售价/店名/招牌/电话/写了什么/什么字/哪一年'等需要看照片文字的题；"
                      "内部会把照片切块放大后 OCR。asset_handle 用 search_memories preview 里的 handle，可省略（默认预览第一张）。"
                      "昂贵，每轮最多 1 次。"
                      + _cap_hint("read_photo_text")),
@@ -1388,4 +1612,13 @@ def register_tools():
         input_schema={"person": "", "operation": "overview|first_occurrence|last_occurrence|common_places|co_occurrence|events"},
         executor=_get_person_memory, read_write="read", cost_class="cheap", readiness="ready",
         produces_evidence=("confirmed_identity", "structured_fact", "location_metadata"),
+    ))
+    register(ToolSpec(
+        name="get_person_profile",
+        description=("读取已确认人物的高维画像（长期记忆）：家庭角色、人物关系、常去地点/常做活动/常同行、近期事件与语义声明。"
+                     "人物未确认或画像数据不足时返回 limited，要如实说明，不要编造。"
+                     "性格等主观问题：照片无法确认时回答 insufficient evidence。"),
+        input_schema={"person": ""},
+        executor=_get_person_profile, read_write="read", cost_class="cheap", readiness="ready",
+        produces_evidence=("confirmed_identity", "structured_fact"),
     ))

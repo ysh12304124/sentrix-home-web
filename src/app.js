@@ -607,12 +607,15 @@
     const pending = state.persons.filter((person) => !person.confirmed);
     const primary = visible.filter((person) => person.confirmed || !person.single_sample);
     const singles = visible.filter((person) => !person.confirmed && person.single_sample);
+    const batchCandidates = pending.filter((person) => !person.single_sample).sort((a, b) => (b.photo_count || 0) - (a.photo_count || 0));
     const personCard = (person, index) => {
       const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`;
       const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : "";
-      return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${caution}<div class="person-stats">${person.confirmed ? `<span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>✓</strong> 已确认</span>` : `<span><strong>${person.cluster_count || 0}</strong> 个人物簇</span><span>待确认</span>`}</div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`}</div></article>`;
+      const profileText = person.confirmed ? (person.profile?.preference_summary_zh || person.profile?.summary_zh || "") : "";
+      const profileLine = person.confirmed && profileText ? `<small class="person-profile-line" title="${escapeHtml(profileText)}">${escapeHtml(profileText)}</small>` : "";
+      return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${profileLine}${caution}<div class="person-stats">${person.confirmed ? `<span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>✓</strong> 已确认</span>` : `<span><strong>${person.cluster_count || 0}</strong> 个人物簇</span><span>待确认</span>`}</div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? `<button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(person.id)}">画像</button>` : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`}</div></article>`;
     };
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会折叠在下方，仍可展开查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${primary.length ? primary.map((person, index) => personCard(person, index)).join("") : emptyState(singles.length ? "没有待确认的多人物簇" : "还没有人物候选", singles.length ? "单样本候选折叠在下方，可能是小脸或误检。" : "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", singles.length ? "" : `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>${singles.length ? `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">单张样本（${singles.length}）· 可能是小脸或误检，展开后谨慎确认</summary><div class="people-grid" style="margin-top:12px;">${singles.map((person, index) => personCard(person, primary.length + index)).join("")}</div></details>` : ""}`;
+    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会折叠在下方，仍可展开查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div>${batchCandidates.length >= 2 ? `<div class="people-banner"><div><strong>我在照片里发现了 ${batchCandidates.length} 个常出现的人</strong><small>先给他们命名并设定家庭角色，系统会在此基础上持续积累每个人的记忆和关系。</small></div><button class="button primary" data-action="batch-confirm">${icon("＋")}批量命名</button></div>` : ""}<section class="people-grid">${primary.length ? primary.map((person, index) => personCard(person, index)).join("") : emptyState(singles.length ? "没有待确认的多人物簇" : "还没有人物候选", singles.length ? "单样本候选折叠在下方，可能是小脸或误检。" : "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", singles.length ? "" : `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>${singles.length ? `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">单张样本（${singles.length}）· 可能是小脸或误检，展开后谨慎确认</summary><div class="people-grid" style="margin-top:12px;">${singles.map((person, index) => personCard(person, primary.length + index)).join("")}</div></details>` : ""}`;
   }
 
   function knowledgeView() {
@@ -873,6 +876,14 @@
     } else if (modal.type === "person") {
       const person = modal.person;
       body = `<form id="modal-form"><div class="modal-kicker">IDENTITY CONFIRMATION · ${escapeHtml(person.id)}</div><h2>确认人物身份</h2><p class="modal-lead">只在这里填写姓名和家庭角色。确认后会把该人物回写到相关事件、人物画像和语义记忆。</p><label>家庭成员名称<input name="name" value="" placeholder="确认时填写名称" required /></label><label>家庭角色<select name="family_role"><option value="">暂不确认</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认并更新记忆</button></div></form>`;
+    } else if (modal.type === "batch-person") {
+      const candidates = modal.candidates || [];
+      const batchRoleOptions = ["母亲", "父亲", "孩子", "祖父母", "其他家庭成员"].map((role) => `<option>${escapeHtml(role)}</option>`).join("");
+      const batchRelationPresets = ["配偶", "丈夫", "妻子", "父亲", "母亲", "儿子", "女儿", "兄弟", "姐妹", "祖父", "祖母", "外祖父", "外祖母", "本人"].map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join("");
+      const batchMemberOptions = candidates.map((candidate, index) => `<option value="${index}">成员 ${index + 1}</option>`).join("");
+      const batchRelationRow = `<div class="batch-relation-row"><select name="rel_subject"><option value="">成员 A</option>${batchMemberOptions}</select><select name="rel_predicate"><option value="">关系</option>${batchRelationPresets}</select><select name="rel_object"><option value="">成员 B</option>${batchMemberOptions}</select><button type="button" class="text-button" data-action="remove-batch-relation">×</button></div>`;
+      const batchCandidateRows = candidates.map((candidate, index) => `<div class="batch-person-row"><div class="batch-person-avatar">${faceAvatar(candidate.avatar_face_instance_id, `成员 ${index + 1}`)}</div><div class="batch-person-fields"><span class="batch-person-label">成员 ${index + 1} · 出现在 ${candidate.photo_count || 0} 张照片</span><div class="batch-person-inputs"><label>姓名或称呼<input name="name_${index}" placeholder="例如：妈妈" /></label><label>家庭角色<select name="role_${index}"><option value="">暂不确认</option>${batchRoleOptions}</select></label></div></div></div>`).join("");
+      body = `<form id="modal-form"><div class="modal-kicker">BATCH IDENTITY</div><h2>认识一下照片里的人</h2><p class="modal-lead">为每个常出现的人填姓名和家庭角色；留空则暂不确认。填完后可建立他们之间的关系。</p><div class="batch-person-list">${batchCandidateRows}</div><div class="section-head"><div><p class="section-kicker">人物关系</p><h3>他们之间是什么关系（可选）</h3></div><button type="button" class="button small ghost" data-action="add-batch-relation">${icon("＋")}添加关系</button></div><div class="batch-relation-list">${batchRelationRow}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">批量确认并建立关系</button></div></form>`;
     } else if (modal.type === "person-evidence") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -906,7 +917,26 @@
       }).join("");
       const aliases = Array.isArray(entity.aliases) ? entity.aliases : [];
       const aliasLine = aliases.length ? `<div class="person-aliases"><strong>其他称呼</strong><span>${aliases.map(escapeHtml).join("、")}</span></div>` : "";
-      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(detail.profile?.summary_zh || entity.summary || "暂无人物画像") + "</p>" + aliasLine + "</div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div><div class=\"section-head\"><div><p class=\"section-kicker\">用户维护档案</p><h3>身份、关系与圈子</h3></div><button class=\"button small ghost\" data-action=\"edit-person-name\">编辑名字</button><button class=\"button small ghost\" data-action=\"edit-person-properties\">修正档案</button></div><div class=\"property-list\">" + (identityRows || emptyState("尚未维护身份属性", "这些字段只由你维护，模型不会覆盖。")) + "</div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
+      const profile = detail.profile || {};
+      const preference = profile.preference_summary_zh || "";
+      const relationshipRows = (detail.relationships || []).filter((r) => r.status === "active" || r.status === "pending").map((r) => {
+        const other = r.subject_entity_id === entity.id ? r.object_name : (r.object_entity_id === entity.id ? r.subject_name : (r.subject_name || r.object_name || ""));
+        return `<div class="property-row"><strong>${escapeHtml(other)} · ${escapeHtml(r.predicate || "关系")}</strong><small>${escapeHtml(r.status)} · 置信度 ${Math.round((r.confidence || 0) * 100)}%</small></div>`;
+      }).join("");
+      const patternGroups = {};
+      (detail.patterns || []).forEach((p) => { (patternGroups[p.pattern_type] = patternGroups[p.pattern_type] || []).push(p); });
+      const patternLabels = { activity: "常做活动", place: "常去地点", co_person: "常同行", clothing: "常穿" };
+      const patternRows = Object.keys(patternGroups).map((type) => {
+        const label = patternLabels[type] || type;
+        const items = patternGroups[type].map((p) => `${escapeHtml(p.value_text)}（${p.support_count || 0} 次）`).join("、");
+        return `<div class="property-row"><strong>${escapeHtml(label)}</strong><small>${items}</small></div>`;
+      }).join("");
+      const eventRows = (detail.event_memory || []).slice(0, 4).map((ev) => {
+        const time = ev.time_start ? String(ev.time_start).slice(0, 10) : "";
+        return `<div class="property-row"><strong>${escapeHtml(ev.activity_text || "家庭记录")}</strong><small>${escapeHtml(ev.place_text || "")}${time ? " · " + escapeHtml(time) : ""}</small></div>`;
+      }).join("");
+      const behaviorSection = (preference || patternRows || relationshipRows || eventRows) ? `<div class="section-head"><div><p class="section-kicker">高维画像</p><h3>行为规律与关系</h3></div><button class="button small ghost" data-action="relationship-graph">关系图</button></div>${preference ? `<div class="profile-note">${escapeHtml(preference)}</div>` : ""}${patternRows ? `<div class="property-list">${patternRows}</div>` : ""}${relationshipRows ? `<div class="section-head"><div><p class="section-kicker">人物关系</p><h3>家庭关系</h3></div></div><div class="property-list">${relationshipRows}</div>` : ""}${eventRows ? `<div class="section-head"><div><p class="section-kicker">近期事件</p><h3>人物近期经历</h3></div></div><div class="property-list">${eventRows}</div>` : ""}` : "";
+      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(profile.summary_zh || entity.summary || "暂无人物画像") + "</p>" + aliasLine + "</div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div>" + behaviorSection + "<div class=\"section-head\"><div><p class=\"section-kicker\">用户维护档案</p><h3>身份、关系与圈子</h3></div><button class=\"button small ghost\" data-action=\"edit-person-name\">编辑名字</button><button class=\"button small ghost\" data-action=\"edit-person-properties\">修正档案</button></div><div class=\"property-list\">" + (identityRows || emptyState("尚未维护身份属性", "这些字段只由你维护，模型不会覆盖。")) + "</div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
     } else if (modal.type === "person-property-edit") {
       const detail = modal.detail;
       const properties = new Map((detail.properties || []).map((item) => [item.property_key, item]));
@@ -1595,6 +1625,36 @@
           state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
         }
       }
+      if (modal.type === "batch-person") {
+        const candidates = modal.candidates || [];
+        const items = [];
+        candidates.forEach((candidate, index) => {
+          const name = String(form.get(`name_${index}`) || "").trim();
+          if (!name) return;
+          items.push({ person_id: candidate.id, name, family_role: String(form.get(`role_${index}`) || "").trim() });
+        });
+        if (!items.length) { state.toast = "至少为一个成员填写姓名"; renderShellNavigation(); return; }
+        const batch = await window.sentrixApi.batchConfirmPeople(items);
+        const nameToEntity = {};
+        (batch.confirmed || []).forEach((row) => { nameToEntity[row.name] = row.entity_id; });
+        const relSubjects = form.getAll("rel_subject");
+        const relPredicates = form.getAll("rel_predicate");
+        const relObjects = form.getAll("rel_object");
+        for (let k = 0; k < relSubjects.length; k++) {
+          const subjectIdx = relSubjects[k];
+          const predicate = String(relPredicates[k] || "").trim();
+          const objectIdx = relObjects[k];
+          if (subjectIdx === "" || objectIdx === "" || !predicate || subjectIdx === objectIdx) continue;
+          const subjectName = String(form.get(`name_${subjectIdx}`) || "").trim();
+          const objectName = String(form.get(`name_${objectIdx}`) || "").trim();
+          const subjectEntity = nameToEntity[subjectName];
+          const objectEntity = nameToEntity[objectName];
+          if (!subjectEntity || !objectEntity) continue;
+          await window.sentrixApi.createRelationship({ subject_entity_id: subjectEntity, predicate, object_entity_id: objectEntity, confidence: 1, status: "active" });
+        }
+        const mergedCount = (batch.confirmed || []).filter((row) => row.merged).length;
+        state.toast = `已确认 ${batch.count || (batch.confirmed || []).length} 位家庭成员${mergedCount ? `，其中 ${mergedCount} 个名字与已有成员合并` : ""}`;
+      }
       if (modal.type === "cluster-merge") {
         await window.sentrixApi.mergeFaceClusters(form.get("target_cluster_id"), modal.cluster.id);
       }
@@ -1760,6 +1820,17 @@
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
+    if (action === "batch-confirm") { const candidates = state.persons.filter((person) => !person.confirmed && !person.single_sample).sort((a, b) => (b.photo_count || 0) - (a.photo_count || 0)); return openModal({ type: "batch-person", candidates }); }
+    if (action === "add-batch-relation") {
+      const list = document.querySelector(".batch-relation-list");
+      const candidates = (state.modal && state.modal.candidates) || [];
+      const memberOptions = candidates.map((candidate, index) => `<option value="${index}">成员 ${index + 1}</option>`).join("");
+      const relationPresets = ["配偶", "丈夫", "妻子", "父亲", "母亲", "儿子", "女儿", "兄弟", "姐妹", "祖父", "祖母", "外祖父", "外祖母", "本人"].map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join("");
+      const row = `<div class="batch-relation-row"><select name="rel_subject"><option value="">成员 A</option>${memberOptions}</select><select name="rel_predicate"><option value="">关系</option>${relationPresets}</select><select name="rel_object"><option value="">成员 B</option>${memberOptions}</select><button type="button" class="text-button" data-action="remove-batch-relation">×</button></div>`;
+      if (list) list.insertAdjacentHTML("beforeend", row);
+      return;
+    }
+    if (action === "remove-batch-relation") { element.closest(".batch-relation-row")?.remove(); return; }
     if (action === "confirm-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-confirm", cluster }); }
     if (action === "merge-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-merge", cluster }); }
     if (action === "split-face") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); const sample = cluster?.samples?.find((item) => item.id === element.dataset.faceInstanceId); return openModal({ type: "cluster-split", cluster, sample }); }

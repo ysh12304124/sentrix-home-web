@@ -1464,6 +1464,38 @@ def confirm_person(person_id: str, payload: dict | None = None):
     return value
 
 
+@app.post("/api/people/batch-confirm")
+def batch_confirm_people(payload: dict | None = None):
+    """Confirm several person candidates at once, skipping the heavy per-person
+    appearance/LLM refresh (confirm_person_entity already rebuilds DB-level memory)."""
+    items = (payload or {}).get("items") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="items is required")
+    confirmed, failed = [], []
+    for item in items:
+        person_id = str(item.get("person_id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        family_role = str(item.get("family_role") or "").strip() or None
+        if not person_id or not name:
+            failed.append({"person_id": person_id, "name": name, "error": "person_id and name are required"})
+            continue
+        try:
+            native = store.confirm_person_entity(person_id, name, family_role)
+            if not native or not native.get("entity"):
+                failed.append({"person_id": person_id, "name": name, "error": "person not found"})
+                continue
+            confirmed.append({
+                "person_id": person_id,
+                "entity_id": native["entity"]["id"],
+                "name": name,
+                "family_role": family_role,
+                "merged": bool(native.get("merged_into")),
+            })
+        except Exception as error:
+            failed.append({"person_id": person_id, "name": name, "error": str(error)[:200]})
+    return {"confirmed": confirmed, "failed": failed, "count": len(confirmed)}
+
+
 @app.post("/api/people/{person_id}/rename")
 def rename_person(person_id: str, payload: dict | None = None):
     new_name = str((payload or {}).get("name") or "").strip()

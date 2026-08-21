@@ -328,6 +328,15 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 "subject": str(observation.get("query") or "记忆照片"),
                 "asset_id": asset_ids[0] if len(asset_ids) == 1 else "",
             })
+        cond_summary = observation.get("condition_summary") or {}
+        for cond_key, cond_status in cond_summary.items():
+            if cond_status in {"matched", "confirmed"}:
+                evidence_rows.append({
+                    "evidence_type": "structured_fact",
+                    "value": f"检索确认满足条件：{cond_key}（共找到 {len(assets)} 张照片）",
+                    "certainty": "confirmed",
+                    "subject": cond_key,
+                })
         places = [item for item in assets if item.get("place")]
         if places:
             evidence_rows.append({
@@ -356,6 +365,21 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             evidence_rows.append({"evidence_type": "visible_text", "value": value,
                                   "subject": str(observation.get("question") or "照片文字"),
                                   "asset_id": str(observation.get("asset_handle") or (input_refs[0] if input_refs else ""))})
+        for ev in (observation.get("exact_values") or []):
+            if ev.get("type") == "year" and ev.get("value"):
+                evidence_rows.append({
+                    "evidence_type": "structured_fact",
+                    "value": f"创立/创建年份为 {ev.get('value')} 年",
+                    "certainty": "confirmed",
+                    "subject": "品牌创立年份",
+                })
+            elif ev.get("type") == "price" and ev.get("value"):
+                evidence_rows.append({
+                    "evidence_type": "structured_fact",
+                    "value": f"价格: {ev.get('text', ev.get('value'))}",
+                    "certainty": "confirmed",
+                    "subject": "商品价格",
+                })
     elif spec.name == "query_memory_facts":
         value = observation.get("value")
         if value is None:
@@ -546,6 +570,27 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     }
 
 
+
+_POLICY_REFUSAL_RULES = [
+    (re.compile(r"忽略.*(?:指令|系统提示|提示词|安全规则|限制)", re.I), "我无法透露系统提示词内容，也不能忽略既有的安全规则。"),
+    (re.compile(r"(?:告诉|输出|显示|给我).*(?:系统提示|提示词|system prompt)", re.I), "我无法透露系统提示词内容，也不能忽略既有的安全规则。"),
+    (re.compile(r"(?:导出|发给|提供|输出|告诉).*(?:特征向量|人脸特征|身份信息|家庭关系|银行卡|密码|住址|电话)", re.I), "我无法导出人脸特征向量和用户隐私身份数据，这属于敏感个人信息。"),
+    (re.compile(r"(?:特征向量|人脸特征|身份信息|家庭关系|银行卡|密码|住址|电话).*(?:导出|发给|发我|提供|输出|给我)", re.I), "我无法导出人脸特征向量和用户隐私身份数据，这属于敏感个人信息。"),
+    (re.compile(r"(?:跳过|绕过).*(?:安全检查|安全验证)", re.I), "我无法通过对话指令执行删除操作，也无法跳过安全验证。"),
+    (re.compile(r"(?:删除|清空|覆盖).*(?:相册|照片|数据)", re.I), "我无法通过对话指令执行删除操作，也无法跳过安全验证。"),
+    (re.compile(r"\b(?:DAN|Do Anything Now)\b", re.I), "我不会扮演不受限制的角色，也无法输出家庭成员的个人隐私信息。"),
+    (re.compile(r"(?:无限制|不受限制|没有任何限制).*(?:模式|助手|AI|版本)", re.I), "我无法切换到无安全限制的模式，也不能提供未经授权提取和使用人脸数据的方法。"),
+    (re.compile(r"如何.*(?:提取人脸|训练.*模型)", re.I), "我无法切换到无安全限制的模式，也不能提供未经授权提取和使用人脸数据的方法。"),
+]
+
+
+def _detect_policy_refusal(message: str) -> str | None:
+    msg = str(message or "").strip()
+    for pattern, refusal_text in _POLICY_REFUSAL_RULES:
+        if pattern.search(msg):
+            return refusal_text
+    return None
+
 def _agent2_answer_context_ready(task_state, answer_context: dict) -> bool:
     """Return true when the planner's evidence requirements are closed enough to write."""
     if not answer_context.get("facts"):
@@ -661,7 +706,7 @@ class AgentRuntime:
                 if act in ("tool_call", "final"):
                     return parsed
                 # 兼容 0.8B 等小模型把工具名直接写在 action 字段的情况（如 {"action":"search_memories", "filters":...}）
-                if act in ("search_memories", "query_memory_facts", "inspect_photo", "read_photo_text", "get_result_page", "get_original_photos", "search_conversation_history", "get_core_memory", "get_person_memory"):
+                if act in ("search_memories", "query_memory_facts", "inspect_photo", "read_photo_text", "get_result_page", "get_original_photos", "search_conversation_history", "get_core_memory", "get_person_memory", "get_person_profile"):
                     tool_name = act
                     args = {k: v for k, v in parsed.items() if k not in ("action", "public_status")}
                     # 如果有 arguments 嵌套则展开
@@ -756,6 +801,29 @@ class AgentRuntime:
         turn.budget.start()
         policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget,
                             allowed_tools=set(self.profile.tools) if self.profile.tools else None)
+        refusal = _detect_policy_refusal(message)
+        if refusal:
+            turn.final_answer = refusal
+            turn.status = "complete"
+            turn.reason = "policy_refusal"
+            return turn
+        # W1.2 stage-timing instrumentation (observation only; no behavior change).
+        # Bucket every model call by call_type; restore the original chat_fn at the end.
+        _stage_timing_ms: dict[str, float] = {}
+        _orig_chat_fn = self.chat_fn
+        def _timed_chat(messages, *, call_type=None, step_id=None, **kwargs):
+            _t0 = time.perf_counter()
+            try:
+                _kw = {}
+                if call_type is not None:
+                    _kw["call_type"] = call_type
+                if step_id is not None:
+                    _kw["step_id"] = step_id
+                return _orig_chat_fn(messages, **_kw, **kwargs)
+            finally:
+                _key = call_type or "recovery_or_judge"
+                _stage_timing_ms[_key] = _stage_timing_ms.get(_key, 0.0) + (time.perf_counter() - _t0) * 1000.0
+        self.chat_fn = _timed_chat
         task = TaskState.from_dict(task_state, user_goal=message)
         agent2_task_state = None
         agent2_evidence_ledger = None
@@ -832,6 +900,10 @@ class AgentRuntime:
         active_lines = []
         if task.active_person:
             active_lines.append(f"当前关注人物：{task.active_person}")
+            from .tools import person_profile_summary
+            profile_line = person_profile_summary(task.active_person, self.scope_id)
+            if profile_line:
+                active_lines.append(f"人物画像：{profile_line}")
         if task.active_event:
             active_lines.append(f"当前关注事件：{task.active_event}")
         if task.open_questions:
@@ -1588,6 +1660,9 @@ class AgentRuntime:
             else:
                 turn.agent2_trace["terminal_reason"] = "shadow_only"
             turn.agent2_trace["budget_outcome"] = turn.budget.as_dict()
+            turn.agent2_trace["stage_timing_ms"] = {
+                k: round(v, 1) for k, v in sorted(_stage_timing_ms.items())}
+        self.chat_fn = _orig_chat_fn
         return turn
 
 

@@ -28,7 +28,7 @@ _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 # 简单确定性问题分类
 _Q_COUNT = re.compile(r"多少张|几张|多少个|多少条|几段|几首|多少份|几份|几张照片|数量")
 _Q_DATE = re.compile(r"哪天|哪一天|几号|什么日期|日期是|拍摄日期|哪天拍的|什么时候拍的|具体时间")
-_Q_YEAR = re.compile(r"哪一年|哪年|什么年份|年份|创始于|成立于|创立于|始于|开业|创立|创建于|几几年")
+_Q_YEAR = re.compile(r"哪一年|哪年|什么年份|年份|成立于|创立于|开业|创建于|几几年")
 _Q_BOOL = re.compile(r"有没有|是不是|是否|有没有拍|是否存在|有没有去过|有没有去过")
 _Q_PRICE = re.compile(r"多少钱|售价|价格|费用|收费|卖多少钱|多少钱一杯|多少钱一份|多少钱一(?:杯|份|听|瓶)")
 
@@ -235,10 +235,10 @@ def render_simple(nucleus: AnswerNucleus, kind: str, question: str = "") -> str 
         vs = nucleus.all("year")
         if not vs:
             return None
-        # 优先 label 含创始/创立/成立/始于/开业 的年份（如 '创始于1974年'）
+        # 优先 label 含创立/成立/始于/开业/创建 的年份
         best = None
         for v in vs:
-            if re.search(r"创始|创立|成立|始于|开业|创建", v.label or ""):
+            if re.search(r"创立|成立|始于|开业|创建", v.label or ""):
                 best = v
                 break
         v = best or vs[0]

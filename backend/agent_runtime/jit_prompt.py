@@ -59,6 +59,10 @@ LITE_TOOL_SCHEMAS = {
         "- get_person_memory: 读取人物结构化记忆。\n"
         '  输入: {"person": "人物名", "operation": "overview|events|common_places"}'
     ),
+    "get_person_profile": (
+        "- get_person_profile: 读取人物高维画像（家庭角色/关系/行为规律/近期事件）。\n"
+        '  输入: {"person": "人物名"}'
+    ),
 }
 
 
@@ -139,7 +143,7 @@ def build_jit_system_prompt(
                 selected_tools.append("read_photo_text")
             if "visual_observation" in open_types:
                 selected_tools.append("inspect_photo")
-        
+
         # 如果仍有检索类需求未满足
         if any(t in open_types for t in ("memory_asset", "location_metadata", "temporal_metadata")):
             if not has_preview:

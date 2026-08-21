@@ -2399,6 +2399,49 @@ class MemoryStore:
             "claims": self.list_semantic_claims(person_id),
         }
 
+    def person_profile_digest(self, person_id, scope_id=None):
+        """Assemble a high-dimensional person profile for agent recall: identity,
+        relationships, behavior patterns, recent events and semantic claims."""
+        entity = self.get_entity(person_id)
+        if not entity or entity.get("entity_type") != "person":
+            return None
+        memory = self.get_person_memory(person_id, scope_id)
+        profile = memory.get("profile") or {}
+        relationships = []
+        for rel in self.list_person_relationships(scope_id):
+            if rel.get("subject_entity_id") == person_id:
+                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("object_name"), "id": rel.get("id"), "status": rel.get("status")})
+            elif rel.get("object_entity_id") == person_id:
+                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("subject_name"), "id": rel.get("id"), "status": rel.get("status")})
+        pattern_groups = {}
+        for pattern in memory.get("patterns") or []:
+            pattern_groups.setdefault(pattern.get("pattern_type"), []).append(
+                {"value": pattern.get("value_text"), "count": pattern.get("support_count") or 0}
+            )
+        top_patterns = []
+        for key in ("activity", "place", "co_person", "clothing"):
+            items = sorted(pattern_groups.get(key, []), key=lambda item: -item["count"])[:3]
+            if items:
+                top_patterns.append({"type": key, "items": items})
+        recent_events = sorted(memory.get("event_memory") or [], key=lambda e: e.get("time_start") or "", reverse=True)[:5]
+        recent_events = [{"title": e.get("activity_text") or e.get("title") or "", "time_start": e.get("time_start")} for e in recent_events]
+        claims = [claim for claim in (memory.get("claims") or []) if claim.get("status") in ("active", "pending")]
+        claims_top = [{"dimension": c.get("dimension"), "predicate": c.get("predicate"), "value": c.get("value_text"), "confidence": c.get("confidence")} for c in claims[:12]]
+        return {
+            "person": entity.get("canonical_name"),
+            "family_role": entity.get("family_role") or "",
+            "status": entity.get("status"),
+            "summary_zh": profile.get("summary_zh") or "",
+            "preference_summary_zh": profile.get("preference_summary_zh") or "",
+            "activity_summary_zh": profile.get("activity_summary_zh") or "",
+            "place_summary_zh": profile.get("place_summary_zh") or "",
+            "appearance_summary_zh": profile.get("appearance_summary_zh") or "",
+            "relationships": relationships,
+            "patterns": top_patterns,
+            "recent_events": recent_events,
+            "claims": claims_top,
+        }
+
     def _rebuild_person_event_memory(self, person_id, event_ids, mentions_by_event):
         self.connection.execute("DELETE FROM person_event_memory WHERE person_id = ?", (person_id,))
         entity = self.get_entity(person_id) or {}
@@ -2602,11 +2645,23 @@ class MemoryStore:
             f"{event.get('time_start') or '时间未知'} 在{event.get('place') or '地点未知'}：{event.get('activity') or event.get('title') or '家庭记录'}"
             for event in event_rows[:12]
         )
+        pref_by_type = {}
+        for pattern in patterns:
+            pref_by_type.setdefault(pattern.get("pattern_type"), []).append(
+                (pattern.get("value_text"), pattern.get("support_count") or 0)
+            )
+        pref_parts = []
+        for label, key in (("常去地点", "place"), ("常做活动", "activity"), ("常同行", "co_person")):
+            items = sorted(pref_by_type.get(key, []), key=lambda item: -item[1])[:3]
+            if items:
+                pref_parts.append(label + "：" + "、".join(f"{value}({count})" for value, count in items))
+        preference_summary = "；".join(pref_parts) or "暂无可归属的行为规律证据"
         profile = self.upsert_semantic_profile(person_id, {
             "summary_zh": summary,
             "activity_summary_zh": activity_summary or "暂无已确认活动",
             "place_summary_zh": "、".join(places[:12]),
             "appearance_summary_zh": "、".join(clothing_values[:12]) or "暂无可归属的人物级衣物证据",
+            "preference_summary_zh": preference_summary,
             "scope_id": entity.get("scope_id") or "home-default",
             "event_memory_json": event_memory,
             "patterns_json": patterns,
@@ -3365,6 +3420,13 @@ class MemoryStore:
         entities = self._rows(f"SELECT * FROM entities {where} ORDER BY updated_at DESC", params)
         for entity in entities:
             entity["cluster_count"] = self.connection.execute("SELECT COUNT(*) FROM face_clusters WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
+            entity["photo_count"] = self.connection.execute(
+                """SELECT COUNT(DISTINCT a.id) FROM face_instances fi
+                JOIN face_clusters fc ON fc.id = fi.cluster_id
+                JOIN assets a ON a.id = fi.asset_id
+                WHERE fc.entity_id = ? AND fc.status != 'rejected'""",
+                (entity["id"],),
+            ).fetchone()[0]
             entity["mention_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_mentions WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
             entity["evidence_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_observations WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
             entity["relationship_count"] = self.connection.execute("SELECT COUNT(*) FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'", (entity["id"], entity["id"])).fetchone()[0]
@@ -4887,12 +4949,28 @@ class MemoryStore:
             next_status = "active" if status == "active" else existing["status"]
             self.connection.execute("UPDATE relationships SET status = ?, evidence_ids_json = ?, confidence = MAX(confidence, ?), updated_at = ?, revision = revision + 1 WHERE id = ?", (next_status, json_value(merged, []), float(confidence or 0), now_iso(), existing["id"]))
             self.connection.commit()
+            if next_status == "active":
+                self.maintain_relationship_claim({
+                    "subject_entity_id": subject_entity_id,
+                    "predicate": predicate,
+                    "object_entity_id": object_entity_id,
+                    "evidence_ids_json": merged,
+                    "confidence": float(confidence or 0) or 0.75,
+                })
             return next((item for item in self.list_relationships() if item["id"] == existing["id"]), None)
         relationship_id = make_id("rel")
         revision = 1
         self.connection.execute("""INSERT INTO relationships(id, scope_id, subject_entity_id, predicate, object_entity_id, status, confidence, evidence_ids_json, supersedes_relationship_id, revision, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""", (relationship_id, scope_id, subject_entity_id, predicate, object_entity_id, status, float(confidence or 0), json_value(evidence_ids, []), revision, now_iso(), now_iso()))
         self.connection.commit()
+        if status == "active":
+            self.maintain_relationship_claim({
+                "subject_entity_id": subject_entity_id,
+                "predicate": predicate,
+                "object_entity_id": object_entity_id,
+                "evidence_ids_json": evidence_ids,
+                "confidence": float(confidence or 0) or 0.75,
+            })
         return self.list_relationships()[0]
 
     def confirm_relationship(self, relationship_id):
