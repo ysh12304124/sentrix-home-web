@@ -2079,7 +2079,12 @@ def _turn_executor():
     global _TURN_EXECUTOR
     if _TURN_EXECUTOR is None:
         from concurrent.futures import ThreadPoolExecutor
-        _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+        # Benchmark orchestrators now run QA evaluation with high question-level
+        # concurrency (aligned with the serving model's max_num_seqs, e.g. 16);
+        # the old fixed 2 workers serialized those turns and silently throttled
+        # concurrent runs. Env-overridable, default 16.
+        workers = max(2, int(os.getenv("SENTRIX_ASSISTANT_TURN_WORKERS", "16")))
+        _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=workers)
     return _TURN_EXECUTOR
 
 
