@@ -444,7 +444,9 @@ function aggregateMetricRows(phase = {}) {
     ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
     ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
     ["Token 用量", summary.prompt_tokens_total == null && summary.completion_tokens_total == null ? "未记录" : `${summary.prompt_tokens_total ?? "-"} / ${summary.completion_tokens_total ?? "-"}`, "输入 / 输出 token", true],
-    ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), "每道 QA 从输入到最终回答的平均 Agent 总耗时，不含 Judge", true],
+    ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), activeRun.value?.qa_concurrency > 1
+      ? `每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）；并发 ${activeRun.value.qa_concurrency} 负载下含排队与批内干扰，勿与串行 run 直接对比`
+      : "每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）", true],
     ["平均任务调用轮数", summary.agent_loop_calls_mean == null ? "未记录" : `${Number(summary.agent_loop_calls_mean).toFixed(2)} 轮`, "仅 Agent/Recovery，不含 L2 Judge、Final Writer 和工具内部模型", true],
     ["图片检索 F1", fmtPct(summary.retrieval_f1_micro), "微平均，平衡噪声与漏召回"],
     ["任务判断准确率", fmtPct(summary.task_decision_accuracy), `标注 ${summary.task_decision_labeled_count ?? 0} 题 · Judge 有效 ${summary.task_decision_valid_count ?? 0} 题`],
