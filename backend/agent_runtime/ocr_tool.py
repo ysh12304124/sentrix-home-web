@@ -234,6 +234,7 @@ def _get_small_engine():
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
                     enable_mkldnn=False,
+                    device="cpu",  # 强制 CPU：onnxruntime 默认试 CUDA，缺 libcudnn.so.9 会初始化失败
                 )
     return _small_engine
 
@@ -319,7 +320,9 @@ def _try_small_ocr(path: str, context: dict | None) -> tuple[dict | None, list]:
     items 是检测框（供 VLM 做文字区域 montage）。
     """
     settings = (context or {}).get("ocr_settings") or {}
-    if not settings.get("small_ocr_enabled"):
+    # W3.4：PaddleOCR 可用时默认启用 small（app 的 DB 设置默认 "false"，不应禁用专用小模型；
+    # 专用小模型能力优于 VLM，这是 OCR 主路径，不是可选项）。用户仍可显式 small_ocr_enabled=false 关闭。
+    if settings.get("small_ocr_enabled", small_ocr_available()) is False:
         return None, []
     if not small_ocr_available():
         return None, []
