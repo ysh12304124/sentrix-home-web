@@ -795,16 +795,6 @@ def delete_memory_space(scope_id: str):
         raise HTTPException(status_code=403, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"删除失败: {exc}")
-    dropped_collections = 0
-    try:
-        from .qdrant_memory import get_qdrant_index
-        index = get_qdrant_index(store.path)
-        if index is not None:
-            dropped_collections = index.drop_scope(scope_id)
-    except Exception as exc:
-        stats["qdrant_drop_error"] = str(exc)[:300]
-    if dropped_collections:
-        stats["qdrant_collections_dropped"] = dropped_collections
     return {"ok": True, "scope_id": scope_id, "removed": stats}
 
 
