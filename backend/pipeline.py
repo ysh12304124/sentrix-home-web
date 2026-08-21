@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -506,7 +507,48 @@ class IngestionPipeline:
             return batch
         for event_id in self.store.batch_event_ids(batch_id):
             self.summarize_event(event_id)
-        return self.store.finish_ingest_batch(batch_id)
+        batch = self.store.finish_ingest_batch(batch_id)
+        scope_id = (batch or {}).get("scope_id")
+        if scope_id:
+            self._maybe_trigger_person_insight(scope_id)
+        return batch
+
+    def _maybe_trigger_person_insight(self, scope_id):
+        """Trigger an incremental person-insight run only for allowlisted scopes.
+
+        A run only starts when new events arrived since the previous run's event
+        watermark; otherwise the live portraits are left untouched.
+        """
+        allowlist = {
+            item.strip() for item in os.getenv("SENTRIX_PERSON_INSIGHT_SCOPES", "").split(",")
+            if item.strip()
+        }
+        if scope_id not in allowlist:
+            return None
+        event_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE scope_id = ?", (scope_id,)
+        ).fetchone()[0]
+        latest = self.store.latest_person_insight_run(scope_id)
+        watermark = int(((latest or {}).get("stats") or {}).get("event_watermark", 0))
+        if latest is not None and event_count <= watermark:
+            return None
+        run = self.store.create_person_insight_run(scope_id, {
+            "max_core_people": 10, "trigger_type": "ingest",
+        })
+
+        def execute():
+            from .person_insights import PersonInsightService
+
+            worker = MemoryStore(self.store.path)
+            try:
+                PersonInsightService(worker, self.gamma).run(
+                    run["id"], scope_id, {"max_core_people": 10, "trigger_type": "ingest"}
+                )
+            finally:
+                worker.close()
+
+        threading.Thread(target=execute, daemon=True).start()
+        return run
 
     def _image_observation(self, asset, precomputed_analysis=None):
         path = asset["path"]

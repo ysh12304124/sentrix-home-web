@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.db import MemoryStore
 from backend.pipeline import IngestionPipeline
@@ -433,6 +434,28 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(store.count("face_instances"), 0)
             self.assertEqual(store.count("events"), 0)
             self.assertEqual(store.count("memory_vectors"), 0)
+
+    def test_finalize_ingest_batch_triggers_person_insight_for_batch_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "family.jpg"
+            image.write_bytes(b"family")
+            store = MemoryStore(f"{directory}/memory.db")
+            pipeline = IngestionPipeline(store, gamma=FakeGamma(), face=FakeFace(), clip=FakeClip())
+            store.create_ingest_batch("batch-1")
+            metadata = {
+                "batch_id": "batch-1",
+                "captured_at": "2026-07-01T18:00:00+08:00",
+                "captured_location": "家中餐厅",
+            }
+            asset = pipeline.create_asset(image, metadata=metadata)
+            pipeline.process_fast_image(asset["id"])
+            pipeline.enrich_fast_image(asset["id"], summarize_event=False)
+            store.complete_ingest_batch("batch-1")
+
+            with patch.object(pipeline, "_maybe_trigger_person_insight", return_value=None) as trigger:
+                pipeline.finalize_ingest_batch("batch-1")
+            self.assertEqual(trigger.call_count, 1)
+            self.assertEqual(trigger.call_args.args[0], "home-default")
 
 
 if __name__ == "__main__":
