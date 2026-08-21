@@ -388,9 +388,11 @@ function gpuMetricRows(phase = {}) {
   ];
 }
 function comparableMemoryProfile(run) {
+  if (!run) return null;
   if (run?.memory_profile) return { ...run.memory_profile, source: "replay" };
   const gpu = run?.phases?.gpu_metrics;
-  if (!gpu?.memory_profile) return null;
+  if (!gpu) return { source: "pending", status: "pending", memory_profile: {}, questions_completed: run.summary?.completed, questions_total: run.summary?.total };
+  if (!gpu?.memory_profile) return { source: "pending", status: gpu.status, memory_profile: {}, questions_completed: run.summary?.completed, questions_total: run.summary?.total };
   return {
     status: gpu.status,
     source: "gpu_metrics",
@@ -1351,15 +1353,15 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 </article>
-        <article v-if="comparableMemoryProfile(activeRun)" class="phase-card result-phase-card gpu-result-card">
+        <article class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
-<b>{{ comparableMemoryProfile(activeRun).source === 'gpu_metrics' ? '可比较显存' : '可比较显存复测' }}</b>
-<span class="phase-status" :class="comparableMemoryProfile(activeRun).status">{{ statusLabel(comparableMemoryProfile(activeRun).status) }}</span>
+<b>{{ comparableMemoryProfile(activeRun)?.source === 'replay' ? '可比较显存复测' : '可比较显存' }}</b>
+<span class="phase-status" :class="comparableMemoryProfile(activeRun)?.status || 'pending'">{{ statusLabel(comparableMemoryProfile(activeRun)?.status || 'pending') }}</span>
 </div>
-<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun).source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' }}可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
+<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun)?.source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : comparableMemoryProfile(activeRun)?.source === 'replay' ? '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' : '本次 run 的 GPU 采样结束后生成；' }}可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
 <p v-if="comparableMemoryProfile(activeRun).error" class="error">{{ comparableMemoryProfile(activeRun).error }}</p>
 <div class="phase-metrics">
-<div v-for="row in memoryProfileRows(comparableMemoryProfile(activeRun))" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<div v-for="row in memoryProfileRows(comparableMemoryProfile(activeRun) || {})" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
 <strong>{{ row[1] }}</strong>
 <small>{{ row[2] }}</small>
