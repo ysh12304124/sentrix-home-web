@@ -149,9 +149,9 @@
       "model": "/home/asus/models/Qwen3.5-4B",
       "served_model_name": "qwen3.5-4b",
       "dtype": "bfloat16",
-      "gpu_memory_utilization": 0.46,
+      "gpu_memory_utilization": 0.83,
       "max_model_len": 4501,
-      "max_num_seqs": 2,
+      "max_num_seqs": 16,
       "tensor_parallel_size": 1,
       "trust_remote_code": true,
       "limit_mm_per_prompt": {
