@@ -262,8 +262,8 @@ function decorateImages(list) {
   return (list || []).map((img) => {
     if (img?.media_url) return img;
     const parts = (img?.image_id || "").split("/");
-    const album = parts.length === 2 ? parts[0] : (activeRun.value?.album_id || "");
     const file = parts.length === 2 ? parts[1] : (img?.file_name || "");
+    const album = activeRun.value?.album_id || (parts.length === 2 ? parts[0] : "");
     const local = (album && file) ? `/api/albums/${encodeURIComponent(album)}/photos/${encodeURIComponent(file)}` : "";
     return local ? { ...img, media_url: local } : img;
   });
@@ -271,7 +271,7 @@ function decorateImages(list) {
 function itemImages(item, gt = false) {
   if (gt) {
     if (item.gt_images?.length) return decorateImages(item.gt_images);
-    return (item.retrieval_image_ids || []).map((id) => ({ image_id: id, file_name: id.split("/").pop(), matched: (item.matched_file_names || []).includes(id.split("/").pop()) }));
+    return decorateImages((item.retrieval_image_ids || []).map((id) => ({ image_id: id, file_name: id.split("/").pop(), matched: (item.matched_file_names || []).includes(id.split("/").pop()) })));
   }
   if (item.predicted_images?.length) return decorateImages(item.predicted_images);
   return (item.predicted_file_names || []).map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
