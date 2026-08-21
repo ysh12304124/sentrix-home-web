@@ -61,7 +61,7 @@
       "tensor_parallel_size": 1,
       "trust_remote_code": true,
       "limit_mm_per_prompt": {
-        "image": 2,
+        "image": 5,
         "video": 0,
         "audio": 1
       },
