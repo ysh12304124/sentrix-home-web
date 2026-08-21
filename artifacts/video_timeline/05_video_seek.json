@@ -1,0 +1,22 @@
+{
+  "keyframe_timestamps": [
+    "0",
+    "6.200880681818181",
+    "11.501633522727273"
+  ],
+  "player_before_click": {
+    "time": 0,
+    "duration": 11.748005,
+    "ready": 4,
+    "seekable": 1
+  },
+  "player_immediately_after_click": {
+    "time": 6.20088,
+    "ready": 1
+  },
+  "player_after_second_keyframe_click": {
+    "time": 6.20088,
+    "ready": 4,
+    "paused": true
+  }
+}

@@ -209,6 +209,7 @@ class TaskState:
             "operation": observation.get("operation"),
             "value": observation.get("value"),
             "rows": observation.get("rows"),
+            "items": observation.get("items"),
             "answer_type": observation.get("answer_type"),
             "filters_applied": observation.get("filters_applied"),
             "samples": observation.get("samples"),

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep runtime imports reproducible. User-site packages previously injected an
-# incompatible Transformers build into the AdaFace/PyTorch dependency graph.
-export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+# AdaFace checkpoint unpickling needs the user-site transformers package in this
+# runtime.  The incompatible torch<->transformers symbol is now handled inside
+# AdaFaceAdapter._load_model, so hiding user-site packages is no longer needed.
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-0}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ -f "$root/.env" ]]; then
@@ -35,7 +36,7 @@ if ((${#runtime_dirs[@]})); then
   export LD_LIBRARY_PATH="${runtime_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-export FACE_PROVIDERS="${FACE_PROVIDERS:-CUDAExecutionProvider,CPUExecutionProvider}"
+export FACE_PROVIDERS="${FACE_PROVIDERS:-CPUExecutionProvider}"
 export SENTRIX_LLM_BACKEND="${SENTRIX_LLM_BACKEND:-vllm}"
 export SENTRIX_VLLM_BASE_URL="${SENTRIX_VLLM_BASE_URL:-http://127.0.0.1:8100/v1}"
 export SENTRIX_VLLM_MODEL="${SENTRIX_VLLM_MODEL:-gemma4-12b-it}"
@@ -58,7 +59,8 @@ export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/asus/.cache/cli
 # visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
 export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"
 export SENTRIX_TEXT_EMBEDDER="${SENTRIX_TEXT_EMBEDDER:-clip}"
-export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-adaface}"
+export FACE_EMBEDDING_MODE="${FACE_EMBEDDING_MODE:-legacy}"
+export ADAFACE_DEVICE="${ADAFACE_DEVICE:-cpu}"
 export ADAFACE_MODEL_PATH="${ADAFACE_MODEL_PATH:-/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt}"
 export ADAFACE_REPO_ROOT="${ADAFACE_REPO_ROOT:-/home/asus/models/AdaFace}"
 

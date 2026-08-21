@@ -19,6 +19,7 @@ from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
                          RESOLVE_OCR, RESOLVE_VISUAL)
 from .emergency import render_emergency_summary
 from .final_guard import FinalGuard
+from .intent import multi_image_intent, ocr_intent, visual_intent
 from .judge import judge_faithfulness
 from .time_context import current_time_line
 from .profile import get_profile
@@ -102,23 +103,26 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
   不要补充 rows 中没有的项目，也不要自行概括出 rows 不支持的维度。
 - search_memories 的 preview 只显示前几张，每张带 place 字段（照片所在地，来自 GPS 反地理编码，
-  如'秦皇岛市昌黎县'/'Chiang Mai'）；用户要求更多/下一页/还有吗 时，用 get_result_page（result_set_id 用 search_memories 返回的，page 从 1 开始）。
+  通常为城市/区县/景区名，如"某市某区"、"某度假村"）；用户要求更多/下一页/还有吗 时，用 get_result_page（result_set_id 用 search_memories 返回的，page 从 1 开始）。
 - 问'在哪里/哪个城市/什么地点/哪举办的'时，用 search_memories 检索并在回答中引用 preview 的 place 字段；
   query_memory_facts 只返回时间/数量/分组，不能回答照片地点。
-- 时间、数量、首末存在性、日期、分组等确定性事实一律用 query_memory_facts，并把用户问题里的时间写进 filters.time（如 '2023年'、'2025-05'）。用户问任何年份/月份都必须如实填进 filters.time，不要省略；不要用 search_memories 代替，也不要用模型估算。
+- 工具选择看用户意图，不是看有没有日期：
+  · 用户要找照片、看照片内容（颜色/服装/道具/人数/雕塑/文字/哪张照片）、或问照片是在哪里拍的 → 用 search_memories（把日期写进 filters.time，不要省略）；需要照片里的视觉细节时再 inspect_photo / read_photo_text。
+  · 只有纯统计/确定性事实（一共多少张、最早/最近一张、是否存在、按时间/地点分组）才用 query_memory_facts，并把用户问题里的时间写进 filters.time（如 '2023年'、'2025-05'），不要用模型估算。
+- 用户要'给我所有视频/照片/音频/文本'或'列出相册里的视频'时，用 query_memory_facts 的 operation=list，并在 filters.media 填 video/image/audio/text；工具返回 items 是实际媒体，回答要引用 items 里的 file_name、时长、场景/关键帧来源，不能只报数量。如果工具返回 summary，直接使用 summary 里的文件名和描述逐项列出。
 - 按月份/地点统计分布用 query_memory_facts 的 operation=group，并填 group_by（month 或 place）。
 - operation=group 且 group_by=place 时，工具会返回 known_location_assets/unknown_location_assets 覆盖信息：
   只要 unknown_location_assets>0，回答必须如实说明还有多少张照片没有可靠地点信息，不能把地点说成完整清单。
 - operation=meal 回答'吃过什么/吃饭/火锅'类问题：工具会返回 explicit_foods（明确食物，按事件去重）、
   meal_scene_events（只能确认在吃饭）、possible_events；回答必须逐项列出 explicit_foods 里的食物
-  （如'火锅、蛋糕…'）并说明各出现几次，有 meal_scene_events 时还要说明其中一部分只能确认在用餐、
+  （如具体菜名）并说明各出现几次，有 meal_scene_events 时还要说明其中一部分只能确认在用餐、
   不能确认具体菜品；没有 explicit_foods 时才只说用餐场景。
 - final 回答直接给答案，先回答用户问题本身；需要说明不确定时用自然语言，不要复述检索过程。
 - 回答结构：1) 直接答案 2) 必要的 uncertainty 3) 可选一句补充。不要以"我为您找到 N 张候选照片/检索到…"开头。
 - 内部检索词汇（query_satisfaction、candidate_only、partial_support、full_support、no_match、候选照片、
   匹配程度、检索结果、相似候选）不得原样出现在 final 回答里；需要用用户能懂的话转译。
 - 不确定性用自然语言四级：
-  确定 → 直接给答案（"是在秦皇岛如是海度假村。"）；
+  确定 → 直接给答案（如"是在某景区门口。"）；
   较可能 → "看起来是在…"；
   不确定 → "可能是在…，但我还不能完全确定。"；
   无依据 → "现有记录里看不出来。"。
@@ -142,8 +146,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - 如果已经调用 read_photo_text / inspect_photo，但照片里仍读不到可靠内容（没有文字、看不清、
   与问题无关），直接如实回答"现有照片里看不出来/不知道"，不要继续绕圈子，不要承诺"可以继续核对"。
 - filters.place 填结构化地点名（城市/区县/景区/地标）。系统会按行政区匹配照片的 GPS 反地理编码：
-  例如"秦皇岛如是海度假村"也能匹配"河北省秦皇岛市昌黎县"的照片，"清迈"能匹配英文"Chiang Mai"。
-  不要把要找的目标/活动/主题当作 place（"沙雕"是主题不是地点）。地点不确定时留空，只按时间和人物过滤。
+  例如用户说"某度假村"，能匹配到该度假村所在区县（如"某市某县"）拍摄的照片；说"某城市"也能匹配该市下辖区县的照片；中文地名与英文译名可互相匹配。
+  不要把要找的目标/活动/主题当作 place（活动/主题不是地点）。地点不确定时留空，只按时间和人物过滤。
 - public_status 是给用户看的简短进度说明。
 """
 
@@ -169,6 +173,27 @@ class ToolResult:
     observation: dict | None = None
     error: str | None = None
     latency_s: float = 0.0
+
+
+
+def _merge_system_constraint(messages: list[dict], constraint: str) -> None:
+    """Keep all system instructions at the beginning for strict chat templates.
+
+    Qwen3.5/3.8 chat templates raise "System message must be at the
+    beginning" when a system message appears mid-conversation, which turns
+    into a 400 from vLLM /tokenize and /chat/completions. Merge later system
+    constraints into the leading system message instead of appending.
+    """
+    if not constraint:
+        return
+    if not messages or messages[0].get("role") != "system":
+        raise ValueError("agent messages must start with a system message")
+    first = messages[0]
+    existing = str(first.get("content") or "").rstrip()
+    messages[0] = {
+        **first,
+        "content": f"{existing}\n\n{constraint}" if existing else constraint,
+    }
 
 
 def _pending_resolution(task) -> dict | None:
@@ -353,13 +378,14 @@ class AgentRuntime:
 
     def __init__(self, *, chat_fn, profile_name: str | None = None,
                  scope_id="home-default", viewer_id="owner", conversation_id=None,
-                 ocr_settings: dict | None = None):
+                 ocr_settings: dict | None = None, include_debug: bool = False):
         self.chat_fn = chat_fn
         self.profile = get_profile(profile_name)
         self.scope_id = scope_id
         self.viewer_id = viewer_id
         self.conversation_id = conversation_id
         self.ocr_settings = ocr_settings or {}
+        self.include_debug = include_debug
 
     def _tool_descriptions(self) -> str:
         lines = []
@@ -375,6 +401,42 @@ class AgentRuntime:
                          f"{(' 能力=' + capability) if capability else ''}"
                          f" 输入schema={json.dumps(spec.input_schema, ensure_ascii=False)}")
         return "\n".join(lines) or "(无工具)"
+
+
+    def _force_final_once(self, turn, messages: list) -> str | None:
+        """额外一次纯 final：让模型明确给出结论（哪怕"没有答案"），失败返回 None。
+
+        不计入 model_steps（用于预算耗尽后的收尾），但仍受墙钟 final reserve 限制。
+        """
+        if not turn.budget.has_final_reserve():
+            return None
+        try:
+            from .final_writer import naturalize_answer
+            final_messages = list(messages)
+            final_messages.append({"role": "user", "content": (
+                "你现在必须给出一个明确的最终回答，不允许再调用工具。"
+                "如果根据已有工具结果足以回答，就直接回答；如果不足以回答，"
+                "就明确说“现有记录不足以确认”并给出你能确认的部分。"
+                '只输出 {"action":"final","answer":"<结论>","evidence_refs":[]}。'
+            )})
+            if self.include_debug:
+                import copy as _copy
+                _ff_prompt = _copy.deepcopy(final_messages)
+            else:
+                _ff_prompt = None
+            raw = self.chat_fn(final_messages)
+            parsed = self._parse_action(raw)
+            if parsed and parsed.get("action") == "final" and (parsed.get("answer") or "").strip():
+                _ff_step = {"type": "model", "raw": (raw or "")[:500],
+                            "call_type": "force_final", "forced_final": True}
+                if _ff_prompt is not None:
+                    _ff_step["prompt"] = _ff_prompt
+                    _ff_step["raw_full"] = raw
+                turn.steps.append(_ff_step)
+                return naturalize_answer(parsed["answer"])
+        except Exception:
+            pass
+        return None
 
 
     def _parse_action(self, text: str) -> dict | None:
@@ -510,7 +572,7 @@ class AgentRuntime:
                             text="正在理解你的问题…")
 
         parse_retries = 0
-        max_parse_retries = 2
+        max_parse_retries = 3
         guard_retries = 0
         max_guard_retries = 1
         seen_tool_calls = set()
@@ -519,6 +581,8 @@ class AgentRuntime:
         search_has_preview = False
         inspect_called = False
         tool_call_seq = 0
+        debug_step_seq = 0
+        last_model_step_id = None
         visual_retries = 0
         max_visual_retries = 1
         resolution_retries = 0
@@ -527,20 +591,15 @@ class AgentRuntime:
         max_completion_retries = 1
         unknown_tool_retries = 0
         max_unknown_tool_retries = 1
-        visual_intent = bool(__import__("re").search(
-            r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|在做什么|"
-            r"有没有|是什么|放着|写了|内容|细节", message))
+        forced_final_attempted = False
+        wants_visual = visual_intent(message)
         # Phase E：Adaptive Visual Budget——按问题类型放宽视觉复核预算
-        multi_image_intent = bool(__import__("re").search(
-            r"哪一张|哪张|哪些|哪几张|每一张|逐[一一张]|逐一|对比|还有吗|还有没有|都看|全部|每张|"
-            r"所有照片|哪几张|哪几个|翻看", message))
-        ocr_intent = bool(__import__("re").search(
-            r"菜单|价格|多少钱|售价|招牌|店名|电话|写了什么|什么字|文字|创始于|"
-            r"价位|几块钱|面单|多少钱一份", message))
+        wants_multi = multi_image_intent(message)
+        wants_ocr = ocr_intent(message)
         adaptive_inspections = self.profile.max_inspections
-        if multi_image_intent:
+        if wants_multi:
             adaptive_inspections = max(adaptive_inspections, 4)
-        elif ocr_intent:
+        elif wants_ocr:
             adaptive_inspections = max(adaptive_inspections, 2)
             # read_photo_text 需要整图 + 3x3 tile 多次图片推理，放宽总预算
             # （同图 OCR 结果已缓存，只有首次需要长预算）
@@ -566,6 +625,17 @@ class AgentRuntime:
                             break
                     except Exception:
                         pass
+                # Phase H H8：兜底改模型输出——预算耗尽时允许额外一次纯 final（不计入步数，
+                # 只受墙钟限制），让"没有答案"也由模型明确说出，而不是代码拼文案。
+                if not forced_final_attempted:
+                    forced_final_attempted = True
+                    forced = self._force_final_once(turn, messages)
+                    if forced:
+                        turn.final_answer = forced
+                        turn.status = "complete"
+                        turn.reason = ""
+                        turn.termination_reason = "forced_final_at_step_limit"
+                        break
                 turn.status = "partial" if turn.steps else "timeout"
                 turn.reason = "model step budget exhausted"
                 if task.tool_results:
@@ -579,7 +649,7 @@ class AgentRuntime:
                     nuc = build_nucleus(task.as_dict(), message)
                     ctext = nuc.constraint_text()
                     if ctext:
-                        messages.append({"role": "system", "content": ctext})
+                        _merge_system_constraint(messages, ctext)
                     turn.nucleus_injected = True
                 except Exception:
                     turn.nucleus_injected = True
@@ -594,13 +664,23 @@ class AgentRuntime:
                 turn.status = "error"
                 turn.reason = f"model_call_error: {exc}"
                 break
-            turn.steps.append({"type": "model", "raw": (raw or "")[:500]})
+            model_step = {"type": "model", "raw": (raw or "")[:500]}
+            if self.include_debug:
+                import copy as _copy
+                model_step["raw_full"] = raw
+                model_step["prompt"] = _copy.deepcopy(messages)
+                step_id = f"step_{debug_step_seq}"
+                debug_step_seq += 1
+                last_model_step_id = step_id
+                model_step["step_id"] = step_id
+                model_step["call_type"] = "agent"
+            turn.steps.append(model_step)
             action = self._parse_action(raw)
             if action is None:
                 if parse_retries < max_parse_retries and turn.budget.can_model_step():
                     parse_retries += 1
                     messages.append({"role": "assistant", "content": raw})
-                    if parse_retries >= 2:
+                    if parse_retries == 2:
                         # D11：第二次恢复——只要求输出最简单的 final（12B 长输出/跑题时最有效）
                         self._emit_progress(
                             turn, progress_callback, stage="recovering", status="running",
@@ -610,6 +690,18 @@ class AgentRuntime:
                             '{"action":"final","answer":"<一句话回答>","evidence_refs":["tool_call_1"]}。'
                             "answer 基于已返回的工具结果用一句自然的话；没有工具结果就如实说没有找到相关记录；"
                             "不要调用任何工具、不要写解释。"
+                        )})
+                    elif parse_retries >= 3:
+                        # 第三次恢复：必须给出明确答案，哪怕确认"现有记录不足以回答"
+                        self._emit_progress(
+                            turn, progress_callback, stage="recovering", status="running",
+                            text="我正在给出一个明确的结论。")
+                        messages.append({"role": "user", "content": (
+                            "你现在必须给出一个明确的 final 答案，不允许再调用工具。"
+                            "如果现有记录足以回答，就直接回答；如果不足以回答，"
+                            '就明确说"现有记录不足以确认"并给出你能确认的部分。'
+                            '只输出 {"action":"final","answer":"<结论>","evidence_refs":[]}，'
+                            "不要 markdown、不要多余文字。"
                         )})
                     else:
                         messages.append({"role": "user", "content": (
@@ -621,7 +713,13 @@ class AgentRuntime:
                 turn.status = "error"
                 turn.reason = "unparseable_action"
                 turn.termination_reason = "parse_failure"
-                if task.tool_results:
+                forced = self._force_final_once(turn, messages)
+                if forced:
+                    turn.final_answer = forced
+                    turn.status = "complete"
+                    turn.reason = ""
+                    turn.termination_reason = "forced_final_after_parse_failure"
+                elif task.tool_results:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
             if action.get("action") == "final":
@@ -685,7 +783,7 @@ class AgentRuntime:
                         )})
                         continue
                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
-                if search_has_preview and not inspect_called and visual_intent \
+                if search_has_preview and not inspect_called and wants_visual \
                         and visual_retries < max_visual_retries and turn.budget.can_model_step():
                     visual_retries += 1
                     denies_found = bool(__import__("re").search(
@@ -736,7 +834,7 @@ class AgentRuntime:
                     if req.code == RESOLVE_OCR and _pending_resolution(task):
                         continue  # 已由上方 recommended_resolution 流程处理
                     if req.code == RESOLVE_VISUAL and search_has_preview and not inspect_called \
-                            and visual_intent and visual_retries < max_visual_retries:
+                            and wants_visual and visual_retries < max_visual_retries:
                         continue  # 已由上方视觉流程处理
                     if completion_retries < max_completion_retries \
                             and turn.budget.can_model_step():
@@ -770,9 +868,16 @@ class AgentRuntime:
                         fctx = build_final_context(message, task.as_dict())
                         if needs_rewrite(turn.final_answer, fctx):
                             turn.budget.record_model_step()
-                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
+                            _wr_debug = {} if self.include_debug else None
+                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer,
+                                                      debug_out=_wr_debug)
                             if rewritten and rewritten != turn.final_answer:
-                                turn.steps.append({"type": "writer", "status": "rewritten"})
+                                _wr_step = {"type": "writer", "status": "rewritten",
+                                            "call_type": "writer"}
+                                if _wr_debug:
+                                    _wr_step["prompt"] = _wr_debug.get("messages")
+                                    _wr_step["raw_full"] = rewritten
+                                turn.steps.append(_wr_step)
                                 turn.final_answer = naturalize_answer(rewritten)
                     except Exception:
                         pass
@@ -813,11 +918,23 @@ class AgentRuntime:
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                     try:
-                        faithful, judge_problems = judge_faithfulness(
+                        judge_result = judge_faithfulness(
                             self.chat_fn, query=message, tool_results=task.tool_results,
-                            answer=turn.final_answer, trusted_facts=trusted)
-                        turn.steps.append({"type": "judge", "faithful": faithful,
-                                           "problems": list(judge_problems)})
+                            answer=turn.final_answer, trusted_facts=trusted,
+                            include_debug=self.include_debug)
+                        if self.include_debug:
+                            faithful, judge_problems, judge_debug = judge_result
+                        else:
+                            faithful, judge_problems = judge_result
+                        judge_step = {"type": "judge", "faithful": faithful,
+                                      "problems": list(judge_problems)}
+                        if self.include_debug:
+                            judge_step["debug"] = judge_debug
+                            step_id = f"step_{debug_step_seq}"
+                            debug_step_seq += 1
+                            judge_step["step_id"] = step_id
+                            judge_step["call_type"] = "faithfulness_judge"
+                        turn.steps.append(judge_step)
                         if not faithful:
                             problems = judge_problems
                     except Exception as exc:
@@ -964,10 +1081,18 @@ class AgentRuntime:
                                     "我重新读取了一次照片，请基于新的工具观察，直接输出一个修正后的 final。"
                                 )})
                                 continue
-                    # Recovery v3 第三层：natural partial —— 展示已确认部分与缺口，不放错误答案
-                    turn.status = "partial"
-                    turn.reason = "truth_unresolved:" + ";".join(problems[:4])
-                    turn.final_answer = _natural_partial(task.as_dict(), problems)
+                    # Recovery v3 第三层：优先让模型明确收尾（哪怕"没有答案"），
+                    # 失败才回退 natural partial 代码文案。
+                    forced = self._force_final_once(turn, messages)
+                    if forced:
+                        turn.final_answer = forced
+                        turn.status = "complete"
+                        turn.reason = ""
+                        turn.termination_reason = "forced_final_after_guard_recovery"
+                    else:
+                        turn.status = "partial"
+                        turn.reason = "truth_unresolved:" + ";".join(problems[:4])
+                        turn.final_answer = _natural_partial(task.as_dict(), problems)
                     break
                 self._emit_progress(
                     turn, progress_callback,
@@ -1062,6 +1187,7 @@ class AgentRuntime:
                 "type": "tool", "tool": tool_name, "arguments": arguments,
                 "status": result.status, "observation": result.observation,
                 "error": result.error, "latency_s": latency,
+                "parent_step_id": last_model_step_id,
             })
             emit_text = public_status
             if tool_name == "inspect_photo" and result.status == "ok":

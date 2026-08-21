@@ -1,0 +1,19 @@
+{
+  "default_provider_id": "dashscope-qwen3.8-max",
+  "providers": {
+    "dashscope-qwen3.8-max": {
+      "label": "云端 qwen3.8-max（推荐）",
+      "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen3.8-max",
+      "api_key": "",
+      "supports_vision": false
+    },
+    "local-mlx": {
+      "label": "本地 qwen3.5-4b-mlx",
+      "url": "http://192.168.1.65:1234",
+      "model": "qwen3.5-4b-mlx",
+      "api_key": "",
+      "supports_vision": false
+    }
+  }
+}

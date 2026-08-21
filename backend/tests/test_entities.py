@@ -104,6 +104,19 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(merged["confidence"], 0.8)
         self.assertEqual(merged["revision"], 2)
 
+    def test_active_family_relationship_is_idempotent_and_writes_semantic_claim(self):
+        owner = self.store.create_entity("我", "person", "confirmed", "自己", 1.0, scope_id="album")
+        spouse = self.store.create_entity("芳芳", "person", "confirmed", "妻子", 1.0, scope_id="album")
+
+        first = self.store.create_relationship(owner["id"], "妻子", spouse["id"], confidence=1.0, status="active")
+        self.store.maintain_relationship_claim(first)
+        second = self.store.create_relationship(owner["id"], "妻子", spouse["id"], confidence=1.0, status="active")
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(self.store.list_person_relationships("album")), 1)
+        claims = self.store.list_semantic_claims(owner["id"], 20)
+        self.assertTrue(any(claim["predicate"] == "妻子" and claim["value_text"] == "芳芳" for claim in claims))
+
     def test_semantic_consolidation_creates_review_candidate_without_merging_entities(self):
         lakeside = self.store.create_entity("湖边", "place", confidence=0.8)
         waterside = self.store.create_entity("水边", "place", confidence=0.8)

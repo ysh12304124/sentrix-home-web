@@ -1,5 +1,5 @@
-from __future__ import annotations
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -53,8 +53,8 @@ app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 maintenance_lock = threading.Lock()
 runtime_lock = threading.Lock()
-pipeline_commit_lock = threading.Lock()
 batch_worker_lock = threading.Lock()
+db_write_lock = threading.RLock()
 active_batch_workers = set()
 VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
 VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
@@ -67,6 +67,39 @@ SUPPORTED_IMPORT_SUFFIXES = {
     ".txt", ".md", ".json",
 }
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
+
+
+@contextlib.contextmanager
+def db_write_guard(label: str = "db-write", timeout: float = 120.0):
+    """Serialize SQLite writes across the request store and background worker stores.
+
+    Background pipeline workers own separate sqlite3 connections (see process_asset),
+    while import endpoints write through the request-scoped ``store``.  SQLite WAL
+    allows only one writer, so all write transactions must be serialized in-process.
+    A timed acquire turns a silent deadlock into an actionable failure instead of
+    hanging the request forever.
+    """
+    started = time.perf_counter()
+    if not db_write_lock.acquire(timeout=timeout):
+        raise RuntimeError(
+            f"timed out acquiring SQLite write lock ({label}) after {timeout:.0f}s; "
+            "a concurrent writer is stuck"
+        )
+    try:
+        waited = time.perf_counter() - started
+        if waited > 0.5:
+            print(f"[db-write-lock] {label} waited {waited:.2f}s", flush=True)
+        yield
+    finally:
+        db_write_lock.release()
+
+
+def _upload_destination(identifier, safe_name, media_type):
+    if media_type == "video":
+        directory = MEDIA_DIR / "videos" / identifier
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"original{Path(safe_name).suffix or '.mp4'}"
+    return MEDIA_DIR / f"{identifier}_{safe_name}"
 
 
 def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_location=None, latitude=None, longitude=None):
@@ -131,6 +164,9 @@ def _allowed_import_roots():
     defaults = [
         DATA_DIR / "imports",
         ROOT / "data" / "imports",
+        Path("/home/asus/data"),
+        Path("/home/asus/datasets"),
+        Path("/home/asus/benchmarks"),
     ]
     values = configured.split(":") if configured else [str(item) for item in defaults]
     roots = []
@@ -281,19 +317,21 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
     )
     limits = _pipeline_worker_limits()
     started_at = time.perf_counter()
-    task_store.update_ingest_batch_metadata(batch_id, {
-        "pipeline_metrics": {**limits, "status": "processing", "asset_count": len(asset_ids)}
-    })
+    with db_write_guard("ingest-group-start"):
+        task_store.update_ingest_batch_metadata(batch_id, {
+            "pipeline_metrics": {**limits, "status": "processing", "asset_count": len(asset_ids)}
+        })
     try:
         image_ids = []
         for asset_id in asset_ids:
             asset = task_store.get_asset(asset_id) or {}
             if asset.get("media_type") == "image" and asset.get("status") in {"queued", "failed"}:
-                task_store.update_asset(asset_id, "processing", {
-                    "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
-                })
+                with db_write_guard("ingest-group-mark-processing"):
+                    task_store.update_asset(asset_id, "processing", {
+                        "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
+                    })
                 image_ids.append(asset_id)
-            elif asset.get("status") in {"queued", "failed"}:
+            elif asset.get("status") in {"queued", "failed", "video-queued"}:
                 process_asset(asset_id)
 
         with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-fast") as executor:
@@ -301,10 +339,10 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
             for asset_id in image_ids:
                 try:
                     prepared = futures[asset_id].result()
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-fast"):
                         task_pipeline.commit_fast_image(asset_id, prepared)
                 except Exception as error:
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-fast-error"):
                         task_store.cleanup_asset_derivatives(asset_id)
                         _retries = int(((task_store.get_asset(asset_id) or {}).get("metadata_json") or {}).get("retry_count") or 0) + 1
                         task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast", "retry_count": _retries})
@@ -318,10 +356,10 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
             for asset_id in semantic_ids:
                 try:
                     prepared = futures[asset_id].result()
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-semantic"):
                         task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
                 except Exception as error:
-                    with pipeline_commit_lock:
+                    with db_write_guard("ingest-commit-semantic-error"):
                         _retries = int(((task_store.get_asset(asset_id) or {}).get("metadata_json") or {}).get("retry_count") or 0) + 1
                         task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic", "retry_count": _retries})
 
@@ -351,14 +389,16 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
             "stage_timings": _pipeline_timing_summary(task_store, asset_ids),
             "total_wall_seconds": round(time.perf_counter() - started_at, 4),
         }
-        task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
+        with db_write_guard("ingest-group-metrics"):
+            task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
     except Exception as error:
-        task_store.update_ingest_batch_metadata(batch_id, {
-            "pipeline_metrics": {
-                **limits, "status": "failed", "asset_count": len(asset_ids),
-                "total_wall_seconds": round(time.perf_counter() - started_at, 4), "error": str(error),
-            }
-        })
+        with db_write_guard("ingest-group-metrics-error"):
+            task_store.update_ingest_batch_metadata(batch_id, {
+                "pipeline_metrics": {
+                    **limits, "status": "failed", "asset_count": len(asset_ids),
+                    "total_wall_seconds": round(time.perf_counter() - started_at, 4), "error": str(error),
+                }
+            })
         raise
     finally:
         task_store.close()
@@ -378,7 +418,7 @@ def process_ingest_batch(asset_ids, batch_id):
         while True:
             rows = task_store._rows(
                 """SELECT id, status, metadata_json FROM assets
-                   WHERE batch_id = ? AND status IN ('queued', 'failed') ORDER BY created_at, id""",
+                   WHERE batch_id = ? AND status IN ('queued', 'failed', 'video-queued') ORDER BY created_at, id""",
                 (batch_id,),
             )
             # Retry cap: stop picking up failed assets after 3 attempts so a
@@ -402,15 +442,19 @@ def process_ingest_batch(asset_ids, batch_id):
                 break
             time.sleep(0.5)
 
-        task_store.complete_ingest_batch(batch_id)
-        if task_store.claim_ingest_batch_summary(batch_id):
+        with db_write_guard("ingest-batch-complete"):
+            task_store.complete_ingest_batch(batch_id)
+        with db_write_guard("ingest-batch-claim"):
+            claimed = task_store.claim_ingest_batch_summary(batch_id)
+        if claimed:
             event_ids = task_store.batch_event_ids(batch_id)
             limits = _pipeline_worker_limits()
             summary_started = time.perf_counter()
             with ThreadPoolExecutor(max_workers=limits["event_summary_workers"], thread_name_prefix="sentrix-event-summary") as executor:
                 event_results = list(executor.map(_summarize_event_worker, event_ids))
             summary_wall_seconds = round(time.perf_counter() - summary_started, 4)
-            task_store.finish_ingest_batch(batch_id)
+            with db_write_guard("ingest-batch-finish"):
+                task_store.finish_ingest_batch(batch_id)
             metrics = {
                 **limits, "status": "completed", "asset_count": len(all_asset_ids),
                 "image_count": len(all_asset_ids), "event_count": len(event_ids),
@@ -420,19 +464,17 @@ def process_ingest_batch(asset_ids, batch_id):
                 "stage_timings": _pipeline_timing_summary(task_store, all_asset_ids),
                 "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4),
             }
-            task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
+            with db_write_guard("ingest-batch-metrics"):
+                task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
     except Exception as error:
-        task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": {"status": "failed", "error": str(error)}})
+        with db_write_guard("ingest-batch-metrics-error"):
+            task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": {"status": "failed", "error": str(error)}})
         raise
     finally:
         task_store.close()
         with batch_worker_lock:
             active_batch_workers.discard(batch_id)
 
-
-
-class SetVLMBackend(BaseModel):
-    backend: str
 
 
 class ModelSwitchRequest(BaseModel):
@@ -551,7 +593,7 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
     served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
     with runtime_lock:
         base_url = (state.get("external_url_hint") if state else None) or gamma.base_url
-        new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai")
+        new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai", manager_url=RUNTIME_VLLM_API_URL or VLLM_API_URL)
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
     return _current_model_runtime()
@@ -653,12 +695,15 @@ def health():
                 agent["capability_matrix"] = {}
     except Exception:
         agent["tools"] = []
+    active_vlm_backend = getattr(gamma, "backend", "vllm")
+    if not isinstance(active_vlm_backend, str):
+        active_vlm_backend = "vllm"
     return {
         "status": "ok",
         "mode": "sentrix-local-backend",
         "agent": agent,
         "models": {
-            "vlm": {"active": "vllm", "name": gamma.model, "endpoint": gamma.base_url},
+            "vlm": {"active": active_vlm_backend, "name": gamma.model, "endpoint": gamma.base_url},
             "llm": _current_model_runtime(),
             "gamma4_12B": {"name": gamma.model, "endpoint": gamma.base_url},
             "asr": {"name": pipeline.asr.model_name, "vad": pipeline.asr.vad_model, "punc": pipeline.asr.punc_model, "ready": pipeline.asr.error is None, "error": pipeline.asr.error},
@@ -669,13 +714,19 @@ def health():
                 "identityModel": pipeline.face.identity_model,
                 "identityConfigured": pipeline.face.identity_configured,
                 "identityReady": pipeline.face.identity_ready,
+                "identityFallback": pipeline.face.identity_fallback,
+                "identityFallbackModel": pipeline.face.identity_fallback_model,
+                "identityFallbackError": pipeline.face.identity_fallback_error,
                 "error": pipeline.face.error,
                 "identityError": pipeline.face.identity_runtime_error or pipeline.face.identity_error,
             },
             "clip": {"enabled": pipeline.clip.enabled, "model": pipeline.clip.model_name, "ready": pipeline.clip.evidence_ready, "evidenceReady": pipeline.clip.evidence_ready, "error": pipeline.clip.error},
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
-        "videoExtraction": "reserved",
+        "videoExtraction": {
+            "adapter": "worldmm_keyframe_memory", "status": "available",
+            "package": "tools/video_keyframe/worldmm_keyframe_pipeline.py",
+        },
         "database": store.path,
     }
 
@@ -739,27 +790,6 @@ def delete_memory_space(scope_id: str):
 
 
 
-@app.get("/api/vlm-backend")
-def vlm_backend():
-    runtime = _current_model_runtime()
-    return {
-        "backend": "vllm",
-        "available_backends": ["vllm"],
-        "profile": runtime.get("profile"),
-        "model": runtime.get("model"),
-        "status": runtime.get("status"),
-        "deprecated": True,
-        "replacement": "/api/model-profiles",
-    }
-
-
-@app.post("/api/vlm-backend")
-def set_vlm_backend(payload: SetVLMBackend):
-    raise HTTPException(
-        status_code=410,
-        detail="VLM backend switching is retired; use POST /api/model-profiles/switch",
-    )
-
 _OCR_SETTING_KEY = "ocr.small_enabled"
 
 
@@ -771,7 +801,7 @@ def _ocr_settings():
         "small_ocr_enabled": enabled,
         "small_ocr_available": available,
         "readiness": "ready" if available else "unavailable",
-        "model": "rapidocr" if available else None,
+        "model": "paddleocr" if available else None,
     }
 
 
@@ -927,8 +957,12 @@ def dashboard(scope_id: str | None = None):
 
 
 @app.get("/api/events")
-def events(scope_id: str | None = None):
-    return {"events": store.list_events(100, scope_id=scope_id)}
+def events(scope_id: str | None = None, limit: int = 1000):
+    # The timeline needs older events when the user selects a historical date.
+    # Keep a server-side ceiling while avoiding the previous silent 100-event
+    # truncation that hid older video scenes.
+    limit = min(max(int(limit or 1000), 1), 5000)
+    return {"events": store.list_events(limit, scope_id=scope_id)}
 
 
 @app.get("/api/trips")
@@ -970,6 +1004,43 @@ def event_detail(event_id: str):
     if not value:
         raise HTTPException(status_code=404, detail="event not found")
     return value
+
+
+@app.get("/api/videos/{asset_id}")
+def video_detail(asset_id: str):
+    value = store.get_asset(asset_id)
+    if not value or value.get("media_type") != "video":
+        raise HTTPException(status_code=404, detail="video asset not found")
+    return {"video": value, "scenes": store.list_video_scene_events(asset_id)}
+
+
+@app.get("/api/videos/{asset_id}/scenes")
+def video_scenes(asset_id: str):
+    value = store.get_asset(asset_id)
+    if not value or value.get("media_type") != "video":
+        raise HTTPException(status_code=404, detail="video asset not found")
+    return {"video_asset_id": asset_id, "scenes": store.list_video_scene_events(asset_id)}
+
+
+@app.get("/api/video-scenes/{scene_id}")
+def video_scene_detail(scene_id: str):
+    value = store.get_event_detail(scene_id)
+    if not value or value["event"].get("source_type") != "video_scene":
+        raise HTTPException(status_code=404, detail="video scene not found")
+    return value
+
+
+@app.post("/api/videos/{asset_id}/reprocess", status_code=202)
+def reprocess_video(asset_id: str, background_tasks: BackgroundTasks):
+    value = store.get_asset(asset_id)
+    if not value or value.get("media_type") != "video":
+        raise HTTPException(status_code=404, detail="video asset not found")
+    store.cleanup_video_derivatives(asset_id)
+    store.update_asset(asset_id, "video-queued", {
+        "video_stage": "video-queued", "error": None, "error_stage": None,
+    })
+    background_tasks.add_task(process_asset, asset_id)
+    return {"accepted": True, "asset_id": asset_id, "status": "video-queued"}
 
 
 @app.post("/api/events")
@@ -1061,10 +1132,6 @@ def entities(status: str | None = None, includePeople: bool = False, scope_id: s
     if not includePeople:
         values = [item for item in values if item["entity_type"] != "person"]
     for item in values:
-        if item.get("entity_type") == "person":
-            item["is_self"] = bool(store._row("SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'", (item["id"],)))
-        else:
-            item["is_self"] = False
         if item.get("entity_type") == "person" and item.get("status") == "pending":
             item["canonical_name"] = "待命名成员"
             item["family_role"] = None
@@ -1321,6 +1388,55 @@ def create_relationship(payload: dict):
     return value
 
 
+@app.post("/api/relationships/batch")
+def create_relationships_batch(payload: dict):
+    scope_id = str(payload.get("scope_id") or "")
+    entity_by_name = {str(k): str(v) for k, v in (payload.get("entity_by_name") or {}).items()}
+    relationships = payload.get("relationships") or []
+
+    entities = {}
+    for entity in store.list_entities(scope_id=scope_id):
+        name = str(entity.get("canonical_name") or "").strip()
+        if name:
+            entities.setdefault(name, entity)
+        role = str(entity.get("family_role") or "").strip()
+        if role:
+            entities.setdefault(role, entity)
+
+    def resolve_entity(name: str) -> str | None:
+        key = str(name or "").strip()
+        if not key:
+            return None
+        if key in entity_by_name:
+            return entity_by_name[key]
+        entity = entities.get(key)
+        return entity.get("id") if entity else None
+
+    results = []
+    for rel in relationships:
+        subject_name = str(rel.get("subject") or "")
+        object_name = str(rel.get("object") or "")
+        predicate = str(rel.get("predicate") or "")
+        subject_id = resolve_entity(subject_name)
+        object_id = resolve_entity(object_name)
+        if not subject_id or not object_id or not predicate:
+            results.append({"subject": subject_name, "predicate": predicate,
+                            "object": object_name, "error": "unresolved entity"})
+            continue
+        try:
+            value = store.create_relationship(
+                subject_id, predicate, object_id, [],
+                float(rel.get("confidence") or 0.5), "pending")
+            results.append({"subject": subject_name, "predicate": predicate,
+                            "object": object_name,
+                            "id": value.get("id") if isinstance(value, dict) else None})
+        except Exception as exc:
+            results.append({"subject": subject_name, "predicate": predicate,
+                            "object": object_name, "error": str(exc)[:200]})
+    imported = sum(1 for r in results if not r.get("error"))
+    return {"requested": len(relationships), "imported": imported, "results": results}
+
+
 @app.post("/api/relationships/{relationship_id}/confirm")
 def confirm_relationship(relationship_id: str):
     value = store.confirm_relationship(relationship_id)
@@ -1575,6 +1691,13 @@ def asset_file(asset_id: str, original: bool = False):
     path = Path(value["path"]) if value else None
     if not value or not path or not path.is_file():
         raise HTTPException(status_code=404, detail="asset file not found")
+    preview_path = Path((value.get("metadata_json") or {}).get("browser_preview_path") or "")
+    if value.get("media_type") == "video" and not original and preview_path.is_file():
+        return FileResponse(
+            preview_path, media_type="video/mp4",
+            filename=f"{Path(value.get('file_name') or asset_id).stem}-preview.mp4",
+            headers={"Cache-Control": "private, max-age=86400", "X-Sentrix-Source": "browser-preview"},
+        )
     # Keep an escape hatch for downloading the untouched original file.
     mime = (value.get("mime_type") or "").split(";", 1)[0].strip().lower()
     if original or not mime.startswith("image/"):
@@ -1629,11 +1752,11 @@ def face_instance_crop(face_instance_id: str):
     if not instance or not asset_path or not Path(asset_path).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image
 
         ensure_heif_support()
         with Image.open(asset_path) as source:
-            image = ImageOps.exif_transpose(source).convert("RGB")
+            image = source.convert("RGB")
         bbox = instance.get("bbox_json") or []
         if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
             raise ValueError("invalid face bounding box")
@@ -1662,160 +1785,22 @@ def stories():
     return {"stories": store.list_stories()}
 
 
-def _truncate_story_evidence(evidence):
-    """Limit story-evidence size so the LLM prompt stays well under the
-    model's context window (vllm gemma4-12b-it caps at 8192 tokens).
-    Statistics (topPlace/topPerson/objects) are computed from the full
-    evidence; only the LLM-facing copy is trimmed here."""
-    trimmed = []
-    for ev in evidence:
-        event = ev.get("event") or {}
-        observations = []
-        for item in (ev.get("observations") or [])[:6]:
-            observations.append({
-                "id": item.get("id"),
-                "captured_at": item.get("captured_at"),
-                "place": item.get("place"),
-                "caption": (item.get("caption") or "")[:150],
-                "transcript": (item.get("transcript") or "")[:150],
-                "objects": (item.get("objects") or [])[:5],
-                "people": [{"name": p.get("name"), "is_self": p.get("is_self")} for p in (item.get("people") or [])[:4]],
-            })
-        trimmed.append({"event": {
-            "title": (event.get("title") or "")[:80],
-            "summary": (event.get("summary") or "")[:150],
-            "time_start": event.get("time_start"),
-            "place": (event.get("place") or "")[:60],
-        }, "observations": observations})
-    return trimmed
-
 @app.post("/api/stories")
 def create_story(payload: dict):
     event_ids = payload.get("event_ids") or []
     if event_ids and not payload.get("content"):
         evidence = []
-        person_freq = {}
-        self_names = set()
-        place_freq = {}
-        days = set()
-        time_values = []
-        object_set = set()
         for event_id in event_ids:
             detail = store.get_event_detail(event_id)
-            if not detail:
-                continue
-            observations = []
-            for item in detail["observations"]:
-                asset = item.get("asset") or {}
-                people = []
-                for p in (item.get("people") or []):
-                    if not p.get("entity_id"):
-                        continue
-                    is_self = bool(store._row(
-                        "SELECT 1 FROM entity_properties WHERE entity_id=? AND property_key='is_self' AND value_json='true'",
-                        (p.get("entity_id"),),
-                    ))
-                    people.append({"name": p.get("name"), "is_self": is_self})
-                    name = p.get("name") or "未知"
-                    person_freq[name] = person_freq.get(name, 0) + 1
-                    if is_self:
-                        self_names.add(name)
-                observations.append({
-                    "id": item.get("id"),
-                    "caption": item.get("caption"),
-                    "transcript": item.get("transcript"),
-                    "captured_at": item.get("captured_at"),
-                    "place": item.get("place"),
-                    "objects": item.get("objects"),
-                    "captured_location": asset.get("captured_location"),
-                    "people": people,
-                })
-                captured = item.get("captured_at")
-                if captured:
-                    days.add(str(captured)[:10])
-                    time_values.append(str(captured))
-                for obj in (item.get("objects") or []):
-                    label = obj if isinstance(obj, str) else (obj.get("label") or obj.get("primary") or "")
-                    if label:
-                        object_set.add(label)
-                location = asset.get("captured_location")
-                if location:
-                    try:
-                        lat, lon = (float(part) for part in str(location).replace(" ", "").split(","))
-                        cluster = f"{round(lat, 1)},{round(lon, 1)}"
-                    except Exception:
-                        cluster = str(location)
-                else:
-                    cluster = item.get("place") or "未知"
-                place_freq[cluster] = place_freq.get(cluster, 0) + 1
-            event_start = (detail["event"] or {}).get("time_start")
-            event_end = (detail["event"] or {}).get("time_end")
-            if event_start:
-                days.add(str(event_start)[:10])
-            if event_end:
-                days.add(str(event_end)[:10])
-            evidence.append({"event": detail["event"], "observations": observations})
-        # 按时间排序:每个事件内observations按captured_at,事件按各自最早时间
-        for ev in evidence:
-            ev["observations"].sort(key=lambda o: str(o.get("captured_at") or ""))
-        evidence.sort(key=lambda ev: str((ev["observations"] or [{}])[0].get("captured_at") or ""))
+            if detail:
+                evidence.append({"event": detail["event"], "observations": [{"id": item["id"], "caption": item.get("caption"), "transcript": item.get("transcript"), "asset_id": item.get("asset_id")} for item in detail["observations"]]})
         if evidence:
-            photo_count = sum(len(ev["observations"]) for ev in evidence)
-            event_count = len(evidence)
-            days_count = len(days)
-            object_count = len(object_set)
-            time_span = f"{min(time_values)[:10]} 至 {max(time_values)[:10]}" if len(time_values) > 1 else (time_values[0][:10] if time_values else "")
-            # topPerson:排除相册主人(我)后的最高频陪伴人物;叙事主语=我+topPerson
-            non_self_freq = {key: value for key, value in person_freq.items() if key not in self_names}
-            top_person = max(non_self_freq, key=non_self_freq.get) if non_self_freq else None
-            subject = f"我和{top_person}" if top_person else "我"
-            # 地点组:GPS聚类给字母标签,附经纬度,不编地名
-            cluster_list = sorted(place_freq.items(), key=lambda item: -item[1])
-            cluster_labels = {}
-            place_lines = []
-            for index, (cluster, count) in enumerate(cluster_list):
-                label = f"地点组{chr(ord('A') + index)}"
-                cluster_labels[cluster] = label
-                place_lines.append(f"{label}(经纬度{cluster},{count}张)")
-            top_label = cluster_labels[cluster_list[0][0]] if cluster_list else ""
-            other_labels = "、".join(cluster_labels[c] for c, _ in cluster_list[1:]) or "无"
-            # 代表事件一句话,给叙事具体画面(防空洞)
-            representative = []
-            for ev in evidence:
-                e = ev["event"] or {}
-                one_line = (e.get("summary") or "").strip() or (e.get("title") or "").strip()
-                if one_line and len(representative) < 3:
-                    representative.append(one_line[:80])
-            stats = (
-                f"时间跨度:{time_span or '未知'};天数:{days_count}天;事件数:{event_count}个;"
-                f"照片数:{photo_count}张;物件数:{object_count}件;"
-                f"地点分布:{'、'.join(place_lines) or '无'};"
-                f"出现最多的地点组(叙述需占约2/3篇幅):{top_label};其他地点组合计约1/3:{other_labels};"
-                f"相册主人(我):{'、'.join(sorted(self_names)) or '无'};陪伴人物:{top_person or '无'}"
-            )
-            prompt = (
-                "根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。\n"
-                "统计概要(系统已算出,仅供叙事参考,不得改动或编造):\n" + stats + "\n"
-                "规则:\n"
-                "1. 严格返回JSON:title、content、outline(数组)。使用中文,content约400字(照片多可略长)。\n"
-                "2. 叙事以" + subject + "为主语主角,第一人称\"我\"。"
-                + ("陪伴人物" + top_person + "与\"我\"是并肩关系,绝不把\"我\"写成\"我与自己相伴\"。"
-                   if top_person else "叙述\"我\"自身的经历,第一人称。") + "\n"
-                "3. 证据中is_self=true的人物=相册主人\"我\"本人,叙事中一律用\"我\"称呼,绝不使用其姓名(如\"zhx\")作为第三人称提及。\n"
-                "4. 出现最多的地点组要占叙事约2/3篇幅,其他地点组合计约1/3。\n"
-                "5. 地点可依据经纬度合理推断城市(如22.5,114.1疑似深圳)并使用,但不得编造未经证据支持的具体地名(商场/餐厅/景点等);若不确定就笼统表述。\n"
-                "6. 严格按时间先后顺序(早→晚)组织叙事,不得倒序或乱序。\n"
-                "7. 参考这些代表性画面,让叙事有具体细节而非统计堆砌:\n"
-                + "\n".join("· " + text for text in representative) + "\n"
-                "证据:" + str(_truncate_story_evidence(evidence))
-            )
-            generated = parse_json_response(gamma.chat(prompt))
-            payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
-            # 方案B:后处理把is_self人物名字替换成"我",防止LLM不服从
-            for name in sorted(self_names):
-                if name and name != "我":
-                    payload["title"] = payload.get("title","").replace("我和"+name, "我").replace(name, "我")
-                    payload["content"] = payload.get("content","").replace("我和"+name, "我").replace(name, "我")
+            prompt = """根据下面的真实家庭事件和证据生成故事初稿。不要补造人物、地点或时间，只能使用证据。严格返回 JSON：title、content、outline（数组）。使用中文，content 300 字以内。证据：""" + str(evidence)
+            try:
+                generated = parse_json_response(gamma.chat(prompt))
+                payload = {**payload, "title": payload.get("title") or generated.get("title"), "content": generated.get("content", ""), "outline": generated.get("outline", [])}
+            except Exception:
+                pass
     return store.create_story(payload)
 
 
@@ -1846,6 +1831,7 @@ class AssistantTurnRequest(BaseModel):
     conversation_id: str | None = None
     feedback: dict | None = None
     scope_id: str = "home-default"
+    include_debug: bool = False
     selected_entity_id: str | None = None
     selected_asset_handle: str | None = None
     selected_result_set_id: str | None = None
@@ -1868,7 +1854,7 @@ def _turn_executor():
 def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="",
                    progress_callback=None, selected_asset_handle=None,
                    selected_result_set_id=None, conversation_summary="",
-                   profile_name=None):
+                   profile_name=None, include_debug=False):
     """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
     from .agent_runtime import tools as runtime_tools
     from .agent_runtime.runtime import AgentRuntime
@@ -1927,7 +1913,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            ocr_settings={"small_ocr_enabled": _ocr_setting},
                            scope_id=scope_id, viewer_id=viewer_id,
-                           conversation_id=conversation_id)
+                           conversation_id=conversation_id,
+                           include_debug=include_debug)
     prev_state = _TOOL_LOOP_TASK_STATE.get(conversation_id) if conversation_id else None
     # Phase C C15：用户点选的照片写入本轮 task_state（selected handle 稳定跨轮可用）
     if selected_asset_handle:
@@ -1991,6 +1978,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "guard_debug": guard_debug,
         "answer_grounding": turn.answer_grounding,
         "termination_reason": turn.termination_reason,
+        "debug_trace": turn.steps if include_debug else None,
     }
 
 
@@ -2025,7 +2013,7 @@ def assistant_turn(request: AssistantTurnRequest):
         _execute_turn_job, turn_id, message, conversation_id,
         request.scope_id, request.viewer_id, recent_turns,
         request.selected_asset_handle, request.selected_result_set_id,
-        conversation_summary)
+        conversation_summary, request.include_debug)
     return {
         "turn_id": turn_id,
         "status": "running",
@@ -2384,7 +2372,7 @@ def assistant_response(result):
 
 def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, recent_turns,
                      selected_asset_handle=None, selected_result_set_id=None,
-                     conversation_summary=""):
+                     conversation_summary="", include_debug=False):
     """B3.4：后台执行 tool-loop turn，progress 增量写入 job。"""
     job = _TURN_JOBS.get(turn_id)
     try:
@@ -2398,7 +2386,8 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
                                  recent_turns=recent_turns, progress_callback=on_progress,
                                  selected_asset_handle=selected_asset_handle,
                                  selected_result_set_id=selected_result_set_id,
-                                 conversation_summary=conversation_summary)
+                                 conversation_summary=conversation_summary,
+                                 include_debug=include_debug)
         # B4 canary telemetry：profile / 工具序列 / guard / 延迟 / fallback 标记
         try:
             trace = result.get("retrieval_trace") or []
@@ -2523,10 +2512,10 @@ async def ingest(
 ):
     safe_name = Path(file.filename or "upload.bin").name
     asset_id = make_id("asset")
-    destination = MEDIA_DIR / f"{asset_id}_{safe_name}"
+    media_type = media_type_from_upload(file.content_type, safe_name)
+    destination = _upload_destination(asset_id, safe_name, media_type)
     with destination.open("wb") as output:
         shutil.copyfileobj(file.file, output)
-    media_type = media_type_from_upload(file.content_type, safe_name)
     mime_type = file.content_type or guess_mime_type(safe_name)
     scope = (scope_id or scopeId or "home-default").strip() or "home-default"
     metadata = {
@@ -2557,8 +2546,10 @@ async def ingest(
         destination.stat().st_size,
         metadata,
     )
+    if media_type == "video":
+        created = store.update_asset(asset_id, "video-queued", {"video_stage": "video-queued"})
     background_tasks.add_task(process_asset, asset_id)
-    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": "queued", "mediaType": media_type, "scope_id": scope}
+    return {"accepted": True, "assetId": created["id"], "fileName": safe_name, "status": created["status"], "mediaType": media_type, "scope_id": scope}
 
 
 @app.post("/api/import", status_code=202)
@@ -2589,35 +2580,39 @@ async def import_remote_files(
     per_file = per_file or [{} for _ in files]
     scope = (scope_id or scopeId or "home-default").strip() or "home-default"
     batch = (batch_id or batchId or make_id("batch")).strip()
-    store.create_memory_space(scope, scope, kind="benchmark")
-    store.create_ingest_batch(batch, scope)
+    with db_write_guard("import-remote-init"):
+        store.create_memory_space(scope, scope, kind="benchmark")
+        store.create_ingest_batch(batch, scope)
     items = []
     queued_asset_ids = []
     for index, upload in enumerate(files):
         safe_name = Path(upload.filename or f"upload-{index}").name
-        destination = MEDIA_DIR / f"{make_id('upload')}_{safe_name}"
+        media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
+        if media_type not in {"image", "audio", "video", "text"}:
+            media_type = media_type_from_upload(upload.content_type, safe_name)
+        destination = _upload_destination(make_id("upload"), safe_name, media_type)
         try:
             save_started = time.perf_counter()
             with destination.open("wb") as output:
                 shutil.copyfileobj(upload.file, output)
             file_save_seconds = round(time.perf_counter() - save_started, 4)
             capture = _normalized_capture_metadata(per_file[index])
-            media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
-            if media_type not in {"image", "audio", "video", "text"}:
-                media_type = "text"
-            created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
-                "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
-                "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
-                "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
-                **capture,
-            })
-            created = store.update_asset(created["id"], created.get("status") or "queued", {
-                "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
-            })
+            with db_write_guard("import-remote-file"):
+                created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
+                    "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
+                    "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
+                    "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
+                    **capture,
+                })
+                if media_type == "video" and created.get("path") == str(destination):
+                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                created = store.update_asset(created["id"], created.get("status") or "queued", {
+                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
+                })
             deduplicated = created.get("path") != str(destination)
             if deduplicated:
                 destination.unlink(missing_ok=True)
-            elif created.get("status") in {"queued", "failed"}:
+            elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
                 queued_asset_ids.append(created["id"])
             items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"], "fileName": created["file_name"], "status": created["status"], "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"), "deduplicated": deduplicated})
         except ValueError as error:
@@ -2644,8 +2639,9 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="source_path not found")
     scope = (request.scope_id or "home-default").strip() or "home-default"
     batch_id = (request.batch_id or make_id("batch")).strip()
-    store.create_memory_space(scope, scope, kind="benchmark", source_path=str(source))
-    store.create_ingest_batch(batch_id, scope)
+    with db_write_guard("import-directory-init"):
+        store.create_memory_space(scope, scope, kind="benchmark", source_path=str(source))
+        store.create_ingest_batch(batch_id, scope)
     if source.is_file():
         candidates = [source]
     else:
@@ -2675,10 +2671,13 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
             shutil.copy2(path, target)
         try:
             copy_started = time.perf_counter()
-            created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
-            created = store.update_asset(created["id"], created.get("status") or "queued", {
-                "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
-            })
+            with db_write_guard("import-directory-file"):
+                created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
+                if created.get("media_type") == "video" and created.get("path") == str(target):
+                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                created = store.update_asset(created["id"], created.get("status") or "queued", {
+                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
+                })
         except Exception as error:
             if request.copy_file:
                 target.unlink(missing_ok=True)
@@ -2687,7 +2686,7 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
         deduplicated = created.get("path") != str(target)
         if request.copy_file and deduplicated:
             target.unlink(missing_ok=True)
-        elif created.get("status") in {"queued", "failed"}:
+        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
             queued_asset_ids.append(created["id"])
         imported.append({
             "asset_id": created["id"],
@@ -2720,8 +2719,9 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
 def create_ingest_batch(request: IngestBatchCreateRequest):
     scope = (request.scope_id or "home-default").strip() or "home-default"
     batch_id = (request.batch_id or make_id("batch")).strip()
-    store.create_memory_space(scope, request.name or scope, kind=request.kind or "benchmark", source_path=request.source_path)
-    store.create_ingest_batch(batch_id, scope)
+    with db_write_guard("ingest-batch-create"):
+        store.create_memory_space(scope, request.name or scope, kind=request.kind or "benchmark", source_path=request.source_path)
+        store.create_ingest_batch(batch_id, scope)
     return _batch_status(batch_id)
 
 
@@ -2734,7 +2734,8 @@ def ingest_batch(batch_id: str):
 def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
     if not store.get_ingest_batch(batch_id):
         raise HTTPException(status_code=404, detail="ingest batch not found")
-    store.complete_ingest_batch(batch_id)
+    with db_write_guard("ingest-batch-complete-endpoint"):
+        store.complete_ingest_batch(batch_id)
     with batch_worker_lock:
         worker_active = batch_id in active_batch_workers
     if not worker_active:
@@ -2744,7 +2745,7 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
 
 @app.post("/api/maintenance/recheck")
 def recheck(background_tasks: BackgroundTasks):
-    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed', 'semantic_enriching') ORDER BY created_at")]
+    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed', 'semantic_enriching', 'video-queued', 'video-processing-failed') ORDER BY created_at")]
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
     return {"accepted": len(assets), "status": "recheck-queued"}
@@ -2794,17 +2795,3 @@ def reject_fact(fact_id: str):
     if not store.get_fact(fact_id):
         raise HTTPException(status_code=404, detail="fact not found")
     return store.reject_fact(fact_id)
-
-
-# ============================================================
-# Phase E — QA Dashboard 只读路由（/qa + /api/qa/runs*）
-# 数据目录可用 SENTRIX_QA_DIR 覆盖（默认 <data>/qa_runs）
-# ============================================================
-from .qa_dashboard import register_qa_routes
-
-QA_RUNS_DIR = Path(os.getenv("SENTRIX_QA_DIR", DATA_DIR / "qa_runs"))
-register_qa_routes(
-    app,
-    QA_RUNS_DIR,
-    dashboard_html=ROOT / "scripts" / "benchmarks" / "qa_dashboard.html",
-)

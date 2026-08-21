@@ -1,0 +1,91 @@
+{
+  "album_id": "album3-14",
+  "album_name": "PhotoBench album3 小子集（14图）",
+  "scope_kind": "benchmark",
+  "family_relationships": [
+    {"subject": "我", "predicate": "妻子", "object": "芳芳", "confidence": 1.0},
+    {"subject": "芳芳", "predicate": "丈夫", "object": "我", "confidence": 1.0},
+    {"subject": "我", "predicate": "母亲", "object": "张晓莉", "confidence": 1.0},
+    {"subject": "张晓莉", "predicate": "儿子", "object": "我", "confidence": 1.0},
+    {"subject": "我", "predicate": "父亲", "object": "王建国", "confidence": 1.0},
+    {"subject": "王建国", "predicate": "儿子", "object": "我", "confidence": 1.0}
+  ],
+  "faces": [
+    {
+      "face_id": "1",
+      "canonical_name": "我",
+      "family_role": "自己",
+      "aliases": ["自己"],
+      "ref_image": "faces/faceid_1.jpg"
+    },
+    {
+      "face_id": "2",
+      "canonical_name": "明明",
+      "family_role": "大宝",
+      "aliases": ["小明"],
+      "ref_image": "faces/faceid_2.jpg"
+    },
+    {
+      "face_id": "3",
+      "canonical_name": "张晓莉",
+      "family_role": "母亲",
+      "aliases": ["妈"],
+      "ref_image": "faces/faceid_3.jpg"
+    },
+    {
+      "face_id": "4",
+      "canonical_name": "乐乐",
+      "family_role": "小宝",
+      "aliases": ["小乐"],
+      "ref_image": "faces/faceid_4.jpg"
+    },
+    {
+      "face_id": "7",
+      "canonical_name": "王建国",
+      "family_role": "父亲",
+      "aliases": ["爸爸"],
+      "ref_image": "faces/faceid_7.jpg"
+    },
+    {
+      "face_id": "8",
+      "canonical_name": "芳芳",
+      "family_role": "妻子",
+      "aliases": ["老婆"],
+      "ref_image": "faces/faceid_8.jpg"
+    },
+    {
+      "face_id": "10",
+      "canonical_name": "雪儿",
+      "family_role": "小宝",
+      "aliases": ["小雪"],
+      "ref_image": "faces/faceid_10.jpg"
+    },
+    {
+      "face_id": "12",
+      "canonical_name": "强子",
+      "family_role": "侄子",
+      "aliases": [],
+      "ref_image": "faces/faceid_12.jpg"
+    }
+  ],
+  "photos": [
+    "photos/2018-04-01 210440.jpg",
+    "photos/2018-04-01 210536.jpg",
+    "photos/2018-04-01 210547.jpg",
+    "photos/2018-04-01 210550.jpg",
+    "photos/IMG_20220623_212500.jpg",
+    "photos/IMG_20220623_212524.jpg",
+    "photos/IMG_20220623_212642.jpg",
+    "photos/IMG_20230806_203916.jpg",
+    "photos/IMG_20230806_204143.jpg",
+    "photos/IMG_20230806_204342.jpg",
+    "photos/IMG_20230806_205755.jpg",
+    "photos/IMG_20230806_205817.jpg",
+    "photos/IMG_8653.JPG",
+    "photos/IMG_8654.JPG"
+  ],
+  "qa_sets": {
+    "compact-10q": "qa/compact-10q.jsonl",
+    "behavior-6q": "qa/behavior-6q.jsonl"
+  }
+}

@@ -14,7 +14,7 @@ from backend.face_clustering import pairwise_metrics
 
 def _truth_from_manifest(manifest_path):
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    return {str(item["file"]): str(item["source_identity"]) for item in manifest.get("assets", [])}
+    return {str(Path(item["file"]).name): str(item["source_identity"]) for item in manifest.get("assets", [])}
 
 
 def _round_metrics(metrics):
