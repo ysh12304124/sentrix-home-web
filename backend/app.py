@@ -31,6 +31,7 @@ from .image_io import (
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
+from .person_insights import rank_core_people
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1132,6 +1133,196 @@ def person_evidence(person_id: str, scope_id: str | None = None):
         entity["family_role"] = None
         entity["summary"] = "由人脸聚类生成，等待用户确认"
     return value
+
+
+@app.get("/api/person-insights")
+def person_insights(scope_id: str | None = None):
+    scope_id = scope_id or "home-default"
+    run = store.latest_person_insight_run(scope_id)
+    features = store.person_candidate_features(scope_id)
+    ranked = rank_core_people(features, limit=10)
+    tiers = {"core": [], "common": [], "incidental": []}
+    for item in ranked:
+        person = store.get_entity(item["person_id"]) or {}
+        role_candidates = store.list_role_hypotheses(
+            person_id=item["person_id"], status="suggested"
+        )
+        portrait = store.get_active_portrait(item["person_id"])
+        tiers[item["tier"]].append({
+            **item,
+            "identity_state": person.get("identity_state") or "clustered",
+            "role_state": person.get("role_state") or "unknown",
+            "name_state": person.get("name_state") or "anonymous",
+            "display_name": person.get("canonical_name") or "未命名成员",
+            "family_role": person.get("family_role"),
+            "role_candidates": role_candidates[:3],
+            "portrait": portrait,
+        })
+    owner_candidates = [
+        hypothesis for hypothesis in store.list_role_hypotheses(scope_id=scope_id, status="suggested")
+        if hypothesis.get("role") == "本人"
+    ]
+    return {
+        "scope_id": scope_id,
+        "run": run,
+        "tiers": tiers,
+        "album_owner_candidates": owner_candidates,
+        "relationship_hypotheses": store.list_relationship_hypotheses(scope_id, status="suggested"),
+    }
+
+
+@app.post("/api/people/{person_id}/role-decision")
+def role_decision(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    decision = str((payload or {}).get("decision") or "").strip()
+    if decision == "confirm":
+        updated = store.confirm_role_hypothesis(
+            (payload or {}).get("hypothesis_id"),
+            role=(payload or {}).get("role"),
+            is_self=bool((payload or {}).get("is_self")),
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        affected = store.supersede_conflicting_hypotheses(person_id)
+        store.rebuild_person_memory(person_id)
+        store.mark_portraits_stale([person_id, *affected])
+        return {"ok": True, "person": updated, "affected": affected}
+    if decision == "reject":
+        rejected = store.reject_role_hypothesis((payload or {}).get("hypothesis_id"))
+        if rejected is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        return {"ok": True, "rejected": rejected["id"]}
+    raise HTTPException(status_code=400, detail="unsupported decision")
+
+
+@app.patch("/api/people/{person_id}/name")
+def rename_person_api(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    name = str((payload or {}).get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    updated = store.rename_person(person_id, name)
+    return {"ok": True, "name": updated["entity"]["canonical_name"]}
+
+
+@app.post("/api/relationship-hypotheses/{hypothesis_id}/decision")
+def relationship_hypothesis_decision(hypothesis_id: str, payload: dict):
+    decision = str((payload or {}).get("decision") or "").strip()
+    if decision == "confirm":
+        hypothesis = store.confirm_relationship_hypothesis(hypothesis_id)
+        if hypothesis is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        affected = store.supersede_conflicting_hypotheses(hypothesis["subject_person_id"])
+        store.rebuild_person_memory(hypothesis["subject_person_id"])
+        store.rebuild_person_memory(hypothesis["object_person_id"])
+        store.mark_portraits_stale([
+            hypothesis["subject_person_id"], hypothesis["object_person_id"], *affected,
+        ])
+        return {"ok": True, "hypothesis": hypothesis}
+    if decision == "reject":
+        rejected = store.reject_relationship_hypothesis(hypothesis_id)
+        if rejected is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        return {"ok": True, "rejected": rejected["id"]}
+    raise HTTPException(status_code=400, detail="unsupported decision")
+
+
+@app.get("/api/people/{person_id}/portrait")
+def person_portrait(person_id: str):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    return {
+        "person_id": person_id,
+        "active": store.get_active_portrait(person_id),
+        "revisions": store.list_portrait_revisions(person_id),
+    }
+
+
+@app.post("/api/people/{person_id}/portrait-feedback")
+def portrait_feedback(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    revision_id = (payload or {}).get("revision_id")
+    verdict = str((payload or {}).get("verdict") or "").strip()
+    note = str((payload or {}).get("note") or "").strip()
+    feedback = verdict + (f"：{note}" if note else "")
+    updated = store.set_portrait_feedback(revision_id, feedback)
+    if not updated:
+        raise HTTPException(status_code=404, detail="revision not found")
+    return {"ok": True, "revision": updated}
+
+
+@app.patch("/api/people/{person_id}/portrait")
+def update_portrait(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    text = str((payload or {}).get("portrait_text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="portrait_text is required")
+    revision_id = (payload or {}).get("revision_id")
+    existing = store.get_portrait_revision(revision_id) if revision_id else None
+    revision = store.create_portrait_revision(person_id, {
+        "portrait_text": text,
+        "themes": (existing or {}).get("themes") or [],
+        "evidence_refs": (existing or {}).get("evidence_refs") or [],
+        "trigger_type": "user_edit",
+        "model_name": "user",
+        "prompt_version": "user-edit",
+    })
+    if bool((payload or {}).get("locked")):
+        revision = store.set_portrait_lock(revision["id"], True)
+    return {"ok": True, "revision": revision}
+
+
+def _execute_person_insight_run(run_id: str, scope_id: str, config: dict):
+    from .person_insights import PersonInsightService
+
+    PersonInsightService(store, gamma).run(run_id, scope_id, config or {})
+
+
+@app.post("/api/person-insight-runs")
+def start_person_insight_run(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    latest = store.latest_person_insight_run(scope_id)
+    if latest and latest.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail="person insight run already in progress")
+    config = dict(payload or {})
+    run = store.create_person_insight_run(scope_id, config)
+    threading.Thread(
+        target=_execute_person_insight_run, args=(run["id"], scope_id, config), daemon=True
+    ).start()
+    return {"status": 202, "run": run}
+
+
+@app.get("/api/person-insight-runs/{run_id}")
+def get_person_insight_run(run_id: str):
+    run = store.get_person_insight_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+@app.post("/api/person-insight-runs/{run_id}/retry")
+def retry_person_insight_run(run_id: str):
+    run = store.get_person_insight_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.get("status") == "running":
+        raise HTTPException(status_code=409, detail="run already running")
+    config = dict(run.get("config") or {})
+    threading.Thread(
+        target=_execute_person_insight_run, args=(run_id, run["scope_id"], config), daemon=True
+    ).start()
+    return {"status": 202, "run": store.get_person_insight_run(run_id)}
 
 
 @app.get("/api/entities")
