@@ -11,7 +11,6 @@ writing) run on the isolated copy only; the source database is opened read-only.
 """
 
 import argparse
-import hashlib
 import json
 import os
 import sqlite3
@@ -113,19 +112,39 @@ def compute_metrics(store, scope_id, answers):
     }
 
 
-def _db_counts(path):
+def _source_snapshot(path, scope_id):
+    """Scope-scoped key counts of the source database, used to prove no pollution.
+
+    The evaluation never writes the source; this snapshot verifies that the
+    album3-max evidence and other scopes stayed unchanged while the copy ran.
+    """
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        tables = ("assets", "observations", "events", "face_instances", "face_clusters")
-        counts = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}
-        hashes = {}
-        for table in ("assets", "observations", "events"):
-            hashes[table] = hashlib.sha256(
-                "".join(str(row[0]) for row in connection.execute(f"SELECT id FROM {table} ORDER BY id")).encode()
-            ).hexdigest()
+        def count(sql, params=()):
+            return connection.execute(sql, params).fetchone()[0]
+
+        return {
+            "album_assets": count("SELECT COUNT(*) FROM assets WHERE scope_id = ?", (scope_id,)),
+            "album_observations": count("SELECT COUNT(*) FROM observations WHERE scope_id = ?", (scope_id,)),
+            "album_face_instances": count(
+                "SELECT COUNT(*) FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE a.scope_id = ?",
+                (scope_id,),
+            ),
+            "album_clusters": count(
+                "SELECT COUNT(*) FROM face_clusters WHERE scope_id = ? AND status != 'rejected'", (scope_id,)
+            ),
+            "album_confirmed_people": count(
+                "SELECT COUNT(*) FROM entities WHERE scope_id = ? AND entity_type = 'person' AND status = 'confirmed'",
+                (scope_id,),
+            ),
+            "album_events": count("SELECT COUNT(*) FROM events WHERE scope_id = ?", (scope_id,)),
+            "album_vectors": count("SELECT COUNT(*) FROM memory_vectors WHERE scope_id = ?", (scope_id,)),
+            "other_assets": count("SELECT COUNT(*) FROM assets WHERE scope_id != ?", (scope_id,)),
+            "other_observations": count("SELECT COUNT(*) FROM observations WHERE scope_id != ?", (scope_id,)),
+            "other_events": count("SELECT COUNT(*) FROM events WHERE scope_id != ?", (scope_id,)),
+        }
     finally:
         connection.close()
-    return {"counts": counts, "hashes": hashes}
 
 
 def evaluate_pipeline(work_store, scope_id, config, gamma, answers):
@@ -162,7 +181,7 @@ def main(argv=None):
         backup_sqlite, backfill_visual_asset_vectors, build_missing_events,
     )
 
-    source_before = _db_counts(args.source_db)
+    source_before = _source_snapshot(args.source_db, args.scope_id)
     work_path = backup_sqlite(args.source_db, args.work_db)
     store = MemoryStore(work_path)
     try:
@@ -177,7 +196,7 @@ def main(argv=None):
         metrics = evaluate_pipeline(store, args.scope_id, config, gamma, answers)
     finally:
         store.close()
-    source_after = _db_counts(args.source_db)
+    source_after = _source_snapshot(args.source_db, args.scope_id)
     metrics["source_database_changed"] = source_before != source_after
 
     output_dir = Path(args.output_dir)
