@@ -1633,6 +1633,7 @@ class BenchmarkRun:
 
     def _evaluate_one(self, row: dict, assets_by_name: dict) -> dict:
         t0 = time.perf_counter()
+        timeline = {"started_at_epoch": round(time.time(), 3)}
         conversation = row.get("conversation") or []
         if conversation and not isinstance(conversation, list):
             raise ValueError("conversation must be a list")
@@ -1735,6 +1736,7 @@ class BenchmarkRun:
             # Judges consume distinct evidence: answer quality uses the reference;
             # evidence grounding uses only this turn's retrieved images.
             t_judge0 = time.perf_counter()
+            timeline["judge_started_at_epoch"] = round(time.time(), 3)
             for index, record in enumerate(turn_records):
                 expected = record.get("expected_action")
                 turn_definition = (conversation[index]
@@ -1784,6 +1786,7 @@ class BenchmarkRun:
             judge = turn_records[-1]["judge"] if turn_records else {"score": None, "reason": "not_applicable"}
             evidence_judge = turn_records[-1]["evidence_judge"] if turn_records else {"score": None, "reason": "not_applicable"}
             judge_ms = round((time.perf_counter() - t_judge0) * 1000, 1)
+            timeline["judge_finished_at_epoch"] = round(time.time(), 3)
 
             # Aggregate LLM metrics from call_metrics
             llm_summary = self._summarize_call_metrics(call_metrics)
@@ -1798,6 +1801,7 @@ class BenchmarkRun:
             attributed = sum(value for value in (model_ms, tool_ms, judge_ms) if value is not None)
             timing_breakdown = {
                 "wall_clock_ms": wall_clock_ms,
+                "timeline": timeline,
                 "agent_wall_ms": agent_wall_ms,
                 "model_ms": model_ms,
                 "tool_ms": tool_ms,
@@ -2506,6 +2510,31 @@ class BenchmarkRun:
         completion_valid = [value for value in completion if isinstance(value, bool)]
         wall_times = [float(item["wall_clock_ms"]) for item in items
                       if isinstance(item.get("wall_clock_ms"), (int, float))]
+        judge_times = [float((item.get("timing_breakdown") or {}).get("judge_ms"))
+                       for item in items
+                       if isinstance((item.get("timing_breakdown") or {}).get("judge_ms"), (int, float))]
+        # Pure-agent throughput: (QA wall clock - judge-exclusive wall time) / N.
+        # Judge intervals from concurrent items overlap agent work; only the
+        # union of judge intervals actually excludes agent execution time.
+        judge_exclusive_ms = None
+        agent_throughput_ms = None
+        timelines = [(item.get("timing_breakdown") or {}).get("timeline") or {} for item in items]
+        spans = [(tl.get("started_at_epoch"), tl.get("judge_started_at_epoch"), tl.get("judge_finished_at_epoch")) for tl in timelines]
+        ends = [s[0] + float((item.get("timing_breakdown") or {}).get("wall_clock_ms") or 0) / 1000 for s, item in zip(spans, items)]
+        if spans and all(isinstance(s[0], (int, float)) for s in spans):
+            wall_start = min(s[0] for s in spans)
+            wall_end = max(e for e in ends if isinstance(e, (int, float)))
+            judge_spans = sorted((s[1], s[2]) for s in spans
+                                 if isinstance(s[1], (int, float)) and isinstance(s[2], (int, float)) and s[2] > s[1])
+            merged: list[list[float]] = []
+            for a, b in judge_spans:
+                if merged and a <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            judge_exclusive_ms = round(sum(b - a for a, b in merged) * 1000, 1)
+            if wall_end > wall_start and items:
+                agent_throughput_ms = round(((wall_end - wall_start) * 1000 - judge_exclusive_ms) / len(items), 1)
         agent_wall_times = [float((item.get("timing_breakdown") or {}).get("agent_wall_ms"))
                             for item in items
                             if isinstance((item.get("timing_breakdown") or {}).get("agent_wall_ms"), (int, float))]
@@ -2544,6 +2573,10 @@ class BenchmarkRun:
             "e2e_latency_max_ms": max(wall_times) if wall_times else None,
             "agent_task_latency_mean_ms": round(sum(agent_wall_times) / len(agent_wall_times), 1)
                 if agent_wall_times else None,
+            "judge_llm_latency_mean_ms": round(sum(judge_times) / len(judge_times), 1)
+                if judge_times else None,
+            "judge_exclusive_wall_ms": judge_exclusive_ms,
+            "agent_throughput_latency_ms": agent_throughput_ms,
             "agent_loop_calls_mean": round(sum(agent_loop_counts) / len(agent_loop_counts), 3)
                 if agent_loop_counts else None,
             "agent2_trace": summarize_agent2_trace([
