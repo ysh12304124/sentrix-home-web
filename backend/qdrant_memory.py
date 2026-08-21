@@ -69,10 +69,13 @@ class QdrantMemoryIndex:
                 self._client = QdrantClient(path=self.path)
         return self._client
 
-    def _collection(self, space: str, model_name: str, dimension: int) -> str:
-        identity = f"{space}\0{model_name}\0{dimension}".encode("utf-8")
+    def _collection(self, space: str, scope_id: str, model_name: str, dimension: int) -> str:
+        # Scope-partitioned collections keep each album's index small: ingestion
+        # only re-optimizes that scope's HNSW graph instead of a global pool, and
+        # dropping an album is a single collection delete.
+        identity = f"{space}\0{scope_id}\0{model_name}\0{dimension}".encode("utf-8")
         suffix = hashlib.sha1(identity).hexdigest()[:10]
-        return f"{self.prefix}_{_safe(space)}_{_safe(model_name)}_{dimension}_{suffix}"[:255]
+        return f"{self.prefix}_{_safe(space)}_{_safe(scope_id)}_{dimension}_{suffix}"[:255]
 
     def _ensure_collection(self, collection: str, space: str, dimension: int) -> None:
         from qdrant_client import models
@@ -103,7 +106,7 @@ class QdrantMemoryIndex:
 
         if not vector:
             return
-        collection = self._collection(space, model_name, len(vector))
+        collection = self._collection(space, scope_id or "home-default", model_name, len(vector))
         with self._lock:
             self._ensure_collection(collection, space, len(vector))
             payload = {
@@ -131,16 +134,19 @@ class QdrantMemoryIndex:
         self.last_error = None
 
     def _matching_collections(self, space: str, dimension: int,
-                              model_name: str | None) -> list[str]:
+                              model_name: str | None, scope_id: str | None = None) -> list[str]:
         client = self._get_client()
+        names = {item.name for item in client.get_collections().collections}
         if model_name:
-            expected = self._collection(space, model_name, dimension)
-            names = {item.name for item in client.get_collections().collections}
+            expected = self._collection(space, scope_id or "home-default", model_name, dimension)
             return [expected] if expected in names else []
+        if scope_id:
+            scope_prefix = f"{self.prefix}_{_safe(space)}_{_safe(scope_id)}_"
+            return [name for name in names if name.startswith(scope_prefix)]
         prefix = f"{self.prefix}_{_safe(space)}_"
         dim_marker = f"_{dimension}_"
-        return [item.name for item in client.get_collections().collections
-                if item.name.startswith(prefix) and dim_marker in item.name]
+        return [name for name in names
+                if name.startswith(prefix) and dim_marker in name]
 
     def clear(self) -> int:
         """Drop only collections owned by this Sentrix index prefix."""
@@ -155,6 +161,22 @@ class QdrantMemoryIndex:
         self.last_error = None
         return len(collections)
 
+    def drop_scope(self, scope_id: str) -> int:
+        """Drop every collection partition owned by one scope. Returns count."""
+        if not scope_id:
+            return 0
+        removed = 0
+        with self._lock:
+            client = self._get_client()
+            marker = f"_{_safe(scope_id)}_"
+            names = [item.name for item in client.get_collections().collections
+                     if item.name.startswith(f"{self.prefix}_") and marker in item.name]
+            for name in names:
+                client.delete_collection(collection_name=name)
+                removed += 1
+        self.last_error = None
+        return removed
+
     def search(self, *, space: str, vector: list[float], limit: int,
                scope_id: str | None = None, model_name: str | None = None) -> list[dict]:
         from qdrant_client import models
@@ -166,7 +188,7 @@ class QdrantMemoryIndex:
                 key="scope_id", match=models.MatchValue(value=scope_id),
             )])
         results = []
-        for collection in self._matching_collections(space, len(vector), model_name):
+        for collection in self._matching_collections(space, len(vector), model_name, scope_id):
             kwargs = {
                 "collection_name": collection,
                 "query": [float(value) for value in vector],
