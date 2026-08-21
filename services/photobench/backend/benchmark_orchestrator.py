@@ -1563,6 +1563,11 @@ class BenchmarkRun:
                 wait_started = time.perf_counter()
                 self._record_phase("qa_eval", "status", "running")
                 fast_streak = 0
+                # Relative criterion: absolute thresholds are model-dependent
+                # (a 4b probe legitimately takes ~20s); the optimization window is
+                # characterised by serialised queueing, so probes count as fast
+                # when they return well below the slow probe baseline.
+                fast_bar = max(5.0, float(probe_ms) / 1000 * 0.5)
                 gate_deadline = time.monotonic() + 600
                 while fast_streak < 2 and time.monotonic() < gate_deadline:
                     if self._cancel.is_set():
@@ -1572,9 +1577,9 @@ class BenchmarkRun:
                     self._record_phase("qa_eval", "progress", {
                         "total": total_qa, "completed": 1,
                         "in_flight": 0, "qa_concurrency": qa_concurrency,
-                        "warmup_gate": {"probe_latency_s": latency, "waited_s": round(time.perf_counter() - wait_started, 1)},
+                        "warmup_gate": {"probe_latency_s": latency, "fast_bar_s": round(fast_bar, 1), "waited_s": round(time.perf_counter() - wait_started, 1)},
                     })
-                    fast_streak = fast_streak + 1 if latency is not None and latency < 5 else 0
+                    fast_streak = fast_streak + 1 if latency is not None and latency <= fast_bar else 0
                 self.state["qa_warmup_gate_seconds"] = round(time.perf_counter() - wait_started, 1)
             remaining = list(enumerate(self.qa_rows))[1:]
             with concurrent.futures.ThreadPoolExecutor(max_workers=qa_concurrency, thread_name_prefix="qa-eval") as executor:
