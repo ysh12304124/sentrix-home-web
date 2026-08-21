@@ -328,16 +328,46 @@ def summarize_agent2_trace(runtime_turns: list[dict]) -> dict:
     return res
 
 
-def load_custom_judge_prompt() -> str | None:
+JUDGE_PROMPT_KINDS: dict[str, str] = {
+    "answer_quality": JUDGE_PROMPT,
+    "task_decision": TASK_JUDGE_PROMPT,
+    "evidence": EVIDENCE_JUDGE_PROMPT,
+}
+
+
+def _read_custom_judge_prompt_file() -> dict:
     if CUSTOM_JUDGE_PROMPT_PATH.exists():
         try:
-            return json.loads(CUSTOM_JUDGE_PROMPT_PATH.read_text(encoding="utf-8")).get("judge_prompt") or None
+            data = json.loads(CUSTOM_JUDGE_PROMPT_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, OSError):
-            return None
-    return None
+            return {}
+    return {}
 
-def save_custom_judge_prompt(prompt: str) -> None:
-    atomic_json(CUSTOM_JUDGE_PROMPT_PATH, {"judge_prompt": prompt})
+
+def load_custom_judge_prompts() -> dict[str, str | None]:
+    data = _read_custom_judge_prompt_file()
+    legacy = data.get("judge_prompt") or None
+    return {
+        "answer_quality": data.get("answer_quality") or legacy,
+        "task_decision": data.get("task_decision") or None,
+        "evidence": data.get("evidence") or None,
+    }
+
+
+def load_custom_judge_prompt() -> str | None:
+    """Legacy helper: answer-quality prompt only."""
+    return load_custom_judge_prompts().get("answer_quality")
+
+
+def save_custom_judge_prompt(prompt: str, kind: str = "answer_quality") -> None:
+    if kind not in JUDGE_PROMPT_KINDS:
+        raise ValueError(f"unknown judge prompt kind: {kind}")
+    data = _read_custom_judge_prompt_file()
+    if "judge_prompt" in data:  # migrate legacy single-prompt key
+        data.setdefault("answer_quality", data.pop("judge_prompt"))
+    data[kind] = prompt.strip() or None  # empty string restores the default
+    atomic_json(CUSTOM_JUDGE_PROMPT_PATH, data)
 
 
 def judge_score_consistency(score: int | None, reason: str) -> bool:
@@ -892,7 +922,8 @@ class BenchmarkRun:
                  qa_set: str, sentrix_url: str, judge_url: str, vllm_api_url: str,
                  vllm_target_id: str, vllm_model_base_url: str, results_root: Path,
                  judge_system_prompt: str = JUDGE_PROMPT, judge_model: str = JUDGE_MODEL,
-                 judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False):
+                 judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False,
+                 task_judge_system_prompt: str = "", evidence_judge_system_prompt: str = ""):
         self.run_id = run_id
         self.album_id = album_id
         self.manifest = manifest
@@ -906,6 +937,8 @@ class BenchmarkRun:
         self.judge_model = judge_model
         self.judge_api_key = judge_api_key
         self.judge_system_prompt = judge_system_prompt
+        self.task_judge_system_prompt = task_judge_system_prompt
+        self.evidence_judge_system_prompt = evidence_judge_system_prompt
         self.vllm_api_url = vllm_api_url.rstrip("/")
         self.vllm_target_id = vllm_target_id
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
@@ -2066,7 +2099,7 @@ class BenchmarkRun:
                   "结合 GT 能力边界，只判断当前模型回答实际表现为直接回答、拒答还是澄清。只输出 JSON。")
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": TASK_JUDGE_PROMPT},
+            "enable_thinking": False, "messages": [{"role": "system", "content": getattr(self, "task_judge_system_prompt", None) or TASK_JUDGE_PROMPT},
                          {"role": "user", "content": prompt}],
         }
         try:
@@ -2110,7 +2143,7 @@ class BenchmarkRun:
                     {"score": 0, "reason": "no_image_evidence", "input": None})
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": EVIDENCE_JUDGE_PROMPT},
+            "enable_thinking": False, "messages": [{"role": "system", "content": getattr(self, "evidence_judge_system_prompt", None) or EVIDENCE_JUDGE_PROMPT},
                          {"role": "user", "content": content}],
         }
         try:
@@ -3264,6 +3297,13 @@ class OrchestratorRepository:
         judge_url = str(payload.get("judge_url") or resolved_judge_url).rstrip("/")
         judge_model = str(payload.get("judge_model") or resolved_judge_model)
         judge_api_key = str(payload.get("judge_api_key") or resolved_judge_api_key)
+        saved_custom = load_custom_judge_prompts()
+        task_system_prompt = payload.get("task_system_prompt")
+        task_system_prompt = (str(task_system_prompt).strip() or saved_custom.get("task_decision")
+                              or TASK_JUDGE_PROMPT)
+        evidence_system_prompt = payload.get("evidence_system_prompt")
+        evidence_system_prompt = (str(evidence_system_prompt).strip() or saved_custom.get("evidence")
+                                  or EVIDENCE_JUDGE_PROMPT)
         if not system_prompt:
             raise ValueError("system_prompt is required")
         if len(system_prompt) > 50000:
@@ -3362,6 +3402,8 @@ class OrchestratorRepository:
                     judge_runner.judge_url = judge_url.rstrip("/")
                     judge_runner.judge_model = judge_model
                     judge_runner.judge_api_key = judge_api_key
+                    judge_runner.task_judge_system_prompt = task_system_prompt
+                    judge_runner.evidence_judge_system_prompt = evidence_system_prompt
                     conversation_context = saved_turns[:turn_index + 1] if turn_index is not None else None
                     agent_status_rj = saved_turn.get("agent_status") or item.get("agent_status")
                     termination_reason_rj = saved_turn.get("termination_reason") or item.get("termination_reason") or ""
@@ -3535,6 +3577,8 @@ class OrchestratorRepository:
                     vllm_target_id=target_id, vllm_model_base_url=vllm_model_base_url,
                     results_root=self.results_root,
                     judge_system_prompt=load_custom_judge_prompt() or JUDGE_PROMPT,
+                    task_judge_system_prompt=load_custom_judge_prompts().get("task_decision") or TASK_JUDGE_PROMPT,
+                    evidence_judge_system_prompt=load_custom_judge_prompts().get("evidence") or EVIDENCE_JUDGE_PROMPT,
                     judge_model=judge_model, judge_api_key=judge_api_key_suite,
                     delete_scope_after_run=delete_scope_after_run,
                 )
@@ -3683,6 +3727,25 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if parsed.path == "/api/judge-prompts":
+                custom = load_custom_judge_prompts()
+                self._json({
+                    "kinds": [
+                        {
+                            "kind": kind,
+                            "label": label,
+                            "default": JUDGE_PROMPT_KINDS[kind],
+                            "custom": custom.get(kind),
+                        }
+                        for kind, label in (
+                            ("answer_quality", "回答质量 Judge"),
+                            ("task_decision", "任务判断 Judge"),
+                            ("evidence", "证据核验 Judge"),
+                        )
+                    ],
+                    "storage_path": str(CUSTOM_JUDGE_PROMPT_PATH),
+                })
+                return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/judge-prompt"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/judge-prompt"))
                 self._json(self.repo.get_run_judge_prompt(run_id))
@@ -3729,6 +3792,20 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     raise ValueError("system_prompt is too long")
                 save_custom_judge_prompt(prompt)
                 self._json({"status": "ok"})
+                return
+            if parsed.path == "/api/judge-prompts":
+                payload = self._payload()
+                kind = str(payload.get("kind") or "").strip()
+                prompt = str(payload.get("system_prompt") or "").strip()
+                if kind not in JUDGE_PROMPT_KINDS:
+                    raise ValueError(f"kind must be one of {sorted(JUDGE_PROMPT_KINDS)}")
+                if not prompt:
+                    raise ValueError("system_prompt is required (empty string to restore default is not allowed here)")
+                if len(prompt) > 50000:
+                    raise ValueError("system_prompt is too long")
+                save_custom_judge_prompt(prompt, kind)
+                self._json({"status": "ok", "kind": kind,
+                            "custom": load_custom_judge_prompts().get(kind)})
                 return
             payload = self._payload()
             if parsed.path.endswith("/rejudge") and parsed.path.startswith("/api/runs/"):

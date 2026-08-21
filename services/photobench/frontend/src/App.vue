@@ -31,6 +31,9 @@ const sentrixUrl = ref("");
 const judgeUrl = ref("");
 const vllmTargetId = ref("");
 const rejudgePrompt = ref("");
+const judgePromptKinds = ref([]);
+const activePromptKind = ref("answer_quality");
+const promptDrafts = reactive({ answer_quality: "", task_decision: "", evidence: "" });
 const judgeProviderId = ref("");
 watch(judgeProviderId, (newId) => {
   const provider = (config.value?.judge_providers || []).find((p) => p.id === newId);
@@ -384,8 +387,22 @@ function gpuMetricRows(phase = {}) {
     ["SM 时钟", fmtNumber(clock.mean, "MHz"), `峰值 ${fmtNumber(clock.peak, "MHz")} · P95 ${fmtNumber(clock.p95, "MHz")}`],
   ];
 }
+function comparableMemoryProfile(run) {
+  if (run?.memory_profile) return { ...run.memory_profile, source: "replay" };
+  const gpu = run?.phases?.gpu_metrics;
+  if (!gpu?.memory_profile) return null;
+  return {
+    status: gpu.status,
+    source: "gpu_metrics",
+    memory_profile: gpu.memory_profile,
+    model_process_memory_used_mib: gpu.model_process_memory_used_mib,
+    questions_completed: run.summary?.completed,
+    questions_total: run.summary?.total,
+  };
+}
 function memoryProfileRows(profile = {}) {
   const memory = profile.memory_profile || {};
+  const isBenchmarkGpuProfile = profile.source === "gpu_metrics";
   if (memory.method === "macos_unified_memory_v1") {
     return [
       ["内存占用峰值", memory.memory_used_peak_gib == null ? "-" : `${Number(memory.memory_used_peak_gib).toFixed(2)} GiB`, "16GB 统一内存整机峰值", true],
@@ -404,8 +421,12 @@ function memoryProfileRows(profile = {}) {
     ["KV Cache 实际峰值", memory.kv_cache_used_peak_gib == null ? "-" : `${Number(memory.kv_cache_used_peak_gib).toFixed(3)} GiB`, `使用率峰值 ${fmtNumber(memory.kv_cache_usage_peak_pct, "%")}`],
     ["模型权重", memory.weight_gib == null ? "-" : `${Number(memory.weight_gib).toFixed(2)} GiB`, `激活峰值 ${memory.peak_activation_gib == null ? "-" : `${memory.peak_activation_gib} GiB`} · CUDA Graph ${memory.cuda_graph_gib == null ? "-" : `${memory.cuda_graph_gib} GiB`}`],
     ["vLLM 进程预留显存", fmtMemory(processMemory.peak), `空载 ${memory.idle_process_memory_gib == null ? "-" : `${Number(memory.idle_process_memory_gib).toFixed(2)} GiB`} · 不用于跨模型需求比较`],
-    ["复测进度", `${profile.questions_completed ?? 0}/${profile.questions_total ?? 0} 题`, `请求失败 ${profile.failed_requests ?? 0} · 答案不保存`],
-    ["原测评数据一致性", profile.items_integrity_ok === true ? "通过" : profile.status === "completed" ? "未通过" : "待完成", profile.answers_persisted === false ? "原答案未写入" : "记录状态异常"],
+    isBenchmarkGpuProfile
+      ? ["评测采样覆盖", `${profile.questions_completed ?? "-"}/${profile.questions_total ?? "-"} 题`, "来自本次正式评测 GPU 采样"]
+      : ["复测进度", `${profile.questions_completed ?? 0}/${profile.questions_total ?? 0} 题`, `请求失败 ${profile.failed_requests ?? 0} · 答案不保存`],
+    isBenchmarkGpuProfile
+      ? ["数据来源", "正式评测采样", "与本次 run 的 QA/GPU 采样同时记录"]
+      : ["原测评数据一致性", profile.items_integrity_ok === true ? "通过" : profile.status === "completed" ? "未通过" : "待完成", profile.answers_persisted === false ? "原答案未写入" : "记录状态异常"],
   ];
 }
 function aggregateMetricRows(phase = {}) {
@@ -972,7 +993,27 @@ async function changeQaPage(page) {
 async function changeQaPageSize() { await loadQaPage(1); }
 async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
 async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
-function resetJudgePrompt() { rejudgePrompt.value = config.value?.judge_prompt || ""; }
+const PROMPT_KIND_LABELS = { answer_quality: "回答质量", task_decision: "任务判断", evidence: "证据核验" };
+function promptKindMeta(kind) { return judgePromptKinds.value.find((k) => k.kind === kind) || null; }
+async function loadJudgePrompts() {
+  try {
+    const data = await fetch("/api/judge-prompts").then((r) => r.json());
+    judgePromptKinds.value = data.kinds || [];
+    for (const meta of judgePromptKinds.value) {
+      promptDrafts[meta.kind] = meta.custom || meta.default || "";
+    }
+    rejudgePrompt.value = promptDrafts.answer_quality || "";
+  } catch { /* keep defaults from config */ }
+}
+function switchPromptKind(kind) {
+  activePromptKind.value = kind;
+  rejudgePrompt.value = promptDrafts[kind] || "";
+}
+function resetJudgePrompt() {
+  const meta = promptKindMeta(activePromptKind.value);
+  rejudgePrompt.value = meta?.default || config.value?.judge_prompt || "";
+  promptDrafts[activePromptKind.value] = rejudgePrompt.value;
+}
 
 const exportScores = ref(["0", "1", "2"]);
 const deleteScopeAfterRun = ref(false);
@@ -986,8 +1027,9 @@ async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
   if (!prompt) { window.alert("提示词不能为空"); return; }
   try {
-    await post("/api/judge-prompt", { system_prompt: prompt });
-    window.alert("已保存，后续评测将使用此提示词");
+    await post("/api/judge-prompts", { kind: activePromptKind.value, system_prompt: prompt });
+    promptDrafts[activePromptKind.value] = prompt;
+    window.alert(`已保存「${PROMPT_KIND_LABELS[activePromptKind.value] || activePromptKind.value}」提示词，重新评分与后续评测将使用它`);
   } catch (e) { window.alert("保存失败：" + e.message); }
 }
 async function startRejudge() {
@@ -998,7 +1040,9 @@ async function startRejudge() {
   try {
    await post(`/api/runs/${encodeURIComponent(activeRunId.value)}/rejudge`, {
     judge_url: judgeUrl.value,
-    system_prompt: rejudgePrompt.value,
+    system_prompt: promptDrafts.answer_quality || rejudgePrompt.value,
+    task_system_prompt: promptDrafts.task_decision || undefined,
+    evidence_system_prompt: promptDrafts.evidence || undefined,
     });
     await loadRuns(); await loadActiveRun(); startPolling();
   } catch (e) { error.value = e.message; }
@@ -1058,6 +1102,7 @@ async function init() {
     vllmTargets.value = config.value.vllm_targets || {};
     vllmTargetId.value = config.value.default_vllm_target_id || Object.keys(vllmTargets.value)[0] || "";
     sentrixUrl.value = config.value.default_sentrix_url; judgeUrl.value = config.value.default_judge_url; rejudgePrompt.value = config.value.custom_judge_prompt || config.value.judge_prompt || "";
+    await loadJudgePrompts();
     judgeProviderId.value = config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
     manifests.value = (await api("/api/manifests")).manifests || [];
     await loadRuns(); await loadProfiles();
@@ -1236,7 +1281,14 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 <span v-if="activeRejudge" class="phase-status" :class="activeRejudge.status">{{ statusLabel(activeRejudge.status) }}</span>
 </div>
-        <label class="rejudge-prompt">Judge System Prompt<textarea v-model="rejudgePrompt" :disabled="activeRejudge?.status === 'running'" rows="8" spellcheck="false">
+        <div class="prompt-kind-tabs">
+          <button v-for="meta in judgePromptKinds" :key="meta.kind" type="button"
+                  class="btn ghost compact prompt-kind-tab" :class="{ active: activePromptKind === meta.kind }"
+                  @click="switchPromptKind(meta.kind)">
+            {{ PROMPT_KIND_LABELS[meta.kind] || meta.kind }}<span v-if="meta.custom" class="custom-badge">已自定义</span>
+          </button>
+        </div>
+        <label class="rejudge-prompt">Judge System Prompt（{{ PROMPT_KIND_LABELS[activePromptKind] || activePromptKind }}）<textarea v-model="rejudgePrompt" :disabled="activeRejudge?.status === 'running'" rows="8" spellcheck="false">
 </textarea>
 </label>
         <div class="rejudge-toolbar">
@@ -1299,15 +1351,15 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 </article>
-        <article v-if="activeRun.memory_profile" class="phase-card result-phase-card gpu-result-card">
+        <article v-if="comparableMemoryProfile(activeRun)" class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
-<b>可比较显存复测</b>
-<span class="phase-status" :class="activeRun.memory_profile.status">{{ statusLabel(activeRun.memory_profile.status) }}</span>
+<b>{{ comparableMemoryProfile(activeRun).source === 'gpu_metrics' ? '可比较显存' : '可比较显存复测' }}</b>
+<span class="phase-status" :class="comparableMemoryProfile(activeRun).status">{{ statusLabel(comparableMemoryProfile(activeRun).status) }}</span>
 </div>
-<p class="metric-calc-time">复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答。可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
-<p v-if="activeRun.memory_profile.error" class="error">{{ activeRun.memory_profile.error }}</p>
+<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun).source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' }}可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
+<p v-if="comparableMemoryProfile(activeRun).error" class="error">{{ comparableMemoryProfile(activeRun).error }}</p>
 <div class="phase-metrics">
-<div v-for="row in memoryProfileRows(activeRun.memory_profile)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<div v-for="row in memoryProfileRows(comparableMemoryProfile(activeRun))" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
 <strong>{{ row[1] }}</strong>
 <small>{{ row[2] }}</small>
