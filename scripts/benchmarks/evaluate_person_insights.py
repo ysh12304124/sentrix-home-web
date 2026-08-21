@@ -187,7 +187,11 @@ def main(argv=None):
     try:
         if args.backfill_clip:
             backfill_visual_asset_vectors(store, args.scope_id)
-        build_missing_events(store, args.scope_id)
+        event_count = store.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE scope_id = ?", (args.scope_id,)
+        ).fetchone()[0]
+        if event_count == 0:
+            build_missing_events(store, args.scope_id)
         answers = freeze_answers(store, args.scope_id)
         from backend.model_clients import GammaClient
 
