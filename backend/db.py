@@ -917,13 +917,128 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_person_patterns_person ON person_patterns(person_id, pattern_type);
             CREATE INDEX IF NOT EXISTS idx_person_patterns_scope ON person_patterns(scope_id, pattern_type);
             CREATE INDEX IF NOT EXISTS idx_query_gaps_status ON query_gaps(status);
+            CREATE TABLE IF NOT EXISTS person_insight_runs (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                status TEXT NOT NULL DEFAULT 'queued',
+                current_stage TEXT NOT NULL DEFAULT 'queued',
+                config_json TEXT NOT NULL DEFAULT '{}',
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS person_moments (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                run_id TEXT REFERENCES person_insight_runs(id),
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                cluster_id TEXT NOT NULL REFERENCES face_clusters(id),
+                event_id TEXT NOT NULL REFERENCES events(id),
+                observation_id TEXT NOT NULL REFERENCES observations(id),
+                asset_id TEXT NOT NULL REFERENCES assets(id),
+                face_instance_id TEXT NOT NULL REFERENCES face_instances(id),
+                action_text TEXT NOT NULL DEFAULT '',
+                interaction_target_ids_json TEXT NOT NULL DEFAULT '[]',
+                interaction_text TEXT NOT NULL DEFAULT '',
+                participation_style TEXT NOT NULL DEFAULT '',
+                visible_affect TEXT NOT NULL DEFAULT '',
+                social_role_cues_json TEXT NOT NULL DEFAULT '[]',
+                narrative_note TEXT NOT NULL DEFAULT '',
+                selection_json TEXT NOT NULL DEFAULT '{}',
+                confidence REAL NOT NULL DEFAULT 0,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(person_id, observation_id, prompt_version)
+            );
+            CREATE TABLE IF NOT EXISTS person_role_hypotheses (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                run_id TEXT REFERENCES person_insight_runs(id),
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                relative_to_person_id TEXT REFERENCES entities(id),
+                role TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_moment_ids_json TEXT NOT NULL DEFAULT '[]',
+                reason_summary TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'suggested',
+                revision INTEGER NOT NULL DEFAULT 1,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS relationship_hypotheses (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                run_id TEXT REFERENCES person_insight_runs(id),
+                subject_person_id TEXT NOT NULL REFERENCES entities(id),
+                predicate TEXT NOT NULL,
+                object_person_id TEXT NOT NULL REFERENCES entities(id),
+                inverse_predicate TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_moment_ids_json TEXT NOT NULL DEFAULT '[]',
+                reason_summary TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'suggested',
+                revision INTEGER NOT NULL DEFAULT 1,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(subject_person_id != object_person_id)
+            );
+            CREATE TABLE IF NOT EXISTS person_portrait_revisions (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                revision INTEGER NOT NULL,
+                portrait_text TEXT NOT NULL,
+                themes_json TEXT NOT NULL DEFAULT '[]',
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                trigger_type TEXT NOT NULL,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                user_feedback TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(person_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_person_insight_runs_scope
+                ON person_insight_runs(scope_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_person_moments_person
+                ON person_moments(person_id, status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_person_moments_event
+                ON person_moments(event_id, person_id);
+            CREATE INDEX IF NOT EXISTS idx_person_roles_person
+                ON person_role_hypotheses(person_id, status, rank);
+            CREATE INDEX IF NOT EXISTS idx_relationship_hypotheses_scope
+                ON relationship_hypotheses(scope_id, status);
+            CREATE INDEX IF NOT EXISTS idx_person_portraits_person
+                ON person_portrait_revisions(person_id, revision DESC);
             """
         )
         self.connection.commit()
         self._ensure_columns("memory_spaces", {"include_in_people": "INTEGER NOT NULL DEFAULT 1"})
         self._ensure_columns("face_instances", {"validity": "TEXT NOT NULL DEFAULT 'uncertain'"})
+        self._ensure_columns("entities", {
+            "identity_state": "TEXT NOT NULL DEFAULT 'clustered'",
+            "role_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "name_state": "TEXT NOT NULL DEFAULT 'anonymous'",
+        })
+        self._ensure_columns("relationships", {
+            "inverse_predicate": "TEXT",
+        })
         self._migrate_evaluation_spaces()
         self._migrate_legacy_persons()
+        self._migrate_person_identity_states()
 
     def _ensure_columns(self, table, columns):
         existing = {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1013,6 +1128,36 @@ class MemoryStore:
                 ) VALUES (?, 'person', ?, ?, NULL, ?, ?, ?, ?)""",
                 (entity_id, person["name"], person["status"], "历史人物候选", float(person["confidence"] or 0), person["created_at"] or timestamp, person["updated_at"] or timestamp),
             )
+        self.connection.commit()
+
+    def _migrate_person_identity_states(self):
+        """Derive identity/role/name confirmation states from legacy user-confirmed fields.
+
+        The migration only reads fields that users explicitly confirmed in the past:
+        a confirmed status, a non-empty family role, and a non-placeholder canonical
+        name. It never invents facts and must be idempotent, so re-running it is a no-op.
+        """
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE entities SET identity_state = 'stable', updated_at = ?
+            WHERE entity_type = 'person' AND status = 'confirmed' AND identity_state != 'stable'""",
+            (timestamp,),
+        )
+        self.connection.execute(
+            """UPDATE entities SET role_state = 'confirmed', updated_at = ?
+            WHERE entity_type = 'person' AND family_role IS NOT NULL AND family_role != ''
+            AND role_state != 'confirmed'""",
+            (timestamp,),
+        )
+        self.connection.execute(
+            """UPDATE entities SET name_state = 'confirmed', updated_at = ?
+            WHERE entity_type = 'person' AND status = 'confirmed'
+            AND canonical_name IS NOT NULL AND canonical_name != ''
+            AND canonical_name NOT LIKE '待确认%' AND canonical_name NOT LIKE '人物%'
+            AND canonical_name NOT LIKE '核心人物%' AND canonical_name NOT LIKE '未命名%'
+            AND name_state != 'confirmed'""",
+            (timestamp,),
+        )
         self.connection.commit()
 
     def count(self, table):
@@ -3866,7 +4011,7 @@ class MemoryStore:
                     aliases.append(old_name)
                 self.set_entity_property(entity_id, "aliases", aliases)
             self.connection.execute(
-                "UPDATE entities SET canonical_name = ?, updated_at = ? WHERE id = ?",
+                "UPDATE entities SET canonical_name = ?, name_state = 'confirmed', updated_at = ? WHERE id = ?",
                 (new_name, timestamp, entity_id),
             )
             self._record_entity_revision(entity_id, "canonical_name", old_name, new_name, "user_rename")
@@ -5134,3 +5279,586 @@ class MemoryStore:
         self.connection.execute("INSERT INTO invites(id, label, token, created_at) VALUES (?, ?, ?, ?)", (invite_id, label or "家庭成员", token, now_iso()))
         self.connection.commit()
         return self._row("SELECT * FROM invites WHERE id = ?", (invite_id,))
+
+    def _scope_for(self, kind, record_id):
+        if not record_id:
+            return None
+        table = {
+            "entity": "entities",
+            "person": "entities",
+            "cluster": "face_clusters",
+            "event": "events",
+            "observation": "observations",
+            "asset": "assets",
+        }.get(kind)
+        if not table:
+            raise ValueError(f"unknown scope kind: {kind}")
+        row = self.connection.execute(
+            f"SELECT scope_id FROM {table} WHERE id = ?", (record_id,)
+        ).fetchone()
+        return row["scope_id"] if row else None
+
+    def _face_instance_scope(self, face_instance_id):
+        row = self.connection.execute(
+            "SELECT asset_id FROM face_instances WHERE id = ?", (face_instance_id,)
+        ).fetchone()
+        return self._scope_for("asset", row["asset_id"]) if row else None
+
+    def _person_moment_row(self, row):
+        if not row:
+            return None
+        result = dict(row)
+        result["interaction_target_ids"] = json.loads(result.pop("interaction_target_ids_json") or "[]")
+        result["social_role_cues"] = json.loads(result.pop("social_role_cues_json") or "[]")
+        result["selection"] = json.loads(result.pop("selection_json") or "{}")
+        return result
+
+    def create_person_insight_run(self, scope_id, config):
+        run_id = make_id("insight")
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO person_insight_runs(id, scope_id, status, current_stage, config_json, stats_json, created_at, updated_at)
+            VALUES (?, ?, 'queued', 'queued', ?, '{}', ?, ?)""",
+            (run_id, scope_id, json_value(config, {}), timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self.get_person_insight_run(run_id)
+
+    def update_person_insight_run(self, run_id, *, status=None, stage=None, stats=None, error=None):
+        fields = {"updated_at": now_iso()}
+        if status is not None:
+            fields["status"] = status
+        if stage is not None:
+            fields["current_stage"] = stage
+        if stats is not None:
+            fields["stats_json"] = json_value(stats, {})
+        if error is not None:
+            fields["error"] = error
+        if status == "completed":
+            fields["completed_at"] = now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        self.connection.execute(
+            f"UPDATE person_insight_runs SET {assignments} WHERE id = ?",
+            (*fields.values(), run_id),
+        )
+        self.connection.commit()
+        return self.get_person_insight_run(run_id)
+
+    def get_person_insight_run(self, run_id):
+        row = self._row("SELECT * FROM person_insight_runs WHERE id = ?", (run_id,))
+        if not row:
+            return None
+        row["config"] = json.loads(row.pop("config_json") or "{}")
+        row["stats"] = json.loads(row.pop("stats_json") or "{}")
+        return row
+
+    def latest_person_insight_run(self, scope_id):
+        row = self._row(
+            "SELECT id FROM person_insight_runs WHERE scope_id = ? ORDER BY created_at DESC LIMIT 1",
+            (scope_id,),
+        )
+        return self.get_person_insight_run(row["id"]) if row else None
+
+    def upsert_person_moment(self, data):
+        person_id = data["person_id"]
+        cluster_id = data.get("cluster_id")
+        event_id = data.get("event_id")
+        observation_id = data["observation_id"]
+        asset_id = data["asset_id"]
+        face_instance_id = data.get("face_instance_id")
+        scopes = [self._scope_for("entity", person_id)]
+        for kind, record_id in (
+            ("cluster", cluster_id),
+            ("event", event_id),
+            ("observation", observation_id),
+            ("asset", asset_id),
+        ):
+            if record_id:
+                scopes.append(self._scope_for(kind, record_id))
+        if face_instance_id:
+            scopes.append(self._face_instance_scope(face_instance_id))
+        scopes = [scope for scope in scopes if scope]
+        if len(set(scopes)) > 1:
+            raise ValueError("person moment must reference entities in the same memory space")
+        scope_id = scopes[0] if scopes else "home-default"
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO person_moments(
+                id, scope_id, run_id, person_id, cluster_id, event_id, observation_id, asset_id,
+                face_instance_id, action_text, interaction_target_ids_json, interaction_text,
+                participation_style, visible_affect, social_role_cues_json, narrative_note,
+                selection_json, confidence, model_name, prompt_version, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            ON CONFLICT(person_id, observation_id, prompt_version) DO UPDATE SET
+                action_text = excluded.action_text,
+                interaction_target_ids_json = excluded.interaction_target_ids_json,
+                interaction_text = excluded.interaction_text,
+                participation_style = excluded.participation_style,
+                visible_affect = excluded.visible_affect,
+                social_role_cues_json = excluded.social_role_cues_json,
+                narrative_note = excluded.narrative_note,
+                selection_json = excluded.selection_json,
+                confidence = excluded.confidence,
+                model_name = excluded.model_name,
+                updated_at = excluded.updated_at""",
+            (
+                make_id("moment"), scope_id, data.get("run_id"), person_id, cluster_id,
+                event_id, observation_id, asset_id, face_instance_id,
+                data.get("action_text") or "", json_value(data.get("interaction_target_ids"), []),
+                data.get("interaction_text") or "", data.get("participation_style") or "",
+                data.get("visible_affect") or "", json_value(data.get("social_role_cues"), []),
+                data.get("narrative_note") or "", json_value(data.get("selection"), {}),
+                float(data.get("confidence") or 0), data.get("model_name") or "unknown",
+                data["prompt_version"], timestamp, timestamp,
+            ),
+        )
+        self.connection.commit()
+        row = self._row(
+            """SELECT * FROM person_moments WHERE person_id = ? AND observation_id = ? AND prompt_version = ?""",
+            (person_id, observation_id, data["prompt_version"]),
+        )
+        return self._person_moment_row(row)
+
+    def list_person_moments(self, person_id=None, scope_id=None, status="active"):
+        clauses, params = [], []
+        if person_id is not None:
+            clauses.append("person_id = ?")
+            params.append(person_id)
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._rows(
+            f"SELECT * FROM person_moments {where} ORDER BY created_at DESC",
+            tuple(params),
+        )
+        return [self._person_moment_row(row) for row in rows]
+
+    @staticmethod
+    def _role_hypothesis_row(row):
+        if not row:
+            return None
+        result = dict(row)
+        result["evidence_event_ids"] = json.loads(result.pop("evidence_event_ids_json") or "[]")
+        result["evidence_moment_ids"] = json.loads(result.pop("evidence_moment_ids_json") or "[]")
+        return result
+
+    def get_role_hypothesis(self, hypothesis_id):
+        return self._role_hypothesis_row(
+            self._row("SELECT * FROM person_role_hypotheses WHERE id = ?", (hypothesis_id,))
+        )
+
+    def replace_role_hypotheses(self, scope_id, run_id, rows):
+        for row in rows:
+            if self._scope_for("entity", row["person_id"]) != scope_id:
+                raise ValueError("role hypothesis person is not in the same memory space")
+            relative_to = row.get("relative_to_person_id")
+            if relative_to and self._scope_for("entity", relative_to) != scope_id:
+                raise ValueError("role hypothesis relative person is not in the same memory space")
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND status = 'suggested'""",
+            (timestamp, scope_id),
+        )
+        inserted = []
+        for row in rows:
+            hypothesis_id = make_id("role_hyp")
+            self.connection.execute(
+                """INSERT INTO person_role_hypotheses(
+                    id, scope_id, run_id, person_id, relative_to_person_id, role, rank,
+                    confidence, evidence_event_ids_json, evidence_moment_ids_json,
+                    reason_summary, status, revision, model_name, prompt_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', 1, ?, ?, ?, ?)""",
+                (
+                    hypothesis_id, scope_id, run_id, row["person_id"],
+                    row.get("relative_to_person_id"), row["role"], int(row.get("rank") or 1),
+                    float(row.get("confidence") or 0), json_value(row.get("evidence_event_ids"), []),
+                    json_value(row.get("evidence_moment_ids"), []), row.get("reason_summary") or "",
+                    row.get("model_name") or "unknown", row["prompt_version"], timestamp, timestamp,
+                ),
+            )
+            inserted.append(self.get_role_hypothesis(hypothesis_id))
+        self.connection.commit()
+        return inserted
+
+    def list_role_hypotheses(self, person_id=None, scope_id=None, status=None):
+        clauses, params = [], []
+        if person_id is not None:
+            clauses.append("person_id = ?")
+            params.append(person_id)
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._rows(
+            f"SELECT * FROM person_role_hypotheses {where} ORDER BY rank, created_at",
+            tuple(params),
+        )
+        return [self._role_hypothesis_row(row) for row in rows]
+
+    @staticmethod
+    def _relationship_hypothesis_row(row):
+        if not row:
+            return None
+        result = dict(row)
+        result["evidence_event_ids"] = json.loads(result.pop("evidence_event_ids_json") or "[]")
+        result["evidence_moment_ids"] = json.loads(result.pop("evidence_moment_ids_json") or "[]")
+        return result
+
+    def get_relationship_hypothesis(self, hypothesis_id):
+        return self._relationship_hypothesis_row(
+            self._row("SELECT * FROM relationship_hypotheses WHERE id = ?", (hypothesis_id,))
+        )
+
+    def replace_relationship_hypotheses(self, scope_id, run_id, rows):
+        for row in rows:
+            if row["subject_person_id"] == row["object_person_id"]:
+                raise ValueError("relationship hypothesis needs distinct people")
+            if self._scope_for("entity", row["subject_person_id"]) != scope_id:
+                raise ValueError("relationship hypothesis subject is not in the same memory space")
+            if self._scope_for("entity", row["object_person_id"]) != scope_id:
+                raise ValueError("relationship hypothesis object is not in the same memory space")
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND status = 'suggested'""",
+            (timestamp, scope_id),
+        )
+        inserted = []
+        for row in rows:
+            hypothesis_id = make_id("rel_hyp")
+            self.connection.execute(
+                """INSERT INTO relationship_hypotheses(
+                    id, scope_id, run_id, subject_person_id, predicate, object_person_id,
+                    inverse_predicate, confidence, evidence_event_ids_json,
+                    evidence_moment_ids_json, reason_summary, status, revision, model_name,
+                    prompt_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', 1, ?, ?, ?, ?)""",
+                (
+                    hypothesis_id, scope_id, run_id, row["subject_person_id"],
+                    row["predicate"], row["object_person_id"], row["inverse_predicate"],
+                    float(row.get("confidence") or 0), json_value(row.get("evidence_event_ids"), []),
+                    json_value(row.get("evidence_moment_ids"), []), row.get("reason_summary") or "",
+                    row.get("model_name") or "unknown", row["prompt_version"], timestamp, timestamp,
+                ),
+            )
+            inserted.append(self.get_relationship_hypothesis(hypothesis_id))
+        self.connection.commit()
+        return inserted
+
+    def list_relationship_hypotheses(self, scope_id, status=None):
+        if status is not None:
+            rows = self._rows(
+                "SELECT * FROM relationship_hypotheses WHERE scope_id = ? AND status = ? ORDER BY confidence DESC",
+                (scope_id, status),
+            )
+        else:
+            rows = self._rows(
+                "SELECT * FROM relationship_hypotheses WHERE scope_id = ? ORDER BY confidence DESC",
+                (scope_id,),
+            )
+        return [self._relationship_hypothesis_row(row) for row in rows]
+
+    @staticmethod
+    def _portrait_row(row):
+        if not row:
+            return None
+        result = dict(row)
+        result["themes"] = json.loads(result.pop("themes_json") or "[]")
+        result["evidence_refs"] = json.loads(result.pop("evidence_refs_json") or "[]")
+        return result
+
+    def get_portrait_revision(self, revision_id):
+        return self._portrait_row(
+            self._row("SELECT * FROM person_portrait_revisions WHERE id = ?", (revision_id,))
+        )
+
+    def create_portrait_revision(self, person_id, payload):
+        current = self.get_active_portrait(person_id)
+        if current and current.get("status") == "user_locked":
+            return current
+        revision = (current or {}).get("revision", 0) + 1
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                "UPDATE person_portrait_revisions SET status = 'superseded', updated_at = ? WHERE id = ?",
+                (timestamp, current["id"]),
+            )
+        revision_id = make_id("portrait")
+        scope_id = self._scope_for("entity", person_id) or "home-default"
+        self.connection.execute(
+            """INSERT INTO person_portrait_revisions(
+                id, scope_id, person_id, revision, portrait_text, themes_json, evidence_refs_json,
+                trigger_type, model_name, prompt_version, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (
+                revision_id, scope_id, person_id, revision, payload["portrait_text"],
+                json_value(payload.get("themes"), []), json_value(payload.get("evidence_refs"), []),
+                payload.get("trigger_type") or "manual", payload.get("model_name") or "unknown",
+                payload["prompt_version"], timestamp, timestamp,
+            ),
+        )
+        self.connection.commit()
+        return self.get_portrait_revision(revision_id)
+
+    def get_active_portrait(self, person_id):
+        row = self._row(
+            """SELECT * FROM person_portrait_revisions
+            WHERE person_id = ? AND status IN ('active', 'user_locked')
+            ORDER BY revision DESC LIMIT 1""",
+            (person_id,),
+        )
+        return self._portrait_row(row)
+
+    def list_portrait_revisions(self, person_id):
+        rows = self._rows(
+            "SELECT * FROM person_portrait_revisions WHERE person_id = ? ORDER BY revision DESC",
+            (person_id,),
+        )
+        return [self._portrait_row(row) for row in rows]
+
+    def set_portrait_feedback(self, revision_id, feedback):
+        self.connection.execute(
+            "UPDATE person_portrait_revisions SET user_feedback = ?, updated_at = ? WHERE id = ?",
+            (feedback, now_iso(), revision_id),
+        )
+        self.connection.commit()
+        return self.get_portrait_revision(revision_id)
+
+    def set_portrait_lock(self, revision_id, locked):
+        status = "user_locked" if locked else "active"
+        self.connection.execute(
+            "UPDATE person_portrait_revisions SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now_iso(), revision_id),
+        )
+        self.connection.commit()
+        return self.get_portrait_revision(revision_id)
+
+    def update_person_identity_state(self, person_id, *, name=None, role=None,
+                                     identity_state=None, role_state=None, name_state=None):
+        updates = {}
+        if role is not None:
+            updates["family_role"] = role
+        if name is not None:
+            updates["canonical_name"] = name
+        if identity_state is not None:
+            updates["identity_state"] = identity_state
+        if role_state is not None:
+            updates["role_state"] = role_state
+        if name_state is not None:
+            updates["name_state"] = name_state
+        if updates:
+            updates["updated_at"] = now_iso()
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            self.connection.execute(
+                f"UPDATE entities SET {assignments} WHERE id = ?",
+                (*updates.values(), person_id),
+            )
+            self.connection.commit()
+        return self.get_entity(person_id)
+
+    def confirm_role_hypothesis(self, hypothesis_id, *, role=None, is_self=False, actor="user"):
+        hypothesis = self.get_role_hypothesis(hypothesis_id)
+        if not hypothesis:
+            return None
+        person_id = hypothesis["person_id"]
+        person = self.get_entity(person_id)
+        if not person:
+            return None
+        from .person_graph import ROLE_OPTIONS
+
+        chosen_role = str(role or hypothesis.get("role") or "").strip()
+        if chosen_role not in ROLE_OPTIONS:
+            raise ValueError(f"unknown role: {chosen_role}")
+        timestamp = now_iso()
+        old_role = person.get("family_role")
+        updates = {"role_state": "confirmed", "updated_at": timestamp}
+        if is_self:
+            updates["family_role"] = "本人"
+        elif chosen_role != "无法判断":
+            updates["family_role"] = chosen_role
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        self.connection.execute(
+            f"UPDATE entities SET {assignments} WHERE id = ?",
+            (*updates.values(), person_id),
+        )
+        if updates.get("family_role"):
+            self._record_entity_revision(
+                person_id, "family_role", old_role, updates["family_role"], actor
+            )
+        self.connection.execute(
+            "UPDATE person_role_hypotheses SET status = 'confirmed', updated_at = ? WHERE id = ?",
+            (timestamp, hypothesis_id),
+        )
+        self.connection.execute(
+            """UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE person_id = ? AND id != ? AND status = 'suggested'""",
+            (timestamp, person_id, hypothesis_id),
+        )
+        self.connection.commit()
+        return self.get_entity(person_id)
+
+    def reject_role_hypothesis(self, hypothesis_id):
+        row = self.connection.execute(
+            "SELECT status FROM person_role_hypotheses WHERE id = ?", (hypothesis_id,)
+        ).fetchone()
+        if not row:
+            return None
+        self.connection.execute(
+            "UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ? WHERE id = ?",
+            (now_iso(), hypothesis_id),
+        )
+        self.connection.commit()
+        return {"id": hypothesis_id, "status": "superseded"}
+
+    def confirm_relationship_hypothesis(self, hypothesis_id, actor="user"):
+        hypothesis = self.get_relationship_hypothesis(hypothesis_id)
+        if not hypothesis:
+            return None
+        subject_id = hypothesis["subject_person_id"]
+        object_id = hypothesis["object_person_id"]
+        predicate = hypothesis["predicate"]
+        evidence = hypothesis.get("evidence_moment_ids") or hypothesis.get("evidence_event_ids") or []
+        relationship = self.create_relationship(
+            subject_id, predicate, object_id,
+            evidence_ids=evidence,
+            confidence=hypothesis.get("confidence") or 0.5,
+            status="active",
+        )
+        if relationship:
+            self.connection.execute(
+                "UPDATE relationships SET inverse_predicate = ? WHERE id = ?",
+                (hypothesis.get("inverse_predicate"), relationship["id"]),
+            )
+        timestamp = now_iso()
+        self.connection.execute(
+            "UPDATE relationship_hypotheses SET status = 'confirmed', updated_at = ? WHERE id = ?",
+            (timestamp, hypothesis_id),
+        )
+        self.connection.execute(
+            """UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND id != ? AND status = 'suggested' AND (
+                (subject_person_id = ? AND object_person_id = ?)
+                OR (subject_person_id = ? AND object_person_id = ?)
+            )""",
+            (timestamp, hypothesis["scope_id"], hypothesis_id,
+             subject_id, object_id, object_id, subject_id),
+        )
+        self.connection.commit()
+        return self.get_relationship_hypothesis(hypothesis_id)
+
+    def reject_relationship_hypothesis(self, hypothesis_id):
+        row = self.connection.execute(
+            "SELECT status FROM relationship_hypotheses WHERE id = ?", (hypothesis_id,)
+        ).fetchone()
+        if not row:
+            return None
+        self.connection.execute(
+            "UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ? WHERE id = ?",
+            (now_iso(), hypothesis_id),
+        )
+        self.connection.commit()
+        return {"id": hypothesis_id, "status": "superseded"}
+
+    def supersede_conflicting_hypotheses(self, person_id):
+        person = self.get_entity(person_id)
+        if not person:
+            return []
+        scope_id = person.get("scope_id") or "home-default"
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE person_id = ? AND status = 'suggested'""",
+            (timestamp, person_id),
+        )
+        self.connection.execute(
+            """UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND status = 'suggested'
+            AND (subject_person_id = ? OR object_person_id = ?)""",
+            (timestamp, scope_id, person_id, person_id),
+        )
+        rows = self._rows(
+            """SELECT DISTINCT person_id FROM (
+                SELECT subject_person_id AS person_id FROM relationship_hypotheses
+                WHERE object_person_id = ? AND status IN ('suggested', 'confirmed')
+                UNION
+                SELECT object_person_id AS person_id FROM relationship_hypotheses
+                WHERE subject_person_id = ? AND status IN ('suggested', 'confirmed')
+            )""",
+            (person_id, person_id),
+        )
+        self.connection.commit()
+        return [row["person_id"] for row in rows]
+
+    def mark_portraits_stale(self, person_ids):
+        count = 0
+        for person_id in person_ids or []:
+            if not person_id:
+                continue
+            self.connection.execute(
+                """UPDATE person_portrait_revisions SET status = 'stale', updated_at = ?
+                WHERE person_id = ? AND status = 'active'""",
+                (now_iso(), person_id),
+            )
+            count += 1
+        self.connection.commit()
+        return count
+
+    def person_candidate_features(self, scope_id):
+        """Aggregate per-cluster core-person features, rooted at face_clusters.scope_id."""
+        rows = self._rows(
+            """SELECT
+                c.id AS cluster_id,
+                COALESCE(c.entity_id, c.id) AS person_id,
+                c.member_count AS member_count,
+                COUNT(DISTINCT substr(o.captured_at, 1, 10)) AS date_count,
+                COUNT(DISTINCT eo.event_id) AS event_count,
+                (
+                    SELECT COUNT(DISTINCT ep.person_id)
+                    FROM event_participants ep
+                    WHERE ep.event_id IN (
+                        SELECT DISTINCT eo2.event_id
+                        FROM event_observations eo2
+                        JOIN face_instances fi2 ON fi2.observation_id = eo2.observation_id
+                        WHERE fi2.cluster_id = c.id
+                    )
+                ) AS co_person_count,
+                COUNT(DISTINCT COALESCE(e.place, '') || '|' || COALESCE(e.activity, '')) AS scene_count,
+                (
+                    SELECT AVG(quality) FROM (
+                        SELECT fi3.quality AS quality
+                        FROM face_instances fi3
+                        WHERE fi3.cluster_id = c.id
+                        ORDER BY fi3.quality DESC
+                        LIMIT 3
+                    )
+                ) AS quality,
+                CASE WHEN ent.status = 'confirmed' THEN 1 ELSE 0 END AS confirmed
+            FROM face_clusters c
+            LEFT JOIN face_instances fi ON fi.cluster_id = c.id
+            LEFT JOIN observations o ON o.id = fi.observation_id
+            LEFT JOIN event_observations eo ON eo.observation_id = o.id
+            LEFT JOIN events e ON e.id = eo.event_id
+            LEFT JOIN entities ent ON ent.id = c.entity_id
+            WHERE c.scope_id = ? AND c.status != 'rejected'
+            GROUP BY c.id""",
+            (scope_id,),
+        )
+        return [{
+            "person_id": row["person_id"],
+            "cluster_id": row["cluster_id"],
+            "date_count": int(row["date_count"] or 0),
+            "event_count": int(row["event_count"] or 0),
+            "member_count": int(row["member_count"] or 0),
+            "co_person_count": int(row["co_person_count"] or 0),
+            "scene_count": int(row["scene_count"] or 0),
+            "quality": float(row["quality"] or 0),
+            "confirmed": bool(row["confirmed"]),
+        } for row in rows]
