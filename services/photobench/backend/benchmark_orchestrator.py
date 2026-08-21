@@ -1553,29 +1553,6 @@ class BenchmarkRun:
                 self._qa_submitted = 1
                 record_qa_progress()
                 self.persist()
-            # Adaptive readiness gate: when the vector backend is still optimizing
-            # after pipeline ingestion (observed as 10x retrieval slowdown for
-            # minutes), concurrent questions serialize behind it. If the probe was
-            # slow, wait until lightweight retrieval probes come back fast twice
-            # before releasing the concurrent batch.
-            probe_ms = ((first_item.get("timing_breakdown") or {}).get("agent_wall_ms"))
-            if isinstance(probe_ms, (int, float)) and probe_ms > 15000 and len(self.qa_rows) > 1:
-                wait_started = time.perf_counter()
-                self._record_phase("qa_eval", "status", "running")
-                fast_streak = 0
-                gate_deadline = time.monotonic() + 600
-                while fast_streak < 2 and time.monotonic() < gate_deadline:
-                    if self._cancel.is_set():
-                        raise RunCancelledError("cancelled during retrieval warmup gate")
-                    time.sleep(5)
-                    latency = self._retrieval_probe(scope_id)
-                    self._record_phase("qa_eval", "progress", {
-                        "total": total_qa, "completed": 1,
-                        "in_flight": 0, "qa_concurrency": qa_concurrency,
-                        "warmup_gate": {"probe_latency_s": latency, "waited_s": round(time.perf_counter() - wait_started, 1)},
-                    })
-                    fast_streak = fast_streak + 1 if latency is not None and latency < 5 else 0
-                self.state["qa_warmup_gate_seconds"] = round(time.perf_counter() - wait_started, 1)
             remaining = list(enumerate(self.qa_rows))[1:]
             with concurrent.futures.ThreadPoolExecutor(max_workers=qa_concurrency, thread_name_prefix="qa-eval") as executor:
                 future_map = {executor.submit(self._evaluate_one, row, assets_by_name): index
@@ -1601,23 +1578,7 @@ class BenchmarkRun:
         self._gpu_sampler.stop()
         self._phase_done("qa_eval", {"total_seconds": round(t1 - t0, 1), "qa_concurrency": qa_concurrency})
 
-    def _retrieval_probe(self, scope_id: str) -> float | None:
-        """Fire one lightweight assistant turn and return its wall latency; None on failure."""
-        try:
-            resp = request_json(f"{self.sentrix_url}/api/assistant/turn", {
-                "message": "帮我看看最近的合影",
-                "scope_id": scope_id,
-                "conversation_id": f"warmup-gate-{uuid.uuid4().hex[:8]}",
-                "viewer_id": "owner",
-            }, "POST", 120)
-            started = time.perf_counter()
-            wait_for_assistant_turn(self.sentrix_url, resp, timeout=300,
-                                    cancelled=self._cancel.is_set)
-            return round(time.perf_counter() - started, 1)
-        except Exception:
-            return None
 
-    def _resolve_qa_concurrency(self) -> int:
         """QA-level concurrency: default follows the serving model's max_num_seqs snapshot."""
         env_value = str(os.getenv("PHOTOBENCH_QA_CONCURRENCY") or "").strip()
         if env_value:
