@@ -1547,7 +1547,7 @@ class BenchmarkRun:
             pool_rows = list(enumerate(self.qa_rows))
             with concurrent.futures.ThreadPoolExecutor(max_workers=qa_concurrency, thread_name_prefix="qa-eval") as executor:
                 future_map = {executor.submit(self._evaluate_one, row, assets_by_name): index
-                              for index, row in remaining}
+                              for index, row in pool_rows}
                 self._qa_submitted = total_qa
                 for future in concurrent.futures.as_completed(future_map):
                     index = future_map[future]
