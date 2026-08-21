@@ -589,7 +589,15 @@
   }
 
   function timelineView() {
-    const events = filteredEvents();
+    // The API keeps newest events first for dashboard/retrieval use.  A video
+    // timeline is a playback-oriented view, so render video scenes in source
+    // timestamp order; otherwise the end of a video appears before its start.
+    const events = filteredEvents().sort((left, right) => {
+      const leftTime = Number(left.source_start_sec);
+      const rightTime = Number(right.source_start_sec);
+      if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return leftTime - rightTime;
+      return String(left.time_start || "").localeCompare(String(right.time_start || ""));
+    });
     const card = (event) => `<article class="timeline-event ${event.isVideoScene ? "video-scene-event" : ""}"><div class="timeline-marker ${event.tone}"></div><div class="timeline-date">${event.date}<small>${escapeHtml(event.typeLabel)}</small></div><div class="timeline-event-body">${event.isVideoScene ? videoSceneStack(event) : `<div class="event-cover ${event.tone}">${event.coverAssetId ? `<img src="/api/assets/${encodeURIComponent(event.coverAssetId)}/file" alt="${escapeHtml(event.title)}的事件证据" loading="lazy" />` : ""}<div class="event-cover-label">${albumBadge(event.scope_id)}<span>${escapeHtml(event.title)}</span></div><b>${escapeHtml(event.countLabel)}</b></div>`}<div class="timeline-event-copy"><div class="card-top"><span class="event-kind">${escapeHtml(event.isVideoScene ? `视频场景 ${(event.source_scene_index || 0) + 1}` : event.status || "active")}</span><span class="confidence-label">${event.isVideoScene ? escapeHtml(event.sceneRange) : `revision ${event.revision || 1}`}</span></div><h2>${escapeHtml(event.title)}</h2><p>${escapeHtml(event.summary || "暂无事件摘要")}</p><div class="event-facts"><span>${icon("◎")} ${escapeHtml(event.placeLabel)}</span><span>${icon("◷")} ${event.isVideoScene ? `${escapeHtml(event.sceneRange)} · ${escapeHtml(event.countLabel)}` : escapeHtml(event.countLabel)}</span><span>${icon("↗")} ${event.isVideoScene ? "可回到原始视频" : "可回到原始证据"}</span></div><div class="event-actions"><button class="button small ghost" data-action="open-event" data-event-id="${escapeHtml(event.id)}">查看证据</button>${event.isVideoScene ? "" : `<button class="text-button" data-action="edit-event" data-event-id="${escapeHtml(event.id)}">修正事件 ${icon("→")}</button>`}</div></div></div></article>`;
     const groups = [];
     const byDate = new Map();

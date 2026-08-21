@@ -715,8 +715,10 @@ def health():
         },
         "memory": {"mode": "sentrix-native", "vectorSpaces": ["episodic", "semantic", "visual"]},
         "videoExtraction": {
-            "adapter": "worldmm_keyframe_memory", "status": "available",
-            "package": "tools/video_keyframe/worldmm_keyframe_pipeline.py",
+            "adapter": "hybrid_webp_memory", "status": "available",
+            "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
+            "sampleFps": 10, "yoloBatch": 16, "targetDecode": "NVDEC",
+            "memoryMerge": True, "duplicateFrameRemoval": True,
         },
         "database": store.path,
     }
