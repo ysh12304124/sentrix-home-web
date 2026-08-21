@@ -589,3 +589,4 @@ details.agent-trace-box > div { display: flex; flex-direction: column; gap: 6px;
 .insight-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .suggested-relations { display: grid; gap: 8px; }.suggested-relation { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px dashed var(--line); border-radius: 10px; flex-wrap: wrap; }.suggested-relation span { font-size: 12px; }
 .suggestion-badge { font-size: 11px; color: var(--accent, #2f6fed); background: color-mix(in srgb, var(--accent, #2f6fed) 12%, transparent); padding: 2px 8px; border-radius: 999px; }
+.cluster-samples-inline { display: flex; gap: 6px; margin: 8px 0 0; }.cluster-samples-inline .face-avatar { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid var(--line); }

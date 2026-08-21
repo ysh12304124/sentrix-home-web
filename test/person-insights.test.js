@@ -16,10 +16,10 @@ test("people UI separates role confirmation from naming", () => {
   assert.match(appSource, /照护者/);
 });
 
-test("people UI has three tiers with recommended relationships", () => {
-  assert.match(appSource, /系统认为最重要的人/);
-  assert.match(appSource, /其他常见人物/);
-  assert.match(appSource, /一次性或低证据人物/);
+test("people UI merges insight into unified person cards", () => {
+  assert.match(appSource, /cluster-samples-inline/);
+  assert.match(appSource, /data-action="open-person-insight"/);
+  assert.match(appSource, /suggestion-badge">重要</);
   assert.match(appSource, /系统建议/);
 });
 
