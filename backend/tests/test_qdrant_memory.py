@@ -12,6 +12,45 @@ from scripts.maintenance.sync_qdrant_vectors import sync
 qdrant_client = pytest.importorskip("qdrant_client")
 
 
+def test_qdrant_returns_none_when_dir_locked_by_another_process(monkeypatch):
+    import fcntl
+
+    with tempfile.TemporaryDirectory() as directory:
+        monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
+        monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
+        monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_locked")
+        original_flock = fcntl.flock
+
+        def rejecting_flock(fd, operation):
+            if operation & fcntl.LOCK_NB and operation & fcntl.LOCK_EX:
+                raise BlockingIOError("directory owned by another process")
+            return original_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", rejecting_flock)
+        assert get_qdrant_index(os.path.join(directory, "memory.db")) is None
+
+
+def test_qdrant_single_instance_lock_acquired(monkeypatch):
+    import fcntl
+
+    with tempfile.TemporaryDirectory() as directory:
+        monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
+        monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
+        monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_owner")
+        index = get_qdrant_index(os.path.join(directory, "memory.db"))
+        assert index is not None
+        lock_path = os.path.join(directory, "qdrant", ".sentrix-qdrant.lock")
+        assert os.path.exists(lock_path)
+        assert get_qdrant_index(os.path.join(directory, "memory.db")) is index
+        fd = os.open(lock_path, os.O_RDONLY)
+        try:
+            with pytest.raises((BlockingIOError, OSError)):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+
+
 def test_qdrant_dual_write_search_and_scope_fallback(monkeypatch):
     with tempfile.TemporaryDirectory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")

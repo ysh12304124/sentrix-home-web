@@ -270,7 +270,43 @@ def _merge_frames(frames, max_duration=300.0, max_gap=30.0):
     return result
 
 
+def _gpu_free_memory_mib(device="0"):
+    """Return free GPU memory in MiB for the configured device, or None if unknown."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        index = int(device) if str(device).lstrip("-").isdigit() else 0
+        free, _total = torch.cuda.mem_get_info(index)
+        return int(free // (1024 * 1024))
+    except Exception:
+        return None
+
+
+def check_video_gpu_capacity():
+    """Refuse to start GPU YOLO/NVDEC work when the GPU is already saturated.
+
+    The vLLM model server shares the same GPU; launching another heavy GPU
+    consumer without a capacity check can OOM the production inference.
+    Returns None when the device is CPU-only or capacity cannot be measured.
+    """
+    device = str(os.getenv("SENTRIX_VIDEO_DEVICE", "cpu")).strip().lower()
+    if device in ("", "cpu", "auto"):
+        return None
+    min_free_mib = int(os.getenv("SENTRIX_VIDEO_GPU_MIN_FREE_MIB", "4096"))
+    free_mib = _gpu_free_memory_mib(device)
+    if free_mib is None:
+        return None
+    if free_mib < min_free_mib:
+        raise RuntimeError(
+            f"insufficient GPU memory for video keyframe extraction: "
+            f"{free_mib} MiB free < {min_free_mib} MiB required (SENTRIX_VIDEO_GPU_MIN_FREE_MIB)"
+        )
+    return free_mib
+
+
 def run(video_path, output_dir, video_id):
+    check_video_gpu_capacity()
     root = Path(__file__).resolve().parents[2] / "tools" / "video_keyframe"
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)

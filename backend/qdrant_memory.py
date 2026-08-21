@@ -10,19 +10,26 @@ Qdrant payload/vector layout.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
 import re
 import threading
 import uuid
-import atexit
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 
 _CLIENTS = {}
 _CLIENTS_LOCK = threading.Lock()
+_DIR_LOCKS = {}
 _POINT_NAMESPACE = uuid.UUID("09cba006-7577-4e7b-b973-f58e005d6822")
+_LOCK_FILENAME = ".sentrix-qdrant.lock"
 
 
 def _enabled() -> bool:
@@ -203,6 +210,26 @@ class QdrantMemoryIndex:
                 "last_error": self.last_error}
 
 
+def _acquire_dir_lock(directory: str):
+    """Take an exclusive flock on the Qdrant dir so only one API process owns it.
+
+    Returns the open fd on success, or None when another process already holds
+    the lock.  A POSIX advisory lock is released automatically when the fd is
+    closed or the process exits, so no explicit unlock is needed on shutdown.
+    """
+    if fcntl is None:
+        return True  # non-POSIX: no cross-process guard available
+    lock_path = Path(directory) / _LOCK_FILENAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def get_qdrant_index(db_path: str | None = None) -> QdrantMemoryIndex | None:
     if not _enabled():
         return None
@@ -217,7 +244,13 @@ def get_qdrant_index(db_path: str | None = None) -> QdrantMemoryIndex | None:
     key = (str(Path(path).resolve()), prefix)
     with _CLIENTS_LOCK:
         if key not in _CLIENTS:
-            _CLIENTS[key] = QdrantMemoryIndex(path, prefix)
+            lock_fd = _acquire_dir_lock(path)
+            if lock_fd is None:
+                return None
+            index = QdrantMemoryIndex(path, prefix)
+            if isinstance(lock_fd, int):
+                _DIR_LOCKS[key] = lock_fd
+            _CLIENTS[key] = index
         return _CLIENTS[key]
 
 
@@ -225,10 +258,17 @@ def close_qdrant_clients() -> None:
     with _CLIENTS_LOCK:
         clients = list(_CLIENTS.values())
         _CLIENTS.clear()
+        locks = list(_DIR_LOCKS.values())
+        _DIR_LOCKS.clear()
     for index in clients:
         try:
             if index._client is not None:
                 index._client.close()
+        except Exception:
+            pass
+    for fd in locks:
+        try:
+            os.close(fd)
         except Exception:
             pass
 
