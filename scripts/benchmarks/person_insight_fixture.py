@@ -43,12 +43,18 @@ def backup_sqlite(source_path, destination_path):
     return str(destination_path)
 
 
-def _source_stats(path):
+def _source_stats(path, scope_id):
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        face_instances = connection.execute("SELECT COUNT(*) FROM face_instances").fetchone()[0]
+        face_instances = connection.execute(
+            """SELECT COUNT(*) FROM face_instances fi
+            JOIN assets a ON a.id = fi.asset_id WHERE a.scope_id = ?""",
+            (scope_id,),
+        ).fetchone()[0]
         active_clusters = connection.execute(
-            "SELECT COUNT(*) FROM face_clusters WHERE status = 'active'"
+            """SELECT COUNT(*) FROM face_clusters
+            WHERE scope_id = ? AND status != 'rejected'""",
+            (scope_id,),
         ).fetchone()[0]
     finally:
         connection.close()
@@ -114,7 +120,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     ensure_sqlite_backend()
-    stats = _source_stats(args.source_db)
+    stats = _source_stats(args.source_db, args.scope_id)
     work_path = backup_sqlite(args.source_db, args.work_db)
 
     from backend.db import MemoryStore
