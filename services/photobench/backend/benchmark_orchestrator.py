@@ -1405,7 +1405,15 @@ class BenchmarkRun:
             self.persist()
             batch_status = (batch_data.get("batch") or {}).get("status")
             if (not pending and batch_status in {"completed", "complete", "failed"}) or poll_count > 600:
-                break
+                stable_polls = getattr(self, "_pipeline_stable_polls", 0) + 1
+                self._pipeline_stable_polls = stable_polls
+                # Confirm a stable zero-pending snapshot twice: asset status rows can
+                # land after the batch flips to completed (upload/pipeline overlap).
+                if stable_polls >= 2 or poll_count > 600:
+                    break
+                self._cancel.wait(3)
+                continue
+            self._pipeline_stable_polls = 0
             if self._cancel.wait(3):
                 break
         t1 = time.perf_counter()
@@ -1429,15 +1437,54 @@ class BenchmarkRun:
             assets_by_name.setdefault(name, []).append(a)
 
         t0 = time.perf_counter()
-        for row in self.qa_rows:
-            item = self._evaluate_one(row, assets_by_name)
+        qa_concurrency = self._resolve_qa_concurrency()
+        with self.lock:
+            self.state["qa_concurrency"] = qa_concurrency
+        if qa_concurrency <= 1:
+            for row in self.qa_rows:
+                if self._cancel.is_set():
+                    break
+                item = self._evaluate_one(row, assets_by_name)
+                with self.lock:
+                    self.state["items"].append(item)
+                    self.persist()
+        else:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=qa_concurrency, thread_name_prefix="qa-eval") as executor:
+                future_map = {executor.submit(self._evaluate_one, row, assets_by_name): index
+                              for index, row in enumerate(self.qa_rows)}
+                for future in concurrent.futures.as_completed(future_map):
+                    index = future_map[future]
+                    try:
+                        item = future.result()
+                    except Exception as exc:
+                        item = {"index": index, "error": repr(exc), "failed": True}
+                    with self.lock:
+                        self.state["items"].append({**item, "_index": index})
+                        self.persist()
             with self.lock:
-                self.state["items"].append(item)
+                self.state["items"].sort(key=lambda it: it.get("_index", 0))
+                for it in self.state["items"]:
+                    it.pop("_index", None)
                 self.persist()
 
         t1 = time.perf_counter()
         self._gpu_sampler.stop()
-        self._phase_done("qa_eval", {"total_seconds": round(t1 - t0, 1)})
+        self._phase_done("qa_eval", {"total_seconds": round(t1 - t0, 1), "qa_concurrency": qa_concurrency})
+
+    def _resolve_qa_concurrency(self) -> int:
+        """QA-level concurrency: default follows the serving model's max_num_seqs snapshot."""
+        env_value = str(os.getenv("PHOTOBENCH_QA_CONCURRENCY") or "").strip()
+        if env_value:
+            try:
+                return max(1, int(env_value))
+            except ValueError:
+                pass
+        try:
+            snapshot = (self.state.get("phases") or {}).get("model_deploy", {}).get("model_state") or {}
+            return max(1, int(snapshot.get("max_num_seqs") or 1))
+        except Exception:
+            return 1
 
     def _evaluate_one(self, row: dict, assets_by_name: dict) -> dict:
         t0 = time.perf_counter()
