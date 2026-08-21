@@ -902,7 +902,7 @@ class BenchmarkRun:
         base = judge_url.rstrip("/")
         # Cloud providers (e.g. DashScope) include /v1 in the base URL;
         # local LM Studio servers do not. Normalize to avoid double /v1.
-        self.judge_url = base.removesuffix("/v1")
+        self.judge_url = base
         self.judge_model = judge_model
         self.judge_api_key = judge_api_key
         self.judge_system_prompt = judge_system_prompt
@@ -1987,7 +1987,7 @@ class BenchmarkRun:
                          {"role": "user", "content": judge_text}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
+            raw = request_json(self._judge_chat_url(), payload, "POST", 180,
                                self._judge_headers())
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             start, end = text.find("{"), text.rfind("}")
@@ -2010,7 +2010,7 @@ class BenchmarkRun:
                     "messages": [{"role": "system", "content": retry_system}, payload["messages"][1]],
                 }
                 try:
-                    retry_raw = request_json(f"{self.judge_url}/v1/chat/completions", retry_payload, "POST", 180,
+                    retry_raw = request_json(self._judge_chat_url(), retry_payload, "POST", 180,
                                              self._judge_headers())
                     retry_text = str(retry_raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
                     retry_parsed = self._parse_judge_json(retry_text)
@@ -2070,7 +2070,7 @@ class BenchmarkRun:
                          {"role": "user", "content": prompt}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
+            raw = request_json(self._judge_chat_url(), payload, "POST", 180,
                                self._judge_headers())
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
@@ -2114,7 +2114,7 @@ class BenchmarkRun:
                          {"role": "user", "content": content}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
+            raw = request_json(self._judge_chat_url(), payload, "POST", 180,
                                self._judge_headers())
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
@@ -2138,6 +2138,14 @@ class BenchmarkRun:
         except json.JSONDecodeError:
             value = {}
         return value if isinstance(value, dict) else {}
+
+    def _judge_chat_url(self) -> str:
+        url = self.judge_url.rstrip("/")
+        if url.endswith("/chat/completions"):
+            return url
+        if url.endswith("/v1") or url.endswith("/v3") or url.endswith("/v2"):
+            return f"{url}/chat/completions"
+        return f"{url}/v1/chat/completions"
 
     def _judge_headers(self) -> dict[str, str]:
         api_key = getattr(self, "judge_api_key", JUDGE_API_KEY)
@@ -2244,10 +2252,10 @@ class BenchmarkRun:
 
     @classmethod
     def _capability_summary(cls, items: list[dict]) -> dict:
-        answer_judges = [judge for item in items for judge in (
-            [turn.get("judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else [item.get("judge") or {}]
-        )]
+        # Canonical metric: per-qa_id, take the final (item-level) judge only.
+        # Multi-turn conversation items used to be flattened into one judge per
+        # turn, inflating the denominator beyond the number of questions.
+        answer_judges = [item.get("judge") or {} for item in items]
         answer_scores = [score for judge in answer_judges if (score := judge_score_for_summary(judge)) is not None]
         answer_dist = {str(score): answer_scores.count(score) for score in (0, 1, 2)}
         retrieval_items = [item for item in items if item.get("retrieval_image_ids")]
@@ -2257,15 +2265,11 @@ class BenchmarkRun:
         precision = tp / predicted if predicted else (0.0 if gt else None)
         recall = tp / gt if gt else None
         f1 = 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else (0.0 if gt else None)
-        evidence_judges = [judge for item in items for judge in (
-            [turn.get("evidence_judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else [item.get("evidence_judge") or {}]
-        )]
+        evidence_judges = [item.get("evidence_judge") or {} for item in items]
         evidence_scores = [judge.get("score") for judge in evidence_judges if judge.get("score") in {0, 1, 2}]
         evidence_dist = {str(score): evidence_scores.count(score) for score in (0, 1, 2)}
         action_judges = [judge for item in items for judge in (
-            [turn.get("task_judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else item.get("task_judges") or [item.get("task_judge") or {}]
+            item.get("task_judges") or [item.get("task_judge") or {}]
         ) if judge.get("expected_action") in {"answer", "refuse", "clarify"}]
         action_valid = [value for value in action_judges if value.get("correct") in {True, False}]
         parse_totals = [item.get("agent_stability", {}).get("json_parse_total") for item in items]
@@ -2699,25 +2703,62 @@ class OrchestratorRepository:
             result["summary"] = self._effective_summary(state)
             return result
 
-    def export_sft(self, run_id: str, min_score: int | None = None) -> dict:
-        """导出轨迹（每步模型调用的 prompt -> response）用于轨迹训练。
+    def export_sft(self, run_id: str, scores: list[int] | None = None,
+                   min_score: int | None = None) -> dict:
+        """导出完整思考轨迹：每题全部 debug_trace 步（含提示词/工具参数/工具结果/守卫/judge）、
+        agent2_trace（task_state/evidence_ledger/answer_context/stage_timing）与评测元数据。
 
-        min_score: None 导出全部；1 只导出答案评分 >=1 的题目；2 只导出评分 =2 的题目。
+        scores: 非空时只导出答案评分落在该集合内的题目（勾选过滤，勾选什么导出什么）。
+        min_score: 兼容旧参数；非 None 时只导出评分 >= min_score 的题目。
         """
+        import ast as _ast
+        def _parse(value):
+            if isinstance(value, dict) or not isinstance(value, str) or not value.strip():
+                return value
+            try:
+                return _ast.literal_eval(value)
+            except Exception:
+                return value
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
                 raise KeyError(run_id)
             state = run.state if isinstance(run, BenchmarkRun) else run
+            items_out = []
             samples = []
+            include = set(scores) if scores else None
             for item in (state.get("items") or []):
-                if min_score is not None:
+                if include is not None:
+                    item_score = (item.get("judge") or {}).get("score")
+                    if item_score not in include:
+                        continue
+                elif min_score is not None:
                     item_score = (item.get("judge") or {}).get("score")
                     if item_score is None or item_score < min_score:
                         continue
                 qa_id = item.get("qa_id")
-                turns = item.get("runtime_turns") or []
-                for turn in turns:
+                turns_out = []
+                for turn in (item.get("runtime_turns") or []):
+                    steps_out = []
+                    for step in (turn.get("debug_trace") or []):
+                        if not isinstance(step, dict):
+                            continue
+                        st = dict(step)
+                        if isinstance(st.get("arguments"), str):
+                            st["arguments"] = _parse(st["arguments"])
+                        if isinstance(st.get("observation"), str):
+                            st["observation"] = _parse(st["observation"])
+                        steps_out.append(st)
+                    turns_out.append({
+                        "turn": turn.get("index"),
+                        "message": turn.get("message"),
+                        "expected_action": turn.get("expected_action"),
+                        "answer": turn.get("answer"),
+                        "agent_status": turn.get("agent_status"),
+                        "turn_outcome": turn.get("turn_outcome"),
+                        "steps": steps_out,
+                    })
+                    # SFT prompt->response 样本（兼容旧格式；完整轨迹见 items）
                     for step in (turn.get("debug_trace") or []):
                         if not isinstance(step, dict) or step.get("type") != "model":
                             continue
@@ -2730,11 +2771,35 @@ class OrchestratorRepository:
                         samples.append({
                             "qa_id": qa_id,
                             "turn": turn.get("index"),
-                            "step": step.get("status", "complete"),
+                            "step": step.get("step_id") or step.get("status", "complete"),
                             "messages": messages,
                         })
-            return {"run_id": run_id, "count": len(samples), "samples": samples,
-                    "min_score": min_score, "filtered": min_score is not None}
+                items_out.append({
+                    "qa_id": qa_id,
+                    "question": item.get("question"),
+                    "expected_action": item.get("expected_action"),
+                    "answer": item.get("answer"),
+                    "judge": item.get("judge"),
+                    "task_judge": item.get("task_judge"),
+                    "retrieval": {k: item.get(k) for k in (
+                        "retrieval_recall", "retrieval_precision", "retrieval_f1",
+                        "gt_images", "predicted_images", "predicted_file_names",
+                        "matched_file_names")},
+                    "agent_status": item.get("agent_status"),
+                    "termination_reason": item.get("termination_reason"),
+                    "turn_outcome": item.get("turn_outcome"),
+                    "timing_breakdown": item.get("timing_breakdown"),
+                    "agent_stability": item.get("agent_stability"),
+                    "answer_grounding": item.get("answer_grounding"),
+                    "tool_trace": item.get("tool_trace"),
+                    "agent2_trace": item.get("agent2_trace"),
+                    "turns": turns_out,
+                })
+            return {"run_id": run_id, "count": len(samples), "item_count": len(items_out),
+                    "items": items_out, "samples": samples,
+                    "scores": sorted(include) if include is not None else None,
+                    "min_score": min_score,
+                    "filtered": (include is not None or min_score is not None)}
 
     def get_run_items(self, run_id: str, page: int = 1, page_size: int = 20,
                       search: str = "", score: str = "", task_type: str = "",
@@ -3294,7 +3359,7 @@ class OrchestratorRepository:
                         self._persist_run_state(run_id, current, current_state)
 
                     judge_runner = BenchmarkRun.__new__(BenchmarkRun)
-                    judge_runner.judge_url = judge_url.rstrip("/").removesuffix("/v1")
+                    judge_runner.judge_url = judge_url.rstrip("/")
                     judge_runner.judge_model = judge_model
                     judge_runner.judge_api_key = judge_api_key
                     conversation_context = saved_turns[:turn_index + 1] if turn_index is not None else None
@@ -3605,9 +3670,11 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))
                 _q = parse_qs(parsed.query)
+                _raw_scores = (_q.get("scores") or [""])[0]
+                scores = [int(x) for x in _raw_scores.split(",") if x.strip() in {"0", "1", "2"}]
                 _raw = (_q.get("min_score") or [""])[0]
                 min_score = int(_raw) if _raw in {"1", "2"} else None
-                payload = self.repo.export_sft(run_id, min_score=min_score)
+                payload = self.repo.export_sft(run_id, scores=scores or None, min_score=min_score)
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")

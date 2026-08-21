@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 
 const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
@@ -32,6 +32,13 @@ const judgeUrl = ref("");
 const vllmTargetId = ref("");
 const rejudgePrompt = ref("");
 const judgeProviderId = ref("");
+watch(judgeProviderId, (newId) => {
+  const provider = (config.value?.judge_providers || []).find((p) => p.id === newId);
+  if (provider?.url) {
+    judgeUrl.value = provider.url;
+  }
+});
+
 const suiteRunning = ref(false);
 const rejudgeSubmitting = ref(false);
 const reviewSaving = ref(false);
@@ -339,6 +346,9 @@ function gpuMetricRows(phase = {}) {
     const thermal = phase.thermal_state || {};
     const cpu = phase.cpu_percent || {};
     const modelMem = phase.model_process_memory_used_mib || {};
+    const arb = phase.arbiter_summary || {};
+    const arbDist = arb.state_distribution || {};
+    const arbLabel = Object.keys(arbDist).length ? Object.entries(arbDist).map(([k, v]) => `${k}=${v}`).join(" ") : "-";
     const thermalLabel = (v) => v == null ? "-" : (["nominal", "fair", "serious", "critical"][Math.round(v)] ?? `${v}`);
     return [
       ["内存压力", fmtNumber(mp.mean), `峰值 ${fmtNumber(mp.peak)} · P95 ${fmtNumber(mp.p95)}`, true],
@@ -348,6 +358,8 @@ function gpuMetricRows(phase = {}) {
       ["散热状态", thermal.mean == null ? "-" : thermalLabel(thermal.mean), `峰值 ${thermal.peak == null ? "-" : thermalLabel(thermal.peak)} · NSProcessInfo.thermalState`, true],
       ["CPU 占用", cpu.mean == null ? "-" : fmtNumber(cpu.mean, "%"), `峰值 ${cpu.peak == null ? "-" : fmtNumber(cpu.peak, "%")} · 全核采样`],
       ["模型进程内存", modelMem.mean == null ? "-" : fmtMemory(modelMem.mean), `峰值 ${modelMem.peak == null ? "-" : fmtMemory(modelMem.peak)} · mlx 进程 RSS（Metal 分配不在其中）`],
+      ["调度状态", arbLabel, `worker_scale 均值 ${arb.worker_scale_mean == null ? "-" : arb.worker_scale_mean} · 预占峰值 ${arb.preempt_count_max ?? 0}`, true],
+      ["Import/Agent 活跃峰值", `import ${arb.import_active_peak ?? 0} · agent ${arb.agent_vlm_active_peak ?? 0}`, "采样期内 VLM 令牌持有峰值"],
       ["采样数量", phase.samples_count == null ? "-" : `${phase.samples_count} 次`, "macOS 系统采样点"],
     ];
   }
@@ -406,7 +418,7 @@ function aggregateMetricRows(phase = {}) {
   return [
     ["图片检索 Precision", fmtPct(summary.retrieval_precision_micro), `图片级微平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT 图`, true],
     ["图片检索 Recall", fmtPct(summary.retrieval_recall_micro), "图片级微平均；列表为题均宏平均", true],
-    ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Judge 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
+    ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
     ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
     ["Token 用量", summary.prompt_tokens_total == null && summary.completion_tokens_total == null ? "未记录" : `${summary.prompt_tokens_total ?? "-"} / ${summary.completion_tokens_total ?? "-"}`, "输入 / 输出 token", true],
     ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), "每道 QA 从输入到最终回答的平均 Agent 总耗时，不含 Judge", true],
@@ -962,12 +974,13 @@ async function selectRun(run) { activeRunId.value = run.run_id; await loadActive
 async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
 function resetJudgePrompt() { rejudgePrompt.value = config.value?.judge_prompt || ""; }
 
-const exportScoreFilter = ref("all");
+const exportScores = ref(["0", "1", "2"]);
 const deleteScopeAfterRun = ref(false);
 function exportSftTraces() {
   if (!activeRunId.value) return;
-  const filter = exportScoreFilter.value === "all" ? "" : `?min_score=${exportScoreFilter.value}`;
-  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft${filter}`, "_blank");
+  const scores = exportScores.value;
+  if (!scores.length) { window.alert("请至少勾选一个评分再导出"); return; }
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft?scores=${scores.join(",")}`, "_blank");
 }
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
@@ -996,7 +1009,7 @@ async function startSuite() {
   if (!selectedModels.size) { window.alert("请至少选择一个模型"); return; }
   suiteRunning.value = true;
   try {
-   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: selectedQa.value, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: deleteScopeAfterRun.value });
+   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: selectedQa.value, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, judge_provider_id: judgeProviderId.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: deleteScopeAfterRun.value });
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -1024,6 +1037,21 @@ function startPolling() {
   };
   poll();
 }
+const arbiterStatus = ref(null);
+let arbiterTimer = null;
+async function loadArbiterStatus() {
+  if (!sentrixUrl.value) return;
+  try {
+    const resp = await fetch(`${sentrixUrl.value.replace(/\/$/, "")}/api/arbiter/status`, { signal: AbortSignal.timeout(3000) });
+    if (resp.ok) arbiterStatus.value = await resp.json();
+  } catch (_) { /* backend 暂不可达时保持上次值 */ }
+}
+function arbStateLabel(s) {
+  return ({idle: "空闲", import_running: "导入运行中", agent_active: "Agent 活跃", preempting: "抢占中"})[s] || s || "-";
+}
+function thermalStateLabel(v) {
+  return ({0: "nominal", 1: "fair", 2: "serious", 3: "critical"})[v] ?? "-";
+}
 async function init() {
   try {
     config.value = await api("/api/config");
@@ -1036,6 +1064,8 @@ async function init() {
     const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
     if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
+  loadArbiterStatus();
+  arbiterTimer = setInterval(loadArbiterStatus, 3000);
 }
 const qaBrowserOptions = computed(() => manifests.value.find((m) => m.album_id === qaBrowserAlbum.value)?.qa_sets || []);
 async function loadQaBrowser() {
@@ -1069,7 +1099,7 @@ function qaReferenceLabel(turn) {
   return turn?.expected_action === "clarify" ? "参考澄清示例" : "参考回答";
 }
 onMounted(init);
-onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); });
+onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if (arbiterTimer) clearInterval(arbiterTimer); });
 </script>
 
 <template>
@@ -1079,6 +1109,22 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
       <button :class="['view-tab', { active: activeView === 'qa-browser' }]" @click="activeView = 'qa-browser'; loadQaBrowser()">QA 数据集浏览</button>
     </nav>
     <template v-if="activeView === 'runs'">
+    <section v-if="arbiterStatus" class="section arbiter-section">
+      <div class="section-head">
+        <h2>实时调度状态（VLMArbiter）</h2>
+        <span class="live-badge">每 3s 刷新</span>
+      </div>
+      <div class="arbiter-grid">
+        <div class="arbiter-cell"><span>调度器状态</span><strong>{{ arbStateLabel(arbiterStatus.state) }}</strong></div>
+        <div class="arbiter-cell"><span>Worker 系数</span><strong>{{ arbiterStatus.worker_scale }}</strong></div>
+        <div class="arbiter-cell"><span>内存压力</span><strong>{{ fmtNumber(arbiterStatus.memory_pressure) }}</strong></div>
+        <div class="arbiter-cell"><span>门控 soft / hard</span><strong>{{ arbiterStatus.memory_gate_threshold }} / {{ arbiterStatus.memory_critical_threshold }}</strong></div>
+        <div class="arbiter-cell"><span>散热状态</span><strong>{{ thermalStateLabel(arbiterStatus.thermal_state) }}</strong></div>
+        <div class="arbiter-cell"><span>Import 活跃</span><strong>{{ arbiterStatus.import_active }}</strong></div>
+        <div class="arbiter-cell"><span>Agent VLM 活跃</span><strong>{{ arbiterStatus.agent_vlm_active }}</strong></div>
+        <div class="arbiter-cell"><span>预占次数</span><strong>{{ arbiterStatus.preempt_count }}</strong></div>
+      </div>
+    </section>
     <section class="section config-section">
       <div class="section-head">
 <h2>评测配置</h2>
@@ -1174,11 +1220,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 <h2>{{ modelName(activeRun) }} · {{ albumName(activeRun) }} · {{ qaName(activeRun) }}</h2>
 <span class="phase-status" :class="activeRun.status">{{ statusLabel(activeRun.status) }}</span>
 <span class="field-label">导出轨迹</span>
-<select v-model="exportScoreFilter" class="input compact">
-  <option value="all">全部</option>
-  <option value="1">1 分及以上</option>
-  <option value="2">2 分</option>
-</select>
+<span class="export-score-filter">
+  <label class="checkbox-inline"><input type="checkbox" value="0" v-model="exportScores">0 分</label>
+  <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
+  <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
+</span>
 <button class="btn compact" @click="exportSftTraces">导出 SFT json</button>
 </div>
       <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}</p>
