@@ -2964,7 +2964,7 @@ async def ingest(
 
 
 @app.post("/api/import", status_code=202)
-async def import_remote_files(
+def import_remote_files(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     metadata: str | None = Form(None),

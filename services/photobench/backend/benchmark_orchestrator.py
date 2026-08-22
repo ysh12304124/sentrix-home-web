@@ -1465,28 +1465,61 @@ class BenchmarkRun:
         t0 = time.perf_counter()
         photo_paths = [self.album_dir / p for p in self.manifest["photos"]]
         chunk_size = max(1, int(os.getenv("PHOTOBENCH_IMPORT_CHUNK_SIZE", "8")))
+        upload_workers = max(1, int(os.getenv("PHOTOBENCH_IMPORT_UPLOAD_WORKERS", "2")))
         batch_id = f"batch_{uuid.uuid4().hex[:12]}"
         self.state["batch_id"] = batch_id
         self.persist()
         items = []
-        for offset in range(0, len(photo_paths), chunk_size):
-            if self._cancel.is_set():
-                break
-            chunk = photo_paths[offset:offset + chunk_size]
-            files = [("files", p.name, p.read_bytes()) for p in chunk]
+
+        def upload_chunk(chunk_index, chunk):
+            # Read bytes inside the bounded worker. Queued chunks retain only
+            # paths, so a large album does not become a second in-memory copy.
+            files = [("files", path.name, path.read_bytes()) for path in chunk]
             result = upload_files(
                 f"{self.sentrix_url}/api/import",
                 {"scope_id": self.state["scope_id"], "batch_id": batch_id,
                  "deferBatchComplete": "true"},
                 files, 600,
             )
-            items.extend(result.get("items", []))
-            self._record_phase("photo_import", "total_photos", len(photo_paths))
-            self._record_phase("photo_import", "accepted_count", sum(1 for i in items if i.get("accepted")))
-            if self._cancel.is_set():
-                self._cancel_remote_batch(self.state.get("cancel_source") or "api")
-                self.persist()
-                break
+            return chunk_index, result
+
+        chunks = [
+            (index, photo_paths[offset:offset + chunk_size])
+            for index, offset in enumerate(range(0, len(photo_paths), chunk_size))
+        ]
+        results_by_chunk = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=upload_workers, thread_name_prefix="photobench-upload"
+        ) as executor:
+            pending = {
+                executor.submit(upload_chunk, chunk_index, chunk): chunk_index
+                for chunk_index, chunk in chunks
+            }
+            for future in concurrent.futures.as_completed(tuple(pending)):
+                pending.pop(future, None)
+                chunk_index, result = future.result()
+                results_by_chunk[chunk_index] = result
+                completed_items = [
+                    item for index in sorted(results_by_chunk)
+                    for item in results_by_chunk[index].get("items", [])
+                ]
+                self._record_phase("photo_import", "total_photos", len(photo_paths))
+                self._record_phase(
+                    "photo_import", "accepted_count",
+                    sum(1 for item in completed_items if item.get("accepted")),
+                )
+                if self._cancel.is_set():
+                    for remaining in pending:
+                        remaining.cancel()
+                    break
+
+        if self._cancel.is_set():
+            self._cancel_remote_batch(self.state.get("cancel_source") or "api")
+            self.persist()
+            return
+
+        for chunk_index in sorted(results_by_chunk):
+            items.extend(results_by_chunk[chunk_index].get("items", []))
         if self._cancel.is_set():
             return
         request_json(
@@ -1501,7 +1534,8 @@ class BenchmarkRun:
             "accepted_count": accepted,
             "batch_id": batch_id,
             "chunk_size": chunk_size,
-            "chunk_count": (len(photo_paths) + chunk_size - 1) // chunk_size,
+            "chunk_count": len(chunks),
+            "upload_workers": upload_workers,
         })
 
     def _phase_processing(self):
