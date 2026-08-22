@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone, timedelta
@@ -1163,10 +1164,21 @@ class MemoryStore:
     def count(self, table):
         if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "entity_merge_candidates", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "dialogue_states", "rebuild_runs", "stories", "invites", "trips"}:
             raise ValueError("unsupported table")
-        return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchall()[0][0]
 
     def create_memory_space(self, scope_id, name, kind="household", source_path=None, include_in_people=True):
         timestamp = now_iso()
+        for attempt in range(5):
+            try:
+                self._insert_memory_space(scope_id, name, kind, source_path, include_in_people, timestamp)
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 4:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+        return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
+
+    def _insert_memory_space(self, scope_id, name, kind, source_path, include_in_people, timestamp):
         self.connection.execute(
             """INSERT INTO memory_spaces(id, name, kind, include_in_people, source_path, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1183,7 +1195,6 @@ class MemoryStore:
             (scope_id, name, kind, int(bool(include_in_people)), source_path, timestamp, timestamp),
         )
         self.connection.commit()
-        return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
 
     def list_memory_spaces(self, status="active"):
         if status:
@@ -1191,8 +1202,8 @@ class MemoryStore:
         return self._rows("SELECT * FROM memory_spaces ORDER BY created_at")
 
     def _row(self, query, params=()):
-        row = self.connection.execute(query, params).fetchone()
-        return dict(row) if row else None
+        rows = self.connection.execute(query, params).fetchall()
+        return dict(rows[0]) if rows else None
 
     def _rows(self, query, params=()):
         return [dict(row) for row in self.connection.execute(query, params).fetchall()]
@@ -1412,7 +1423,7 @@ class MemoryStore:
         self.connection.execute(f"DELETE FROM entity_mentions WHERE observation_id IN ({placeholders})", observation_ids)
         self.connection.execute(f"DELETE FROM observations WHERE id IN ({placeholders})", observation_ids)
         for event_id in event_ids:
-            if self.connection.execute("SELECT COUNT(*) FROM event_observations WHERE event_id = ?", (event_id,)).fetchone()[0] == 0:
+            if self.connection.execute("SELECT COUNT(*) FROM event_observations WHERE event_id = ?", (event_id,)).fetchall()[0][0] == 0:
                 self.connection.execute("DELETE FROM event_entities WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM event_revisions WHERE event_id = ?", (event_id,))
@@ -4720,7 +4731,7 @@ class MemoryStore:
             active_count = self.connection.execute(
                 "SELECT COUNT(*) FROM face_clusters WHERE entity_id = ? AND status IN ('pending', 'confirmed') AND member_count > 0",
                 (entity["id"],),
-            ).fetchone()[0]
+            ).fetchall()[0][0]
             if active_count == 0 and entity["status"] != "confirmed":
                 self.connection.execute(
                     "UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ?",
@@ -5343,16 +5354,16 @@ class MemoryStore:
         }.get(kind)
         if not table:
             raise ValueError(f"unknown scope kind: {kind}")
-        row = self.connection.execute(
+        rows = self.connection.execute(
             f"SELECT scope_id FROM {table} WHERE id = ?", (record_id,)
-        ).fetchone()
-        return row["scope_id"] if row else None
+        ).fetchall()
+        return rows[0]["scope_id"] if rows else None
 
     def _face_instance_scope(self, face_instance_id):
-        row = self.connection.execute(
+        rows = self.connection.execute(
             "SELECT asset_id FROM face_instances WHERE id = ?", (face_instance_id,)
-        ).fetchone()
-        return self._scope_for("asset", row["asset_id"]) if row else None
+        ).fetchall()
+        return self._scope_for("asset", rows[0]["asset_id"]) if rows else None
 
     def _person_moment_row(self, row):
         if not row:
@@ -5756,10 +5767,10 @@ class MemoryStore:
         return self.get_entity(person_id)
 
     def reject_role_hypothesis(self, hypothesis_id):
-        row = self.connection.execute(
+        rows = self.connection.execute(
             "SELECT status FROM person_role_hypotheses WHERE id = ?", (hypothesis_id,)
-        ).fetchone()
-        if not row:
+        ).fetchall()
+        if not rows:
             return None
         self.connection.execute(
             "UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ? WHERE id = ?",
@@ -5805,10 +5816,10 @@ class MemoryStore:
         return self.get_relationship_hypothesis(hypothesis_id)
 
     def reject_relationship_hypothesis(self, hypothesis_id):
-        row = self.connection.execute(
+        rows = self.connection.execute(
             "SELECT status FROM relationship_hypotheses WHERE id = ?", (hypothesis_id,)
-        ).fetchone()
-        if not row:
+        ).fetchall()
+        if not rows:
             return None
         self.connection.execute(
             "UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ? WHERE id = ?",
