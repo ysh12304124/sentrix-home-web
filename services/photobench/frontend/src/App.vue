@@ -1050,7 +1050,7 @@ const runModeMeta = computed(() => RUN_MODES_UI.find((m) => m.id === runMode.val
 const memorySpaces = ref([]);
 const memorySpacesLoading = ref(false);
 const existingScopeId = ref("");
-const memorySpacesFilter = ref("");
+const scopeAlbumHint = ref("");
 async function loadMemorySpaces() {
   memorySpacesLoading.value = true;
   try {
@@ -1059,13 +1059,31 @@ async function loadMemorySpaces() {
   } catch { memorySpaces.value = []; }
   finally { memorySpacesLoading.value = false; }
 }
-const filteredSpaces = computed(() => {
-  const kw = memorySpacesFilter.value.trim().toLowerCase();
-  const list = memorySpaces.value;
-  return kw ? list.filter((s) => `${s.name || ""} ${s.id || ""}`.toLowerCase().includes(kw)) : list;
+const selectedSpace = computed(() => memorySpaces.value.find((s) => s.id === existingScopeId.value) || null);
+// 隐藏"照片"下拉后，QA 题目与 GT 对照的数据集依据从所选现有相册自动推断：
+// 优先查 run 历史（scope_id → album_id），再按相册名子串匹配（长 id 优先），最后保持当前选择。
+function inferAlbumForScope(space) {
+  if (!space) return null;
+  const run = runs.value.find((r) => r.scope_id === space.id && (r.mode === "build" || r.mode === "full" || !r.mode));
+  if (run?.album_id && manifests.value.some((m) => m.album_id === run.album_id)) return run.album_id;
+  const name = String(space.name || "");
+  const candidates = manifests.value.map((m) => m.album_id).filter((id) => name.includes(id));
+  if (candidates.length) return candidates.sort((a, b) => b.length - a.length)[0];
+  return null;
+}
+watch(existingScopeId, () => {
+  if (runMode.value !== "reuse") return;
+  const album = inferAlbumForScope(selectedSpace.value);
+  if (album) {
+    selectedAlbum.value = album;
+    scopeAlbumHint.value = `题目对照数据集：${album}`;
+  } else {
+    scopeAlbumHint.value = "未能自动匹配数据集，题目对照沿用当前 QA 数据集所属数据";
+  }
 });
 function onModeChange() {
   existingScopeId.value = "";
+  scopeAlbumHint.value = "";
   if (runMode.value === "reuse" && !memorySpaces.value.length) loadMemorySpaces();
 }
 const startDisabledReason = computed(() => {
@@ -1242,14 +1260,21 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </select>
 <span class="config-help mode-hint">{{ runModeMeta.hint }}</span>
 </label>
-        <label>相册<select v-model="selectedAlbum">
+        <label v-if="runMode !== 'reuse'">照片<select v-model="selectedAlbum">
 <option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} ({{ manifest.face_count }}人 / {{ manifest.photo_count }}图)</option>
 </select>
-<span class="config-help">{{ runMode === 'reuse' ? '仅作 GT 题目对照，不新建相册' : (runMode === 'build' ? '图片与身份来源，处理后相册保留' : '') }}</span>
+<span v-if="runMode === 'build'" class="config-help">图片与身份来源，处理后相册保留</span>
+</label>
+        <label v-if="runMode === 'reuse'">现有相册<select v-model="existingScopeId" :disabled="memorySpacesLoading">
+<option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (memorySpaces.length ? '请选择现有相册' : '无相册（检查 Sentrix 后端地址）') }}</option>
+<option v-for="space in memorySpaces" :key="space.id" :value="space.id">{{ space.name }}（{{ space.id }}）</option>
+</select>
+<span class="config-help">{{ scopeAlbumHint || '后端已有相册，不新建、不删除' }}</span>
 </label>
         <label v-if="runMode !== 'build'">QA 数据集<select v-model="selectedQa">
 <option v-for="qa in qaOptions" :key="qa" :value="qa">{{ qa }}</option>
 </select>
+<span v-if="runMode === 'reuse'" class="config-help">题目与对照随所选现有相册自动匹配</span>
 </label>
         <label>Sentrix 后端<input v-model="sentrixUrl" type="text" />
 </label>
@@ -1265,16 +1290,6 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </select>
 <span class="config-help">{{ vllmTargets[vllmTargetId]?.manager_url }} → {{ vllmTargets[vllmTargetId]?.model_base_url }}</span>
 </label>
-      </div>
-      <div v-if="runMode === 'reuse'" class="scope-picker">
-        <span class="field-label">复用相册（后端已有）</span>
-        <input v-model="memorySpacesFilter" class="scope-filter" type="text" placeholder="搜索相册名 / ID…" />
-        <label class="scope-select">相册<select v-model="existingScopeId" :disabled="memorySpacesLoading">
-<option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (filteredSpaces.length ? '请选择相册' : '无相册（检查 Sentrix 后端地址）') }}</option>
-<option v-for="space in filteredSpaces" :key="space.id" :value="space.id">{{ space.name }}（{{ space.id }}）</option>
-</select>
-</label>
-        <button class="btn ghost compact" type="button" :disabled="memorySpacesLoading" @click="loadMemorySpaces">刷新相册列表</button>
       </div>
       <div class="model-picker">
 <span class="field-label">选择模型（可多选，串行测试）</span>

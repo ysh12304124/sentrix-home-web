@@ -107,7 +107,3 @@ label,.field-label { display:block; color:var(--muted); font-size:12px; } input[
 .mode-badge.mode-reuse { color: #1d4ed8; background: #eef3ff; border: 1px solid #c7d7fe; }
 .mode-badge.mode-build { color: #047857; background: #ecfdf5; border: 1px solid #a7f3d0; }
 .mode-hint { max-width: 360px; }
-.scope-picker { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 2px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px; background: var(--surface); }
-.scope-picker .scope-filter { width: 200px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg, #fff); font-size: 12px; }
-.scope-picker .scope-select { flex: 1; min-width: 260px; }
-.scope-picker .scope-select select { width: 100%; }
