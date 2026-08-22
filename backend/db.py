@@ -1672,8 +1672,10 @@ class MemoryStore:
         return self._rows("SELECT entity_id, confidence FROM entity_mentions WHERE observation_id = ?",
                           (observation_id,))
 
-    def list_observations(self, limit=100, scope_id=None):
-        if scope_id:
+    def list_observations(self, limit=100, scope_id=None, asset_id=None):
+        if asset_id:
+            rows = self._rows("SELECT * FROM observations WHERE asset_id = ? ORDER BY created_at DESC LIMIT ?", (asset_id, limit))
+        elif scope_id:
             rows = self._rows("SELECT * FROM observations WHERE scope_id = ? ORDER BY created_at DESC LIMIT ?", (scope_id, limit))
         else:
             rows = self._rows("SELECT * FROM observations ORDER BY created_at DESC LIMIT ?", (limit,))

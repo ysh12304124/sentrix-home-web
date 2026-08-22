@@ -310,7 +310,9 @@ class EvidenceRetrievalKernel:
         return items
 
     def _observations_for_asset(self, asset_id):
-        return [item for item in self.store.list_observations(limit=100_000) if item.get("asset_id") == asset_id]
+        # Indexed lookup: the old full-scan-and-filter decoded every observation
+        # JSON (~11k rows) once per fusion candidate (~100x per search).
+        return self.store.list_observations(asset_id=asset_id, limit=1000)
 
     def probe(self, raw_text: str, scope_id: str | None, viewer_id: str = "owner",
               *, focus=None, media_hint=None):
