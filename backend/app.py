@@ -261,6 +261,85 @@ def _prepare_asset_stage(asset_id, stage):
         worker_store.close()
 
 
+def _process_image_stages(image_ids, task_store, task_pipeline, limits):
+    """Run fast and semantic model work as a bounded two-stage pipeline.
+
+    Fast commits stay in upload order because they establish face/event
+    clustering state. Semantic inference can start as soon as its fast commit
+    exists; semantic commits remain ordered and are bounded so a slow VLM does
+    not leave an unbounded list of prepared results in memory.
+    """
+    image_ids = list(image_ids or [])
+    if not image_ids:
+        return
+
+    worker_count = max(1, int(limits["effective_workers"]))
+    semantic_window = max(worker_count, worker_count * 2)
+    fast_pending = {}
+    semantic_pending = {}
+    semantic_order = []
+    next_fast_submit = 0
+    next_fast_commit = 0
+    next_semantic_commit = 0
+
+    def mark_fast_failed(asset_id, error):
+        with db_write_guard("ingest-commit-fast-error"):
+            task_store.cleanup_asset_derivatives(asset_id)
+            task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
+
+    def mark_semantic_failed(asset_id, error):
+        with db_write_guard("ingest-commit-semantic-error"):
+            task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic"})
+
+    def commit_semantic(asset_id):
+        future = semantic_pending.pop(asset_id)
+        try:
+            prepared = future.result()
+            with db_write_guard("ingest-commit-semantic"):
+                task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
+        except Exception as error:
+            mark_semantic_failed(asset_id, error)
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="sentrix-batch-fast") as fast_executor, \
+            ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="sentrix-batch-semantic") as semantic_executor:
+        while next_fast_submit < len(image_ids) and len(fast_pending) < worker_count:
+            asset_id = image_ids[next_fast_submit]
+            fast_pending[asset_id] = fast_executor.submit(_prepare_asset_stage, asset_id, "fast")
+            next_fast_submit += 1
+
+        while next_fast_commit < len(image_ids):
+            asset_id = image_ids[next_fast_commit]
+            future = fast_pending.pop(asset_id)
+            try:
+                prepared = future.result()
+                with db_write_guard("ingest-commit-fast"):
+                    task_pipeline.commit_fast_image(asset_id, prepared)
+                semantic_pending[asset_id] = semantic_executor.submit(
+                    _prepare_asset_stage, asset_id, "semantic"
+                )
+                semantic_order.append(asset_id)
+            except Exception as error:
+                mark_fast_failed(asset_id, error)
+
+            next_fast_commit += 1
+            while next_fast_submit < len(image_ids) and len(fast_pending) < worker_count:
+                next_asset_id = image_ids[next_fast_submit]
+                fast_pending[next_asset_id] = fast_executor.submit(
+                    _prepare_asset_stage, next_asset_id, "fast"
+                )
+                next_fast_submit += 1
+
+            # Apply backpressure after two worker windows. This preserves
+            # semantic commit order without retaining every VLM result.
+            while len(semantic_pending) >= semantic_window:
+                commit_semantic(semantic_order[next_semantic_commit])
+                next_semantic_commit += 1
+
+        while next_semantic_commit < len(semantic_order):
+            commit_semantic(semantic_order[next_semantic_commit])
+            next_semantic_commit += 1
+
+
 def _summarize_event_worker(event_id):
     worker_store = MemoryStore(store.path)
     worker_pipeline = IngestionPipeline(
@@ -335,32 +414,7 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
             elif asset.get("status") in {"queued", "failed", "video-queued"}:
                 process_asset(asset_id)
 
-        with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-fast") as executor:
-            futures = {asset_id: executor.submit(_prepare_asset_stage, asset_id, "fast") for asset_id in image_ids}
-            for asset_id in image_ids:
-                try:
-                    prepared = futures[asset_id].result()
-                    with db_write_guard("ingest-commit-fast"):
-                        task_pipeline.commit_fast_image(asset_id, prepared)
-                except Exception as error:
-                    with db_write_guard("ingest-commit-fast-error"):
-                        task_store.cleanup_asset_derivatives(asset_id)
-                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
-
-        semantic_ids = [
-            asset_id for asset_id in image_ids
-            if (task_store.get_asset(asset_id) or {}).get("status") == "semantic_enriching"
-        ]
-        with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-semantic") as executor:
-            futures = {asset_id: executor.submit(_prepare_asset_stage, asset_id, "semantic") for asset_id in semantic_ids}
-            for asset_id in semantic_ids:
-                try:
-                    prepared = futures[asset_id].result()
-                    with db_write_guard("ingest-commit-semantic"):
-                        task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
-                except Exception as error:
-                    with db_write_guard("ingest-commit-semantic-error"):
-                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic"})
+        _process_image_stages(image_ids, task_store, task_pipeline, limits)
 
         if finalize_batch:
             task_store.complete_ingest_batch(batch_id)
