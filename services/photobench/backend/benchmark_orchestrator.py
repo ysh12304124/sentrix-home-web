@@ -1391,10 +1391,12 @@ class BenchmarkRun:
         self._phase_start("scope_attach")
         t0 = time.perf_counter()
         scope_id = self.existing_scope_id
-        result = request_json(
-            f"{self.sentrix_url}/api/memory-spaces/{quote(scope_id)}", timeout=30,
-        )
-        if not result or not (result.get("id") or result.get("scope_id")):
+        # 后端没有 GET /api/memory-spaces/{id} 单查（405），从列表中定位。
+        spaces = request_json(f"{self.sentrix_url}/api/memory-spaces", timeout=30)
+        if isinstance(spaces, dict):
+            spaces = spaces.get("spaces") or spaces.get("items") or []
+        result = next((s for s in (spaces or []) if s.get("id") == scope_id), None)
+        if not result:
             raise ValueError(f"memory space not found on backend: {scope_id}")
         self.state["scope_id"] = scope_id
         self.state["scope_name"] = result.get("name") or scope_id
