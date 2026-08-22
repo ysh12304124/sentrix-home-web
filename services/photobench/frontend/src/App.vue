@@ -296,6 +296,15 @@ function toolBindingLabel(trace) {
   if (trace?.round_binding_source === "step_id") return "按步骤 ID 精确绑定";
   return trace?.round_binding_source === "inferred_single_model_call" ? "单轮数据推断归属" : "按执行轨迹绑定";
 }
+function retrievalBackendLabel(trace) {
+  const channels = trace?.retrieval_timing?.channels || {};
+  const backends = [...new Set(Object.values(channels).map((channel) => channel && channel.backend).filter(Boolean))];
+  return backends.length ? backends.join("/") : "";
+}
+function retrievalBackendDegraded(trace) {
+  const label = retrievalBackendLabel(trace);
+  return Boolean(label) && label.split("/").some((backend) => backend !== "qdrant");
+}
 function judgeRoundState(item) {
   const task = activeRejudge.value;
   const judge = item.judge || {};
@@ -1575,7 +1584,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                           </details>
                           <div v-if="showToolBranch(call) && toolsForGroupedCall(itemDetail(summary), call).length" class="tool-tree">
                             <details v-for="(trace, toolIndex) in toolsForGroupedCall(itemDetail(summary), call)" :key="toolIndex" class="tool-node">
-                              <summary><strong>{{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span class="binding-source">{{ toolBindingLabel(trace) }}</span></summary>
+                              <summary><strong>{{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span class="binding-source">{{ toolBindingLabel(trace) }}</span><span v-if="retrievalBackendLabel(trace)" class="retrieval-backend" :class="{ degraded: retrievalBackendDegraded(trace) }">检索后端 {{ retrievalBackendLabel(trace) }}</span></summary>
                               <details v-if="debugToolsForCall(itemDetail(summary), group, call)[toolIndex]" class="debug-inline">
                                 <summary>完整工具输入 / 输出</summary>
                                 <p class="muted small">工具输入</p><pre>{{ JSON.stringify(debugToolsForCall(itemDetail(summary), group, call)[toolIndex].arguments, null, 2) }}</pre>
@@ -1597,7 +1606,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                 <p v-else class="qa-performance-empty">该历史结果未记录主模型调用性能或失败轨迹。</p>
                 <details v-if="unboundTools(itemDetail(summary)).length" class="call-node unbound-tools">
                   <summary><strong>未绑定模型轮次的工具序列</strong><span>{{ unboundTools(itemDetail(summary)).length }} 次 · 历史数据未保存精确轮次关系</span></summary>
-                  <div class="call-node-body tool-tree"><details v-for="(trace, toolIndex) in unboundTools(itemDetail(summary))" :key="toolIndex" class="tool-node"><summary><strong>#{{ toolIndex + 1 }} {{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span></summary></details></div>
+                  <div class="call-node-body tool-tree"><details v-for="(trace, toolIndex) in unboundTools(itemDetail(summary))" :key="toolIndex" class="tool-node"><summary><strong>#{{ toolIndex + 1 }} {{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span v-if="retrievalBackendLabel(trace)" class="retrieval-backend" :class="{ degraded: retrievalBackendDegraded(trace) }">检索后端 {{ retrievalBackendLabel(trace) }}</span></summary></details></div>
                 </details>
                 <details v-if="guardSummary(itemDetail(summary)).recorded" class="call-node guard-node final-agent-status"><summary><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong><span>{{ completionLabel(itemDetail(summary)) }}</span></summary><div class="guard-grid"><span>运行状态 <b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span>终止原因 <b>{{ guardSummary(itemDetail(summary)).termination || "正常完成" }}</b></span><span>恢复次数 <b>{{ guardSummary(itemDetail(summary)).recoveries }}</b></span><span>运行详情 <b>{{ itemDetail(summary).agent_reason || "-" }}</b></span></div></details>
               </section>

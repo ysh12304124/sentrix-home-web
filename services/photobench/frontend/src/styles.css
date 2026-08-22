@@ -96,3 +96,7 @@ label,.field-label { display:block; color:var(--muted); font-size:12px; } input[
 .prompt-kind-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
 .prompt-kind-tab.active { border-color: #4c7dff; color: #1d4ed8; background: #eef3ff; }
 .prompt-kind-tab .custom-badge { margin-left: 6px; font-size: 10px; color: #b45309; background: #fef3c7; border-radius: 4px; padding: 1px 5px; }
+
+/* 检索后端徽标：正常 qdrant 为强调色；出现 sqlite/sqlite_fallback 等降级后端时红色告警 */
+.retrieval-backend { color: var(--accent2); }
+.retrieval-backend.degraded { color: #dc2626; font-weight: 600; }
