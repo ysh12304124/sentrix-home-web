@@ -663,6 +663,13 @@ def _video_extraction_status():
     }
 
 
+def _vector_index_status_safe():
+    try:
+        return store.vector_search_status()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.get("/api/health")
 def health():
     # Phase C C12：profile manifest 作为运维真实来源
@@ -733,7 +740,7 @@ def health():
         "memory": {
             "mode": "sentrix-native",
             "vectorSpaces": ["episodic", "semantic", "visual"],
-            "vectorIndex": store.vector_search_status(),
+            "vectorIndex": _vector_index_status_safe(),
         },
         "videoExtraction": _video_extraction_status(),
         "database": store.path,

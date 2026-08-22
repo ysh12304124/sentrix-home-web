@@ -125,7 +125,7 @@ class TextAnnRetriever:
         for space in self.spaces:
             rows = self.store.search_vectors(
                 space, vector, limit=max(limit * 4, limit),
-                scope_id=scope, model_name=model_id,
+                scope_id=scope, model_name=model_id, route="text_ann",
             )
             for row in rows:
                 metadata = row.get("metadata_json") or {}

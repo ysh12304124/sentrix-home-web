@@ -6,11 +6,69 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timezone, timedelta
 
 from .geocoding import format_gps_prefix
 from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
+
+
+# 检索可观测性（进程级共享）：worker 各自新建 MemoryStore 连接执行检索，
+# 而 /api/health 只读模块级 store，实例级状态会漏掉 worker 侧的降级。
+_VECTOR_METRICS_GUARD = threading.Lock()
+_VECTOR_SEARCH_HISTORY = deque(maxlen=128)
+_VECTOR_DEGRADED_SINCE = None
+
+
+def _percentile(values, pct):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * (len(ordered) - 1)))))
+    return round(ordered[index], 1)
+
+
+def _record_vector_search(route, elapsed_ms, status):
+    global _VECTOR_DEGRADED_SINCE
+    backend = (status or {}).get("backend") or "unknown"
+    enabled = True
+    try:
+        from .qdrant_memory import _enabled as qdrant_enabled
+        enabled = qdrant_enabled()
+    except Exception:
+        pass
+    degraded = enabled and backend in {"sqlite", "sqlite_fallback"}
+    entry = {
+        "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "route": route,
+        "backend": backend,
+        "ms": round(elapsed_ms, 1),
+        "error": (status or {}).get("error"),
+    }
+    with _VECTOR_METRICS_GUARD:
+        _VECTOR_SEARCH_HISTORY.append(entry)
+        if degraded:
+            if _VECTOR_DEGRADED_SINCE is None:
+                _VECTOR_DEGRADED_SINCE = entry["ts"]
+        else:
+            _VECTOR_DEGRADED_SINCE = None
+
+
+def vector_search_metrics():
+    with _VECTOR_METRICS_GUARD:
+        history = list(_VECTOR_SEARCH_HISTORY)
+        degraded_since = _VECTOR_DEGRADED_SINCE
+    samples = [float(item["ms"]) for item in history if item.get("ms") is not None]
+    return {
+        "total_searches": len(history),
+        "active_backend": history[-1]["backend"] if history else None,
+        "active_route": history[-1]["route"] if history else None,
+        "last_search_at": history[-1]["ts"] if history else None,
+        "latency_p50_ms": _percentile(samples, 50),
+        "latency_p95_ms": _percentile(samples, 95),
+        "degraded_since": degraded_since,
+        "recent": history[-8:],
+    }
 
 
 def make_id(prefix):
@@ -3270,9 +3328,18 @@ class MemoryStore:
             pass
         return row
 
-    def search_vectors(self, space, vector, limit=10, scope_id=None, model_name=None):
+    def search_vectors(self, space, vector, limit=10, scope_id=None, model_name=None, route=None):
+        started = time.perf_counter()
+        try:
+            return self._search_vectors_impl(space, vector, limit=limit, scope_id=scope_id, model_name=model_name)
+        finally:
+            _record_vector_search(route or "default", (time.perf_counter() - started) * 1000.0,
+                                  dict(self._last_vector_search))
+
+    def _search_vectors_impl(self, space, vector, limit=10, scope_id=None, model_name=None):
         query = self._normalise_vector(vector)
         if not query:
+            self._last_vector_search = {"backend": "noop", "error": None}
             return []
         try:
             from .qdrant_memory import get_qdrant_index
@@ -3336,14 +3403,24 @@ class MemoryStore:
 
     def vector_search_status(self):
         status = dict(self._last_vector_search)
+        accelerator = None
         try:
-            from .qdrant_memory import get_qdrant_index
+            from .qdrant_memory import get_qdrant_index, _enabled as _qdrant_enabled
             accelerator = get_qdrant_index(self.path)
+            status["qdrant_enabled"] = _qdrant_enabled()
             if accelerator is not None:
                 status.update(accelerator.collection_stats())
                 status["active_backend"] = self._last_vector_search.get("backend")
         except Exception as error:
             status.setdefault("error", f"{type(error).__name__}: {error}")
+        status["qdrant_available"] = accelerator is not None
+        status["degraded"] = bool(status.get("qdrant_enabled")) and accelerator is None
+        status.update(vector_search_metrics())
+        try:
+            from .qdrant_memory import qdrant_lock_status
+            status["qdrant_lock"] = qdrant_lock_status()
+        except Exception:
+            pass
         return status
 
     def has_vector_model(self, space, model_name, dimension=None):

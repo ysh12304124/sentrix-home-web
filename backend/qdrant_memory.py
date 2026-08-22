@@ -13,9 +13,11 @@ from __future__ import annotations
 import atexit
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -28,6 +30,40 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 _CLIENTS = {}
 _CLIENTS_LOCK = threading.Lock()
 _DIR_LOCKS = {}
+
+_LOCK_LOGGER = logging.getLogger(__name__)
+_LOCK_FAILURE_STATE = {"ts": None, "path": None, "logged": False}
+_LOCK_FAILURE_GUARD = threading.Lock()
+
+
+def _record_lock_failure(path):
+    message_path = str(path)
+    with _LOCK_FAILURE_GUARD:
+        first = not _LOCK_FAILURE_STATE["logged"]
+        _LOCK_FAILURE_STATE.update(
+            {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "path": message_path, "logged": True}
+        )
+    if first:
+        _LOCK_LOGGER.error(
+            "qdrant dir lock is held by another process (%s/%s); vector search "
+            "degrades to SQLite full scans until that process exits",
+            message_path, _LOCK_FILENAME,
+        )
+
+
+def _clear_lock_failure(path):
+    with _LOCK_FAILURE_GUARD:
+        recovered = _LOCK_FAILURE_STATE["logged"]
+        _LOCK_FAILURE_STATE.update({"ts": None, "path": None, "logged": False})
+    if recovered:
+        _LOCK_LOGGER.warning("qdrant dir lock re-acquired after previous failure: %s", path)
+
+
+def qdrant_lock_status():
+    with _LOCK_FAILURE_GUARD:
+        state = dict(_LOCK_FAILURE_STATE)
+    state["held_by_process"] = bool(_CLIENTS)
+    return state
 _POINT_NAMESPACE = uuid.UUID("09cba006-7577-4e7b-b973-f58e005d6822")
 _LOCK_FILENAME = ".sentrix-qdrant.lock"
 
@@ -268,11 +304,13 @@ def get_qdrant_index(db_path: str | None = None) -> QdrantMemoryIndex | None:
         if key not in _CLIENTS:
             lock_fd = _acquire_dir_lock(path)
             if lock_fd is None:
+                _record_lock_failure(path)
                 return None
             index = QdrantMemoryIndex(path, prefix)
             if isinstance(lock_fd, int):
                 _DIR_LOCKS[key] = lock_fd
             _CLIENTS[key] = index
+            _clear_lock_failure(path)
         return _CLIENTS[key]
 
 
