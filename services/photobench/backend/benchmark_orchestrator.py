@@ -1425,6 +1425,8 @@ class BenchmarkRun:
                 files, 600,
             )
             items.extend(result.get("items", []))
+            self._record_phase("photo_import", "total_photos", len(photo_paths))
+            self._record_phase("photo_import", "accepted_count", sum(1 for i in items if i.get("accepted")))
             if self._cancel.is_set():
                 self._cancel_remote_batch(self.state.get("cancel_source") or "api")
                 self.persist()
