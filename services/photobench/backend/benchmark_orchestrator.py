@@ -518,6 +518,9 @@ def upload_files(url: str, fields: dict, files: list[tuple[str, str, bytes]], ti
         return json.loads(resp.read())
 
 
+RUN_MODES = ("full", "reuse", "build")
+
+
 class RunCancelledError(RuntimeError):
     """Raised when the orchestrator cancels while waiting on a remote call."""
 
@@ -929,7 +932,15 @@ class BenchmarkRun:
                  vllm_target_id: str, vllm_model_base_url: str, results_root: Path,
                  judge_system_prompt: str = JUDGE_PROMPT, judge_model: str = JUDGE_MODEL,
                  judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False,
-                 task_judge_system_prompt: str = "", evidence_judge_system_prompt: str = ""):
+                 task_judge_system_prompt: str = "", evidence_judge_system_prompt: str = "",
+                 mode: str = "full", existing_scope_id: str = "",
+                 scope_reused_from_runs: list | None = None):
+        if mode not in RUN_MODES:
+            raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
+        if mode == "reuse" and not existing_scope_id:
+            raise ValueError("existing_scope_id is required when mode=reuse")
+        self.mode = mode
+        self.existing_scope_id = str(existing_scope_id).strip()
         self.run_id = run_id
         self.album_id = album_id
         self.manifest = manifest
@@ -950,7 +961,8 @@ class BenchmarkRun:
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
         self.results_root = results_root
         self.lock = threading.RLock()
-        self.delete_scope_after_run = bool(delete_scope_after_run)
+        # 复用/构建模式的产物相册必须保留，绝不允许 delete_scope 清掉。
+        self.delete_scope_after_run = bool(delete_scope_after_run) and mode == "full"
 
         album_base = BENCHMARK_DATA_ROOT / album_id
         self.album_dir = album_base
@@ -961,6 +973,8 @@ class BenchmarkRun:
 
         self.state: dict = {
             "run_id": run_id,
+            "mode": mode,
+            "scope_source": None,
             "album_id": album_id,
             "model_profile": model_profile,
             "qa_set": qa_set,
@@ -979,6 +993,8 @@ class BenchmarkRun:
             "finished_at": None,
            "scope_id": None,
            "scope_name": None,
+           "existing_scope_id": self.existing_scope_id or None,
+           "scope_reused_from_runs": list(scope_reused_from_runs or []),
            "phases": {},
             "items": [],
             "summary": {},
@@ -1110,9 +1126,10 @@ class BenchmarkRun:
         self.state["hardware_snapshots"]["start"] = self._hardware_snapshot()
         self._current_phase = None
         self.persist()
-        phases = [
+        all_phases = [
             ("model_deploy", self._phase_model_deploy),
             ("scope_setup", self._phase_scope_setup),
+            ("scope_attach", self._phase_scope_attach),
             ("identity_seed", self._phase_identity_seed),
             ("photo_import", self._phase_photo_import),
             ("pipeline_processing", self._phase_processing),
@@ -1120,6 +1137,19 @@ class BenchmarkRun:
             ("gpu_metrics", self._phase_gpu_metrics),
             ("aggregate", self._phase_aggregate),
         ]
+        # 工作模式决定阶段编排：
+        #   full  全链路（现状）：建相册→身份→导入→流水线→测评
+        #   build 只构建相册：建相册→身份→导入→流水线（产物 scope 保留，供后续复用测评）
+        #   reuse 复用已有相册：绑定 scope→直接测评
+        phase_names_by_mode = {
+            "full": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                     "pipeline_processing", "qa_eval", "gpu_metrics", "aggregate"],
+            "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                      "pipeline_processing", "gpu_metrics", "aggregate"],
+            "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
+        }
+        phases = [(name, fn) for name, fn in all_phases
+                  if name in phase_names_by_mode[self.mode]]
         try:
             for name, fn in phases:
                 if self._cancel.is_set():
@@ -1351,9 +1381,33 @@ class BenchmarkRun:
                               {"name": scope_name}, "POST", 30)
         scope_id = result.get("id") or result.get("scope_id")
         self.state["scope_id"] = scope_id
-        self.state["scope_name"] = result.get("name") or scope_name
+        self.state["scope_name"] = result.get("name") or scope_id
+        self.state["scope_source"] = "created"
         t1 = time.perf_counter()
         self._phase_done("scope_setup", {"scope_id": scope_id, "scope_name": self.state["scope_name"], "create_seconds": round(t1 - t0, 3)})
+
+    def _phase_scope_attach(self):
+        """reuse 模式：绑定一个已存在的相册 scope，不创建、不删除。"""
+        self._phase_start("scope_attach")
+        t0 = time.perf_counter()
+        scope_id = self.existing_scope_id
+        result = request_json(
+            f"{self.sentrix_url}/api/memory-spaces/{quote(scope_id)}", timeout=30,
+        )
+        if not result or not (result.get("id") or result.get("scope_id")):
+            raise ValueError(f"memory space not found on backend: {scope_id}")
+        self.state["scope_id"] = scope_id
+        self.state["scope_name"] = result.get("name") or scope_id
+        self.state["scope_source"] = "reused"
+        t1 = time.perf_counter()
+        self._phase_done("scope_attach", {
+            "scope_id": scope_id,
+            "scope_name": self.state["scope_name"],
+            "scope_kind": result.get("kind"),
+            "scope_created_at": result.get("created_at"),
+            "attach_seconds": round(t1 - t0, 3),
+            "reused_from_runs": self.state.get("scope_reused_from_runs") or [],
+        })
 
     def _phase_identity_seed(self):
         self._phase_start("identity_seed")
@@ -1511,6 +1565,11 @@ class BenchmarkRun:
 
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
+        # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
+        if not self._gpu_sampling_started:
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         scope_id = self.state["scope_id"]
         assets_data = request_json(f"{self.sentrix_url}/api/assets?scope_id={scope_id}&limit=2000", timeout=60)
         assets = assets_data.get("assets", [])
@@ -2407,7 +2466,8 @@ class BenchmarkRun:
                     context_tokens.append(prompt + completion)
 
         summary = {
-            "total": len(self.qa_rows),
+            # build 模式不做 QA；total 置 0 避免前端把未执行的题数渲染成 0/N。
+            "total": len(self.qa_rows) if self.mode != "build" else 0,
             "completed": len(items),
             "retrieval_recall_mean": round(sum(recalls) / len(recalls), 3) if recalls else None,
             "judge_distribution": distribution,
@@ -3721,7 +3781,21 @@ class OrchestratorRepository:
 
     def start_suite(self, payload: dict) -> dict:
         album_id = payload.get("album_id", "album3-14")
-        qa_set = payload.get("qa_set", "compact-10q")
+        mode = str(payload.get("mode") or "full").strip().lower()
+        if mode not in RUN_MODES:
+            raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
+        manifest_early = self.get_manifest(album_id)
+        if not manifest_early:
+            raise ValueError(f"manifest not found for album: {album_id}")
+        qa_set = payload.get("qa_set") or (
+            # build 模式不做 QA，允许不选；默认取 manifest 第一个仅用于加载结构。
+            next(iter(manifest_early.get("qa_sets") or {}), "")
+        )
+        if not qa_set:
+            raise ValueError(f"album {album_id} has no qa_sets in manifest")
+        existing_scope_id = str(payload.get("existing_scope_id") or "").strip()
+        if mode == "reuse" and not existing_scope_id:
+            raise ValueError("existing_scope_id is required when mode=reuse")
         models = payload.get("models", [])
         sentrix_url = payload.get("sentrix_url", DEFAULT_SENTRIX_URL)
         judge_provider_id = str(payload.get("judge_provider_id") or DEFAULT_JUDGE_PROVIDER_ID)
@@ -3749,11 +3823,23 @@ class OrchestratorRepository:
             if not manifest:
                 raise ValueError(f"manifest not found for album: {album_id}")
 
+            # reuse 模式：反查该 scope 由哪些历史 run 创建，写进新 run 做来源关联。
+            scope_reused_from_runs: list = []
+            if mode == "reuse":
+                for rid, run in self.runs.items():
+                    state = run.state if isinstance(run, BenchmarkRun) else run
+                    if (state.get("scope_id") == existing_scope_id
+                            and state.get("scope_source") == "created"
+                            and state.get("mode") in ("full", "build")):
+                        scope_reused_from_runs.append(rid)
+                scope_reused_from_runs.sort()
+
             suite_id = f"suite-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
             created_runs = []
             for model in models:
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                run_id = f"{ts}-{safe_slug(album_id)}-{safe_slug(model)}-{uuid.uuid4().hex[:6]}"
+                mode_tag = "" if mode == "full" else f"-{mode}"
+                run_id = f"{ts}-{safe_slug(album_id)}-{safe_slug(model)}{mode_tag}-{uuid.uuid4().hex[:6]}"
                 run = BenchmarkRun(
                     run_id=run_id, album_id=album_id, manifest=manifest,
                     model_profile=model, qa_set=qa_set,
@@ -3765,6 +3851,8 @@ class OrchestratorRepository:
                     evidence_judge_system_prompt=load_custom_judge_prompts().get("evidence") or EVIDENCE_JUDGE_PROMPT,
                     judge_model=judge_model, judge_api_key=judge_api_key_suite,
                     delete_scope_after_run=delete_scope_after_run,
+                    mode=mode, existing_scope_id=existing_scope_id,
+                    scope_reused_from_runs=scope_reused_from_runs,
                 )
                 self.runs[run_id] = run
                 created_runs.append(run_id)
@@ -3782,7 +3870,8 @@ class OrchestratorRepository:
 
         threading.Thread(target=_run_sequentially, name=f"suite-{suite_id}", daemon=True).start()
         return {"suite_id": suite_id, "run_ids": created_runs, "album_id": album_id,
-                "models": models, "qa_set": qa_set}
+                "models": models, "qa_set": qa_set, "mode": mode,
+                "existing_scope_id": existing_scope_id or None}
 
 
 # ---------------------------------------------------------------------------
@@ -3809,6 +3898,19 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/memory-spaces":
+                # 复用相册测评的相册下拉数据：转发 Sentrix 后端列表（新创建的在前）。
+                params = parse_qs(parsed.query)
+                sentrix_base = (params.get("sentrix_url") or [DEFAULT_SENTRIX_URL])[0].rstrip("/")
+                spaces = request_json(f"{sentrix_base}/api/memory-spaces", timeout=30)
+                if isinstance(spaces, dict):
+                    spaces = spaces.get("spaces") or spaces.get("items") or []
+                spaces = sorted(
+                    spaces or [],
+                    key=lambda s: str(s.get("created_at") or ""), reverse=True,
+                )
+                self._json({"spaces": spaces})
+                return
             if parsed.path == "/api/config":
                 self._json({
                     "default_sentrix_url": DEFAULT_SENTRIX_URL,

@@ -1038,6 +1038,44 @@ function resetJudgePrompt() {
 
 const exportScores = ref(["0", "1", "2"]);
 const deleteScopeAfterRun = ref(false);
+
+// ---- 工作模式：全链路 / 复用相册测评 / 构建相册 ----
+const RUN_MODES_UI = [
+  { id: "full", label: "全链路测试", hint: "新建相册 → 身份预置 → 照片导入 → 流水线处理 → QA 测评", button: "启动评测" },
+  { id: "reuse", label: "复用相册测评", hint: "选择后端已有相册，跳过导入与处理，直接 QA 测评（相册不会被删除）", button: "启动复用测评" },
+  { id: "build", label: "构建相册", hint: "新建相册并完成身份预置、导入与数据处理；产物相册保留供复用，不做 QA 测评", button: "启动相册构建" },
+];
+const runMode = ref("full");
+const runModeMeta = computed(() => RUN_MODES_UI.find((m) => m.id === runMode.value) || RUN_MODES_UI[0]);
+const memorySpaces = ref([]);
+const memorySpacesLoading = ref(false);
+const existingScopeId = ref("");
+const memorySpacesFilter = ref("");
+async function loadMemorySpaces() {
+  memorySpacesLoading.value = true;
+  try {
+    const data = await fetch(`/api/memory-spaces?sentrix_url=${encodeURIComponent(sentrixUrl.value)}`).then((r) => r.json());
+    memorySpaces.value = data.spaces || [];
+  } catch { memorySpaces.value = []; }
+  finally { memorySpacesLoading.value = false; }
+}
+const filteredSpaces = computed(() => {
+  const kw = memorySpacesFilter.value.trim().toLowerCase();
+  const list = memorySpaces.value;
+  return kw ? list.filter((s) => `${s.name || ""} ${s.id || ""}`.toLowerCase().includes(kw)) : list;
+});
+function onModeChange() {
+  existingScopeId.value = "";
+  if (runMode.value === "reuse" && !memorySpaces.value.length) loadMemorySpaces();
+}
+const startDisabledReason = computed(() => {
+  if (hasRunning.value || suiteRunning.value) return "已有任务运行中";
+  if (!selectedModels.size) return "请先选择模型";
+  if (runMode.value === "reuse" && !existingScopeId.value) return "请先选择要复用的相册";
+  return "";
+});
+const modeLabel = (mode) => (({ full: "全链路", reuse: "复用测评", build: "构建相册" })[mode || "full"] || mode);
+const modeBadgeClass = (mode) => (({ full: "mode-full", reuse: "mode-reuse", build: "mode-build" })[mode || "full"] || "mode-full");
 function exportSftTraces() {
   if (!activeRunId.value) return;
   const scores = exportScores.value;
@@ -1070,11 +1108,13 @@ async function startRejudge() {
   finally { rejudgeSubmitting.value = false; }
 }
 async function startSuite() {
-  if (hasRunning.value || suiteRunning.value) return;
-  if (!selectedModels.size) { window.alert("请至少选择一个模型"); return; }
+  const blocked = startDisabledReason.value;
+  if (blocked && !blocked.includes("运行中")) { window.alert(blocked); return; }
+  if (blocked) return;
+  if (runMode.value === "build" && !window.confirm("构建相册模式只导入并处理数据，不做 QA 测评；产物相册会保留。确定开始？")) return;
   suiteRunning.value = true;
   try {
-   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: selectedQa.value, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, judge_provider_id: judgeProviderId.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: deleteScopeAfterRun.value });
+   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, judge_provider_id: judgeProviderId.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -1197,11 +1237,17 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span v-if="hasRunning" class="live-badge">实时更新中</span>
 </div>
       <div class="config-grid">
+        <label>工作模式<select v-model="runMode" :disabled="suiteRunning || hasRunning" @change="onModeChange">
+<option v-for="mode in RUN_MODES_UI" :key="mode.id" :value="mode.id">{{ mode.label }}</option>
+</select>
+<span class="config-help mode-hint">{{ runModeMeta.hint }}</span>
+</label>
         <label>相册<select v-model="selectedAlbum">
 <option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} ({{ manifest.face_count }}人 / {{ manifest.photo_count }}图)</option>
 </select>
+<span class="config-help">{{ runMode === 'reuse' ? '仅作 GT 题目对照，不新建相册' : (runMode === 'build' ? '图片与身份来源，处理后相册保留' : '') }}</span>
 </label>
-        <label>QA 数据集<select v-model="selectedQa">
+        <label v-if="runMode !== 'build'">QA 数据集<select v-model="selectedQa">
 <option v-for="qa in qaOptions" :key="qa" :value="qa">{{ qa }}</option>
 </select>
 </label>
@@ -1209,7 +1255,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </label>
        <label>Judge 服务<input v-model="judgeUrl" type="text" />
 </label>
-        <label>Judge 模型<select v-model="judgeProviderId">
+        <label v-if="runMode !== 'build'">Judge 模型<select v-model="judgeProviderId">
 <option v-for="provider in (config?.judge_providers || [])" :key="provider.id" :value="provider.id">{{ provider.label }}</option>
 </select>
 <span class="config-help">{{ (config?.judge_providers || []).find((p) => p.id === judgeProviderId)?.model || '-' }}</span>
@@ -1220,6 +1266,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="config-help">{{ vllmTargets[vllmTargetId]?.manager_url }} → {{ vllmTargets[vllmTargetId]?.model_base_url }}</span>
 </label>
       </div>
+      <div v-if="runMode === 'reuse'" class="scope-picker">
+        <span class="field-label">复用相册（后端已有）</span>
+        <input v-model="memorySpacesFilter" class="scope-filter" type="text" placeholder="搜索相册名 / ID…" />
+        <label class="scope-select">相册<select v-model="existingScopeId" :disabled="memorySpacesLoading">
+<option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (filteredSpaces.length ? '请选择相册' : '无相册（检查 Sentrix 后端地址）') }}</option>
+<option v-for="space in filteredSpaces" :key="space.id" :value="space.id">{{ space.name }}（{{ space.id }}）</option>
+</select>
+</label>
+        <button class="btn ghost compact" type="button" :disabled="memorySpacesLoading" @click="loadMemorySpaces">刷新相册列表</button>
+      </div>
       <div class="model-picker">
 <span class="field-label">选择模型（可多选，串行测试）</span>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
@@ -1227,8 +1283,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </label>
 </div>
       <div class="actions">
-<label class="check"><input type="checkbox" v-model="deleteScopeAfterRun" :disabled="suiteRunning || hasRunning" />完成后删除相册</label>
-<button class="btn" :disabled="suiteRunning || hasRunning" @click="startSuite">{{ hasRunning ? '已有任务运行中' : '启动评测' }}</button>
+<label v-if="runMode === 'full'" class="check"><input type="checkbox" v-model="deleteScopeAfterRun" :disabled="suiteRunning || hasRunning" />完成后删除相册</label>
+<span v-if="startDisabledReason" class="config-help">{{ startDisabledReason }}</span>
+<button class="btn" :disabled="Boolean(startDisabledReason)" @click="startSuite">{{ hasRunning ? '已有任务运行中' : runModeMeta.button }}</button>
 <button class="btn warn" :disabled="!hasRunning" @click="stopSuite">停止全部</button>
 <button class="btn ghost" @click="loadProfiles">刷新模型列表</button>
 </div>
@@ -1260,6 +1317,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <tr v-for="run in runs" :key="run.run_id" class="run-row" :class="{ selected: activeRunId === run.run_id }" @click="selectRun(run)">
 <td>
 <b>{{ modelName(run) }}</b>
+<span class="mode-badge" :class="modeBadgeClass(run.mode)">{{ modeLabel(run.mode) }}</span>
 </td>
 <td class="muted small">{{ albumName(run) }}</td>
 <td class="muted small">{{ fmtDate(run.started_at) }}</td>
@@ -1267,7 +1325,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <td>
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
-<td>{{ run.summary?.completed || 0 }}/{{ run.summary?.total || run.qa_count || 0 }}</td>
+<td>{{ run.mode === 'build' ? '—' : `${run.summary?.completed || 0}/${run.summary?.total || run.qa_count || 0}` }}</td>
 <td>{{ fmtPct(run.summary?.retrieval_recall_mean) }}</td>
 <td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
@@ -1293,8 +1351,8 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </span>
 <button class="btn compact" @click="exportSftTraces">导出 SFT json</button>
 </div>
-      <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}</p>
-      <section class="rejudge-card">
+      <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}<template v-if="activeRun.mode === 'reuse'"> · 复用相册 {{ activeRun.scope_name || activeRun.scope_id || activeRun.existing_scope_id }}<span v-if="(activeRun.scope_reused_from_runs || []).length">（源自 run {{ activeRun.scope_reused_from_runs.join('、') }}）</span><span v-else>（外部创建，非编排器产物）</span></template><template v-else-if="activeRun.mode === 'build'"> · 产出相册 {{ activeRun.scope_id || '-' }}（已保留，可在复用测评中使用）</template></p>
+      <section v-if="activeRun.mode !== 'build'" class="rejudge-card">
         <div class="rejudge-head">
 <div>
 <h3>重新 Judge 评分</h3>
