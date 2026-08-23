@@ -12,6 +12,8 @@ FRONTEND_PORT=${BENCH_DEV_PORT:-5173}
 LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
 BACKEND_PID_FILE="$ROOT_DIR/logs/orchestrator.pid"
 FRONTEND_PID_FILE="$ROOT_DIR/logs/vite.pid"
+PHOTOBENCH_QA_CONCURRENCY=${PHOTOBENCH_QA_CONCURRENCY:-12}
+PHOTOBENCH_JUDGE_CONCURRENCY=${PHOTOBENCH_JUDGE_CONCURRENCY:-12}
 mkdir -p "$ROOT_DIR/logs"
 
 wait_for_url() {
@@ -38,7 +40,9 @@ if curl -fsS "http://127.0.0.1:$BACKEND_PORT/api/config" >/dev/null 2>&1; then
   fi
   echo "Backend already available: http://127.0.0.1:$BACKEND_PORT/"
 else
-  nohup python3 "$ROOT_DIR/backend/benchmark_orchestrator.py" \
+  nohup env PHOTOBENCH_QA_CONCURRENCY="$PHOTOBENCH_QA_CONCURRENCY" \
+    PHOTOBENCH_JUDGE_CONCURRENCY="$PHOTOBENCH_JUDGE_CONCURRENCY" \
+    python3 "$ROOT_DIR/backend/benchmark_orchestrator.py" \
     --host 0.0.0.0 \
     --port "$BACKEND_PORT" \
     >> "$ROOT_DIR/logs/orchestrator.log" 2>&1 &
