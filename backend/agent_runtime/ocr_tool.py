@@ -529,11 +529,16 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
     """
     asset_handle = arguments.get("asset_handle") or ""
     task_state = (context or {}).get("task_state") or {}
+    preview = (task_state.get("result_preview") or []) or []
     if asset_handle:
         handles = [asset_handle]
+        # 硬值不丢：显式读单张时，也把其余预览候选的 exact_values（价格/电话/年份）合并进来，
+        # 避免关键值在另一张照片上（事件召回常多张）。
+        other_handles = [p.get("handle") for p in preview[:5]
+                         if p.get("handle") and p.get("handle") != asset_handle]
     else:
-        preview = (task_state.get("result_preview") or []) or []
         handles = [p.get("handle") for p in preview[:5] if p.get("handle")]
+        other_handles = []
     if not handles:
         return {"summary": "无法定位照片。", "full_text": "", "text_regions": [],
                 "certainty": "uncertain", "persisted": False}
@@ -544,6 +549,10 @@ def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> di
         if res and (res.get("full_text") or res.get("exact_values")):
             if res.get("full_text"):
                 texts.append(res["full_text"])
+            exact.extend(res.get("exact_values") or [])
+    for h in other_handles:
+        res = _ocr_single_asset(h, arguments, context)
+        if res:
             exact.extend(res.get("exact_values") or [])
     if texts:
         merged = "\n".join(texts)[:1600]
