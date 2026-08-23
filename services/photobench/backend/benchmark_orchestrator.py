@@ -4506,14 +4506,14 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 rows = load_jsonl(qa_path)
                 self._json({"album_id": album_id, "qa_set": qa_set, "items": rows})
                 return
-            if parsed.path.startswith("/api/albums/") and "/photos/" in parsed.path:
-                parts = parsed.path.removeprefix("/api/albums/").split("/photos/", 1)
-                if len(parts) == 2:
+            if parsed.path.startswith("/api/albums/"):
+                parts = parsed.path.removeprefix("/api/albums/").split("/", 2)
+                if len(parts) == 3 and parts[1] in {"photos", "faces"}:
                     album_id = unquote(parts[0])
-                    file_name = unquote(parts[1])
-                    photo_path = BENCHMARK_DATA_ROOT / album_id / "photos" / file_name
-                    if photo_path.is_file():
-                        self._serve_file(photo_path)
+                    file_name = unquote(parts[2])
+                    media_path = BENCHMARK_DATA_ROOT / album_id / parts[1] / file_name
+                    if media_path.is_file():
+                        self._serve_file(media_path)
                         return
                 self._json({"error": "photo not found"}, 404)
                 return

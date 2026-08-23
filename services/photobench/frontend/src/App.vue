@@ -279,7 +279,8 @@ function turnScore(score) {
 }
 function albumLocalUrl(fileName) {
   const album = activeRun.value?.album_id || "";
-  return (album && fileName) ? `/api/albums/${encodeURIComponent(album)}/photos/${encodeURIComponent(fileName)}` : "";
+  const collection = /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(String(fileName || "")) ? "faces" : "photos";
+  return (album && fileName) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(fileName)}` : "";
 }
 function decorateImages(list) {
   return (list || []).map((img) => {
@@ -287,7 +288,8 @@ function decorateImages(list) {
     const parts = (img?.image_id || "").split("/");
     const file = parts.length === 2 ? parts[1] : (img?.file_name || "");
     const album = activeRun.value?.album_id || (parts.length === 2 ? parts[0] : "");
-    const local = (album && file) ? `/api/albums/${encodeURIComponent(album)}/photos/${encodeURIComponent(file)}` : "";
+    const collection = /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(file) ? "faces" : "photos";
+    const local = (album && file) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(file)}` : "";
     return local ? { ...img, media_url: local } : img;
   });
 }
