@@ -16,3 +16,4 @@ __pycache__/
 q_*.py
 /sentrix.db
 /web-*.log
+.venv-text/

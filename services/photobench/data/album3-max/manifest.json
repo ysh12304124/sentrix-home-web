@@ -470,6 +470,9 @@
     "photos/user01 (5).JPG"
   ],
   "qa_sets": {
-    "100qa-full": "qa/album3-max-100qa.jsonl"
+    "100qa-full": "qa/album3-max-100qa.jsonl",
+    "max-answerable": "qa/max-answerable.jsonl",
+    "max-clarify": "qa/max-clarify.jsonl",
+    "max-refuse": "qa/max-refuse.jsonl"
   }
 }

@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import base64
 import hashlib
@@ -60,6 +61,11 @@ CUSTOM_JUDGE_PROMPT_PATH = PROJECT_ROOT / "config/custom_judge_prompt.json"
 TASK_ACTION_POLICY_PATH = PROJECT_ROOT / "config/qa_task_actions.json"
 JUDGE_PROVIDERS_PATH = PROJECT_ROOT / "config/judge_providers.json"
 EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
+# Progress is served from the in-memory run state.  Coalesce frequent snapshots
+# so disk I/O does not become part of the Agent/Judge wall-clock measurements.
+PERSIST_DEBOUNCE_SECONDS = max(
+    0.05, float(os.environ.get("PHOTOBENCH_PERSIST_DEBOUNCE_SECONDS", "0.25"))
+)
 
 
 def _load_judge_providers():
@@ -1004,19 +1010,74 @@ class BenchmarkRun:
         self._gpu_sampler = GpuSampler(vllm_api_url, on_sample=self._persist_gpu_sample)
         self._cancel = threading.Event()
         self._phase_started_perf: dict[str, float] = {}
+        self._persist_condition = threading.Condition(self.lock)
+        self._persist_requested = 0
+        self._persist_written = 0
+        self._persist_error: Exception | None = None
+        self._persist_stopping = False
+        self._persist_thread = threading.Thread(
+            target=self._persist_loop,
+            name=f"persist-{run_id}",
+            daemon=True,
+        )
+        self._persist_thread.start()
 
     @property
     def run_dir(self) -> Path:
         return self.results_root / self.run_id
 
-    def persist(self):
-        with self.lock:
-            stored = {k: v for k, v in self.state.items()}
-            atomic_json(self.run_dir / "run.json", stored)
-            items = stored.get("items") or []
-            path = self.run_dir / "results.jsonl"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in items), encoding="utf-8")
+    def _write_persisted_snapshot(self, stored: dict) -> None:
+        atomic_json(self.run_dir / "run.json", stored)
+        items = stored.get("items") or []
+        path = self.run_dir / "results.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in items), encoding="utf-8")
+
+    def _persist_loop(self) -> None:
+        while True:
+            with self._persist_condition:
+                while self._persist_written >= self._persist_requested and not self._persist_stopping:
+                    self._persist_condition.wait()
+                if self._persist_stopping and self._persist_written >= self._persist_requested:
+                    return
+                # Coalesce progress updates arriving in the same short interval.
+                target = self._persist_requested
+                self._persist_condition.wait(timeout=PERSIST_DEBOUNCE_SECONDS)
+                target = self._persist_requested
+                stored = copy.deepcopy(self.state)
+            try:
+                self._write_persisted_snapshot(stored)
+            except Exception as exc:
+                with self._persist_condition:
+                    self._persist_error = exc
+                    self._persist_written = max(self._persist_written, target)
+                    self._persist_condition.notify_all()
+                continue
+            with self._persist_condition:
+                self._persist_written = max(self._persist_written, target)
+                self._persist_condition.notify_all()
+
+    def persist(self, wait: bool = False) -> None:
+        """Schedule a snapshot; optionally wait until this request reaches disk."""
+        with self._persist_condition:
+            if self._persist_error is not None and wait:
+                raise RuntimeError(f"benchmark state persistence failed: {self._persist_error}")
+            self._persist_requested += 1
+            target = self._persist_requested
+            self._persist_condition.notify()
+            if not wait:
+                return
+            while self._persist_written < target:
+                self._persist_condition.wait()
+            if self._persist_error is not None:
+                raise RuntimeError(f"benchmark state persistence failed: {self._persist_error}")
+
+    def _stop_persist_writer(self) -> None:
+        self.persist(wait=True)
+        with self._persist_condition:
+            self._persist_stopping = True
+            self._persist_condition.notify_all()
+        self._persist_thread.join(timeout=10)
 
     def _gpu_samples_path(self) -> Path:
         return self.run_dir / "gpu_samples.jsonl"
@@ -1043,8 +1104,7 @@ class BenchmarkRun:
             self.state["status"] = "cancelling"
         self._cancel_remote_batch(source)
         self._reclaim_vllm_after_cancel()
-        with self.lock:
-            self.persist()
+        self.persist(wait=True)
 
     def _reclaim_vllm_after_cancel(self) -> None:
         """Best-effort: terminate a vLLM instance this run started (loading or serving).
@@ -1119,7 +1179,8 @@ class BenchmarkRun:
         if self._cancel.is_set():
             self.state["status"] = "cancelled"
             self.state["finished_at"] = self.state.get("finished_at") or now_iso()
-            self.persist()
+            self.persist(wait=True)
+            self._stop_persist_writer()
             return
         self.state["started_at"] = now_iso()
         self.state["status"] = "running"
@@ -1168,7 +1229,9 @@ class BenchmarkRun:
             self.state["status"] = "cancelled"
         except Exception as e:
             if self._current_phase:
-                self._record_phase(self._current_phase, "status", "failed")
+                phase_state = self.state["phases"].get(self._current_phase) or {}
+                if phase_state.get("status") != "stalled":
+                    self._record_phase(self._current_phase, "status", "failed")
                 self._record_phase(self._current_phase, "error", str(e))
                 self._record_phase(self._current_phase, "finished_at", now_iso())
             self.state["status"] = "failed"
@@ -1184,10 +1247,10 @@ class BenchmarkRun:
                 partial.update({"status": "partial", "partial": True, "finished_at": now_iso()})
                 self.state["phases"]["gpu_metrics"] = partial
             self.state["finished_at"] = now_iso()
-            with self.lock:
-                self.persist()
+            self.persist(wait=True)
             if self.delete_scope_after_run:
                 self._cleanup_scope()
+            self._stop_persist_writer()
 
     def _cleanup_scope(self):
         """Delete the PhotoBench-created memory space after the run finishes."""
@@ -1208,8 +1271,7 @@ class BenchmarkRun:
             self.state["scope_cleanup"] = {
                 "status": "failed", "scope_id": scope_id, "error": str(exc),
             }
-        with self.lock:
-            self.persist()
+        self.persist(wait=True)
 
     # ---- Phase implementations ----
 
@@ -1549,6 +1611,12 @@ class BenchmarkRun:
         batch_data = {}
         total = 0
         processed = 0
+        try:
+            stall_timeout_seconds = max(0, int(os.getenv(
+                "PHOTOBENCH_PIPELINE_STALL_TIMEOUT_SECONDS", "1200"
+            )))
+        except ValueError:
+            stall_timeout_seconds = 1200
         while True:
             if self._cancel.is_set():
                 break
@@ -1559,11 +1627,6 @@ class BenchmarkRun:
             total = len(assets)
             processed = len([a for a in assets if a.get("status") == "processed"])
             failed = len([a for a in assets if a.get("status") == "failed"])
-            self._record_phase("pipeline_processing", "status", "running")
-            self._record_phase("pipeline_processing", "progress", {
-                "total": total, "processed": processed, "pending": len(pending), "failed": failed,
-                "poll_count": poll_count,
-            })
             batch_data = {}
             batch_id = self.state.get("batch_id")
             if batch_id:
@@ -1575,18 +1638,80 @@ class BenchmarkRun:
                         self._record_phase("pipeline_processing", "pipeline_metrics", batch_metrics)
                 except Exception:
                     batch_data = {}
-            self.persist()
             batch_status = (batch_data.get("batch") or {}).get("status")
-            if (not pending and batch_status in {"completed", "complete", "failed"}) or poll_count > 600:
+            status_counts = {}
+            for asset in assets:
+                status = str(asset.get("status") or "unknown")
+                status_counts[status] = status_counts.get(status, 0) + 1
+            # Compare each asset's state instead of only aggregate counts. Two assets
+            # can transition in opposite directions during one poll and leave the
+            # counts unchanged even though the pipeline is making progress.
+            asset_status_signature = tuple(sorted(
+                (str(asset.get("id") or asset.get("asset_id") or asset.get("path") or index),
+                 str(asset.get("status") or "unknown"))
+                for index, asset in enumerate(assets)
+            ))
+            progress_signature = (asset_status_signature, batch_status)
+            now = time.monotonic()
+            if getattr(self, "_pipeline_progress_signature", None) != progress_signature:
+                self._pipeline_progress_signature = progress_signature
+                self._pipeline_last_progress_at = now
+                self._pipeline_last_progress_wall = now_iso()
+            last_progress_at = getattr(self, "_pipeline_last_progress_at", now)
+            no_progress_seconds = max(0.0, now - last_progress_at)
+            self._record_phase("pipeline_processing", "status", "running")
+            self._record_phase("pipeline_processing", "progress", {
+                "total": total, "processed": processed, "pending": len(pending), "failed": failed,
+                "poll_count": poll_count,
+                "status_counts": status_counts,
+                "last_progress_at": getattr(self, "_pipeline_last_progress_wall", now_iso()),
+                "no_progress_seconds": round(no_progress_seconds, 1),
+            })
+            self.persist()
+            if batch_status == "failed":
+                raise RuntimeError(
+                    f"Sentrix ingest batch failed: batch={batch_id or '-'}, "
+                    f"processed={processed}/{total}, pending={len(pending)}, failed={failed}"
+                )
+            if not pending and batch_status in {"completed", "complete"}:
                 stable_polls = getattr(self, "_pipeline_stable_polls", 0) + 1
                 self._pipeline_stable_polls = stable_polls
                 # Confirm a stable zero-pending snapshot twice: asset status rows can
                 # land after the batch flips to completed (upload/pipeline overlap).
-                if stable_polls >= 2 or poll_count > 600:
+                if stable_polls >= 2:
                     break
                 self._cancel.wait(3)
                 continue
             self._pipeline_stable_polls = 0
+            batch_still_open_without_assets = (
+                total == 0 and batch_status not in {"completed", "complete", "failed"}
+            )
+            if (
+                stall_timeout_seconds > 0
+                and not batch_still_open_without_assets
+                and no_progress_seconds >= stall_timeout_seconds
+            ):
+                stall_progress = {
+                    "total": total,
+                    "processed": processed,
+                    "pending": len(pending),
+                    "failed": failed,
+                    "poll_count": poll_count,
+                    "status_counts": status_counts,
+                    "batch_status": batch_status,
+                    "last_progress_at": getattr(self, "_pipeline_last_progress_wall", None),
+                    "no_progress_seconds": round(no_progress_seconds, 1),
+                    "stall_timeout_seconds": stall_timeout_seconds,
+                }
+                self._record_phase("pipeline_processing", "status", "stalled")
+                self._record_phase("pipeline_processing", "stalled_at", now_iso())
+                self._record_phase("pipeline_processing", "stalled_progress", stall_progress)
+                self.persist()
+                raise RuntimeError(
+                    f"pipeline processing stalled: no asset status change for "
+                    f"{no_progress_seconds:.0f}s (threshold {stall_timeout_seconds}s); "
+                    f"processed={processed}/{total}, pending={len(pending)}, failed={failed}"
+                )
             if self._cancel.wait(3):
                 break
         t1 = time.perf_counter()
@@ -1616,55 +1741,169 @@ class BenchmarkRun:
 
         t0 = time.perf_counter()
         qa_concurrency = self._resolve_qa_concurrency()
+        judge_concurrency = self._resolve_judge_concurrency(qa_concurrency)
+        agent_phase_started_perf = time.perf_counter()
+        agent_phase_started_epoch = round(time.time(), 3)
         with self.lock:
             self.state["qa_concurrency"] = qa_concurrency
+            self.state["judge_concurrency"] = judge_concurrency
         total_qa = len(self.qa_rows)
+        self._qa_submitted = 0
+        self._qa_agent_completed = 0
+        self._qa_judge_submitted = 0
+        self._qa_judge_completed = 0
+        self._qa_judge_skipped = 0
+        self._record_phase("qa_eval", "agent_phase_started_at", now_iso())
+        self._record_phase("qa_eval", "agent_phase_started_at_epoch", agent_phase_started_epoch)
+        self._record_phase("qa_eval", "agent_total", total_qa)
+        self._record_phase("qa_eval", "judge_total", total_qa)
 
         def record_qa_progress():
-            done = len(self.state.get("items") or [])
-            submitted = getattr(self, "_qa_submitted", 0)
+            agent_done = getattr(self, "_qa_agent_completed", 0)
+            judge_done = getattr(self, "_qa_judge_completed", 0)
+            judge_submitted = getattr(self, "_qa_judge_submitted", 0)
             self._record_phase("qa_eval", "progress", {
-                "total": total_qa, "completed": done,
-                "in_flight": max(0, submitted - done),
+                "total": total_qa,
+                # ``completed`` remains Agent completion for old UI clients.
+                "completed": agent_done,
+                "agent_completed": agent_done,
+                "agent_total": total_qa,
+                "agent_in_flight": max(0, total_qa - agent_done),
+                "judge_completed": judge_done,
+                "judge_total": total_qa,
+                "judge_submitted": judge_submitted,
+                "judge_skipped": getattr(self, "_qa_judge_skipped", 0),
+                "judge_in_flight": max(0, judge_submitted - (judge_done - getattr(self, "_qa_judge_skipped", 0))),
                 "qa_concurrency": qa_concurrency,
+                "judge_concurrency": judge_concurrency,
             })
 
-        if qa_concurrency <= 1:
-            for row in self.qa_rows:
-                if self._cancel.is_set():
-                    break
-                item = self._evaluate_one(row, assets_by_name)
+        pool_rows = list(enumerate(self.qa_rows))
+        agent_futures = {}
+        judge_futures = {}
+        judge_phase_started_perf = None
+        judge_phase_started_epoch = None
+
+        # The Agent pool is deliberately independent from the cloud Judge pool.
+        # A completed Agent future returns immediately, releasing its model slot;
+        # its item is then queued for Judge work in the second pool.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=qa_concurrency, thread_name_prefix="qa-agent"
+        ) as agent_executor, concurrent.futures.ThreadPoolExecutor(
+            max_workers=judge_concurrency, thread_name_prefix="qa-judge"
+        ) as judge_executor:
+            agent_futures = {
+                agent_executor.submit(self._evaluate_one, row, assets_by_name): index
+                for index, row in pool_rows
+            }
+            self._qa_submitted = total_qa
+            record_qa_progress()
+
+            for future in concurrent.futures.as_completed(agent_futures):
+                index = agent_futures[future]
+                try:
+                    item = future.result()
+                    agent_failed = bool(item.get("failed")) or bool(item.get("error"))
+                except Exception as exc:
+                    item = {"index": index, "error": repr(exc), "failed": True}
+                    agent_failed = True
+                item["_index"] = index
                 with self.lock:
                     self.state["items"].append(item)
-                    self._qa_submitted = len(self.state["items"])
+                    self._qa_agent_completed += 1
                     record_qa_progress()
                     self.persist()
-        else:
-            import concurrent.futures
-            pool_rows = list(enumerate(self.qa_rows))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=qa_concurrency, thread_name_prefix="qa-eval") as executor:
-                future_map = {executor.submit(self._evaluate_one, row, assets_by_name): index
-                              for index, row in pool_rows}
-                self._qa_submitted = total_qa
-                for future in concurrent.futures.as_completed(future_map):
-                    index = future_map[future]
-                    try:
-                        item = future.result()
-                    except Exception as exc:
-                        item = {"index": index, "error": repr(exc), "failed": True}
+
+                if agent_failed:
+                    # There is no Agent answer for Judge to score. Count this
+                    # item as skipped so the two progress counters can finish.
+                    self._qa_judge_skipped += 1
+                    self._qa_judge_completed += 1
                     with self.lock:
-                        self.state["items"].append({**item, "_index": index})
                         record_qa_progress()
                         self.persist()
+                    continue
+
+                if judge_phase_started_perf is None:
+                    judge_phase_started_perf = time.perf_counter()
+                    judge_phase_started_epoch = round(time.time(), 3)
+                    self._record_phase("qa_eval", "judge_phase_started_at", now_iso())
+                    self._record_phase("qa_eval", "judge_phase_started_at_epoch", judge_phase_started_epoch)
+                item.setdefault("timing_breakdown", {}).setdefault("timeline", {})[
+                    "judge_queued_at_epoch"
+                ] = round(time.time(), 3)
+                self._qa_judge_submitted += 1
+                # Judge must not mutate the shared item while the main thread
+                # persists state. Merge its result back in the completion loop.
+                judge_item = copy.deepcopy(item)
+                judge_futures[judge_executor.submit(
+                    self._judge_item, judge_item, self.qa_rows[index], assets_by_name,
+                )] = index
+                with self.lock:
+                    record_qa_progress()
+                    self.persist()
+
+            agent_phase_finished_perf = time.perf_counter()
+            agent_phase_finished_epoch = round(time.time(), 3)
+            agent_phase_wall_ms = round((agent_phase_finished_perf - agent_phase_started_perf) * 1000, 1)
+            self._record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+            self._record_phase("qa_eval", "agent_phase_finished_at_epoch", agent_phase_finished_epoch)
+            self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
+            self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
+            self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
+            self._gpu_sampler.stop()
+
+            for future in concurrent.futures.as_completed(judge_futures):
+                index = judge_futures[future]
+                try:
+                    judged_item = future.result()
+                    with self.lock:
+                        item = next((candidate for candidate in self.state["items"]
+                                     if candidate.get("_index") == index), None)
+                        if item is not None and isinstance(judged_item, dict):
+                            item.update({
+                                key: value for key, value in judged_item.items()
+                                if key != "_index"
+                            })
+                except Exception as exc:
+                    with self.lock:
+                        item = next((candidate for candidate in self.state["items"]
+                                     if candidate.get("_index") == index), None)
+                        if item is not None:
+                            item.update({
+                                "judge": {"score": None, "reason": f"judge_error: {exc}"},
+                                "task_judge": {"actual_action": None, "correct": None,
+                                                "reason": f"judge_error: {exc}"},
+                                "evidence_judge": {"score": None, "reason": "judge_error"},
+                                "judge_status": "failed",
+                            })
+                self._qa_judge_completed += 1
+                with self.lock:
+                    record_qa_progress()
+                    self.persist()
+
+            if judge_phase_started_perf is not None:
+                judge_phase_finished_perf = time.perf_counter()
+                judge_phase_finished_epoch = round(time.time(), 3)
+                judge_phase_wall_ms = round((judge_phase_finished_perf - judge_phase_started_perf) * 1000, 1)
+                self._record_phase("qa_eval", "judge_phase_finished_at", now_iso())
+                self._record_phase("qa_eval", "judge_phase_finished_at_epoch", judge_phase_finished_epoch)
+                self._record_phase("qa_eval", "judge_phase_total_seconds", round(judge_phase_wall_ms / 1000, 3))
+                self._record_phase("qa_eval", "judge_phase_wall_ms", judge_phase_wall_ms)
+
             with self.lock:
                 self.state["items"].sort(key=lambda it: it.get("_index", 0))
                 for it in self.state["items"]:
                     it.pop("_index", None)
+                record_qa_progress()
                 self.persist()
 
         t1 = time.perf_counter()
-        self._gpu_sampler.stop()
-        self._phase_done("qa_eval", {"total_seconds": round(t1 - t0, 1), "qa_concurrency": qa_concurrency})
+        self._phase_done("qa_eval", {
+            "total_seconds": round(t1 - t0, 1),
+            "qa_concurrency": qa_concurrency,
+            "judge_concurrency": judge_concurrency,
+        })
 
     def _resolve_qa_concurrency(self) -> int:
         """QA-level concurrency: default follows the serving model's max_num_seqs snapshot."""
@@ -1679,6 +1918,17 @@ class BenchmarkRun:
             return max(1, int(snapshot.get("max_num_seqs") or 1))
         except Exception:
             return 1
+
+    @staticmethod
+    def _resolve_judge_concurrency(qa_concurrency: int) -> int:
+        """Judge uses a separate cloud-API pool and never consumes Agent slots."""
+        env_value = str(os.getenv("PHOTOBENCH_JUDGE_CONCURRENCY") or "").strip()
+        if env_value:
+            try:
+                return max(1, int(env_value))
+            except ValueError:
+                pass
+        return max(1, int(qa_concurrency or 1))
 
     def _evaluate_one(self, row: dict, assets_by_name: dict) -> dict:
         t0 = time.perf_counter()
@@ -1756,6 +2006,7 @@ class BenchmarkRun:
                 call_metrics,
             )
             tool_trace = self._attach_tool_observations(tool_trace, all_tool_observations)
+            call_metrics, tool_trace = self._annotate_agent_loop_timings(call_metrics, tool_trace)
             answer = str(resp.get("answer") or "")
 
             # Extract predicted images — recursive walk to catch any nesting
@@ -1782,86 +2033,16 @@ class BenchmarkRun:
                     "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous",
                 })
 
-            # Judges consume distinct evidence: answer quality uses the reference;
-            # evidence grounding uses only this turn's retrieved images.
-            t_judge0 = time.perf_counter()
-            timeline["judge_started_at_epoch"] = round(time.time(), 3)
-            for index, record in enumerate(turn_records):
-                expected = record.get("expected_action")
-                turn_definition = (conversation[index]
-                                   if index < len(conversation) and isinstance(conversation[index], dict)
-                                   else {})
-                turn_reference = str(turn_definition.get("reference_answer") or "")
-                if not turn_reference:
-                    turn_reference = (
-                        "应要求用户提供至少一个具体、可用于后续检索的锚点；询问形式不限。"
-                        if expected == "clarify" else reference
-                    )
-                conv_ctx = turn_records[:index + 1]
-                record["task_judge"] = self._judge_task_action(
-                    record["message"], record["answer"], expected,
-                    record["agent_status"], record["termination_reason"],
-                    task_type=row.get("task_type"),
-                    question_type=row.get("question_type"),
-                    answerability=row.get("answerability"),
-                    reference=turn_reference,
-                    conversation=conv_ctx,
-                )
-                # Run answer-quality and evidence judges concurrently
-                should_judge_evidence = (
-                    EVIDENCE_JUDGE_ENABLED
-                    and record.get("predicted_images") and record.get("answer")
-                    and record["task_judge"].get("actual_action") != "clarify"
-                )
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                    quality_future = pool.submit(
-                        self._judge, record["message"], turn_reference, record["answer"],
-                        expected_action=expected,
-                        task_type=row.get("task_type"),
-                        question_type=row.get("question_type"),
-                        answerability=row.get("answerability"),
-                        conversation=conv_ctx,
-                    ) if expected in ANSWER_QUALITY_RUBRICS else None
-                    evidence_future = pool.submit(
-                        self._judge_evidence,
-                        record["message"], record["answer"],
-                        record.get("predicted_images") or [],
-                        assets_by_name, self.sentrix_url, conversation=conv_ctx,
-                    ) if should_judge_evidence else None
-                record["judge"] = quality_future.result() if quality_future else {"score": None, "reason": "not_labeled"}
-                record["evidence_judge"] = evidence_future.result() if evidence_future else {"score": None, "reason": "not_applicable"}
-            task_judges = [record["task_judge"] for record in turn_records]
-            task_judge = task_judges[-1] if task_judges else {"actual_action": None, "correct": None}
-            judge = turn_records[-1]["judge"] if turn_records else {"score": None, "reason": "not_applicable"}
-            evidence_judge = turn_records[-1]["evidence_judge"] if turn_records else {"score": None, "reason": "not_applicable"}
-            judge_ms = round((time.perf_counter() - t_judge0) * 1000, 1)
-            timeline["judge_finished_at_epoch"] = round(time.time(), 3)
-
-            # Aggregate LLM metrics from call_metrics
+            # Agent phase ends before any Judge request starts.  Judge is queued
+            # by _phase_qa_eval in a separate executor after this item returns.
+            timeline["agent_finished_at_epoch"] = round(time.time(), 3)
+            timeline["agent_finished_at"] = now_iso()
             llm_summary = self._summarize_call_metrics(call_metrics)
-            wall_clock_ms = round((time.perf_counter() - t0) * 1000, 1)
-            model_ms = llm_summary.get("total_ms_sum") if llm_summary else None
-            tool_ms = None
-            if tool_trace_present:
-                tool_ms = round(sum(
-                    float(trace.get("latency_s") or 0) * 1000
-                    for trace in tool_trace if isinstance(trace, dict)
-                ), 1)
-            attributed = sum(value for value in (model_ms, tool_ms, judge_ms) if value is not None)
-            timing_breakdown = {
-                "wall_clock_ms": wall_clock_ms,
-                "timeline": timeline,
-                "agent_wall_ms": agent_wall_ms,
-                "model_ms": model_ms,
-                "tool_ms": tool_ms,
-                "judge_ms": judge_ms,
-                "other_ms": round(max(0.0, wall_clock_ms - attributed), 1)
-                    if tool_trace_present else None,
-                "agent_overhead_ms": round(max(0.0, agent_wall_ms - (model_ms or 0) - (tool_ms or 0)), 1)
-                    if tool_trace_present else None,
-                "orchestrator_overhead_ms": round(max(0.0, wall_clock_ms - agent_wall_ms - judge_ms), 1),
-                "tool_trace_recorded": tool_trace_present,
-            }
+            wall_clock_ms = agent_wall_ms
+            timing_breakdown = self._build_timing_breakdown(
+                call_metrics, tool_trace, wall_clock_ms, agent_wall_ms, None,
+                timeline, tool_trace_present,
+            )
 
             item.update({
                 "answer": answer, "predicted_images": predicted_image_records,
@@ -1869,13 +2050,14 @@ class BenchmarkRun:
                 "matched_file_names": matched, "retrieval_recall": recall,
                 "retrieval_precision": precision, "retrieval_f1": f1,
                 "gt_images": gt_images,
-                "judge": judge, "task_judge": task_judge,
-                "task_judges": task_judges, "conversation": turn_records if conversation else [],
+                "judge": {"score": None, "reason": "pending_judge"},
+                "task_judge": {"actual_action": None, "correct": None, "reason": "pending_judge"},
+                "task_judges": [], "conversation": turn_records if conversation else [],
                 "runtime_turns": turn_records,
                 "conversation_id": conversation_id if conversation else None,
                 "conversation_turn_count": len(turn_records) if conversation else 1,
                 "conversation_context_mode": "shared_conversation_id" if conversation else "single_turn",
-                "evidence_judge": evidence_judge, "judge_ms": judge_ms,
+                "evidence_judge": {"score": None, "reason": "pending_judge"}, "judge_ms": None,
                 "wall_clock_ms": wall_clock_ms,
                 "model_call_metrics": call_metrics,
                 "execution_trace": execution_trace,
@@ -1891,6 +2073,8 @@ class BenchmarkRun:
                 "answer_grounding": resp.get("answer_grounding") or resp.get("answerGrounding") or {},
                 "agent2_trace": summarize_agent2_trace(turn_records),
                 "timing_breakdown": timing_breakdown,
+                "tool_trace_recorded": tool_trace_present,
+                "judge_status": "pending",
             })
             item["delivery_status"] = resp.get("delivery_status") or {}
             item["agent_stability"] = self._agent_stability(item)
@@ -1900,6 +2084,99 @@ class BenchmarkRun:
                          "retrieval_precision": None, "retrieval_f1": None,
                          "judge": {"score": None, "reason": "error"},
                          "wall_clock_ms": round((time.perf_counter() - t0) * 1000, 1)})
+        return item
+
+    def _judge_item(self, item: dict, row: dict, assets_by_name: dict) -> dict:
+        """Score one completed Agent answer in the independent Judge pool."""
+        t_judge0 = time.perf_counter()
+        timing = item.get("timing_breakdown") or {}
+        timeline = dict(timing.get("timeline") or {})
+        judge_started_epoch = round(time.time(), 3)
+        timeline["judge_started_at_epoch"] = judge_started_epoch
+        timeline["judge_started_at"] = now_iso()
+        queued_epoch = timeline.get("judge_queued_at_epoch")
+        if isinstance(queued_epoch, (int, float)):
+            timeline["judge_queue_wait_ms"] = round(max(0.0, judge_started_epoch - queued_epoch) * 1000, 1)
+
+        conversation = row.get("conversation") or []
+        reference = str(item.get("reference_answer") or row.get("answer") or "")
+        turn_records = item.get("runtime_turns") or []
+        for index, record in enumerate(turn_records):
+            expected = record.get("expected_action")
+            turn_definition = (conversation[index]
+                               if index < len(conversation) and isinstance(conversation[index], dict)
+                               else {})
+            turn_reference = str(turn_definition.get("reference_answer") or "")
+            if not turn_reference:
+                turn_reference = (
+                    "应要求用户提供至少一个具体、可用于后续检索的锚点；询问形式不限。"
+                    if expected == "clarify" else reference
+                )
+            conv_ctx = turn_records[:index + 1]
+            record["task_judge"] = self._judge_task_action(
+                record["message"], record["answer"], expected,
+                record.get("agent_status"), record.get("termination_reason"),
+                task_type=row.get("task_type"),
+                question_type=row.get("question_type"),
+                answerability=row.get("answerability"),
+                reference=turn_reference,
+                conversation=conv_ctx,
+            )
+            # Answer quality and evidence calls for the same turn remain parallel.
+            should_judge_evidence = (
+                EVIDENCE_JUDGE_ENABLED
+                and record.get("predicted_images") and record.get("answer")
+                and record["task_judge"].get("actual_action") != "clarify"
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                quality_future = pool.submit(
+                    self._judge, record["message"], turn_reference, record["answer"],
+                    expected_action=expected,
+                    task_type=row.get("task_type"),
+                    question_type=row.get("question_type"),
+                    answerability=row.get("answerability"),
+                    conversation=conv_ctx,
+                ) if expected in ANSWER_QUALITY_RUBRICS else None
+                evidence_future = pool.submit(
+                    self._judge_evidence,
+                    record["message"], record["answer"],
+                    record.get("predicted_images") or [],
+                    assets_by_name, self.sentrix_url, conversation=conv_ctx,
+                ) if should_judge_evidence else None
+            record["judge"] = quality_future.result() if quality_future else {"score": None, "reason": "not_labeled"}
+            record["evidence_judge"] = evidence_future.result() if evidence_future else {"score": None, "reason": "not_applicable"}
+
+        task_judges = [record.get("task_judge") or {} for record in turn_records]
+        task_judge = task_judges[-1] if task_judges else {"actual_action": None, "correct": None}
+        judge = turn_records[-1].get("judge") if turn_records else {"score": None, "reason": "not_applicable"}
+        evidence_judge = turn_records[-1].get("evidence_judge") if turn_records else {"score": None, "reason": "not_applicable"}
+        judge_ms = round((time.perf_counter() - t_judge0) * 1000, 1)
+        judge_finished_epoch = round(time.time(), 3)
+        timeline["judge_finished_at_epoch"] = judge_finished_epoch
+        timeline["judge_finished_at"] = now_iso()
+        queue_wait_ms = timeline.get("judge_queue_wait_ms")
+        if not isinstance(queue_wait_ms, (int, float)):
+            queue_wait_ms = 0.0
+        agent_wall_ms = self._numeric_ms(timing.get("agent_wall_ms")) or 0.0
+        wall_clock_ms = round(agent_wall_ms + queue_wait_ms + judge_ms, 1)
+        call_metrics = item.get("model_call_metrics") or []
+        tool_trace = item.get("tool_trace") or []
+        timing_breakdown = self._build_timing_breakdown(
+            call_metrics, tool_trace, wall_clock_ms, agent_wall_ms, judge_ms,
+            timeline, bool(item.get("tool_trace_recorded")), queue_wait_ms,
+        )
+        item.update({
+            "judge": judge or {"score": None, "reason": "not_applicable"},
+            "task_judge": task_judge,
+            "task_judges": task_judges,
+            "evidence_judge": evidence_judge or {"score": None, "reason": "not_applicable"},
+            "judge_ms": judge_ms,
+            "wall_clock_ms": wall_clock_ms,
+            "judge_status": "completed",
+            "timing_breakdown": timing_breakdown,
+        })
+        item["agent_stability"] = self._agent_stability(item)
+        item["attribution"] = self._derive_attribution(item)
         return item
 
     @staticmethod
@@ -1923,6 +2200,137 @@ class BenchmarkRun:
         }
 
     @staticmethod
+    def _numeric_ms(value) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
+    @classmethod
+    def _annotate_agent_loop_timings(cls, model_calls: list, tool_trace: list) -> tuple[list[dict], list[dict]]:
+        """Record model + child-tool duration without flattening nested work.
+
+        ``total_ms`` remains the raw model request duration.  The new
+        ``agent_loop_total_ms`` is the end-to-end duration for that model round
+        plus directly attached tools.  Tool-internal model calls stay nested in
+        their parent tool and are not added as another top-level loop.
+        """
+        calls = [dict(call) for call in model_calls if isinstance(call, dict)]
+        tools = [dict(trace) for trace in tool_trace if isinstance(trace, dict)]
+        by_call: dict[int, list[dict]] = {}
+        for trace in tools:
+            try:
+                index = int(trace.get("model_call_index"))
+            except (TypeError, ValueError):
+                continue
+            duration_ms = cls._numeric_ms(trace.get("duration_ms"))
+            if duration_ms is None:
+                latency_s = cls._numeric_ms(trace.get("latency_s"))
+                duration_ms = latency_s * 1000 if latency_s is not None else None
+            if duration_ms is not None:
+                trace["duration_ms"] = round(duration_ms, 1)
+            by_call.setdefault(index, []).append(trace)
+
+        for index, call in enumerate(calls):
+            model_ms = cls._numeric_ms(call.get("total_ms"))
+            if model_ms is None:
+                continue
+            ttft_ms = cls._numeric_ms(call.get("ttft_ms"))
+            child_tools = by_call.get(index, [])
+            tool_ms = round(sum(float(tool.get("duration_ms") or 0) for tool in child_tools), 1)
+            generation_ms = round(max(0.0, model_ms - (ttft_ms or 0)), 1) if ttft_ms is not None else model_ms
+            call["agent_loop_total_ms"] = round(model_ms + tool_ms, 1)
+            call["agent_loop_timing"] = {
+                "model_ms": round(model_ms, 1),
+                "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+                "model_generation_ms": generation_ms,
+                "tool_ms": tool_ms if child_tools else 0.0,
+                "tool_count": len(child_tools),
+                "tools": [
+                    {"tool": tool.get("tool") or "未知工具", "duration_ms": tool.get("duration_ms")}
+                    for tool in child_tools
+                ],
+            }
+        return calls, tools
+
+    @classmethod
+    def _build_timing_breakdown(cls, model_calls: list, tool_trace: list,
+                                wall_clock_ms: float, agent_wall_ms: float,
+                                judge_ms: float, timeline: dict,
+                                tool_trace_present: bool,
+                                judge_queue_wait_ms: float = 0.0) -> dict:
+        """Build the two-level latency contract used by the UI.
+
+        QA children are Agent Loops, Judge, and residual overhead.  Each Agent
+        Loop exposes TTFT, model generation, and direct child tools.  A tool's
+        own latency already includes any nested work, so nested model calls are
+        intentionally excluded from the QA-level children.
+        """
+        loops = []
+        total_tool_ms = 0.0
+        for index, call in enumerate(model_calls):
+            call_type = str(call.get("call_type") or "agent")
+            if call_type in {"tool_internal", "faithfulness_judge"}:
+                continue
+            loop_ms = cls._numeric_ms(call.get("agent_loop_total_ms"))
+            model_ms = cls._numeric_ms(call.get("total_ms"))
+            if loop_ms is None or model_ms is None:
+                continue
+            timing = call.get("agent_loop_timing") or {}
+            tool_ms = cls._numeric_ms(timing.get("tool_ms")) or 0.0
+            total_tool_ms += tool_ms
+            observation = call.get("call_observation") or {}
+            label = observation.get("label") or {
+                "planner": "Agent 2.0 目标分解与规划",
+                "agent": "Agent 决策 / 回答",
+                "recovery": "Agent 恢复调用",
+                "writer": "最终回答重写",
+            }.get(call_type, call_type)
+            loops.append({
+                "index": index,
+                "label": label,
+                "call_type": call_type,
+                "step_id": call.get("step_id"),
+                "conversation_turn": call.get("conversation_turn"),
+                "duration_ms": loop_ms,
+                "model_ms": round(model_ms, 1),
+                "ttft_ms": timing.get("ttft_ms"),
+                "model_generation_ms": timing.get("model_generation_ms"),
+                "tool_ms": tool_ms,
+                "tool_count": timing.get("tool_count", 0),
+            })
+        loop_sum_ms = round(sum(float(loop["duration_ms"]) for loop in loops), 1)
+        agent_overhead_ms = round(max(0.0, agent_wall_ms - loop_sum_ms), 1)
+        judge_value = cls._numeric_ms(judge_ms)
+        queue_value = cls._numeric_ms(judge_queue_wait_ms) or 0.0
+        other_ms = round(max(0.0, wall_clock_ms - loop_sum_ms - (judge_value or 0) - queue_value), 1)
+        model_ms = round(sum(float(loop["model_ms"]) for loop in loops), 1) if loops else None
+        tool_ms = round(total_tool_ms, 1) if tool_trace_present else None
+        return {
+            "wall_clock_ms": wall_clock_ms,
+            "timeline": timeline,
+            "agent_wall_ms": agent_wall_ms,
+            "model_ms": model_ms,
+            "tool_ms": tool_ms,
+            "judge_ms": judge_value,
+            "judge_queue_wait_ms": queue_value if queue_value > 0 else None,
+            "other_ms": other_ms if tool_trace_present else None,
+            "agent_overhead_ms": agent_overhead_ms if tool_trace_present else None,
+            "orchestrator_overhead_ms": round(max(0.0, wall_clock_ms - agent_wall_ms - queue_value - (judge_value or 0)), 1),
+            "tool_trace_recorded": tool_trace_present,
+            "agent_loop_timing_recorded": bool(loops),
+            "agent_loops": loops,
+            "agent_loop_sum_ms": loop_sum_ms if loops else None,
+            "qa_components": ([
+                *[{"kind": "agent_loop", **loop} for loop in loops],
+                *([{"kind": "judge", "label": "Judge", "duration_ms": judge_value}] if judge_value else []),
+                *([{"kind": "judge_queue", "label": "Judge 排队 / 编排", "duration_ms": queue_value}] if queue_value > 0 else []),
+                *([{"kind": "other", "label": "其他", "duration_ms": other_ms}] if other_ms > 0 else []),
+            ] if loops else []),
+        }
+
+    @staticmethod
     def _bind_tool_calls_to_model_rounds(tool_trace: list, retrieval_trace: list,
                                          model_calls: list | int | None = None) -> list[dict]:
         """Attach tools by step ID first, with ordered fallback for historical runs."""
@@ -1938,6 +2346,7 @@ class BenchmarkRun:
                 continue
             key = (call.get("conversation_turn"), str(call.get("step_id")))
             call_index_by_step[key] = index
+            call_index_by_step[("any", str(call.get("step_id")))] = index
         for trace in bound:
             parent_step_id = trace.get("parent_step_id")
             key = (trace.get("conversation_turn"), str(parent_step_id))
@@ -1951,18 +2360,37 @@ class BenchmarkRun:
                         trace["model_call_index"] = 0
                         trace["round_binding_source"] = "inferred_single_model_call"
             return bound
-        model_index = -1
+        model_index = None
+        ordered_call_index = 0
         tool_index = 0
         for step in retrieval_trace:
             if not isinstance(step, dict):
                 continue
             stage = step.get("stage") or step.get("type")
-            if stage == "model":
-                model_index += 1
+            step_id = step.get("step_id")
+            step_key = (step.get("conversation_turn"), str(step_id))
+            mapped_index = call_index_by_step.get(step_key)
+            if mapped_index is None:
+                mapped_index = call_index_by_step.get(("any", str(step_id)))
+            if stage in {"planner", "model", "writer", "judge"}:
+                if mapped_index is not None:
+                    model_index = mapped_index
+                    ordered_call_index = max(ordered_call_index, mapped_index + 1)
+                elif ordered_call_index < model_call_count:
+                    model_index = ordered_call_index
+                    ordered_call_index += 1
             elif stage == "tool" and tool_index < len(bound):
-                if model_index >= 0 and bound[tool_index].get("model_call_index") is None:
+                if model_index is not None and model_index >= 0 and bound[tool_index].get("model_call_index") is None:
                     bound[tool_index]["model_call_index"] = model_index
                     bound[tool_index]["round_binding_source"] = "retrieval_trace"
+                    if step.get("parent_step_id") is not None:
+                        bound[tool_index]["parent_step_id"] = step.get("parent_step_id")
+                elif model_index is not None and model_index >= 0 and step.get("parent_step_id") is not None:
+                    # The execution trace is authoritative when older Sentrix
+                    # responses carried a stale positional model_call_index.
+                    bound[tool_index]["model_call_index"] = model_index
+                    bound[tool_index]["round_binding_source"] = "retrieval_trace_parent"
+                    bound[tool_index]["parent_step_id"] = step.get("parent_step_id")
                 tool_index += 1
         if model_call_count == 1:
             for trace in bound:
@@ -2523,7 +2951,7 @@ class BenchmarkRun:
             "llm_context_tokens_p95": nearest_rank_percentile(context_tokens, 0.95),
             "llm_context_samples_count": len(context_tokens),
         }
-        summary.update(self._capability_summary(items))
+        summary.update(self._capability_summary(items, self.state.get("phases") or {}))
         summary["benchmark_e2e_latency_excluding_judge_ms"] = self._benchmark_e2e_latency_excluding_judge_ms(
             self.state.get("phases") or {}, items,
         )
@@ -2531,7 +2959,7 @@ class BenchmarkRun:
         self._phase_done("aggregate", {"summary": summary})
 
     @classmethod
-    def _capability_summary(cls, items: list[dict]) -> dict:
+    def _capability_summary(cls, items: list[dict], phases: dict | None = None) -> dict:
         # Canonical metric: per-qa_id, take the final (item-level) judge only.
         # Multi-turn conversation items used to be flattened into one judge per
         # turn, inflating the denominator beyond the number of questions.
@@ -2563,11 +2991,17 @@ class BenchmarkRun:
         judge_times = [float((item.get("timing_breakdown") or {}).get("judge_ms"))
                        for item in items
                        if isinstance((item.get("timing_breakdown") or {}).get("judge_ms"), (int, float))]
-        # Pure-agent throughput: (QA wall clock - judge-exclusive wall time) / N.
-        # Judge intervals from concurrent items overlap agent work; only the
-        # union of judge intervals actually excludes agent execution time.
+        # New runs record the real Agent-only phase wall clock.  This is the
+        # concurrency throughput metric: Agent phase wall / number of QA items.
+        # It must not be reconstructed by subtracting Judge intervals, because
+        # cloud Judge calls can overlap other Agent requests.
         judge_exclusive_ms = None
         agent_throughput_ms = None
+        agent_throughput_mode = "historical_interval_estimate"
+        agent_phase_wall_ms = cls._numeric_ms((phases or {}).get("qa_eval", {}).get("agent_phase_wall_ms"))
+        agent_phase_count = (phases or {}).get("qa_eval", {}).get("agent_completed")
+        if not isinstance(agent_phase_count, int) or agent_phase_count <= 0:
+            agent_phase_count = len(items)
         timelines = [(item.get("timing_breakdown") or {}).get("timeline") or {} for item in items]
         spans = [(tl.get("started_at_epoch"), tl.get("judge_started_at_epoch"), tl.get("judge_finished_at_epoch")) for tl in timelines]
         ends = []
@@ -2575,11 +3009,23 @@ class BenchmarkRun:
             wall_ms = (item.get("timing_breakdown") or {}).get("wall_clock_ms")
             if isinstance(s[0], (int, float)) and isinstance(wall_ms, (int, float)):
                 ends.append(s[0] + float(wall_ms) / 1000)
-        if spans and all(isinstance(s[0], (int, float)) for s in spans):
-            wall_start = min(s[0] for s in spans)
+        phase = (phases or {}).get("qa_eval") or {}
+        try:
+            phase_start = datetime.fromisoformat(str(phase.get("started_at"))).timestamp()
+            phase_end = datetime.fromisoformat(str(phase.get("finished_at"))).timestamp()
+        except (TypeError, ValueError, OSError):
+            phase_start = phase_end = None
+        valid_item_spans = [s for s in spans if isinstance(s[0], (int, float))]
+        if phase_end is not None and phase_start is not None and phase_end > phase_start:
+            wall_start, wall_end = phase_start, phase_end
+        elif valid_item_spans and ends:
+            wall_start = min(s[0] for s in valid_item_spans)
             wall_end = max(e for e in ends if isinstance(e, (int, float)))
-            judge_spans = sorted((s[1], s[2]) for s in spans
-                                 if isinstance(s[1], (int, float)) and isinstance(s[2], (int, float)) and s[2] > s[1])
+        else:
+            wall_start = wall_end = None
+        judge_spans = sorted((s[1], s[2]) for s in spans
+                             if isinstance(s[1], (int, float)) and isinstance(s[2], (int, float)) and s[2] > s[1])
+        if wall_start is not None and wall_end is not None and judge_spans:
             merged: list[list[float]] = []
             for a, b in judge_spans:
                 if merged and a <= merged[-1][1]:
@@ -2587,8 +3033,15 @@ class BenchmarkRun:
                 else:
                     merged.append([a, b])
             judge_exclusive_ms = round(sum(b - a for a, b in merged) * 1000, 1)
-            if wall_end > wall_start and items:
-                agent_throughput_ms = round(((wall_end - wall_start) * 1000 - judge_exclusive_ms) / len(items), 1)
+        if agent_phase_wall_ms is not None and agent_phase_wall_ms > 0 and agent_phase_count > 0:
+            agent_throughput_ms = round(agent_phase_wall_ms / agent_phase_count, 1)
+            agent_throughput_mode = "measured_agent_phase"
+        elif wall_start is not None and wall_end is not None and judge_spans and items:
+            # Compatibility fallback for old runs that had no Agent/Judge
+            # boundary.  Keep it explicitly marked as an estimate.
+            agent_throughput_ms = round(max(0.0, (wall_end - wall_start) * 1000 - (judge_exclusive_ms or 0)) / len(items), 1)
+        judge_phase = (phases or {}).get("qa_eval") or {}
+        judge_phase_wall_ms = cls._numeric_ms(judge_phase.get("judge_phase_wall_ms"))
         agent_wall_times = [float((item.get("timing_breakdown") or {}).get("agent_wall_ms"))
                             for item in items
                             if isinstance((item.get("timing_breakdown") or {}).get("agent_wall_ms"), (int, float))]
@@ -2630,7 +3083,16 @@ class BenchmarkRun:
             "judge_llm_latency_mean_ms": round(sum(judge_times) / len(judge_times), 1)
                 if judge_times else None,
             "judge_exclusive_wall_ms": judge_exclusive_ms,
+            "judge_phase_wall_ms": judge_phase_wall_ms,
+            "judge_concurrency": judge_phase.get("judge_concurrency"),
             "agent_throughput_latency_ms": agent_throughput_ms,
+            "agent_throughput_latency_mode": agent_throughput_mode,
+            "agent_phase_wall_ms": agent_phase_wall_ms,
+            "agent_phase_completed_count": agent_phase_count if agent_phase_wall_ms is not None else None,
+            "agent_throughput_qa_per_s": round(1000 * agent_phase_count / agent_phase_wall_ms, 3)
+                if agent_phase_wall_ms and agent_phase_count else None,
+            "agent_throughput_latency_sample_count": agent_phase_count if agent_phase_wall_ms is not None else len(judge_spans),
+            "agent_throughput_latency_total_count": len(items),
             "agent_loop_calls_mean": round(sum(agent_loop_counts) / len(agent_loop_counts), 3)
                 if agent_loop_counts else None,
             "agent2_trace": summarize_agent2_trace([
@@ -2640,15 +3102,22 @@ class BenchmarkRun:
 
     @staticmethod
     def _benchmark_e2e_latency_excluding_judge_ms(phases: dict, items: list[dict]) -> float | None:
-        """Wall time from data import through QA completion, excluding Judge calls."""
+        """Wall time from data import through Agent completion, excluding Judge.
+
+        New runs have an explicit Agent phase boundary.  Only historical runs
+        without that boundary use the old per-item subtraction fallback.
+        """
         started_at = (phases.get("identity_seed") or {}).get("started_at")
-        finished_at = (phases.get("qa_eval") or {}).get("finished_at")
+        qa_phase = phases.get("qa_eval") or {}
+        finished_at = qa_phase.get("agent_phase_finished_at") or qa_phase.get("finished_at")
         if not started_at or not finished_at:
             return None
         try:
             wall_ms = (datetime.fromisoformat(str(finished_at)) - datetime.fromisoformat(str(started_at))).total_seconds() * 1000
         except (TypeError, ValueError):
             return None
+        if qa_phase.get("agent_phase_finished_at"):
+            return round(max(0.0, wall_ms), 1)
         judge_values = [(item.get("timing_breakdown") or {}).get("judge_ms") for item in items]
         if items and not all(isinstance(value, (int, float)) for value in judge_values):
             return None
@@ -3329,7 +3798,7 @@ class OrchestratorRepository:
             "attribution": {"primary": attribution_primary, "layer_failures": attribution_layers},
             "delivery_breakdown": saved.get("delivery_breakdown", cls._aggregate_delivery(items)),
         })
-        for key, value in BenchmarkRun._capability_summary(items).items():
+        for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
             if saved.get(key) is None:
                 saved[key] = value
         if saved.get("benchmark_e2e_latency_excluding_judge_ms") is None:
@@ -3438,7 +3907,7 @@ class OrchestratorRepository:
                 else (round(sum(recalls) / len(recalls), 3) if recalls else None),
             "answer_quality_mean": round(sum(scores) / len(scores), 3) if scores else None,
         })
-        for key, value in BenchmarkRun._capability_summary(items).items():
+        for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
             if saved.get(key) is None:
                 saved[key] = value
         return saved
@@ -3564,7 +4033,7 @@ class OrchestratorRepository:
             "exact_accuracy": round(distribution["2"] / denom, 3) if denom else None,
             "core_accuracy": round((distribution["1"] + distribution["2"]) / denom, 3) if denom else None,
         })
-        summary.update(BenchmarkRun._capability_summary(items))
+        summary.update(BenchmarkRun._capability_summary(items, state.get("phases") or {}))
         state["summary"] = summary
         aggregate = (state.get("phases") or {}).get("aggregate")
         if aggregate:

@@ -38,6 +38,21 @@ class IngestionPipeline:
         from .video import VideoMemoryAdapter
         self.video_memory_adapter = VideoMemoryAdapter()
 
+    def _text_embed(self, text: str):
+        """文本嵌入：SENTRIX_TEXT_EMBEDDER=bge 时走 bge sidecar，否则 clip。返回 (vector, model_name)。"""
+        if os.getenv("SENTRIX_TEXT_EMBEDDER", "clip").strip().lower() == "bge":
+            try:
+                import httpx
+                url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
+                resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=15)
+                resp.raise_for_status()
+                vec = (resp.json() or {}).get("vector")
+                if vec:
+                    return vec, os.getenv("SENTRIX_TEXT_EMBED_MODEL", "BAAI/bge-m3")
+            except Exception:
+                pass
+        return self.clip.embed_text(str(text)), self.clip.model_name
+
     def prepare_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
         """Prepare file metadata without mutating SQLite.
 
@@ -216,10 +231,10 @@ class IngestionPipeline:
             )
             fact_text = " ".join(f"{item.get('subject', '')} {item.get('predicate', '')} {item.get('object', '')}" for item in result.get("facts", []))
             clothing_text = " ".join(str(item) for item in (observation.get("clothing") or []))
-            text_embedding = self.clip.embed_text(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text])))
-            self.store.upsert_vector("episodic", "observation", observation["id"], text_embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event["id"]})
-            self.store.upsert_vector("episodic", "event", event["id"], text_embedding, self.clip.model_name, {"observation_id": observation["id"]})
-            self.store.upsert_vector("semantic", "observation", observation["id"], text_embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event["id"]})
+            text_embedding, text_model = self._text_embed(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text])))
+            self.store.upsert_vector("episodic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
+            self.store.upsert_vector("episodic", "event", event["id"], text_embedding, text_model, {"observation_id": observation["id"]})
+            self.store.upsert_vector("semantic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
             fact_ids = []
             scope_id = observation.get("scope_id") or (self.store.get_asset(asset_id) or {}).get("scope_id")
             for fact in result.get("facts", []):
@@ -398,11 +413,12 @@ class IngestionPipeline:
         object_text = " ".join(object_text(item) for item in objects)
         text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text]))
         embedding_started = time.perf_counter()
-        embedding = self.clip.embed_text(text)
+        embedding, embedding_model = self._text_embed(text)
         embedding_seconds = time.perf_counter() - embedding_started
         return {
             "analysis": analysis,
             "embedding": embedding,
+            "embedding_model": embedding_model,
             "timings": {
                 "vlm_image_description_seconds": round(vision_seconds, 4),
                 "text_embedding_seconds": round(embedding_seconds, 4),
@@ -435,11 +451,12 @@ class IngestionPipeline:
         entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation_id, event_id)]
         entity_maintenance_seconds = time.perf_counter() - step_started
         embedding = prepared["embedding"]
+        embedding_model = prepared.get("embedding_model") or self.clip.model_name
         step_started = time.perf_counter()
-        self.store.upsert_vector("episodic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
-        self.store.upsert_vector("semantic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
+        self.store.upsert_vector("episodic", "observation", observation_id, embedding, embedding_model, {"asset_id": asset_id, "event_id": event_id})
+        self.store.upsert_vector("semantic", "observation", observation_id, embedding, embedding_model, {"asset_id": asset_id, "event_id": event_id})
         if event_id:
-            self.store.upsert_vector("episodic", "event", event_id, embedding, self.clip.model_name, {"observation_id": observation_id})
+            self.store.upsert_vector("episodic", "event", event_id, embedding, embedding_model, {"observation_id": observation_id})
             # Fast-path events keep placeholder place ("其他或不确定"); sync the
             # visual place after enrichment so later participant refreshes do not
             # rewrite summaries with a blank location.
@@ -481,8 +498,8 @@ class IngestionPipeline:
                 "summary": result.get("summary"),
             })
             event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
-            vector = self.clip.embed_text(event_text)
-            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result.get("model"), "event_summary": True})
+            vector, vector_model = self._text_embed(event_text)
+            self.store.upsert_vector("episodic", "event", event_id, vector, vector_model, {"summary_model": result.get("model"), "event_summary": True})
             return updated
 
     def summarize_event(self, event_id):

@@ -25,7 +25,7 @@ BASE_SYSTEM_PROMPT = """你是 Sentrix 家庭记忆助手。根据当前待确�
 LITE_TOOL_SCHEMAS = {
     "search_memories": (
         "- search_memories: 检索照片。返回照片预览（含地点/拍摄时间/handle）。\n"
-        '  输入: {"query": "关键词", "filters": {"time": "时间(如2019年7月)", "person": "人物", "place": "地点"}}'
+        '  输入: {"query": "关键词", "filters": {"time": "<问题中的时间，缺省省略>", "person": "人物", "place": "地点"}}'
     ),
     "query_memory_facts": (
         "- query_memory_facts: 查询统计与结构化事实（总数/最早/最近/分组）。\n"

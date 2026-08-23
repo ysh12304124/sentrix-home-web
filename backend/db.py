@@ -1566,6 +1566,9 @@ class MemoryStore:
         if face_ids:
             face_placeholders = ",".join("?" for _ in face_ids)
             self.connection.execute(f"DELETE FROM face_prototypes WHERE face_instance_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM person_appearance_evidence WHERE face_instance_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM entity_mentions WHERE face_instance_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM person_moments WHERE face_instance_id IN ({face_placeholders})", face_ids)
             self.connection.execute(f"DELETE FROM memory_vectors WHERE source_type = 'face_instance' AND source_id IN ({face_placeholders})", face_ids)
             self.connection.execute(f"DELETE FROM face_instances WHERE id IN ({face_placeholders})", face_ids)
         self.connection.execute(
@@ -1583,6 +1586,7 @@ class MemoryStore:
                 self.connection.execute("DELETE FROM event_entities WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM event_revisions WHERE event_id = ?", (event_id,))
+                self.connection.execute("DELETE FROM person_event_memory WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.commit()
 

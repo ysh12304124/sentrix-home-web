@@ -197,6 +197,13 @@ function effectiveRunSummary(run) {
     llm_context_tokens_max: saved.llm_context_tokens_max ?? (contextTokens.length ? Math.max(...contextTokens) : null),
     llm_context_tokens_p95: saved.llm_context_tokens_p95 ?? nearestRankPercentile(contextTokens, 0.95),
     llm_context_samples_count: saved.llm_context_samples_count ?? contextTokens.length,
+    agent_throughput_latency_mode: saved.agent_throughput_latency_mode
+      ?? (run?.phases?.qa_eval?.agent_phase_wall_ms != null ? "measured_agent_phase" : "historical_interval_estimate"),
+    agent_phase_wall_ms: saved.agent_phase_wall_ms ?? run?.phases?.qa_eval?.agent_phase_wall_ms ?? null,
+    agent_phase_completed_count: saved.agent_phase_completed_count ?? run?.phases?.qa_eval?.agent_completed ?? null,
+    agent_throughput_qa_per_s: saved.agent_throughput_qa_per_s ?? null,
+    judge_phase_wall_ms: saved.judge_phase_wall_ms ?? run?.phases?.qa_eval?.judge_phase_wall_ms ?? null,
+    judge_concurrency: saved.judge_concurrency ?? run?.phases?.qa_eval?.judge_concurrency ?? run?.judge_concurrency ?? null,
   };
 }
 function resultPhaseStatus(phase) {
@@ -226,14 +233,27 @@ function itemParseRate(item) {
   if (stability.json_parse_total == null) return "未记录";
   return `${stability.json_parse_success ?? 0}/${stability.json_parse_total} 次模型输出解析为合法动作 (${fmtPct(stability.json_parse_rate)})`;
 }
-function completionLabel(item) {
-  const completed = item?.agent_stability?.completed_within_steps;
-  if (completed === true) return "完成";
-  if (completed === false) {
-    const reason = normalizedTerminationReason(item) || item?.agent_status;
-    return reason ? `未完成（${reason}）` : "未完成";
+function executionState(item) {
+  const stability = item?.agent_stability || {};
+  const status = String(item?.agent_status || item?.guard_debug?.status || "").toLowerCase();
+  const termination = String(item?.termination_reason || item?.guard_debug?.termination_reason || "").toLowerCase();
+  const turns = Array.isArray(item?.runtime_turns) ? item.runtime_turns : [];
+  const outcome = String(item?.turn_outcome || turns[turns.length - 1]?.turn_outcome || "").toLowerCase();
+  const failure = [status, termination, outcome].some((value) => /error|failed|failure|timeout|cancel|blocked|parse_failure|model_error/.test(value));
+  const partial = [status, termination, outcome].some((value) => /partial|limit|budget|incomplete|tool_call_limit|step_limit/.test(value));
+  if (failure) return { key: "failed", label: "执行失败" };
+  if (partial) return { key: "partial", label: "部分完成" };
+  if (outcome === "final_answer" || ["complete", "completed", "done", "success"].includes(status)
+      || ["complete", "completed", "done", "success"].includes(termination)
+      || stability.completed_within_steps === true) {
+    return { key: "complete", label: "已完成" };
   }
-  return "未记录";
+  if (status || termination || outcome || stability.completed_within_steps === false) return { key: "unknown", label: "状态待确认" };
+  return { key: "unknown", label: "未记录" };
+}
+function executionStateClass(item) { return `status-${executionState(item).key}`; }
+function completionLabel(item) {
+  return executionState(item).label;
 }
 function taskDecisionLabel(item) {
   const judge = item?.task_judge || {};
@@ -447,23 +467,31 @@ function aggregateMetricRows(phase = {}) {
   const summary = effectiveRunSummary(activeRun.value);
   const dist = summary.judge_distribution || {};
   const evidenceDist = summary.evidence_distribution || {};
+  const throughputSamples = Number(summary.agent_throughput_latency_sample_count);
+  const throughputTotal = Number(summary.agent_throughput_latency_total_count ?? summary.total);
+  const throughputNote = summary.agent_throughput_latency_mode === "measured_agent_phase"
+    ? `Agent 阶段实际墙钟 ÷ ${summary.agent_phase_completed_count ?? throughputTotal} 题 · 并发 ${activeRun.value?.qa_concurrency ?? "-"} · 不含 Judge，Judge 可与 Agent 并行`
+    : Number.isFinite(throughputSamples) && Number.isFinite(throughputTotal)
+      ? `历史记录按 Agent/Judge 时间线回退估算 · ${throughputSamples}/${throughputTotal} 题，不能视为实测`
+      : "历史记录未保存 Agent 独立阶段墙钟";
   return [
     ["图片检索 Precision", fmtPct(summary.retrieval_precision_micro), `图片级微平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT 图`, true],
-    ["图片检索 Recall", fmtPct(summary.retrieval_recall_micro), "图片级微平均；列表为题均宏平均", true],
+    ["图片检索 Recall", fmtPct(summary.retrieval_recall_micro), "图片级微平均；与评测记录列表同口径", true],
     ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
     ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
-    ["Token 用量", summary.prompt_tokens_total == null && summary.completion_tokens_total == null ? "未记录" : `${summary.prompt_tokens_total ?? "-"} / ${summary.completion_tokens_total ?? "-"}`, "输入 / 输出 token", true],
+    ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "历史记录未保存解析轨迹" : `${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个需解析模型输出`, true],
+    ["Agent 并发吞吐折算时延", fmtMs(summary.agent_throughput_latency_ms), throughputNote, true],
+    ["平均调用轮数", summary.agent_loop_calls_mean == null ? "未记录" : `${Number(summary.agent_loop_calls_mean).toFixed(2)} 轮`, "仅 Agent/Recovery，不含 L2 Judge、Final Writer 和工具内部模型", true],
+    ["累计输入 token", fmtTokens(summary.prompt_tokens_total), "所有主 Agent 模型调用输入 token 累计", true],
+    ["累计输出 token", fmtTokens(summary.completion_tokens_total), "所有主 Agent 模型调用输出 token 累计", true],
     ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), activeRun.value?.qa_concurrency > 1
       ? `每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）；并发 ${activeRun.value.qa_concurrency} 负载下含排队与批内干扰，勿与串行 run 直接对比`
       : "每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）", true],
-    ["纯 Agent 吞吐时延", fmtMs(summary.agent_throughput_latency_ms), "(QA 阶段墙钟 − Judge 实际独占时长) ÷ 题数 · 并发摊薄口径，不含 Judge", true],
-    ["Judge LLM 平均时延", fmtMs(summary.judge_llm_latency_mean_ms), `每题 Judge 评分调用平均耗时 · 全程独占合计 ${fmtMs(summary.judge_exclusive_wall_ms)}`],
-    ["平均任务调用轮数", summary.agent_loop_calls_mean == null ? "未记录" : `${Number(summary.agent_loop_calls_mean).toFixed(2)} 轮`, "仅 Agent/Recovery，不含 L2 Judge、Final Writer 和工具内部模型", true],
     ["图片检索 F1", fmtPct(summary.retrieval_f1_micro), "微平均，平衡噪声与漏召回"],
+    ["Judge LLM 平均时延", fmtMs(summary.judge_llm_latency_mean_ms), `每题 Judge 评分调用平均耗时 · Judge 阶段墙钟 ${fmtMs(summary.judge_phase_wall_ms)}`],
     ["任务判断准确率", fmtPct(summary.task_decision_accuracy), `标注 ${summary.task_decision_labeled_count ?? 0} 题 · Judge 有效 ${summary.task_decision_valid_count ?? 0} 题`],
     ["证据对应均分", summary.evidence_mean == null ? "未记录" : `${summary.evidence_mean} / 2`, `0:${evidenceDist["0"] || 0} · 1:${evidenceDist["1"] || 0} · 2:${evidenceDist["2"] || 0}`],
     ["证据完全支持率", fmtPct(summary.evidence_fully_supported_rate), "证据 Judge = 2"],
-    ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "历史记录未保存解析轨迹" : `${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个需解析模型输出`],
     ["端到端测评总时延（不含 Judge）", fmtMs(summary.benchmark_e2e_latency_excluding_judge_ms), "身份/关系及图片导入开始至全部 QA 完成，已扣除 Judge 时延"],
     ["完全准确率", fmtPct(summary.exact_accuracy), "Judge 评分为 2 的比例"],
     ["核心准确率", fmtPct(summary.core_accuracy), "Judge 评分为 1 或 2 的比例"],
@@ -500,7 +528,9 @@ function conversationTurnNumber(value, fallback = 0) {
   return Number.isInteger(turn) && turn >= 0 ? turn : fallback;
 }
 function agentLoopGroups(item) {
-  const savedCalls = itemCallMetrics(item).map((call, globalIndex) => ({ ...call, _globalCallIndex: globalIndex }));
+  const savedCalls = itemCallMetrics(item)
+    .map((call, globalIndex) => ({ ...call, _globalCallIndex: globalIndex }))
+    .filter((call) => callType(call) !== "tool_internal");
   const traceModels = itemExecutionTrace(item).filter((step) => ["model", "writer", "judge"].includes(String(step.stage || step.type || "")));
   const turns = conversationTurns(item);
   const knownTurns = new Set();
@@ -510,6 +540,7 @@ function agentLoopGroups(item) {
   if (!knownTurns.size) knownTurns.add(0);
   const metricKeys = new Set(savedCalls.map((call) => `${conversationTurnNumber(call.conversation_turn)}:${call.step_id || ""}`));
   const traceOnlyCalls = traceModels.filter((step) => {
+    if (String(step.call_type || "") === "tool_internal") return false;
     const key = `${conversationTurnNumber(step.conversation_turn)}:${step.step_id || ""}`;
     return (step.status === "error" || step.status === "failed" || step.parse_status === "failed") && !metricKeys.has(key);
   }).map((step, index) => {
@@ -544,10 +575,7 @@ function turnTerminationLabel(turn) {
   })[reason] || reason || "未记录";
 }
 function turnCompletionLabel(turn) {
-  if (turn?.turn_outcome === "final_answer" && turn?.agent_status !== "error") return "完成";
-  if (turn?.answer && ["complete", "completed", "done", "success"].includes(String(turn?.agent_status || "").toLowerCase())) return "完成";
-  if (turn?.agent_status || turn?.termination_reason || turn?.turn_outcome) return `未完成（${turnTerminationLabel(turn)}）`;
-  return "未记录";
+  return executionState(turn).label;
 }
 function turnRecoveryCount(group) {
   return group?.calls?.filter((call) => callType(call) === "recovery").length ?? 0;
@@ -660,6 +688,142 @@ function itemToolTrace(item) {
 }
 function itemDetail(summary) { return qaDetails[summary?.index] || null; }
 
+function toolExecutionSteps(item) {
+  return itemExecutionTrace(item).filter((step) => String(step.stage || step.type || "") === "tool");
+}
+
+function callIndexForStep(item, stepId, conversationTurn) {
+  if (!stepId) return null;
+  const calls = itemCallMetrics(item);
+  const exact = calls.findIndex((call) => String(call.step_id || "") === String(stepId)
+    && (conversationTurn == null || conversationTurnNumber(call.conversation_turn) === conversationTurnNumber(conversationTurn)));
+  if (exact >= 0) return exact;
+  const fallback = calls.findIndex((call) => String(call.step_id || "") === String(stepId));
+  return fallback >= 0 ? fallback : null;
+}
+
+function normalizedToolCallIndex(item, trace, traceIndex) {
+  const parentStepId = trace?.parent_step_id;
+  const parentIndex = callIndexForStep(item, parentStepId, trace?.conversation_turn);
+  if (parentIndex != null) return parentIndex;
+  const sameTurnTraces = itemToolTrace(item).filter((candidate) => trace?.conversation_turn == null
+    || conversationTurnNumber(candidate.conversation_turn) === conversationTurnNumber(trace.conversation_turn));
+  const localTraceIndex = sameTurnTraces.indexOf(trace);
+  const executionStep = toolExecutionSteps(item).filter((step) => trace?.conversation_turn == null
+    || conversationTurnNumber(step.conversation_turn) === conversationTurnNumber(trace.conversation_turn))[localTraceIndex >= 0 ? localTraceIndex : traceIndex];
+  const executionIndex = callIndexForStep(item, executionStep?.parent_step_id, trace?.conversation_turn);
+  if (executionIndex != null) return executionIndex;
+  const savedIndex = Number(trace?.model_call_index);
+  return Number.isInteger(savedIndex) ? savedIndex : null;
+}
+
+function toolsForGroupedCall(item, call) {
+  const turnIndex = conversationTurnNumber(call?.conversation_turn);
+  return itemToolTrace(item).filter((trace, traceIndex) => {
+    const sameTurn = conversationTurnNumber(trace.conversation_turn) === turnIndex;
+    return sameTurn && normalizedToolCallIndex(item, trace, traceIndex) === Number(call?._globalCallIndex);
+  });
+}
+
+function toolDurationMs(trace) {
+  const duration = Number(trace?.duration_ms);
+  if (Number.isFinite(duration) && duration >= 0) return duration;
+  const latency = Number(trace?.latency_s);
+  return Number.isFinite(latency) && latency >= 0 ? latency * 1000 : null;
+}
+
+function toolLatencySegments(trace) {
+  const timing = trace?.retrieval_timing || {};
+  const segments = [];
+  const add = (kind, label, value) => {
+    const ms = Number(value);
+    if (Number.isFinite(ms) && ms > 0) segments.push({ kind, label, ms });
+  };
+  add("nested-tool", "查询构建", timing.query_build_ms);
+  Object.entries(timing.channels || {}).forEach(([channel, value]) => {
+    add("nested-tool", channel, value?.latency_ms);
+  });
+  add("nested-tool", "融合", timing.fusion_ms);
+  add("nested-tool", "后处理", timing.postprocess_ms);
+  const total = Number(timing.total_ms);
+  const accounted = segments.reduce((sum, segment) => sum + segment.ms, 0);
+  if (Number.isFinite(total) && total > accounted + 0.5) segments.push({ kind: "other", label: "工具其他", ms: total - accounted });
+  return segments;
+}
+
+function callAgentLoopTiming(item, call) {
+  const modelMs = Number(call?.total_ms);
+  const validModelMs = Number.isFinite(modelMs) && modelMs >= 0 ? modelMs : null;
+  const saved = call?.agent_loop_timing || {};
+  const tools = toolsForGroupedCall(item, call);
+  const toolMs = Number.isFinite(Number(saved.tool_ms))
+    ? Number(saved.tool_ms)
+    : tools.reduce((sum, trace) => sum + (toolDurationMs(trace) || 0), 0);
+  const ttftMs = Number(call?.ttft_ms);
+  const validTtftMs = Number.isFinite(ttftMs) && ttftMs >= 0 ? ttftMs : null;
+  const generationMs = Number.isFinite(Number(saved.model_generation_ms))
+    ? Number(saved.model_generation_ms)
+    : validModelMs == null ? null : Math.max(0, validModelMs - (validTtftMs || 0));
+  const totalMs = Number.isFinite(Number(call?.agent_loop_total_ms))
+    ? Number(call.agent_loop_total_ms)
+    : validModelMs == null ? null : validModelMs + toolMs;
+  return { modelMs: validModelMs, ttftMs: validTtftMs, generationMs, toolMs, totalMs, tools };
+}
+
+function callLatencySegments(item, call) {
+  const timing = callAgentLoopTiming(item, call);
+  const segments = [];
+  if (timing.ttftMs != null && timing.ttftMs > 0) segments.push({ kind: "ttft", label: "TTFT", ms: timing.ttftMs });
+  if (timing.generationMs != null && timing.generationMs > 0) segments.push({ kind: "generation", label: "模型生成 / 回答", ms: timing.generationMs });
+  timing.tools.forEach((trace, index) => {
+    const ms = toolDurationMs(trace);
+    if (ms != null && ms > 0) segments.push({ kind: "tool", label: trace.tool || `工具 ${index + 1}`, ms, trace });
+  });
+  const accounted = segments.reduce((sum, segment) => sum + segment.ms, 0);
+  if (timing.totalMs != null && timing.totalMs > accounted + 0.5) {
+    segments.push({ kind: "other", label: "Agent 编排", ms: timing.totalMs - accounted });
+  }
+  return segments;
+}
+
+function latencySegmentTitle(segment) {
+  const detail = segment.trace?.retrieval_timing?.total_ms != null
+    ? `\n检索内部耗时 ${fmtMs(segment.trace.retrieval_timing.total_ms)}` : "";
+  return `${segment.label} · ${fmtMs(segment.ms)}${detail}`;
+}
+
+function qaLatencySegments(item) {
+  const loops = agentLoopGroups(item).flatMap((group) => group.calls).map((call, index) => {
+    const timing = callAgentLoopTiming(item, call);
+    return timing.totalMs == null ? null : {
+      kind: "agent-loop",
+      label: `Agent Loop ${index + 1} · ${callTypeLabel(call)}`,
+      shortLabel: `Loop ${index + 1}`,
+      ms: timing.totalMs,
+      call,
+    };
+  }).filter(Boolean);
+  const breakdown = itemTimingBreakdown(item);
+  const loopMs = loops.reduce((sum, segment) => sum + segment.ms, 0);
+  const judgeMs = Number(breakdown.judge_ms);
+  if (Number.isFinite(judgeMs) && judgeMs > 0) loops.push({ kind: "judge", label: "Judge", shortLabel: "Judge", ms: judgeMs });
+  const judgeQueueMs = Number(breakdown.judge_queue_wait_ms);
+  if (Number.isFinite(judgeQueueMs) && judgeQueueMs > 0) {
+    loops.push({ kind: "judge-queue", label: "Judge 排队 / 编排", shortLabel: "Judge 排队", ms: judgeQueueMs });
+  }
+  const wallMs = Number(breakdown.wall_clock_ms);
+  const otherMs = Number.isFinite(wallMs)
+    ? Math.max(0, wallMs - loopMs - (Number.isFinite(judgeMs) ? judgeMs : 0) - (Number.isFinite(judgeQueueMs) ? judgeQueueMs : 0))
+    : 0;
+  if (otherMs > 0.5) loops.push({ kind: "other", label: "其他未归因时延", shortLabel: "其他", ms: otherMs });
+  return loops;
+}
+
+function latencySegmentStyle(segment, segments) {
+  const total = segments.reduce((sum, value) => sum + value.ms, 0) || 1;
+  return { flex: `${Math.max(segment.ms, 0.1)} 1 0%`, "--segment-share": `${(segment.ms / total) * 100}%` };
+}
+
 function runtimeDebugTurns(item) {
   const turns = item?.runtime_turns || [];
   return Array.isArray(turns) ? turns.filter((turn) => turn && Array.isArray(turn.debug_trace)) : [];
@@ -753,6 +917,48 @@ function getAgent2LedgerEntries(item) {
   return trace.evidence_ledger?.entries || [];
 }
 
+function formatAgent2EvidenceValue(value) {
+  if (value == null) return "已记录证据，但没有提取出的文本值";
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return "已记录证据，但没有提取出的文本值";
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      return value;
+    }
+  }
+  const formatted = JSON.stringify(value, null, 2);
+  return formatted ?? String(value);
+}
+
+function agent2EvidenceRows(value) {
+  return Math.max(3, formatAgent2EvidenceValue(value).split("\n").length);
+}
+function agent2EvidenceHeight(value) {
+  return String(agent2EvidenceRows(value) * 15.5 + 16) + "px";
+}
+function agent2RequirementStatusLabel(status) {
+  return ({ satisfied: "已满足", partially_supported: "部分满足", open: "待满足", failed: "未满足" })[status] || status || "未记录";
+}
+function agent2RequirementStatusClass(status) {
+  return status === "satisfied" ? "status-complete" : status === "partially_supported" ? "status-partial" : "status-failed";
+}
+function agent2EvidenceTypeLabel(type) {
+  return ({ visual: "视觉", text: "文字 / OCR", temporal: "时间", geographic: "地点", identity: "身份", semantic: "语义" })[type] || type || "证据";
+}
+function agent2RequirementSummary(item) {
+  const requirements = getAgent2Requirements(item);
+  const satisfied = requirements.filter((req) => req.status === "satisfied").length;
+  const partial = requirements.filter((req) => req.status === "partially_supported").length;
+  return `${satisfied}/${requirements.length} 项满足${partial ? `，${partial} 项部分满足` : ""}`;
+}
+function agent2DecisionSummary(item) {
+  const decisions = getAgent2Trace(item)?.planner_decisions || [];
+  const decision = decisions[decisions.length - 1] || {};
+  return decision.status === "accepted" ? "规划已接受" : decision.status === "fallback" ? "规划失败，已回退主流程" : decision.status || "已记录";
+}
+
 function attributionSummary(item) {
   const attribution = item?.attribution || {};
   const layers = attribution.layers || {};
@@ -768,17 +974,8 @@ function attributionClass(status) { return status === "fail" ? "score-0" : statu
 function toolsForCall(item, callIndex) {
   return itemToolTrace(item).filter((trace) => Number(trace.model_call_index) === callIndex);
 }
-function toolsForGroupedCall(item, call) {
-  if (call?._traceOnly) return [];
-  const turnIndex = conversationTurnNumber(call?.conversation_turn);
-  return itemToolTrace(item).filter((trace) => {
-    const sameTurn = conversationTurnNumber(trace.conversation_turn) === turnIndex;
-    if (trace.parent_step_id && call?.step_id) return sameTurn && String(trace.parent_step_id) === String(call.step_id);
-    return Number(trace.model_call_index) === Number(call?._globalCallIndex);
-  });
-}
 function unboundTools(item) {
-  return itemToolTrace(item).filter((trace) => !Number.isInteger(Number(trace.model_call_index)));
+  return itemToolTrace(item).filter((trace, traceIndex) => normalizedToolCallIndex(item, trace, traceIndex) == null);
 }
 function toolStatusLabel(trace) {
   const status = trace?.status || "未知";
@@ -831,6 +1028,12 @@ function normalizedTerminationReason(item) {
   if (/token budget preflight failed|tokenize-current|502 Bad Gateway/i.test(reason)) return "上下文 token 预检失败（tokenize 接口 502）";
   return item?.guard_debug?.termination_reason || item?.termination_reason || "-";
 }
+function terminationDisplayLabel(item) {
+  const raw = normalizedTerminationReason(item);
+  if (raw === "complete" || (raw === "-" && executionState(item).key === "complete")) return "正常完成";
+  if (raw === "-") return "未记录";
+  return turnTerminationLabel({ ...item, termination_reason: raw });
+}
 function hasToolTrace(item) {
   return Object.prototype.hasOwnProperty.call(item || {}, "tool_trace")
     || item?.timing_breakdown?.tool_trace_recorded === true;
@@ -882,7 +1085,11 @@ function phaseSummary(key, phase) {
   if (key === "qa_eval") {
     const p = phase.progress;
     if (p && (p.completed != null || p.in_flight != null)) {
-      return `完成 ${p.completed ?? 0}/${p.total ?? "?"} · 在途 ${p.in_flight ?? 0}${p.qa_concurrency > 1 ? ` · 并发 ${p.qa_concurrency}` : ""} · ${fmtSeconds(phaseSeconds(phase))}`;
+      const agentText = `Agent ${p.agent_completed ?? p.completed ?? 0}/${p.agent_total ?? p.total ?? "?"}`;
+      const judgeText = `Judge ${p.judge_completed ?? 0}/${p.judge_total ?? p.total ?? "?"}`;
+      const concurrencyText = p.qa_concurrency > 1 || p.judge_concurrency > 1
+        ? ` · 并发 Agent ${p.qa_concurrency ?? "-"} / Judge ${p.judge_concurrency ?? "-"}` : "";
+      return `${agentText} · ${judgeText}${concurrencyText} · ${fmtSeconds(phaseSeconds(phase))}`;
     }
     return `${activeRun.value?.item_count || 0} 题 · ${fmtSeconds(phaseSeconds(phase))}`;
   }
@@ -1321,7 +1528,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <th>耗时</th>
 <th>状态</th>
 <th>进度</th>
-<th>题均召回率</th>
+<th>图片级召回率</th>
 <th>质量均分</th>
 <th>
 </th>
@@ -1340,7 +1547,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
 <td>{{ run.mode === 'build' ? '—' : `${run.summary?.completed || 0}/${run.summary?.total || run.qa_count || 0}` }}</td>
-<td>{{ fmtPct(run.summary?.retrieval_recall_mean) }}</td>
+<td>{{ fmtPct(run.summary?.retrieval_recall_micro) }}</td>
 <td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>
@@ -1354,17 +1561,21 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
     <section id="detail-region">
 <div v-if="!activeRun" class="section muted">点击上方列表中的某条记录查看详情</div>
 <section v-else class="section detail-section">
-      <div class="section-head">
-<h2>{{ modelName(activeRun) }} · {{ albumName(activeRun) }} · {{ qaName(activeRun) }}</h2>
-<span class="phase-status" :class="activeRun.status">{{ statusLabel(activeRun.status) }}</span>
-<span class="field-label">导出轨迹</span>
-<span class="export-score-filter">
-  <label class="checkbox-inline"><input type="checkbox" value="0" v-model="exportScores">0 分</label>
-  <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
-  <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
-</span>
-<button class="btn compact" @click="exportSftTraces">导出 SFT json</button>
-</div>
+      <div class="section-head detail-section-head">
+        <h2>{{ modelName(activeRun) }} · {{ albumName(activeRun) }} · {{ qaName(activeRun) }}</h2>
+        <div class="detail-head-tools">
+          <span class="phase-status" :class="activeRun.status">{{ statusLabel(activeRun.status) }}</span>
+          <div class="export-control">
+            <span class="field-label">导出轨迹</span>
+            <span class="export-score-filter">
+              <label class="checkbox-inline"><input type="checkbox" value="0" v-model="exportScores">0 分</label>
+              <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
+              <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
+            </span>
+            <button class="btn compact" @click="exportSftTraces">导出 SFT JSON</button>
+          </div>
+        </div>
+      </div>
       <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}<template v-if="activeRun.mode === 'reuse'"> · 复用相册 {{ activeRun.scope_name || activeRun.scope_id || activeRun.existing_scope_id }}<span v-if="(activeRun.scope_reused_from_runs || []).length">（源自 run {{ activeRun.scope_reused_from_runs.join('、') }}）</span><span v-else>（外部创建，非编排器产物）</span></template><template v-else-if="activeRun.mode === 'build'"> · 产出相册 {{ activeRun.scope_id || '-' }}（已保留，可在复用测评中使用）</template></p>
       <section v-if="activeRun.mode !== 'build'" class="rejudge-card">
         <div class="rejudge-head">
@@ -1628,6 +1839,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                 <div class="timing-breakdown">
                   <span>端到端 <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).wall_clock_ms) }}</b></span><span>Agent 总耗时 <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).agent_wall_ms) }}</b></span><span>模型 <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).model_ms) }}</b></span><span>工具 <b>{{ hasToolTrace(itemDetail(summary)) ? fmtMs(itemTimingBreakdown(itemDetail(summary)).tool_ms) : "未记录" }}</b></span><span>Judge <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).judge_ms) }}</b></span><span>其他 <b>{{ hasToolTrace(itemDetail(summary)) ? fmtMs(itemTimingBreakdown(itemDetail(summary)).other_ms) : "未记录" }}</b></span>
                 </div>
+                <div v-if="qaLatencySegments(itemDetail(summary)).length" class="latency-composition qa-latency-composition">
+                  <div class="latency-composition-head"><strong>QA 样本时延组成</strong><span>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).wall_clock_ms) }}</span></div>
+                  <div class="latency-bar" role="img" aria-label="QA 样本时延组成">
+                    <span v-for="(segment, segmentIndex) in qaLatencySegments(itemDetail(summary))" :key="`${segment.kind}-${segmentIndex}`" class="latency-segment" :class="`latency-segment-${segment.kind}`" :style="latencySegmentStyle(segment, qaLatencySegments(itemDetail(summary)))" :data-tooltip="`${segment.label} · ${fmtMs(segment.ms)}`"><b>{{ fmtMs(segment.ms) }}</b></span>
+                  </div>
+                  <div class="latency-segment-legend"><span v-for="(segment, segmentIndex) in qaLatencySegments(itemDetail(summary))" :key="`${segment.kind}-legend-${segmentIndex}`"><i :class="`latency-dot latency-dot-${segment.kind}`"></i>{{ segment.shortLabel }} {{ fmtMs(segment.ms) }}</span></div>
+                </div>
                 <div v-if="agentLoopGroups(itemDetail(summary)).some((group) => group.calls.length)" class="agent-loop-groups">
                   <section v-for="group in agentLoopGroups(itemDetail(summary))" :key="group.turnIndex" class="agent-loop-group">
                     <header v-if="showAgentLoopGroupHeaders(itemDetail(summary))" class="agent-loop-turn-head">
@@ -1637,10 +1855,17 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                     <div v-if="group.calls.length" class="call-tree">
                       <details v-for="(call, callIndex) in group.calls" :key="`${group.turnIndex}-${call.step_id || call._globalCallIndex || callIndex}`" :class="['call-node', `call-type-${callType(call)}`, { 'trace-only-call': call._traceOnly }]">
                         <summary>
-                          <span class="call-round">{{ callIndex + 1 }}</span><strong>{{ callTypeLabel(call) }}</strong><span v-if="['agent','recovery'].includes(callType(call))" :class="['call-outcome', callOutcomeClass(call)]">{{ callOutcome(call) }}</span><span>{{ call.role || "-" }} · {{ call.model || modelName(activeRun) }}</span><span>TTFT {{ fmtMs(call.ttft_ms) }}</span><span>总时延 {{ fmtMs(call.total_ms) }}</span><span>Token {{ call.preflight_prompt_tokens ?? call.prompt_tokens ?? "-" }} / {{ call.completion_tokens ?? "-" }}</span><span>{{ fmtTokenRate(call.tokens_per_second) }}</span><span class="stream-state" :class="{ streamed: call.streamed === true }">{{ callStatus(call) }}</span>
+                          <span class="call-round">{{ callIndex + 1 }}</span><strong>{{ callTypeLabel(call) }}</strong><span v-if="['agent','recovery'].includes(callType(call))" :class="['call-outcome', callOutcomeClass(call)]">{{ callOutcome(call) }}</span><span>{{ call.role || "-" }} · {{ call.model || modelName(activeRun) }}</span><span>TTFT {{ fmtMs(call.ttft_ms) }}</span><span>Agent Loop 总时延 {{ fmtMs(callAgentLoopTiming(itemDetail(summary), call).totalMs) }}</span><span>模型 {{ fmtMs(call.total_ms) }}</span><span>Token {{ call.preflight_prompt_tokens ?? call.prompt_tokens ?? "-" }} / {{ call.completion_tokens ?? "-" }}</span><span>{{ fmtTokenRate(call.tokens_per_second) }}</span><span class="stream-state" :class="{ streamed: call.streamed === true }">{{ callStatus(call) }}</span>
                         </summary>
-                        <div class="call-node-body">
-                          <div class="call-purpose-grid"><span><small>用途</small><b>{{ callTypeDescription(call) }}</b></span><span><small>触发</small><b>{{ callObservation(call).trigger }}</b></span><span><small>结果</small><b>{{ callObservation(call).outcome }}</b></span><span><small>记录来源</small><b>{{ callObservation(call).source }}</b></span></div>
+                          <div class="call-node-body">
+                            <div v-if="callLatencySegments(itemDetail(summary), call).length" class="latency-composition call-latency-composition">
+                              <div class="latency-composition-head"><strong>Agent Loop 时延组成</strong><span>{{ fmtMs(callAgentLoopTiming(itemDetail(summary), call).totalMs) }}</span></div>
+                              <div class="latency-bar" role="img" aria-label="Agent Loop 时延组成">
+                                <span v-for="(segment, segmentIndex) in callLatencySegments(itemDetail(summary), call)" :key="`${segment.kind}-${segmentIndex}`" class="latency-segment" :class="`latency-segment-${segment.kind}`" :style="latencySegmentStyle(segment, callLatencySegments(itemDetail(summary), call))" :data-tooltip="latencySegmentTitle(segment)"><b>{{ fmtMs(segment.ms) }}</b></span>
+                              </div>
+                              <div class="latency-segment-legend"><span v-for="(segment, segmentIndex) in callLatencySegments(itemDetail(summary), call)" :key="`${segment.kind}-legend-${segmentIndex}`"><i :class="`latency-dot latency-dot-${segment.kind}`"></i>{{ segment.label }} {{ fmtMs(segment.ms) }}</span></div>
+                            </div>
+                            <div class="call-purpose-grid"><span><small>用途</small><b>{{ callTypeDescription(call) }}</b></span><span><small>触发</small><b>{{ callObservation(call).trigger }}</b></span><span><small>结果</small><b>{{ callObservation(call).outcome }}</b></span><span><small>记录来源</small><b>{{ callObservation(call).source }}</b></span></div>
                           <div class="call-budget-line"><span>请求预算</span><b>{{ callBudget(call) }}</b><span v-if="call.step_id">步骤 {{ call.step_id }}</span><span v-if="callObservation(call).relatedTool !== '-'">关联工具 {{ callObservation(call).relatedTool }}</span><span v-if="callObservation(call).parentStep !== '-'">父步骤 {{ callObservation(call).parentStep }}</span></div>
                           <details v-if="debugStepForCallInGroup(itemDetail(summary), group, call)" class="debug-inline">
                             <summary>完整输入 / 输出</summary>
@@ -1657,6 +1882,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                           <div v-if="showToolBranch(call) && toolsForGroupedCall(itemDetail(summary), call).length" class="tool-tree">
                             <details v-for="(trace, toolIndex) in toolsForGroupedCall(itemDetail(summary), call)" :key="toolIndex" class="tool-node">
                               <summary><strong>{{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span class="binding-source">{{ toolBindingLabel(trace) }}</span><span v-if="retrievalBackendLabel(trace)" class="retrieval-backend" :class="{ degraded: retrievalBackendDegraded(trace) }">检索后端 {{ retrievalBackendLabel(trace) }}</span></summary>
+                              <div v-if="toolLatencySegments(trace).length" class="latency-composition nested-tool-latency">
+                                <div class="latency-composition-head"><strong>工具内部时延组成</strong><span>{{ fmtMs(toolDurationMs(trace)) }}</span></div>
+                                <div class="latency-bar" role="img" aria-label="工具内部时延组成">
+                                  <span v-for="(segment, segmentIndex) in toolLatencySegments(trace)" :key="`${segment.kind}-${segmentIndex}`" class="latency-segment" :class="`latency-segment-${segment.kind}`" :style="latencySegmentStyle(segment, toolLatencySegments(trace))" :data-tooltip="`${segment.label} · ${fmtMs(segment.ms)}`"><b>{{ fmtMs(segment.ms) }}</b></span>
+                                </div>
+                                <div class="latency-segment-legend"><span v-for="(segment, segmentIndex) in toolLatencySegments(trace)" :key="`${segment.kind}-legend-${segmentIndex}`"><i :class="`latency-dot latency-dot-${segment.kind}`"></i>{{ segment.label }} {{ fmtMs(segment.ms) }}</span></div>
+                              </div>
                               <details v-if="debugToolsForCall(itemDetail(summary), group, call)[toolIndex]" class="debug-inline">
                                 <summary>完整工具输入 / 输出</summary>
                                 <p class="muted small">工具输入</p><pre>{{ JSON.stringify(debugToolsForCall(itemDetail(summary), group, call)[toolIndex].arguments, null, 2) }}</pre>
@@ -1669,10 +1901,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                       </details>
                     </div>
                     <p v-else class="qa-performance-empty">本轮没有保存模型调用性能或失败轨迹。</p>
-                    <details v-if="group.turn.agent_status || group.turn.termination_reason || group.turn.turn_outcome" class="call-node guard-node turn-guard-node">
-                      <summary><strong>第 {{ group.turnIndex + 1 }} 轮结束状态</strong><span>{{ turnCompletionLabel(group.turn) }}</span></summary>
-                      <div class="guard-grid"><span>运行状态 <b>{{ group.turn.agent_status || "未记录" }}</b></span><span>终止原因 <b>{{ turnTerminationLabel(group.turn) }}</b></span><span>轮次结果 <b>{{ group.turn.turn_outcome || "未记录" }}</b></span><span>JSON 解析 <b>{{ group.turn.parse_status || "未记录" }}</b></span><span>恢复次数 <b>{{ turnRecoveryCount(group) }}</b></span><span>下一步 <b>{{ group.turn.next_step || "未记录" }}</b></span></div>
-                    </details>
+                    <div v-if="group.turn.agent_status || group.turn.termination_reason || group.turn.turn_outcome" :class="['turn-status-strip', executionStateClass(group.turn)]">
+                      <strong>第 {{ group.turnIndex + 1 }} 轮状态</strong><span class="status-pill">{{ turnCompletionLabel(group.turn) }}</span><span>运行状态 <b>{{ group.turn.agent_status || "未记录" }}</b></span><span>终止原因 <b>{{ turnTerminationLabel(group.turn) }}</b></span><span>JSON 解析 <b>{{ group.turn.parse_status || "未记录" }}</b></span><span>恢复 <b>{{ turnRecoveryCount(group) }} 次</b></span>
+                    </div>
                   </section>
                 </div>
                 <p v-else class="qa-performance-empty">该历史结果未记录主模型调用性能或失败轨迹。</p>
@@ -1680,51 +1911,32 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                   <summary><strong>未绑定模型轮次的工具序列</strong><span>{{ unboundTools(itemDetail(summary)).length }} 次 · 历史数据未保存精确轮次关系</span></summary>
                   <div class="call-node-body tool-tree"><details v-for="(trace, toolIndex) in unboundTools(itemDetail(summary))" :key="toolIndex" class="tool-node"><summary><strong>#{{ toolIndex + 1 }} {{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span v-if="retrievalBackendLabel(trace)" class="retrieval-backend" :class="{ degraded: retrievalBackendDegraded(trace) }">检索后端 {{ retrievalBackendLabel(trace) }}</span></summary></details></div>
                 </details>
-                <details v-if="guardSummary(itemDetail(summary)).recorded" class="call-node guard-node final-agent-status"><summary><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong><span>{{ completionLabel(itemDetail(summary)) }}</span></summary><div class="guard-grid"><span>运行状态 <b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span>终止原因 <b>{{ guardSummary(itemDetail(summary)).termination || "正常完成" }}</b></span><span>恢复次数 <b>{{ guardSummary(itemDetail(summary)).recoveries }}</b></span><span>运行详情 <b>{{ itemDetail(summary).agent_reason || "-" }}</b></span></div></details>
+                <section v-if="guardSummary(itemDetail(summary)).recorded" :class="['execution-status-panel', executionStateClass(itemDetail(summary))]">
+                  <div class="execution-status-head"><div><small>执行结果</small><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong></div><span class="status-pill">{{ completionLabel(itemDetail(summary)) }}</span></div>
+                  <div class="execution-status-grid"><span><small>运行状态</small><b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span><small>终止原因</small><b>{{ terminationDisplayLabel(itemDetail(summary)) }}</b></span><span><small>恢复次数</small><b>{{ guardSummary(itemDetail(summary)).recoveries }} 次</b></span><span><small>JSON 解析</small><b>{{ itemParseRate(itemDetail(summary)) }}</b></span><span class="execution-status-wide"><small>运行说明</small><b>{{ itemDetail(summary).agent_reason || "本轮 Agent 已按正常流程结束" }}</b></span></div>
+                </section>
               </section>
-                            <!-- Agent 2.0 目标与证据账本轨迹 -->
-              <details v-if="getAgent2Trace(itemDetail(summary))" class="call-node agent2-trace-node">
-                <summary><strong>Agent 2.0 目标驱动与证据账本（TaskState / EvidenceLedger）</strong><span>{{ getAgent2LedgerEntries(itemDetail(summary)).length }} 条证据 · {{ getAgent2Requirements(itemDetail(summary)).length }} 项需求</span></summary>
-                <div class="debug-trace-body">
-                  <div v-if="getAgent2Trace(itemDetail(summary))?.task_declaration" class="call-node-body">
-                    <p class="muted small"><strong>规划目标 (Goal)：</strong> {{ getAgent2Trace(itemDetail(summary)).task_declaration.goal }}</p>
-                    <p class="muted small"><strong>空间作用域 (Scope)：</strong> {{ getAgent2Trace(itemDetail(summary)).task_declaration.scope_id }}</p>
-                  </div>
-                  <div v-if="getAgent2Requirements(itemDetail(summary)).length" class="call-node-body">
-                    <p class="muted small"><strong>证据需求分解 (Requirements)：</strong></p>
-                    <table class="history-table" style="margin-top: 6px;">
-                      <thead><tr><th>ID</th><th>证据类型</th><th>状态</th><th>描述</th><th>证据引用</th><th>未满足原因</th></tr></thead>
-                      <tbody>
-                        <tr v-for="(req, rIdx) in getAgent2Requirements(itemDetail(summary))" :key="rIdx">
-                          <td>{{ req.id }}</td>
-                          <td><code>{{ req.evidence_type }}</code></td>
-                          <td><span :class="req.status === 'satisfied' ? 'tag-green' : req.status === 'partially_supported' ? 'tag-yellow' : 'tag-muted'">{{ req.status }}</span></td>
-                          <td>{{ req.description || '-' }}</td>
-                          <td>{{ (req.evidence_refs || []).join(', ') || '-' }}</td>
-                          <td><span v-if="req.unmet_reason" class="tag-red">{{ req.unmet_reason }}</span><span v-else>-</span></td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-                  <div v-if="getAgent2LedgerEntries(itemDetail(summary)).length" class="call-node-body">
-                    <p class="muted small"><strong>证据账本记录 (Evidence Ledger Entries)：</strong></p>
-                    <pre>{{ JSON.stringify(getAgent2LedgerEntries(itemDetail(summary)), null, 2) }}</pre>
-                  </div>
-                  <div v-if="getAgent2Trace(itemDetail(summary))?.planner_decisions?.length" class="call-node-body">
-                    <p class="muted small"><strong>规划决策 (Planner Decisions)：</strong></p>
-                    <pre>{{ JSON.stringify(getAgent2Trace(itemDetail(summary)).planner_decisions, null, 2) }}</pre>
-                  </div>
+              <!-- Agent 2.0 的首轮规划与证据账本是第一步调用的审计结果，直接展示摘要。 -->
+              <details v-if="getAgent2Trace(itemDetail(summary))" class="agent2-summary-panel">
+                <summary class="agent2-summary-toggle">
+                  <span class="agent2-toggle-copy"><small>首轮规划调用 · Agent 2.0 Shadow</small><strong>目标分解与证据账本详情</strong><span>回答前先把用户目标拆成可验证的证据需求，再记录工具带回的证据</span></span>
+                  <span class="agent2-counters"><span>{{ agent2RequirementSummary(itemDetail(summary)) }}</span><span>{{ getAgent2LedgerEntries(itemDetail(summary)).length }} 条证据</span><span>{{ agent2DecisionSummary(itemDetail(summary)) }}</span></span>
+                </summary>
+                <div class="agent2-summary-body">
+                <div class="agent2-overview-grid"><span><small>目标</small><b>{{ getAgent2Trace(itemDetail(summary))?.task_declaration?.goal || "未记录" }}</b></span><span><small>作用域</small><b>{{ getAgent2Trace(itemDetail(summary))?.task_declaration?.scope_id || "未记录" }}</b></span><span><small>需求数</small><b>{{ getAgent2Requirements(itemDetail(summary)).length }} 项证据需求</b></span><span><small>证据数</small><b>{{ getAgent2LedgerEntries(itemDetail(summary)).length }} 条账本记录</b></span></div>
+                <div v-if="getAgent2Requirements(itemDetail(summary)).length" class="agent2-detail-section"><div class="agent2-section-label">证据需求</div><div class="agent2-requirement-list"><div v-for="(req, rIdx) in getAgent2Requirements(itemDetail(summary))" :key="rIdx" class="agent2-requirement"><div class="agent2-requirement-head"><b>{{ req.id }}</b><span>{{ agent2EvidenceTypeLabel(req.evidence_type) }}</span><em :class="agent2RequirementStatusClass(req.status)">{{ agent2RequirementStatusLabel(req.status) }}</em></div><p>{{ req.description || "未记录需求描述" }}</p><small>证据引用：{{ (req.evidence_refs || []).join("、") || "暂无" }}<span v-if="req.unmet_reason"> · 未满足原因：{{ req.unmet_reason }}</span></small></div></div></div>
+                <div v-if="getAgent2LedgerEntries(itemDetail(summary)).length" class="agent2-detail-section"><div class="agent2-section-label">证据账本</div><div class="agent2-evidence-list"><div v-for="(entry, eIdx) in getAgent2LedgerEntries(itemDetail(summary))" :key="eIdx" class="agent2-evidence"><div class="agent2-evidence-head"><b>{{ entry.capability || agent2EvidenceTypeLabel(entry.evidence_type) }}</b><span>{{ agent2EvidenceTypeLabel(entry.evidence_type) }}</span><em>{{ entry.certainty || "未定" }}</em></div><textarea class="agent2-json-view" readonly wrap="off" :rows="agent2EvidenceRows(entry.extracted_value ?? entry.value ?? null)" :style="{ height: agent2EvidenceHeight(entry.extracted_value ?? entry.value ?? null) }" :value="formatAgent2EvidenceValue(entry.extracted_value ?? entry.value ?? null)" aria-label="证据账本 JSON 内容"></textarea><small>来源：{{ (entry.provenance_refs || entry.input_refs || []).join("、") || entry.tool_call_id || "未记录" }}<span v-if="entry.asset_id"> · 图片：{{ entry.asset_id }}</span></small></div></div></div>
                 </div>
               </details>
 
               <details v-if="runtimeDebugTurns(itemDetail(summary)).length" class="call-node debug-trace-node">
-                <summary><strong>完整运行时轨迹（提示词 / 回答 / 工具输入输出 / 评判）</strong><span>{{ runtimeDebugTurns(itemDetail(summary)).length }} 轮</span></summary>
+                <summary><strong>调试详情：完整运行时轨迹</strong><span>{{ runtimeDebugTurns(itemDetail(summary)).length }} 轮用户问答 · 提示词 / 回答 / 工具输入输出 / 评判</span></summary>
                 <div class="debug-trace-body">
                   <details v-for="(turn, turnIndex) in runtimeDebugTurns(itemDetail(summary))" :key="turnIndex" class="debug-turn">
-                    <summary>第 {{ turn.index + 1 }} 轮 · {{ turn.message || "问答" }}</summary>
+                    <summary><span class="debug-turn-index">第 {{ turn.index + 1 }} 轮</span><strong>{{ turn.message || "问答" }}</strong><span class="debug-turn-meta">{{ turn.debug_trace.length }} 个步骤</span></summary>
                     <div class="debug-steps">
                       <details v-for="(step, stepIndex) in turn.debug_trace" :key="stepIndex" class="debug-step" :class="'debug-step-' + (step.type || 'step')">
-                        <summary><strong>{{ step.type === 'model' ? '模型步骤' : step.type === 'tool' ? '工具步骤' : step.type === 'judge' ? '评判步骤' : step.type }}</strong><span>{{ step.status || '' }}</span></summary>
+                        <summary><span class="debug-step-index">{{ stepIndex + 1 }}</span><strong>{{ step.type === 'model' ? '模型步骤' : step.type === 'tool' ? '工具步骤' : step.type === 'judge' ? '评判步骤' : step.type }}</strong><span class="debug-step-status">{{ step.status || '已记录' }}</span></summary>
                         <div v-if="step.type === 'model'">
                           <p class="muted small">提示词</p><pre>{{ JSON.stringify(step.prompt, null, 2) }}</pre>
                           <p class="muted small">模型回答</p><pre>{{ step.raw_full || step.raw }}</pre>

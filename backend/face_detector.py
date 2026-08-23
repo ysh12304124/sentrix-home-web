@@ -18,6 +18,8 @@ import threading
 
 import numpy as np
 
+from .onnx_runtime import face_onnx_providers
+
 STEPS = [8, 16, 32]
 MIN_SIZES = [[16, 32], [64, 128], [256, 512]]
 INPUT_SIZE = (640, 640)
@@ -93,11 +95,7 @@ class RetinaFaceTiledDetector:
             if self._session is None:
                 try:
                     import onnxruntime
-                    providers = [
-                        item for item in os.getenv(
-                            "RETINAFACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider"
-                        ).split(",") if item
-                    ]
+                    providers = face_onnx_providers("RETINAFACE_PROVIDERS")
                     self._session = onnxruntime.InferenceSession(self.model_path, providers=providers)
                     self._input_name = self._session.get_inputs()[0].name
                 except Exception as error:

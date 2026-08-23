@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .face_embeddings import FaceEmbeddingUnavailable, compute_face_quality
 from .geocoding import format_gps_prefix
+from .onnx_runtime import face_gpu_inference_gate, face_onnx_provider_options, face_onnx_providers
 
 
 def align_face_crop(image, bbox, landmarks=None):
@@ -1440,6 +1441,8 @@ class FaceAdapter:
         self.enabled = os.getenv("FACE_ENABLED", "true").lower() in {"1", "true", "yes"}
         self._app = None
         self._load_lock = threading.Lock()
+        self._face_analysis_lock = threading.Lock()
+        self._recognition_lock = threading.Lock()
         self._retina = None
         self._recognition_session = None
         self.error = None
@@ -1513,7 +1516,7 @@ class FaceAdapter:
             model_path = os.path.join(model_root, os.getenv("FACE_MODEL_NAME", "buffalo_l"), "w600k_r50.onnx")
             if not os.path.isfile(model_path):
                 return None
-            providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
+            providers = face_onnx_providers("FACE_PROVIDERS")
             return onnxruntime.InferenceSession(model_path, providers=providers)
         except Exception:
             return None
@@ -1524,14 +1527,19 @@ class FaceAdapter:
             crop = crop.resize((112, 112))
             image = np.asarray(crop.convert("RGB"), dtype=np.float32)
             blob = ((image - 127.5) / 128.0).transpose(2, 0, 1)[None, ...]
-            output = self._recognition_session.run(
-                None, {self._recognition_session.get_inputs()[0].name: blob}
-            )[0]
+            with self._recognition_lock:
+                output = self._recognition_session.run(
+                    None, {self._recognition_session.get_inputs()[0].name: blob}
+                )[0]
             return [float(value) for value in output[0]]
         except Exception:
             return []
 
     def _detect_retina_tiled(self, image):
+        with face_gpu_inference_gate():
+            return self._detect_retina_tiled_unlocked(image)
+
+    def _detect_retina_tiled_unlocked(self, image):
         """RetinaFace tiled detection + SCRFD validity gate.
 
         RetinaFace finds face candidates (high recall), then buffalo_l SCRFD on
@@ -1565,7 +1573,8 @@ class FaceAdapter:
                 sub, sub_x, sub_y = self._expand_crop(image, bbox)
                 if sub is None:
                     continue
-                sub_faces = self._app.get(sub)
+                with self._face_analysis_lock:
+                    sub_faces = self._app.get(sub)
                 if not sub_faces:
                     # SCRFD finds no face here -> UNCERTAIN evidence only, never a
                     # cluster seed. RetinaFace landmark alignment is too unreliable
@@ -1711,14 +1720,20 @@ class FaceAdapter:
                 self._configure_onnx_runtime_libraries()
                 from insightface.app import FaceAnalysis
                 providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
-                kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
-                if self.identity_model in {"adaface", "magface"}:
-                    kwargs["allowed_modules"] = ["detection", "landmark_2d_106", "recognition"]
+                kwargs = {
+                    "name": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
+                    "providers": providers,
+                    "provider_options": face_onnx_provider_options("FACE_PROVIDERS"),
+                    # This adapter only consumes SCRFD landmarks and ArcFace
+                    # embeddings; avoid loading unused 3D/106-point/gender models.
+                    "allowed_modules": ["detection", "recognition"],
+                }
                 if os.getenv("FACE_MODEL_ROOT"):
                     kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
                 self._app = FaceAnalysis(**kwargs)
                 det_size = int(os.getenv("FACE_DET_SIZE", "640"))
-                self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
+                use_cuda = any(item.strip() == "CUDAExecutionProvider" for item in providers)
+                self._app.prepare(ctx_id=0 if use_cuda else -1, det_size=(det_size, det_size))
 
     @staticmethod
     def _expand_crop(image, bbox, margin=0.75, min_side=256):

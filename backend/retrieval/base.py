@@ -28,6 +28,7 @@ class HardFilterContext:
     negated_media: frozenset[str] = frozenset()      # must_not media (video etc.)
     negated_dimensions: frozenset[str] = frozenset()
     all_authorized: bool = False
+    place: str | None = None          # semantic place prefilter (recall backbone)
 
     @classmethod
     def from_spec(cls, spec) -> "HardFilterContext":
@@ -36,7 +37,10 @@ class HardFilterContext:
         media_types, negated_media = [], set()
         time_bounds = None
         negated_dimensions = set()
+        place = None
         for constraint in spec.constraints:
+            if constraint.dimension == "place" and not constraint.negated:
+                place = str(constraint.value or "").strip() or None
             if constraint.strictness != HARD:
                 continue
             if constraint.dimension == "media":
@@ -59,6 +63,7 @@ class HardFilterContext:
             negated_media=frozenset(negated_media),
             negated_dimensions=frozenset(negated_dimensions),
             all_authorized=spec.scope_mode == "all_authorized",
+            place=place,
         )
 
 

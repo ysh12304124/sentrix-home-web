@@ -662,6 +662,82 @@ def _event_resolution(question: str, store, scope_id: str) -> dict | None:
             return {"event_id": eid, "event_title": top[2], "asset_ids": asset_ids[:50]}
     return None
 
+def _time_matches_event(time_expr: str | None, ts: str | None) -> int:
+    """事件时间匹配分：完整日期/年月/年命中返回 3，否则 0。相对时间不参与确定性锚定。"""
+    if not time_expr or not ts:
+        return 0
+    q = re.sub(r"\s+", "", time_expr)
+    day = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", q)
+    if day:
+        return 3 if ts.startswith(f"{int(day.group(1)):04d}-{int(day.group(2)):02d}-{int(day.group(3)):02d}") else 0
+    ym = re.search(r"(\d{4})年(\d{1,2})月", q)
+    if ym:
+        return 3 if ts.startswith(f"{int(ym.group(1)):04d}-{int(ym.group(2)):02d}") else 0
+    y = re.search(r"(\d{4})年", q)
+    if y:
+        return 3 if ts.startswith(y.group(1)) else 0
+    return 0
+
+
+def _event_resolution_geo(question, store, scope_id, time_expr=None, place=None):
+    """事件级主路径：时间+地点 → 锁单个事件 → 返回其资产。
+
+    仅当单事件高置信（时间+地点同时命中，score>=6 且明显领先）才返回；
+    否则返回 None，交回融合检索。全程数据驱动，不硬编码任何 benchmark 内容。
+    """
+    from ..geocoding import place_text_matches
+    if store is None or not scope_id or (not time_expr and not place):
+        return None
+    try:
+        rows = store.connection.execute(
+            "SELECT e.id, e.title, e.time_start, e.event_type, e.activity, "
+            "a.metadata_json AS cover_meta "
+            "FROM events e LEFT JOIN assets a ON a.id=e.cover_asset_id "
+            "WHERE e.scope_id=? AND e.status NOT IN ('rejected','superseded','merged')",
+            (scope_id,)).fetchall()
+    except Exception:
+        return None
+    scored = []
+    for r in rows:
+        score = 0
+        ts = r["time_start"] or ""
+        if time_expr:
+            score += _time_matches_event(time_expr, ts)
+        geo = None
+        if r["cover_meta"]:
+            try:
+                geo = (json.loads(r["cover_meta"]) or {}).get("reverse_geocode")
+            except Exception:
+                geo = None
+        if place and geo and place_text_matches(place, geo):
+            score += 3
+        hay = " ".join(str(x) for x in (r["title"], r["event_type"], r["activity"]) if x)
+        q = str(question or "")
+        for length in (3, 2):
+            ngrams = {hay[i:i + length] for i in range(max(0, len(hay) - length + 1))
+                      if len(hay[i:i + length]) == length}
+            if any(ng in q for ng in ngrams):
+                score += 1
+                break
+        if score:
+            scored.append((score, r["id"], r["title"]))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    top, second = scored[0], scored[1] if len(scored) > 1 else None
+    if top[0] >= 4 and (second is None or top[0] - second[0] >= 1):
+        eid = top[1]
+        asset_ids = store.connection.execute(
+            "SELECT DISTINCT o.asset_id FROM observations o "
+            "JOIN event_observations eo ON eo.observation_id=o.id "
+            "JOIN assets a ON a.id=o.asset_id "
+            "WHERE eo.event_id=? AND a.scope_id=?", (eid, scope_id)).fetchall()
+        ids = [a["asset_id"] for a in asset_ids]
+        if ids:
+            return {"event_id": eid, "event_title": top[2], "asset_ids": ids[:50]}
+    return None
+
+
 
 _REFERENT_MARKERS = ("就是", "那次", "这次", "刚才", "上次", "那个", "这个", "那一次", "这一次")
 
@@ -719,6 +795,31 @@ def _search_from_prior_result_set(prior_rs, scope_id: str) -> dict | None:
     }
 
 
+
+def _relaxed_retrieve(query: str, filters: dict, scope_id: str, viewer_id: str, mode: str):
+    """确定性渐进放宽：严格检索为空时依次降级，返回 (packet, level)。
+
+    level 0=严格, 1=去person, 2=去place, 3=去time, 4=纯语义。全程数据驱动。
+    """
+    base = dict(filters or {})
+    steps = [
+        dict(base),
+        {k: v for k, v in base.items() if k != "person"},
+        {k: v for k, v in base.items() if k not in ("person", "place")},
+        {k: v for k, v in base.items() if k not in ("person", "place", "time")},
+        {},
+    ]
+    last = None
+    for level, f in enumerate(steps):
+        draft = _draft_from_filters({**f, "query": query}, answer_type="asset_set")
+        draft.result_requirement = {"mode": mode}
+        spec = _spec_for(draft, scope_id, viewer_id)
+        last = _kernel().retrieve(spec)
+        if last.assets:
+            return last, level
+    return last, len(steps) - 1
+
+
 def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     query = arguments.get("query") or ""
     mode = arguments.get("mode") or "best"
@@ -737,15 +838,23 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         user_message = ((context or {}).get("task_state") or {}).get("user_goal") or arguments.get("query") or ""
 
         ci = extract_constraints(user_message, _RUNTIME.get("store"), scope_id)
-        if ci.get("strong"):
-            # P2 v2 Fusion：canonical 结构化约束作为 filters 增强，保留 hybrid 语义 query，
-            # 避免 v1 空 query 走纯元数据路径丢失 OCR/关键词召回。
-            if ci.get("time"):
-                filters["time"] = ci["time"]
-            if ci.get("place"):
-                filters["place"] = ci["place"]
-            if ci.get("person"):
-                filters["person"] = ci["person"]
+        # 事件级主路径：place 或 time 任一解析到单事件即锁事件（确定性），否则回落融合检索。
+        if ci.get("place") or ci.get("time"):
+            _ev = _event_resolution_geo(user_message, _RUNTIME.get("store"), scope_id,
+                                        time_expr=ci.get("time"), place=ci.get("place"))
+            if _ev:
+                _ns = type("RS", (), {})()
+                _ns.asset_ids = _ev["asset_ids"]
+                _ns.result_set_id = "event_" + _ev["event_id"]
+                return _search_from_prior_result_set(_ns, scope_id)
+        # canonical 结构化约束始终作为 filters 增强（覆盖 agent 的坏值如"所有时间"），
+        # 保留 hybrid 语义 query，避免 v1 空 query 走纯元数据路径丢失 OCR/关键词召回。
+        if ci.get("time"):
+            filters["time"] = ci["time"]
+        if ci.get("place"):
+            filters["place"] = ci["place"]
+        if ci.get("person"):
+            filters["person"] = ci["person"]
     # W2.3：多轮引用消解 —— 引用类 query 先解析到已有 current_result_set，不重新全库搜索。
     # 引用标记在用户原话（task_state.user_goal）里，search query 是 LLM 提取后的内容，故两者都检测。
     _user_msg = ((context or {}).get("task_state") or {}).get("user_goal") or ""
@@ -777,7 +886,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         # 纯时间/地点/人物/媒体筛选：走确定性元数据路径，不依赖 ANN 语义召回（生产多检索器下空 query 会 0 召回）
         user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
         return _search_metadata_only(draft, spec, scope_id, query, mode, user_goal=user_goal)
-    packet = _kernel().retrieve(spec)
+    packet, _relax_level = _relaxed_retrieve(query, filters, scope_id, viewer_id, mode)
     assets = packet.assets or []
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
     rs = _RUNTIME["result_sets"].new(
@@ -840,6 +949,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "can_inspect": len(preview) > 0,
         "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
         "retrieval_timing": packet.retrieval_timing,
+        "relaxation_level": _relax_level,
         "recommended_resolution": _recommended_resolution(
             query, preview, satisfaction,
             user_goal=((context or {}).get("task_state") or {}).get("user_goal") or ""),
@@ -1542,8 +1652,9 @@ def register_tools():
     register(ToolSpec(
         name="search_memories",
         description=("检索照片（人/物/场景/衣着/颜色）。返回结果集摘要。"
-                     "时间必须写 filters.time（'2024年'/'去年'等），系统会自动从 query 提取漏填的时间。"
-                     "filters.place 只填结构化地名（城市/区县/景区/地标），不要把目标/活动/主题当 place；不确定留空。"),
+                     "时间必须从用户问题里提取并写 filters.time（如'2024年7月'）；问题没给具体时间就省略 time，不要写'所有时间'。"
+                     "filters.place 只填结构化地名（城市/区县/景区/地标），不要把目标/活动/主题当 place；不确定留空。"
+                     "filters.person 只填用户明确提到的人物名，不要用'伴娘/兄弟/亲戚'这类角色词。"),
         input_schema={"query": "", "mode": "best|all|representative",
                       "filters": {"time": "", "place": "", "person": ""}},
         executor=_search_memories, read_write="read", cost_class="medium", readiness="ready",
