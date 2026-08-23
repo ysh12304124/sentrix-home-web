@@ -18,7 +18,7 @@ from typing import Any
 
 # 硬值类型：出现这些类型的值必须原样保留
 HARD_KINDS = {"count", "date", "first", "last", "result_total",
-              "price", "phone", "year", "boolean"}
+              "price", "phone", "year", "boolean", "place"}
 
 # 价格/电话/年份提取（与 final_guard._check_ocr_hard_values 对齐）
 _PRICE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:元|块|¥|￥)")
@@ -31,6 +31,7 @@ _Q_DATE = re.compile(r"哪天|哪一天|几号|什么日期|日期是|拍摄日�
 _Q_YEAR = re.compile(r"哪一年|哪年|什么年份|年份|成立于|创立于|开业|创建于|几几年")
 _Q_BOOL = re.compile(r"有没有|是不是|是否|有没有拍|是否存在|有没有去过|有没有去过")
 _Q_PRICE = re.compile(r"多少钱|售价|价格|费用|收费|卖多少钱|多少钱一杯|多少钱一份|多少钱一(?:杯|份|听|瓶)")
+_Q_WHERE = re.compile(r"在哪里|在哪|哪儿|哪里|什么地点|哪个地方|在什么地方|在哪儿")
 
 
 @dataclass
@@ -169,7 +170,8 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                         nucleus.values.append(NucleusValue(
                             kind="year", value=m.group(1), certainty="confirmed",
                             source="ocr", display=m.group(1)))
-        # 4) 地点（GPS 反编码，条件匹配）
+        # 4) 地点（GPS 反编码，条件匹配）；where 题把匹配照片地点绑为硬值防编造
+        _place_counter: dict[str, int] = {}
         if tr.get("tool") == "search_memories":
             for p in (tr.get("preview") or []) or []:
                 place = str(p.get("place") or "").strip()
@@ -180,6 +182,14 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                     nucleus.values.append(NucleusValue(
                         kind="place", value=place, certainty="confirmed",
                         source="search_memories", display=place))
+                if len(place) >= 2:
+                    _place_counter[place] = _place_counter.get(place, 0) + 1
+        if _Q_WHERE.search(question) and _place_counter:
+            top_place, top_n = max(_place_counter.items(), key=lambda kv: kv[1])
+            if top_n >= 2 and top_place not in [v.display for v in nucleus.all("place")]:
+                nucleus.values.append(NucleusValue(
+                    kind="place", value=top_place, certainty="confirmed",
+                    source="search_memories_majority", display=top_place))
 
     # 5) 当前关注人物
     active = task_state.get("active_person")
