@@ -207,7 +207,7 @@ def _details(values, allowed, raw_labels):
 
 def normalize_semantic_analysis(analysis):
     """Normalize model semantic choices while preserving non-taxonomy labels."""
-    source = deepcopy(analysis or {})
+    source = deepcopy(analysis) if isinstance(analysis, dict) else {}
     semantic_input = source.get("semantic") if isinstance(source.get("semantic"), dict) else {}
     semantic_available = bool(
         semantic_input.get("available")
@@ -259,7 +259,9 @@ def normalize_semantic_analysis(analysis):
         if isinstance(item, str):
             item = {"label": item}
         if not isinstance(item, dict):
-            raw_labels["objects"].append(_text(item))
+            raw_value = _text(item)
+            if raw_value:
+                raw_labels["objects"].append(raw_value)
             continue
         detail_raw = []
         label = _text(item.get("label"))
@@ -299,4 +301,8 @@ def normalize_semantic_analysis(analysis):
     }
     normalized["scene_type"] = place_primary
     normalized["raw_labels"] = raw_labels
+    # Keep the top-level field aligned with the sanitized taxonomy list. The
+    # model may return numbers or other scalar values in objects; leaving the
+    # original list here lets downstream code call dict methods on them.
+    normalized["objects"] = objects
     return normalized

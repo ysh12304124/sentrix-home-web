@@ -1485,6 +1485,15 @@ class MemoryStore:
         self.connection.commit()
         return self.get_ingest_batch(batch_id)
 
+    def reopen_ingest_batch(self, batch_id):
+        """Reopen a completed batch so recovered assets can be finalized."""
+        self.connection.execute(
+            "UPDATE ingest_batches SET status = 'complete', updated_at = ? WHERE id = ? AND status = 'completed'",
+            (now_iso(), str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
     def batch_event_ids(self, batch_id):
         rows = self._rows(
             """SELECT DISTINCT eo.event_id FROM event_observations eo

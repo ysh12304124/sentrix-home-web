@@ -14,6 +14,9 @@ class _FakeStore:
     def cleanup_asset_derivatives(self, asset_id):
         self.cleaned.append(asset_id)
 
+    def get_asset(self, asset_id):
+        return {"id": asset_id, "metadata_json": {}}
+
     def update_asset(self, asset_id, status, metadata):
         self.failures[asset_id] = {"status": status, **metadata}
 
@@ -31,6 +34,18 @@ class _FakePipeline:
 
     def commit_semantic_image(self, asset_id, prepared, summarize_event=False):
         self.events.append(("semantic-commit", asset_id, summarize_event))
+
+
+class _BatchStore:
+    def __init__(self, rows, assets):
+        self.rows = rows
+        self.assets = assets
+
+    def _rows(self, query, params=()):
+        return self.rows
+
+    def get_asset(self, asset_id):
+        return self.assets[asset_id]
 
 
 class IngestSchedulerTests(unittest.TestCase):
@@ -91,6 +106,22 @@ class IngestSchedulerTests(unittest.TestCase):
         self.assertEqual(store.cleaned, ["asset-2"])
         self.assertEqual(store.failures["asset-2"]["failed_stage"], "fast")
         self.assertEqual(store.failures["asset-3"]["failed_stage"], "semantic")
+
+    def test_terminal_failed_assets_are_skipped_from_batch_work(self):
+        store = _BatchStore(
+            [{"id": "queued"}, {"id": "retryable"}, {"id": "terminal"}],
+            {
+                "queued": {"status": "queued", "metadata_json": {}},
+                "retryable": {"status": "failed", "metadata_json": {"pipeline_attempts": 1}},
+                "terminal": {"status": "failed", "metadata_json": {"pipeline_attempts": ingest_app.PIPELINE_MAX_ATTEMPTS}},
+            },
+        )
+
+        selected = ingest_app._batch_work_asset_ids(store, "batch-1")
+
+        self.assertIn("queued", selected)
+        self.assertIn("retryable", selected)
+        self.assertNotIn("terminal", selected)
 
 
 if __name__ == "__main__":

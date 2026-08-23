@@ -383,10 +383,19 @@ class IngestionPipeline:
         analysis["location_context"] = metadata.get("reverse_geocode") or {}
         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
         objects = analysis.get("objects") or []
-        object_text = " ".join(
-            item if isinstance(item, str) else " ".join(str(item.get(key, "")) for key in ("label", "primary", "details") if item.get(key))
-            for item in objects
-        )
+
+        def object_text(item):
+            if isinstance(item, str):
+                return item
+            if isinstance(item, dict):
+                return " ".join(
+                    str(item.get(key, ""))
+                    for key in ("label", "primary", "details")
+                    if item.get(key)
+                )
+            return str(item)
+
+        object_text = " ".join(object_text(item) for item in objects)
         text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text]))
         embedding_started = time.perf_counter()
         embedding = self.clip.embed_text(text)

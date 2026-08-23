@@ -69,6 +69,10 @@ SUPPORTED_IMPORT_SUFFIXES = {
 }
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
 IMPORT_DB_CHUNK_SIZE = max(1, int(os.getenv("SENTRIX_IMPORT_DB_CHUNK_SIZE", "32")))
+PIPELINE_MAX_RETRIES = max(0, int(os.getenv("SENTRIX_PIPELINE_MAX_RETRIES", "1")))
+PIPELINE_MAX_ATTEMPTS = PIPELINE_MAX_RETRIES + 1
+PIPELINE_WORK_STATUSES = ("queued", "failed", "video-queued", "video-processing-failed")
+PIPELINE_STALE_STATUSES = ("processing", "semantic_enriching")
 
 
 @contextlib.contextmanager
@@ -247,6 +251,52 @@ def _pipeline_worker_limits():
     }
 
 
+def _pipeline_attempt_count(asset):
+    metadata = (asset or {}).get("metadata_json") or {}
+    try:
+        return max(0, int(metadata.get("pipeline_attempts") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _batch_work_asset_ids(task_store, batch_id, *, include_stale=False):
+    statuses = list(PIPELINE_WORK_STATUSES)
+    if include_stale:
+        statuses.extend(PIPELINE_STALE_STATUSES)
+    placeholders = ",".join("?" for _ in statuses)
+    rows = task_store._rows(
+        f"SELECT id FROM assets WHERE batch_id = ? AND status IN ({placeholders}) ORDER BY created_at, id",
+        (batch_id, *statuses),
+    )
+    selected = []
+    for row in rows:
+        asset = task_store.get_asset(row["id"]) or {}
+        if asset.get("status") == "failed" and _pipeline_attempt_count(asset) >= PIPELINE_MAX_ATTEMPTS:
+            continue
+        selected.append(row["id"])
+    return selected
+
+
+def _recover_stale_batch_assets(task_store, batch_id):
+    """Requeue assets left active when a worker process was interrupted."""
+    rows = task_store._rows(
+        "SELECT id, status FROM assets WHERE batch_id = ? AND status IN (?, ?) ORDER BY created_at, id",
+        (batch_id, *PIPELINE_STALE_STATUSES),
+    )
+    recovered = []
+    for row in rows:
+        task_store.cleanup_asset_derivatives(row["id"])
+        task_store.update_asset(row["id"], "queued", {
+            "error": None,
+            "failed_stage": None,
+            "pipeline_attempts": 0,
+            "pipeline_retry_count": 0,
+            "pipeline_recovered_from_status": row["status"],
+        })
+        recovered.append(row["id"])
+    return recovered
+
+
 def _prepare_asset_stage(asset_id, stage):
     worker_store = MemoryStore(store.path)
     worker_pipeline = IngestionPipeline(
@@ -284,13 +334,25 @@ def _process_image_stages(image_ids, task_store, task_pipeline, limits):
     next_semantic_commit = 0
 
     def mark_fast_failed(asset_id, error):
+        asset = task_store.get_asset(asset_id) or {}
+        attempts = _pipeline_attempt_count(asset)
         with db_write_guard("ingest-commit-fast-error"):
             task_store.cleanup_asset_derivatives(asset_id)
-            task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
+            task_store.update_asset(asset_id, "failed", {
+                "error": str(error), "failed_stage": "fast",
+                "pipeline_failure_terminal": attempts >= PIPELINE_MAX_ATTEMPTS,
+            })
 
     def mark_semantic_failed(asset_id, error):
+        asset = task_store.get_asset(asset_id) or {}
+        attempts = _pipeline_attempt_count(asset)
         with db_write_guard("ingest-commit-semantic-error"):
-            task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic"})
+            if attempts >= PIPELINE_MAX_ATTEMPTS:
+                task_store.cleanup_asset_derivatives(asset_id)
+            task_store.update_asset(asset_id, "failed", {
+                "error": str(error), "failed_stage": "semantic",
+                "pipeline_failure_terminal": attempts >= PIPELINE_MAX_ATTEMPTS,
+            })
 
     def commit_semantic(asset_id):
         future = semantic_pending.pop(asset_id)
@@ -406,13 +468,33 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
         image_ids = []
         for asset_id in asset_ids:
             asset = task_store.get_asset(asset_id) or {}
-            if asset.get("media_type") == "image" and asset.get("status") in {"queued", "failed"}:
+            if asset.get("status") not in PIPELINE_WORK_STATUSES:
+                continue
+            attempts = _pipeline_attempt_count(asset) + 1
+            attempt_metadata = {
+                "pipeline_attempts": attempts,
+                "pipeline_retry_count": max(0, attempts - 1),
+                "pipeline_max_retries": PIPELINE_MAX_RETRIES,
+                "error": None,
+                "failed_stage": None,
+                "pipeline_failure_terminal": False,
+            }
+            if attempts > 1 and asset.get("media_type") == "image":
+                with db_write_guard("ingest-retry-cleanup"):
+                    task_store.cleanup_asset_derivatives(asset_id)
+            if asset.get("media_type") == "image":
                 with db_write_guard("ingest-group-mark-processing"):
                     task_store.update_asset(asset_id, "processing", {
-                        "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
+                        **attempt_metadata,
+                        "processing_timings": {
+                            **((asset.get("metadata_json") or {}).get("processing_timings") or {}),
+                            "queue_wait_seconds": round(time.perf_counter() - started_at, 4),
+                        },
                     })
                 image_ids.append(asset_id)
-            elif asset.get("status") in {"queued", "failed", "video-queued"}:
+            else:
+                with db_write_guard("ingest-group-mark-processing"):
+                    task_store.update_asset(asset_id, "processing", attempt_metadata)
                 process_asset(asset_id)
 
         _process_image_stages(image_ids, task_store, task_pipeline, limits)
@@ -468,24 +550,21 @@ def process_ingest_batch(asset_ids, batch_id):
     all_asset_ids = list(dict.fromkeys(asset_ids or []))
     pipeline_started_at = time.perf_counter()
     try:
-        first = True
+        with db_write_guard("ingest-recover-stale"):
+            recovered_ids = _recover_stale_batch_assets(task_store, batch_id)
+        all_asset_ids.extend(item for item in recovered_ids if item not in all_asset_ids)
         while True:
-            rows = task_store._rows(
-                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed', 'video-queued') ORDER BY created_at, id",
-                (batch_id,),
-            )
-            queued_ids = [row["id"] for row in rows]
+            queued_ids = _batch_work_asset_ids(task_store, batch_id)
             if queued_ids:
                 all_asset_ids.extend(item for item in queued_ids if item not in all_asset_ids)
                 _process_ingest_asset_group(queued_ids, batch_id, finalize_batch=False)
-                first = False
                 continue
             batch = task_store.get_ingest_batch(batch_id) or {}
             pending_row = task_store._row(
                 "SELECT COUNT(*) AS count FROM assets WHERE batch_id = ? AND status IN ('queued', 'processing', 'semantic_enriching')",
                 (batch_id,),
             )
-            if batch.get("status") == "complete" and not (pending_row and pending_row["count"]):
+            if batch.get("status") in {"complete", "completed"} and not (pending_row and pending_row["count"]):
                 break
             time.sleep(0.5)
 
@@ -508,6 +587,13 @@ def process_ingest_batch(asset_ids, batch_id):
                 "event_summary_call_count": len(event_results),
                 "event_summary_wall_seconds": summary_wall_seconds,
                 "event_summaries": event_results,
+                "failed_count": len(task_store._rows(
+                    "SELECT id FROM assets WHERE batch_id = ? AND status = 'failed'", (batch_id,)
+                )),
+                "failed_asset_ids": [row["id"] for row in task_store._rows(
+                    "SELECT id FROM assets WHERE batch_id = ? AND status = 'failed' ORDER BY created_at, id", (batch_id,)
+                )],
+                "pipeline_max_retries": PIPELINE_MAX_RETRIES,
                 "stage_timings": _pipeline_timing_summary(task_store, all_asset_ids),
                 "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4),
             }
@@ -3221,7 +3307,18 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
     with batch_worker_lock:
         worker_active = batch_id in active_batch_workers
     if not worker_active:
-        background_tasks.add_task(pipeline.finalize_ingest_batch, batch_id)
+        pending_ids = _batch_work_asset_ids(store, batch_id, include_stale=True)
+        if pending_ids:
+            if (store.get_ingest_batch(batch_id) or {}).get("status") == "completed":
+                with db_write_guard("ingest-batch-reopen-recovery"):
+                    store.reopen_ingest_batch(batch_id)
+            background_tasks.add_task(process_ingest_batch, pending_ids, batch_id)
+        else:
+            all_batch_ids = [row["id"] for row in store._rows(
+                "SELECT id FROM assets WHERE batch_id = ? ORDER BY created_at, id",
+                (batch_id,),
+            )]
+            background_tasks.add_task(process_ingest_batch, all_batch_ids, batch_id)
     return _batch_status(batch_id)
 
 
