@@ -1,6 +1,13 @@
 #!/bin/bash
 # Sentrix production API (8091). RX answer pipeline enabled (validated 14/14 on 8092).
 # 12B-FC validation flags are intentionally NOT here — those are test-only.
+# bge-m3 text embedder sidecar keepalive（SENTRIX_TEXT_EMBEDDER=bge 依赖）
+if ! curl -s -m 2 http://127.0.0.1:8101/health >/dev/null 2>&1; then
+  echo starting bge sidecar
+  cd /home/asus/Github/Sentrix-Home-Web
+  PYTHONNOUSERSITE=1 HF_ENDPOINT=https://hf-mirror.com HF_HUB_OFFLINE=1 SENTRIX_TEXT_EMBEDDER_DEVICE=cpu     setsid nohup .venv-text/bin/python scripts/maintenance/text_embedder_sidecar.py > /tmp/bge_sidecar.log 2>&1 < /dev/null &
+  sleep 5
+fi
 cd /home/asus/Github/Sentrix-Home-Web
 # AdaFace checkpoint unpickles torchmetrics, which needs the user-site
 # transformers package in the current Python environment.  Some shells export
