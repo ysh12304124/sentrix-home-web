@@ -547,3 +547,26 @@ git diff --check
 - 项目记忆双层存储约定不变：153 本文档为完整权威来源，Project Memory MCP
   `projects/sentrix-home-web/` 保存精炼共享摘要、任务、决策与 handoff；重要提交后
   两边同时更新。
+
+## 8091 安全重启 SOP 与检索健康探测（2026-08-23 benchmark 侧部署）
+
+- 背景：2026-08-22 排查确认，重启 8091 若只按端口杀监听进程，进程树中持
+  qdrant 目录锁的进程会存活，导致新进程向量层降级 SQLite 全表扫（恒定
+  20-25s、无报错）。同日代码已补可观测性（`476f649b`：qdrant 锁失败打限流
+  ERROR、`/api/health` 的 `memory.vectorIndex` 暴露 degraded/按路 telemetry）。
+- 本机脚本（`scripts/`，由 benchmark 项目同名脚本改编，去 ssh 层）：
+  - `restart_sentrix_8091_153.sh`：安全重启 SOP——8771 活跃 run 拦截
+    （`--force` 跳过）→ 按完整命令行精确 pkill（`[b]ackend` 字符类防自匹配）
+    → pgrep 复核全灭（残留强杀）→ `scripts/runtime/start_sentrix_api_8091.sh`
+    拉起 → health 就绪 → 自动跑 Level 1 检索探测。重启 8091 一律用本脚本，
+    禁止 `lsof -ti :8091 | xargs kill`。
+  - `probe_sentrix_retrieval.py`：两级检索探测。Level 1 查 health 的
+    vectorIndex（qdrant 可用/未降级/锁无失败/p95，秒级、无需主模型）；
+    `--live` 追加 5 个固定问题走 assistant/turn 断言单次 search_memories
+    < 3s（需 8100 主模型在线）。改动 8091/向量库后必跑。
+- 用法（153 本机）：
+  `bash scripts/restart_sentrix_8091_153.sh`（常规）或 `--force`；
+  `python3 scripts/probe_sentrix_retrieval.py --host 127.0.0.1:8091 [--live]`。
+- 降级判断速查：`curl -s localhost:8091/api/health | python3 -m json.tool`
+  看 `memory.vectorIndex.degraded`；日志 `logs/sentrix-api-8091.log` 搜
+  "qdrant dir lock"。
