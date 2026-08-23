@@ -3513,6 +3513,52 @@ class MemoryStore:
             return self.get_entity(existing["id"])
         return self.create_entity(name, entity_type, "pending", confidence=confidence, summary=summary, scope_id=scope_id)
 
+    def _find_or_create_entities_batch(self, specs, scope_id, confidence):
+        """Prefetch known entities, then create only missing names."""
+        unique_specs = []
+        seen = set()
+        for entity_type, name, summary in specs:
+            key = (entity_type, str(name or '').strip())
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            unique_specs.append((key[0], key[1], summary))
+        if not unique_specs:
+            return {}
+        grouped = {}
+        for entity_type, name, _summary in unique_specs:
+            grouped.setdefault(entity_type, []).append(name)
+        entities = {}
+        for entity_type, names in grouped.items():
+            placeholders = ','.join('?' for _ in names)
+            rows = self._rows(
+                f"""SELECT * FROM entities
+                WHERE scope_id = ? AND entity_type = ? AND canonical_name IN ({placeholders})
+                AND status != 'rejected'
+                ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'confirmed' THEN 1 ELSE 2 END,
+                         updated_at DESC""",
+                [scope_id or 'home-default', entity_type, *names],
+            )
+            for row in rows:
+                entities.setdefault((entity_type, row['canonical_name']), row)
+        existing = [entities[(entity_type, name)] for entity_type, name, _summary in unique_specs if (entity_type, name) in entities]
+        timestamp = now_iso()
+        if existing:
+            self.connection.executemany(
+                "UPDATE entities SET confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
+                [(float(confidence or 0), timestamp, row['id']) for row in existing],
+            )
+            for row in existing:
+                entities[(row['entity_type'], row['canonical_name'])] = self.get_entity(row['id'])
+        for entity_type, name, summary in unique_specs:
+            key = (entity_type, name)
+            if key not in entities:
+                entities[key] = self.create_entity(
+                    name, entity_type, 'pending', confidence=confidence,
+                    summary=summary, scope_id=scope_id,
+                )
+        return entities
+
     @_defer_entity_maintenance_commits
     def maintain_observation_entities(self, observation_id, event_id=None):
         """Create evidence-backed non-person entities from existing observations."""
@@ -3563,25 +3609,39 @@ class MemoryStore:
             ("atmosphere", atmosphere_names, "由图片观察到的画面氛围"),
             ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
         ]
-        entities = []
-        place_entity = None
-        time_entity = None
+        specs = []
         for entity_type, names, summary in values:
             for name in names if isinstance(names, list) else [names]:
-                entity = self._find_or_create_entity(name, entity_type, scope_id, observation.get("confidence", 0), summary)
-                if not entity:
+                specs.append((entity_type, name, summary))
+        entity_lookup = self._find_or_create_entities_batch(
+            specs, scope_id, observation.get("confidence", 0),
+        )
+        entities = []
+        entity_ids = set()
+        observation_confidence = float(observation.get("confidence", 0) or 0)
+        observation_timestamp = now_iso()
+        observation_links = []
+        place_entity = None
+        time_entity = None
+        for entity_type, names, _summary in values:
+            for name in names if isinstance(names, list) else [names]:
+                entity = entity_lookup.get((entity_type, str(name or "").strip()))
+                if not entity or entity["id"] in entity_ids:
                     continue
-                self.connection.execute(
-                    """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
-                    VALUES (?, ?, ?, 'observation_extraction', ?) ON CONFLICT(entity_id, observation_id)
-                    DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
-                    (entity["id"], observation_id, float(observation.get("confidence", 0) or 0), now_iso()),
-                )
+                observation_links.append((entity["id"], observation_id, observation_confidence, observation_timestamp))
                 if entity_type == "place":
                     place_entity = entity
                 if entity_type == "time":
                     time_entity = entity
+                entity_ids.add(entity["id"])
                 entities.append(entity)
+        if observation_links:
+            self.connection.executemany(
+                """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
+                VALUES (?, ?, ?, 'observation_extraction', ?) ON CONFLICT(entity_id, observation_id)
+                DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
+                observation_links,
+            )
         evidence_ids = [observation_id, event_id] if event_id else [observation_id]
         if place_entity:
             if gps_place:

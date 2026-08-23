@@ -3104,6 +3104,7 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
     imported = []
     skipped = []
     queued_asset_ids = []
+    prepared_records = []
     for path in candidates:
         metadata = {
             "scope_id": scope,
@@ -3117,36 +3118,66 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
             "captured_location": request.captured_location,
         }
         target = path
-        if request.copy_file:
-            target = MEDIA_DIR / f"{make_id('import')}_{path.name}"
-            shutil.copy2(path, target)
+        copy_started = time.perf_counter()
         try:
-            copy_started = time.perf_counter()
-            with db_write_guard("import-directory-file"):
-                created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
-                if created.get("media_type") == "video" and created.get("path") == str(target):
-                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
-                created = store.update_asset(created["id"], created.get("status") or "queued", {
-                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
-                })
+            if request.copy_file:
+                target = MEDIA_DIR / f"{make_id('import')}_{path.name}"
+                shutil.copy2(path, target)
+            file_save_seconds = round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0
+            prepared = pipeline.prepare_asset(target, file_name=path.name, metadata=metadata)
+            prepared["metadata"]["import_timings"] = {
+                **(prepared["metadata"].get("import_timings") or {}),
+                "file_save_seconds": file_save_seconds,
+            }
+            prepared_records.append({"source_path": path, "target": target, "prepared": prepared})
         except Exception as error:
             if request.copy_file:
                 target.unlink(missing_ok=True)
             skipped.append({"path": str(path), "reason": str(error)})
-            continue
-        deduplicated = created.get("path") != str(target)
-        if request.copy_file and deduplicated:
-            target.unlink(missing_ok=True)
-        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
-            queued_asset_ids.append(created["id"])
-        imported.append({
-            "asset_id": created["id"],
-            "file_name": created["file_name"],
-            "media_type": created["media_type"],
-            "status": created["status"],
-            "deduplicated": deduplicated,
-            "source_path": str(path),
-        })
+
+    for offset in range(0, len(prepared_records), IMPORT_DB_CHUNK_SIZE):
+        chunk = prepared_records[offset:offset + IMPORT_DB_CHUNK_SIZE]
+        chunk_imported = []
+        chunk_queued_asset_ids = []
+        cleanup_paths = []
+        try:
+            with db_write_guard("import-directory-chunk"):
+                with store.transaction():
+                    created_batch = pipeline.create_assets([item["prepared"] for item in chunk])
+                    for item, created in zip(chunk, created_batch):
+                        target = item["target"]
+                        if created.get("media_type") == "video" and created.get("path") == str(target):
+                            created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                        created = store.update_asset(created["id"], created.get("status") or "queued", {
+                            "import_timings": {
+                                **((created.get("metadata_json") or {}).get("import_timings") or {}),
+                                "file_save_seconds": (item["prepared"].get("metadata") or {}).get("import_timings", {}).get("file_save_seconds", 0.0),
+                            }
+                        })
+                        deduplicated = created.get("path") != str(target)
+                        if deduplicated:
+                            cleanup_paths.append(target)
+                        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
+                            chunk_queued_asset_ids.append(created["id"])
+                        chunk_imported.append({
+                            "asset_id": created["id"],
+                            "file_name": created["file_name"],
+                            "media_type": created["media_type"],
+                            "status": created["status"],
+                            "deduplicated": deduplicated,
+                            "source_path": str(item["source_path"]),
+                        })
+            imported.extend(chunk_imported)
+            queued_asset_ids.extend(chunk_queued_asset_ids)
+            for target in cleanup_paths:
+                if request.copy_file:
+                    target.unlink(missing_ok=True)
+        except Exception as error:
+            for item in chunk:
+                if request.copy_file:
+                    item["target"].unlink(missing_ok=True)
+                skipped.append({"path": str(item["source_path"]), "reason": str(error)})
+
     if queued_asset_ids:
         store.complete_ingest_batch(batch_id)
         background_tasks.add_task(process_ingest_batch, queued_asset_ids, batch_id)
