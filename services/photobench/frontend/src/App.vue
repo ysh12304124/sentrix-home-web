@@ -1134,6 +1134,14 @@ function pipelineMetricRows(phase = {}) {
 }
 
 async function loadRuns() { runs.value = (await api("/api/runs")).runs || []; }
+function runProgressLabel(run) {
+  if (run?.mode === "build") return "—";
+  const progress = run?.phases?.qa_eval?.progress;
+  if (progress && progress.judge_total != null) {
+    return `${progress.judge_completed ?? 0}/${progress.judge_total}`;
+  }
+  return `${run?.summary?.completed || 0}/${run?.summary?.total || run?.qa_count || 0}`;
+}
 async function loadQaPage(page = qaPage.value.page || 1) {
   if (!activeRunId.value) return;
   const runId = activeRunId.value;
@@ -1546,7 +1554,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <td>
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
-<td>{{ run.mode === 'build' ? '—' : `${run.summary?.completed || 0}/${run.summary?.total || run.qa_count || 0}` }}</td>
+<td>{{ runProgressLabel(run) }}</td>
 <td>{{ fmtPct(run.summary?.retrieval_recall_micro) }}</td>
 <td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>

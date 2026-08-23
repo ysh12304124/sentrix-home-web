@@ -66,6 +66,12 @@ EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
 PERSIST_DEBOUNCE_SECONDS = max(
     0.05, float(os.environ.get("PHOTOBENCH_PERSIST_DEBOUNCE_SECONDS", "0.25"))
 )
+JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "3")))
+JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "1.0")))
+JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
+    JUDGE_RETRY_BACKOFF_SECONDS,
+    float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_MAX_SECONDS", "8.0")),
+)
 
 
 def _load_judge_providers():
@@ -1764,8 +1770,8 @@ class BenchmarkRun:
             judge_submitted = getattr(self, "_qa_judge_submitted", 0)
             self._record_phase("qa_eval", "progress", {
                 "total": total_qa,
-                # ``completed`` remains Agent completion for old UI clients.
-                "completed": agent_done,
+                # User-facing completion means Judge reached a terminal state.
+                "completed": judge_done,
                 "agent_completed": agent_done,
                 "agent_total": total_qa,
                 "agent_in_flight": max(0, total_qa - agent_done),
@@ -1819,6 +1825,7 @@ class BenchmarkRun:
                     # item as skipped so the two progress counters can finish.
                     self._qa_judge_skipped += 1
                     self._qa_judge_completed += 1
+                    item["judge_status"] = "skipped"
                     with self.lock:
                         record_qa_progress()
                         self.persist()
@@ -2165,6 +2172,11 @@ class BenchmarkRun:
             call_metrics, tool_trace, wall_clock_ms, agent_wall_ms, judge_ms,
             timeline, bool(item.get("tool_trace_recorded")), queue_wait_ms,
         )
+        all_judge_outputs = [judge, evidence_judge, *task_judges]
+        judge_terminal_status = "failed" if any(
+            isinstance(value, dict) and value.get("judge_status") == "failed"
+            for value in all_judge_outputs
+        ) else "completed"
         item.update({
             "judge": judge or {"score": None, "reason": "not_applicable"},
             "task_judge": task_judge,
@@ -2172,7 +2184,7 @@ class BenchmarkRun:
             "evidence_judge": evidence_judge or {"score": None, "reason": "not_applicable"},
             "judge_ms": judge_ms,
             "wall_clock_ms": wall_clock_ms,
-            "judge_status": "completed",
+            "judge_status": judge_terminal_status,
             "timing_breakdown": timing_breakdown,
         })
         item["agent_stability"] = self._agent_stability(item)
@@ -2694,8 +2706,7 @@ class BenchmarkRun:
                          {"role": "user", "content": judge_text}],
         }
         try:
-            raw = request_json(self._judge_chat_url(), payload, "POST", 180,
-                               self._judge_headers())
+            raw, retry_attempts = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             start, end = text.find("{"), text.rfind("}")
             try:
@@ -2717,8 +2728,7 @@ class BenchmarkRun:
                     "messages": [{"role": "system", "content": retry_system}, payload["messages"][1]],
                 }
                 try:
-                    retry_raw = request_json(self._judge_chat_url(), retry_payload, "POST", 180,
-                                             self._judge_headers())
+                    retry_raw, _ = self._judge_request(retry_payload)
                     retry_text = str(retry_raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
                     retry_parsed = self._parse_judge_json(retry_text)
                     retry_score = retry_parsed.get("score") if retry_parsed.get("score") in {0, 1, 2} else None
@@ -2737,9 +2747,12 @@ class BenchmarkRun:
                 "reason": reason,
                 "input": payload,
                 "raw_text": text,
+                "judge_status": "completed",
+                "judge_retry_attempts": retry_attempts,
             }
         except Exception as e:
-            return {"score": None, "reason": f"judge_error: {e}", "input": payload}
+            return {"score": None, "reason": f"judge_error: {e}", "input": payload,
+                    "judge_status": "failed"}
 
     def _judge_task_action(self, question: str, answer: str, expected_action: str | None,
                            agent_status: str | None, termination_reason: str,
@@ -2777,8 +2790,7 @@ class BenchmarkRun:
                          {"role": "user", "content": prompt}],
         }
         try:
-            raw = request_json(self._judge_chat_url(), payload, "POST", 180,
-                               self._judge_headers())
+            raw, _ = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
             actual = parsed.get("actual_action") if parsed.get("actual_action") in {"answer", "refuse", "clarify", "none"} else None
@@ -2790,10 +2802,12 @@ class BenchmarkRun:
                 "reason": str(parsed.get("reason") or text[:200]),
                 "input": payload,
                 "raw_text": text,
+                "judge_status": "completed",
             }
         except Exception as exc:
             return {"expected_action": expected_action, "actual_action": None, "correct": None,
-                    "reason": f"judge_error: {exc}", "input": payload}
+                    "reason": f"judge_error: {exc}", "input": payload,
+                    "judge_status": "failed"}
 
     def _judge_evidence(self, question: str, answer: str, predicted_images: list[dict],
                         assets_by_name: dict, sentrix_url: str,
@@ -2821,21 +2835,21 @@ class BenchmarkRun:
                          {"role": "user", "content": content}],
         }
         try:
-            raw = request_json(self._judge_chat_url(), payload, "POST", 180,
-                               self._judge_headers())
+            raw, _ = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
             applicable = parsed.get("applicable") is not False
             if not applicable:
                 return {"score": None, "applicable": False,
                         "reason": str(parsed.get("reason") or "no_visual_claims"),
-                        "input": payload, "raw_text": text}
+                        "input": payload, "raw_text": text, "judge_status": "completed"}
             score = parsed.get("score") if parsed.get("score") in {0, 1, 2} else None
             return {"score": score, "applicable": True,
                     "reason": str(parsed.get("reason") or text[:200]),
-                    "input": payload, "raw_text": text}
+                    "input": payload, "raw_text": text, "judge_status": "completed"}
         except Exception as exc:
-            return {"score": None, "reason": f"judge_error: {exc}", "input": payload}
+            return {"score": None, "reason": f"judge_error: {exc}", "input": payload,
+                    "judge_status": "failed"}
 
     @staticmethod
     def _parse_judge_json(text: str) -> dict:
@@ -2853,6 +2867,30 @@ class BenchmarkRun:
         if url.endswith("/v1") or url.endswith("/v3") or url.endswith("/v2"):
             return f"{url}/chat/completions"
         return f"{url}/v1/chat/completions"
+
+    def _judge_request(self, payload: dict, timeout: int = 180) -> tuple[dict, int]:
+        """Call remote Judge with bounded exponential-backoff retries."""
+        last_error = None
+        for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
+            try:
+                response = request_json(
+                    self._judge_chat_url(), payload, "POST", timeout,
+                    self._judge_headers(),
+                )
+                if not isinstance(response, dict):
+                    raise ValueError("judge response is not an object")
+                return response, attempt
+            except Exception as exc:
+                last_error = exc
+                if attempt >= JUDGE_RETRY_ATTEMPTS:
+                    break
+                delay = min(JUDGE_RETRY_BACKOFF_MAX_SECONDS,
+                            JUDGE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                if self._cancel.wait(delay):
+                    raise RunCancelledError("cancelled while retrying Judge request") from exc
+        raise RuntimeError(
+            f"judge request failed after {JUDGE_RETRY_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     def _judge_headers(self) -> dict[str, str]:
         api_key = getattr(self, "judge_api_key", JUDGE_API_KEY)
@@ -2932,7 +2970,7 @@ class BenchmarkRun:
         summary = {
             # build 模式不做 QA；total 置 0 避免前端把未执行的题数渲染成 0/N。
             "total": len(self.qa_rows) if self.mode != "build" else 0,
-            "completed": len(items),
+            "completed": sum(1 for item in items if item.get("judge_status") in {"completed", "failed", "skipped"}),
             "retrieval_recall_mean": round(sum(recalls) / len(recalls), 3) if recalls else None,
             "judge_distribution": distribution,
             "judge_valid_count": denom,
@@ -3776,7 +3814,7 @@ class OrchestratorRepository:
                     attribution_layers[str(key)] = attribution_layers.get(str(key), 0) + 1
         saved.update({
             "total": saved.get("total", state.get("qa_count") or len(items)),
-            "completed": len(items),
+            "completed": sum(1 for item in items if item.get("judge_status") in {"completed", "failed", "skipped"}),
             "judge_valid_count": len(scores),
             "judge_distribution": distribution,
             "retrieval_recall_mean": saved.get("retrieval_recall_mean", round(sum(recalls) / len(recalls), 3) if recalls else None),
