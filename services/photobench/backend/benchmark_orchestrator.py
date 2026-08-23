@@ -1805,89 +1805,100 @@ class BenchmarkRun:
             self._qa_submitted = total_qa
             record_qa_progress()
 
-            for future in concurrent.futures.as_completed(agent_futures):
-                index = agent_futures[future]
-                try:
-                    item = future.result()
-                    agent_failed = bool(item.get("failed")) or bool(item.get("error"))
-                except Exception as exc:
-                    item = {"index": index, "error": repr(exc), "failed": True}
-                    agent_failed = True
-                item["_index"] = index
-                with self.lock:
-                    self.state["items"].append(item)
-                    self._qa_agent_completed += 1
-                    record_qa_progress()
-                    self.persist()
+            # One completion loop services both pools.  This keeps Agent and
+            # Judge truly pipelined: a finished Judge is merged immediately,
+            # even while other Agent futures are still running.
+            pending = {future: ("agent", index) for future, index in agent_futures.items()}
+            agent_phase_recorded = False
 
-                if agent_failed:
-                    # There is no Agent answer for Judge to score. Count this
-                    # item as skipped so the two progress counters can finish.
-                    self._qa_judge_skipped += 1
-                    self._qa_judge_completed += 1
-                    item["judge_status"] = "skipped"
-                    with self.lock:
-                        record_qa_progress()
-                        self.persist()
-                    continue
+            def record_agent_phase_finished() -> None:
+                nonlocal agent_phase_recorded
+                if agent_phase_recorded:
+                    return
+                agent_phase_recorded = True
+                agent_phase_finished_perf = time.perf_counter()
+                agent_phase_finished_epoch = round(time.time(), 3)
+                agent_phase_wall_ms = round(
+                    (agent_phase_finished_perf - agent_phase_started_perf) * 1000, 1
+                )
+                self._record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+                self._record_phase("qa_eval", "agent_phase_finished_at_epoch", agent_phase_finished_epoch)
+                self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
+                self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
+                self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
+                self._gpu_sampler.stop()
 
-                if judge_phase_started_perf is None:
-                    judge_phase_started_perf = time.perf_counter()
-                    judge_phase_started_epoch = round(time.time(), 3)
-                    self._record_phase("qa_eval", "judge_phase_started_at", now_iso())
-                    self._record_phase("qa_eval", "judge_phase_started_at_epoch", judge_phase_started_epoch)
-                item.setdefault("timing_breakdown", {}).setdefault("timeline", {})[
-                    "judge_queued_at_epoch"
-                ] = round(time.time(), 3)
-                self._qa_judge_submitted += 1
-                # Judge must not mutate the shared item while the main thread
-                # persists state. Merge its result back in the completion loop.
-                judge_item = copy.deepcopy(item)
-                judge_futures[judge_executor.submit(
-                    self._judge_item, judge_item, self.qa_rows[index], assets_by_name,
-                )] = index
-                with self.lock:
-                    record_qa_progress()
-                    self.persist()
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    kind, index = pending.pop(future)
+                    if kind == "agent":
+                        try:
+                            item = future.result()
+                            agent_failed = bool(item.get("failed")) or bool(item.get("error"))
+                        except Exception as exc:
+                            item = {"index": index, "error": repr(exc), "failed": True}
+                            agent_failed = True
+                        item["_index"] = index
+                        if agent_failed:
+                            # There is no Agent answer for Judge to score.
+                            item["judge_status"] = "skipped"
+                            self._qa_judge_skipped += 1
+                            self._qa_judge_completed += 1
+                        else:
+                            if judge_phase_started_perf is None:
+                                judge_phase_started_perf = time.perf_counter()
+                                judge_phase_started_epoch = round(time.time(), 3)
+                                self._record_phase("qa_eval", "judge_phase_started_at", now_iso())
+                                self._record_phase("qa_eval", "judge_phase_started_at_epoch", judge_phase_started_epoch)
+                            item.setdefault("timing_breakdown", {}).setdefault("timeline", {})[
+                                "judge_queued_at_epoch"
+                            ] = round(time.time(), 3)
+                            self._qa_judge_submitted += 1
+                            judge_item = copy.deepcopy(item)
+                            judge_future = judge_executor.submit(
+                                self._judge_item, judge_item, self.qa_rows[index], assets_by_name,
+                            )
+                            judge_futures[judge_future] = index
+                            pending[judge_future] = ("judge", index)
+                        with self.lock:
+                            self.state["items"].append(item)
+                            self._qa_agent_completed += 1
+                            record_qa_progress()
+                            self.persist()
+                        if not any(k == "agent" for k, _ in pending.values()):
+                            record_agent_phase_finished()
+                    else:
+                        try:
+                            judged_item = future.result()
+                            with self.lock:
+                                item = next((candidate for candidate in self.state["items"]
+                                             if candidate.get("_index") == index), None)
+                                if item is not None and isinstance(judged_item, dict):
+                                    item.update({
+                                        key: value for key, value in judged_item.items()
+                                        if key != "_index"
+                                    })
+                        except Exception as exc:
+                            with self.lock:
+                                item = next((candidate for candidate in self.state["items"]
+                                             if candidate.get("_index") == index), None)
+                                if item is not None:
+                                    item.update({
+                                        "judge": {"score": None, "reason": f"judge_error: {exc}"},
+                                        "task_judge": {"actual_action": None, "correct": None,
+                                                        "reason": f"judge_error: {exc}"},
+                                        "evidence_judge": {"score": None, "reason": "judge_error"},
+                                        "judge_status": "failed",
+                                    })
+                        self._qa_judge_completed += 1
+                        with self.lock:
+                            record_qa_progress()
+                            self.persist()
 
-            agent_phase_finished_perf = time.perf_counter()
-            agent_phase_finished_epoch = round(time.time(), 3)
-            agent_phase_wall_ms = round((agent_phase_finished_perf - agent_phase_started_perf) * 1000, 1)
-            self._record_phase("qa_eval", "agent_phase_finished_at", now_iso())
-            self._record_phase("qa_eval", "agent_phase_finished_at_epoch", agent_phase_finished_epoch)
-            self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
-            self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
-            self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
-            self._gpu_sampler.stop()
-
-            for future in concurrent.futures.as_completed(judge_futures):
-                index = judge_futures[future]
-                try:
-                    judged_item = future.result()
-                    with self.lock:
-                        item = next((candidate for candidate in self.state["items"]
-                                     if candidate.get("_index") == index), None)
-                        if item is not None and isinstance(judged_item, dict):
-                            item.update({
-                                key: value for key, value in judged_item.items()
-                                if key != "_index"
-                            })
-                except Exception as exc:
-                    with self.lock:
-                        item = next((candidate for candidate in self.state["items"]
-                                     if candidate.get("_index") == index), None)
-                        if item is not None:
-                            item.update({
-                                "judge": {"score": None, "reason": f"judge_error: {exc}"},
-                                "task_judge": {"actual_action": None, "correct": None,
-                                                "reason": f"judge_error: {exc}"},
-                                "evidence_judge": {"score": None, "reason": "judge_error"},
-                                "judge_status": "failed",
-                            })
-                self._qa_judge_completed += 1
-                with self.lock:
-                    record_qa_progress()
-                    self.persist()
+            record_agent_phase_finished()
 
             if judge_phase_started_perf is not None:
                 judge_phase_finished_perf = time.perf_counter()
