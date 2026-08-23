@@ -99,7 +99,8 @@ def _defer_entity_maintenance_commits(method):
         self._defer_entity_maintenance_commits = True
         try:
             result = method(self, *args, **kwargs)
-            self.connection.commit()
+            _commit_with_retry(self.connection, "entity-maintenance")
+            self._flush_pending_qdrant_upserts()
             return result
         except Exception:
             self.connection.rollback()
@@ -108,6 +109,24 @@ def _defer_entity_maintenance_commits(method):
             self._defer_entity_maintenance_commits = previous
 
     return wrapped
+
+
+_SQLITE_COMMIT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.5, 1.0)
+
+
+def _commit_with_retry(connection, label="sqlite-commit"):
+    """Retry only the commit boundary; callers remain responsible for idempotency."""
+    delays = (0.0, *_SQLITE_COMMIT_RETRY_DELAYS)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            connection.commit()
+            return
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).lower() or attempt == len(delays) - 1:
+                raise
+            print(f"[sqlite-commit-retry] {label} attempt={attempt + 1}", flush=True)
 
 
 def json_value(value, fallback):
@@ -342,7 +361,8 @@ class MemoryStore:
             raise
         else:
             if depth == 0:
-                self.connection.commit()
+                _commit_with_retry(self.connection, "transaction")
+                self._flush_pending_qdrant_upserts()
         finally:
             self._transaction_depth = depth
 
@@ -1311,7 +1331,29 @@ class MemoryStore:
 
     def _commit(self):
         if not getattr(self, "_defer_entity_maintenance_commits", False) and not getattr(self, "_transaction_depth", 0):
-            self.connection.commit()
+            _commit_with_retry(self.connection)
+
+    def _queue_qdrant_upsert(self, payload):
+        pending = getattr(self, "_pending_qdrant_upserts", None)
+        if pending is None:
+            pending = []
+            self._pending_qdrant_upserts = pending
+        pending.append(payload)
+
+    def _flush_pending_qdrant_upserts(self):
+        pending = getattr(self, "_pending_qdrant_upserts", None)
+        if not pending:
+            return
+        self._pending_qdrant_upserts = []
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is None:
+                return
+            for payload in pending:
+                accelerator.upsert(**payload)
+        except Exception as error:
+            print(f"[qdrant-derived-write] deferred upsert failed: {type(error).__name__}: {error}", flush=True)
 
     def _decode(self, row, fields):
         if not row:
@@ -3368,20 +3410,15 @@ class MemoryStore:
         )
         self._commit()
         row = self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
-        try:
-            from .qdrant_memory import get_qdrant_index
-            accelerator = get_qdrant_index(self.path)
-            if accelerator is not None:
-                accelerator.upsert(
-                    row_id=row["id"], scope_id=row["scope_id"], space=space,
-                    source_type=source_type, source_id=source_id, vector=values,
-                    model_name=model_name, metadata=metadata,
-                    created_at=row["created_at"], updated_at=row["updated_at"],
-                )
-        except Exception:
-            # Qdrant is a derived acceleration layer.  SQLite commit above is
-            # authoritative and must never be rolled back by index failure.
-            pass
+        payload = {
+            "row_id": row["id"], "scope_id": row["scope_id"], "space": space,
+            "source_type": source_type, "source_id": source_id, "vector": values,
+            "model_name": model_name, "metadata": metadata,
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+        self._queue_qdrant_upsert(payload)
+        if not getattr(self, "_transaction_depth", 0) and not getattr(self, "_defer_entity_maintenance_commits", False):
+            self._flush_pending_qdrant_upserts()
         return row
 
     def search_vectors(self, space, vector, limit=10, scope_id=None, model_name=None, route=None):
@@ -5351,30 +5388,34 @@ class MemoryStore:
         return self.get_event(target_event_id)
 
     def _refresh_event_participants(self, observation_ids):
+        # Group observations first: one event summary/transaction per affected event.
+        event_observations = {}
         for observation_id in set(observation_ids):
-            rows = self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,))
-            for row in rows:
-                event = self.get_event(row["event_id"])
-                participants = event.get("participants") or []
-                observation = self.get_observation(observation_id) or {}
-                merged = participants[:]
-                for key in self._confirmed_entity_ids_for_observation(observation_id):
-                    entity = self.get_entity(key)
-                    person = {"entity_id": key, "name": entity["canonical_name"], "status": "confirmed"}
-                    if not any((item.get("entity_id") if isinstance(item, dict) else item) == key for item in merged):
-                        merged.append(person)
-                    self.upsert_event_participant(row["event_id"], key, "visible_subject", [observation_id], 0.75)
-                asset = self.get_asset(observation.get("asset_id")) or {}
-                source_owner_id = asset.get("source_owner_id")
-                source_owner = self.get_entity(source_owner_id) if source_owner_id else None
-                if source_owner and source_owner.get("status") == "confirmed":
-                    self.upsert_event_participant(row["event_id"], source_owner_id, "captured_by", [observation_id], float(asset.get("source_confidence", 0.5) or 0.5))
-                self.connection.execute("UPDATE events SET participants_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?", (json_value(merged, []), now_iso(), event["id"]))
-                # A WorldMM Scene owns authoritative absolute boundaries and the
-                # original video's GPS/place. Generic image-event refresh may
-                # enrich participants, but must not replace that provenance.
+            for row in self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,)):
+                event_observations.setdefault(row["event_id"], set()).add(observation_id)
+        with self.transaction():
+            for event_id, event_observation_ids in event_observations.items():
+                event = self.get_event(event_id)
+                if not event:
+                    continue
+                merged = list(event.get("participants") or [])
+                for observation_id in event_observation_ids:
+                    observation = self.get_observation(observation_id) or {}
+                    for key in self._confirmed_entity_ids_for_observation(observation_id):
+                        entity = self.get_entity(key)
+                        if not entity:
+                            continue
+                        if not any((item.get("entity_id") if isinstance(item, dict) else item) == key for item in merged):
+                            merged.append({"entity_id": key, "name": entity["canonical_name"], "status": "confirmed"})
+                        self.upsert_event_participant(event_id, key, "visible_subject", [observation_id], 0.75)
+                    asset = self.get_asset(observation.get("asset_id")) or {}
+                    source_owner_id = asset.get("source_owner_id")
+                    source_owner = self.get_entity(source_owner_id) if source_owner_id else None
+                    if source_owner and source_owner.get("status") == "confirmed":
+                        self.upsert_event_participant(event_id, source_owner_id, "captured_by", [observation_id], float(asset.get("source_confidence", 0.5) or 0.5))
+                self.connection.execute("UPDATE events SET participants_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?", (json_value(merged, []), now_iso(), event_id))
                 if event.get("source_type") != "video_scene":
-                    self.refresh_event_summary(row["event_id"])
+                    self.refresh_event_summary(event_id)
 
     def reject_face_cluster(self, cluster_id):
         """Delete a face cluster that is not a person. Confirmed clusters refuse."""
