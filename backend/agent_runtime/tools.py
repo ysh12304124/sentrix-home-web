@@ -762,15 +762,18 @@ def _search_from_prior_result_set(prior_rs, scope_id: str) -> dict | None:
         handle = f"photo_{i + 1}"
         place = ""
         captured_at = None
+        file_name = ""
         if store is not None:
             try:
                 asset = store.get_asset(aid) or {}
                 captured_at = asset.get("captured_at")
                 place = _short_place_label(asset)
+                file_name = asset.get("file_name") or ""
             except Exception:
                 pass
         preview.append({"handle": handle, "captured_at": captured_at, "level": "exact",
-                        "place": place, "media_kind": "original_image", "condition_summary": {}})
+                        "file_name": file_name, "place": place,
+                        "media_kind": "original_image", "condition_summary": {}})
     _RUNTIME["last_handles"] = handles
     return {
         "result_set_id": prior_rs.result_set_id,
@@ -838,6 +841,13 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         user_message = ((context or {}).get("task_state") or {}).get("user_goal") or arguments.get("query") or ""
 
         ci = extract_constraints(user_message, _RUNTIME.get("store"), scope_id)
+        # 防御：user_message 提取不到 time/place 时，再从 search query 提取并合并（覆盖边角）。
+        if not (ci.get("time") or ci.get("place")):
+            ci_q = extract_constraints(arguments.get("query") or "", _RUNTIME.get("store"), scope_id)
+            for k in ("time", "place", "person"):
+                if not ci.get(k) and ci_q.get(k):
+                    ci[k] = ci_q[k]
+            ci["strong"] = bool(ci.get("time") and ci.get("place"))
         # 事件级主路径：place 或 time 任一解析到单事件即锁事件（确定性），否则回落融合检索。
         if ci.get("place") or ci.get("time"):
             _ev = _event_resolution_geo(user_message, _RUNTIME.get("store"), scope_id,
