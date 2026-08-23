@@ -3183,7 +3183,18 @@ class MemoryStore:
                 (event_id, entity_id, relation, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
             )
         self._commit()
-        return self.list_event_entities(event_id)
+        row = self._row(
+            """SELECT ee.*, e.id AS entity_id_value, e.entity_type, e.canonical_name, e.status, e.summary
+            FROM event_entities ee JOIN entities e ON e.id = ee.entity_id
+            WHERE ee.event_id = ? AND ee.entity_id = ? AND ee.relation = ?""",
+            (event_id, entity_id, relation),
+        )
+        if not row:
+            return None
+        value = self._decode(row, ["evidence_ids_json"])
+        value["id"] = value.pop("entity_id_value")
+        value["evidence_count"] = len(value["evidence_ids_json"])
+        return self.public_entity(value)
 
     def list_event_entities(self, event_id):
         rows = self._rows(
@@ -5497,7 +5508,10 @@ class MemoryStore:
                     "evidence_ids_json": merged,
                     "confidence": float(confidence or 0) or 0.75,
                 })
-            return next((item for item in self.list_relationships() if item["id"] == existing["id"]), None)
+            return self._decode(
+                self._row("SELECT * FROM relationships WHERE id = ?", (existing["id"],)),
+                ["evidence_ids_json"],
+            )
         relationship_id = make_id("rel")
         revision = 1
         self.connection.execute("""INSERT INTO relationships(id, scope_id, subject_entity_id, predicate, object_entity_id, status, confidence, evidence_ids_json, supersedes_relationship_id, revision, created_at, updated_at)
@@ -5511,7 +5525,10 @@ class MemoryStore:
                 "evidence_ids_json": evidence_ids,
                 "confidence": float(confidence or 0) or 0.75,
             })
-        return self.list_relationships()[0]
+        return self._decode(
+            self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,)),
+            ["evidence_ids_json"],
+        )
 
     def confirm_relationship(self, relationship_id):
         relationship = self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
