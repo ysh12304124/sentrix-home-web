@@ -7,7 +7,9 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+from functools import wraps
 
 from .geocoding import format_gps_prefix
 from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
@@ -87,6 +89,25 @@ def parse_time(value):
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def _defer_entity_maintenance_commits(method):
+    """Commit an observation's derived entity graph once after all writes succeed."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        previous = getattr(self, "_defer_entity_maintenance_commits", False)
+        self._defer_entity_maintenance_commits = True
+        try:
+            result = method(self, *args, **kwargs)
+            self.connection.commit()
+            return result
+        except Exception:
+            self.connection.rollback()
+            raise
+        finally:
+            self._defer_entity_maintenance_commits = previous
+
+    return wrapped
 
 
 def json_value(value, fallback):
@@ -302,6 +323,28 @@ class MemoryStore:
 
     def close(self):
         self.connection.close()
+
+    @contextmanager
+    def transaction(self):
+        """Group related writes into one SQLite transaction.
+
+        Nested callers share the outer transaction. Methods that normally
+        commit immediately route through _commit so pipeline batches can
+        defer the fsync and release the SQLite writer lock once.
+        """
+        depth = int(getattr(self, "_transaction_depth", 0) or 0)
+        self._transaction_depth = depth + 1
+        try:
+            yield self
+        except Exception:
+            if depth == 0:
+                self.connection.rollback()
+            raise
+        else:
+            if depth == 0:
+                self.connection.commit()
+        finally:
+            self._transaction_depth = depth
 
     def apply_authorized_revision(self, *, proposal_id, confirmation_token, actor):
         """Plan §6 Memory Kernel entry point.
@@ -1252,7 +1295,7 @@ class MemoryStore:
             source_path = excluded.source_path, updated_at = excluded.updated_at""",
             (scope_id, name, kind, int(bool(include_in_people)), source_path, timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
 
     def list_memory_spaces(self, status="active"):
         if status:
@@ -1265,6 +1308,10 @@ class MemoryStore:
 
     def _rows(self, query, params=()):
         return [dict(row) for row in self.connection.execute(query, params).fetchall()]
+
+    def _commit(self):
+        if not getattr(self, "_defer_entity_maintenance_commits", False) and not getattr(self, "_transaction_depth", 0):
+            self.connection.commit()
 
     def _decode(self, row, fields):
         if not row:
@@ -1297,7 +1344,7 @@ class MemoryStore:
                 metadata.get("source_frame_index"), metadata.get("source_scene_index"), timestamp, timestamp,
             ),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_asset(asset_id)
 
     def get_asset(self, asset_id):
@@ -1356,7 +1403,7 @@ class MemoryStore:
                 now_iso(), asset_id,
             ),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_asset(asset_id)
 
     def create_ingest_batch(self, batch_id, scope_id="home-default"):
@@ -1687,7 +1734,7 @@ class MemoryStore:
                 timestamp,
             ),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_observation(observation_id)
 
     def get_observation(self, observation_id):
@@ -1719,7 +1766,7 @@ class MemoryStore:
         assignments.extend(["updated_at = ?"])
         params.extend([now_iso(), observation_id])
         self.connection.execute(f"UPDATE observations SET {', '.join(assignments)} WHERE id = ?", params)
-        self.connection.commit()
+        self._commit()
         mentioned = self._rows("SELECT DISTINCT entity_id FROM entity_mentions WHERE observation_id = ?", (observation_id,))
         for item in mentioned:
             self.rebuild_person_memory(item["entity_id"])
@@ -2113,7 +2160,7 @@ class MemoryStore:
                 "UPDATE events SET aggregation_score = ?, aggregation_breakdown_json = ? WHERE id = ?",
                 (float(event.get("aggregation_score", 0) or 0), json_value(event.get("aggregation_breakdown", {}), {}), event_id),
             )
-        self.connection.commit()
+        self._commit()
         self.select_event_cover(event_id)
         self._refresh_event_participants([observation["id"]])
         return self.get_event(event_id)
@@ -2165,7 +2212,7 @@ class MemoryStore:
             "INSERT OR IGNORE INTO event_observations(event_id, observation_id) VALUES (?, ?)",
             (event_id, observation_id),
         )
-        self.connection.commit()
+        self._commit()
         self.select_event_cover(event_id)
         self._refresh_event_participants([observation_id])
         return self.get_event(event_id)
@@ -2270,7 +2317,7 @@ class MemoryStore:
             "UPDATE events SET cover_asset_id = ?, cover_selection_json = ?, updated_at = ? WHERE id = ?",
             (asset["id"], json_value(selection, {}), now_iso(), event_id),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_event(event_id)
 
     def upsert_event_participant(self, event_id, person_id, role, evidence_ids=None, confidence=0.5):
@@ -2292,7 +2339,7 @@ class MemoryStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (make_id("event_person"), event_id, person_id, role, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
             )
-        self.connection.commit()
+        self._commit()
         self._maintain_event_cooccurrence_candidates(event_id)
         return self.list_event_participants(event_id)
 
@@ -2398,7 +2445,7 @@ class MemoryStore:
             "UPDATE events SET summary = ?, place = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
             (summary, place, now_iso(), event_id),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_event(event_id)
 
     def get_semantic_profile(self, person_id):
@@ -3084,7 +3131,7 @@ class MemoryStore:
                 "INSERT INTO event_entities(event_id, entity_id, relation, evidence_ids_json, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (event_id, entity_id, relation, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
             )
-        self.connection.commit()
+        self._commit()
         return self.list_event_entities(event_id)
 
     def list_event_entities(self, event_id):
@@ -3149,7 +3196,7 @@ class MemoryStore:
                     "INSERT INTO event_revisions(id, event_id, field_name, old_value, new_value, source, created_at) VALUES (?, ?, ?, ?, ?, 'user', ?)",
                     (make_id("event_revision"), event_id, key, str(event.get(key) or ""), str(value or ""), now_iso()),
                 )
-        self.connection.commit()
+        self._commit()
         return self.get_event(event_id)
 
     def _fact_row(self, row):
@@ -3310,7 +3357,7 @@ class MemoryStore:
                 scope_id = excluded.scope_id, vector_json = excluded.vector_json, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at""",
             (make_id("vec"), metadata["scope_id"], space, source_type, source_id, json_value(values, []), model_name, json_value(metadata, {}), timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
         row = self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
         try:
             from .qdrant_memory import get_qdrant_index
@@ -3445,7 +3492,7 @@ class MemoryStore:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (scope_id or "home-default", entity_id, entity_type, name, status, family_role, summary, float(confidence or 0), timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_entity(entity_id)
 
     def _find_or_create_entity(self, name, entity_type, scope_id, confidence, summary):
@@ -3462,10 +3509,11 @@ class MemoryStore:
                 "UPDATE entities SET confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
                 (float(confidence or 0), now_iso(), existing["id"]),
             )
-            self.connection.commit()
+            self._commit()
             return self.get_entity(existing["id"])
         return self.create_entity(name, entity_type, "pending", confidence=confidence, summary=summary, scope_id=scope_id)
 
+    @_defer_entity_maintenance_commits
     def maintain_observation_entities(self, observation_id, event_id=None):
         """Create evidence-backed non-person entities from existing observations."""
         observation = self.get_observation(observation_id)
@@ -3649,7 +3697,7 @@ class MemoryStore:
                     entity["id"], "记录于", time_entity["id"], [observation_id, event_id] if event_id else [observation_id],
                     observation.get("confidence", 0),
                 )
-        self.connection.commit()
+        self._commit()
         return entities
 
     def reindex_observation_entities(self, scope_id=None):
@@ -4335,10 +4383,10 @@ class MemoryStore:
             VALUES (?, ?, ?, 0, ?, ?, ?)""",
             (scope_id or "home-default", cluster_id, json_value(values, []), float(confidence or 0), timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
         entity = self.create_entity(f"待确认人物簇 · {cluster_id}", "person", "pending", None, float(confidence or 0), "由 buffalo_l embedding 生成，等待用户确认", scope_id=scope_id)
         self.connection.execute("UPDATE face_clusters SET entity_id = ? WHERE id = ?", (entity["id"], cluster_id))
-        self.connection.commit()
+        self._commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
 
     def _record_entity_revision(self, entity_id, field_name, old_value, new_value, source, evidence_ids=None):
@@ -4409,7 +4457,7 @@ class MemoryStore:
                 "UPDATE entity_properties SET confidence = MAX(confidence, ?), evidence_ids_json = ?, updated_at = ? WHERE id = ?",
                 (float(confidence or 0), json_value(list(dict.fromkeys(json.loads(current["evidence_ids_json"] or "[]") + evidence_ids)), []), now_iso(), current["id"]),
             )
-            self.connection.commit()
+            self._commit()
             return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (current["id"],)))
         timestamp = now_iso()
         status = "active" if not current else "pending"
@@ -4422,7 +4470,7 @@ class MemoryStore:
              json_value(evidence_ids, []), current["id"] if current else None,
              int(current["revision"] or 0) + 1 if current else 1, timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
 
     def maintain_entity_property_values(self, entity_id, property_key, values, confidence=0.0, evidence_ids=None, source="derived"):
@@ -4440,7 +4488,7 @@ class MemoryStore:
             "UPDATE entity_properties SET value_json = ?, confidence = MAX(confidence, ?), evidence_ids_json = ?, updated_at = ? WHERE id = ?",
             (json_value(merged, []), float(confidence or 0), json_value(list(dict.fromkeys(old_evidence + list(evidence_ids or []))), []), now_iso(), current["id"]),
         )
-        self.connection.commit()
+        self._commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (current["id"],)))
 
     def set_entity_property(self, entity_id, property_key, value, evidence_ids=None):
@@ -4555,7 +4603,7 @@ class MemoryStore:
                     float(face.get("quality_signal", 0) or 0), validity, now_iso(),
                 ),
             )
-            self.connection.commit()
+            self._commit()
             self.upsert_vector(
                 "visual", "face_instance", instance_id, embedding, embedding_model,
                 {"asset_id": asset_id, "observation_id": observation_id, "model_version": embedding_version,
@@ -4602,7 +4650,7 @@ class MemoryStore:
             ),
         )
         self._refresh_face_prototypes(best["id"])
-        self.connection.commit()
+        self._commit()
         self.upsert_vector("visual", "face_instance", instance_id, embedding, embedding_model, {"cluster_id": best["id"], "asset_id": asset_id, "observation_id": observation_id, "model_version": embedding_version, "quality": float(quality or 0), "pose_bucket": pose_bucket_value})
         entity = self.get_entity(best.get("entity_id")) if best.get("entity_id") else None
         if entity and entity.get("status") == "confirmed":
@@ -4617,7 +4665,7 @@ class MemoryStore:
             (make_id("mention"), entity["id"], observation_id, face_instance_id, float(confidence or 0), now_iso()),
         )
         self._add_entity_to_observation(observation_id, entity)
-        self.connection.commit()
+        self._commit()
 
     def _refresh_face_prototypes(self, cluster_id):
         rows = self._rows(
@@ -5314,7 +5362,7 @@ class MemoryStore:
             confidence=float(relationship.get("confidence") or 0.75),
             confidence_source="user-confirmed",
         )
-        self.connection.commit()
+        self._commit()
         return claim
 
     def create_relationship(self, subject_entity_id, predicate, object_entity_id, evidence_ids=None, confidence=0.5, status="pending"):
@@ -5330,7 +5378,7 @@ class MemoryStore:
             merged = list(dict.fromkeys(old_evidence + evidence_ids))
             next_status = "active" if status == "active" else existing["status"]
             self.connection.execute("UPDATE relationships SET status = ?, evidence_ids_json = ?, confidence = MAX(confidence, ?), updated_at = ?, revision = revision + 1 WHERE id = ?", (next_status, json_value(merged, []), float(confidence or 0), now_iso(), existing["id"]))
-            self.connection.commit()
+            self._commit()
             if next_status == "active":
                 self.maintain_relationship_claim({
                     "subject_entity_id": subject_entity_id,
@@ -5344,7 +5392,7 @@ class MemoryStore:
         revision = 1
         self.connection.execute("""INSERT INTO relationships(id, scope_id, subject_entity_id, predicate, object_entity_id, status, confidence, evidence_ids_json, supersedes_relationship_id, revision, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""", (relationship_id, scope_id, subject_entity_id, predicate, object_entity_id, status, float(confidence or 0), json_value(evidence_ids, []), revision, now_iso(), now_iso()))
-        self.connection.commit()
+        self._commit()
         if status == "active":
             self.maintain_relationship_claim({
                 "subject_entity_id": subject_entity_id,

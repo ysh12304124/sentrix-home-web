@@ -38,12 +38,14 @@ class IngestionPipeline:
         from .video import VideoMemoryAdapter
         self.video_memory_adapter = VideoMemoryAdapter()
 
-    def create_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
+    def prepare_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
+        """Prepare file metadata without mutating SQLite.
+
+        Hashing, EXIF parsing and offline geocoding can be relatively slow, so
+        callers may run this phase outside the process-wide SQLite write guard.
+        """
         path = Path(path)
-        asset_id = make_id("asset")
         media_type = media_type or self._media_type(path)
-        # Import metadata is provenance only. Model hints and benchmark labels
-        # must never enter the memory graph through the asset boundary.
         metadata = {key: value for key, value in (metadata or {}).items() if key in IMPORT_METADATA_KEYS}
         import_timings = dict(metadata.get("import_timings") or {})
         step_started = time.perf_counter()
@@ -54,15 +56,13 @@ class IngestionPipeline:
         import_timings["exif_seconds"] = round(time.perf_counter() - step_started, 4)
         existing = self.store.find_asset_by_hash(metadata["content_sha256"], metadata.get("scope_id"))
         if existing:
-            return existing
+            return {"existing": existing, "path": path, "file_name": file_name or path.name,
+                    "media_type": media_type, "mime_type": mime_type, "metadata": metadata}
         for key in ("captured_at", "captured_location", "source_device_id"):
             if metadata.get(key) is None and metadata["exif"].get(key):
                 metadata[key] = metadata["exif"][key]
         gps = self._gps_from_metadata(metadata)
         if gps:
-            # Keep the raw GPS coordinate as the event-clustering location
-            # anchor (the original logic); reverse_geocode stays a display-only
-            # semantic place and must not overwrite the coordinate.
             if not metadata.get("captured_location"):
                 metadata["captured_location"] = f"{float(gps['latitude']):.6f},{float(gps['longitude']):.6f}"
             if "reverse_geocode" not in metadata:
@@ -72,20 +72,42 @@ class IngestionPipeline:
                 if location_context:
                     metadata["reverse_geocode"] = location_context
         metadata["import_timings"] = import_timings
+        return {"existing": None, "path": path, "file_name": file_name or path.name,
+                "media_type": media_type, "mime_type": mime_type, "metadata": metadata}
+
+    def create_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None, prepared=None):
+        prepared = prepared or self.prepare_asset(path, file_name, media_type, mime_type, metadata)
+        existing = prepared.get("existing")
+        if existing:
+            return existing
+        asset_id = make_id("asset")
+        metadata = dict(prepared.get("metadata") or {})
+        import_timings = dict(metadata.get("import_timings") or {})
         step_started = time.perf_counter()
-        created = self.store.create_asset(
-            asset_id,
-            file_name or path.name,
-            media_type,
-            str(path),
-            mime_type or guess_mime_type(path),
-            path.stat().st_size,
-            metadata,
-            scope_id=metadata.get("scope_id"),
-        )
-        import_timings["database_create_seconds"] = round(time.perf_counter() - step_started, 4)
-        import_timings["asset_create_seconds"] = round(sum(import_timings.values()), 4)
-        return self.store.update_asset(created["id"], created.get("status") or "queued", {"import_timings": import_timings})
+        with self.store.transaction():
+            created = self.store.create_asset(
+                asset_id,
+                prepared.get("file_name") or Path(prepared["path"]).name,
+                prepared["media_type"],
+                str(prepared["path"]),
+                prepared.get("mime_type") or guess_mime_type(prepared["path"]),
+                Path(prepared["path"]).stat().st_size,
+                metadata,
+                scope_id=metadata.get("scope_id"),
+            )
+            import_timings["database_create_seconds"] = round(time.perf_counter() - step_started, 4)
+            import_timings["asset_create_seconds"] = round(sum(import_timings.values()), 4)
+            return self.store.update_asset(created["id"], created.get("status") or "queued", {"import_timings": import_timings})
+
+    def create_assets(self, prepared_assets):
+        """Persist a prepared import chunk in one SQLite transaction."""
+        created = []
+        with self.store.transaction():
+            for prepared in prepared_assets or []:
+                created.append(self.create_asset(
+                    prepared["path"], prepared=prepared,
+                ))
+        return created
 
     @staticmethod
     def _gps_from_metadata(metadata):
@@ -269,6 +291,11 @@ class IngestionPipeline:
         }
 
     def commit_fast_image(self, asset_id, prepared, started_at=None):
+        """Commit one fast result as one SQLite transaction."""
+        with self.store.transaction():
+            return self._commit_fast_image(asset_id, prepared, started_at=started_at)
+
+    def _commit_fast_image(self, asset_id, prepared, started_at=None):
         """Commit prepared face/CLIP evidence in deterministic image order."""
         asset = self.store.get_asset(asset_id)
         if not asset:
@@ -375,6 +402,13 @@ class IngestionPipeline:
         }
 
     def commit_semantic_image(self, asset_id, prepared, summarize_event=False, started_at=None):
+        """Commit one semantic result as one SQLite transaction."""
+        with self.store.transaction():
+            return self._commit_semantic_image(
+                asset_id, prepared, summarize_event=summarize_event, started_at=started_at
+            )
+
+    def _commit_semantic_image(self, asset_id, prepared, summarize_event=False, started_at=None):
         """Commit prepared semantic data after ordered face/event clustering."""
         asset = self.store.get_asset(asset_id)
         metadata = (asset or {}).get("metadata_json") or {}
@@ -428,6 +462,20 @@ class IngestionPipeline:
             "semantic_enrichment_seconds": timings["semantic_enrichment_seconds"],
         })
 
+    def _persist_event_summary(self, event_id, result):
+        """Persist one event projection and its vector in one SQLite transaction."""
+        with self.store.transaction():
+            updated = self.store.update_event(event_id, {
+                "title": result.get("title"),
+                "event_type": result.get("event_type"),
+                "activity": result.get("activity"),
+                "summary": result.get("summary"),
+            })
+            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
+            vector = self.clip.embed_text(event_text)
+            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result.get("model"), "event_summary": True})
+            return updated
+
     def summarize_event(self, event_id):
         detail = self.store.get_event_detail(event_id)
         if not detail or not detail["observations"] or not hasattr(self.gamma, "summarize_event"):
@@ -458,27 +506,10 @@ class IngestionPipeline:
             result = self.gamma.summarize_event(detail["event"], detail["observations"])
             if str(result.get("title") or "").strip() in {"待总结事件", "待确认的家庭记录", "待判断"}:
                 result = fallback_projection()
-            updated = self.store.update_event(event_id, {
-                "title": result.get("title"),
-                "event_type": result.get("event_type"),
-                "activity": result.get("activity"),
-                "summary": result.get("summary"),
-            })
-            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
-            vector = self.clip.embed_text(event_text)
-            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result.get("model"), "event_summary": True})
-            return updated
+            return self._persist_event_summary(event_id, result)
         except Exception:
             result = fallback_projection()
-            updated = self.store.update_event(event_id, {
-                "title": result["title"], "event_type": result["event_type"],
-                "activity": result["activity"], "summary": result["summary"],
-            })
-            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
-            vector = self.clip.embed_text(event_text)
-            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result["model"], "event_summary": True})
-            return updated
-
+            return self._persist_event_summary(event_id, result)
     def summarize_events(self, scope_id=None):
         return [self.summarize_event(event["id"]) for event in self.store.list_events(1000, scope_id)]
 

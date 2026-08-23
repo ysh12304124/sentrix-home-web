@@ -375,6 +375,19 @@ class MemoryStoreTests(unittest.TestCase):
             verifier.close()
 
 
+    def test_transaction_groups_asset_writes_into_one_commit(self):
+        commits = []
+        self.store.connection.set_trace_callback(
+            lambda statement: commits.append(statement.strip().upper())
+            if statement.strip().upper() in {"BEGIN", "COMMIT", "ROLLBACK"} else None
+        )
+        with self.store.transaction():
+            self.store.create_asset("tx-asset", "tx.jpg", "image", "/tmp/tx.jpg")
+            self.store.update_asset("tx-asset", "queued", {"batch_id": "tx-batch"})
+        self.assertEqual(commits.count("COMMIT"), 1)
+        self.assertEqual(self.store.get_asset("tx-asset")["batch_id"], "tx-batch")
+
+
 if __name__ == "__main__":
     unittest.main()
 

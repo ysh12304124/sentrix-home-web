@@ -68,6 +68,7 @@ SUPPORTED_IMPORT_SUFFIXES = {
     ".txt", ".md", ".json",
 }
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
+IMPORT_DB_CHUNK_SIZE = max(1, int(os.getenv("SENTRIX_IMPORT_DB_CHUNK_SIZE", "32")))
 
 
 @contextlib.contextmanager
@@ -2996,6 +2997,7 @@ def import_remote_files(
         store.create_ingest_batch(batch, scope)
     items = []
     queued_asset_ids = []
+    prepared_records = []
     for index, upload in enumerate(files):
         safe_name = Path(upload.filename or f"upload-{index}").name
         media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
@@ -3008,30 +3010,68 @@ def import_remote_files(
                 shutil.copyfileobj(upload.file, output)
             file_save_seconds = round(time.perf_counter() - save_started, 4)
             capture = _normalized_capture_metadata(per_file[index])
-            with db_write_guard("import-remote-file"):
-                created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
-                    "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
-                    "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
-                    "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
-                    **capture,
-                })
-                if media_type == "video" and created.get("path") == str(destination):
-                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
-                created = store.update_asset(created["id"], created.get("status") or "queued", {
-                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
-                })
-            deduplicated = created.get("path") != str(destination)
-            if deduplicated:
-                destination.unlink(missing_ok=True)
-            elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
-                queued_asset_ids.append(created["id"])
-            items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"], "fileName": created["file_name"], "status": created["status"], "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"), "deduplicated": deduplicated})
+            prepared = pipeline.prepare_asset(destination, file_name=safe_name,
+                                              media_type=media_type,
+                                              mime_type=upload.content_type,
+                                              metadata={
+                                                  "scope_id": scope, "batch_id": batch,
+                                                  "source_owner_id": sourceOwnerId,
+                                                  "source_owner_label": sourceOwnerLabel,
+                                                  "source_device_id": sourceDeviceId,
+                                                  "source_album_id": sourceAlbumId,
+                                                  "source_confidence": 1.0 if sourceOwnerId else 0.0,
+                                                  **capture,
+                                              })
+            prepared["metadata"]["import_timings"] = {
+                **(prepared["metadata"].get("import_timings") or {}),
+                "file_save_seconds": file_save_seconds,
+            }
+            prepared_records.append({"file_name": safe_name, "media_type": media_type,
+                                     "destination": destination, "prepared": prepared})
         except ValueError as error:
             destination.unlink(missing_ok=True)
             items.append({"accepted": False, "fileName": safe_name, "status": "rejected", "error": str(error)})
         except Exception as error:
             destination.unlink(missing_ok=True)
             items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
+
+    for offset in range(0, len(prepared_records), IMPORT_DB_CHUNK_SIZE):
+        chunk = prepared_records[offset:offset + IMPORT_DB_CHUNK_SIZE]
+        try:
+            chunk_items = []
+            chunk_queued_asset_ids = []
+            cleanup_paths = []
+            with db_write_guard("import-remote-chunk"):
+                with store.transaction():
+                    created_batch = pipeline.create_assets([item["prepared"] for item in chunk])
+                    for item, created in zip(chunk, created_batch):
+                        destination = item["destination"]
+                        if item["media_type"] == "video" and created.get("path") == str(destination):
+                            created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                        created = store.update_asset(created["id"], created.get("status") or "queued", {
+                            "import_timings": {
+                                **((created.get("metadata_json") or {}).get("import_timings") or {}),
+                                "file_save_seconds": (item["prepared"].get("metadata") or {}).get("import_timings", {}).get("file_save_seconds", 0.0),
+                            }
+                        })
+                        deduplicated = created.get("path") != str(destination)
+                        if deduplicated:
+                            cleanup_paths.append(destination)
+                        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
+                            chunk_queued_asset_ids.append(created["id"])
+                        chunk_items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"],
+                                      "fileName": created["file_name"], "status": created["status"],
+                                      "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"),
+                                      "deduplicated": deduplicated})
+            queued_asset_ids.extend(chunk_queued_asset_ids)
+            items.extend(chunk_items)
+            for destination in cleanup_paths:
+                destination.unlink(missing_ok=True)
+        except Exception as error:
+            for item in chunk:
+                item["destination"].unlink(missing_ok=True)
+                items.append({"accepted": False, "fileName": item["file_name"], "status": "failed", "error": str(error)})
+
     if queued_asset_ids:
         if not deferBatchComplete:
             store.complete_ingest_batch(batch)
