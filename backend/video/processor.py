@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ..db import make_id
+from ..db import MemoryStore, make_id
 from ..geocoding import format_gps_prefix
 from .metadata import probe_video_metadata
 from .worldmm_adapter import WorldMMAdapter
