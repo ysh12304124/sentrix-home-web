@@ -9,6 +9,7 @@ const EXECUTION_PHASES = [
   { key: "pipeline_processing", label: "流水线处理" },
   { key: "qa_eval", label: "QA 评测" },
 ];
+const CURRENT_MODEL_SELECTION = "__current__";
 
 const config = ref(null);
 const manifests = ref([]);
@@ -27,6 +28,10 @@ const reviewDrafts = reactive({});
 const selectedAlbum = ref("album3-14");
 const selectedQa = ref("compact-10q");
 const selectedModels = reactive(new Set());
+const currentModelSnapshot = ref(null);
+const currentModelLoading = ref(false);
+const currentModelError = ref("");
+const currentModelPopoverOpen = ref(false);
 const sentrixUrl = ref("");
 const judgeUrl = ref("");
 const vllmTargetId = ref("");
@@ -82,13 +87,41 @@ const fmtTokens = (value) => value == null || !Number.isFinite(Number(value)) ? 
 const scoreClass = (score) => score === 2 ? "score-2" : score === 1 ? "score-1" : score === 0 ? "score-0" : "score-none";
 const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", interrupted: "中断", cancelled: "已取消", partial: "部分采样", not_run: "未执行" }[status] || status || "等待");
 function setModelSelected(modelId, checked) {
-  if (checked) selectedModels.add(modelId);
-  else selectedModels.delete(modelId);
+  if (!checked) {
+    selectedModels.delete(modelId);
+    return;
+  }
+  if (modelId === CURRENT_MODEL_SELECTION) {
+    selectedModels.clear();
+  } else {
+    selectedModels.delete(CURRENT_MODEL_SELECTION);
+  }
+  selectedModels.add(modelId);
 }
 
 const qaOptions = computed(() => manifests.value.find((m) => m.album_id === selectedAlbum.value)?.qa_sets || ["compact-10q"]);
 const hasRunning = computed(() => runs.value.some((run) => ["running", "pending", "cancelling"].includes(run.status) || run.rejudge?.status === "running"));
 const activeRejudge = computed(() => activeRun.value?.rejudge || null);
+const visibleExecutionPhases = computed(() => activeRun.value?.model_source === "current"
+  ? EXECUTION_PHASES.filter((phase) => phase.key !== "model_deploy")
+  : EXECUTION_PHASES);
+const currentModelState = computed(() => currentModelSnapshot.value?.state || {});
+const currentModelId = computed(() => currentModelSnapshot.value?.model_id || "启动时获取");
+const currentModelStateRows = computed(() => {
+  const state = currentModelState.value;
+  return [
+    ["模型 ID", state.profile || currentModelSnapshot.value?.model_id],
+    ["Served name", state.served_model_name],
+    ["模型路径", state.model],
+    ["端口 / PID", [state.port, state.pid].filter((value) => value != null).join(" / ")],
+    ["精度 / 量化", [state.dtype, state.quantization || "无量化"].filter(Boolean).join(" / ")],
+    ["上下文长度", state.max_model_len],
+    ["最大并发", state.max_num_seqs],
+    ["显存利用率", state.gpu_memory_utilization],
+    ["默认输出上限", state.default_max_tokens],
+    ["启动时间", state.started_at_utc],
+  ].filter((row) => row[1] !== undefined && row[1] !== null && row[1] !== "");
+});
 const visibleQaItems = computed(() => {
   const items = qaPage.value?.items || [];
   const task = activeRejudge.value;
@@ -1230,7 +1263,29 @@ async function changeQaPage(page) {
 }
 async function changeQaPageSize() { await loadQaPage(1); }
 async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
-async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
+async function loadProfiles() {
+  profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || [];
+}
+async function loadCurrentModel() {
+  currentModelLoading.value = true;
+  currentModelError.value = "";
+  currentModelPopoverOpen.value = true;
+  try {
+    currentModelSnapshot.value = await post("/api/current-model", { vllm_target_id: vllmTargetId.value });
+  } catch (e) {
+    currentModelSnapshot.value = null;
+    currentModelError.value = e.message;
+  } finally {
+    currentModelLoading.value = false;
+  }
+}
+async function changeVllmTarget() {
+  selectedModels.clear();
+  currentModelSnapshot.value = null;
+  currentModelError.value = "";
+  currentModelPopoverOpen.value = false;
+  await loadProfiles();
+}
 const PROMPT_KIND_LABELS = { answer_quality: "回答质量", task_decision: "任务判断", evidence: "证据核验" };
 function promptKindMeta(kind) { return judgePromptKinds.value.find((k) => k.kind === kind) || null; }
 async function loadJudgePrompts() {
@@ -1350,6 +1405,7 @@ async function startSuite() {
   suiteRunning.value = true;
   try {
    const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, judge_provider_id: judgeProviderId.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
+    if (result.current_model_snapshot) currentModelSnapshot.value = result.current_model_snapshot;
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -1502,7 +1558,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </select>
 <span class="config-help">{{ (config?.judge_providers || []).find((p) => p.id === judgeProviderId)?.model || '-' }}</span>
 </label>
-        <label>vLLM 服务目标<select v-model="vllmTargetId" @change="loadProfiles">
+        <label>vLLM 服务目标<select v-model="vllmTargetId" @change="changeVllmTarget">
 <option v-for="(target, id) in vllmTargets" :key="id" :value="id">{{ target.label }}</option>
 </select>
 <span class="config-help">{{ vllmTargets[vllmTargetId]?.manager_url }} → {{ vllmTargets[vllmTargetId]?.model_base_url }}</span>
@@ -1510,6 +1566,19 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </div>
       <div class="model-picker">
 <span class="field-label">选择模型（可多选，串行测试）</span>
+<div class="current-model-option">
+<label class="check current-model-check" :class="{ active: selectedModels.has(CURRENT_MODEL_SELECTION) }">
+<input type="checkbox" :checked="selectedModels.has(CURRENT_MODEL_SELECTION)" @change="setModelSelected(CURRENT_MODEL_SELECTION, $event.target.checked)" />当前模型（{{ currentModelId }}）
+</label>
+<button class="current-model-refresh" type="button" title="获取当前 vLLM 模型状态" aria-label="获取当前 vLLM 模型状态" @click="loadCurrentModel">↻</button>
+<section v-if="currentModelPopoverOpen" class="current-model-popover" aria-live="polite">
+<header><div><small>VLLM RUNTIME STATE</small><strong>{{ currentModelId }}</strong></div><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></header>
+<p v-if="currentModelLoading" class="current-model-loading">正在获取当前运行状态…</p>
+<p v-else-if="currentModelError" class="error">{{ currentModelError }}</p>
+<div v-else class="current-model-state-grid"><div v-for="row in currentModelStateRows" :key="row[0]"><span>{{ row[0] }}</span><b>{{ row[1] }}</b></div></div>
+<footer v-if="currentModelSnapshot">校验时间 {{ fmtDate(currentModelSnapshot.verified_at) }} · 已核对实际 /v1/models</footer>
+</section>
+</div>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
 <input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="!profile.available">（不可用）</span>
 </label>
@@ -1627,7 +1696,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </section>
       <h3>Pipeline 执行阶段</h3>
 <div class="phase-list">
-<article v-for="(phaseDef, index) in EXECUTION_PHASES" :key="phaseDef.key" class="phase-card">
+<article v-for="(phaseDef, index) in visibleExecutionPhases" :key="phaseDef.key" class="phase-card">
 <div class="phase-title">
 <div class="phase-name">
 <span class="phase-step">{{ index + 1 }}</span>

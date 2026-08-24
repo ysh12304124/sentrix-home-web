@@ -531,6 +531,7 @@ def upload_files(url: str, fields: dict, files: list[tuple[str, str, bytes]], ti
 
 
 RUN_MODES = ("full", "reuse", "build")
+CURRENT_MODEL_SELECTION = "__current__"
 
 
 class RunCancelledError(RuntimeError):
@@ -567,7 +568,7 @@ def _extract_image_ids(result: dict) -> list[str]:
 
     def visit(value):
         if isinstance(value, dict):
-            for key in ("asset_ids", "image_ids"):
+            for key in ("asset_ids", "image_ids", "debug_asset_ids"):
                 if isinstance(value.get(key), list):
                     ids.extend(str(x) for x in value[key])
             for key in ("image_id", "asset_id", "file_name", "path"):
@@ -580,14 +581,14 @@ def _extract_image_ids(result: dict) -> list[str]:
             for child in value:
                 visit(child)
 
-    for key in ("image_results", "evidence", "retrieved_images", "images"):
+    for key in ("image_results", "evidence", "retrieved_images", "images", "tool_trace"):
         visit(result.get(key))
     task_state = result.get("task_state") or result.get("taskState") or {}
     if isinstance(task_state, dict):
         for tool_result in task_state.get("tool_results") or task_state.get("toolResults") or []:
             if not isinstance(tool_result, dict):
                 continue
-            for key in ("asset_ids", "image_ids"):
+            for key in ("asset_ids", "image_ids", "debug_asset_ids"):
                 values = tool_result.get(key)
                 if isinstance(values, list):
                     ids.extend(str(value) for value in values if value)
@@ -946,7 +947,8 @@ class BenchmarkRun:
                  judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False,
                  task_judge_system_prompt: str = "", evidence_judge_system_prompt: str = "",
                  mode: str = "full", existing_scope_id: str = "",
-                 scope_reused_from_runs: list | None = None):
+                 scope_reused_from_runs: list | None = None,
+                 use_current_model: bool = False, current_model_snapshot: dict | None = None):
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
         if mode == "reuse" and not existing_scope_id:
@@ -957,6 +959,8 @@ class BenchmarkRun:
         self.album_id = album_id
         self.manifest = manifest
         self.model_profile = model_profile
+        self.use_current_model = bool(use_current_model)
+        self.current_model_snapshot = dict(current_model_snapshot or {})
         self.qa_set = qa_set
         self.sentrix_url = sentrix_url.rstrip("/")
         base = judge_url.rstrip("/")
@@ -989,6 +993,8 @@ class BenchmarkRun:
             "scope_source": None,
             "album_id": album_id,
             "model_profile": model_profile,
+            "model_source": "current" if self.use_current_model else "managed",
+            "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
             "judge_model": judge_model,
             "judge_url": self.judge_url,
@@ -1010,6 +1016,7 @@ class BenchmarkRun:
            "phases": {},
             "items": [],
             "summary": {},
+            "run_valid": False,
             "fatal_error": None,
         }
         self._gpu_sampling_started = False
@@ -1118,6 +1125,8 @@ class BenchmarkRun:
         Without this, cancelling during model_deploy leaves the load running on the
         GPU and the manager keeps serving a model nobody asked for.
         """
+        if self.use_current_model:
+            return
         try:
             state = request_json(f"{self.vllm_api_url}/state", timeout=5) or {}
         except Exception:
@@ -1204,19 +1213,8 @@ class BenchmarkRun:
             ("gpu_metrics", self._phase_gpu_metrics),
             ("aggregate", self._phase_aggregate),
         ]
-        # 工作模式决定阶段编排：
-        #   full  全链路（现状）：建相册→身份→导入→流水线→测评
-        #   build 只构建相册：建相册→身份→导入→流水线（产物 scope 保留，供后续复用测评）
-        #   reuse 复用已有相册：绑定 scope→直接测评
-        phase_names_by_mode = {
-            "full": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
-                     "pipeline_processing", "qa_eval", "gpu_metrics", "aggregate"],
-            "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
-                      "pipeline_processing", "gpu_metrics", "aggregate"],
-            "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
-        }
-        phases = [(name, fn) for name, fn in all_phases
-                  if name in phase_names_by_mode[self.mode]]
+        selected_phase_names = self._selected_phase_names()
+        phases = [(name, fn) for name, fn in all_phases if name in selected_phase_names]
         try:
             for name, fn in phases:
                 if self._cancel.is_set():
@@ -1257,6 +1255,20 @@ class BenchmarkRun:
             if self.delete_scope_after_run:
                 self._cleanup_scope()
             self._stop_persist_writer()
+
+    def _selected_phase_names(self) -> list[str]:
+        # 工作模式决定阶段编排；当前模型模式不拥有模型生命周期，因此没有部署阶段。
+        phase_names_by_mode = {
+            "full": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                     "pipeline_processing", "qa_eval", "gpu_metrics", "aggregate"],
+            "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                      "pipeline_processing", "gpu_metrics", "aggregate"],
+            "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
+        }
+        selected = phase_names_by_mode[self.mode]
+        if self.use_current_model:
+            selected = [name for name in selected if name != "model_deploy"]
+        return selected
 
     def _cleanup_scope(self):
         """Delete the PhotoBench-created memory space after the run finishes."""
@@ -1913,6 +1925,11 @@ class BenchmarkRun:
                 self.state["items"].sort(key=lambda it: it.get("_index", 0))
                 for it in self.state["items"]:
                     it.pop("_index", None)
+                executed = sum(1 for it in self.state["items"]
+                               if it.get("execution_status") == "completed")
+                self.state["run_valid"] = bool(
+                    len(self.state["items"]) == total_qa and executed == total_qa
+                )
                 record_qa_progress()
                 self.persist()
 
@@ -1933,6 +1950,8 @@ class BenchmarkRun:
                 pass
         try:
             snapshot = (self.state.get("phases") or {}).get("model_deploy", {}).get("model_state") or {}
+            if not snapshot:
+                snapshot = (self.state.get("current_model_snapshot") or {}).get("state") or {}
             return max(1, int(snapshot.get("max_num_seqs") or 1))
         except Exception:
             return 1
@@ -1959,13 +1978,14 @@ class BenchmarkRun:
         reference = str(row["answer"])
         gt_ids = [str(v) for v in row.get("retrieval_image_ids", [])]
         item = {"qa_id": row.get("qa_id"), "question": query, "reference_answer": reference,
-                "retrieval_image_ids": gt_ids}
+                "retrieval_image_ids": gt_ids, "execution_status": "scheduled"}
         for field in ("task_type", "question_type", "angle", "difficulty", "answerability",
                       "scope", "scope_anchor", "required_evidence_sources", "query_anchors",
                       "expected_action"):
             if row.get(field) is not None:
                 item[field] = row[field]
         try:
+            item["execution_status"] = "started"
             t_agent0 = time.perf_counter()
             conversation_id = str(uuid.uuid4())
             turn_records = []
@@ -2097,7 +2117,13 @@ class BenchmarkRun:
             item["delivery_status"] = resp.get("delivery_status") or {}
             item["agent_stability"] = self._agent_stability(item)
             item["attribution"] = self._derive_attribution(item)
+            item["execution_status"] = "completed"
         except Exception as e:
+            message = str(e).lower()
+            if "timed out" in message or "timeout" in message:
+                item["execution_status"] = "timeout"
+            else:
+                item["execution_status"] = "failed"
             item.update({"error": str(e), "retrieval_recall": 0,
                          "retrieval_precision": None, "retrieval_f1": None,
                          "judge": {"score": None, "reason": "error"},
@@ -3365,10 +3391,34 @@ class OrchestratorRepository:
     def query_profiles(self, vllm_api_url: str) -> dict:
         try:
             profiles = request_json(f"{vllm_api_url.rstrip('/')}/profiles", timeout=15)
-            state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10)
-            return {"profiles": profiles, "current": state}
+            return {"profiles": profiles}
         except Exception as e:
-            return {"profiles": [], "current": {}, "error": str(e)}
+            return {"profiles": [], "error": str(e)}
+
+    def query_current_model(self, vllm_api_url: str, model_base_url: str) -> dict:
+        state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10) or {}
+        profile = str(state.get("profile") or "").strip()
+        served_name = str(state.get("served_model_name") or "").strip()
+        model_id = profile or served_name
+        if not model_id or not served_name:
+            raise ValueError("vLLM Manager has no running model")
+        live_models = request_json(f"{model_base_url.rstrip('/')}/models", timeout=15) or {}
+        served_models = [
+            str(item.get("id")) for item in live_models.get("data") or []
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if served_name not in served_models:
+            raise ValueError(
+                f"vLLM state is stale or mismatched: expected {served_name}, "
+                f"live endpoint serves {served_models or 'nothing'}"
+            )
+        return {
+            "model_id": model_id,
+            "served_model_name": served_name,
+            "verified_at": now_iso(),
+            "served_models": served_models,
+            "state": state,
+        }
 
     def start_memory_profile(self, payload: dict) -> dict:
         """Replay saved questions to measure comparable memory without changing QA results."""
@@ -4351,6 +4401,8 @@ class OrchestratorRepository:
         if mode == "reuse" and not existing_scope_id:
             raise ValueError("existing_scope_id is required when mode=reuse")
         models = payload.get("models", [])
+        if not isinstance(models, list) or not models:
+            raise ValueError("models must contain at least one model")
         sentrix_url = payload.get("sentrix_url", DEFAULT_SENTRIX_URL)
         judge_provider_id = str(payload.get("judge_provider_id") or DEFAULT_JUDGE_PROVIDER_ID)
         _, resolved_judge_url, resolved_judge_model, resolved_judge_api_key = resolve_judge_provider(judge_provider_id)
@@ -4362,8 +4414,27 @@ class OrchestratorRepository:
         target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
         vllm_api_url = str(target["manager_url"])
         vllm_model_base_url = str(target["model_base_url"])
-        delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
         dirty_statuses = {"running", "pending", "cancelling"}
+        with self.lock:
+            busy = [
+                rid for rid, run in self.runs.items()
+                if (run.state.get("status") if isinstance(run, BenchmarkRun)
+                    else run.get("status")) in dirty_statuses
+            ]
+        if busy:
+            raise ValueError(f"another benchmark suite is still active: {', '.join(busy)}")
+        use_current_model = CURRENT_MODEL_SELECTION in models
+        if use_current_model and len(models) != 1:
+            raise ValueError("current model cannot be combined with managed model profiles")
+        current_model_snapshot = None
+        if use_current_model:
+            current_model_snapshot = self.query_current_model(vllm_api_url, vllm_model_base_url)
+            models = [current_model_snapshot["model_id"]]
+            request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-runtime", {
+                "manager_url": vllm_api_url,
+                "model_base_url": vllm_model_base_url,
+            }, "POST", 30)
+        delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
         with self.lock:
             busy = [
                 rid
@@ -4407,6 +4478,8 @@ class OrchestratorRepository:
                     delete_scope_after_run=delete_scope_after_run,
                     mode=mode, existing_scope_id=existing_scope_id,
                     scope_reused_from_runs=scope_reused_from_runs,
+                    use_current_model=use_current_model,
+                    current_model_snapshot=current_model_snapshot,
                 )
                 self.runs[run_id] = run
                 created_runs.append(run_id)
@@ -4425,7 +4498,8 @@ class OrchestratorRepository:
         threading.Thread(target=_run_sequentially, name=f"suite-{suite_id}", daemon=True).start()
         return {"suite_id": suite_id, "run_ids": created_runs, "album_id": album_id,
                 "models": models, "qa_set": qa_set, "mode": mode,
-                "existing_scope_id": existing_scope_id or None}
+                "existing_scope_id": existing_scope_id or None,
+                "current_model_snapshot": current_model_snapshot}
 
 
 # ---------------------------------------------------------------------------
@@ -4657,6 +4731,13 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/profiles":
                 target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
                 result = self.repo.query_profiles(str(target["manager_url"]))
+                result.update({"target_id": target_id, "target": target})
+                self._json(result)
+            elif self.path == "/api/current-model":
+                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                result = self.repo.query_current_model(
+                    str(target["manager_url"]), str(target["model_base_url"]),
+                )
                 result.update({"target_id": target_id, "target": target})
                 self._json(result)
             elif self.path == "/api/memory-profile":
