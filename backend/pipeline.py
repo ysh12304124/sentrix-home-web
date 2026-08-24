@@ -421,18 +421,16 @@ class IngestionPipeline:
         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
         objects = analysis.get("objects") or []
 
-        def object_text(item):
+        def _object_item_text(item):
+            # Local small models (e.g. gemma4:e2b via ollama) may emit mixed-type
+            # objects entries (str/dict/int); tolerate anything instead of crashing.
             if isinstance(item, str):
                 return item
             if isinstance(item, dict):
-                return " ".join(
-                    str(item.get(key, ""))
-                    for key in ("label", "primary", "details")
-                    if item.get(key)
-                )
-            return str(item)
+                return " ".join(str(item.get(key, "")) for key in ("label", "primary", "details") if item.get(key))
+            return str(item) if item is not None else ""
 
-        object_text = " ".join(object_text(item) for item in objects)
+        object_text = " ".join(filter(None, (_object_item_text(item) for item in objects)))
         detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
         detail_text = " ".join(
             (str(item.get("text") or item.get("label") or "")
