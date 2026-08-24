@@ -102,9 +102,7 @@ function setModelSelected(modelId, checked) {
 const qaOptions = computed(() => manifests.value.find((m) => m.album_id === selectedAlbum.value)?.qa_sets || ["compact-10q"]);
 const hasRunning = computed(() => runs.value.some((run) => ["running", "pending", "cancelling"].includes(run.status) || run.rejudge?.status === "running"));
 const activeRejudge = computed(() => activeRun.value?.rejudge || null);
-const visibleExecutionPhases = computed(() => activeRun.value?.model_source === "current"
-  ? EXECUTION_PHASES.filter((phase) => phase.key !== "model_deploy")
-  : EXECUTION_PHASES);
+const visibleExecutionPhases = computed(() => EXECUTION_PHASES);
 const currentModelState = computed(() => currentModelSnapshot.value?.state || {});
 const currentModelId = computed(() => currentModelSnapshot.value?.model_id || "启动时获取");
 const currentModelStateRows = computed(() => {
@@ -1105,6 +1103,12 @@ function retrievalChannelRows(item) {
   return rows;
 }
 function phaseSummary(key, phase) {
+  if (key === "model_deploy" && activeRun.value?.model_source === "current") {
+    const snapshot = activeRun.value?.current_model_snapshot || {};
+    const state = snapshot.state || {};
+    const modelId = state.profile || snapshot.model_id || activeRun.value?.model_profile || "未知";
+    return `已使用当前部署模型 · ${modelId}`;
+  }
   if (!phase) return "";
   if (key === "model_deploy" && phase.unload_seconds != null) return `卸载 ${fmtSeconds(phase.unload_seconds)} · 加载 ${fmtSeconds(phase.load_seconds)} · 健康检查 ${fmtSeconds(phase.health_check_seconds)}`;
   if (key === "scope_setup") return `创建 ${fmtSeconds(phaseSeconds(phase, "create_seconds"))}`;
@@ -1702,7 +1706,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-step">{{ index + 1 }}</span>
 <b>{{ phaseDef.label }}</b>
 </div>
-<span class="phase-status" :class="activeRun.phases?.[phaseDef.key]?.status || 'pending'">{{ statusLabel(activeRun.phases?.[phaseDef.key]?.status || 'pending') }}</span>
+<span class="phase-status" :class="activeRun.phases?.[phaseDef.key]?.status || (phaseDef.key === 'model_deploy' && activeRun.model_source === 'current' ? 'done' : 'pending')">{{ statusLabel(activeRun.phases?.[phaseDef.key]?.status || (phaseDef.key === 'model_deploy' && activeRun.model_source === 'current' ? 'done' : 'pending')) }}</span>
 </div>
 <p class="phase-summary">{{ phaseSummary(phaseDef.key, activeRun.phases?.[phaseDef.key]) }}</p>
 <div v-if="phaseDef.key === 'pipeline_processing' && activeRun.phases?.[phaseDef.key]?.progress" class="phase-bar">
