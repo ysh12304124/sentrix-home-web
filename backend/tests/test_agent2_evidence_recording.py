@@ -60,7 +60,7 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
 
     def test_observation_can_bind_multiple_requirements_from_one_search(self):
         task = TaskState.from_declaration(TaskDeclaration(
-            goal="find the dated place photo", scope_id="album1",
+            goal="查找有日期和地点的照片", scope_id="album1",
             requirements=(
                 EvidenceRequirement(id="asset", evidence_type="memory_asset"),
                 EvidenceRequirement(id="place", evidence_type="location_metadata"),
@@ -79,7 +79,7 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
                 "total": 1,
                 "asset_ids": ["asset_1"],
                 "preview": [{"handle": "photo_1", "place": "秦皇岛", "captured_at": "2019-07-22"}],
-                "query": "沙雕合影",
+                "query": "沙雕合影", "evidence_status": "validated", "evidence_asset_ids": ["asset_1"],
                 "certainty": "supported",
             })
 
@@ -106,7 +106,7 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
                 "result_set_id": "result_1", "total": 1, "asset_ids": ["asset_1"],
                 "preview": [{"handle": "photo_1", "people": [{
                     "name": "明明", "family_role": "孩子", "identity_status": "confirmed",
-                }]}], "query": "合影", "certainty": "supported",
+                }]}], "query": "合影", "evidence_status": "validated", "evidence_asset_ids": ["asset_1"], "certainty": "supported",
             })
 
         self.assertTrue(recorded)

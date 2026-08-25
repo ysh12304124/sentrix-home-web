@@ -608,6 +608,8 @@ def _extract_image_sets(result: dict) -> dict[str, list[str]]:
         if not isinstance(trace, dict):
             continue
         add(trace.get("debug_asset_ids"), retrieved)
+        # Debug previews are candidate projections, not evidence sources.
+        add(trace.get("debug_preview_asset_ids"), retrieved)
         # Debug preview is only a candidate projection, not evidence.
         observation = trace.get("observation") or trace.get("result") or {}
         if isinstance(observation, dict):

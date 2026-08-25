@@ -131,6 +131,13 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                 kind="result_total", value=total, unit="张",
                 certainty=certainty, source=tr.get("tool_call_id") or "search_memories",
                 display=str(total)))
+            group_count = tr.get("group_photo_count")
+            if isinstance(group_count, int) and group_count >= 0:
+                sizes = tr.get("group_photo_sizes") or []
+                nucleus.values.append(NucleusValue(
+                    kind="count", value=group_count, unit="张",
+                    certainty="confirmed", source=tr.get("tool_call_id") or "search_memories",
+                    label="不同人数合影", display=str(group_count)))
         # 3) read_photo_text：OCR 硬值（价格/电话/年份/数字）
         #    优先用结构化 exact_values（带 label/provider/confidence），缺失时回退 ocr_text 正则。
         if tr.get("tool") == "read_photo_text":

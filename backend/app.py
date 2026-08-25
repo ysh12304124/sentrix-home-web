@@ -225,7 +225,7 @@ def process_asset(asset_id):
     # transactions and raises "cannot start a transaction within a transaction".
     task_store = MemoryStore(store.path)
     task_pipeline = IngestionPipeline(
-        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        task_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     try:
         asset = task_store.get_asset(asset_id) or {}
@@ -303,7 +303,7 @@ def _recover_stale_batch_assets(task_store, batch_id):
 def _prepare_asset_stage(asset_id, stage):
     worker_store = MemoryStore(store.path)
     worker_pipeline = IngestionPipeline(
-        worker_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        worker_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     try:
         if stage == "fast":
@@ -409,7 +409,7 @@ def _process_image_stages(image_ids, task_store, task_pipeline, limits):
 def _summarize_event_worker(event_id):
     worker_store = MemoryStore(store.path)
     worker_pipeline = IngestionPipeline(
-        worker_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        worker_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     started_at = time.perf_counter()
     try:
@@ -459,7 +459,7 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
     asset_ids = list(dict.fromkeys(asset_ids or []))
     task_store = MemoryStore(store.path)
     task_pipeline = IngestionPipeline(
-        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        task_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     limits = _pipeline_worker_limits()
     started_at = time.perf_counter()
@@ -1089,10 +1089,16 @@ def bind_cloud_runtime(request: CloudRuntimeBindRequest):
     new_gamma.bind_store(store)
     with runtime_lock:
         previous_pipeline = pipeline
+        # The cloud profile is text-only (DeepSeek chat/V3). Keep the
+        # existing local vision-capable gamma for ingestion/semantic
+        # enrichment; only the interactive Agent runtime switches to cloud.
+        vision_gamma = getattr(previous_pipeline, "gamma", None)
+        if vision_gamma is None:
+            raise HTTPException(status_code=503, detail="local vision runtime is unavailable")
         gamma = new_gamma
         pipeline = IngestionPipeline(
             store,
-            gamma=new_gamma,
+            gamma=vision_gamma,
             asr=previous_pipeline.asr,
             face=previous_pipeline.face,
             clip=previous_pipeline.clip,
@@ -2332,9 +2338,18 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         # Qdrant query and hides the actual sub-millisecond index latency.
         embedding_router = EmbeddingRouter.from_clip(pipeline.clip)
         retrieval_config = RetrievalConfig()
-    except Exception:
+    except Exception as exc:
+        # Retrieval must never silently fall back to the legacy full-table
+        # scan. Keep the failure visible in the service log so a missing
+        # embedder/index cannot masquerade as a normal search result.
+        import logging
+        logging.getLogger(__name__).exception("embedding_router_init_failed: %s", exc)
         embedding_router = None
-        retrieval_config = None
+        try:
+            from .retrieval import RetrievalConfig
+            retrieval_config = RetrievalConfig()
+        except Exception:
+            retrieval_config = None
     runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
                                retrieval_config=retrieval_config)
     runtime_tools.set_conversation_id(conversation_id)
@@ -2944,6 +2959,32 @@ def assistant_response(result):
     result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
     result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
     result["answerGrounding"] = result.get("answer_grounding", {})
+    # The production client renders representative source images from this
+    # stable projection.  Keep it separate from the full retrieval trace and
+    # never promote raw candidates; selected assets win, otherwise expose only
+    # the first three evidence sources.
+    grounding = result.get("answer_grounding") or {}
+    if not result.get("image_results") and isinstance(grounding, dict):
+        evidence_images = [
+            item for item in (grounding.get("evidence_images") or [])
+            if isinstance(item, dict) and item.get("asset_id")
+        ]
+        selected_ids = {str(value) for value in (grounding.get("selected_asset_ids") or []) if value}
+        if selected_ids:
+            selected = [item for item in evidence_images if str(item.get("asset_id")) in selected_ids]
+            evidence_images = selected or evidence_images
+        projected = []
+        for item in evidence_images[:3]:
+            asset_id = str(item.get("asset_id"))
+            media_url = item.get("media_url") or f"/api/assets/{asset_id}/file"
+            projected.append({
+                "asset_id": asset_id,
+                "file_name": item.get("file_name") or "",
+                "media_url": media_url,
+                "display_handle": item.get("handle") or "原始图片",
+                "captured_at": item.get("captured_at") or "",
+            })
+        result["image_results"] = projected
     result["terminationReason"] = result.get("termination_reason", "")
     result["claimVerifications"] = result["claim_verifications"]
     result["claimVerificationStatus"] = result["claim_verification_status"]

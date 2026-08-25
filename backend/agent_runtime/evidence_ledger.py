@@ -139,7 +139,10 @@ class EvidenceLedger:
     def append(self, entry: LedgerEntry) -> None:
         if entry.provenance_scope_id and entry.provenance_scope_id != self.scope_id:
             raise ValueError("scope mismatch")
-        if any(existing.tool_call_id == entry.tool_call_id and existing.evidence_type == entry.evidence_type for existing in self.entries):
+        # One tool call may legitimately emit multiple facts of the same type
+        # (for example two confirmed people in one group photo). Reject only
+        # an exact duplicate row, not the second distinct person/asset.
+        if any(existing == entry for existing in self.entries):
             raise ValueError("duplicate tool call")
         self.entries.append(entry)
 
@@ -162,6 +165,12 @@ class EvidenceLedger:
             (not relevant_types or entry.evidence_type in relevant_types)
             and (not requirement_ids or bool(set(entry.requirement_refs) & requirement_ids))
         )]
+        # A tool may emit a typed field before the planner attaches a
+        # requirement reference. Keep that explicit, asset-bound fact rather
+        # than making the writer appear to have no evidence at all.
+        if not entries and relevant_types:
+            entries = [entry for entry in self.entries
+                       if entry.evidence_type in relevant_types]
         entries.sort(key=_answer_entry_sort_key, reverse=True)
 
         facts: list[dict[str, Any]] = []

@@ -19,7 +19,7 @@ class FinalWriterEvidenceTests(unittest.TestCase):
         context = build_final_context("这张照片里是谁？", task)
         self.assertIn("王建国", context["confirmed_people"])
         self.assertIn("direct_evidence_refused", evidence_answer_problems("这张照片里是谁？", "现有照片里看不出来。", context))
-        self.assertIn("王建国", context["confirmed_people"])
+        self.assertTrue(any("王建国" in str(f.get("value")) for f in context["facts"]))
 
     def test_date_fact_cannot_be_answered_by_generic_candidate_sentence(self):
         task = {"fact_operation": "date", "fact_value": "2017年11月5日", "tool_results": []}
@@ -42,7 +42,7 @@ class FinalWriterEvidenceTests(unittest.TestCase):
         context = build_final_context("这张合影里有哪些人？", task)
         self.assertIn("我", context["confirmed_people"])
         self.assertIn("明明", context["confirmed_people"])
-        self.assertTrue(any(f.get("source") == "photo_identity_unknown" for f in context["facts"]))
+        self.assertTrue(any("未确认身份" in str(f.get("value")) for f in context["facts"]))
 
     def test_inspection_scopes_identities_and_counts_unnamed_people(self):
         context = build_final_context(
@@ -59,7 +59,7 @@ class FinalWriterEvidenceTests(unittest.TestCase):
             ]},
         )
         self.assertNotIn("乐乐", context["confirmed_people"])
-        self.assertTrue(any(f.get("source") == "photo_identity_unknown" for f in context["facts"]))
+        self.assertTrue(any("未确认身份" in str(f.get("value")) for f in context["facts"]))
 
     def test_search_preview_people_are_answer_facts(self):
         context = build_final_context(

@@ -256,6 +256,7 @@ class TaskState:
             "source_asset_ids": observation.get("source_asset_ids") or [],
             "source_handles": observation.get("source_handles") or [],
             "operation": observation.get("operation"),
+            "metadata_operation": observation.get("metadata_operation"),
             "value": observation.get("value"),
             "rows": observation.get("rows"),
             "items": observation.get("items"),
@@ -263,8 +264,12 @@ class TaskState:
             "filters_applied": observation.get("filters_applied"),
             "samples": observation.get("samples"),
             "recommended_resolution": observation.get("recommended_resolution"),
+            "retrieval_channels": observation.get("retrieval_channels"),
             "preview": observation.get("preview"),
             "condition_summary": observation.get("condition_summary"),
+            "group_photo_count": observation.get("group_photo_count"),
+            "group_photo_sizes": observation.get("group_photo_sizes") or [],
+            "group_photo_rows": observation.get("group_photo_rows") or [],
             # Phase H H4：OCR 结构化硬值（供 nucleus 提取与 guard 校验）
             "exact_values": observation.get("exact_values") or [],
             "provider": observation.get("provider"),
@@ -278,15 +283,36 @@ class TaskState:
         person = (arguments.get("filters") or {}).get("person") or arguments.get("person") or ""
         if person:
             self.active_person = person
-        if tool_name in {"query_memory_facts", "query_memory_metadata"}:
+        if tool_name == "query_memory_facts":
             total = observation.get("total")
-            self.fact_total = int(total) if total is not None else None
+            self.fact_total = int(total) if total is not None else self.fact_total
             self.fact_value = observation.get("value")
             self.fact_operation = observation.get("operation")
             self.fact_rows = observation.get("rows")
             self.fact_group_by = arguments.get("group_by") or "month"
-            self.last_tool = tool_name
-            self.fulfillment = "empty" if total == 0 else ("fulfilled" if total else "pending")
+            self.last_tool = "query_memory_facts"
+            if total is not None and int(total or 0) > 0:
+                # A structured fact result is a successful retrieval even when
+                # an earlier semantic search returned no candidates. Do not
+                # let that stale no_match state drive the final gate.
+                if self.result_total is None or int(self.result_total or 0) <= 0:
+                    self.result_total = int(total)
+                self.fulfillment = "fulfilled"
+                self.search_satisfaction = "full_support"
+            elif total == 0 and self.result_total in (None, 0):
+                self.fulfillment = "empty"
+                self.search_satisfaction = "no_match"
+        if tool_name == "query_memory_metadata":
+            total = observation.get("total")
+            self.last_tool = "query_memory_metadata"
+            if total is not None and int(total or 0) > 0:
+                if self.result_total is None or int(self.result_total or 0) <= 0:
+                    self.result_total = int(total)
+                self.fulfillment = "fulfilled"
+                self.search_satisfaction = "full_support"
+            elif total == 0 and self.result_total in (None, 0):
+                self.fulfillment = "empty"
+                self.search_satisfaction = "no_match"
         if tool_name == "search_memories" and observation.get("result_set_id"):
             # Preserve the last usable result set when a later search returns
             # zero matches.  An empty result must not invalidate handles that
@@ -308,6 +334,18 @@ class TaskState:
                 self.fulfillment = "partial" if observation.get("gaps") else "fulfilled"
             self.search_satisfaction = observation.get("query_satisfaction")
             self.search_condition_summary = observation.get("condition_summary") or {}
+            # Event-anchored search may already contain a bounded structured
+            # count (for example two group photos of sizes 3 and 4). Promote
+            # that fact into the same nucleus fields used by query_memory_facts
+            # so deterministic rendering cannot fall back to candidate total.
+            if observation.get("group_photo_count") is not None:
+                self.fact_total = int(observation.get("group_photo_count") or 0)
+                self.fact_rows = observation.get("group_photo_rows") or []
+                self.fact_value = {
+                    "count": self.fact_total,
+                    "sizes": observation.get("group_photo_sizes") or [],
+                }
+                self.fact_operation = "group"
         if tool_name == "get_original_photos":
             self.delivery_state = "delivered"
             self.delivered_count = observation.get("delivered")

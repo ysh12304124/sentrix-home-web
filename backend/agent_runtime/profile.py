@@ -25,19 +25,22 @@ class ProfileConfig:
 PROFILES = {
     "goal_driven_candidate": ProfileConfig(
         name="goal_driven_candidate",
-        tools=("query_memory_facts", "query_memory_metadata", "search_memories", "query_photo_people", "get_original_photos", "get_result_page",
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,
         max_inspections=3,
-        wall_time_s=90.0,
+        # search_memories may perform several bounded 12B validation batches
+        # before the Agent gets a final Writer turn.  Keep a dedicated reserve
+        # instead of falling into the emergency renderer after validation.
+        wall_time_s=180.0,
         final_reserve_s=10.0,
         features={"rx": True, "tool_loop": True, "conversation_store": True,
                   "agent2_authoritative": True},
     ),
     "goal_driven_shadow": ProfileConfig(
         name="goal_driven_shadow",
-        tools=("query_memory_facts", "query_memory_metadata", "search_memories", "query_photo_people", "get_original_photos", "get_result_page",
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,
@@ -49,7 +52,7 @@ PROFILES = {
     ),
     "tool_loop_shadow": ProfileConfig(
         name="tool_loop_shadow",
-        tools=("query_memory_facts", "query_memory_metadata", "search_memories", "query_photo_people", "get_original_photos", "get_result_page",
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=6,
         max_tool_calls=4,
@@ -60,7 +63,7 @@ PROFILES = {
     ),
     "tool_loop": ProfileConfig(
         name="tool_loop",
-        tools=("query_memory_facts", "query_memory_metadata", "search_memories", "query_photo_people", "get_original_photos", "get_result_page",
+        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,

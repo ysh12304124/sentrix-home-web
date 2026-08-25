@@ -50,13 +50,13 @@ def render_emergency_summary(task_state: dict, *, reason: str = "") -> str:
     if result_total is not None:
         if result_total == 0:
             parts.append("检索没有找到符合条件的照片。")
-        else:
-            remaining = task_state.get("result_remaining") or 0
-            parts.append(f"找到 {result_total} 张接近的照片。")
-            if satisfaction == "candidate_only":
-                parts.append("这几张只是接近，还不能完全确认。")
-            elif satisfaction == "partial_support":
-                parts.append("部分信息能对上，还有细节不能完全确认。")
+        # A positive search total is retrieval telemetry, not a user answer
+        # fact.  The bounded evidence preview is already exposed separately;
+        # do not turn a broad candidate pool into "找到 N 张" fallback text.
+        elif satisfaction == "candidate_only":
+            parts.append("找到了一些相关照片，但还不能完全确认。")
+        elif satisfaction == "partial_support":
+            parts.append("找到了一些相关照片，部分信息能对上，还有细节不能完全确认。")
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
             handle = tr.get("inspect_handle") or ""

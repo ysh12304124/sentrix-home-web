@@ -53,15 +53,28 @@ def _place_variants(token: str) -> list[str]:
 def _place_labels(store, scope_id: str) -> list[str]:
     """收集 scope 内已知地点：reverse_geocode label/district/city + observations.place。"""
     labels = []
+
+    def value(row, key, fallback=None):
+        """Read sqlite Row and lightweight test doubles uniformly."""
+        try:
+            return row[key]
+        except (KeyError, IndexError, TypeError):
+            if isinstance(row, dict):
+                return row.get(key, fallback)
+            return fallback
+
     try:
         rows = store.connection.execute(
             "SELECT DISTINCT json_extract(a.metadata_json,'$.reverse_geocode.label') AS label, "
+            "json_extract(a.metadata_json,'$.reverse_geocode.province') AS province, "
+            "json_extract(a.metadata_json,'$.reverse_geocode.admin1') AS admin1, "
             "json_extract(a.metadata_json,'$.reverse_geocode.district') AS dist, "
             "json_extract(a.metadata_json,'$.reverse_geocode.city') AS city "
             "FROM assets a WHERE a.scope_id=?",
             (scope_id or "",)).fetchall()
         for r in rows:
-            for v in (r["label"], r["dist"], r["city"]):
+            for v in (value(r, "label"), value(r, "province"), value(r, "admin1"),
+                      value(r, "dist"), value(r, "city")):
                 if v and str(v).strip():
                     labels.append(str(v).strip())
     except Exception:
@@ -72,7 +85,7 @@ def _place_labels(store, scope_id: str) -> list[str]:
             "JOIN assets a ON a.id=o.asset_id WHERE a.scope_id=? AND o.place IS NOT NULL AND o.place<>''",
             (scope_id or "",)).fetchall()
         for r in rows:
-            labels.append(str(r[0]).strip())
+            labels.append(str(value(r, 0, value(r, "place", ""))).strip())
     except Exception:
         pass
     return sorted(set(labels))
@@ -92,8 +105,8 @@ def extract_place(question: str, store, scope_id: str) -> str | None:
         for variant in _place_variants(label):
             if len(variant) >= 2 and variant in q:
                 position = q.rfind(variant)
-                # When city and district have the same token length (邯郸/馆陶),
-                # prefer the more specific trailing place phrase instead of
+                # When city and district have the same token length, prefer
+                # the more specific trailing place phrase instead of
                 # the first broad city token.
                 if len(variant) > best_len or (len(variant) == best_len and position > best_position):
                     best, best_len, best_position = variant, len(variant), position

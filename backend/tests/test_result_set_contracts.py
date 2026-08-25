@@ -61,7 +61,7 @@ class ResultSetContractTests(unittest.TestCase):
             metadata={"captured_at": "2026-08-24T10:00:00"}, scope_id="album",
         )
         self.store.add_observation(asset["id"], {
-            "caption": "婚礼现场",
+            "caption": "户外聚会现场",
             "activity": "参加仪式",
             "objects": [{"label": "蓝色礼服"}],
             "detail": {"visible_details": [{"text": "两名伴娘穿蓝色长款礼服"}]},
@@ -109,9 +109,9 @@ class ResultSetContractTests(unittest.TestCase):
             scope_id="album", query="照片", asset_ids=["asset_1"]
         )
         out = runtime_tools._search_from_prior_result_set(
-            rs, "album", query="婚礼伴娘穿什么", user_goal="婚礼伴娘穿什么"
+            rs, "album", query="现场人物穿什么", user_goal="现场人物穿什么"
         )
-        self.assertEqual(out["query"], "婚礼伴娘穿什么")
+        self.assertEqual(out["query"], "现场人物穿什么")
         self.assertEqual(out["recommended_resolution"]["tool"], "inspect_photo")
 
     def test_debug_projection_separates_full_candidates_from_preview(self):
@@ -164,29 +164,29 @@ class ResultSetContractTests(unittest.TestCase):
         self.assertEqual(requested, "rs_private")
 
     def test_visual_intent_covers_decoration_and_display_board_questions(self):
-        self.assertTrue(visual_intent("婚房做了哪些主要的婚庆布置"))
-        self.assertTrue(visual_intent("迎宾展架上写了什么祝福文字"))
+        self.assertTrue(visual_intent("房间做了哪些主要的装饰布置"))
+        self.assertTrue(visual_intent("展示牌上写了什么文字"))
 
     def test_preview_query_order_promotes_visual_detail_matches(self):
         asset_ids = ["noise_1", "answer", "noise_2"]
         summaries = {
-            "noise_1": "婚礼现场；舞台；装饰灯光",
-            "answer": "户外站立；广告牌；文字：结婚这里的幸福",
-            "noise_2": "婚礼现场；宾客",
+            "noise_1": "户外现场；舞台；装饰灯光",
+            "answer": "户外站立；展示牌；文字：这里的幸福",
+            "noise_2": "户外现场；宾客",
         }
         with patch.object(runtime_tools, "_observation_summary",
                           side_effect=lambda _store, aid: summaries[aid]):
             order = runtime_tools._preview_query_order(
-                asset_ids, "迎宾展架上写了什么祝福文字", None)
+                asset_ids, "展示牌上写了什么文字", None)
         self.assertEqual(order[0], 1)
 
     def test_query_order_applies_even_when_result_set_fits_preview(self):
         asset_ids = ["noise", "answer"]
-        summaries = {"noise": "婚礼现场；文字：you", "answer": "广告牌；文字：一起幸福"}
+        summaries = {"noise": "室内场景；文字：you", "answer": "装饰；文字：一起幸福"}
         with patch.object(runtime_tools, "_observation_summary",
                           side_effect=lambda _store, aid: summaries[aid]):
             order = runtime_tools._preview_indices(
-                asset_ids, "best", None, query="迎宾展架祝福文字")
+                asset_ids, "best", None, query="装饰文字")
         self.assertEqual(order[0], 1)
 
     def test_inspection_handle_is_confined_to_visible_preview(self):
@@ -200,12 +200,12 @@ class ResultSetContractTests(unittest.TestCase):
     def test_model_time_filter_must_match_user_wording(self):
         sanitized = runtime_tools._sanitize_model_filters(
             {"time": "2026年8月24日", "place": "易县"},
-            query="易县婚礼照片", user_goal="帮我找2017年的易县婚礼照片",
+            query="易县活动照片", user_goal="帮我找2017年的易县活动照片",
         )
         self.assertEqual(sanitized["time"], "2017年")
         no_time = runtime_tools._sanitize_model_filters(
             {"time": "2026年8月24日", "place": "易县"},
-            query="易县婚礼照片", user_goal="帮我找易县婚礼照片",
+            query="易县活动照片", user_goal="帮我找易县活动照片",
         )
         self.assertNotIn("time", no_time)
 

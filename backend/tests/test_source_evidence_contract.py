@@ -26,9 +26,10 @@ class SourceEvidenceContractTests(unittest.TestCase):
             selected_image_handles=["photo_1"], selected_image_ids=["asset_1"],
         )
         self.assertEqual(grounding["retrieved_asset_ids"], ["asset_1", "asset_2", "asset_3"])
-        self.assertEqual(grounding["evidence_asset_ids"], ["asset_1", "asset_3"])
-        self.assertEqual(grounding["selected_asset_ids"], ["asset_1"])
-        self.assertEqual(grounding["selected_image_handles"], ["photo_1"])
+        # A search preview is a candidate only; only the metadata source is evidence.
+        self.assertEqual(grounding["evidence_asset_ids"], ["asset_3"])
+        self.assertEqual(grounding["selected_asset_ids"], [])
+        self.assertEqual(grounding["selected_image_handles"], [])
 
     def test_benchmark_extracts_candidates_without_promoting_them_to_delivery(self):
         result = {

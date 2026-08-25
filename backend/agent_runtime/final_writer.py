@@ -11,6 +11,7 @@ Writer 只做风格与结构修正：事实边界完全来自 TaskState 的确�
 from __future__ import annotations
 
 import json
+import os
 import re
 
 # 与 Answer Style Benchmark 同源的内部词汇清单（检测用，重写时一并禁止）
@@ -101,7 +102,7 @@ def build_final_context(message: str, task: dict) -> dict:
     if total is not None:
         if total > 0:
             facts.append({
-                "value": f"找到 {total} 张相关照片。",
+                "value": "找到相关照片。",
                 "certainty": _certainty(satisfaction),
                 "source": "search",
             })
@@ -135,8 +136,8 @@ def build_final_context(message: str, task: dict) -> dict:
                     })
                 # Once a concrete photo has been inspected, identities from
                 # other search candidates are not evidence for that photo and
-                # must not pollute the answer (e.g. adding 乐乐 to the target
-                # three-person 邯郸 image).
+                # must not pollute the answer with identities from another
+                # candidate photo.
                 if has_inspection:
                     continue
                 for identity in (item or {}).get("people") or []:
@@ -181,7 +182,9 @@ def build_final_context(message: str, task: dict) -> dict:
                 count_words = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
                                "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
                 total_seen = 0
-                for raw, _kind in re.findall(r"([一二两三四五六七八九]|\d+)\s*名?\s*(?:个)?(人|成年人|小孩|孩子)", text):
+                for raw, _kind in re.findall(
+                        r"([一二两三四五六七八九]|\d+)\s*名?\s*(?:个)?"
+                        r"(人|成年人|成人|成年男子|成年女性|小孩|孩子|幼儿)", text):
                     total_seen += count_words.get(raw, int(raw) if raw.isdigit() else 0)
                 if total_seen:
                     named = len([x for x in (tr.get("photo_identities") or [])
@@ -267,7 +270,7 @@ def build_final_context(message: str, task: dict) -> dict:
 
 
 _REFUSAL_RE = re.compile(r"看不出来|无法确认|不能确认|无法判断|不知道|没有相关|未找到", re.I)
-_PERSON_QUESTION_RE = re.compile(r"人物|谁|哪个人|哪位|爸爸|妈妈|父母|明明|乐乐|王建国|张晓莉")
+_PERSON_QUESTION_RE = re.compile(r"人物|谁|哪个人|哪位|爸爸|妈妈|父母")
 _PERSON_LIST_QUESTION_RE = re.compile(r"都有谁|有哪些人|哪几个人|几个人|多少人")
 _DATE_QUESTION_RE = re.compile(r"哪天|什么时候|何时|日期|时间|几月|哪一年|最早|最近一次")
 
@@ -282,8 +285,8 @@ def evidence_answer_problems(message: str, answer: str, context: dict) -> list[s
         problems.append("direct_evidence_refused")
     if _PERSON_QUESTION_RE.search(message or "") and context.get("confirmed_people"):
         # List-style questions must include every confirmed person from the
-        # same source photo. Targeted questions (for example “王建国穿什么”)
-        # still only require one relevant identity.
+        # same source photo. Targeted questions still only require one
+        # relevant identity.
         required_names = (context["confirmed_people"]
                           if _PERSON_LIST_QUESTION_RE.search(message or "")
                           else context["confirmed_people"][:1])
@@ -320,7 +323,8 @@ def needs_rewrite(answer: str, context: dict) -> bool:
         return True
     if _BOILERPLATE_TAIL_RE.search(answer) or _TAIL_JUNK_RE.search(answer):
         return True
-    if evidence_answer_problems(context.get("user_question", ""), answer, context):
+    if (os.getenv("SENTRIX_SIMPLE_WRITER", "0").strip().lower() not in {"1", "true", "on"}
+            and evidence_answer_problems(context.get("user_question", ""), answer, context)):
         return True
     return False
 
@@ -362,9 +366,37 @@ _WRITER_SYSTEM = (
     "5. 数字/价格/电话/年份/日期/人名必须与受控事实完全一致，禁止改写或增减。\n"
     "6. 如果受控事实为空、与问题无关，或照片里没有识别到可用内容，直接说“现有照片里看不出来/不知道”，"
     "不要编造，不要承诺“可以继续核对”。\n"
+    "6a. 如果 facts 已明确支持用户问题中的一个字段，即使 unknowns 仍有其它字段，必须先回答这个已支持字段，"
+    "再用一句话说明其余部分尚不能确认；不得因为存在 unknowns 而整体拒答。\n"
+    "6b. 如果受控事实明确“找到 N 张相关照片”，绝对不要说“没有找到/未找到”，只如实说明能确认到什么程度。\n"
+    "7. 不要复述检索或工具过程。\n"
+    "8. 如果事实里有“事件合影人数统计”或 group_photo_count/group_photo_sizes，必须同时写出合影张数和各组人数，不能只报候选总数。\n"
+    "9. 只回答用户实际问的字段，不要无关地追加日期、地点或候选数量；人物列表要写出所有受控事实中的已确认姓名，并把未确认同行者单独说明。\n"
+)
+
+# Benchmark switch: keep the previously used style-only writer available for
+# retrieval ablations. It deliberately does not impose evidence-type/tool
+# requirements; those belong to retrieval/evidence promotion, not wording.
+_SIMPLE_WRITER_SYSTEM = (
+    "你是 Sentrix，一个自然、克制的家庭记忆助手。你的任务：根据「受控事实」直接回答用户问题。\n"
+    "规则：\n"
+    "1. 先直接回答用户问题本身；\n"
+    "2. 必要的不确定性用自然语言（“看起来是…”；“可能是…，但我还不能完全确定。”）；\n"
+    "3. 最多一句有帮助的补充。\n"
+    "4. 禁止以“我找到 N 张候选照片/检索到…”开头；禁止出现这些内部词汇：候选照片、候选、相似候选、"
+    "匹配程度、条件已确认、未查看、partial_support、candidate_only、full_support、no_match、"
+    "query_satisfaction、检索结果。\n"
+    "5. 数字/价格/电话/年份/日期/人名必须与受控事实完全一致，禁止改写或增减。\n"
+    "6. 如果受控事实为空、与问题无关，或照片里没有识别到可用内容，直接说“现有照片里看不出来/不知道”，"
+    "不要编造，不要承诺“可以继续核对”。\n"
     "6b. 如果受控事实明确“找到 N 张相关照片”，绝对不要说“没有找到/未找到”，只如实说明能确认到什么程度。\n"
     "7. 不要复述检索或工具过程。\n"
 )
+
+
+def _writer_system() -> str:
+    return (_SIMPLE_WRITER_SYSTEM if os.getenv("SENTRIX_SIMPLE_WRITER", "0").strip().lower()
+            in {"1", "true", "on"} else _WRITER_SYSTEM)
 
 
 def build_answer_writer_messages(message: str, answer_context: dict) -> list[dict]:
@@ -374,8 +406,8 @@ def build_answer_writer_messages(message: str, answer_context: dict) -> list[dic
         "unknowns": answer_context.get("unknowns") or [],
         "conflicts": answer_context.get("conflicts") or [],
     }
-    system = _WRITER_SYSTEM + (
-        "\n8. 下面的事实材料是唯一可用证据，只输出最终回答文本，不要输出 JSON、工具调用、"
+    system = _writer_system() + (
+        "\n10. 下面的事实材料是唯一可用证据，只输出最终回答文本，不要输出 JSON、工具调用、"
         "证据编号或内部字段名。\n"
     )
     user = (
@@ -420,7 +452,7 @@ def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = N
     )
     try:
         messages = [
-            {"role": "system", "content": _WRITER_SYSTEM},
+            {"role": "system", "content": _writer_system()},
             {"role": "user", "content": user},
         ]
         if debug_out is not None:

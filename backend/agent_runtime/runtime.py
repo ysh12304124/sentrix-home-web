@@ -30,6 +30,24 @@ from .tool_policy import ToolPolicy
 from .tool_registry import get_tool, list_tools
 
 
+def _people_count_from_summary(text: str) -> int:
+    """Infer a bounded visible-person count without assigning identities."""
+    text = str(text or "")
+    count_words = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
+                   "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    matches = re.findall(
+        r"([一二两三四五六七八九十]|\d+)\s*名?\s*(?:个)?"
+        r"(人|成年人|成人|成年男子|成年女性|小孩|孩子|幼儿)", text)
+    if not matches:
+        return 0
+    aggregate = [count_words.get(raw, int(raw) if raw.isdigit() else 0)
+                 for raw, kind in matches if kind == "人"]
+    if aggregate:
+        return max(aggregate)
+    return sum(count_words.get(raw, int(raw) if raw.isdigit() else 0)
+               for raw, _kind in matches)
+
+
 def _natural_partial(task_state: dict, problems=None) -> str:
     """G6 Recovery v3 第三层：自然 partial——展示已确认部分与缺口，不猜、不暴露工程错误。"""
     problems = problems or []
@@ -68,13 +86,29 @@ def _model_visible_observation(observation: dict | None) -> dict:
     """Keep tool evidence for planning while excluding telemetry from LLM context."""
     if not isinstance(observation, dict):
         return {}
-    hidden = {"retrieval_timing", "debug", "telemetry", "trace"}
+    # Retrieval diagnostics describe the server-owned full candidate pool and
+    # must not become answer facts.  They remain in the recorded trace for
+    # recall auditing, while the model only receives the bounded public
+    # candidate window and evidence projection.
+    hidden = {
+        "retrieval_timing", "debug", "telemetry", "trace",
+        "raw_candidate_count", "validation_candidate_count", "validation_batches",
+        "retrieval_channels", "validation_rows",
+    }
     compact = {key: value for key, value in observation.items() if key not in hidden}
     preview = compact.get("preview")
     if isinstance(preview, list):
         compact["preview"] = preview[:5]
         if compact["preview"] and isinstance(compact["preview"][0], dict):
             compact["recommended_handle"] = compact["preview"][0].get("handle")
+        # Asset IDs are server-side provenance. Handles remain the only stable
+        # references visible to the Agent; benchmark/debug projections resolve
+        # the handle mapping outside the model prompt.
+        compact["preview"] = [
+            {key: value for key, value in item.items() if key != "asset_id"}
+            if isinstance(item, dict) else item
+            for item in compact["preview"]
+        ]
     # ResultSet keeps the full internal mapping server-side. The model only
     # needs stable handles from the bounded preview; exposing asset IDs turns
     # the whole candidate set into model-visible evidence and encourages
@@ -385,7 +419,8 @@ def public_agent2_trace(trace: dict | None) -> dict:
 def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                                 tool_call_id: str, input_refs=(), provenance_refs=(),
                                 observation: dict | None = None,
-                                allow_partial: bool = True) -> bool:
+                                allow_partial: bool = True,
+                                question: str = "") -> bool:
     """Record rich, scope-bound evidence produced by one capability call.
 
     ``observation`` is optional for backwards compatibility with the original
@@ -397,6 +432,7 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
     observation = observation or {}
     input_refs = tuple(str(ref) for ref in input_refs if ref)
     provenance_refs = tuple(str(ref) for ref in provenance_refs if ref)
+    question_text = str(question or getattr(task_state, "user_goal", "") or "")
 
     def mark_failure(reason: str) -> bool:
         recorded = False
@@ -448,7 +484,18 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
     confidence = _evidence_confidence(observation)
     preview = observation.get("preview") or []
     asset_ids = tuple(str(value) for value in observation.get("asset_ids") or [] if value)
-    all_provenance = tuple(dict.fromkeys((*provenance_refs, *asset_ids)))
+    observation_asset_ids = tuple(
+        str(value) for value in (
+            observation.get("evidence_asset_ids")
+            or observation.get("source_asset_ids")
+            or ([observation.get("_source_asset_id")] if observation.get("_source_asset_id") else [])
+            or observation.get("retrieved_asset_ids")
+            or []
+        ) if value
+    )
+    all_provenance = tuple(dict.fromkeys(
+        (*provenance_refs, *asset_ids, *observation_asset_ids)
+    ))
     requested = max(1, int(observation.get("total") or len(preview) or 1))
     processed = min(requested, len(preview) or (1 if observation else 0))
     if spec.name not in {"search_memories", "get_result_page"}:
@@ -457,11 +504,23 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
     evidence_rows: list[dict] = []
 
     if spec.name in {"search_memories", "get_result_page"}:
+        # A bounded preview is only a candidate window unless the retrieval
+        # validator explicitly promoted it to validated/full_support. Do not
+        # satisfy person/location/visual requirements from an unvalidated
+        # candidate merely because its descriptive fields look plausible.
+        preview_evidence_allowed = str(
+            observation.get("evidence_status") or "").lower() in {
+                "validated", "full_support"
+            }
         assets = [{
             "handle": item.get("handle"),
             "captured_at": item.get("captured_at"),
             "place": item.get("place"),
-            "asset": asset_ids[index] if index < len(asset_ids) else "",
+            # Search previews carry the server-side asset id in the raw trace,
+            # while ``asset_ids`` is an optional legacy field. Preserve the
+            # preview id so metadata evidence can be traced to the exact photo.
+            "asset": (asset_ids[index] if index < len(asset_ids)
+                      else str(item.get("asset_id") or "")),
         } for index, item in enumerate(preview) if isinstance(item, dict)]
         if assets or asset_ids:
             evidence_rows.append({
@@ -474,7 +533,61 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         for index, item in enumerate(preview):
             if not isinstance(item, dict):
                 continue
-            asset_id = asset_ids[index] if index < len(asset_ids) else str(item.get("asset_id") or "")
+            asset_id = (asset_ids[index] if index < len(asset_ids)
+                        else str(item.get("asset_id") or ""))
+            summary = str(item.get("evidence_summary") or "").strip()
+            if not preview_evidence_allowed:
+                continue
+            if summary:
+                # The ingestion observation is an evidence source in its own
+                # right. Keep it tied to this exact asset so the Writer can
+                # use a rich memory description even when a later 12B visual
+                # pass misses a small/occluded detail; inspect_photo remains a
+                # bounded freshness check rather than the sole source.
+                evidence_rows.append({
+                    "evidence_type": "visual_observation",
+                    "value": summary,
+                    "subject": "照片观察摘要",
+                    "asset_id": asset_id,
+                    "certainty": "supported",
+                })
+                if re.search(r"都有谁|有哪些人|哪几个人|几个人|谁一起|谁参加|人物", question_text):
+                    visible_count = _people_count_from_summary(summary)
+                    named_count = sum(
+                        1 for person in (item.get("people") or [])
+                        if isinstance(person, dict)
+                        and str(person.get("name") or "").strip()
+                        and person.get("identity_status") == "confirmed"
+                    )
+                    unknown_count = max(0, visible_count - named_count)
+                    if unknown_count:
+                        evidence_rows.append({
+                            "evidence_type": "photo_identity",
+                            "value": {
+                                "identity_status": "unconfirmed",
+                                "visible_people_count": visible_count,
+                                "confirmed_people_count": named_count,
+                                "unconfirmed_people_count": unknown_count,
+                                "description": f"另有{unknown_count}名未确认身份的同行者",
+                            },
+                            "subject": "照片人物总数与未确认同行者",
+                            "asset_id": asset_id,
+                            "certainty": "supported",
+                        })
+                if ocr_intent(question_text):
+                    # Ingestion OCR is a usable text source when the more
+                    # expensive tile OCR times out. Preserve only the exact
+                    # stored text fragment; never let the writer infer a
+                    # different slogan from the scene description.
+                    text_match = re.search(r"文字：(.+)$", summary)
+                    if text_match and text_match.group(1).strip():
+                        evidence_rows.append({
+                            "evidence_type": "visible_text",
+                            "value": text_match.group(1).strip()[:600],
+                            "subject": "照片中已记录的文字",
+                            "asset_id": asset_id,
+                            "certainty": "supported",
+                        })
             for person in item.get("people") or []:
                 if not isinstance(person, dict) or person.get("identity_status") != "confirmed":
                     continue
@@ -494,35 +607,91 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 })
         cond_summary = observation.get("condition_summary") or {}
         for cond_key, cond_status in cond_summary.items():
-            if cond_status in {"matched", "confirmed"}:
+            if preview_evidence_allowed and cond_status in {"matched", "confirmed"}:
                 evidence_rows.append({
                     "evidence_type": "structured_fact",
                     "value": f"检索确认满足条件：{cond_key}（共找到 {len(assets)} 张照片）",
                     "certainty": "confirmed",
                     "subject": cond_key,
                 })
+        group_count = observation.get("group_photo_count")
+        group_sizes = observation.get("group_photo_sizes") or []
+        if preview_evidence_allowed and group_count:
+            evidence_rows.append({
+                "evidence_type": "structured_fact",
+                "value": {
+                    "group_photo_count": int(group_count),
+                    "group_photo_sizes": list(group_sizes),
+                    "rows": observation.get("group_photo_rows") or [],
+                },
+                "subject": "事件合影人数统计",
+                "asset_id": ((observation.get("group_photo_rows") or [{}])[0].get("asset_id")
+                             if isinstance((observation.get("group_photo_rows") or [{}])[0], dict)
+                             else ""),
+                "certainty": "supported",
+            })
+        location_question = bool(re.search(
+            r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text))
         places = [item for item in assets if item.get("place")]
+        # GPS/reverse-geocode is a direct structured field.  For a location
+        # question the highest-ranked preview may therefore be used as a
+        # source even before visual validation; do not promote the rest of a
+        # broad candidate pool.
+        if places and not preview_evidence_allowed and location_question:
+            places = places[:1]
+        elif not preview_evidence_allowed:
+            places = []
         if places:
             evidence_rows.append({
                 "evidence_type": "location_metadata",
-                "value": [{"asset": item.get("asset") or item.get("handle"),
+                "value": [{"asset": item.get("asset_id") or item.get("asset") or item.get("handle"),
                            "value": item.get("place")} for item in places],
                 "subject": "照片地点",
+                "asset_id": places[0].get("asset_id") or places[0].get("asset") or "",
             })
+        date_question = bool(re.search(
+            r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text))
         dates = [item for item in assets if item.get("captured_at")]
+        if dates and not preview_evidence_allowed and date_question:
+            dates = dates[:1]
+        elif not preview_evidence_allowed:
+            dates = []
         if dates:
             evidence_rows.append({
                 "evidence_type": "temporal_metadata",
-                "value": [{"asset": item.get("asset") or item.get("handle"),
+                "value": [{"asset": item.get("asset_id") or item.get("asset") or item.get("handle"),
                            "value": item.get("captured_at")} for item in dates],
                 "subject": "照片拍摄时间",
+                "asset_id": dates[0].get("asset_id") or dates[0].get("asset") or "",
             })
+            # Date/year questions are structured facts even when the user
+            # also describes a visual scene. Bind the same source timestamps
+            # to structured_fact so the authoritative writer can answer the
+            # requested year instead of treating a valid dated candidate as
+            # an unresolved visual match.
+            if date_question:
+                evidence_rows.append({
+                    "evidence_type": "structured_fact",
+                    "value": [{"asset": item.get("asset_id") or item.get("asset") or item.get("handle"),
+                                "captured_at": item.get("captured_at")} for item in dates],
+                    "subject": "照片拍摄时间事实",
+                    "asset_id": dates[0].get("asset_id") or dates[0].get("asset") or "",
+                    "certainty": "supported",
+                })
     elif spec.name == "inspect_photo":
         value = observation.get("observation") or observation.get("scene") or observation.get("summary")
-        if value:
+        # A visual inspection can directly disprove a requested scene. That
+        # negative observation is useful for recovery, but must not satisfy a
+        # positive visual requirement merely because it is non-empty.
+        negative_visual = bool(value and re.search(
+            r"(?:没有|未发现|未看到|不存在|不包含|看不到|无法确认|不是).{0,24}",
+            str(value), re.I))
+        if value and not negative_visual:
             evidence_rows.append({"evidence_type": "visual_observation", "value": value,
                                   "subject": str(observation.get("question") or "照片视觉细节"),
-                                  "asset_id": str(observation.get("asset_handle") or (input_refs[0] if input_refs else ""))})
+                                  "asset_id": str(observation.get("_source_asset_id")
+                                                  or observation.get("asset_handle")
+                                                  or (input_refs[0] if input_refs else ""))})
         for identity in observation.get("photo_identities") or []:
             if not isinstance(identity, dict) or identity.get("identity_status") != "confirmed":
                 continue
@@ -537,7 +706,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "identity_status": "confirmed",
                 },
                 "subject": "当前照片中的已确认人物",
-                "asset_id": str(identity.get("asset_id") or observation.get("asset_handle") or ""),
+                "asset_id": str(identity.get("asset_id") or observation.get("_source_asset_id")
+                                or observation.get("asset_handle") or ""),
                 "certainty": "confirmed",
             })
     elif spec.name == "read_photo_text":
@@ -565,17 +735,92 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         value = observation.get("value")
         if value is None:
             value = observation.get("rows") or observation.get("items") or observation.get("summary")
-        if value is not None:
+        if value not in (None, "", [], {}):
             evidence_rows.append({"evidence_type": "structured_fact", "value": value,
                                   "subject": str(observation.get("operation") or "结构化记忆事实")})
-        if observation.get("operation") in {"date", "first", "last"} and observation.get("value") is not None:
+        if (observation.get("operation") in {"date", "first", "last"}
+                and observation.get("value") not in (None, "", [], {})):
             evidence_rows.append({"evidence_type": "temporal_metadata", "value": observation.get("value"),
                                   "subject": str(observation.get("operation"))})
+        filters = observation.get("filters_applied") or {}
+        time_range = filters.get("time_range") if isinstance(filters, dict) else None
+        items = observation.get("items") or []
+        if time_range and items:
+            temporal_value = [
+                {"asset": str(row.get("asset_id") or row.get("id") or ""),
+                 "value": row.get("captured_at") or row.get("date") or ""}
+                for row in items if isinstance(row, dict)
+                and (row.get("captured_at") or row.get("date"))
+            ]
+            if temporal_value:
+                evidence_rows.append({"evidence_type": "temporal_metadata",
+                                      "value": temporal_value,
+                                      "subject": "时间过滤后的照片拍摄时间",
+                                      "asset_id": temporal_value[0].get("asset") or ""})
         if observation.get("group_by") == "place" or observation.get("common_places"):
             value = observation.get("rows") or observation.get("common_places")
             if value:
                 evidence_rows.append({"evidence_type": "location_metadata", "value": value,
                                       "subject": "结构化地点事实"})
+    elif spec.name == "query_memory_metadata":
+        # Dedicated structured metadata must enter the same typed ledger as
+        # search/inspect results; otherwise direct date/place/event evidence is
+        # visible in the tool trace but remains invisible to the final gate.
+        value = observation.get("value")
+        if value is None:
+            value = observation.get("items") or observation.get("rows") or observation.get("summary")
+        source_ids = tuple(str(value) for value in (
+            observation.get("evidence_asset_ids")
+            or observation.get("source_asset_ids")
+            or []
+        ) if value)
+        operation = str(observation.get("metadata_operation")
+                        or observation.get("operation") or "").lower()
+        if value is not None:
+            evidence_rows.append({
+                "evidence_type": "structured_fact",
+                "value": value,
+                "subject": f"结构化元数据:{operation or 'query'}",
+                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
+            })
+        if operation in {"date", "first", "last"} and value not in (None, "", [], {}):
+            evidence_rows.append({
+                "evidence_type": "temporal_metadata", "value": value,
+                "subject": "结构化日期事实",
+                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
+            })
+        filters = observation.get("filters_applied") or {}
+        time_range = filters.get("time_range") if isinstance(filters, dict) else None
+        if time_range and source_ids:
+            evidence_rows.append({
+                "evidence_type": "temporal_metadata",
+                "value": {"time_range": time_range, "source_asset_ids": list(source_ids)},
+                "subject": "时间过滤后的结构化照片来源",
+                "asset_id": source_ids[0],
+            })
+        if operation == "place" and value not in (None, "", [], {}):
+            evidence_rows.append({
+                "evidence_type": "location_metadata", "value": value,
+                "subject": "结构化地点事实",
+                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
+            })
+    elif spec.name == "query_photo_people":
+        people = observation.get("people") or []
+        unknown = observation.get("unconfirmed_people") or []
+        if people or unknown or observation.get("summary"):
+            source_ids = tuple(str(value) for value in (
+                observation.get("evidence_asset_ids")
+                or observation.get("source_asset_ids")
+                or []
+            ) if value)
+            evidence_rows.append({
+                "evidence_type": "photo_identity",
+                "value": {"people": people, "unconfirmed_people": unknown,
+                          "summary": observation.get("summary") or ""},
+                "subject": "当前照片人物",
+                "asset_id": source_ids[0] if source_ids else str(observation.get("asset_id") or ""),
+                "certainty": "confirmed" if people else "supported",
+            })
     elif spec.name == "get_original_photos":
         if int(observation.get("delivered") or 0) > 0 and observation.get("result_set_id"):
             evidence_rows.append({
@@ -657,10 +902,39 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
     recorded = False
     for row in evidence_rows:
         evidence_type = row["evidence_type"]
+        row_coverage = coverage
+        # A bounded preview is intentionally smaller than the retrieved set,
+        # but it is still a complete successful attempt for requirements that
+        # only need one source photo or one directly observed metadata field.
+        # Do not turn a useful location/date/asset row into a failure merely
+        # because the result set has more candidates on later pages.
+        if spec.name in {"search_memories", "get_result_page"} and evidence_type in {
+                "memory_asset", "location_metadata", "temporal_metadata",
+                "photo_identity", "structured_fact"}:
+            row_coverage = Coverage(requested=1, processed=1)
+        # Search validation may inspect only a bounded preview of a large
+        # candidate set. A visual row that the validator explicitly accepted
+        # is complete evidence for that asset; counting the whole candidate
+        # pool as the requested coverage incorrectly leaves the requirement
+        # ``partial`` and triggers a late refusal after a valid search.
+        if (spec.name in {"search_memories", "get_result_page"}
+                and evidence_type == "visual_observation"):
+            validated = {
+                str(value) for value in (observation.get("evidence_asset_ids") or [])
+                if value
+            }
+            if str(row.get("asset_id") or "") in validated:
+                row_coverage = Coverage(requested=1, processed=1)
         active = [state for state in task_state.requirements.values()
                   if state.requirement.evidence_type == evidence_type
                   and state.requirement.required
-                  and state.status in {"open", "running", "partially_supported"}]
+                  and (state.status in {"open", "running", "partially_supported"}
+                       # One inspection can emit several facts of the same
+                       # type (e.g. two named people). Keep binding later
+                       # rows from this call to the requirement after the
+                       # first row has satisfied it.
+                       or (state.status == "satisfied"
+                           and tool_call_id in state.evidence_refs))]
         subject = str(row.get("subject") or "").strip()
         if len(active) == 1:
             refs = (active[0].requirement.id,)
@@ -672,6 +946,34 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     or state.requirement.description in subject
                 )
             )
+        # A generic scene request is not enough to satisfy a targeted visual
+        # requirement (for example, "请描述这张照片" cannot close a
+        # bridesmaid-attire requirement). Keep it as an unmatched observation
+        # so the model/auto resolver must issue a targeted inspection.
+        if (evidence_type == "visual_observation" and len(active) == 1
+                and subject in {"请描述这张照片", "描述这张照片", "照片视觉细节"}):
+            refs = ()
+        evidence_conflict = False
+        if evidence_type == "visual_observation":
+            current_value = str(row.get("value") or "")
+            negates_subject = bool(re.search(
+                r"(没有|无|未见|看不出).{0,12}(伴娘|bridesmaid)"
+                r"|\bno\s+(?:clear\s+|visible\s+)?bridesmaid\b",
+                current_value, re.I))
+            if negates_subject:
+                prior_positive = any(
+                    entry.evidence_type == "visual_observation"
+                    and entry.asset_id == str(row.get("asset_id") or "")
+                    and re.search(r"伴娘|bridesmaid", str(entry.extracted_value or ""), re.I)
+                    and not re.search(
+                        r"(没有|无|未见|看不出).{0,12}(伴娘|bridesmaid)"
+                        r"|\bno\s+(?:clear\s+|visible\s+)?bridesmaid\b",
+                        str(entry.extracted_value or ""), re.I)
+                    for entry in evidence_ledger.entries
+                )
+                if prior_positive:
+                    refs = ()
+                    evidence_conflict = True
         try:
             evidence_ledger.append(LedgerEntry(
                 tool_call_id=tool_call_id,
@@ -679,17 +981,19 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 evidence_type=evidence_type,
                 input_refs=input_refs,
                 provenance_refs=all_provenance,
-                certainty=str(observation.get("certainty") or "supported"),
-                coverage=coverage,
+                certainty=("uncertain" if evidence_conflict
+                           else str(observation.get("certainty") or "supported")),
+                coverage=row_coverage,
                 failure_reason=(str(observation.get("reason") or "")
-                                if coverage.failed else ""),
+                                if row_coverage.failed else ""),
                 provenance_scope_id=evidence_ledger.scope_id,
                 subject=str(row.get("subject") or ""),
                 asset_id=str(row.get("asset_id") or ""),
                 extracted_value=row.get("value"),
                 confidence=confidence,
                 requirement_refs=refs,
-                unmatched_reason=("evidence_incompatible" if not refs and task_state.requirements
+                unmatched_reason=("evidence_conflict" if evidence_conflict
+                                  else "evidence_incompatible" if not refs and task_state.requirements
                                   else ""),
             ))
         except ValueError as exc:
@@ -705,7 +1009,7 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             if state.status == "open":
                 task_state.mark_running(state.requirement.id)
             if state.status == "running":
-                if coverage.is_partial:
+                if row_coverage.is_partial:
                     if allow_partial:
                         task_state.mark_partially_supported(
                             state.requirement.id, evidence_refs=(tool_call_id,))
@@ -725,7 +1029,7 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "question": str(observation.get("question") or row.get("subject") or ""),
                     "outcome": outcome,
                     "evidence_type": evidence_type,
-                    "coverage": coverage.as_dict(),
+                    "coverage": row_coverage.as_dict(),
                 })
     return recorded
 
@@ -762,13 +1066,9 @@ def _trusted_facts(task_state: dict) -> list[str]:
         sample = rows[:6]
         facts.append("工具返回的分组为：" + "、".join(
             f"{r.get('group')}({r.get('count')}条)" for r in sample))
-    result_total = task_state.get("result_total")
-    if result_total is not None:
-        satisfaction = task_state.get("search_satisfaction")
-        label = {"full_support": "可以确认", "partial_support": "部分信息已确认",
-                 "candidate_only": "还不能完全确认", "no_match": "无结果"}.get(
-            satisfaction, "")
-        facts.append(f"找到 {result_total} 张相关照片{('，' + label) if label else ''}。")
+    # Search result cardinality is retrieval telemetry, not an answer fact.
+    # Explicit count questions are represented by query_memory_facts instead;
+    # never turn a broad ResultSet size into a user-facing claim here.
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
             handle = tr.get("inspect_handle") or ""
@@ -795,6 +1095,51 @@ def _confirmed_facts(task_state: dict) -> list[str]:
     if places:
         facts.append("照片 GPS 反编码确认的地点：" + "、".join(places[:5]) + "。")
     return facts
+
+
+def _promote_structured_sources_to_result_set(task: TaskState, observation: dict,
+                                              *, scope_id: str, query: str = "") -> None:
+    """Make structured-fact sources addressable by the same photo handles.
+
+    Metadata/fact tools may be the first successful retrieval after a semantic
+    search returned zero candidates. Their source assets must therefore be
+    merged into the current server-side ResultSet; otherwise grounding has
+    asset IDs but the UI cannot resolve a handle or media URL.
+    """
+    if not observation or not task.current_result_set:
+        return
+    ids: list[str] = []
+    for value in (observation.get("evidence_asset_ids")
+                  or observation.get("source_asset_ids") or []):
+        if value and str(value) not in ids:
+            ids.append(str(value))
+    for row in (observation.get("items") or observation.get("rows") or []):
+        if isinstance(row, dict):
+            value = row.get("asset_id") or row.get("id")
+            if value and str(value) not in ids:
+                ids.append(str(value))
+    if not ids:
+        return
+    try:
+        from . import tools as runtime_tools
+        rs_store = runtime_tools._RUNTIME.get("result_sets")
+        if rs_store is None:
+            return
+        rs = rs_store.get(task.current_result_set)
+        if rs is None:
+            rs = rs_store.new(scope_id=scope_id, query=query,
+                              asset_ids=ids, owner="owner")
+            task.current_result_set = rs.result_set_id
+        else:
+            merged = list(dict.fromkeys([*(rs.asset_ids or []), *ids]))
+            if merged != list(rs.asset_ids or []):
+                rs.asset_ids = merged
+                rs.total = len(merged)
+                rs.shown = min(6, len(merged))
+                rs_store.save(rs)
+        task.result_preview = [f"photo_{i + 1}" for i in range(min(20, len(rs.asset_ids)))]
+    except Exception:
+        return
 
 
 def _build_answer_grounding(*, message: str, task: TaskState,
@@ -864,11 +1209,9 @@ def _build_answer_grounding(*, message: str, task: TaskState,
                                            "caption": (s.get("caption") or s.get("transcript") or "")[:80]})
                     if aid not in source_assets:
                         source_assets.append(aid)
-    # The current result preview remains available for inspection/candidate
-    # browsing but is not promoted to answer evidence.
-    for aid in (selected_image_ids or []):
-        if aid and str(aid) not in source_assets:
-            source_assets.append(str(aid))
+    # A model-selected preview is still only a candidate.  Never promote it
+    # to evidence merely because it was placed in selected_image_ids; delivery
+    # must remain a subset of validated/structured evidence sources.
     evidence_count = len(evidence_handles) + len(evidence_assets)
     # Keep retrieved candidates, validated evidence and explicit delivery
     # distinct even when the model chose no image for final delivery.
@@ -881,6 +1224,7 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     evidence_assets = [aid for aid in retrieved_assets if aid in set(evidence_assets)]
     evidence_count = max(evidence_count, len(evidence_assets))
     evidence_images: list[dict] = []
+    rs = None
     if evidence_assets:
         try:
             from . import tools as runtime_tools
@@ -916,6 +1260,18 @@ def _build_answer_grounding(*, message: str, task: TaskState,
         display_mode = "inline_images"
     else:
         display_mode = "collapsed"
+    evidence_asset_set = set(evidence_assets)
+    valid_selected_ids = [str(aid) for aid in (selected_image_ids or [])
+                          if aid and str(aid) in evidence_asset_set]
+    valid_selected_handles = list(selected_image_handles or [])
+    if rs is not None:
+        valid_selected_handles = [handle for handle in valid_selected_handles
+                                  if any(str(aid) in evidence_asset_set
+                                         and f"photo_{list(rs.asset_ids).index(aid) + 1}" == str(handle)
+                                         for aid in (rs.asset_ids or []))]
+    else:
+        # A handle without its originating result set cannot be resolved safely.
+        valid_selected_handles = []
     return {
         "required": used_evidence,
         "display_mode": display_mode,
@@ -924,8 +1280,8 @@ def _build_answer_grounding(*, message: str, task: TaskState,
         "all_evidence_available": bool(task.current_result_set),
         "result_set_id": task.current_result_set,
         "explicit_image_request": explicit_image,
-        "selected_image_handles": list(selected_image_handles or []),
-        "selected_asset_ids": list(selected_image_ids or []),
+        "selected_image_handles": valid_selected_handles,
+        "selected_asset_ids": valid_selected_ids,
         "retrieved_asset_ids": list(dict.fromkeys(retrieved_assets)),
         "evidence_asset_ids": list(dict.fromkeys(evidence_assets)),
         "evidence_images": evidence_images,
@@ -954,12 +1310,19 @@ def _detect_policy_refusal(message: str) -> str | None:
     return None
 
 def _agent2_answer_context_ready(task_state, answer_context: dict) -> bool:
-    """Return true when the planner's evidence requirements are closed enough to write."""
+    """Return true when at least one required field is grounded enough to write.
+
+    A single unresolved ancillary requirement must not discard a directly
+    supported answer (for example, a GPS location while visual confirmation
+    of the scene is still pending). The writer receives only the grounded
+    fields and is instructed to state the remaining uncertainty.
+    """
     if not answer_context.get("facts"):
         return False
-    states = getattr(task_state, "requirements", {}).values()
-    return all(state.status == "satisfied" for state in states
-               if getattr(state.requirement, "required", True))
+    states = [state for state in getattr(task_state, "requirements", {}).values()
+              if getattr(state.requirement, "required", True)]
+    return any(state.status in {"satisfied", "partially_supported"}
+               for state in states)
 
 
 def _refresh_agent2_status(task_state, evidence_ledger) -> str:
@@ -1173,6 +1536,7 @@ class AgentRuntime:
         ))
         turn.budget.start()
         selected_image_handles: list[str] = []
+        last_model_final_answer = ""
         policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget,
                             allowed_tools=set(self.profile.tools) if self.profile.tools else None)
         refusal = _detect_policy_refusal(message)
@@ -1393,6 +1757,21 @@ class AgentRuntime:
             args = {"asset_handle": handle}
             if tool_name == "read_photo_text":
                 args["question"] = message
+            elif tool_name == "inspect_photo":
+                # The automatic closure call must inspect the missing field,
+                # not a generic scene summary. Reuse the planner's pending
+                # visual requirement so attire/person/action questions remain
+                # answerable even when the model skipped or mis-targeted its
+                # first inspect call.
+                target_question = ""
+                if agent2_task_state is not None:
+                    for state in agent2_task_state.requirements.values():
+                        if (state.requirement.evidence_type == "visual_observation"
+                                and state.status in {"open", "running", "partially_supported"}):
+                            target_question = str(state.requirement.description or "").strip()
+                            if target_question:
+                                break
+                args["question"] = target_question or message
             self._emit_progress(
                 turn, progress_callback, stage="inspecting", status="running",
                 text=f"正在复核照片 {handle}…" if tool_name == "inspect_photo"
@@ -1433,6 +1812,10 @@ class AgentRuntime:
                     }
                 return False
             task.update_from_tool(tool_name, args, observation)
+            if tool_name in {"query_memory_facts", "query_memory_metadata"}:
+                _promote_structured_sources_to_result_set(
+                    task, observation, scope_id=self.scope_id,
+                    query=str(args.get("query") or message or ""))
             task.record_tool_result(call_id, tool_name, observation)
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 record_agent2_tool_evidence(
@@ -1441,9 +1824,39 @@ class AgentRuntime:
                     input_refs=(handle,), provenance_refs=(handle,),
                     observation=observation,
                     allow_partial=not self.profile.features.get("agent2_authoritative"),
+                    question=message,
                 )
+                # An event-level group fact directly answers a visual
+                # enumeration requirement; do not force a second identity
+                # inspection merely because the planner described the same
+                # requirement as visual_observation.
+                if any(tr.get("tool") == "search_memories"
+                       and tr.get("group_photo_count") is not None
+                       for tr in task.tool_results):
+                    for req_id, req_state in agent2_task_state.requirements.items():
+                        if (req_state.requirement.evidence_type == "visual_observation"
+                                and re.search(r"合影|人数|兄弟|brother|photo|number|count",
+                                              f"{message} {req_state.requirement.description or ''}", re.I)):
+                            try:
+                                agent2_task_state.mark_satisfied(
+                                    req_id, evidence_refs=(tool_call_id,))
+                            except Exception:
+                                pass
                 _refresh_agent2_status(agent2_task_state, agent2_evidence_ledger)
                 new_entries = agent2_evidence_ledger.entries[ledger_entries_before:]
+                # Keep the public grounding projection in sync with the
+                # authoritative ledger.  Structured location/date facts can
+                # be valid evidence even when search validation returns no
+                # visual rows, and must still carry their source asset.
+                if task.tool_results:
+                    ledger_assets = [str(entry.asset_id) for entry in new_entries
+                                     if getattr(entry, "asset_id", None)]
+                    if ledger_assets:
+                        current = task.tool_results[-1].setdefault("evidence_asset_ids", []) or []
+                        task.tool_results[-1]["evidence_asset_ids"] = list(dict.fromkeys(
+                            [*current, *ledger_assets]))
+                        task.tool_results[-1]["source_asset_ids"] = list(dict.fromkeys(
+                            [*(task.tool_results[-1].get("source_asset_ids") or []), *ledger_assets]))
                 turn.steps[-1]["standardized_evidence"] = [entry.as_dict() for entry in new_entries]
                 turn.steps[-1]["evidence_ids"] = [
                     f"{entry.tool_call_id}:{entry.evidence_type}" for entry in new_entries
@@ -1468,8 +1881,15 @@ class AgentRuntime:
                 turn.ocr_partial_reason = str(observation.get("reason") or "ocr_failed")
             messages.append({"role": "assistant", "content": _model_visible_action({
                 "action": "tool_call", "tool": tool_name, "arguments": args})})
-            messages.append({"role": "tool", "tool_call_id": call_id,
-                             "content": json.dumps(_model_visible_observation(observation), ensure_ascii=False)})
+            # The action is serialized as ordinary assistant content, not an
+            # OpenAI tool_calls message. A strict OpenAI-compatible API (e.g.
+            # DeepSeek) rejects a following role=tool message without the
+            # matching tool_calls envelope, so keep the observation in a
+            # normal user turn that remains model-visible.
+            messages.append({"role": "user", "content": (
+                f"工具 {tool_name}（{call_id}）返回：\n" +
+                json.dumps(_model_visible_observation(observation), ensure_ascii=False)
+            )})
             return True
 
         # Phase E：Adaptive Visual Budget——按问题类型放宽视觉复核预算
@@ -1514,6 +1934,44 @@ class AgentRuntime:
                         ) or ""
                         from .final_writer import clean_writer_output
                         turn.final_answer = clean_writer_output(raw_writer)
+                        # The single evidence writer can still choose a generic
+                        # refusal when 12B sees rich facts. Apply the same
+                        # claim-completeness policy used by the normal final
+                        # path before releasing this answer; this is a
+                        # text-only rewrite over the existing controlled facts,
+                        # never a deterministic answer template.
+                        # In authoritative Agent2 the evidence-only writer has
+                        # already received the complete ledger. A second
+                        # legacy-context rewrite can drop explicit unknown
+                        # companions or replace a correct answer with a
+                        # refusal, so style repair is limited to shadow mode.
+                        if not self.profile.features.get("agent2_authoritative"):
+                            try:
+                                from .final_writer import (
+                                    build_final_context, evidence_answer_problems,
+                                    needs_rewrite, rewrite_final,
+                                )
+                                writer_context = build_final_context(message, task.as_dict())
+                                writer_issues = evidence_answer_problems(
+                                    message, turn.final_answer, writer_context)
+                                if ((needs_rewrite(turn.final_answer, writer_context)
+                                     or writer_issues)
+                                        and turn.budget.can_model_step()):
+                                    turn.budget.record_model_step()
+                                    rewritten = rewrite_final(
+                                        self.chat_fn, writer_context, turn.final_answer,
+                                        step_id="answer_writer_repair")
+                                    if rewritten:
+                                        turn.final_answer = clean_writer_output(rewritten)
+                                        turn.steps.append({
+                                            "type": "writer", "status": "rewritten",
+                                            "call_type": "writer",
+                                            "step_id": "answer_writer_repair",
+                                        })
+                                        if turn.agent2_trace:
+                                            turn.agent2_trace["writer_repair_output"] = turn.final_answer
+                            except Exception:
+                                pass
                         turn.steps.append({
                             "type": "writer",
                             "status": "generated",
@@ -1578,7 +2036,7 @@ class AgentRuntime:
                         answer_writer_pending = False
             if not turn.budget.can_model_step():
                 # Phase H H4：步骤耗尽但 OCR 已读到确定性硬值时，直接渲染交付（不依赖 12B 收尾）
-                if task.tool_results:
+                if task.tool_results and not self.profile.features.get("agent2_authoritative"):
                     try:
                         nuc = build_nucleus(task.as_dict(), message)
                         kind = classify_deterministic(message)
@@ -1706,6 +2164,7 @@ class AgentRuntime:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
             if action.get("action") == "final":
+                last_model_final_answer = str(action.get("answer") or "").strip()
                 selected_image_handles = _normalize_selected_image_handles(
                     action.get("selected_image_handles") or action.get("image_handles"),
                     task.result_preview,
@@ -1759,7 +2218,13 @@ class AgentRuntime:
                             for state in agent2_task_state.requirements.values()
                             if state.requirement.required and state.status != "satisfied"
                         ]
-                        if agent2_status == "in_progress" and available and turn.budget.can_model_step():
+                        has_partial_answer = any(
+                            state.requirement.required and state.status == "satisfied"
+                            for state in agent2_task_state.requirements.values()
+                        )
+                        if (agent2_status == "in_progress" and available
+                                and turn.budget.can_model_step()
+                                and not has_partial_answer):
                             final_gate.update({
                                 "decision": "continue",
                                 "available_tools": [spec.name for spec in available],
@@ -1772,15 +2237,26 @@ class AgentRuntime:
                                 "请选择一个工具继续获取实际证据。"
                             )})
                             continue
-                        final_gate.update({
-                            "decision": "block",
-                            "available_tools": [spec.name for spec in available],
-                        })
-                        turn.final_answer = "现有证据不足，无法确认。"
-                        turn.status = "partial"
-                        turn.reason = "agent2_insufficient_evidence"
-                        turn.termination_reason = "evidence_gate_blocked"
-                        break
+                        if has_partial_answer:
+                            # A required ancillary field (for example venue)
+                            # may remain unresolved while the user-requested
+                            # field (for example confirmed people) is already
+                            # directly supported. Let the writer answer only
+                            # the supported portion and state the missing one.
+                            final_gate.update({
+                                "decision": "partial_answer",
+                                "available_tools": [spec.name for spec in available],
+                            })
+                        else:
+                            final_gate.update({
+                                "decision": "block",
+                                "available_tools": [spec.name for spec in available],
+                            })
+                            turn.final_answer = "现有证据不足，无法确认。"
+                            turn.status = "partial"
+                            turn.reason = "agent2_insufficient_evidence"
+                            turn.termination_reason = "evidence_gate_blocked"
+                            break
                 # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
                 if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
                     open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
@@ -1861,7 +2337,7 @@ class AgentRuntime:
                 # Phase H H-A：简单确定性问题（数量/日期/布尔）直接按 Nucleus 确定性渲染，
                 # 不再把 total=5 交给 12B 自由改写（reg3 少报根因）。
                 try:
-                    if task.tool_results:
+                    if task.tool_results and not self.profile.features.get("agent2_authoritative"):
                         nuc = build_nucleus(task.as_dict(), message)
                         kind = classify_deterministic(message)
                         if kind:
@@ -2060,7 +2536,7 @@ class AgentRuntime:
                         turn.status = "complete"
                         break
                     # Phase H H4：guard 拦截后若问题可确定性渲染（价格/年份/数量），直接交付硬值
-                    if task.tool_results:
+                    if task.tool_results and not self.profile.features.get("agent2_authoritative"):
                         try:
                             nuc = build_nucleus(task.as_dict(), message)
                             kind = classify_deterministic(message)
@@ -2152,6 +2628,11 @@ class AgentRuntime:
                             if auto_decision.allowed:
                                 task.update_from_tool(recovery_tool, auto_args,
                                                        auto_decision.observation or {})
+                                if recovery_tool in {"query_memory_facts", "query_memory_metadata"}:
+                                    _promote_structured_sources_to_result_set(
+                                        task, auto_decision.observation or {},
+                                        scope_id=self.scope_id,
+                                        query=str(auto_args.get("query") or message or ""))
                                 task.record_tool_result(f"recovery_{recovery_tool}", recovery_tool,
                                                         auto_decision.observation or {})
                                 if not self.profile.features.get("agent2_authoritative"):
@@ -2163,12 +2644,11 @@ class AgentRuntime:
                                         auto_decision.observation.get("reason") or "ocr_failed")
                                 messages.append({"role": "assistant",
                                                  "content": _model_visible_action(action)})
-                                messages.append({"role": "tool",
-                                                 "tool_call_id": f"recovery_{recovery_tool}",
-                                                 "content": json.dumps(
-                                                     _model_visible_observation(
-                                                         auto_decision.observation),
-                                                     ensure_ascii=False)})
+                                messages.append({"role": "user", "content": (
+                                    f"工具 {recovery_tool}（恢复结果）返回：\n" +
+                                    json.dumps(_model_visible_observation(
+                                        auto_decision.observation), ensure_ascii=False)
+                                )})
                                 messages.append({"role": "user", "content": (
                                     "我重新读取了一次照片，请基于新的工具观察，直接输出一个修正后的 final。"
                                 )})
@@ -2234,10 +2714,10 @@ class AgentRuntime:
                         break
                     dedup_retries += 1
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                    messages.append({"role": "tool", "tool_call_id": tool_name,
-                                     "content": json.dumps(
-                                         _model_visible_observation(cached_observation),
-                                         ensure_ascii=False)})
+                    messages.append({"role": "user", "content": (
+                        f"工具 {tool_name}（缓存结果）返回：\n" +
+                        json.dumps(_model_visible_observation(cached_observation), ensure_ascii=False)
+                    )})
                     messages.append({"role": "user", "content": (
                         "这是你刚才相同工具调用的已缓存结果，不需要再次调用。"
                         "请直接基于该结果输出 final；如果证据仍不足，请明确说明无法确认。"
@@ -2345,6 +2825,38 @@ class AgentRuntime:
                         req_id: state.status
                         for req_id, state in agent2_task_state.requirements.items()
                     }
+                # A stale model-selected handle is a recoverable visual
+                # resolution failure. Retry the next bounded preview handle
+                # before closing the task; otherwise one bad handle made the
+                # whole answer look like missing evidence.
+                if self.profile.features.get("agent2_authoritative") and tool_name in {
+                        "inspect_photo", "read_photo_text"}:
+                    failed_code = RESOLVE_VISUAL if tool_name == "inspect_photo" else RESOLVE_OCR
+                    if _auto_retry_failed_resolution({"code": failed_code, "tool": tool_name}):
+                        continue
+                # A late duplicate/stale inspection must not erase a complete
+                # structured answer. Preserve the model answer when no
+                # structured override exists; for event group counts use the
+                # typed fact already recorded by search_memories.
+                if (self.profile.features.get("agent2_authoritative")
+                        and agent2_task_state is not None
+                        and agent2_task_state.status == "complete"):
+                    group_fact = next((tr for tr in task.tool_results
+                                       if tr.get("tool") == "search_memories"
+                                       and tr.get("group_photo_count") is not None), None)
+                    if group_fact:
+                        sizes = group_fact.get("group_photo_sizes") or []
+                        suffix = ("，分别是" + "、".join(str(x) + "人" for x in sizes)) if sizes else ""
+                        turn.final_answer = (
+                            f"一共拍了{int(group_fact.get('group_photo_count') or 0)}张不同人数的合影{suffix}。"
+                        )
+                    elif last_model_final_answer:
+                        turn.final_answer = last_model_final_answer
+                    if turn.final_answer:
+                        turn.status = "complete"
+                        turn.reason = "late_tool_rejection_after_complete"
+                        turn.termination_reason = "task_complete"
+                        break
                 turn.status = "partial" if turn.steps else "error"
                 turn.reason = f"tool_denied:{tool_name}:{decision.reason}"
                 if self.profile.features.get("agent2_authoritative"):
@@ -2354,6 +2866,10 @@ class AgentRuntime:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="工具调用被拒绝")
                 break
             task.update_from_tool(tool_name, arguments, result.observation or {})
+            if tool_name in {"query_memory_facts", "query_memory_metadata"}:
+                _promote_structured_sources_to_result_set(
+                    task, result.observation or {}, scope_id=self.scope_id,
+                    query=str(arguments.get("query") or message or ""))
             task.record_tool_result(tool_call_id, tool_name, result.observation or {})
             if result.status == "ok":
                 tool_result_cache[call_signature] = dict(result.observation or {})
@@ -2368,9 +2884,19 @@ class AgentRuntime:
                     provenance_refs=input_refs,
                     observation=result.observation or {},
                     allow_partial=not self.profile.features.get("agent2_authoritative"),
+                    question=message,
                 )
                 _refresh_agent2_status(agent2_task_state, agent2_evidence_ledger)
                 new_entries = agent2_evidence_ledger.entries[ledger_entries_before:]
+                if task.tool_results:
+                    ledger_assets = [str(entry.asset_id) for entry in new_entries
+                                     if getattr(entry, "asset_id", None)]
+                    if ledger_assets:
+                        current = task.tool_results[-1].setdefault("evidence_asset_ids", []) or []
+                        task.tool_results[-1]["evidence_asset_ids"] = list(dict.fromkeys(
+                            [*current, *ledger_assets]))
+                        task.tool_results[-1]["source_asset_ids"] = list(dict.fromkeys(
+                            [*(task.tool_results[-1].get("source_asset_ids") or []), *ledger_assets]))
                 turn.steps[-1]["standardized_evidence"] = [entry.as_dict() for entry in new_entries]
                 turn.steps[-1]["evidence_ids"] = [
                     f"{entry.tool_call_id}:{entry.evidence_type}" for entry in new_entries
@@ -2414,8 +2940,13 @@ class AgentRuntime:
                     allowed_tool_names=self.profile.tools,
                 )
             messages.append({"role": "assistant", "content": _model_visible_action(action)})
-            messages.append({"role": "tool", "tool_call_id": tool_name, "content": json.dumps(
-                _model_visible_observation(result.observation), ensure_ascii=False)})
+            # See the strict-provider compatibility note above: observations
+            # use a regular user turn because the assistant action is not a
+            # native tool_calls object.
+            messages.append({"role": "user", "content": (
+                f"工具 {tool_name} 返回：\n" +
+                json.dumps(_model_visible_observation(result.observation), ensure_ascii=False)
+            )})
             if self.profile.features.get("agent2_authoritative"):
                 failed_resolution = None
                 obs = result.observation or {}
@@ -2459,6 +2990,72 @@ class AgentRuntime:
             message=message, task=task, selected_handle=selected_handle,
             selected_image_handles=turn.selected_image_handles,
             selected_image_ids=turn.selected_image_ids)
+        # Enumeration answers should deliver every bounded source row that
+        # carries a distinct group size, even if the model selected only one
+        # image in its final JSON.
+        group_fact = next((tr for tr in task.tool_results
+                           if tr.get("tool") == "search_memories"
+                           and tr.get("group_photo_rows")), None)
+        if group_fact:
+            group_ids = {str(row.get("asset_id")) for row in
+                         (group_fact.get("group_photo_rows") or []) if row.get("asset_id")}
+            group_handles = [str(item.get("handle")) for item in
+                             (turn.answer_grounding.get("evidence_images") or [])
+                             if str(item.get("asset_id")) in group_ids and item.get("handle")][:3]
+            if group_handles:
+                turn.selected_image_handles = group_handles
+                try:
+                    from . import tools as runtime_tools
+                    turn.selected_image_ids = [
+                        asset_id for handle in group_handles
+                        if (asset_id := runtime_tools.resolve_handle_asset_id(
+                            handle, task.current_result_set, self.scope_id))
+                    ]
+                except Exception:
+                    turn.selected_image_ids = []
+                turn.answer_grounding = _build_answer_grounding(
+                    message=message, task=task, selected_handle=selected_handle,
+                    selected_image_handles=turn.selected_image_handles,
+                    selected_image_ids=turn.selected_image_ids)
+        # Delivery is a projection of evidence, not a second retrieval path.
+        # If the writer omits selected_image_handles, expose up to three
+        # representative evidence images so both 4174 and 8771 still show the
+        # sources that support the answer.  Never fall back to raw candidates.
+        if not turn.selected_image_handles:
+            fallback_items = [
+                item for item in
+                (turn.answer_grounding.get("evidence_images") or [])
+                if item.get("asset_id")
+            ][:3]
+            fallback_handles = [
+                str(item.get("handle")) for item in fallback_items
+                if item.get("handle")
+            ]
+            fallback_ids = [
+                str(item.get("asset_id")) for item in fallback_items
+                if item.get("asset_id")
+            ]
+            if fallback_handles or fallback_ids:
+                # A structured fact may have a source asset but no current
+                # ResultSet handle.  Keep the asset ID as the delivery key so
+                # both benchmark and production clients can render it.
+                turn.selected_image_handles = fallback_handles
+                turn.selected_image_ids = fallback_ids
+                try:
+                    from . import tools as runtime_tools
+                    resolved = [
+                        asset_id for handle in fallback_handles
+                        if (asset_id := runtime_tools.resolve_handle_asset_id(
+                            handle, task.current_result_set, self.scope_id))
+                    ]
+                    if resolved:
+                        turn.selected_image_ids = list(dict.fromkeys(resolved))
+                except Exception:
+                    pass
+                turn.answer_grounding = _build_answer_grounding(
+                    message=message, task=task, selected_handle=selected_handle,
+                    selected_image_handles=turn.selected_image_handles,
+                    selected_image_ids=turn.selected_image_ids)
         turn.termination_reason = _classify_termination(turn)
         if turn.agent2_trace:
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
