@@ -80,7 +80,7 @@ const fmtMs = (value) => value == null ? "-" : value >= 1000 ? `${(value / 1000)
 const fmtPct = (value) => value == null ? "-" : `${(Number(value) * 100).toFixed(1)}%`;
 const fmtTokens = (value) => value == null || !Number.isFinite(Number(value)) ? "-" : `${Math.round(Number(value)).toLocaleString("en-US")} token`;
 const scoreClass = (score) => score === 2 ? "score-2" : score === 1 ? "score-1" : score === 0 ? "score-0" : "score-none";
-const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", interrupted: "中断", cancelled: "已取消", partial: "部分采样", not_run: "未执行" }[status] || status || "等待");
+const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", interrupted: "中断", cancelled: "已取消", partial: "部分采样", not_run: "未执行", skipped: "不适用" }[status] || status || "等待");
 function setModelSelected(modelId, checked) {
   if (checked) selectedModels.add(modelId);
   else selectedModels.delete(modelId);
@@ -305,7 +305,18 @@ function itemImages(item, gt = false) {
     return decorateImages(item.evidence_source_file_names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) })));
   }
   if (item.predicted_images?.length) return decorateImages(item.predicted_images);
-  return (item.predicted_file_names || []).map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+  if (item.predicted_file_names?.length) {
+    return item.predicted_file_names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+  }
+  // A validator may leave all candidates as candidate_only.  They are not
+  // answer evidence, but hiding them makes a healthy retrieval look empty
+  // in the evaluation UI.  Show a bounded representative window here; the
+  // full candidate set remains in retrieval metrics and the trace.
+  if (item.retrieved_candidate_images?.length) {
+    return decorateImages(item.retrieved_candidate_images.slice(0, 6));
+  }
+  return (item.retrieved_file_names || []).slice(0, 6)
+    .map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
 }
 function itemEvidenceImages(item) {
   const images = item?.evidence_source_images || [];
@@ -1554,7 +1565,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       <div class="model-picker">
 <span class="field-label">选择模型（可多选，串行测试）</span>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
-<input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="!profile.available">（不可用）</span>
+<input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="profile.source === 'cloud_api'">（云端 API）</span><span v-if="!profile.available">（不可用）</span>
 </label>
 </div>
       <div class="actions">

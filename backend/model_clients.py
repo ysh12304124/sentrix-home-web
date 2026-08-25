@@ -236,6 +236,10 @@ def contains_latin_text(value):
 # answer and repair paths.
 ROLE_INFERENCE = {
     "parser": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
+    # Search validation is a bounded classification pass, not free-form
+    # reasoning. Keep the JSON response short so one vision batch does not
+    # consume the Agent wall-time budget.
+    "search_validation": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 320},
     "answer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "writer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "verify": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
@@ -489,8 +493,15 @@ class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
-                 repair_model=None, backend=None, api_key=None, manager_url=None):
+                 repair_model=None, backend=None, api_key=None, manager_url=None,
+                 runtime_source=None, api_mode=None):
         self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
+        self.runtime_source = str(
+            runtime_source or os.getenv("SENTRIX_RUNTIME_SOURCE", "managed")
+        ).strip().lower()
+        self.api_mode = str(
+            api_mode or os.getenv("SENTRIX_OPENAI_API_MODE", "vllm")
+        ).strip().lower()
         ollama_fallback_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         if self.backend == "openai":
             self._base_url_setting = self._normalize_openai_base_url(
@@ -510,12 +521,13 @@ class GammaClient:
             self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
             self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-        self.manager_url = (
-            manager_url
-            or os.getenv("SENTRIX_VLLM_MANAGER_API")
+        manager_setting = (
+            manager_url if manager_url is not None
+            else os.getenv("SENTRIX_VLLM_MANAGER_API")
             or os.getenv("SENTRIX_VLLM_API_URL")
             or ""
-        ).strip().rstrip("/")
+        )
+        self.manager_url = str(manager_setting or "").strip().rstrip("/")
         self._call_metrics_local = threading.local()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
@@ -587,7 +599,7 @@ class GammaClient:
     @staticmethod
     def _normalize_openai_base_url(value):
         value = str(value or "http://127.0.0.1:8100/v1").rstrip("/")
-        return value if value.endswith("/v1") else f"{value}/v1"
+        return value if re.search(r"/v\d+$", value, flags=re.IGNORECASE) else f"{value}/v1"
 
     _CACHE_TTL_SECONDS = 5.0
 
@@ -694,10 +706,16 @@ class GammaClient:
 
         endpoint_base, model = self._endpoint_for(role)
         requested_max_tokens = int(max_tokens) if max_tokens is not None else None
-        budget = self._tokenize_for_budget(endpoint_base, messages)
-        budget_source = str((budget or {}).get("token_count_source") or "vllm_tokenize")
-        preflight_status = str((budget or {}).get("preflight_status") or "ok")
-        preflight_reason = str((budget or {}).get("preflight_fallback_reason") or "")
+        is_cloud_api = self.runtime_source == "cloud_api"
+        budget = None if is_cloud_api else self._tokenize_for_budget(endpoint_base, messages)
+        if is_cloud_api:
+            budget_source = "provider_managed"
+            preflight_status = "not_requested"
+            preflight_reason = "cloud_api_context_managed_by_provider"
+        else:
+            budget_source = str((budget or {}).get("token_count_source") or "vllm_tokenize")
+            preflight_status = str((budget or {}).get("preflight_status") or "ok")
+            preflight_reason = str((budget or {}).get("preflight_fallback_reason") or "")
         if budget:
             prompt_tokens = int(budget["prompt_tokens"])
             max_model_len = int(budget["max_model_len"])
@@ -736,8 +754,9 @@ class GammaClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": temperature,
-            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
+        if self.api_mode != "generic":
+            payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
         headers = {}
@@ -760,8 +779,8 @@ class GammaClient:
                         int(budget["prompt_tokens"]) + int(max_tokens)
                         if budget and max_tokens is not None else None
                     ),
-                    "token_count_source": budget_source if budget else "response_usage",
-                    "preflight_status": preflight_status if budget else "not_configured",
+                    "token_count_source": budget_source if (budget or is_cloud_api) else "response_usage",
+                    "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
                     "preflight_fallback_reason": preflight_reason,
                 })
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
@@ -778,8 +797,8 @@ class GammaClient:
                 "requested_max_tokens": requested_max_tokens,
                 "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
                 "max_model_len": int(budget["max_model_len"]) if budget else None,
-                "token_count_source": budget_source if budget else None,
-                "preflight_status": preflight_status if budget else "not_configured",
+                "token_count_source": budget_source if (budget or is_cloud_api) else None,
+                "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
                 "preflight_fallback_reason": preflight_reason,
             })
             raise ModelError(f"model request failed: {error_detail}") from error
@@ -912,8 +931,9 @@ class GammaClient:
             "stream": use_stream,
             "stream_options": {"include_usage": True} if use_stream else None,
             "temperature": 0,
-            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
+        if self.api_mode != "generic":
+            payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
             payload["response_format"] = {"type": "json_object"}
         params = ROLE_INFERENCE.get(role)

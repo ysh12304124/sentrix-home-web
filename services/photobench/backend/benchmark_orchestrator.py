@@ -110,6 +110,10 @@ _, _P_URL, _P_MODEL, _P_KEY = resolve_judge_provider(None)
 DEFAULT_JUDGE_URL = os.environ.get("BENCH_JUDGE_URL") or _P_URL
 DEFAULT_VLLM_API_URL = os.environ.get("BENCH_VLLM_API_URL", "http://192.168.0.153:8500")
 DEFAULT_VLLM_BASE_URL = os.environ.get("BENCH_VLLM_BASE_URL", "http://192.168.0.153:8105/v1")
+BIG_MODEL_PROFILE_ID = "big_model"
+BIG_MODEL_BASE_URL = os.environ.get("BENCH_BIG_MODEL_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3")
+BIG_MODEL_MODEL = os.environ.get("BENCH_BIG_MODEL_MODEL", "doubao-seed-2.0-lite")
+BIG_MODEL_ENABLED = os.environ.get("BENCH_BIG_MODEL_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL") or _P_MODEL
 JUDGE_API_KEY = os.environ.get("BENCH_JUDGE_API_KEY") or _P_KEY
 
@@ -664,7 +668,7 @@ def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
         model_profile = model_profile or str(source.get("model_profile") or "").strip()
         if not album_id or not model_profile:
             name = str(space.get("name") or "")
-            match = re.search(r"PhotoBench-\d{8}-\d{6}-(?P<album>.+?)-(?P<model>(?:qwen|gemma|llama|phi|mistral|current)[^-]*)$", name, re.I)
+            match = re.search(r"PhotoBench-\d{8}-\d{6}-(?P<album>.+?)-(?P<model>(?:qwen|gemma|llama|phi|mistral|current|big_model)[^-]*)$", name, re.I)
             if match:
                 album_id = album_id or match.group("album")
                 model_profile = model_profile or match.group("model")
@@ -1046,7 +1050,8 @@ class BenchmarkRun:
                  task_judge_system_prompt: str = "", evidence_judge_system_prompt: str = "",
                  mode: str = "full", existing_scope_id: str = "",
                  scope_reused_from_runs: list | None = None,
-                 use_current_model: bool = False, current_model_snapshot: dict | None = None):
+                 use_current_model: bool = False, current_model_snapshot: dict | None = None,
+                 use_cloud_model: bool = False):
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
         if mode == "reuse" and not existing_scope_id:
@@ -1058,6 +1063,7 @@ class BenchmarkRun:
         self.manifest = manifest
         self.model_profile = model_profile
         self.use_current_model = bool(use_current_model)
+        self.use_cloud_model = bool(use_cloud_model)
         self.current_model_snapshot = dict(current_model_snapshot or {})
         self.qa_set = qa_set
         self.sentrix_url = sentrix_url.rstrip("/")
@@ -1091,7 +1097,11 @@ class BenchmarkRun:
             "scope_source": None,
             "album_id": album_id,
             "model_profile": model_profile,
-            "model_source": "current" if self.use_current_model else "managed",
+            "model_source": "cloud_api" if self.use_cloud_model else (
+                "current" if self.use_current_model else "managed"
+            ),
+            "model_backend": "openai" if self.use_cloud_model else "vllm",
+            "model_name": BIG_MODEL_MODEL if self.use_cloud_model else model_profile,
             "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
             "judge_model": judge_model,
@@ -1223,7 +1233,7 @@ class BenchmarkRun:
         Without this, cancelling during model_deploy leaves the load running on the
         GPU and the manager keeps serving a model nobody asked for.
         """
-        if self.use_current_model:
+        if self.use_current_model or self.use_cloud_model:
             return
         try:
             state = request_json(f"{self.vllm_api_url}/state", timeout=5) or {}
@@ -1273,6 +1283,13 @@ class BenchmarkRun:
 
     def _hardware_snapshot(self) -> dict:
         """Use existing Manager endpoints; absence is recorded, never inferred from logs."""
+        if self.use_cloud_model:
+            return {
+                "captured_at": now_iso(),
+                "source": "cloud_api",
+                "status": "not_applicable",
+                "reason": "cloud_api_has_no_local_gpu_metrics",
+            }
         snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
         try:
             snapshot["manager"] = request_json(f"{self.vllm_api_url}/state", timeout=10)
@@ -1341,7 +1358,8 @@ class BenchmarkRun:
             self.state["fatal_error"] = str(e)
             traceback.print_exc()
         finally:
-            self._gpu_sampler.stop()
+            if not self.use_cloud_model:
+                self._gpu_sampler.stop()
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
             if self._gpu_sampling_started and gpu_phase.get("status") != "done":
@@ -1448,6 +1466,20 @@ class BenchmarkRun:
 
     def _phase_model_deploy(self):
         self._phase_start("model_deploy")
+        if self.use_cloud_model:
+            runtime = request_json(
+                f"{self.sentrix_url}/api/model-profiles/bind-cloud-runtime",
+                {"profile": BIG_MODEL_PROFILE_ID}, "POST", 30,
+            )
+            self._phase_done("model_deploy", {
+                "source": "cloud_api",
+                "deployment_mode": "remote_api",
+                "manager_status": "not_applicable",
+                "health_check": "skipped",
+                "model_probe": "skipped",
+                "runtime": runtime,
+            })
+            return
         t0 = time.perf_counter()
         # 1. Stop (unload)
         t_stop0 = time.perf_counter()
@@ -1718,9 +1750,10 @@ class BenchmarkRun:
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        self._reset_gpu_samples_file()
-        self._gpu_sampling_started = True
-        self._gpu_sampler.start()
+        if not self.use_cloud_model:
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         t0 = time.perf_counter()
         scope_id = self.state["scope_id"]
         poll_count = 0
@@ -1843,7 +1876,7 @@ class BenchmarkRun:
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
         # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
-        if not self._gpu_sampling_started:
+        if not self.use_cloud_model and not self._gpu_sampling_started:
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -1936,7 +1969,8 @@ class BenchmarkRun:
                 self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
                 self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
                 self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
-                self._gpu_sampler.stop()
+                if not self.use_cloud_model:
+                    self._gpu_sampler.stop()
 
             while pending:
                 done, _ = concurrent.futures.wait(
@@ -3134,6 +3168,13 @@ class BenchmarkRun:
 
     def _phase_gpu_metrics(self):
         self._phase_start("gpu_metrics")
+        if self.use_cloud_model:
+            self._phase_done("gpu_metrics", {
+                "status": "skipped",
+                "source": "cloud_api",
+                "reason": "cloud_api_has_no_local_gpu_metrics",
+            })
+            return
         agg = self._gpu_sampler.aggregate()
         self._phase_done("gpu_metrics", agg)
 
@@ -3551,11 +3592,33 @@ class OrchestratorRepository:
         return None
 
     def query_profiles(self, vllm_api_url: str) -> dict:
+        profiles = []
+        error = None
         try:
-            profiles = request_json(f"{vllm_api_url.rstrip('/')}/profiles", timeout=15)
-            return {"profiles": profiles}
+            remote_profiles = request_json(f"{vllm_api_url.rstrip('/')}/profiles", timeout=15)
+            if isinstance(remote_profiles, list):
+                profiles = remote_profiles
+            elif isinstance(remote_profiles, dict):
+                profiles = remote_profiles.get("profiles") or []
         except Exception as e:
-            return {"profiles": [], "error": str(e)}
+            error = str(e)
+        if BIG_MODEL_ENABLED and not any(
+            isinstance(item, dict) and item.get("id") == BIG_MODEL_PROFILE_ID
+            for item in profiles
+        ):
+            profiles.append({
+                "id": BIG_MODEL_PROFILE_ID,
+                "model": BIG_MODEL_MODEL,
+                "served_model_name": BIG_MODEL_MODEL,
+                "base_url": BIG_MODEL_BASE_URL,
+                "source": "cloud_api",
+                "available": True,
+                "notes": "external OpenAI-compatible API",
+            })
+        result = {"profiles": profiles}
+        if error:
+            result["error"] = error
+        return result
 
     def query_current_model(self, vllm_api_url: str, model_base_url: str) -> dict:
         state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10) or {}
@@ -3587,6 +3650,15 @@ class OrchestratorRepository:
         run_ids = [str(value) for value in payload.get("run_ids") or []]
         if not run_ids:
             raise ValueError("run_ids is required")
+        with self.lock:
+            cloud_runs = []
+            for rid in run_ids:
+                run = self.runs.get(rid)
+                state = run.state if isinstance(run, BenchmarkRun) else run or {}
+                if state.get("model_source") == "cloud_api":
+                    cloud_runs.append(rid)
+        if cloud_runs:
+            raise ValueError("cloud API model does not support local GPU memory profiling")
         target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
         manager_url = str(target["manager_url"]).rstrip("/")
         sentrix_url = str(payload.get("sentrix_url") or DEFAULT_SENTRIX_URL).rstrip("/")
@@ -4573,9 +4645,17 @@ class OrchestratorRepository:
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
         # The benchmark uses the fixed primary Manager target.  Do not allow a
         # per-request URL to split the orchestrator and Sentrix runtime.
-        target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
-        vllm_api_url = str(target["manager_url"])
-        vllm_model_base_url = str(target["model_base_url"])
+        if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
+            raise ValueError("big_model cannot be combined with current model")
+        managed_models = [model for model in models if model != BIG_MODEL_PROFILE_ID]
+        if managed_models:
+            target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+            vllm_api_url = str(target["manager_url"])
+            vllm_model_base_url = str(target["model_base_url"])
+        else:
+            target_id = ""
+            vllm_api_url = ""
+            vllm_model_base_url = ""
         dirty_statuses = {"running", "pending", "cancelling"}
         with self.lock:
             busy = [
@@ -4630,8 +4710,10 @@ class OrchestratorRepository:
                 run = BenchmarkRun(
                     run_id=run_id, album_id=album_id, manifest=manifest,
                     model_profile=model, qa_set=qa_set,
-                    sentrix_url=sentrix_url, judge_url=judge_url, vllm_api_url=vllm_api_url,
-                    vllm_target_id=target_id, vllm_model_base_url=vllm_model_base_url,
+                    sentrix_url=sentrix_url, judge_url=judge_url,
+                    vllm_api_url=vllm_api_url if model != BIG_MODEL_PROFILE_ID else "",
+                    vllm_target_id=target_id if model != BIG_MODEL_PROFILE_ID else "",
+                    vllm_model_base_url=vllm_model_base_url if model != BIG_MODEL_PROFILE_ID else "",
                     results_root=self.results_root,
                     judge_system_prompt=load_custom_judge_prompt() or JUDGE_PROMPT,
                     task_judge_system_prompt=load_custom_judge_prompts().get("task_decision") or TASK_JUDGE_PROMPT,
@@ -4642,6 +4724,7 @@ class OrchestratorRepository:
                     scope_reused_from_runs=scope_reused_from_runs,
                     use_current_model=use_current_model,
                     current_model_snapshot=current_model_snapshot,
+                    use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
                 )
                 self.runs[run_id] = run
                 created_runs.append(run_id)

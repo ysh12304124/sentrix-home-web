@@ -63,6 +63,8 @@ VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
 RUNTIME_VLLM_API_URL = None
 RUNTIME_VLLM_BASE_URL = None
+RUNTIME_MODEL_SOURCE = "managed"
+RUNTIME_MODEL_PROFILE = None
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
@@ -706,6 +708,15 @@ def _profile_summary(profile_id, profile):
 
 
 def _current_model_runtime():
+    if RUNTIME_MODEL_SOURCE == "cloud_api":
+        return {
+            "backend": getattr(gamma, "backend", "unknown"),
+            "base_url": gamma.base_url, "model": gamma.model,
+            "profile": RUNTIME_MODEL_PROFILE,
+            "source": "cloud_api",
+            "status": "running",
+            "state": None,
+        }
     registry = _load_vllm_registry()
     state = _load_vllm_state(registry)
     running = bool(state and state.get("pid"))
@@ -719,7 +730,7 @@ def _current_model_runtime():
 
 
 def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
-    global gamma, pipeline
+    global gamma, pipeline, RUNTIME_MODEL_SOURCE, RUNTIME_MODEL_PROFILE
     registry = _load_vllm_registry()
     profile = profile or (registry.get("profiles") or {}).get(profile_id) or {}
     state = state or _load_vllm_state(registry) or {}
@@ -730,6 +741,8 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
         new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai", manager_url=RUNTIME_VLLM_API_URL or VLLM_API_URL)
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
+        RUNTIME_MODEL_SOURCE = "managed"
+        RUNTIME_MODEL_PROFILE = profile_id
     return _current_model_runtime()
 
 
@@ -1041,6 +1054,61 @@ def bind_model_runtime(request: RuntimeBindRequest):
     runtime = _apply_vllm_profile_to_runtime_from_state()
     return {"accepted": True, "manager_url": RUNTIME_VLLM_API_URL,
             "model_base_url": RUNTIME_VLLM_BASE_URL, "runtime": runtime}
+
+class CloudRuntimeBindRequest(BaseModel):
+    profile: str = "big_model"
+
+@app.post("/api/model-profiles/bind-cloud-runtime")
+def bind_cloud_runtime(request: CloudRuntimeBindRequest):
+    """Bind Agent runtime to the configured external OpenAI-compatible API."""
+    if request.profile != "big_model":
+        raise HTTPException(status_code=400, detail="unsupported cloud model profile")
+    base_url = os.getenv(
+        "SENTRIX_BIG_MODEL_BASE_URL",
+        "https://ark.cn-beijing.volces.com/api/plan/v3",
+    ).strip().rstrip("/")
+    model = os.getenv("SENTRIX_BIG_MODEL_MODEL", "doubao-seed-2.0-lite").strip()
+    api_key = os.getenv("SENTRIX_BIG_MODEL_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="SENTRIX_BIG_MODEL_API_KEY is not configured")
+    if not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid cloud model base URL")
+    if not model:
+        raise HTTPException(status_code=400, detail="cloud model name is empty")
+
+    global gamma, pipeline, RUNTIME_MODEL_SOURCE, RUNTIME_MODEL_PROFILE
+    new_gamma = GammaClient(
+        base_url=base_url,
+        model=model,
+        backend="openai",
+        api_key=api_key,
+        manager_url="",
+        runtime_source="cloud_api",
+        api_mode="generic",
+    )
+    new_gamma.bind_store(store)
+    with runtime_lock:
+        previous_pipeline = pipeline
+        gamma = new_gamma
+        pipeline = IngestionPipeline(
+            store,
+            gamma=new_gamma,
+            asr=previous_pipeline.asr,
+            face=previous_pipeline.face,
+            clip=previous_pipeline.clip,
+        )
+        RUNTIME_MODEL_SOURCE = "cloud_api"
+        RUNTIME_MODEL_PROFILE = request.profile
+    runtime = _current_model_runtime()
+    return {
+        "accepted": True,
+        "profile": request.profile,
+        "source": "cloud_api",
+        "backend": "openai",
+        "base_url": base_url,
+        "model": model,
+        "runtime": runtime,
+    }
 
 @app.post("/api/model-profiles/sync-runtime")
 def sync_model_runtime():
@@ -2294,15 +2362,22 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         return int(zh * 0.7 + (total - zh) * 0.25) + 400
 
     def chat_fn(messages, *, call_type="agent", step_id=None):
-        max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
-        # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
-        # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
-        try:
-            room = 4400 - _estimate_prompt_tokens(messages)
-            if room < max_tokens:
-                max_tokens = max(64, room)
-        except Exception:
-            pass
+        is_cloud_model = getattr(gamma, "runtime_source", "") == "cloud_api"
+        if is_cloud_model:
+            max_tokens = max(1, int(os.getenv(
+                "SENTRIX_BIG_MODEL_MAX_OUTPUT_TOKENS",
+                os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"),
+            )))
+        else:
+            max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
+            # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
+            # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
+            try:
+                room = 4400 - _estimate_prompt_tokens(messages)
+                if room < max_tokens:
+                    max_tokens = max(64, room)
+            except Exception:
+                pass
         try:
             text = gamma.chat_messages(
                 messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
