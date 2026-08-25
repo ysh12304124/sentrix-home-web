@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .agent_conversation import ConversationStore
+from .agent_runtime.result_set import debug_asset_projection
 from .db import MemoryStore, make_id
 from .image_io import (
     encode_jpeg_preview,
@@ -2453,13 +2454,34 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                    "problems": list(s.get("problems") or [])}
                   for s in turn.steps if s.get("type") == "judge"],
     }
-    tool_trace = [
-        {"tool": s.get("tool", ""), "status": s.get("status", ""),
-         "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
-         "error": s.get("error") or "",
-         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
-        for s in turn.steps if s.get("type") == "tool"
-    ]
+    tool_trace = []
+    for step in turn.steps:
+        if step.get("type") != "tool":
+            continue
+        observation = step.get("observation") or {}
+        tool_record = {
+            "tool": step.get("tool", ""), "status": step.get("status", ""),
+            "tool_call_id": step.get("tool_call_id") or "",
+            "step_id": step.get("step_id") or "",
+            "parent_step_id": step.get("parent_step_id") or "",
+            "arguments": step.get("arguments") or {},
+            # 8771 needs the actual tool observation, not just a performance
+            # summary; this is still server-side debug data and never enters
+            # the model-visible observation path.
+            "observation": observation,
+            "latency_s": step.get("latency_s"), "reason": step.get("reason") or "",
+            "error": step.get("error") or "",
+            "retrieval_timing": observation.get("retrieval_timing"),
+        }
+        # Benchmark/debug consumers need to score returned handles, but model-facing
+        # observations must continue to hide internal asset IDs.
+        if include_debug and step.get("tool") in {"search_memories", "get_result_page"}:
+            result_set_id = observation.get("result_set_id")
+            result_sets = getattr(runtime_tools, "_RUNTIME", {}).get("result_sets")
+            result_set = result_sets.get(result_set_id) if result_sets and result_set_id else None
+            if result_set is not None:
+                tool_record.update(debug_asset_projection(result_set, observation.get("preview")))
+        tool_trace.append(tool_record)
     return {
         "answer": turn.final_answer,
         "model_call_metrics": ordered_metrics,
@@ -2475,6 +2497,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "agent2_trace": turn.agent2_trace if include_debug else public_agent2_trace(turn.agent2_trace),
         "guard_debug": guard_debug,
         "answer_grounding": turn.answer_grounding,
+        "selected_image_handles": list(getattr(turn, "selected_image_handles", []) or []),
+        "selected_image_ids": list(getattr(turn, "selected_image_ids", []) or []),
         "termination_reason": turn.termination_reason,
         "debug_trace": turn.steps if include_debug else None,
     }
@@ -3323,8 +3347,14 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
 
 
 @app.post("/api/maintenance/recheck")
-def recheck(background_tasks: BackgroundTasks):
-    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed', 'semantic_enriching', 'video-queued', 'video-processing-failed') ORDER BY created_at")]
+def recheck(background_tasks: BackgroundTasks, scope_id: str | None = None):
+    clauses = ["status IN ('queued', 'failed', 'semantic_enriching', 'video-queued', 'video-processing-failed')"]
+    params = []
+    if scope_id:
+        clauses.append("scope_id = ?")
+        params.append(scope_id)
+    assets = [store.get_asset(row["id"]) for row in store._rows(
+        "SELECT id FROM assets WHERE " + " AND ".join(clauses) + " ORDER BY created_at", params)]
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
     return {"accepted": len(assets), "status": "recheck-queued"}

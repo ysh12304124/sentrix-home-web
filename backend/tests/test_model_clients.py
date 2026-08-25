@@ -111,6 +111,23 @@ class ModelClientTests(unittest.TestCase):
         )
         self.assertEqual(client.manager_url, "http://manager-8500")
 
+    @patch("backend.model_clients.httpx.post")
+    def test_tokenizer_502_falls_back_to_local_estimate(self, post):
+        request = httpx.Request("POST", "http://manager-8500/tokenize-current")
+        response = httpx.Response(502, request=request, text="bad gateway")
+        error = httpx.HTTPStatusError("502 Bad Gateway", request=request, response=response)
+        post.return_value.raise_for_status.side_effect = error
+        client = GammaClient(
+            base_url="http://sentrix-vllm/v1", model="qwen3.5-0.8-lora-v2",
+            manager_url="http://manager-8500",
+        )
+        with patch.object(client, "_chat_openai_stream", return_value="ok") as stream:
+            self.assertEqual(client.chat_messages(
+                [{"role": "user", "content": "测试"}], role="tool_loop", max_tokens=64), "ok")
+        budget_metrics = stream.call_args.kwargs["budget_metrics"]
+        self.assertEqual(budget_metrics["token_count_source"], "local_estimate")
+        self.assertEqual(budget_metrics["preflight_status"], "fallback")
+
     def test_parses_json_inside_markdown_fence(self):
         result = parse_json_response('```json\n{"caption":"公园"}\n```')
         self.assertEqual(result["caption"], "公园")
@@ -219,6 +236,10 @@ class ModelClientTests(unittest.TestCase):
         self.assertFalse(payload["think"])
         self.assertEqual(payload["options"]["num_ctx"], 4096)
         self.assertEqual(payload["options"]["num_predict"], 320)
+
+    def test_core_vision_default_budget_can_hold_full_observation_contract(self):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="gemma4-12b-it")
+        self.assertEqual(client._core_vision_options()["num_predict"], 800)
 
     def test_image_prompt_uses_approved_place_taxonomy(self):
         client = GammaClient()

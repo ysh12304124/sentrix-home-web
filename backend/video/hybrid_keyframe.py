@@ -262,6 +262,18 @@ def _merge_frames(frames, max_duration=300.0, max_gap=30.0):
             "objects": objects,
             "actions": actions,
             "expressions": expressions,
+            "frame_observations": [
+                {
+                    "source_timestamp_sec": row.get("source_timestamp_sec"),
+                    "event_start_sec": row.get("event_start_sec"),
+                    "event_end_sec": row.get("event_end_sec"),
+                    "objects": row.get("objects") or [],
+                    "actions": row.get("actions") or [],
+                    "expressions": row.get("expressions") or [],
+                    "event_label": row.get("event_label") or "",
+                }
+                for row in group
+            ],
             "source_frame_count": len(group),
             "duplicate_frame_count": duplicate_count,
             "visual_duplicate_count": max(0, len(valid) - len(representatives)),

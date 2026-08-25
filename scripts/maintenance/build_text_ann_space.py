@@ -29,9 +29,14 @@ def observation_text(obs) -> str:
         f"{f.get('subject', '')} {f.get('predicate', '')} {f.get('object', '')}"
         for f in facts if isinstance(f, dict)
     )
+    detail = obs.get("detail") or {}
+    detail_text = " ".join(
+        str(item.get("text") or item.get("label") or item)
+        for item in (detail.get("visible_details") or [])
+    ) if isinstance(detail, dict) else ""
     return " ".join(filter(None, [
         obs.get("caption"), obs.get("activity"), obs.get("place"),
-        obs.get("ocr_text"), obs.get("transcript"), clothing, fact_text,
+        obs.get("ocr_text"), obs.get("transcript"), clothing, fact_text, detail_text,
     ]))
 
 

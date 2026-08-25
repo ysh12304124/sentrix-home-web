@@ -352,6 +352,13 @@ class VideoMemoryAdapter:
                     "memory_duplicate_frame_removal": True, "source_event_ids": item["source_event_ids"],
                     "source_frame_count": item["source_frame_count"], "duplicate_frame_count": item["duplicate_frame_count"],
                     "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
+                    "frame_observations": item.get("frame_observations") or [],
+                    "event_detail": {
+                        key: event_analysis.get(key)
+                        for key in ("caption", "activity", "people", "objects", "clothing",
+                                    "spatial_relations", "ocr_text", "facts", "detail")
+                        if event_analysis.get(key) not in (None, "", [], {})
+                    },
                     "vlm_evidence_count": len(evidence_paths),
                     "vlm_evidence_persisted": len(representatives),
                     "vlm_selected_evidence_indices": [

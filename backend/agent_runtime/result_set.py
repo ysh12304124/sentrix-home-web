@@ -14,6 +14,41 @@ import uuid
 from dataclasses import dataclass, field
 
 RESULT_SET_TTL_S = 24 * 60 * 60  # D7：ResultSet TTL 延长到 24h（多轮/跨会话稳定）
+RESULT_SET_PAGE_SIZE = 6
+
+
+def debug_asset_projection(result_set: "ResultSet", preview: list[dict] | None) -> dict:
+    """Project full and model-visible evidence IDs for benchmark-only diagnostics.
+
+    The full ResultSet remains server-owned.  This projection is emitted only by
+    an include_debug response so offline evaluation can compare candidate recall
+    with the bounded preview without exposing IDs to the model.
+    """
+    full_ids = list(getattr(result_set, "asset_ids", None) or [])
+    preview_handles = []
+    preview_ids = []
+    for item in preview or []:
+        if not isinstance(item, dict):
+            continue
+        handle = str(item.get("handle") or "")
+        asset_id = ""
+        if handle.startswith("photo_"):
+            try:
+                index = int(handle.removeprefix("photo_")) - 1
+            except ValueError:
+                index = -1
+            if 0 <= index < len(full_ids):
+                asset_id = str(full_ids[index])
+        if handle and handle not in preview_handles:
+            preview_handles.append(handle)
+        if asset_id and asset_id not in preview_ids:
+            preview_ids.append(asset_id)
+    return {
+        "debug_asset_ids": full_ids,
+        "debug_preview_asset_ids": preview_ids,
+        "debug_preview_handles": preview_handles,
+        "debug_result_total": len(full_ids),
+    }
 
 
 @dataclass
@@ -29,7 +64,7 @@ class ResultSet:
     owner: str = ""
     expires_at: float = 0.0
     revision: str = ""
-    page_size: int = 6
+    page_size: int = RESULT_SET_PAGE_SIZE
     shown: int = 0
 
     def handles(self) -> dict[str, str]:
@@ -44,7 +79,7 @@ class ResultSet:
 
     def page(self, page_no: int, page_size: int | None = None) -> list[dict]:
         """返回第 page_no 页（1-based）的 handle 列表；handle 序号为全局序号。"""
-        size = page_size or self.page_size
+        size = min(RESULT_SET_PAGE_SIZE, max(1, int(page_size or self.page_size)))
         start = max(0, (int(page_no) - 1) * size)
         end = start + size
         return [
@@ -201,11 +236,25 @@ class TaskState:
             "satisfaction": observation.get("query_satisfaction"),
             "blocked": observation.get("blocked"),
             "inspect_text": observation.get("observation") or observation.get("summary"),
+            "inspect_observation": observation.get("observation"),
             "inspect_handle": observation.get("asset_handle"),
+            "asset_id": observation.get("asset_id") or observation.get("_source_asset_id"),
+            "target_person": observation.get("target_person"),
+            "target_face_status": observation.get("target_face_status"),
+            "target_bbox": observation.get("target_bbox"),
+            "photo_identities": observation.get("photo_identities") or [],
             "confirms_visual_only": observation.get("confirms_visual_only", False),
             "certainty": observation.get("certainty"),
             "ocr_text": observation.get("full_text") or "",
+            "text_regions": observation.get("text_regions") or [],
             "asset_ids": observation.get("asset_ids"),
+            "retrieved_asset_ids": (observation.get("retrieved_asset_ids")
+                                     or observation.get("_retrieved_asset_ids")
+                                     or observation.get("asset_ids")),
+            "preview_asset_ids": observation.get("preview_asset_ids") or observation.get("_preview_asset_ids"),
+            "evidence_asset_ids": observation.get("evidence_asset_ids"),
+            "source_asset_ids": observation.get("source_asset_ids") or [],
+            "source_handles": observation.get("source_handles") or [],
             "operation": observation.get("operation"),
             "value": observation.get("value"),
             "rows": observation.get("rows"),
@@ -221,23 +270,31 @@ class TaskState:
             "provider": observation.get("provider"),
             "confidence": observation.get("confidence"),
             "fallback_used": observation.get("fallback_used"),
+            "status": observation.get("status"),
+            "reason": observation.get("reason"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):
         person = (arguments.get("filters") or {}).get("person") or arguments.get("person") or ""
         if person:
             self.active_person = person
-        if tool_name == "query_memory_facts":
+        if tool_name in {"query_memory_facts", "query_memory_metadata"}:
             total = observation.get("total")
             self.fact_total = int(total) if total is not None else None
             self.fact_value = observation.get("value")
             self.fact_operation = observation.get("operation")
             self.fact_rows = observation.get("rows")
             self.fact_group_by = arguments.get("group_by") or "month"
-            self.last_tool = "query_memory_facts"
+            self.last_tool = tool_name
             self.fulfillment = "empty" if total == 0 else ("fulfilled" if total else "pending")
         if tool_name == "search_memories" and observation.get("result_set_id"):
-            self.current_result_set = observation["result_set_id"]
+            # Preserve the last usable result set when a later search returns
+            # zero matches.  An empty result must not invalidate handles that
+            # were already shown and are still being resolved by the loop.
+            total = observation.get("total")
+            has_matches = total is None or int(total or 0) > 0
+            if has_matches or not self.current_result_set:
+                self.current_result_set = observation["result_set_id"]
             self.result_mode = arguments.get("mode") or "best"
             self.has_more = bool(observation.get("has_more"))
             self.delivery_state = "available" if observation.get("has_more") else "complete"

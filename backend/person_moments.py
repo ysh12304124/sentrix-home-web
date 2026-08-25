@@ -6,7 +6,6 @@ ethnicity, politics, sexual orientation, age/generation/gender presentation)
 is filtered before anything reaches the memory store.
 """
 
-import json
 import tempfile
 from pathlib import Path
 

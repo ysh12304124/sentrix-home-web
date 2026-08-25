@@ -14,20 +14,22 @@ from dataclasses import dataclass
 
 from .planner_contracts import parse_planner_action
 from .task_state import TaskDeclaration, EvidenceRequirement
+from .evidence_contract import planner_evidence_types
 
 
 # 极简 Planning 提示词：小于 120 tokens，不包含庞杂工具描述与冗余参数
 _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精简的 JSON 对象，格式如下：
 {{"action":"declare","declaration":{{"goal":"<用户目标>","scope_id":"{scope_id}","requirements":[{{"id":"req_1","evidence_type":"<证据类型>","description":"<描述>"}}]}}}}
-证据类型（evidence_type）只能是以下之一：
-- memory_asset（查找照片/视频）
-- location_metadata（地点/城市/度假村）
-- temporal_metadata（时间/日期）
-- confirmed_identity（人物/家庭成员）
-- visual_observation（视觉细节/颜色/物品/人数）
-- visible_text（文字/招牌/价格/数字）
-- structured_fact（统计/数量/最早/最近）
-- user_statement（历史对话）
+证据类型（evidence_type）只能来自系统注册表，不得创造新类型。
+{evidence_types}
+
+只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据重复声明。规则：
+- 数量、是否存在、分组等结构化问题声明 structured_fact；拍摄时间/日期/年份声明 temporal_metadata；只有用户明确要求找出照片时才增加 memory_asset。
+- 用户没有明确要求“历史对话/之前说过什么”时，不要声明 user_statement。
+- 地点问题声明 location_metadata；照片内容/颜色/动作声明 visual_observation；照片文字/数字声明 visible_text。
+- 身份问题只有在需要确认照片中的人名时才声明 photo_identity；不要用 visual_observation 代替身份。
+- 同一种 evidence_type 只声明一次；不要为了同一个答案同时声明多个等价需求。
+每个 requirement 都必须能由注册表中的工具直接或通过 prerequisite 获得。
 
 不要调用工具，不要输出 SQL，不要直接回答用户。"""
 
@@ -70,8 +72,13 @@ class GoalPlanner:
 
     def declare(self, message: str, *, scope_id: str, history: str = "",
                 include_debug: bool = False, step_id: str = "planner_step_0") -> PlannerDeclarationResult:
+        evidence_lines = "\n".join(f"- {item}" for item in planner_evidence_types())
+        prompt = _DECLARATION_PROMPT.format(
+            scope_id=scope_id,
+            evidence_types=evidence_lines,
+        )
         messages = [
-            {"role": "system", "content": _DECLARATION_PROMPT.format(scope_id=scope_id)},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": message},
         ]
         if history:
@@ -92,7 +99,7 @@ class GoalPlanner:
             action = parse_planner_action(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
             return PlannerDeclarationResult(fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
-        if action.kind != "declare" or action.declaration is None:
+        if action.kind not in {"declare", "revise"} or action.declaration is None:
             return PlannerDeclarationResult(fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
         if action.declaration.scope_id != scope_id:
             return PlannerDeclarationResult(fallback_reason="scope_mismatch", raw=raw, prompt=prompt_copy)
@@ -118,21 +125,30 @@ class GoalPlanner:
             
         reqs = decl.get("requirements") or decl.get("needs") or []
         normalized_reqs = []
+        seen_types = set()
         for idx, item in enumerate(reqs):
             if isinstance(item, str):
                 etype = _TYPE_MAP.get(item.lower(), "memory_asset")
+                if etype in seen_types:
+                    continue
+                seen_types.add(etype)
                 normalized_reqs.append({
                     "id": f"req_{idx+1}",
                     "evidence_type": etype,
                     "description": item,
+                    "required": True,
                 })
             elif isinstance(item, dict):
                 etype = str(item.get("evidence_type") or item.get("type") or "memory_asset").strip()
                 etype = _TYPE_MAP.get(etype.lower(), etype)
+                if etype in seen_types:
+                    continue
+                seen_types.add(etype)
                 normalized_reqs.append({
                     "id": str(item.get("id") or f"req_{idx+1}"),
                     "evidence_type": etype,
                     "description": str(item.get("description") or item.get("desc") or ""),
+                    "required": bool(item.get("required", True)),
                 })
         if not normalized_reqs:
             normalized_reqs.append({

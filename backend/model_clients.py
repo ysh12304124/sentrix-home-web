@@ -695,6 +695,9 @@ class GammaClient:
         endpoint_base, model = self._endpoint_for(role)
         requested_max_tokens = int(max_tokens) if max_tokens is not None else None
         budget = self._tokenize_for_budget(endpoint_base, messages)
+        budget_source = str((budget or {}).get("token_count_source") or "vllm_tokenize")
+        preflight_status = str((budget or {}).get("preflight_status") or "ok")
+        preflight_reason = str((budget or {}).get("preflight_fallback_reason") or "")
         if budget:
             prompt_tokens = int(budget["prompt_tokens"])
             max_model_len = int(budget["max_model_len"])
@@ -710,7 +713,9 @@ class GammaClient:
                     "available_output_tokens": max(0, available_output_tokens),
                     "max_model_len": max_model_len,
                     "estimated_total_tokens": prompt_tokens + (requested_max_tokens or 0),
-                    "token_count_source": "vllm_tokenize",
+                    "token_count_source": budget_source,
+                    "preflight_status": preflight_status,
+                    "preflight_fallback_reason": preflight_reason,
                     "ttft_ms": None,
                     "total_ms": None,
                     "tokens_per_second": None,
@@ -755,7 +760,9 @@ class GammaClient:
                         int(budget["prompt_tokens"]) + int(max_tokens)
                         if budget and max_tokens is not None else None
                     ),
-                    "token_count_source": "vllm_tokenize" if budget else "response_usage",
+                    "token_count_source": budget_source if budget else "response_usage",
+                    "preflight_status": preflight_status if budget else "not_configured",
+                    "preflight_fallback_reason": preflight_reason,
                 })
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             error_detail = _http_error_detail(error)
@@ -771,7 +778,9 @@ class GammaClient:
                 "requested_max_tokens": requested_max_tokens,
                 "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
                 "max_model_len": int(budget["max_model_len"]) if budget else None,
-                "token_count_source": "vllm_tokenize" if budget else None,
+                "token_count_source": budget_source if budget else None,
+                "preflight_status": preflight_status if budget else "not_configured",
+                "preflight_fallback_reason": preflight_reason,
             })
             raise ModelError(f"model request failed: {error_detail}") from error
 
@@ -780,21 +789,56 @@ class GammaClient:
         manager_url = self.manager_url
         if not manager_url:
             return None
-        try:
-            response = httpx.post(
-                f"{manager_url}/tokenize-current",
-                json={"messages": messages, "add_generation_prompt": True},
-                timeout=min(15, self.timeout),
-            )
-            response.raise_for_status()
-            value = response.json()
-            if int(value.get("prompt_tokens") or 0) < 1 or int(value.get("max_model_len") or 0) < 1:
-                raise ValueError("invalid tokenizer budget response")
-            return value
-        except (httpx.HTTPError, ValueError, TypeError) as error:
-            if os.getenv("SENTRIX_TOKEN_BUDGET_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}:
-                raise ModelError(f"token budget preflight failed: {error}") from error
-            return None
+        url = f"{manager_url}/tokenize-current"
+        last_error = None
+        for attempt in range(2):
+            try:
+                response = httpx.post(
+                    url,
+                    json={"messages": messages, "add_generation_prompt": True},
+                    timeout=min(15, self.timeout),
+                )
+                response.raise_for_status()
+                value = response.json()
+                if int(value.get("prompt_tokens") or 0) < 1 or int(value.get("max_model_len") or 0) < 1:
+                    raise ValueError("invalid tokenizer budget response")
+                value["token_count_source"] = "vllm_tokenize"
+                value["preflight_status"] = "ok"
+                return value
+            except (httpx.HTTPError, ValueError, TypeError) as error:
+                last_error = error
+                response = getattr(error, "response", None)
+                status = int(getattr(response, "status_code", 0) or 0)
+                transient = status >= 500 or status == 0
+                if transient and attempt == 0:
+                    time.sleep(0.1)
+                    continue
+                if transient:
+                    return self._local_token_budget(messages, reason=_http_error_detail(error))
+                if os.getenv("SENTRIX_TOKEN_BUDGET_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}:
+                    raise ModelError(f"token budget preflight failed: {error}") from error
+                return None
+        return self._local_token_budget(messages, reason=str(last_error or "manager_unavailable"))
+
+    @staticmethod
+    def _local_token_budget(messages, *, reason: str = "manager_unavailable"):
+        """Conservative fallback when the manager tokenizer is unavailable."""
+        text = json.dumps(messages or [], ensure_ascii=False, separators=(",", ":"))
+        chinese = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+        estimate = max(1, int(chinese * 0.7 + (len(text) - chinese) * 0.25) + 400)
+        max_model_len = int(
+            os.getenv("SENTRIX_TOKEN_BUDGET_MAX_MODEL_LEN")
+            or os.getenv("SENTRIX_MAX_MODEL_LEN")
+            or os.getenv("VLLM_MAX_MODEL_LEN")
+            or "4501"
+        )
+        return {
+            "prompt_tokens": estimate,
+            "max_model_len": max_model_len,
+            "token_count_source": "local_estimate",
+            "preflight_status": "fallback",
+            "preflight_fallback_reason": reason[:500],
+        }
 
     def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
@@ -993,7 +1037,10 @@ class GammaClient:
         return {
             "think": False,
             "num_ctx": int(os.getenv("VISION_CORE_NUM_CTX", "4096")),
-            "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "320")),
+            # The full observation contract contains caption, people, objects,
+            # clothing, relations and detail arrays.  320 tokens truncates this
+            # JSON before it can be parsed, silently producing an empty memory.
+            "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "800")),
         }
 
     def encode_vision_image(self, path):
@@ -1023,8 +1070,8 @@ class GammaClient:
         file_path = Path(path)
         encoded, mime_type = self._encode_core_image(file_path)
         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
-严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；确实看不清才用空数组或空字符串。
-字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
+严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过160字；activity、place、event_type 各不超过40字；people、objects、clothing、emotions、spatial_relations 尽量完整记录（分别最多12、40、12、12、40项），每项可包含不超过80字的可见细节；facts 最多8项；ocr_text 不超过1000字；确实看不清才用空数组或空字符串。
+字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts、detail。detail 用于保存不应被短摘要丢弃的可验证细节，包含 visible_details、regions、text_blocks、uncertainties 四个数组，每项写清可见内容和 confidence，不要猜测。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
 地点主类只能从："""
         prompt += "、".join(PLACE_PRIMARY_TYPES)
         prompt += "；物品主类只能从："
@@ -1036,14 +1083,14 @@ class GammaClient:
         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
         if not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text")) and not parsed.get("people") and not parsed.get("objects"):
             recovery_prompt = """首轮图片结果只有分类或为空，请补齐可验证的自然语言观察。只根据图片，不猜测姓名，不输出坐标。
-严格返回简体中文 JSON：caption（图片中看到什么，20字内）、activity（正在发生什么，10字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，10字内）、event_type（10字内）、people（最多2项）、objects（最多4项）、ocr_text（20字内）。画面确实看不清才留空；不要只返回分类字段。"""
+严格返回简体中文 JSON：caption（图片中看到什么，160字内）、activity（正在发生什么，40字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，40字内）、event_type（40字内）、people（最多12项）、objects（最多40项）、ocr_text（1000字内）、detail（visible_details/regions/text_blocks/uncertainties）。画面确实看不清才留空；不要只返回分类字段。"""
             recovered = parse_json_response(self.chat(recovery_prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
             for key in ("caption", "activity", "place", "event_type", "people", "objects", "ocr_text"):
                 if recovered.get(key) not in (None, "", []):
                     parsed[key] = recovered[key]
         scalar_text = " ".join(as_text(parsed.get(key)) for key in ("caption", "activity", "place", "event_type", "ocr_text"))
         if contains_latin_text(scalar_text):
-            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："
+            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts、detail。detail 必须保留 visible_details、regions、text_blocks、uncertainties。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："
             canonical_prompt += "、".join(SCENE_TYPE_OPTIONS)
             canonical_prompt += "。\n原始观察：" + json.dumps(parsed, ensure_ascii=False)
             parsed = parse_json_response(self.chat(canonical_prompt))
@@ -1053,6 +1100,16 @@ class GammaClient:
         parsed["emotions"] = as_list(parsed.get("emotions"))
         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
+        detail = parsed.get("detail") if isinstance(parsed.get("detail"), dict) else {}
+        parsed["detail"] = {
+            "schema_version": 1,
+            "visible_details": as_list(detail.get("visible_details")),
+            "regions": as_list(detail.get("regions")),
+            "text_blocks": as_list(detail.get("text_blocks")),
+            "uncertainties": as_list(detail.get("uncertainties")),
+            **{key: value for key, value in detail.items()
+               if key not in {"visible_details", "regions", "text_blocks", "uncertainties"}},
+        }
         normalize_analysis_fields(parsed)
         parsed = normalize_semantic_analysis(parsed)
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
@@ -1070,7 +1127,7 @@ class GammaClient:
         prompt = """你是家庭视频事件观察器。输入是同一连续事件中按时间顺序排列的3至5张临时证据图。
 综合全部图片和YOLO时间序列语义，描述事件期间可验证的人物、物品、环境与活动变化；不能只描述第一张或最后一张，不能猜测姓名或关系。忽略单纯的站立、坐着、抬手等低信息动作，除非它们对事件变化不可缺少。
 caption 和 activity 必须由选中的证据图片直接支持，不得描述已经离开画面的活动。返回 representative_indices：能够覆盖 caption、activity 和事件中不同阶段的最小图片序号集合，从0开始，最多3张。单一活动或相似画面只能选1张；只有出现不同地点、不同活动阶段且单图无法覆盖时才选2至3张，例如“泳池环境”和“烧烤操作”应各选一张。禁止选择重复画面。
-严格返回简体中文 JSON：caption（20字内）、activity（15字内）、place（10字内）、scene_type、semantic、people（最多4项）、objects（最多8项）、clothing（最多4项）、emotions（最多4项）、spatial_relations（最多6项）、ocr_text（40字内）、event_type、facts（最多2项）、representative_indices（整数数组，1至3项）。
+严格返回简体中文 JSON：caption（160字内）、activity（60字内）、place（40字内）、scene_type、semantic、people（最多20项）、objects（最多60项）、clothing（最多20项）、emotions（最多20项）、spatial_relations（最多60项）、ocr_text（1000字内）、event_type、facts（最多12项）、detail（visible_details/regions/text_blocks/uncertainties）、representative_indices（整数数组，1至3项）。
 图片顺序和事件上下文：""" + json.dumps({
             "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
         }, ensure_ascii=False)
@@ -1081,6 +1138,16 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
         parsed["emotions"] = as_list(parsed.get("emotions"))
         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
+        detail = parsed.get("detail") if isinstance(parsed.get("detail"), dict) else {}
+        parsed["detail"] = {
+            "schema_version": 1,
+            "visible_details": as_list(detail.get("visible_details")),
+            "regions": as_list(detail.get("regions")),
+            "text_blocks": as_list(detail.get("text_blocks")),
+            "uncertainties": as_list(detail.get("uncertainties")),
+            **{key: value for key, value in detail.items()
+               if key not in {"visible_details", "regions", "text_blocks", "uncertainties"}},
+        }
         normalize_analysis_fields(parsed)
         parsed = normalize_semantic_analysis(parsed)
         raw_indices = parsed.get("representative_indices")

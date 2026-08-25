@@ -99,6 +99,8 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(result["status"], "processed")
             observation = store.list_observations()[0]
             self.assertEqual(observation["ocr_text"], "生日快乐")
+            self.assertEqual(observation["detail"]["schema_version"], 1)
+            self.assertEqual(observation["detail"]["objects"][0]["label"], "蛋糕")
             self.assertEqual(store.count("events"), 1)
             self.assertEqual(store.count("face_clusters"), 1)
             self.assertEqual({item["entity_type"] for item in store.list_entities()}, {"person", "place", "object", "time"})

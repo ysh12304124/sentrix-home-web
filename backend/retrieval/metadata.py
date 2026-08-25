@@ -53,11 +53,19 @@ class MetadataRetriever:
                     continue
             # place 预筛（镜像 kernel 判定：geocode 匹配或缺失保留，不匹配剔除）
             if filters.place:
-                geo = None
-                try:
-                    geo = (asset.get("metadata_json") or {}).get("reverse_geocode")
-                except Exception:
-                    geo = None
+                # ``MemoryStore`` returns metadata_json as a JSON string.  The
+                # old code only handled a dict, so every asset with GPS was
+                # silently treated as having no geocode and passed the place
+                # prefilter.  That polluted the metadata channel with the
+                # whole scope and let insertion order displace exact places.
+                metadata = asset.get("metadata_json") or {}
+                if isinstance(metadata, str):
+                    try:
+                        import json
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                geo = metadata.get("reverse_geocode") if isinstance(metadata, dict) else None
                 if geo and not place_text_matches(filters.place, geo):
                     continue
             hits.append(CandidateHit(

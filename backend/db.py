@@ -454,6 +454,7 @@ class MemoryStore:
                 confidence REAL NOT NULL DEFAULT 0,
                 raw_json TEXT NOT NULL DEFAULT '{}',
                 canonical_json TEXT NOT NULL DEFAULT '{}',
+                detail_json TEXT NOT NULL DEFAULT '{}',
                 source_owner_id TEXT,
                 inferred_captured_by TEXT,
                 clothing_json TEXT NOT NULL DEFAULT '[]',
@@ -1149,6 +1150,7 @@ class MemoryStore:
         )
         self.connection.commit()
         self._ensure_columns("memory_spaces", {"include_in_people": "INTEGER NOT NULL DEFAULT 1"})
+        self._ensure_columns("observations", {"detail_json": "TEXT NOT NULL DEFAULT '{}'"})
         self._ensure_columns("face_instances", {"validity": "TEXT NOT NULL DEFAULT 'uncertain'"})
         self._ensure_columns("entities", {
             "identity_state": "TEXT NOT NULL DEFAULT 'clustered'",
@@ -1761,8 +1763,8 @@ class MemoryStore:
             """INSERT INTO observations(
                 id, scope_id, asset_id, captured_at, source_type, caption, activity, place,
                 people_json, objects_json, ocr_text, event_type, transcript, confidence, raw_json,
-                canonical_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                canonical_json, detail_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 observation_id,
                 scope_id,
@@ -1780,6 +1782,7 @@ class MemoryStore:
                 float(data.get("confidence", 0) or 0),
                 json_value(data.get("raw"), {}),
                 json_value(data.get("canonical"), {}),
+                json_value(data.get("detail"), {}),
                 data.get("source_owner_id"),
                 data.get("inferred_captured_by"),
                 json_value(data.get("clothing"), []),
@@ -1793,12 +1796,13 @@ class MemoryStore:
         return self.get_observation(observation_id)
 
     def get_observation(self, observation_id):
-        result = self._decode(self._row("SELECT * FROM observations WHERE id = ?", (observation_id,)), ["people_json", "objects_json", "raw_json", "canonical_json", "clothing_json", "spatial_relations_json"])
+        result = self._decode(self._row("SELECT * FROM observations WHERE id = ?", (observation_id,)), ["people_json", "objects_json", "raw_json", "canonical_json", "detail_json", "clothing_json", "spatial_relations_json"])
         if result:
             result["people"] = result.get("people_json", [])
             result["objects"] = result.get("objects_json", [])
             result["raw"] = result.get("raw_json", {})
             result["canonical"] = result.get("canonical_json", {})
+            result["detail"] = result.get("detail_json", {})
             result["clothing"] = result.get("clothing_json", [])
             result["spatial_relations"] = result.get("spatial_relations_json", [])
         return result
@@ -1807,10 +1811,11 @@ class MemoryStore:
         observation = self.get_observation(observation_id)
         if not observation:
             return None
-        canonical = {**(observation.get("canonical") or {}), **{key: value for key, value in details.items() if value not in (None, "", [], {})}}
-        assignments = ["canonical_json = ?", "revision = revision + 1"]
-        params = [json_value(canonical, {})]
-        for key, column in (("objects", "objects_json"), ("clothing", "clothing_json"), ("spatial_relations", "spatial_relations_json")):
+        canonical = {**(observation.get("canonical") or {}), **{key: value for key, value in details.items() if key != "detail" and value not in (None, "", [], {})}}
+        detail = {**(observation.get("detail") or {}), **(details.get("detail") or {})}
+        assignments = ["canonical_json = ?", "detail_json = ?", "revision = revision + 1"]
+        params = [json_value(canonical, {}), json_value(detail, {})]
+        for key, column in (("people", "people_json"), ("objects", "objects_json"), ("clothing", "clothing_json"), ("spatial_relations", "spatial_relations_json")):
             if key in details:
                 assignments.append(f"{column} = ?")
                 params.append(json_value(details[key], []))
@@ -1841,11 +1846,12 @@ class MemoryStore:
             rows = self._rows("SELECT * FROM observations ORDER BY created_at DESC LIMIT ?", (limit,))
         values = []
         for row in rows:
-            value = self._decode(row, ["people_json", "objects_json", "raw_json", "canonical_json", "clothing_json", "spatial_relations_json"])
+            value = self._decode(row, ["people_json", "objects_json", "raw_json", "canonical_json", "detail_json", "clothing_json", "spatial_relations_json"])
             value["people"] = value.get("people_json", [])
             value["objects"] = value.get("objects_json", [])
             value["raw"] = value.get("raw_json", {})
             value["canonical"] = value.get("canonical_json", {})
+            value["detail"] = value.get("detail_json", {})
             value["clothing"] = value.get("clothing_json", [])
             value["spatial_relations"] = value.get("spatial_relations_json", [])
             values.append(value)
@@ -1947,7 +1953,9 @@ class MemoryStore:
         # group shots, and different camera angles need not look alike. Split
         # only when independent semantic evidence also conflicts and no known
         # person/object bridges the candidate event.
-        if visual_available and semantic_conflict and visual_similarity < 0.45 and not corroborated:
+        if semantic_conflict and not corroborated and (
+            not visual_available or visual_similarity < 0.45
+        ):
             split_guard = "semantic_visual_conflict"
         visual_boost = (
             max(0.0, min(1.0, (visual_similarity - 0.70) / 0.30))
@@ -2096,9 +2104,11 @@ class MemoryStore:
         location_score = max((max(0.0, 1.0 - min(value, 1000.0) / 1000.0) for value in distances), default=0.0)
         left_vectors, right_vectors = self._event_asset_vectors(left), self._event_asset_vectors(right)
         visual_score = max((self._cosine(a, b) for a in left_vectors for b in right_vectors), default=0.0)
-        semantic_score = self._set_overlap(self._event_semantic_values(left), self._event_semantic_values(right))
+        left_semantic, right_semantic = self._event_semantic_values(left), self._event_semantic_values(right)
+        semantic_score = self._set_overlap(left_semantic, right_semantic)
+        semantic_conflict = bool(left_semantic and right_semantic and not semantic_score)
         face_overlap = bool(self._event_face_clusters(left).intersection(self._event_face_clusters(right)))
-        merge = time_score >= 0.70 and (
+        merge = not semantic_conflict and time_score >= 0.70 and (
             (location_score >= 0.65 and (visual_score >= 0.55 or semantic_score > 0 or face_overlap))
             or (visual_score >= 0.80 and (semantic_score > 0 or face_overlap))
             or (location_score >= 0.85 and semantic_score > 0)
@@ -2106,6 +2116,7 @@ class MemoryStore:
         return {
             "merge": merge, "time": time_score, "location": location_score,
             "visual_similarity": visual_score, "semantic": semantic_score,
+            "semantic_conflict": semantic_conflict,
             "face_overlap": face_overlap,
             "total": 0.35 * time_score + 0.25 * location_score + 0.25 * visual_score + 0.10 * semantic_score + (0.05 if face_overlap else 0.0),
         }
@@ -3453,6 +3464,10 @@ class MemoryStore:
             from .qdrant_memory import get_qdrant_index
             accelerator = get_qdrant_index(self.path)
             if accelerator is not None:
+                matching = accelerator.matching_collections(
+                    space=space, dimension=len(query), model_name=model_name,
+                    scope_id=scope_id,
+                )
                 accelerated = accelerator.search(
                     space=space, vector=query, limit=max(limit * 4, limit),
                     scope_id=scope_id, model_name=model_name,
@@ -3476,6 +3491,10 @@ class MemoryStore:
                         )
                     self._last_vector_search = {"backend": "qdrant", "error": None}
                     return accelerated[:max(1, limit)]
+                self._last_vector_search = {
+                    "backend": "sqlite_fallback",
+                    "error": "qdrant_no_collection" if not matching else "qdrant_empty",
+                }
         except Exception as error:
             self._last_vector_search = {
                 "backend": "sqlite_fallback",
@@ -3523,6 +3542,13 @@ class MemoryStore:
             status.setdefault("error", f"{type(error).__name__}: {error}")
         status["qdrant_available"] = accelerator is not None
         status["degraded"] = bool(status.get("qdrant_enabled")) and accelerator is None
+        if status.get("degraded"):
+            status["degraded_reason"] = "qdrant_unavailable_or_lock"
+        elif status.get("qdrant_enabled") and status.get("active_backend") in {
+                "sqlite", "sqlite_fallback"}:
+            status["degraded_reason"] = "qdrant_search_fallback"
+        else:
+            status["degraded_reason"] = ""
         status.update(vector_search_metrics())
         try:
             from .qdrant_memory import qdrant_lock_status
@@ -4956,20 +4982,33 @@ class MemoryStore:
         clusters = self._rows(
             """SELECT c.id, c.representative_embedding_json, c.member_count
             FROM face_clusters c
-            WHERE c.scope_id = ? AND c.status IN ('pending', 'confirmed') AND c.member_count >= 2""",
+            WHERE c.scope_id = ? AND c.status = 'confirmed' AND c.member_count >= 2""",
             (scope_id,),
         )
-        best_id = None
-        best_cos = 0.0
+        ranked = []
         for cluster in clusters:
-            representative = json.loads(cluster["representative_embedding_json"] or "[]")
-            if not representative or len(representative) != len(embedding):
-                continue
-            cos = self._cosine(embedding, representative)
-            if cos > best_cos:
-                best_cos = cos
-                best_id = cluster["id"]
-        return best_id if best_cos >= threshold else None
+            prototypes = self._rows(
+                "SELECT embedding_json FROM face_prototypes WHERE cluster_id = ?",
+                (cluster["id"],),
+            )
+            representatives = [
+                json.loads(item["embedding_json"] or "[]")
+                for item in prototypes
+            ]
+            if not representatives:
+                representatives = [json.loads(cluster["representative_embedding_json"] or "[]")]
+            scores = [self._cosine(embedding, representative) for representative in representatives
+                      if representative and len(representative) == len(embedding)]
+            if scores:
+                ranked.append((max(scores), cluster["id"]))
+        ranked.sort(reverse=True)
+        if not ranked or ranked[0][0] < threshold:
+            return None
+        # A small margin is required even for a confirmed person: uncertain
+        # detections must not be silently attached to a near-tie.
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.08:
+            return None
+        return ranked[0][1]
 
     def _sync_face_entity_statuses(self, timestamp=None):
         """Hide pending entities whose candidate face clusters were retired."""

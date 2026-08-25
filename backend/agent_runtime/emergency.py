@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from .final_writer import sanitize_internal_refs
+
 _OPERATION_LABEL = {
     "count": "数量",
     "media": "照片数量",
@@ -58,11 +60,15 @@ def render_emergency_summary(task_state: dict, *, reason: str = "") -> str:
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
             handle = tr.get("inspect_handle") or ""
-            parts.append(f"照片{(' ' + handle) if handle else ''}复核：{tr['inspect_text']}")
+            display_handle = sanitize_internal_refs(handle)
+            if display_handle == "这张照片":
+                parts.append(f"{display_handle}复核：{tr['inspect_text']}")
+            else:
+                parts.append(f"照片{(' ' + display_handle) if display_handle else ''}复核：{tr['inspect_text']}")
         if tr.get("tool") == "get_original_photos" and tr.get("total"):
             parts.append("原图交付已授权。")
     if not parts:
         parts.append("这次处理没有完成，没有产生可确认的结果。")
     tail = _REASON_TAIL.get(reason, _DEFAULT_TAIL if not reason else
                             f"这次处理因故没有完整完成，可以继续问我。")
-    return "；".join(parts) + tail
+    return sanitize_internal_refs("；".join(parts) + tail)

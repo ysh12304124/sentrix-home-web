@@ -84,23 +84,31 @@ def extract_place(question: str, store, scope_id: str) -> str | None:
     from ..geocoding import place_alias_names
     best = None
     best_len = 0
+    best_position = -1
     for label in _place_labels(store, scope_id):
         if any(n in label for n in _PLACE_NOISE):
             continue
         # label 自身变体
         for variant in _place_variants(label):
-            if len(variant) >= 2 and variant in q and len(variant) > best_len:
-                best, best_len = variant, len(variant)
+            if len(variant) >= 2 and variant in q:
+                position = q.rfind(variant)
+                # When city and district have the same token length (邯郸/馆陶),
+                # prefer the more specific trailing place phrase instead of
+                # the first broad city token.
+                if len(variant) > best_len or (len(variant) == best_len and position > best_position):
+                    best, best_len, best_position = variant, len(variant), position
         # 通用别名（place_alias_names 是 geocoding 的真实世界地名表，非 benchmark 特定）
         for alias in place_alias_names(label):
-            if alias in q and len(alias) > best_len:
-                best, best_len = alias, len(alias)
+            if alias in q:
+                position = q.rfind(alias)
+                if len(alias) > best_len or (len(alias) == best_len and position > best_position):
+                    best, best_len, best_position = alias, len(alias), position
     # 反向：问题里的中文地名词经通用别名展开后，能命中 scope 已知 label
     for alias in place_alias_names(q):
         for known in _place_labels(store, scope_id):
             if alias and (alias in known or known in alias):
                 if len(alias) > best_len:
-                    best, best_len = alias, len(alias)
+                    best, best_len, best_position = alias, len(alias), q.rfind(alias)
     return best
 
 

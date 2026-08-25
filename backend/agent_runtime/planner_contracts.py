@@ -25,7 +25,7 @@ def parse_planner_action(
     if not isinstance(payload, dict):
         raise ValueError("planner action must be an object")
     kind = str(payload.get("action") or "")
-    if kind == "declare":
+    if kind in {"declare", "revise"}:
         return PlannerAction(
             kind=kind,
             declaration=TaskDeclaration.from_dict(dict(payload.get("declaration") or {})),

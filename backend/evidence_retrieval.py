@@ -157,7 +157,7 @@ class EvidenceRetrievalKernel:
         evaluated, which is the semantic-difference this phase introduces.
         """
         total_started = time.monotonic()
-        from .retrieval import HardFilterContext, RetrievalQuery, fuse
+        from .retrieval import HardFilterContext, RetrievalQuery
         from .retrieval.config import RetrievalConfig
         from .retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS
         from .retrieval.ranking import VISUAL_ONLY, rank
@@ -168,6 +168,26 @@ class EvidenceRetrievalKernel:
         query = RetrievalQuery.from_spec(spec, embedding_router=self.embedding_router)
         query_build_ms = round((time.monotonic() - query_started) * 1000, 1)
         recall_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
+        # Anchored searches (place/time) need a larger recall budget than a
+        # generic visual top-20.  The metadata channel may contain an entire
+        # event/day whose exact asset sits just past the visual head; truncating
+        # before fusion made valid source photos disappear (e.g. the 15:27
+        # 三峡坝址基石 photo while four nearby 15:00 photos survived).
+        if filters.place:
+            # A city/district can contain hundreds of assets. Keep the full
+            # anchored candidate universe large enough for the semantic query
+            # to recover a specific scene (for example a three-person photo)
+            # instead of truncating at an arbitrary top-100 head. The user
+            # preview remains bounded; this only changes retrieved_candidates.
+            recall_limit = max(recall_limit, 500)
+        elif filters.time_bounds:
+            recall_limit = max(recall_limit, 200)
+        else:
+            # Pure semantic queries also need a recoverable candidate window;
+            # top-20 was too shallow for paraphrases such as “大型水利工程”
+            # whose exact photos may rank below generic scene captions. The
+            # model/UI still see only the bounded preview.
+            recall_limit = max(recall_limit, 500)
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
 
@@ -202,6 +222,8 @@ class EvidenceRetrievalKernel:
                 "embedding_ms": round(sum(event.get("latency_ms", 0) for event in embedding_events), 1),
                 "embedding_events": embedding_events,
             }
+            if self.embedding_router and hasattr(self.embedding_router, "status"):
+                trace["embedding_status"] = self.embedding_router.status()
             if channel_reason:
                 trace["reason"] = channel_reason
             channel_trace[retriever.name] = trace
@@ -253,6 +275,25 @@ class EvidenceRetrievalKernel:
 
         postprocess_started = time.monotonic()
         packet.assets = primary_items + [item for item in adjacency_items if item["asset_id"] not in already]
+        # An explicit place is an identity anchor for the user-visible search.
+        # Missing geocode must not turn a face-ID/uncertain asset into a
+        # plausible-looking result.  Keep only candidates with direct place
+        # support when such candidates exist; if none exists, return no match
+        # rather than displaying unrelated approximate photos.  The open-world
+        # behavior remains available to the lower-level condition evaluator and
+        # evidence tests, but it is not safe for a delivered place search.
+        place_constraints = [c for c in spec.constraints if c.dimension == "place" and not c.negated]
+        if place_constraints:
+            matched_place = [
+                item for item in packet.assets
+                if any(item.get("condition_results", {}).get(c.key, {}).get("status") == "matched"
+                       for c in place_constraints)
+            ]
+            if matched_place:
+                packet.assets = matched_place
+            else:
+                packet.gaps.append({"condition": "place", "reason": "no_direct_support"})
+                packet.assets = []
         for item in packet.assets:
             if item["level"] == "exact":
                 packet.exact_results.append(item)
@@ -277,6 +318,8 @@ class EvidenceRetrievalKernel:
             "fusion_ms": round(primary_fusion_ms + adjacency_fusion_ms, 1),
             "postprocess_ms": round((time.monotonic() - postprocess_started) * 1000, 1),
         }
+        if self.embedding_router and hasattr(self.embedding_router, "status"):
+            packet.retrieval_timing["embedding_status"] = self.embedding_router.status()
         return packet
 
     def _evaluate_fused(self, fused, spec, packet, filters, all_authorized, scope_id, *, skip_assets):
@@ -521,6 +564,13 @@ class EvidenceRetrievalKernel:
         if geocode and place_text_matches(value, geocode):
             return ("matched", "asset_metadata", asset.get("id"),
                     float(geocode.get("confidence") or 0.9))
+        # A normalized observation.place value is a direct field fact when it
+        # exactly names the requested place.  Keep broader captions/scene
+        # prose weak, but do not downgrade this precise field to possible.
+        observation_place = str(observation.get("place") or "").strip()
+        if observation_place and observation_place == value:
+            return ("matched", "observation_field_exact", observation.get("id"),
+                    float(observation.get("confidence") or 0))
         pool = " ".join(filter(None, [observation.get("place"), observation.get("caption")]))
         if _contains(pool, value):
             return ("possible", "observation", observation.get("id"),

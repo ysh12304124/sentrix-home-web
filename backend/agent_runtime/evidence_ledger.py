@@ -62,6 +62,9 @@ class LedgerEntry:
     extracted_value: Any = None
     confidence: float | None = None
     requirement_refs: tuple[str, ...] = ()
+    # Explicitly distinguish evidence that is valid but cannot satisfy any
+    # currently declared requirement from a missing/failed tool result.
+    unmatched_reason: str = ""
 
     def __post_init__(self):
         if not self.tool_call_id:
@@ -85,6 +88,7 @@ class LedgerEntry:
             "failure_reason": self.failure_reason,
             "provenance_scope_id": self.provenance_scope_id,
             "requirement_refs": list(self.requirement_refs),
+            "unmatched_reason": self.unmatched_reason,
         }
         if self.subject:
             data["subject"] = self.subject
@@ -119,6 +123,7 @@ class LedgerEntry:
             confidence=(float(payload["confidence"])
                         if payload.get("confidence") is not None else None),
             requirement_refs=tuple(str(ref) for ref in payload.get("requirement_refs") or []),
+            unmatched_reason=str(payload.get("unmatched_reason") or ""),
         )
 
 
@@ -152,8 +157,10 @@ class EvidenceLedger:
         """
         requirements = _task_requirements(task_state)
         relevant_types = {item["evidence_type"] for item in requirements}
+        requirement_ids = {item["id"] for item in requirements}
         entries = [entry for entry in self.entries if (
-            not relevant_types or entry.evidence_type in relevant_types
+            (not relevant_types or entry.evidence_type in relevant_types)
+            and (not requirement_ids or bool(set(entry.requirement_refs) & requirement_ids))
         )]
         entries.sort(key=_answer_entry_sort_key, reverse=True)
 
@@ -182,12 +189,12 @@ class EvidenceLedger:
                 seen.add(key)
 
         conflicts = _find_conflicts(facts)
-        facts_by_type = {fact["evidence_type"] for fact in facts}
         unknowns = []
         for item in requirements:
             if item["status"] in {"satisfied", "partially_supported"}:
                 continue
-            if item["evidence_type"] in facts_by_type:
+            if any(item["id"] in (fact.get("requirement_refs") or [])
+                   for fact in facts):
                 continue
             unknowns.append({
                 "requirement_id": item["id"],

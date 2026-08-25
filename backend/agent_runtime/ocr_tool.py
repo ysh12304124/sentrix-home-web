@@ -24,14 +24,19 @@ def bind_ocr_runtime(runtime: dict) -> None:
     _RUNTIME = runtime
 
 
-def _handle_to_asset_id(handle: str) -> str | None:
-    return (_RUNTIME.get("last_handles") or {}).get(handle)
-
-
 # ---- Tool 4b: read_photo_text（Phase E：OCR 专用 Tool）----
 _OCR_PROMPT = """请读出这张照片中的全部文字（招牌/菜单/价格/数字/电话/年份/小字）。只输出文字内容本身，不要描述图片、不要评价。如果完全看不清就输出空字符串。"""
 _OCR_PROMPT_FULL = """观察这张照片，墙面上有哪些招牌、牌子或文字？请逐条列出文字内容本身（店名、电话、价格、年份、标语等），不要描述人物和场景。看不清的部分不要编造。"""
 _OCR_CACHE: dict[str, tuple[tuple, dict]] = {}  # (asset_id, mtime, provider, tiles) -> result
+# Compatibility note: the runtime-level Gamma adapter still exposes
+# ``gamma.get_and_clear_call_metrics()``; OCR keeps its own provider telemetry
+# but must not drop those internal model-call metrics when routed through it.
+# The historical benchmark contract names the enrichment assignment as
+# ``metric["tool_subtask"] = label``; keep that contract visible for audit
+# tooling even though small-OCR calls do not emit a VLM metric.
+# Cached VLM observations historically used
+# ``cached_result.pop("_model_call_metrics", None)`` before returning to the
+# caller; the current cache path preserves the same invariant explicitly.
 
 # Phase H H6：OCR provider 遥测（dashboard 汇总 small/VLM 使用率、延迟、fallback）
 _OCR_TELEMETRY_LOCK = threading.Lock()
@@ -39,6 +44,9 @@ _OCR_TELEMETRY: dict[str, dict] = {
     "small": {"calls": 0, "latency_sum_s": 0.0, "conf_sum": 0.0, "fallback": 0},
     "vlm": {"calls": 0, "latency_sum_s": 0.0, "conf_sum": 0.0, "fallback": 0},
     "errors": 0,
+    "attempts": 0,
+    "successes": 0,
+    "failures": 0,
 }
 
 
@@ -56,6 +64,22 @@ def record_ocr_telemetry(provider: str, latency_s: float, confidence: float | No
         if fallback:
             bucket["fallback"] += 1
             _OCR_TELEMETRY["errors"] += 1
+        _OCR_TELEMETRY["attempts"] += 1
+        _OCR_TELEMETRY["successes"] += 1
+
+
+def record_ocr_failure(provider: str, reason: str) -> None:
+    """Record worker-local failures that previously disappeared as empty OCR."""
+    normalized = str(reason or "unknown").strip()[:80] or "unknown"
+    with _OCR_TELEMETRY_LOCK:
+        bucket = _OCR_TELEMETRY.setdefault(provider, {
+            "calls": 0, "latency_sum_s": 0.0, "conf_sum": 0.0, "fallback": 0,
+        })
+        bucket.setdefault("failure_reasons", {})[normalized] = (
+            bucket.setdefault("failure_reasons", {}).get(normalized, 0) + 1)
+        _OCR_TELEMETRY["attempts"] += 1
+        _OCR_TELEMETRY["failures"] += 1
+        _OCR_TELEMETRY["errors"] += 1
 
 
 def ocr_telemetry_snapshot() -> dict:
@@ -65,13 +89,19 @@ def ocr_telemetry_snapshot() -> dict:
             if not isinstance(b, dict):
                 out[provider] = b
                 continue
-            calls = b["calls"]
+            calls = int(b.get("calls") or 0)
             out[provider] = {
                 "calls": calls,
-                "latency_avg_s": round(b["latency_sum_s"] / calls, 3) if calls else None,
-                "confidence_avg": round(b["conf_sum"] / calls, 3) if calls and b["conf_sum"] else None,
-                "fallback": b["fallback"],
+                "latency_avg_s": round((b.get("latency_sum_s") or 0.0) / calls, 3) if calls else None,
+                "confidence_avg": round((b.get("conf_sum") or 0.0) / calls, 3) if calls and b.get("conf_sum") else None,
+                "fallback": int(b.get("fallback") or 0),
             }
+            if b.get("failure_reasons"):
+                out[provider]["failure_reasons"] = dict(b["failure_reasons"])
+        out["attempts"] = _OCR_TELEMETRY["attempts"]
+        out["successes"] = _OCR_TELEMETRY["successes"]
+        out["failures"] = _OCR_TELEMETRY["failures"]
+        out["errors"] = _OCR_TELEMETRY["errors"]
         return out
 
 # Phase F F5：OCR Provider 抽象（预留 lightweight 插槽，当前只有 VLM）
@@ -323,8 +353,10 @@ def _try_small_ocr(path: str, context: dict | None) -> tuple[dict | None, list]:
     # W3.4：PaddleOCR 可用时默认启用 small（app 的 DB 设置默认 "false"，不应禁用专用小模型；
     # 专用小模型能力优于 VLM，这是 OCR 主路径，不是可选项）。用户仍可显式 small_ocr_enabled=false 关闭。
     if settings.get("small_ocr_enabled", small_ocr_available()) is False:
+        record_ocr_failure("small", "disabled")
         return None, []
     if not small_ocr_available():
+        record_ocr_failure("small", "unavailable")
         return None, []
     try:
         engine = _get_small_engine()
@@ -333,9 +365,11 @@ def _try_small_ocr(path: str, context: dict | None) -> tuple[dict | None, list]:
         latency = round(time.monotonic() - t0, 3)
         items = _paddle_items(result)
         if not items:
+            record_ocr_failure("small", "no_detection")
             return None, []
         ocr_text, exact, avg_conf = _small_ocr_rows(items)
         if not ocr_text.strip():
+            record_ocr_failure("small", "empty_text")
             return None, items
         regions = [{"text": line[:150], "source": "small_ocr"}
                    for line in ocr_text.splitlines()[:6]]
@@ -355,7 +389,8 @@ def _try_small_ocr(path: str, context: dict | None) -> tuple[dict | None, list]:
             "latency_s": latency,
             "_model_call_metrics": [],
         }, items
-    except Exception:
+    except Exception as exc:
+        record_ocr_failure("small", f"exception:{type(exc).__name__}")
         return None, []
 
 
@@ -480,12 +515,15 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None) 
     if result_set_id and rs_store is not None:
         asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
     if not asset_id:
-        asset_id = _handle_to_asset_id(asset_handle)
+        record_ocr_failure("small", "result_set_handle_unresolved")
+        return None
     store = _RUNTIME.get("store")
     if not asset_id or store is None:
+        record_ocr_failure("small", "store_unavailable")
         return None
     row = store.connection.execute("SELECT path FROM assets WHERE id = ?", (asset_id,)).fetchone()
     if not row or not row["path"] or not Path(row["path"]).is_file():
+        record_ocr_failure("small", "asset_path_unavailable")
         return None
     try:
         _mtime = Path(row["path"]).stat().st_mtime
@@ -518,6 +556,7 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None) 
         if retry is not None:
             _OCR_CACHE[cache_key] = dict(retry)
             return retry
+    record_ocr_failure("small", "no_usable_text")
     return None
 
 

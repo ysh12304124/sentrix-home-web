@@ -85,3 +85,35 @@ class EmbeddingRouter:
         events = list(self._timing_events)
         self._timing_events.clear()
         return events
+
+    @staticmethod
+    def _slot_status(slot):
+        if slot is None:
+            return {"configured": False, "available": False}
+        status_fn = getattr(slot, "status", None)
+        if callable(status_fn):
+            try:
+                value = status_fn()
+                if isinstance(value, dict):
+                    return dict(value)
+            except Exception as exc:
+                return {"configured": True, "available": False,
+                        "status_error": f"{type(exc).__name__}: {exc}"}
+        try:
+            available = bool(getattr(slot, "available", False))
+        except Exception as exc:
+            return {"configured": True, "available": False,
+                    "status_error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "configured": True,
+            "available": available,
+            "model_id": getattr(slot, "model_id", None),
+            "dimension": getattr(slot, "dimension", None),
+        }
+
+    def status(self) -> dict:
+        """Return observable slot health without exposing model internals."""
+        return {
+            "visual": self._slot_status(self.visual),
+            "text": self._slot_status(self.text),
+        }

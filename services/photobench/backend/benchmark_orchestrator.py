@@ -562,38 +562,136 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, c
     raise TimeoutError(f"assistant turn {turn_id} did not complete within {timeout}s")
 
 
-def _extract_image_ids(result: dict) -> list[str]:
-    """Collect images returned by retrieval tools without scanning unrelated payload data."""
+def _extract_image_sets(result: dict) -> dict[str, list[str]]:
+    """Separate retrieval candidates, evidence sources, and user delivery.
+
+    Debug candidate fields are intentionally used only for retrieval accounting;
+    they must never silently become the user-facing delivery set.
+    """
+    retrieved: list[str] = []
+    evidence: list[str] = []
     ids: list[str] = []
+    selected_handles: list[str] = []
 
-    def visit(value):
-        if isinstance(value, dict):
-            for key in ("asset_ids", "image_ids", "debug_asset_ids"):
-                if isinstance(value.get(key), list):
-                    ids.extend(str(x) for x in value[key])
-            for key in ("image_id", "asset_id", "file_name", "path"):
-                if value.get(key):
-                    ids.append(str(value[key]))
-                    break
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
+    def add(values, target):
+        if isinstance(values, list):
+            target.extend(str(value) for value in values if value)
 
-    for key in ("image_results", "evidence", "retrieved_images", "images", "tool_trace"):
-        visit(result.get(key))
-    task_state = result.get("task_state") or result.get("taskState") or {}
-    if isinstance(task_state, dict):
-        for tool_result in task_state.get("tool_results") or task_state.get("toolResults") or []:
-            if not isinstance(tool_result, dict):
-                continue
-            for key in ("asset_ids", "image_ids", "debug_asset_ids"):
-                values = tool_result.get(key)
-                if isinstance(values, list):
-                    ids.extend(str(value) for value in values if value)
-            visit(tool_result.get("preview"))
-    return list(dict.fromkeys(ids))
+    add(result.get("retrieved_asset_ids"), retrieved)
+    add(result.get("evidence_asset_ids"), evidence)
+    add(result.get("source_asset_ids"), evidence)
+    add(result.get("selected_image_ids"), ids)
+    grounding = result.get("answer_grounding") or result.get("answerGrounding") or {}
+    if isinstance(grounding, dict):
+        add(grounding.get("retrieved_asset_ids"), retrieved)
+        add(grounding.get("evidence_asset_ids"), evidence)
+        add(grounding.get("selected_asset_ids"), ids)
+        values = grounding.get("selected_image_handles") or grounding.get("selectedImageHandles")
+        if isinstance(values, list):
+            selected_handles.extend(str(value) for value in values if value)
+    delivery = result.get("image_delivery") or result.get("imageDelivery") or {}
+    if isinstance(delivery, dict):
+        add(delivery.get("selected_asset_ids") or delivery.get("asset_ids"), ids)
+    # Legacy top-level fields are retained only because they already represent
+    # an explicit user-facing image payload, not an arbitrary nested search trace.
+    for item in result.get("retrieved_images") or []:
+        if isinstance(item, dict) and item.get("asset_id"):
+            ids.append(str(item["asset_id"]))
+
+    # Resolve explicitly selected handles through debug preview projections.
+    # The full debug_asset_ids list is deliberately ignored.
+    for trace in result.get("tool_trace") or []:
+        if not isinstance(trace, dict):
+            continue
+        add(trace.get("debug_asset_ids"), retrieved)
+        # Debug preview is only a candidate projection, not evidence.
+        observation = trace.get("observation") or trace.get("result") or {}
+        if isinstance(observation, dict):
+            add(observation.get("retrieved_asset_ids") or observation.get("asset_ids"), retrieved)
+            add(observation.get("evidence_asset_ids"), evidence)
+            add(observation.get("source_asset_ids"), evidence)
+            for row in (observation.get("items") or observation.get("rows") or []):
+                if isinstance(row, dict) and row.get("asset_id"):
+                    evidence.append(str(row["asset_id"]))
+                    retrieved.append(str(row["asset_id"]))
+        handles = trace.get("debug_preview_handles") or []
+        preview_ids = trace.get("debug_preview_asset_ids") or []
+        if not handles or not preview_ids:
+            continue
+        mapping = {str(handle): str(preview_ids[index])
+                   for index, handle in enumerate(handles)
+                   if index < len(preview_ids) and preview_ids[index]}
+        ids.extend(mapping[handle] for handle in selected_handles if handle in mapping)
+    # Explicit delivery is also evidence, but only after the independent sets
+    # have been collected. This preserves the subset invariant.
+    evidence.extend(ids)
+    retrieved.extend(evidence)
+    return {
+        "retrieved_asset_ids": list(dict.fromkeys(retrieved)),
+        "evidence_asset_ids": list(dict.fromkeys(evidence)),
+        "selected_asset_ids": list(dict.fromkeys(ids)),
+    }
+
+
+def _extract_image_ids(result: dict) -> list[str]:
+    """Backward-compatible delivery-only projection."""
+    return _extract_image_sets(result)["selected_asset_ids"]
+
+
+def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
+    """Build exact reusable album/model bases from persisted run-to-scope links."""
+    runs_by_scope = {}
+    for run in runs or []:
+        if not isinstance(run, dict) or not run.get("scope_id"):
+            continue
+        runs_by_scope.setdefault(str(run["scope_id"]), []).append(run)
+    groups = {}
+    for space in spaces or []:
+        if not isinstance(space, dict) or not space.get("id"):
+            continue
+        scope_id = str(space["id"])
+        linked = sorted(runs_by_scope.get(scope_id, []),
+                        key=lambda item: str(item.get("started_at") or item.get("created_at") or ""),
+                        reverse=True)
+        source = linked[0] if linked else {}
+        album_id = str(source.get("album_id") or "").strip()
+        model_candidates = sorted({str(run.get("model_profile") or "").strip()
+                                   for run in linked if run.get("model_profile")},
+                                  key=len, reverse=True)
+        space_name = str(space.get("name") or "").lower()
+        model_profile = next((model for model in model_candidates
+                              if safe_slug(model).lower() in space_name), "")
+        model_profile = model_profile or str(source.get("model_profile") or "").strip()
+        if not album_id or not model_profile:
+            name = str(space.get("name") or "")
+            match = re.search(r"PhotoBench-\d{8}-\d{6}-(?P<album>.+?)-(?P<model>(?:qwen|gemma|llama|phi|mistral|current)[^-]*)$", name, re.I)
+            if match:
+                album_id = album_id or match.group("album")
+                model_profile = model_profile or match.group("model")
+        if not album_id or not model_profile:
+            continue
+        key = (album_id, model_profile)
+        matching_runs = [run for run in linked
+                         if str(run.get("album_id") or "") == album_id
+                         and str(run.get("model_profile") or "") == model_profile]
+        group = groups.setdefault(key, {
+            "base_id": f"{album_id}::{model_profile}",
+            "album_id": album_id,
+            "model_profile": model_profile,
+            "scope_id": scope_id,
+            "scope_name": space.get("name") or scope_id,
+            "created_at": space.get("created_at") or "",
+            "source_run_ids": [],
+            "ready": str(space.get("status") or "active") == "active",
+        })
+        if str(space.get("created_at") or "") > str(group.get("created_at") or ""):
+            group.update({"scope_id": scope_id, "scope_name": space.get("name") or scope_id,
+                          "created_at": space.get("created_at") or ""})
+        group["source_run_ids"] = sorted(set(group["source_run_ids"] + [
+            str(run.get("run_id")) for run in matching_runs if run.get("run_id")
+        ]))
+    return sorted(groups.values(), key=lambda item: (
+        str(item.get("album_id") or ""), str(item.get("model_profile") or "")))
 
 
 def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> list[dict]:
@@ -1999,9 +2097,7 @@ class BenchmarkRun:
                 }, "POST", 300)
                 resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900,
                                                cancelled=self._cancel.is_set)
-                turn_metrics = resp.get("model_call_metrics", [])
-                turn_trace = resp.get("retrieval_trace") or resp.get("retrievalTrace") or []
-                turn_tools = resp.get("tool_trace") or resp.get("toolTrace") or []
+                turn_metrics, turn_trace, turn_tools = self._normalize_turn_traces(resp)
                 _, turn_observations = self._extract_tool_perf(resp.get("task_state") or {})
                 for metric in turn_metrics:
                     if isinstance(metric, dict):
@@ -2047,16 +2143,27 @@ class BenchmarkRun:
             call_metrics, tool_trace = self._annotate_agent_loop_timings(call_metrics, tool_trace)
             answer = str(resp.get("answer") or "")
 
-            # Extract predicted images — recursive walk to catch any nesting
-            predicted_images = _extract_image_ids(resp)
+            # Keep retrieval, evidence, and final delivery independent. The
+            # retrieval metric must not punish the UI for showing only a few
+            # representative sources.
+            image_sets = _extract_image_sets(resp)
+            predicted_images = image_sets["selected_asset_ids"]
+            retrieved_images = image_sets["retrieved_asset_ids"]
+            evidence_images = image_sets["evidence_asset_ids"]
 
             # Match against GT
             gt_names = {Path(v).name for v in gt_ids}
             predicted_image_records = _resolve_predicted_images(predicted_images, assets_by_name)
+            retrieved_image_records = _resolve_predicted_images(retrieved_images, assets_by_name)
+            evidence_image_records = _resolve_predicted_images(evidence_images, assets_by_name)
             pred_names = {image["file_name"] for image in predicted_image_records}
-            matched = sorted(gt_names & pred_names)
+            retrieved_names = {image["file_name"] for image in retrieved_image_records}
+            evidence_names = {image["file_name"] for image in evidence_image_records}
+            matched = sorted(gt_names & retrieved_names)
+            delivery_matched = sorted(gt_names & pred_names)
+            evidence_matched = sorted(gt_names & evidence_names)
             recall = len(matched) / len(gt_names) if gt_names else None
-            precision = len(matched) / len(pred_names) if pred_names else (0.0 if gt_names else None)
+            precision = len(matched) / len(retrieved_names) if retrieved_names else (0.0 if gt_names else None)
             f1 = (2 * precision * recall / (precision + recall)) if precision is not None and recall is not None and precision + recall else 0.0 if gt_names else None
             gt_images = []
             for image_id in gt_ids:
@@ -2067,7 +2174,7 @@ class BenchmarkRun:
                     "image_id": image_id,
                     "file_name": file_name,
                     "asset_id": asset_id,
-                    "matched": file_name in pred_names,
+                    "matched": file_name in retrieved_names,
                     "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous",
                 })
 
@@ -2084,8 +2191,20 @@ class BenchmarkRun:
 
             item.update({
                 "answer": answer, "predicted_images": predicted_image_records,
+                "retrieved_candidate_images": retrieved_image_records,
+                "evidence_source_images": evidence_image_records,
                 "predicted_file_names": sorted(pred_names),
-                "matched_file_names": matched, "retrieval_recall": recall,
+                "retrieved_file_names": sorted(retrieved_names),
+                "evidence_source_file_names": sorted(evidence_names),
+                "matched_file_names": matched,
+                "retrieved_matched_file_names": matched,
+                "evidence_matched_file_names": evidence_matched,
+                "delivery_matched_file_names": delivery_matched,
+                "selected_delivery_file_names": sorted(pred_names),
+                "retrieved_asset_ids": image_sets["retrieved_asset_ids"],
+                "evidence_asset_ids": image_sets["evidence_asset_ids"],
+                "selected_asset_ids": image_sets["selected_asset_ids"],
+                "retrieval_recall": recall,
                 "retrieval_precision": precision, "retrieval_f1": f1,
                 "gt_images": gt_images,
                 "judge": {"score": None, "reason": "pending_judge"},
@@ -2617,6 +2736,49 @@ class BenchmarkRun:
         return calls
 
     @staticmethod
+    def _normalize_turn_traces(response: dict) -> tuple[list, list, list]:
+        """Normalize the response into one authoritative ordered trace.
+
+        ``debug_trace`` is the only response field that contains tool
+        arguments, parent step IDs, and the full observation.  Use it as the
+        fallback when the compact retrieval/tool summaries are absent.
+        """
+        response = response if isinstance(response, dict) else {}
+        metrics = response.get("model_call_metrics") or []
+        debug = response.get("debug_trace") or []
+        execution = response.get("retrieval_trace") or response.get("retrievalTrace") or []
+        if not execution and isinstance(debug, list):
+            execution = debug
+        compact_tools = response.get("tool_trace") or response.get("toolTrace") or []
+        debug_tools = []
+        if isinstance(debug, list):
+            debug_tools = [
+                step for step in debug
+                if isinstance(step, dict)
+                and str(step.get("type") or step.get("stage") or "") == "tool"
+            ]
+        # The compact trace carries timing/summary fields, while debug_trace
+        # carries the authoritative arguments, parent_step_id and full
+        # observation. Merge them by execution order so 8771 shows one
+        # complete, internally consistent tool record.
+        if debug_tools:
+            tools = []
+            for index, debug_tool in enumerate(debug_tools):
+                merged = dict(debug_tool)
+                if isinstance(compact_tools, list) and index < len(compact_tools):
+                    compact = compact_tools[index]
+                    if isinstance(compact, dict):
+                        for key, value in compact.items():
+                            if key not in {"observation", "arguments", "parent_step_id", "step_id", "tool", "tool_name"}:
+                                merged.setdefault(key, value)
+                tools.append(merged)
+        else:
+            tools = compact_tools
+        return list(metrics) if isinstance(metrics, list) else [], \
+            list(execution) if isinstance(execution, list) else [], \
+            list(tools) if isinstance(tools, list) else []
+
+    @staticmethod
     def _extract_tool_perf(task_state: dict) -> tuple[dict, list[dict]]:
         """Extract tool-internal metrics already returned in task_state.tool_results."""
         perf = {}
@@ -3042,8 +3204,8 @@ class BenchmarkRun:
         answer_scores = [score for judge in answer_judges if (score := judge_score_for_summary(judge)) is not None]
         answer_dist = {str(score): answer_scores.count(score) for score in (0, 1, 2)}
         retrieval_items = [item for item in items if item.get("retrieval_image_ids")]
-        tp = sum(len(item.get("matched_file_names") or []) for item in retrieval_items)
-        predicted = sum(len(item.get("predicted_file_names") or []) for item in retrieval_items)
+        tp = sum(len(item.get("retrieved_matched_file_names") or item.get("matched_file_names") or []) for item in retrieval_items)
+        predicted = sum(len(item.get("retrieved_file_names") or item.get("predicted_file_names") or []) for item in retrieval_items)
         gt = sum(len(item.get("retrieval_image_ids") or []) for item in retrieval_items)
         precision = tp / predicted if predicted else (0.0 if gt else None)
         recall = tp / gt if gt else None
@@ -4537,7 +4699,8 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     spaces or [],
                     key=lambda s: str(s.get("created_at") or ""), reverse=True,
                 )
-                self._json({"spaces": spaces})
+                self._json({"spaces": spaces, "reuse_bases": _build_reuse_bases(
+                    spaces, self.repo.list_runs())})
                 return
             if parsed.path == "/api/config":
                 self._json({

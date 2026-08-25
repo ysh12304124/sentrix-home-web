@@ -107,6 +107,19 @@ def test_qdrant_never_returns_rows_deleted_from_sqlite(monkeypatch):
         store.close()
 
 
+def test_qdrant_missing_collection_is_explicit_in_fallback_status(monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
+        monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
+        monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_missing")
+        store = MemoryStore(os.path.join(directory, "memory.db"))
+        assert store.search_vectors("visual", [1.0, 0.0], model_name="clip") == []
+        status = store.vector_search_status()
+        assert status["active_backend"] == "sqlite_fallback"
+        assert status["error"] == "qdrant_no_collection"
+        store.close()
+
+
 def test_full_sync_removes_orphaned_qdrant_points(monkeypatch):
     with tempfile.TemporaryDirectory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")

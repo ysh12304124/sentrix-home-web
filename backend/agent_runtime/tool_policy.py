@@ -43,8 +43,19 @@ class ToolPolicy:
         decision = self.authorize(spec, spec.name, arguments)
         if not decision.allowed:
             return decision
+        context = context or {}
+        if "asset_handle_in_current_preview" in getattr(spec, "preconditions", ()):
+            task_state = context.get("task_state") or {}
+            preview = task_state.get("result_preview") or []
+            handles = {
+                item.get("handle") if isinstance(item, dict) else str(item)
+                for item in preview
+            }
+            handle = str(arguments.get("asset_handle") or "")
+            if not handle or handle not in handles:
+                return ToolDecision(False, "asset_handle_not_in_current_preview")
         try:
-            payload = spec.executor(arguments, context=context or {})
+            payload = spec.executor(arguments, context=context)
         except Exception as exc:
             return ToolDecision(False, "tool_execution_error", error=str(exc))
         if self.budget is not None:
@@ -57,7 +68,8 @@ class ToolPolicy:
         "remaining", "counts", "coverage", "facts", "items", "completeness",
         "unresolved", "delivered", "blocked", "observation", "certainty",
         "confirms_visual_only", "source", "persisted", "question", "asset_handle",
-        "reason", "url", "status", "family_role", "_model_call_metrics",
+        "reason", "url", "status", "family_role", "photo_identities",
+        "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
@@ -71,11 +83,11 @@ class ToolPolicy:
             "condition_summary", "can_inspect", "inspect_hint",
             "recommended_resolution",
             "asset_ids", "evidence_count", "place",
-            "retrieval_timing",
+            "retrieval_timing", "_preview_asset_ids", "_retrieved_asset_ids",
         },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
         "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
-        "inspect_photo": _DEFAULT_ALLOWED,
+        "inspect_photo": _DEFAULT_ALLOWED | {"_source_asset_id"},
         "read_photo_text": _DEFAULT_ALLOWED | {
             "full_text", "text_regions", "confidence", "exact_values", "fallback_used",
             "provider", "cache_hit", "tiles", "vlm_calls",

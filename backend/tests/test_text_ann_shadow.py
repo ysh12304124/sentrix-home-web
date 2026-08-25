@@ -56,6 +56,18 @@ class SidecarClientCircuitBreakerTests(unittest.TestCase):
             post.return_value.json.return_value = {"vector": [1.0]}
             self.assertEqual(embedder.embed_query("ok"), [1.0])
 
+    def test_health_probe_is_cached_during_batched_queries(self):
+        with mock.patch.object(bge_module.httpx, "get") as get, \
+                mock.patch.object(bge_module.httpx, "post") as post:
+            get.return_value = mock.Mock(status_code=200)
+            post.return_value = mock.Mock()
+            post.return_value.raise_for_status.return_value = None
+            post.return_value.json.return_value = {"vector": [1.0]}
+            embedder = bge_module.BgeM3TextQueryEmbedder(base_url="http://sidecar:8101")
+            self.assertTrue(embedder.available)
+            self.assertTrue(embedder.available)
+            self.assertEqual(get.call_count, 1)
+
 
 class TextAnnShadowRankingTests(unittest.TestCase):
     def test_bge_shadow_does_not_move_visual_top_k(self):

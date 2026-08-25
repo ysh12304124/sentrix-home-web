@@ -60,6 +60,11 @@ class RequirementCompletion:
         # If asset_id or subject constraint is provided, filter entries
         matching_entry: LedgerEntry | None = None
         for entry in entries:
+            if requirement_id not in entry.requirement_refs:
+                # Evidence without an explicit requirement binding is valid
+                # telemetry, but cannot satisfy a requirement implicitly by
+                # sharing only its evidence type.
+                continue
             if asset_id and entry.asset_id and entry.asset_id != asset_id:
                 continue
             if subject and entry.subject and entry.subject != subject:
@@ -94,6 +99,7 @@ class RequirementCompletion:
                 matching_entries = [
                     entry for entry in self.evidence_ledger.entries
                     if entry.evidence_type == req_type
+                    and req_id in entry.requirement_refs
                 ]
                 if matching_entries:
                     refs = tuple(e.tool_call_id for e in matching_entries)

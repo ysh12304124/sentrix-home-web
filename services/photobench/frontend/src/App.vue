@@ -9,7 +9,6 @@ const EXECUTION_PHASES = [
   { key: "pipeline_processing", label: "流水线处理" },
   { key: "qa_eval", label: "QA 评测" },
 ];
-const CURRENT_MODEL_SELECTION = "__current__";
 
 const config = ref(null);
 const manifests = ref([]);
@@ -28,10 +27,6 @@ const reviewDrafts = reactive({});
 const selectedAlbum = ref("album3-14");
 const selectedQa = ref("compact-10q");
 const selectedModels = reactive(new Set());
-const currentModelSnapshot = ref(null);
-const currentModelLoading = ref(false);
-const currentModelError = ref("");
-const currentModelPopoverOpen = ref(false);
 const sentrixUrl = ref("");
 const judgeUrl = ref("");
 const vllmTargetId = ref("");
@@ -87,39 +82,13 @@ const fmtTokens = (value) => value == null || !Number.isFinite(Number(value)) ? 
 const scoreClass = (score) => score === 2 ? "score-2" : score === 1 ? "score-1" : score === 0 ? "score-0" : "score-none";
 const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", interrupted: "中断", cancelled: "已取消", partial: "部分采样", not_run: "未执行" }[status] || status || "等待");
 function setModelSelected(modelId, checked) {
-  if (!checked) {
-    selectedModels.delete(modelId);
-    return;
-  }
-  if (modelId === CURRENT_MODEL_SELECTION) {
-    selectedModels.clear();
-  } else {
-    selectedModels.delete(CURRENT_MODEL_SELECTION);
-  }
-  selectedModels.add(modelId);
+  if (checked) selectedModels.add(modelId);
+  else selectedModels.delete(modelId);
 }
 
 const qaOptions = computed(() => manifests.value.find((m) => m.album_id === selectedAlbum.value)?.qa_sets || ["compact-10q"]);
 const hasRunning = computed(() => runs.value.some((run) => ["running", "pending", "cancelling"].includes(run.status) || run.rejudge?.status === "running"));
 const activeRejudge = computed(() => activeRun.value?.rejudge || null);
-const visibleExecutionPhases = computed(() => EXECUTION_PHASES);
-const currentModelState = computed(() => currentModelSnapshot.value?.state || {});
-const currentModelId = computed(() => currentModelSnapshot.value?.model_id || "启动时获取");
-const currentModelStateRows = computed(() => {
-  const state = currentModelState.value;
-  return [
-    ["模型 ID", state.profile || currentModelSnapshot.value?.model_id],
-    ["Served name", state.served_model_name],
-    ["模型路径", state.model],
-    ["端口 / PID", [state.port, state.pid].filter((value) => value != null).join(" / ")],
-    ["精度 / 量化", [state.dtype, state.quantization || "无量化"].filter(Boolean).join(" / ")],
-    ["上下文长度", state.max_model_len],
-    ["最大并发", state.max_num_seqs],
-    ["显存利用率", state.gpu_memory_utilization],
-    ["默认输出上限", state.default_max_tokens],
-    ["启动时间", state.started_at_utc],
-  ].filter((row) => row[1] !== undefined && row[1] !== null && row[1] !== "");
-});
 const visibleQaItems = computed(() => {
   const items = qaPage.value?.items || [];
   const task = activeRejudge.value;
@@ -158,7 +127,7 @@ function effectiveRunSummary(run) {
   const evidenceScores = items.map((item) => item.evidence_judge?.score).filter((score) => [0, 1, 2].includes(score));
   const retrievalItems = items.filter((item) => Array.isArray(item.retrieval_image_ids) && item.retrieval_image_ids.length);
   const retrievalTp = retrievalItems.reduce((sum, item) => sum + (item.matched_file_names || []).length, 0);
-  const retrievalPredicted = retrievalItems.reduce((sum, item) => sum + (item.predicted_file_names || []).length, 0);
+  const retrievalPredicted = retrievalItems.reduce((sum, item) => sum + (item.retrieved_file_names || []).length, 0);
   const retrievalGt = retrievalItems.reduce((sum, item) => sum + (item.retrieval_image_ids || []).length, 0);
   const retrievalPrecision = retrievalPredicted ? retrievalTp / retrievalPredicted : (retrievalGt ? 0 : null);
   const retrievalRecall = retrievalGt ? retrievalTp / retrievalGt : null;
@@ -329,8 +298,20 @@ function itemImages(item, gt = false) {
     if (item.gt_images?.length) return decorateImages(item.gt_images);
     return decorateImages((item.retrieval_image_ids || []).map((id) => ({ image_id: id, file_name: id.split("/").pop(), matched: (item.matched_file_names || []).includes(id.split("/").pop()) })));
   }
+  // Model recall is the upstream evidence projection, not only explicit
+  // delivery images. Keep the smaller delivery subset available separately.
+  if (item.evidence_source_images?.length) return decorateImages(item.evidence_source_images);
+  if (item.evidence_source_file_names?.length) {
+    return decorateImages(item.evidence_source_file_names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) })));
+  }
   if (item.predicted_images?.length) return decorateImages(item.predicted_images);
   return (item.predicted_file_names || []).map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+}
+function itemEvidenceImages(item) {
+  const images = item?.evidence_source_images || [];
+  if (images.length) return decorateImages(images);
+  const names = item?.evidence_source_file_names || [];
+  return decorateImages(names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) })));
 }
 function isDirectEvidence(item, imageId) {
   return (item?.answer_evidence_image_ids || []).includes(imageId)
@@ -926,6 +907,9 @@ function debugToolsForCall(item, group, call) {
   return steps.filter((s) => s?.type === "tool"
     && String(s?.parent_step_id) === String(modelStep.step_id));
 }
+function debugPromptAnnotations(item, group, call) {
+  return debugStepForCallInGroup(item, group, call)?.prompt_annotations || [];
+}
 function getAgent2Trace(item) {
   if (!item) return null;
   if (item.agent2_trace && (item.agent2_trace.task_declaration || item.agent2_trace.task_state || item.agent2_trace.evidence_ledger)) {
@@ -978,7 +962,17 @@ function agent2RequirementStatusClass(status) {
   return status === "satisfied" ? "status-complete" : status === "partially_supported" ? "status-partial" : "status-failed";
 }
 function agent2EvidenceTypeLabel(type) {
-  return ({ visual: "视觉", text: "文字 / OCR", temporal: "时间", geographic: "地点", identity: "身份", semantic: "语义" })[type] || type || "证据";
+  return ({
+    // Legacy aliases kept for historical runs.
+    visual: "视觉", text: "文字 / OCR", temporal: "时间", geographic: "地点",
+    identity: "身份", semantic: "语义",
+    // Canonical Agent2 evidence types emitted by the backend.
+    memory_asset: "照片 / 视频", memory_reference: "记忆引用",
+    visual_observation: "视觉观察", visible_text: "可见文字 / OCR",
+    structured_fact: "结构化事实", temporal_metadata: "时间元数据",
+    location_metadata: "地点元数据", confirmed_identity: "已确认身份",
+    user_statement: "用户陈述", transcript: "转写文本",
+  })[type] || type || "证据";
 }
 function agent2RequirementSummary(item) {
   const requirements = getAgent2Requirements(item);
@@ -1103,12 +1097,6 @@ function retrievalChannelRows(item) {
   return rows;
 }
 function phaseSummary(key, phase) {
-  if (key === "model_deploy" && activeRun.value?.model_source === "current") {
-    const snapshot = activeRun.value?.current_model_snapshot || {};
-    const state = snapshot.state || {};
-    const modelId = state.profile || snapshot.model_id || activeRun.value?.model_profile || "未知";
-    return `已使用当前部署模型 · ${modelId}`;
-  }
   if (!phase) return "";
   if (key === "model_deploy" && phase.unload_seconds != null) return `卸载 ${fmtSeconds(phase.unload_seconds)} · 加载 ${fmtSeconds(phase.load_seconds)} · 健康检查 ${fmtSeconds(phase.health_check_seconds)}`;
   if (key === "scope_setup") return `创建 ${fmtSeconds(phaseSeconds(phase, "create_seconds"))}`;
@@ -1267,29 +1255,7 @@ async function changeQaPage(page) {
 }
 async function changeQaPageSize() { await loadQaPage(1); }
 async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
-async function loadProfiles() {
-  profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || [];
-}
-async function loadCurrentModel() {
-  currentModelLoading.value = true;
-  currentModelError.value = "";
-  currentModelPopoverOpen.value = true;
-  try {
-    currentModelSnapshot.value = await post("/api/current-model", { vllm_target_id: vllmTargetId.value });
-  } catch (e) {
-    currentModelSnapshot.value = null;
-    currentModelError.value = e.message;
-  } finally {
-    currentModelLoading.value = false;
-  }
-}
-async function changeVllmTarget() {
-  selectedModels.clear();
-  currentModelSnapshot.value = null;
-  currentModelError.value = "";
-  currentModelPopoverOpen.value = false;
-  await loadProfiles();
-}
+async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
 const PROMPT_KIND_LABELS = { answer_quality: "回答质量", task_decision: "任务判断", evidence: "证据核验" };
 function promptKindMeta(kind) { return judgePromptKinds.value.find((k) => k.kind === kind) || null; }
 async function loadJudgePrompts() {
@@ -1324,18 +1290,22 @@ const RUN_MODES_UI = [
 const runMode = ref("full");
 const runModeMeta = computed(() => RUN_MODES_UI.find((m) => m.id === runMode.value) || RUN_MODES_UI[0]);
 const memorySpaces = ref([]);
+const reuseBases = ref([]);
 const memorySpacesLoading = ref(false);
 const existingScopeId = ref("");
+const selectedReuseBaseId = ref("");
 const scopeAlbumHint = ref("");
 async function loadMemorySpaces() {
   memorySpacesLoading.value = true;
   try {
     const data = await fetch(`/api/memory-spaces?sentrix_url=${encodeURIComponent(sentrixUrl.value)}`).then((r) => r.json());
     memorySpaces.value = data.spaces || [];
-  } catch { memorySpaces.value = []; }
+    reuseBases.value = data.reuse_bases || [];
+  } catch { memorySpaces.value = []; reuseBases.value = []; }
   finally { memorySpacesLoading.value = false; }
 }
 const selectedSpace = computed(() => memorySpaces.value.find((s) => s.id === existingScopeId.value) || null);
+const selectedReuseBase = computed(() => reuseBases.value.find((item) => item.base_id === selectedReuseBaseId.value) || null);
 // 隐藏"照片"下拉后，QA 题目与 GT 对照的数据集依据从所选现有相册自动推断：
 // 优先查 run 历史（scope_id → album_id），再按相册名子串匹配（长 id 优先），最后保持当前选择。
 function inferAlbumForScope(space) {
@@ -1357,8 +1327,22 @@ watch(existingScopeId, () => {
     scopeAlbumHint.value = "未能自动匹配数据集，题目对照沿用当前 QA 数据集所属数据";
   }
 });
+watch(selectedReuseBaseId, () => {
+  if (runMode.value !== "reuse") return;
+  const base = selectedReuseBase.value;
+  if (!base) return;
+  existingScopeId.value = base.scope_id || "";
+  if (base.album_id) {
+    selectedAlbum.value = base.album_id;
+    const manifest = manifests.value.find((item) => item.album_id === base.album_id);
+    const options = Object.keys(manifest?.qa_sets || {});
+    if (options.length && !options.includes(selectedQa.value)) selectedQa.value = options[0];
+  }
+  scopeAlbumHint.value = `复用基座：${base.album_id} · ${base.model_profile}；QA 数据集：${base.album_id}`;
+});
 function onModeChange() {
   existingScopeId.value = "";
+  selectedReuseBaseId.value = "";
   scopeAlbumHint.value = "";
   if (runMode.value === "reuse" && !memorySpaces.value.length) loadMemorySpaces();
 }
@@ -1409,7 +1393,6 @@ async function startSuite() {
   suiteRunning.value = true;
   try {
    const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, judge_provider_id: judgeProviderId.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
-    if (result.current_model_snapshot) currentModelSnapshot.value = result.current_model_snapshot;
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -1542,11 +1525,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </select>
 <span v-if="runMode === 'build'" class="config-help">图片与身份来源，处理后相册保留</span>
 </label>
-        <label v-if="runMode === 'reuse'">现有相册<select v-model="existingScopeId" :disabled="memorySpacesLoading">
-<option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (memorySpaces.length ? '请选择现有相册' : '无相册（检查 Sentrix 后端地址）') }}</option>
-<option v-for="space in memorySpaces" :key="space.id" :value="space.id">{{ space.name }}（{{ space.id }}）</option>
+        <label v-if="runMode === 'reuse'">复用基座<select v-model="selectedReuseBaseId" :disabled="memorySpacesLoading">
+<option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (reuseBases.length ? '请选择相册基座（相册 + 模型）' : '无可复用基座（检查 Sentrix 后端地址）') }}</option>
+<option v-for="base in reuseBases" :key="base.base_id" :value="base.base_id">{{ base.album_id }} · {{ base.model_profile }} · {{ base.scope_name }}</option>
 </select>
-<span class="config-help">{{ scopeAlbumHint || '后端已有相册，不新建、不删除' }}</span>
+<span class="config-help">{{ scopeAlbumHint || '选择后直接复用已生成相册，不重新处理照片' }}</span>
 </label>
         <label v-if="runMode !== 'build'">QA 数据集<select v-model="selectedQa">
 <option v-for="qa in qaOptions" :key="qa" :value="qa">{{ qa }}</option>
@@ -1562,7 +1545,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </select>
 <span class="config-help">{{ (config?.judge_providers || []).find((p) => p.id === judgeProviderId)?.model || '-' }}</span>
 </label>
-        <label>vLLM 服务目标<select v-model="vllmTargetId" @change="changeVllmTarget">
+        <label>vLLM 服务目标<select v-model="vllmTargetId" @change="loadProfiles">
 <option v-for="(target, id) in vllmTargets" :key="id" :value="id">{{ target.label }}</option>
 </select>
 <span class="config-help">{{ vllmTargets[vllmTargetId]?.manager_url }} → {{ vllmTargets[vllmTargetId]?.model_base_url }}</span>
@@ -1570,19 +1553,6 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </div>
       <div class="model-picker">
 <span class="field-label">选择模型（可多选，串行测试）</span>
-<div class="current-model-option">
-<label class="check current-model-check" :class="{ active: selectedModels.has(CURRENT_MODEL_SELECTION) }">
-<input type="checkbox" :checked="selectedModels.has(CURRENT_MODEL_SELECTION)" @change="setModelSelected(CURRENT_MODEL_SELECTION, $event.target.checked)" />当前模型（{{ currentModelId }}）
-</label>
-<button class="current-model-refresh" type="button" title="获取当前 vLLM 模型状态" aria-label="获取当前 vLLM 模型状态" @click="loadCurrentModel">↻</button>
-<section v-if="currentModelPopoverOpen" class="current-model-popover" aria-live="polite">
-<header><div><small>VLLM RUNTIME STATE</small><strong>{{ currentModelId }}</strong></div><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></header>
-<p v-if="currentModelLoading" class="current-model-loading">正在获取当前运行状态…</p>
-<p v-else-if="currentModelError" class="error">{{ currentModelError }}</p>
-<div v-else class="current-model-state-grid"><div v-for="row in currentModelStateRows" :key="row[0]"><span>{{ row[0] }}</span><b>{{ row[1] }}</b></div></div>
-<footer v-if="currentModelSnapshot">校验时间 {{ fmtDate(currentModelSnapshot.verified_at) }} · 已核对实际 /v1/models</footer>
-</section>
-</div>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
 <input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="!profile.available">（不可用）</span>
 </label>
@@ -1700,13 +1670,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </section>
       <h3>Pipeline 执行阶段</h3>
 <div class="phase-list">
-<article v-for="(phaseDef, index) in visibleExecutionPhases" :key="phaseDef.key" class="phase-card">
+<article v-for="(phaseDef, index) in EXECUTION_PHASES" :key="phaseDef.key" class="phase-card">
 <div class="phase-title">
 <div class="phase-name">
 <span class="phase-step">{{ index + 1 }}</span>
 <b>{{ phaseDef.label }}</b>
 </div>
-<span class="phase-status" :class="activeRun.phases?.[phaseDef.key]?.status || (phaseDef.key === 'model_deploy' && activeRun.model_source === 'current' ? 'done' : 'pending')">{{ statusLabel(activeRun.phases?.[phaseDef.key]?.status || (phaseDef.key === 'model_deploy' && activeRun.model_source === 'current' ? 'done' : 'pending')) }}</span>
+<span class="phase-status" :class="activeRun.phases?.[phaseDef.key]?.status || 'pending'">{{ statusLabel(activeRun.phases?.[phaseDef.key]?.status || 'pending') }}</span>
 </div>
 <p class="phase-summary">{{ phaseSummary(phaseDef.key, activeRun.phases?.[phaseDef.key]) }}</p>
 <div v-if="phaseDef.key === 'pipeline_processing' && activeRun.phases?.[phaseDef.key]?.progress" class="phase-bar">
@@ -1908,6 +1878,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                   </div>
                   <h4>模型召回图片（{{ itemImages(itemDetail(summary)).length }}）</h4>
                   <div class="image-grid"><div v-for="image in itemImages(itemDetail(summary))" :key="image.asset_id || image.file_name" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div><span v-if="!itemImages(itemDetail(summary)).length" class="muted small">模型没有返回可识别的图片</span></div>
+                  <h4>回答来源图片（{{ itemEvidenceImages(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="image in itemEvidenceImages(itemDetail(summary)).slice(0, 3)" :key="`evidence-${image.asset_id || image.file_name}`" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div><span v-if="!itemEvidenceImages(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
+                  <details v-if="itemEvidenceImages(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceImages(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="image in itemEvidenceImages(itemDetail(summary)).slice(3)" :key="`evidence-more-${image.asset_id || image.file_name}`" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div></div></details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>
@@ -1958,6 +1931,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                               <p v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw" class="muted small">评判原始回答</p><pre v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw">{{ debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw }}</pre>
                             </div>
                             <div v-else>
+                              <p v-if="debugPromptAnnotations(itemDetail(summary), group, call).length" class="muted small">内部控制消息（不是用户原话）</p><pre v-if="debugPromptAnnotations(itemDetail(summary), group, call).length">{{ JSON.stringify(debugPromptAnnotations(itemDetail(summary), group, call), null, 2) }}</pre>
                               <p class="muted small">完整提示词</p><pre>{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).prompt, null, 2) }}</pre>
                               <p class="muted small">模型原始回答</p><pre>{{ debugStepForCallInGroup(itemDetail(summary), group, call).raw_full || debugStepForCallInGroup(itemDetail(summary), group, call).raw }}</pre>
                             </div>
@@ -2008,7 +1982,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                 <div class="agent2-summary-body">
                 <div class="agent2-overview-grid"><span><small>目标</small><b>{{ getAgent2Trace(itemDetail(summary))?.task_declaration?.goal || "未记录" }}</b></span><span><small>作用域</small><b>{{ getAgent2Trace(itemDetail(summary))?.task_declaration?.scope_id || "未记录" }}</b></span><span><small>需求数</small><b>{{ getAgent2Requirements(itemDetail(summary)).length }} 项证据需求</b></span><span><small>证据数</small><b>{{ getAgent2LedgerEntries(itemDetail(summary)).length }} 条账本记录</b></span></div>
                 <div v-if="getAgent2Requirements(itemDetail(summary)).length" class="agent2-detail-section"><div class="agent2-section-label">证据需求</div><div class="agent2-requirement-list"><div v-for="(req, rIdx) in getAgent2Requirements(itemDetail(summary))" :key="rIdx" class="agent2-requirement"><div class="agent2-requirement-head"><b>{{ req.id }}</b><span>{{ agent2EvidenceTypeLabel(req.evidence_type) }}</span><em :class="agent2RequirementStatusClass(req.status)">{{ agent2RequirementStatusLabel(req.status) }}</em></div><p>{{ req.description || "未记录需求描述" }}</p><small>证据引用：{{ (req.evidence_refs || []).join("、") || "暂无" }}<span v-if="req.unmet_reason"> · 未满足原因：{{ req.unmet_reason }}</span></small></div></div></div>
-                <div v-if="getAgent2LedgerEntries(itemDetail(summary)).length" class="agent2-detail-section"><div class="agent2-section-label">证据账本</div><div class="agent2-evidence-list"><div v-for="(entry, eIdx) in getAgent2LedgerEntries(itemDetail(summary))" :key="eIdx" class="agent2-evidence"><div class="agent2-evidence-head"><b>{{ entry.capability || agent2EvidenceTypeLabel(entry.evidence_type) }}</b><span>{{ agent2EvidenceTypeLabel(entry.evidence_type) }}</span><em>{{ entry.certainty || "未定" }}</em></div><textarea class="agent2-json-view" readonly wrap="off" :rows="agent2EvidenceRows(entry.extracted_value ?? entry.value ?? null)" :style="{ height: agent2EvidenceHeight(entry.extracted_value ?? entry.value ?? null) }" :value="formatAgent2EvidenceValue(entry.extracted_value ?? entry.value ?? null)" aria-label="证据账本 JSON 内容"></textarea><small>来源：{{ (entry.provenance_refs || entry.input_refs || []).join("、") || entry.tool_call_id || "未记录" }}<span v-if="entry.asset_id"> · 图片：{{ entry.asset_id }}</span></small></div></div></div>
+                <div v-if="getAgent2LedgerEntries(itemDetail(summary)).length" class="agent2-detail-section"><div class="agent2-section-label">证据账本</div><div class="agent2-evidence-list"><div v-for="(entry, eIdx) in getAgent2LedgerEntries(itemDetail(summary))" :key="eIdx" class="agent2-evidence"><div class="agent2-evidence-head"><b>{{ entry.capability || agent2EvidenceTypeLabel(entry.evidence_type) }}</b><span>{{ agent2EvidenceTypeLabel(entry.evidence_type) }}</span><em>{{ entry.certainty || "未定" }}</em></div><textarea class="agent2-json-view" readonly wrap="off" :rows="agent2EvidenceRows(entry.extracted_value ?? entry.value ?? null)" :style="{ height: agent2EvidenceHeight(entry.extracted_value ?? entry.value ?? null) }" :value="formatAgent2EvidenceValue(entry.extracted_value ?? entry.value ?? null)" aria-label="证据账本 JSON 内容"></textarea><small>来源：{{ (entry.provenance_refs || entry.input_refs || []).join("、") || entry.tool_call_id || "未记录" }}<span v-if="entry.asset_id"> · 图片：{{ entry.asset_id }}</span><span v-if="entry.unmatched_reason"> · {{ entry.unmatched_reason === "evidence_incompatible" ? "非当前需求证据" : entry.unmatched_reason }}</span></small></div></div></div>
                 </div>
               </details>
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from .task_state import TaskState
-from .tool_registry import get_tool, ToolSpec
+from .tool_registry import get_tool, ToolSpec, list_tools
 
 
 # 极简通用核心规则（小于 100 tokens）
@@ -17,8 +17,9 @@ BASE_SYSTEM_PROMPT = """你是 Sentrix 家庭记忆助手。根据当前待确�
 规则：
 1. 每次只输出一个标准 JSON 对象，不要输出 markdown 代码块或解释；
 2. 调用工具格式：{"action":"tool_call","tool":"<工具名>","arguments":{...},"public_status":"<简短状态>"}
-3. 结论输出格式：{"action":"final","answer":"<直接回答用户问题>","evidence_refs":["tool_call_1"]}
-4. 未检索相册前禁止猜测或回答；已有足够事实时直接输出 final。"""
+3. 结论输出格式：{"action":"final","answer":"<直接回答用户问题>","evidence_refs":["tool_call_1"],"selected_image_handles":["photo_1"]}；只有确实要给用户看的图片才填写 selected_image_handles，最多 6 张。
+4. 未检索相册前禁止猜测或回答；已有足够事实时直接输出 final。
+5. selected_image_handles 只能填写当前 search_memories preview 中出现的 handle；搜索候选不等于要展示的图片。"""
 
 
 # 工具极简契约定义（每个工具仅保留最精简输入格式，<40 tokens）
@@ -73,6 +74,7 @@ def build_jit_system_prompt(
     tool_results: list[dict] | None = None,
     preview_handles: list[str] | None = None,
     is_candidate: bool = False,
+    allowed_tool_names: set[str] | tuple[str, ...] | None = None,
 ) -> str:
     """按需动态组装当前轮次的 System Prompt。"""
     tool_results = tool_results or []
@@ -113,43 +115,43 @@ def build_jit_system_prompt(
         state_desc += "所有证据已确认充分，请直接整理 final 回答。"
     parts.append(state_desc)
 
-    # 3. JIT 动态挑选候选工具 (方案 A: 分步呈现)
-    selected_tools: list[str] = []
-    
-    # 判断是否已有检索 preview
-    has_preview = bool(preview_handles)
+    # 3. JIT 只依据统一注册表和未满足需求提供工具，不按问题关键词
+    # 硬编码“先 search 再 inspect”的流程。模型仍然决定下一步调用哪个工具。
     open_types = {
         r.requirement.evidence_type for r in task_state.requirements.values()
         if r.status in ("open", "running", "partially_supported")
+        and r.requirement.required
     }
-
-    # 规则 A1: 如果尚未执行检索，优先供给检索类工具
-    if not tool_results:
-        if "structured_fact" in open_types:
-            selected_tools.append("query_memory_facts")
-            selected_tools.append("search_memories")
-        elif "user_statement" in open_types:
-            selected_tools.append("search_conversation_history")
-            selected_tools.append("search_memories")
-        else:
-            selected_tools.append("search_memories")
-            if any(t in open_types for t in ("structured_fact", "confirmed_identity")):
-                selected_tools.append("query_memory_facts")
-    else:
-        # 已有工具执行结果
-        if has_preview:
-            # 存在照片预览，检查是否需要视觉或 OCR 深入复核
-            if "visible_text" in open_types:
-                selected_tools.append("read_photo_text")
-            if "visual_observation" in open_types:
-                selected_tools.append("inspect_photo")
-
-        # 如果仍有检索类需求未满足
-        if any(t in open_types for t in ("memory_asset", "location_metadata", "temporal_metadata")):
-            if not has_preview:
-                selected_tools.append("search_memories")
-        if "structured_fact" in open_types and not any(tr.get("tool") == "query_memory_facts" for tr in tool_results):
-            selected_tools.append("query_memory_facts")
+    ready_specs = list_tools(readiness="ready")
+    if allowed_tool_names is not None:
+        allowed = set(allowed_tool_names)
+        ready_specs = [spec for spec in ready_specs if spec.name in allowed]
+    satisfied_types = {
+        state.requirement.evidence_type
+        for state in task_state.requirements.values()
+        if state.status == "satisfied"
+    }
+    missing_prerequisites = set()
+    for spec in ready_specs:
+        if not any(spec.can_satisfy(evidence_type) for evidence_type in open_types):
+            continue
+        if "asset_handle_in_current_preview" in spec.preconditions and not preview_handles:
+            missing_prerequisites.update(
+                item for item in spec.prerequisite_evidence_types
+                if item not in satisfied_types
+            )
+    selected_specs: list[ToolSpec] = []
+    for spec in ready_specs:
+        direct = any(spec.can_satisfy(evidence_type) for evidence_type in open_types)
+        prerequisite_provider = any(
+            spec.can_satisfy(evidence_type) for evidence_type in missing_prerequisites
+        )
+        if not direct and not prerequisite_provider:
+            continue
+        if "asset_handle_in_current_preview" in spec.preconditions and not preview_handles:
+            continue
+        selected_specs.append(spec)
+    selected_tools = [spec.name for spec in selected_specs]
 
     # 如果所有需求都满足或无需工具，不暴露工具，直接引导 final
     if not open_reqs or not selected_tools:

@@ -27,6 +27,38 @@ _HEDGE_WHEN_CONFIRMED_RE = re.compile(r"还不能完全确认|无法完全确认
 _PROMISE_RE = re.compile(r"我(?:可以|能|会)?(?:继续)?(?:帮你|为您)?(?:再)?(?:核对|确认|查看|找)")
 _DENIES_FOUND_RE = re.compile(r"没有找到|没找到|未找到|没有获取到|找不到|不存在相关|没有相关")
 
+_INTERNAL_ID_RE = re.compile(
+    r"\b(?:asset_|obs_|entity_|mention_|claim_|turn_|conversation_|result_|evt_)[a-f0-9]{6,}\b",
+    re.I,
+)
+_INTERNAL_TABLE_RE = re.compile(
+    r"\b(?:assets|observations|entity_mentions|semantic_claims|agent_result_sets)\b",
+    re.I,
+)
+_PHOTO_HANDLE_PARENS_RE = re.compile(
+    r"[ \t]*[（(]\s*photo_\d+(?:\s*(?:[、,，/]|和|与)\s*photo_\d+)*\s*[)）]",
+    re.I,
+)
+_PHOTO_HANDLE_SERIES_RE = re.compile(
+    r"(?<![A-Za-z0-9_])photo_\d+(?:\s*(?:[、,，/]|和|与)\s*photo_\d+)+(?![A-Za-z0-9_])",
+    re.I,
+)
+_PHOTO_HANDLE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])photo_\d+(?![A-Za-z0-9_])",
+    re.I,
+)
+
+
+def sanitize_internal_refs(text: str) -> str:
+    """Remove internal identifiers and table names from user-visible text."""
+    text = str(text or "")
+    text = _PHOTO_HANDLE_PARENS_RE.sub("", text)
+    text = _PHOTO_HANDLE_SERIES_RE.sub("这些照片", text)
+    text = _PHOTO_HANDLE_RE.sub("这张照片", text)
+    text = _INTERNAL_ID_RE.sub("[内部记录]", text)
+    text = _INTERNAL_TABLE_RE.sub("[内部记录]", text)
+    return text
+
 # Phase G G7：空壳收尾/套话（自然化时删除，不引入新事实）
 _BOILERPLATE_TAIL_RE = re.compile(
     r"[。；]?(?:以上是我目前能确认的部分信息|以上是目前能确认的部分|以上是我能确认的内容|"
@@ -53,6 +85,17 @@ def build_final_context(message: str, task: dict) -> dict:
     unknowns: list[str] = []
     resolution_state = "none"
     ctx_has_results = False
+    has_inspection = any((tr or {}).get("tool") == "inspect_photo"
+                         for tr in task.get("tool_results") or [])
+    inspected_asset_ids = set()
+    for tr in task.get("tool_results") or []:
+        if (tr or {}).get("tool") != "inspect_photo":
+            continue
+        if tr.get("asset_id"):
+            inspected_asset_ids.add(str(tr["asset_id"]))
+        for identity in tr.get("photo_identities") or []:
+            if isinstance(identity, dict) and identity.get("asset_id"):
+                inspected_asset_ids.add(str(identity["asset_id"]))
     total = task.get("result_total")
     satisfaction = task.get("search_satisfaction")
     if total is not None:
@@ -68,13 +111,45 @@ def build_final_context(message: str, task: dict) -> dict:
     for tr in task.get("tool_results") or []:
         tool = tr.get("tool")
         if tool == "search_memories":
+            preview_asset_ids = list(tr.get("preview_asset_ids") or [])
             for item in (tr.get("preview") or []):
                 place = (item or {}).get("place") or ""
                 handle = (item or {}).get("handle") or ""
+                try:
+                    preview_index = [p.get("handle") for p in (tr.get("preview") or [])].index(handle)
+                    preview_asset_id = str(preview_asset_ids[preview_index]) if preview_index < len(preview_asset_ids) else ""
+                except (ValueError, IndexError):
+                    preview_asset_id = ""
+                if has_inspection and inspected_asset_ids and preview_asset_id not in inspected_asset_ids:
+                    continue
                 if place:
                     facts.append({
                         "value": f"{handle} 拍摄于 {place}。",
                         "certainty": "confirmed", "source": "search_place",
+                    })
+                captured_at = str((item or {}).get("captured_at") or "").strip()
+                if captured_at:
+                    facts.append({
+                        "value": f"{handle} 的拍摄时间是 {captured_at}。",
+                        "certainty": "confirmed", "source": "search_time",
+                    })
+                # Once a concrete photo has been inspected, identities from
+                # other search candidates are not evidence for that photo and
+                # must not pollute the answer (e.g. adding 乐乐 to the target
+                # three-person 邯郸 image).
+                if has_inspection:
+                    continue
+                for identity in (item or {}).get("people") or []:
+                    if not isinstance(identity, dict):
+                        continue
+                    name = str(identity.get("name") or identity.get("person_name") or "").strip()
+                    if not name or identity.get("identity_status") not in {None, "confirmed"}:
+                        continue
+                    role = str(identity.get("family_role") or "").strip()
+                    facts.append({
+                        "value": f"照片{(' ' + handle) if handle else ''}中确认有{name}{f'（{role}）' if role else ''}。",
+                        "certainty": "confirmed", "source": "photo_identity",
+                        "person_name": name, "asset_id": item.get("asset_id"),
                     })
         elif tool == "inspect_photo":
             text = (tr.get("inspect_text") or "").strip()
@@ -85,6 +160,41 @@ def build_final_context(message: str, task: dict) -> dict:
                     "certainty": "confirmed", "source": "inspect",
                 })
                 resolution_state = "visual_done"
+            for identity in (tr.get("photo_identities") or []):
+                if not isinstance(identity, dict):
+                    continue
+                name = str(identity.get("person_name") or "").strip()
+                if name:
+                    role = str(identity.get("family_role") or "").strip()
+                    facts.append({
+                        "value": f"照片中确认有{name}{f'（{role}）' if role else ''}。",
+                        "certainty": "confirmed", "source": "photo_identity",
+                        "person_name": name,
+                        "asset_id": identity.get("asset_id") or tr.get("asset_id"),
+                    })
+            unknown_count = int(tr.get("unconfirmed_people_count") or 0)
+            if not unknown_count and _PERSON_LIST_QUESTION_RE.search(message or ""):
+                # Visual inspection often reports a total composition (“一个
+                # 小孩和两个成年人”) without naming every face. Count those
+                # groups and preserve the remaining people as explicitly
+                # unconfirmed instead of guessing a name.
+                count_words = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
+                               "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+                total_seen = 0
+                for raw, _kind in re.findall(r"([一二两三四五六七八九]|\d+)\s*名?\s*(?:个)?(人|成年人|小孩|孩子)", text):
+                    total_seen += count_words.get(raw, int(raw) if raw.isdigit() else 0)
+                if total_seen:
+                    named = len([x for x in (tr.get("photo_identities") or [])
+                                 if isinstance(x, dict) and x.get("person_name")])
+                    unknown_count = max(0, total_seen - named)
+            if unknown_count:
+                facts.append({
+                    "value": f"照片中还有{unknown_count}名未确认身份的同行者。",
+                    "certainty": "confirmed", "source": "photo_identity_unknown",
+                    "asset_id": tr.get("asset_id"),
+                })
+            if tr.get("target_person") and tr.get("target_face_status") == "not_located":
+                unknowns.append(f"未能在这张照片中定位目标人物{tr['target_person']}，不能把其他人的细节归给他/她。")
         elif tool == "read_photo_text":
             ocr = (tr.get("ocr_text") or "").strip()
             if ocr:
@@ -151,7 +261,46 @@ def build_final_context(message: str, task: dict) -> dict:
         "resolution_state": resolution_state,
         "facts_confirmed": any(f.get("certainty") == "confirmed" for f in facts),
         "has_results": ctx_has_results,
+        "confirmed_people": [f["person_name"] for f in facts
+                             if f.get("source") == "photo_identity" and f.get("person_name")],
     }
+
+
+_REFUSAL_RE = re.compile(r"看不出来|无法确认|不能确认|无法判断|不知道|没有相关|未找到", re.I)
+_PERSON_QUESTION_RE = re.compile(r"人物|谁|哪个人|哪位|爸爸|妈妈|父母|明明|乐乐|王建国|张晓莉")
+_PERSON_LIST_QUESTION_RE = re.compile(r"都有谁|有哪些人|哪几个人|几个人|多少人")
+_DATE_QUESTION_RE = re.compile(r"哪天|什么时候|何时|日期|时间|几月|哪一年|最早|最近一次")
+
+
+def evidence_answer_problems(message: str, answer: str, context: dict) -> list[str]:
+    """Deterministic completeness checks; semantic correctness remains Judge's job."""
+    text = str(answer or "").strip()
+    if not text:
+        return ["empty_answer"]
+    problems = []
+    if context.get("facts_confirmed") and _REFUSAL_RE.search(text):
+        problems.append("direct_evidence_refused")
+    if _PERSON_QUESTION_RE.search(message or "") and context.get("confirmed_people"):
+        # List-style questions must include every confirmed person from the
+        # same source photo. Targeted questions (for example “王建国穿什么”)
+        # still only require one relevant identity.
+        required_names = (context["confirmed_people"]
+                          if _PERSON_LIST_QUESTION_RE.search(message or "")
+                          else context["confirmed_people"][:1])
+        if not all(name in text for name in required_names):
+            problems.append("person_fact_missing")
+    if _DATE_QUESTION_RE.search(message or ""):
+        date_values = [str(f.get("value") or "") for f in context.get("facts") or []
+                       if f.get("source") == "facts"]
+        if date_values and not re.search(r"20\d{2}|\d{1,2}\s*月|\d{1,2}[./-]\d{1,2}", text):
+            problems.append("date_fact_missing")
+        expected_years = set()
+        for value in date_values:
+            expected_years.update(re.findall(r"20\d{2}", value))
+        answer_years = set(re.findall(r"20\d{2}", text))
+        if expected_years and answer_years and not answer_years.issubset(expected_years):
+            problems.append("date_fact_conflict")
+    return problems
 
 
 def needs_rewrite(answer: str, context: dict) -> bool:
@@ -170,6 +319,8 @@ def needs_rewrite(answer: str, context: dict) -> bool:
     if context.get("resolution_state") == "unresolved" and _PROMISE_RE.search(answer):
         return True
     if _BOILERPLATE_TAIL_RE.search(answer) or _TAIL_JUNK_RE.search(answer):
+        return True
+    if evidence_answer_problems(context.get("user_question", ""), answer, context):
         return True
     return False
 
@@ -193,7 +344,10 @@ def naturalize_answer(answer: str) -> str:
     text = text.strip().strip("； ")
     if text and text[-1] not in "。！？!?；":
         text += "。"
-    return text
+    # Every user-visible path eventually calls naturalize_answer; apply the
+    # internal-reference scrub here so normal final answers cannot bypass the
+    # writer-only sanitizer.
+    return sanitize_internal_refs(text)
 
 
 _WRITER_SYSTEM = (
@@ -247,7 +401,7 @@ def clean_writer_output(raw: str) -> str:
             text = str(parsed["answer"]).strip()
     except Exception:
         pass
-    return naturalize_answer(text.strip().strip('"'))
+    return naturalize_answer(sanitize_internal_refs(text.strip().strip('"')))
 
 
 def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = None,
@@ -288,4 +442,4 @@ def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = N
     text = text.strip().strip('"').strip()
     if not text:
         return None
-    return text[:1600]
+    return sanitize_internal_refs(text)[:1600]

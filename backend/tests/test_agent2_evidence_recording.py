@@ -21,7 +21,8 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
                         executor=_execute, produces_evidence=("visible_text",))
 
         recorded = record_agent2_tool_evidence(
-            task, ledger, spec, tool_call_id="tool_call_1", input_refs=("photo_1",))
+            task, ledger, spec, tool_call_id="tool_call_1", input_refs=("photo_1",),
+            observation={"full_text": "招牌文字", "certainty": "supported"})
 
         self.assertTrue(recorded)
         self.assertEqual(task.requirement("text").status, "satisfied")
@@ -41,6 +42,22 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
         self.assertEqual(task.requirement("text").status, "open")
         self.assertEqual(ledger.entries, [])
 
+    def test_ocr_failure_summary_is_not_visible_text_evidence(self):
+        task = TaskState.from_declaration(TaskDeclaration(
+            goal="read sign", scope_id="album1",
+            requirements=(EvidenceRequirement(id="text", evidence_type="visible_text"),),
+        ))
+        ledger = EvidenceLedger(scope_id="album1")
+        spec = ToolSpec(name="read_photo_text", description="ocr", input_schema={},
+                        executor=_execute, produces_evidence=("visible_text",))
+
+        self.assertTrue(record_agent2_tool_evidence(
+            task, ledger, spec, tool_call_id="ocr_failed",
+            observation={"summary": "这次没能可靠读出照片里的文字。",
+                         "status": "partial", "reason": "ocr_failed"}))
+        self.assertEqual(task.requirement("text").coverage_status, "failed")
+        self.assertEqual(ledger.entries[0].failure_reason, "ocr_failed")
+
     def test_observation_can_bind_multiple_requirements_from_one_search(self):
         task = TaskState.from_declaration(TaskDeclaration(
             goal="find the dated place photo", scope_id="album1",
@@ -52,7 +69,8 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
         ))
         ledger = EvidenceLedger(scope_id="album1")
         spec = ToolSpec(name="search_memories", description="search", input_schema={},
-                        executor=_execute, produces_evidence=("memory_asset", "memory_reference"))
+                        executor=_execute, produces_evidence=(
+                            "memory_asset", "location_metadata", "temporal_metadata"))
 
         recorded = record_agent2_tool_evidence(
             task, ledger, spec, tool_call_id="tool_call_1",
@@ -73,6 +91,28 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
         self.assertEqual(task.requirement("place").status, "satisfied")
         self.assertEqual(task.requirement("date").status, "satisfied")
         self.assertEqual(set(ledger.entries[0].requirement_refs), {"asset"})
+
+    def test_search_records_confirmed_people_from_preview(self):
+        task = TaskState.from_declaration(TaskDeclaration(
+            goal="identify people in a photo", scope_id="album1",
+            requirements=(EvidenceRequirement(id="identity", evidence_type="photo_identity"),),
+        ))
+        ledger = EvidenceLedger(scope_id="album1")
+        spec = ToolSpec(name="search_memories", description="search", input_schema={},
+                        executor=_execute, produces_evidence=("memory_asset", "photo_identity"))
+
+        recorded = record_agent2_tool_evidence(
+            task, ledger, spec, tool_call_id="tool_call_1", observation={
+                "result_set_id": "result_1", "total": 1, "asset_ids": ["asset_1"],
+                "preview": [{"handle": "photo_1", "people": [{
+                    "name": "明明", "family_role": "孩子", "identity_status": "confirmed",
+                }]}], "query": "合影", "certainty": "supported",
+            })
+
+        self.assertTrue(recorded)
+        identity = next(entry for entry in ledger.entries if entry.evidence_type == "photo_identity")
+        self.assertEqual(identity.extracted_value["person_name"], "明明")
+        self.assertEqual(identity.asset_id, "asset_1")
 
 
 if __name__ == "__main__":
