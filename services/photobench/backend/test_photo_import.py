@@ -20,14 +20,20 @@ class PhotoImportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paths = []
-            for index in range(4):
+            for index in range(3):
                 path = root / f"photo-{index}.jpg"
                 path.write_bytes(f"photo-{index}".encode())
                 paths.append(path)
+            video = root / "clip.mp4"
+            video.write_bytes(b"video-bytes")
+            paths.append(video)
 
             run = MODULE.BenchmarkRun.__new__(MODULE.BenchmarkRun)
             run.album_dir = root
-            run.manifest = {"photos": [path.name for path in paths]}
+            run.manifest = {
+                "photos": [path.name for path in paths[:3]],
+                "videos": [video.name],
+            }
             run.sentrix_url = "http://sentrix.test"
             run.state = {"scope_id": "scope-1", "phases": {}, "items": []}
             run.run_id = "test-run"
@@ -35,6 +41,9 @@ class PhotoImportTests(unittest.TestCase):
             run.lock = threading.RLock()
             run._cancel = threading.Event()
             run._phase_started_perf = {}
+            run.persist = lambda wait=False: None
+            run._record_phase = lambda *args, **kwargs: None
+            run._cancel_remote_batch = lambda *args, **kwargs: None
             phase_done = {}
             run._phase_done = lambda phase, extra=None: phase_done.update(extra or {})
 
@@ -66,9 +75,21 @@ class PhotoImportTests(unittest.TestCase):
 
             self.assertEqual(max_active, 2)
             self.assertEqual(phase_done["accepted_count"], 4)
+            self.assertEqual(phase_done["total_photos"], 3)
+            self.assertEqual(phase_done["total_videos"], 1)
+            self.assertEqual(phase_done["total_media"], 4)
             self.assertEqual(phase_done["upload_workers"], 2)
             self.assertEqual(phase_done["chunk_count"], 4)
             self.assertEqual(set(call_order), {path.name for path in paths})
+
+    def test_album_media_entries_keeps_photos_then_videos(self):
+        self.assertEqual(
+            MODULE.album_media_entries({
+                "photos": ["photos/a.jpg", "photos/b.jpg"],
+                "videos": ["videos/c.mp4", "photos/a.jpg"],
+            }),
+            ["photos/a.jpg", "photos/b.jpg", "videos/c.mp4"],
+        )
 
 
 if __name__ == "__main__":

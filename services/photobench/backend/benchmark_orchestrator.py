@@ -535,6 +535,11 @@ def upload_files(url: str, fields: dict, files: list[tuple[str, str, bytes]], ti
 
 
 RUN_MODES = ("full", "reuse", "build")
+PIPELINE_PENDING_STATUSES = {
+    "queued", "processing", "semantic_enriching",
+    "video-queued", "video-keyframe-extracting", "video-scene-importing",
+}
+PIPELINE_FAILED_STATUSES = {"failed", "video-processing-failed"}
 CURRENT_MODEL_SELECTION = "__current__"
 
 
@@ -587,9 +592,9 @@ def _extract_image_sets(result: dict) -> dict[str, list[str]]:
     add(result.get("selected_image_ids"), ids)
     grounding = result.get("answer_grounding") or result.get("answerGrounding") or {}
     if isinstance(grounding, dict):
-        add(grounding.get("retrieved_asset_ids"), retrieved)
-        add(grounding.get("evidence_asset_ids"), evidence)
-        add(grounding.get("selected_asset_ids"), ids)
+        add(grounding.get("retrieved_candidates") or grounding.get("retrieved_asset_ids"), retrieved)
+        add(grounding.get("evidence_sources") or grounding.get("evidence_asset_ids"), evidence)
+        add(grounding.get("selected_delivery") or grounding.get("selected_asset_ids"), ids)
         values = grounding.get("selected_image_handles") or grounding.get("selectedImageHandles")
         if isinstance(values, list):
             selected_handles.extend(str(value) for value in values if value)
@@ -820,6 +825,19 @@ def safe_slug(value: str, fallback: str = "x") -> str:
     return slug or fallback
 
 
+def album_media_entries(manifest: dict) -> list[str]:
+    """Return photo then video paths from an album manifest, de-duplicated."""
+    entries = []
+    seen = set()
+    for key in ("photos", "videos"):
+        for item in manifest.get(key) or []:
+            relative = str(item).strip()
+            if relative and relative not in seen:
+                seen.add(relative)
+                entries.append(relative)
+    return entries
+
+
 def load_jsonl(path: Path) -> list[dict]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -880,7 +898,7 @@ def dataset_integrity(album_dir: Path, manifest: dict, qa_set: str) -> dict:
     manifest_path = album_dir / "manifest.json"
     qa_path = album_dir / str((manifest.get("qa_sets") or {})[qa_set])
     entries = ["manifest.json", str(qa_path.relative_to(album_dir))]
-    entries.extend(str(path) for path in manifest.get("photos") or [])
+    entries.extend(album_media_entries(manifest))
     entries.extend(str(face.get("ref_image")) for face in manifest.get("faces") or [] if face.get("ref_image"))
     missing, file_digests = [], []
     for relative in sorted(set(entries)):
@@ -1675,7 +1693,13 @@ class BenchmarkRun:
     def _phase_photo_import(self):
         self._phase_start("photo_import")
         t0 = time.perf_counter()
-        photo_paths = [self.album_dir / p for p in self.manifest["photos"]]
+        media_relpaths = album_media_entries(self.manifest)
+        media_paths = [self.album_dir / p for p in media_relpaths]
+        missing = [rel for rel, path in zip(media_relpaths, media_paths) if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"album media missing: {missing[:8]}")
+        photo_count = len(self.manifest.get("photos") or [])
+        video_count = len(self.manifest.get("videos") or [])
         chunk_size = max(1, int(os.getenv("PHOTOBENCH_IMPORT_CHUNK_SIZE", "8")))
         upload_workers = max(1, int(os.getenv("PHOTOBENCH_IMPORT_UPLOAD_WORKERS", "2")))
         batch_id = f"batch_{uuid.uuid4().hex[:12]}"
@@ -1696,8 +1720,8 @@ class BenchmarkRun:
             return chunk_index, result
 
         chunks = [
-            (index, photo_paths[offset:offset + chunk_size])
-            for index, offset in enumerate(range(0, len(photo_paths), chunk_size))
+            (index, media_paths[offset:offset + chunk_size])
+            for index, offset in enumerate(range(0, len(media_paths), chunk_size))
         ]
         results_by_chunk = {}
         with concurrent.futures.ThreadPoolExecutor(
@@ -1715,7 +1739,9 @@ class BenchmarkRun:
                     item for index in sorted(results_by_chunk)
                     for item in results_by_chunk[index].get("items", [])
                 ]
-                self._record_phase("photo_import", "total_photos", len(photo_paths))
+                self._record_phase("photo_import", "total_photos", photo_count)
+                self._record_phase("photo_import", "total_videos", video_count)
+                self._record_phase("photo_import", "total_media", len(media_paths))
                 self._record_phase(
                     "photo_import", "accepted_count",
                     sum(1 for item in completed_items if item.get("accepted")),
@@ -1742,7 +1768,9 @@ class BenchmarkRun:
         accepted = sum(1 for i in items if i.get("accepted"))
         self._phase_done("photo_import", {
             "upload_seconds": round(t1 - t0, 1),
-            "total_photos": len(photo_paths),
+            "total_photos": photo_count,
+            "total_videos": video_count,
+            "total_media": len(media_paths),
             "accepted_count": accepted,
             "batch_id": batch_id,
             "chunk_size": chunk_size,
@@ -1774,10 +1802,10 @@ class BenchmarkRun:
             poll_count += 1
             data = request_json(f"{self.sentrix_url}/api/assets?scope_id={scope_id}&limit=2000", timeout=60)
             assets = data.get("assets", [])
-            pending = [a for a in assets if a.get("status") in ("queued", "processing", "semantic_enriching")]
+            pending = [a for a in assets if a.get("status") in PIPELINE_PENDING_STATUSES]
             total = len(assets)
             processed = len([a for a in assets if a.get("status") == "processed"])
-            failed = len([a for a in assets if a.get("status") == "failed"])
+            failed = len([a for a in assets if a.get("status") in PIPELINE_FAILED_STATUSES])
             batch_data = {}
             batch_id = self.state.get("batch_id")
             if batch_id:
@@ -3581,6 +3609,7 @@ class OrchestratorRepository:
                             "album_id": m["album_id"], "album_name": m["album_name"],
                             "face_count": len(m.get("faces", [])),
                             "photo_count": len(m.get("photos", [])),
+                            "video_count": len(m.get("videos", [])),
                             "qa_sets": list(m.get("qa_sets", {}).keys()),
                         })
                     except (OSError, KeyError, json.JSONDecodeError):
@@ -4841,7 +4870,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path.startswith("/api/albums/"):
                 parts = parsed.path.removeprefix("/api/albums/").split("/", 2)
-                if len(parts) == 3 and parts[1] in {"photos", "faces"}:
+                if len(parts) == 3 and parts[1] in {"photos", "faces", "videos"}:
                     album_id = unquote(parts[0])
                     file_name = unquote(parts[2])
                     media_path = BENCHMARK_DATA_ROOT / album_id / parts[1] / file_name

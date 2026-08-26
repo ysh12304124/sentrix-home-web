@@ -5,7 +5,7 @@ const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
   { key: "scope_setup", label: "创建相册" },
   { key: "identity_seed", label: "预置身份" },
-  { key: "photo_import", label: "照片导入" },
+  { key: "photo_import", label: "照片/视频导入" },
   { key: "pipeline_processing", label: "流水线处理" },
   { key: "qa_eval", label: "QA 评测" },
 ];
@@ -25,6 +25,11 @@ const qaPageSize = ref(20);
 const qaFilters = reactive({ search: "", score: "", task_type: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
 const reviewDrafts = reactive({});
 const selectedAlbum = ref("album3-14");
+const albumCountLabel = (manifest) => {
+  const videos = Number(manifest?.video_count || 0);
+  const base = `${manifest.face_count}人 / ${manifest.photo_count}图`;
+  return videos ? `${base} / ${videos}视频` : base;
+};
 const selectedQa = ref("compact-10q");
 const selectedModels = reactive(new Set());
 const sentrixUrl = ref("");
@@ -1294,9 +1299,9 @@ const deleteScopeAfterRun = ref(false);
 
 // ---- 工作模式：全链路 / 复用相册测评 / 构建相册 ----
 const RUN_MODES_UI = [
-  { id: "full", label: "全链路测试", hint: "新建相册 → 身份预置 → 照片导入 → 流水线处理 → QA 测评", button: "启动评测" },
+  { id: "full", label: "全链路测试", hint: "新建相册 → 身份预置 → 导入图片和视频 → 流水线处理 → QA 测评", button: "启动评测" },
   { id: "reuse", label: "复用相册测评", hint: "选择后端已有相册，跳过导入与处理，直接 QA 测评（相册不会被删除）", button: "启动复用测评" },
-  { id: "build", label: "构建相册", hint: "新建相册并完成身份预置、导入与数据处理；产物相册保留供复用，不做 QA 测评", button: "启动相册构建" },
+  { id: "build", label: "构建相册", hint: "新建相册并导入图片/视频完成数据处理；产物相册保留供复用或在线测试，不做 QA 测评", button: "启动相册构建" },
 ];
 const runMode = ref("full");
 const runModeMeta = computed(() => RUN_MODES_UI.find((m) => m.id === runMode.value) || RUN_MODES_UI[0]);
@@ -1532,9 +1537,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="config-help mode-hint">{{ runModeMeta.hint }}</span>
 </label>
         <label v-if="runMode !== 'reuse'">照片<select v-model="selectedAlbum">
-<option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} ({{ manifest.face_count }}人 / {{ manifest.photo_count }}图)</option>
+<option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} ({{ albumCountLabel(manifest) }})</option>
 </select>
-<span v-if="runMode === 'build'" class="config-help">图片与身份来源，处理后相册保留</span>
+<span v-if="runMode === 'build'" class="config-help">图片、视频与身份来源，处理后相册保留</span>
 </label>
         <label v-if="runMode === 'reuse'">复用基座<select v-model="selectedReuseBaseId" :disabled="memorySpacesLoading">
 <option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (reuseBases.length ? '请选择相册基座（相册 + 模型）' : '无可复用基座（检查 Sentrix 后端地址）') }}</option>
@@ -1860,7 +1865,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                   <article v-for="(turn, turnIndex) in conversationTurns(itemDetail(summary))" :key="turn.index ?? turnIndex" class="result-conversation-turn">
                     <div class="result-turn-marker"><b>{{ turnIndex + 1 }}</b><span>{{ conversationContextLabel(turn, turnIndex) }}</span></div>
                     <div class="result-message result-user-message"><small>用户 · 第 {{ turnIndex + 1 }} 轮</small><p>{{ turn.message }}</p></div>
-                    <div class="result-message result-assistant-message"><small>模型回答</small><p>{{ turn.answer || "未完成" }}</p></div>
+                    <div class="result-message result-assistant-message"><small>模型回答</small><p>{{ turn.final_answer || turn.answer || "未完成" }}</p></div>
                     <div class="result-turn-scores">
                       <span>任务行为 <b>期望{{ actionLabel(turn.expected_action) }} / 实际{{ actionLabel(turn.task_judge?.actual_action) }}</b><em :class="turn.task_judge?.correct === true ? 'pass' : turn.task_judge?.correct === false ? 'fail' : ''">{{ turn.task_judge?.correct === true ? '一致' : turn.task_judge?.correct === false ? '不一致' : '未记录' }}</em></span>
                       <span>回答质量 <b>{{ turnScore(turn.judge?.score) }}</b></span>
@@ -1877,7 +1882,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               </section>
               <div class="item-body">
                 <div>
-                  <h4>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮回答" : "模型回答" }}</h4><p>{{ itemDetail(summary).answer || itemDetail(summary).error || "未完成" }}</p>
+                  <h4>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮回答" : "模型回答" }}</h4><p>{{ itemDetail(summary).final_answer || itemDetail(summary).answer || itemDetail(summary).error || "未完成" }}</p>
                   <div class="capability-grid">
                     <span><small>任务判断</small><b>{{ taskDecisionLabel(itemDetail(summary)) }}</b></span>
                     <span><small>任务判断结果</small><b>{{ itemDetail(summary).task_judge?.correct === true ? "一致" : itemDetail(summary).task_judge?.correct === false ? "不一致" : "未记录" }}</b></span>
@@ -2046,7 +2051,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
         </header>
         <div class="qa-browser-toolbar">
           <label><span>相册</span><select v-model="qaBrowserAlbum" @change="qaBrowserSet = (qaBrowserOptions[0] || 'compact-10q'); loadQaBrowser()">
-            <option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} · {{ manifest.face_count }} 人 / {{ manifest.photo_count }} 图</option>
+            <option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} · {{ albumCountLabel(manifest) }}</option>
           </select></label>
           <label><span>QA 数据集</span><select v-model="qaBrowserSet" @change="loadQaBrowser">
             <option v-for="qa in qaBrowserOptions" :key="qa" :value="qa">{{ qa }}</option>
