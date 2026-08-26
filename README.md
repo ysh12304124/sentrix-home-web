@@ -57,14 +57,20 @@ node --check src/api.js
 .venv/bin/python -m compileall -q backend scripts
 ```
 
-Video imports require `ffprobe` on `PATH`. The repository vendors the supplied
-WorldMM-a pipeline and its fixed YOLO/Pose weights under `tools/video_keyframe/`;
-runtime tuning uses `SENTRIX_VIDEO_WIDTH`, `SENTRIX_VIDEO_SAMPLE_FPS`,
-`SENTRIX_VIDEO_ANALYSIS_FPS`, `SENTRIX_VIDEO_DEVICE`, and
-`SENTRIX_VIDEO_MAX_KEYFRAMES`. WorldMM's complete `memory_keyframes` remain
-available in the derived output; Sentrix uses the package's recommended
-`research/summary_keyframes.json` and imports at most the configured number of
-representative frames (160 by default).
+Video imports require `ffprobe` and a CUDA-enabled `ffmpeg` on `PATH`. The
+frozen keyframe method is `sentrix-keyframe-hybrid-v2.0.0`, recorded in
+`tools/video_keyframe/METHOD_VERSION`. It runs 10 FPS batched YOLO/Pose
+prefiltering, merges stable spans, sends only high-change windows through
+targeted Katna, decodes final representatives with NVDEC, and writes one
+full-resolution WebP per event. Stable samples are retained in `semantic.json`
+as semantic substitutions; there is no 160-frame cap and no JPEG intermediate.
+
+The backend uses this method by default through `SENTRIX_VIDEO_METHOD=hybrid_v2`.
+Use `SENTRIX_VIDEO_METHOD=legacy` only for an explicit old WorldMM comparison.
+Runtime tuning uses `SENTRIX_VIDEO_SCAN_FPS`, `SENTRIX_VIDEO_YOLO_BATCH_SIZE`,
+`SENTRIX_VIDEO_KATNA_SCAN_FPS`, `SENTRIX_VIDEO_KATNA_UNSTABLE_PERCENTILE`,
+`SENTRIX_VIDEO_MERGE_MAX_SEC`, `SENTRIX_VIDEO_TARGET_DECODE_WORKERS`,
+`SENTRIX_VIDEO_WEBP_QUALITY`, and `SENTRIX_VIDEO_DEVICE`.
 
 The maintenance rebuild is intentionally explicit because it replaces derived
 memory data:

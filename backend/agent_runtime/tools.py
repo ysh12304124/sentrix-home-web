@@ -274,7 +274,7 @@ def _query_media_list(filters: dict, *, scope_id="home-default", viewer_id="owne
             continue
         media_type = asset.get("media_type") or row.get("media_type") or ""
         derived_kind = asset.get("derived_kind")
-        if derived_kind == "video_keyframe":
+        if derived_kind in {"video_keyframe", "video_keyframe_webp"}:
             media_kind = "video_keyframe"
         elif media_type == "video":
             media_kind = "video"
@@ -290,7 +290,7 @@ def _query_media_list(filters: dict, *, scope_id="home-default", viewer_id="owne
             "derived_kind": derived_kind,
             "captured_at": asset.get("captured_at") or row.get("captured_at"),
         }
-        if derived_kind == "video_keyframe":
+        if derived_kind in {"video_keyframe", "video_keyframe_webp"}:
             source_video_id = asset.get("parent_asset_id")
             item["source_video_asset_id"] = source_video_id
             item["source_timestamp_sec"] = asset.get("source_timestamp_sec")
@@ -522,7 +522,7 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
             try:
                 asset = store.get_asset(a.get("id")) or {}
                 place = _short_place_label(asset)
-                if asset.get("derived_kind") == "video_keyframe":
+                if asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
                     media_kind = "video_keyframe"
                     source_video_asset_id = asset.get("parent_asset_id")
                     source_timestamp_sec = asset.get("source_timestamp_sec")
@@ -628,7 +628,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             try:
                 asset = store.get_asset(item.get("asset_id")) or {}
                 place = _short_place_label(asset)
-                if asset.get("derived_kind") == "video_keyframe":
+                if asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
                     media_kind = "video_keyframe"
                     source_video_asset_id = asset.get("parent_asset_id")
                     source_timestamp_sec = asset.get("source_timestamp_sec")
@@ -793,7 +793,7 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     target = handle if asset_id else (rs.asset_ids[0] if rs.asset_ids else None)
     store = _RUNTIME.get("store")
     target_asset = store.get_asset(asset_id or target) if store and (asset_id or target) else None
-    if target_asset and target_asset.get("derived_kind") == "video_keyframe" and target_asset.get("parent_asset_id"):
+    if target_asset and target_asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"} and target_asset.get("parent_asset_id"):
         source_video_id = target_asset["parent_asset_id"]
         return {
             "summary": "已从结果集授权原始视频交付，来源是关键帧对应的时间点。",
