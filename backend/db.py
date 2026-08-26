@@ -7,6 +7,7 @@ import threading
 import uuid
 from collections import Counter
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from .geocoding import format_gps_prefix
 from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
@@ -785,6 +786,64 @@ class MemoryStore:
                 updated_at TEXT NOT NULL
             );
 
+            -- EventAgg is a second index over the immutable v2.0 keyframe
+            -- evidence.  These tables never rewrite baseline video_scene rows.
+            CREATE TABLE IF NOT EXISTS method_runs (
+                run_id TEXT PRIMARY KEY,
+                media_id TEXT,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                method_version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                config_json TEXT NOT NULL DEFAULT '{}',
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS places (
+                place_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                name TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS event_aggregate_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES method_runs(run_id),
+                media_id TEXT NOT NULL,
+                scope_id TEXT NOT NULL DEFAULT 'home-default',
+                source_index INTEGER NOT NULL,
+                start_sec REAL NOT NULL,
+                end_sec REAL NOT NULL,
+                start_time TEXT,
+                end_time TEXT,
+                representative_frame_id TEXT,
+                place_id TEXT REFERENCES places(place_id),
+                merge_score REAL NOT NULL DEFAULT 0,
+                frame_count INTEGER NOT NULL DEFAULT 0,
+                object_summary_json TEXT NOT NULL DEFAULT '[]',
+                person_count_range_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                method_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS event_aggregate_frames (
+                run_id TEXT NOT NULL REFERENCES method_runs(run_id),
+                event_id TEXT NOT NULL REFERENCES event_aggregate_events(event_id),
+                frame_id TEXT NOT NULL,
+                timestamp_sec REAL NOT NULL,
+                is_representative INTEGER NOT NULL DEFAULT 0,
+                is_preview INTEGER NOT NULL DEFAULT 0,
+                frame_hash TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(run_id, event_id, frame_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_method_runs_media ON method_runs(media_id, method_version, created_at);
+            CREATE INDEX IF NOT EXISTS idx_eventagg_events_media ON event_aggregate_events(media_id, run_id, source_index);
+            CREATE INDEX IF NOT EXISTS idx_eventagg_frames_event ON event_aggregate_frames(event_id, timestamp_sec);
+
             CREATE TABLE IF NOT EXISTS runtime_settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -1140,6 +1199,21 @@ class MemoryStore:
                 metadata.get("content_sha256", metadata.get("sha256", current.get("content_sha256"))),
                 metadata.get("captured_at", current.get("captured_at")), metadata.get("captured_location", current.get("captured_location")),
                 now_iso(), asset_id,
+            ),
+        )
+        self.connection.commit()
+        return self.get_asset(asset_id)
+
+    def update_asset_file(self, asset_id, path, *, file_name=None, mime_type=None, size_bytes=None, content_sha256=None):
+        """Update the stored media identity after an in-place video compaction."""
+        current = self.get_asset(asset_id) or {}
+        self.connection.execute(
+            """UPDATE assets SET path = ?, file_name = ?, mime_type = ?, size_bytes = ?,
+               content_sha256 = ?, updated_at = ? WHERE id = ?""",
+            (
+                str(path), file_name or current.get("file_name"), mime_type or current.get("mime_type"),
+                int(size_bytes if size_bytes is not None else current.get("size_bytes") or 0),
+                content_sha256 or current.get("content_sha256"), now_iso(), asset_id,
             ),
         )
         self.connection.commit()
@@ -1926,7 +2000,7 @@ class MemoryStore:
                         self.get_asset(asset_id) for asset_id in row.get("asset_ids", [])
                         if (self.get_asset(asset_id) or {}).get("derived_kind") == "video_keyframe_webp"
                     ]
-                row["keyframe_assets"] = [
+                derived_keyframes = [
                     {key: asset.get(key) for key in (
                         "id", "file_name", "media_type", "status", "captured_at", "captured_location",
                         "parent_asset_id", "derived_kind", "source_timestamp_sec", "source_frame_index",
@@ -1935,10 +2009,47 @@ class MemoryStore:
                     for asset in derived_assets if asset
                 ]
                 source_video = self.get_asset(row.get("source_asset_id")) or {}
+                package = (source_video.get("metadata_json") or {}).get("keyframe_video_package") or {}
+                if not derived_keyframes and package:
+                    frame_map = {}
+                    try:
+                        frame_map = json.loads(Path(str(package.get("frame_map_path"))).read_text(encoding="utf-8"))
+                        mapped_frames = frame_map.get("frames") if isinstance(frame_map, dict) else frame_map
+                    except (OSError, ValueError, TypeError):
+                        mapped_frames = []
+                    mapped_frames = mapped_frames if isinstance(mapped_frames, list) else []
+                    if len(mapped_frames) > 80:
+                        stride = len(mapped_frames) / 80
+                        mapped_frames = [mapped_frames[min(int(index * stride), len(mapped_frames) - 1)] for index in range(80)]
+                    scene_start = float(row.get("source_start_sec") or 0)
+                    scene_end = float(row.get("source_end_sec") or float("inf"))
+                    encoded_fps = float(package.get("encoded_fps") or (frame_map.get("encoded_fps") if isinstance(frame_map, dict) else 0) or 25)
+                    derived_keyframes = []
+                    for ordinal, frame in enumerate(mapped_frames):
+                        if not isinstance(frame, dict):
+                            continue
+                        timestamp = float(frame.get("source_timestamp_sec", frame.get("timestamp_sec", 0)) or 0)
+                        if timestamp < scene_start - 0.001 or timestamp > scene_end + 0.001:
+                            continue
+                        encoded_index = int(frame.get("encoded_frame_index", ordinal) or 0)
+                        derived_keyframes.append({
+                            "id": f"{source_video.get('id')}:frame:{encoded_index}",
+                            "file_name": f"keyframe-{encoded_index:06d}",
+                            "media_type": "video-frame", "status": "processed",
+                            "parent_asset_id": source_video.get("id"), "derived_kind": "video_keyframe",
+                            "source_timestamp_sec": timestamp,
+                            "source_frame_index": int(frame.get("source_frame_index", 0) or 0),
+                            "encoded_frame_index": encoded_index,
+                            "encoded_fps": encoded_fps,
+                            "source_scene_index": row.get("source_scene_index"),
+                        })
+                row["keyframe_assets"] = derived_keyframes
                 row["source_video"] = {key: source_video.get(key) for key in (
                     "id", "file_name", "media_type", "mime_type", "status", "captured_at",
                     "captured_location", "size_bytes",
                 )}
+                row["source_video"]["keyframe_video"] = bool(package)
+                row["source_video"]["keyframe_video_encoded_fps"] = float(package.get("encoded_fps") or 25) if package else 0
             row["participant_roles"] = self.list_event_participants(event_id)
         return row
 
@@ -2005,6 +2116,136 @@ class MemoryStore:
             (video_asset_id,),
         )
         return [self.get_event(row["id"]) for row in rows]
+
+    def create_method_run(self, run_id, media_id, scope_id, method_version, config=None):
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT OR REPLACE INTO method_runs(
+                run_id, media_id, scope_id, method_version, status, config_json,
+                metrics_json, error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'running', ?, '{}', NULL, ?, ?)""",
+            (run_id, media_id, scope_id or "home-default", method_version,
+             json_value(config or {}, {}), timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self._decode(self._row("SELECT * FROM method_runs WHERE run_id = ?", (run_id,)), ["config_json", "metrics_json"])
+
+    def finish_method_run(self, run_id, status, metrics=None, error=None):
+        self.connection.execute(
+            "UPDATE method_runs SET status = ?, metrics_json = ?, error = ?, updated_at = ? WHERE run_id = ?",
+            (status, json_value(metrics or {}, {}), error, now_iso(), run_id),
+        )
+        self.connection.commit()
+        return self._decode(self._row("SELECT * FROM method_runs WHERE run_id = ?", (run_id,)), ["config_json", "metrics_json"])
+
+    def replace_eventagg_run(self, run_id, media_id, scope_id, method_version, groups, metrics, config=None):
+        """Write only the EventAgg index; baseline ``events`` remain untouched."""
+        self.create_method_run(run_id, media_id, scope_id, method_version, config)
+        self.connection.execute("DELETE FROM event_aggregate_frames WHERE run_id = ?", (run_id,))
+        self.connection.execute("DELETE FROM event_aggregate_events WHERE run_id = ?", (run_id,))
+        timestamp = now_iso()
+        for index, group in enumerate(groups):
+            data = group if isinstance(group, dict) else {}
+            event_id = str(data.get("event_id") or f"{run_id}_event_{index + 1:04d}")
+            self.connection.execute(
+                """INSERT INTO event_aggregate_events(
+                    event_id, run_id, media_id, scope_id, source_index, start_sec, end_sec,
+                    start_time, end_time, representative_frame_id, place_id, merge_score,
+                    frame_count, object_summary_json, person_count_range_json, metadata_json,
+                    method_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id, run_id, media_id, scope_id or "home-default", index,
+                    float(data.get("start_sec") or 0), float(data.get("end_sec") or 0),
+                    data.get("start_time"), data.get("end_time"), data.get("representative_frame_id"),
+                    data.get("place_id"), float(data.get("merge_score") or 0), int(data.get("frame_count") or 0),
+                    json_value(data.get("object_summary") or [], []), json_value(data.get("person_count_range") or [], []),
+                    json_value({key: value for key, value in data.items() if key not in {"event_id", "member_frame_ids", "preview_frame_ids", "object_summary", "person_count_range"}}, {}),
+                    method_version, timestamp, timestamp,
+                ),
+            )
+            members = list(data.get("member_frames") or [])
+            member_ids = list(data.get("member_frame_ids") or [])
+            preview_ids = set(data.get("preview_frame_ids") or [])
+            for member_index, member in enumerate(members):
+                frame_id = str(member.get("frame_id") if isinstance(member, dict) else member)
+                if not frame_id and member_index < len(member_ids):
+                    frame_id = str(member_ids[member_index])
+                self.connection.execute(
+                    """INSERT OR REPLACE INTO event_aggregate_frames(
+                        run_id, event_id, frame_id, timestamp_sec, is_representative,
+                        is_preview, frame_hash, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id, event_id, frame_id,
+                        float(member.get("timestamp_sec") or 0) if isinstance(member, dict) else 0.0,
+                        int(frame_id == str(data.get("representative_frame_id"))),
+                        int(frame_id in preview_ids),
+                        member.get("frame_hash") if isinstance(member, dict) else None,
+                        json_value(member if isinstance(member, dict) else {}, {}),
+                    ),
+                )
+        self.connection.commit()
+        return self.finish_method_run(run_id, "completed", metrics)
+
+    def list_method_runs(self, media_id=None, scope_id=None, method_version=None):
+        where, params = ["1=1"], []
+        if media_id:
+            where.append("media_id = ?"); params.append(media_id)
+        if scope_id:
+            where.append("scope_id = ?"); params.append(scope_id)
+        if method_version:
+            where.append("method_version = ?"); params.append(method_version)
+        rows = self._rows(f"SELECT * FROM method_runs WHERE {' AND '.join(where)} ORDER BY created_at DESC", params)
+        return [self._decode(row, ["config_json", "metrics_json"]) for row in rows]
+
+    def list_eventagg_events(self, run_id=None, media_id=None, scope_id=None, method_version=None):
+        where, params = ["1=1"], []
+        if run_id:
+            where.append("run_id = ?"); params.append(run_id)
+        if media_id:
+            where.append("media_id = ?"); params.append(media_id)
+        if scope_id:
+            where.append("scope_id = ?"); params.append(scope_id)
+        if method_version:
+            where.append("method_version = ?"); params.append(method_version)
+        rows = self._rows(f"SELECT * FROM event_aggregate_events WHERE {' AND '.join(where)} ORDER BY start_sec, source_index", params)
+        result = []
+        for row in rows:
+            row = self._decode(row, ["object_summary_json", "person_count_range_json", "metadata_json"])
+            metadata = row.get("metadata_json") or {}
+            objects = row.get("object_summary_json") or []
+            frame_rows = self._rows(
+                "SELECT frame_id, timestamp_sec, is_representative, is_preview, frame_hash, metadata_json "
+                "FROM event_aggregate_frames WHERE event_id = ? ORDER BY timestamp_sec",
+                (row["event_id"],),
+            )
+            frame_ids = [str(frame["frame_id"]) for frame in frame_rows]
+            object_text = "、".join(str(item) for item in objects[:12])
+            row.update({
+                "id": row["event_id"], "title": f"事件：{object_text}" if object_text else f"视频事件 {row['source_index'] + 1}",
+                "event_type": "视频事件", "time_start": row.get("start_time"), "time_end": row.get("end_time"),
+                "place": row.get("place_id") or "其他或不确定", "activity": object_text or "视频事件",
+                "summary": f"{object_text or '视频事件'} · {row['start_sec']:.1f}s~{row['end_sec']:.1f}s · {row['frame_count']} 张证据帧",
+                "participants_json": [], "confidence": 1.0, "status": "active", "revision": 1,
+                "source_type": "video_eventagg", "source_asset_id": row["media_id"], "source_scene_index": row["source_index"],
+                "source_start_sec": row["start_sec"], "source_end_sec": row["end_sec"],
+                "source_metadata_json": {**metadata, "event_id": row["event_id"], "method_version": row["method_version"], "frame_count": row["frame_count"], "object_summary": objects, "person_count_range": row.get("person_count_range_json") or []},
+                "cover_asset_id": row.get("representative_frame_id"), "cover_selection_json": {"source": "eventagg"},
+                "method_version": row["method_version"], "frame_count": row["frame_count"],
+                "asset_ids": frame_ids, "observation_ids": [],
+                "evidence_frames": [self._decode(frame, ["metadata_json"]) for frame in frame_rows],
+            })
+            result.append(row)
+        return result
+
+    def get_eventagg_event_detail(self, event_id):
+        event = self._decode(self._row("SELECT * FROM event_aggregate_events WHERE event_id = ?", (event_id,)), ["object_summary_json", "person_count_range_json", "metadata_json"])
+        if not event:
+            return None
+        frames = [self._decode(row, ["metadata_json"]) for row in self._rows("SELECT * FROM event_aggregate_frames WHERE event_id = ? ORDER BY timestamp_sec", (event_id,))]
+        event_view = next((item for item in self.list_eventagg_events(run_id=event["run_id"]) if item.get("id") == event_id), {})
+        return {"event": event_view, "frames": frames}
 
     def cleanup_video_derivatives(self, video_asset_id):
         """Delete only derived keyframes/scenes owned by one video for an explicit retry."""

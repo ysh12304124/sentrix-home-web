@@ -31,6 +31,9 @@ from .image_io import (
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
+from .worldmm_memory import WorldMMMemory, worldmm_artifact_path
+from .video.event_aggregator import EVENTAGG_METHOD_VERSION
+from .video.mtsw import MTSW_METHOD_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +70,7 @@ SUPPORTED_IMPORT_SUFFIXES = {
     ".txt", ".md", ".json",
 }
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
+KEYFRAME_PACKAGE_SIDECARS = {"frame_map.json", "semantic.json"}
 
 
 @contextlib.contextmanager
@@ -206,6 +210,128 @@ def _batch_status(batch_id: str):
         "identity_confirmation": {
             "list_clusters": f"GET /api/face-clusters?scope_id={batch.get('scope_id')}",
             "confirm_cluster": "POST /api/face-clusters/{cluster_id}/confirm",
+        },
+    }
+
+
+def _performance_number(metadata, keys):
+    """Return the first finite timing value recorded by a video pipeline."""
+    for key in keys:
+        value = (metadata or {}).get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return round(float(value), 4)
+    return None
+
+
+def _video_performance(scope_id=None):
+    """Read-only performance summary for the frontend performance dashboard.
+
+    Older WorldMM publishers did not persist every stage separately.  The
+    response therefore marks the source of each number and leaves unavailable
+    values null instead of presenting a misleading zero.
+    """
+    all_assets = store.list_assets(limit=100000, scope_id=scope_id or None)
+    videos = [item for item in all_assets if item.get("media_type") == "video"]
+    children_by_parent = {}
+    for item in all_assets:
+        parent_id = item.get("parent_asset_id")
+        derived_kind = item.get("derived_kind")
+        if parent_id and derived_kind in {"video_keyframe", "video_keyframe_webp"}:
+            children_by_parent.setdefault(parent_id, []).append(item)
+
+    def safe_int(value, default=0):
+        try:
+            return int(value or default)
+        except (TypeError, ValueError):
+            return default
+
+    records = []
+    total_original = 0
+    total_keyframe = 0
+    known_extraction = []
+    known_memory = []
+    for video in videos:
+        metadata = video.get("metadata_json") or {}
+        children = children_by_parent.get(video.get("id"), [])
+        keyframe_bytes = sum(max(0, safe_int(item.get("size_bytes"))) for item in children)
+        original_bytes = max(0, safe_int(video.get("size_bytes") or metadata.get("source_video_size_bytes")))
+        retained_ratio = (keyframe_bytes / original_bytes) if original_bytes else None
+        extraction = _performance_number(metadata, [
+            "keyframe_extraction_seconds", "worldmm_keyframe_seconds",
+            "video_keyframe_seconds", "video_processing_seconds",
+        ])
+        extraction_source = "关键帧提取" if any(
+            isinstance(metadata.get(key), (int, float)) and not isinstance(metadata.get(key), bool)
+            for key in ["keyframe_extraction_seconds", "worldmm_keyframe_seconds", "video_keyframe_seconds"]
+        ) else ("视频处理总耗时（未拆分）" if extraction is not None else None)
+        memory_build = _performance_number(metadata, [
+            "memory_build_seconds", "video_memory_build_seconds",
+            "event_summary_wall_seconds",
+        ])
+        batch_id = video.get("batch_id") or metadata.get("batch_id")
+        if memory_build is None and batch_id:
+            batch = store.get_ingest_batch(batch_id)
+            metrics = (batch or {}).get("metadata_json", {}).get("pipeline_metrics", {})
+            candidate = metrics.get("total_wall_seconds")
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                memory_build = round(float(candidate), 4)
+        if extraction is not None:
+            known_extraction.append(extraction)
+        if memory_build is not None:
+            known_memory.append(memory_build)
+        total_original += original_bytes
+        total_keyframe += keyframe_bytes
+        records.append({
+            "id": video.get("id"),
+            "file_name": video.get("file_name") or video.get("id"),
+            "scope_id": video.get("scope_id"),
+            "status": video.get("status"),
+            "format": metadata.get("keyframe_video_memory_format") or (
+                "webp" if any(item.get("derived_kind") == "video_keyframe_webp" for item in children) else "未知"
+            ),
+            "original_bytes": original_bytes,
+            "keyframe_bytes": keyframe_bytes,
+            "retained_ratio": round(retained_ratio, 6) if retained_ratio is not None else None,
+            "compression_ratio": round(1 - retained_ratio, 6) if retained_ratio is not None else None,
+            "keyframe_count": safe_int(metadata.get("worldmm_selected_keyframe_count") or metadata.get("keyframe_video_memory_frame_count") or len(children)),
+            "scene_count": safe_int(metadata.get("worldmm_scene_count") or len(metadata.get("video_scene_event_ids") or [])),
+            "extraction_seconds": extraction,
+            "extraction_source": extraction_source,
+            "memory_build_seconds": memory_build,
+            "batch_id": batch_id,
+        })
+
+    batches = []
+    try:
+        rows = store._rows("SELECT id FROM ingest_batches " + ("WHERE scope_id = ? " if scope_id else "") + "ORDER BY updated_at DESC LIMIT 10", (scope_id,) if scope_id else ())
+        for row in rows:
+            batch = store.get_ingest_batch(row["id"])
+            if batch:
+                metrics = (batch.get("metadata_json") or {}).get("pipeline_metrics") or {}
+                batches.append({"id": batch.get("id"), "scope_id": batch.get("scope_id"), "status": batch.get("status"), "updated_at": batch.get("updated_at"), "pipeline_metrics": metrics})
+    except Exception:
+        batches = []
+    latest_batch = batches[0] if batches else None
+    return {
+        "scope_id": scope_id or "",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "summary": {
+            "video_count": len(records),
+            "keyframe_count": sum(item["keyframe_count"] for item in records),
+            "scene_count": sum(item["scene_count"] for item in records),
+            "original_bytes": total_original,
+            "keyframe_bytes": total_keyframe,
+            "retained_ratio": round(total_keyframe / total_original, 6) if total_original else None,
+            "compression_ratio": round(1 - total_keyframe / total_original, 6) if total_original else None,
+            "extraction_seconds": round(sum(known_extraction), 4) if known_extraction else None,
+            "memory_build_seconds": round(sum(known_memory), 4) if known_memory else None,
+        },
+        "videos": records,
+        "latest_batch": latest_batch,
+        "notes": {
+            "compression": "关键帧证据文件总大小 / 原视频大小；未保存原视频时显示可测到的资产大小。",
+            "extraction": "旧批次只保存视频处理总耗时时，会明确标注为未拆分。",
+            "qa": "问答响应、检索、模型、图片加载和通道耗时由浏览器在每次问答后记录。",
         },
     }
 
@@ -705,9 +831,9 @@ def health():
                 "identityModel": pipeline.face.identity_model,
                 "identityConfigured": pipeline.face.identity_configured,
                 "identityReady": pipeline.face.identity_ready,
-                "identityFallback": pipeline.face.identity_fallback,
-                "identityFallbackModel": pipeline.face.identity_fallback_model,
-                "identityFallbackError": pipeline.face.identity_fallback_error,
+                "identityFallback": getattr(pipeline.face, "identity_fallback", False),
+                "identityFallbackModel": getattr(pipeline.face, "identity_fallback_model", None),
+                "identityFallbackError": getattr(pipeline.face, "identity_fallback_error", None),
                 "error": pipeline.face.error,
                 "identityError": pipeline.face.identity_runtime_error or pipeline.face.identity_error,
             },
@@ -719,13 +845,43 @@ def health():
             "vectorIndex": store.vector_search_status(),
         },
         "videoExtraction": {
-            "adapter": "hybrid_webp_memory", "status": "available",
+            "adapter": "hybrid_v2_yolo_katna_nvdec_webp", "status": "available",
+            "method_version": "sentrix-keyframe-hybrid-v2.0.0",
             "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
             "sampleFps": 10, "yoloBatch": 16, "targetDecode": "NVDEC",
             "memoryMerge": True, "duplicateFrameRemoval": True,
         },
         "database": store.path,
     }
+
+
+@app.get("/api/performance")
+def performance(scope_id: str | None = None, method: str = "baseline"):
+    """Video and browser-side QA performance data for the local dashboard."""
+    try:
+        scope = (scope_id or "").strip() or None
+        payload = _video_performance(scope)
+        runs = store.list_method_runs(scope_id=scope)
+        if runs:
+            media_ids = {run.get("media_id") for run in runs if run.get("media_id")}
+            runs = [item for media_id in media_ids for item in store.list_method_runs(media_id=media_id)]
+        payload["method_comparison"] = {
+            "baseline_method": "keyframe-hybrid-v2.0.0",
+            "eventagg_method": EVENTAGG_METHOD_VERSION,
+            "mtsw_method": MTSW_METHOD_VERSION,
+            "references": [{
+                "method_version": "keyframe-hybrid-v2.0.0",
+                "label": "Baseline v2.0",
+                "status": "frozen_reference",
+                "metrics_json": {"keyframes": 180, "events": 180, "total_wall_seconds": 293.26, "extraction_seconds": 77.827},
+            }],
+            "runs": runs,
+            "selected_method": "mtsw" if str(method).lower() in {"mtsw", "mtsw_v23", MTSW_METHOD_VERSION.lower()} else "eventagg" if str(method).lower() in {"eventagg", "eventagg_v21"} else "baseline",
+        }
+        return payload
+    except Exception as error:
+        # Keep this observability endpoint non-fatal for the rest of the app.
+        raise HTTPException(status_code=500, detail=f"performance summary failed: {error}") from error
 
 @app.get("/api/hardware")
 def hardware():
@@ -954,12 +1110,34 @@ def dashboard(scope_id: str | None = None):
 
 
 @app.get("/api/events")
-def events(scope_id: str | None = None, limit: int = 1000):
+def events(scope_id: str | None = None, limit: int = 1000, method: str = "baseline", run_id: str | None = None):
     # The timeline needs older events when the user selects a historical date.
     # Keep a server-side ceiling while avoiding the previous silent 100-event
     # truncation that hid older video scenes.
     limit = min(max(int(limit or 1000), 1), 5000)
-    return {"events": store.list_events(limit, scope_id=scope_id)}
+    method_name = str(method or "baseline").lower()
+    if method_name in {"mtsw", "mtsw_v23", MTSW_METHOD_VERSION.lower()}:
+        method_version = MTSW_METHOD_VERSION
+        if not run_id:
+            runs = store.list_method_runs(scope_id=scope_id, method_version=method_version)
+            run_id = runs[0]["run_id"] if runs else None
+        return {"events": store.list_eventagg_events(run_id=run_id, scope_id=scope_id, method_version=method_version)[:limit], "method": method_version, "run_id": run_id}
+    if method_name in {"eventagg", "eventagg_v21", EVENTAGG_METHOD_VERSION.lower()}:
+        if not run_id:
+            runs = store.list_method_runs(scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
+            preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
+            run_id = (preferred or (runs[0] if runs else {})).get("run_id")
+        if not run_id:
+            return {"events": [], "method": EVENTAGG_METHOD_VERSION, "run_id": None}
+        events = store.list_eventagg_events(run_id=run_id, scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
+        return {"events": events[:limit], "method": EVENTAGG_METHOD_VERSION, "run_id": run_id}
+    baseline_events = store.list_events(limit, scope_id=scope_id)
+    return {"events": baseline_events, "method": "baseline"}
+
+
+@app.get("/api/method-runs")
+def method_runs(scope_id: str | None = None, media_id: str | None = None, method_version: str | None = None):
+    return {"runs": store.list_method_runs(media_id=media_id, scope_id=scope_id, method_version=method_version)}
 
 
 @app.get("/api/trips")
@@ -999,6 +1177,8 @@ def reject_trip(trip_id: str):
 def event_detail(event_id: str):
     value = store.get_event_detail(event_id)
     if not value:
+        value = store.get_eventagg_event_detail(event_id)
+    if not value:
         raise HTTPException(status_code=404, detail="event not found")
     return value
 
@@ -1017,6 +1197,27 @@ def video_scenes(asset_id: str):
     if not value or value.get("media_type") != "video":
         raise HTTPException(status_code=404, detail="video asset not found")
     return {"video_asset_id": asset_id, "scenes": store.list_video_scene_events(asset_id)}
+
+
+@app.get("/api/videos/{asset_id}/eventagg")
+def video_eventagg(asset_id: str, run_id: str | None = None):
+    if not store.get_asset(asset_id):
+        raise HTTPException(status_code=404, detail="video asset not found")
+    if not run_id:
+        runs = store.list_method_runs(media_id=asset_id, method_version=EVENTAGG_METHOD_VERSION)
+        preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
+        run_id = (preferred or (runs[0] if runs else {})).get("run_id")
+    return {"video_asset_id": asset_id, "method": EVENTAGG_METHOD_VERSION, "run_id": run_id, "events": store.list_eventagg_events(run_id=run_id, media_id=asset_id)}
+
+
+@app.get("/api/videos/{asset_id}/mtsw")
+def video_mtsw(asset_id: str, run_id: str | None = None):
+    if not store.get_asset(asset_id):
+        raise HTTPException(status_code=404, detail="video asset not found")
+    if not run_id:
+        runs = store.list_method_runs(media_id=asset_id, method_version=MTSW_METHOD_VERSION)
+        run_id = runs[0]["run_id"] if runs else None
+    return {"video_asset_id": asset_id, "method": MTSW_METHOD_VERSION, "run_id": run_id, "events": store.list_eventagg_events(run_id=run_id, media_id=asset_id, method_version=MTSW_METHOD_VERSION)}
 
 
 @app.get("/api/video-scenes/{scene_id}")
@@ -1834,6 +2035,12 @@ class AssistantTurnRequest(BaseModel):
     viewer_id: str = "owner"
 
 
+class WorldMMQARequest(BaseModel):
+    question: str
+    options: dict[str, str] = Field(default_factory=dict)
+    scope_id: str = "home-default"
+
+
 _TOOL_LOOP_TASK_STATE: dict[str, dict] = {}  # conversation_id -> task_state（B3.1 跨 turn 结果集续接）
 _TURN_JOBS: dict[str, dict] = {}  # turn_id -> job（B3.4 异步轮询）
 _TURN_EXECUTOR = None  # 惰性初始化 ThreadPoolExecutor
@@ -2117,6 +2324,48 @@ def assistant_turn(request: AssistantTurnRequest):
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
     }
+
+
+def _load_worldmm_memory(scope_id):
+    """Return a rebuilt WorldMM artifact when this scope has one."""
+    path = worldmm_artifact_path(DATA_DIR, scope_id)
+    if not path.is_file():
+        return None
+    try:
+        return WorldMMMemory(path)
+    except Exception as error:
+        print(f"[worldmm] unable to load {path}: {error}", flush=True)
+        return None
+
+
+def _worldmm_turn(message, scope_id, *, options=None, progress_callback=None):
+    memory = _load_worldmm_memory(scope_id)
+    if memory is None:
+        raise HTTPException(status_code=404, detail=f"WorldMM memory is not built for scope {scope_id}")
+    if progress_callback:
+        progress_callback({"stage": "retrieval", "status": "running", "text": "正在检索 Caption、Episodic、Semantic、Visual 四类记忆。"})
+    result = memory.answer(gamma, message, options=options or {})
+    if progress_callback:
+        progress_callback({"stage": "answer", "status": "complete", "text": "已完成 WorldMM 多路记忆融合回答。"})
+    result.update({
+        "conversation_id": f"worldmm_{uuid.uuid4().hex[:12]}",
+        "intent": "worldmm_memory_qa",
+        "memory_used": True,
+        "evidence_status": "worldmm_fused",
+        "worldmm": {"scope_id": scope_id, "manifest": memory.manifest},
+        "retrieval_trace": [{"stage": "worldmm_fusion", "status": "complete", "detail": result.get("retrieval") or {}, "retrieval_timing": result.get("retrieval_timing") or {}}],
+        "tool_trace": [],
+        "public_progress": [],
+        "segments": [{"type": "text", "text": result.get("answer", "")}],
+    })
+    return result
+
+
+@app.post("/api/worldmm/qa")
+def worldmm_qa(request: WorldMMQARequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+    return assistant_response(_worldmm_turn(request.question.strip(), request.scope_id, options=request.options))
 
 
 @app.get("/api/assistant/turn/{turn_id}")
@@ -2479,6 +2728,21 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
                 job["public_progress"] = job.get("progress_events")
 
         started = time.time()
+        # A rebuilt WorldMM scope owns its QA path.  The existing tool-loop
+        # remains unchanged for ordinary household scopes.
+        if _load_worldmm_memory(scope_id) is not None:
+            result = _worldmm_turn(message, scope_id, progress_callback=on_progress)
+            result["telemetry"] = {
+                "profile": "worldmm_memory",
+                "status": "complete",
+                "latency_s": round(time.time() - started, 2),
+                "fallback": False,
+            }
+            result = assistant_response(result)
+            if job is not None:
+                job.update({"status": "complete", "result": result,
+                            "public_progress": result.get("public_progress") or job.get("public_progress") or []})
+            return
         result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
                                  recent_turns=recent_turns, progress_callback=on_progress,
                                  selected_asset_handle=selected_asset_handle,
@@ -2680,10 +2944,28 @@ async def import_remote_files(
     with db_write_guard("import-remote-init"):
         store.create_memory_space(scope, scope, kind="benchmark")
         store.create_ingest_batch(batch, scope)
+    upload_names = {Path(upload.filename or "").name.lower() for upload in files}
+    package_video_upload = next((upload for upload in files if Path(upload.filename or "").suffix.lower() in {".mp4", ".m4v", ".mov"}
+                                and ("selected_frames" in Path(upload.filename or "").stem.lower()
+                                     or "frame_map.json" in upload_names and "semantic.json" in upload_names)), None)
+    is_keyframe_package = bool(package_video_upload and KEYFRAME_PACKAGE_SIDECARS <= upload_names)
+    package_sidecar_paths = {}
+    package_video_asset = None
     items = []
     queued_asset_ids = []
     for index, upload in enumerate(files):
         safe_name = Path(upload.filename or f"upload-{index}").name
+        if is_keyframe_package and safe_name.lower() in KEYFRAME_PACKAGE_SIDECARS:
+            sidecar_path = MEDIA_DIR / f"{make_id('keyframe-package')}_{safe_name}"
+            try:
+                with sidecar_path.open("wb") as output:
+                    shutil.copyfileobj(upload.file, output)
+                package_sidecar_paths[safe_name.lower()] = sidecar_path
+                items.append({"accepted": True, "fileName": safe_name, "status": "attached", "package_sidecar": True, "scope_id": scope, "batch_id": batch})
+            except Exception as error:
+                sidecar_path.unlink(missing_ok=True)
+                items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
+            continue
         media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
         if media_type not in {"image", "audio", "video", "text"}:
             media_type = media_type_from_upload(upload.content_type, safe_name)
@@ -2703,6 +2985,8 @@ async def import_remote_files(
                 })
                 if media_type == "video" and created.get("path") == str(destination):
                     created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                    if is_keyframe_package and upload is package_video_upload:
+                        package_video_asset = created
                 created = store.update_asset(created["id"], created.get("status") or "queued", {
                     "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
                 })
@@ -2718,6 +3002,30 @@ async def import_remote_files(
         except Exception as error:
             destination.unlink(missing_ok=True)
             items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
+    if is_keyframe_package and package_video_asset and len(package_sidecar_paths) == len(KEYFRAME_PACKAGE_SIDECARS):
+        package_dir = Path(package_video_asset["path"]).parent
+        moved = {}
+        for name, source in package_sidecar_paths.items():
+            target = package_dir / name
+            shutil.move(str(source), str(target))
+            moved[name] = str(target)
+        try:
+            frame_map = json.loads(Path(moved["frame_map.json"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            frame_map = {}
+        package_descriptor = {
+            "frame_map_path": moved["frame_map.json"],
+            "semantic_path": moved["semantic.json"],
+            "encoded_fps": frame_map.get("encoded_fps", 25) if isinstance(frame_map, dict) else 25,
+            "source_fps": frame_map.get("source_fps", 0) if isinstance(frame_map, dict) else 0,
+            "source_width": frame_map.get("source_width", 0) if isinstance(frame_map, dict) else 0,
+            "source_height": frame_map.get("source_height", 0) if isinstance(frame_map, dict) else 0,
+        }
+        with db_write_guard("import-keyframe-package"):
+            package_video_asset = store.update_asset(package_video_asset["id"], "video-queued", {
+                "video_stage": "video-queued", "keyframe_video": True,
+                "keyframe_video_package": package_descriptor,
+            })
     if queued_asset_ids:
         if not deferBatchComplete:
             store.complete_ingest_batch(batch)
