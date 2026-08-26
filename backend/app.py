@@ -3161,10 +3161,14 @@ async def ingest(
         "captured_at": capturedAt,
         "captured_location": capturedLocation,
         "content_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
-        "exif": pipeline._extract_exif(destination) if media_type == "image" else {},
+        "exif": pipeline.extract_capture_metadata(destination, media_type),
     }
     metadata["captured_at"] = metadata["captured_at"] or metadata["exif"].get("captured_at")
+    metadata["captured_location"] = metadata["captured_location"] or metadata["exif"].get("captured_location")
     metadata["source_device_id"] = metadata["source_device_id"] or metadata["exif"].get("device")
+    gps = pipeline._gps_from_metadata(metadata)
+    if gps and not metadata.get("captured_location"):
+        metadata["captured_location"] = f"{float(gps['latitude']):.6f},{float(gps['longitude']):.6f}"
     # Deduplication is scoped to the album: the same photo may legitimately
     # appear in a different memory space without being treated as a duplicate.
     existing = store.find_asset_by_hash(metadata["content_sha256"], scope)

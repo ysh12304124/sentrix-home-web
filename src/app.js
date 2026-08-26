@@ -725,7 +725,7 @@
       ["场景图片语义理解", `${state.assets.filter((a) => a.derived_kind === "video_keyframe" && a.status === "processed").length} 张关键帧`, activeVideo ? "active" : "done"],
       ["事件记忆构建", `${stats().events} 个事件 · ${stats().facts} 条事实`, "done"],
     ];
-    return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "视频会在后台读取拍摄信息、提取关键画面并整理进家庭时间线。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或点击选择文件</strong><small>视频支持 MOV / MP4，并在后台构建场景记忆</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
+    return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "选择相册文件夹后，图片和视频会一起上传，并自动读取拍摄时间与地点。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择相册文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,video/*,.mp4,.mov,.m4v,.avi,.mkv" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.bmp,.gif,.mp4,.mov,.m4v,.avi,.mkv,image/*,video/*" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或选择整个相册文件夹</strong><small>支持 JPG / HEIC / PNG / MP4 / MOV，自动解析拍摄时间和地点</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
   }
 
   function ocrSettingsCard() {
@@ -1077,7 +1077,7 @@
       const form = nodes.length >= 2 ? `<form id="modal-form" class="relation-form"><label>人物A<select name="person_a" required>${personOptions}</select></label><label>家庭关系<select name="relation">${relationSelect}</select><input name="relation_custom" placeholder="或自定义关系，如：养父" value="${editing && !relationOptions.includes(editing.predicate) ? escapeHtml(editing.predicate) : ""}" /></label><label>人物B<select name="person_b" required>${personOptions}</select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="clear-relation-edit">取消</button><button type="submit" class="button primary">${editing ? "保存修改" : "添加关系"}</button></div></form>` : "";
       body = `<div class="modal-kicker">FAMILY GRAPH</div><h2>家庭关系图</h2><p class="modal-lead">这里只显示你已确认的人物与家庭关系。关系写入后会进入本地记忆，家庭助手也能回忆这些关系。</p>${graphBody}<div class="family-graph-toolbar"><div class="section-head"><div><p class="section-kicker">维护家庭关系</p><h3>${editing ? "编辑关系" : "添加关系"}</h3></div></div>${form}<div class="section-head" style="margin-top:18px"><div><p class="section-kicker">已建立的关系</p><h3>${(graph.relationships || []).filter((item) => item.status !== "retracted").length} 条</h3></div></div><div class="fact-review-list">${relationRows || emptyState("还没有家庭关系", "从上方选择两个人并填写家庭角色，关系会出现在这张图上。")}</div></div>`;
     } else if (modal.type === "import-picker") {
-      body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
+      body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器不能在同一个窗口同时选文件和文件夹。选择整个相册文件夹时，会导入其中的图片和视频。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个相册文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
       const spaceRows = (state.spaces || []).map((sp) => {
         const isDefault = sp.id === "home-default";
@@ -1287,7 +1287,7 @@
     const dropzone = fileInput?.closest(".dropzone");
     if (dropzone) {
       const hint = dropzone.querySelector("small");
-      if (hint) hint.textContent = "选择文件或文件夹，系统会自动导入其中的 JPG/JPEG/PNG 图片";
+      if (hint) hint.textContent = "选择文件或整个相册文件夹，系统会自动导入图片和视频，并读取拍摄时间与地点";
       const chooseButton = dropzone.querySelector(".button.primary");
       if (chooseButton && chooseButton.tagName !== "BUTTON") {
         const unifiedButton = document.createElement("button");
@@ -1468,11 +1468,11 @@
 
   async function handleFiles(event) {
     let files = Array.from(event.target.files || []);
-    if (event.target.id === "folder-input") files = files.filter((file) => /\.(jpe?g|png)$/i.test(file.name || ""));
-    if (!files.length) { state.toast = "所选目录中没有 JPG/JPEG/PNG 图片"; renderShellNavigation(); return; }
+    files = files.filter((file) => window.sentrixImageMetadata?.isAlbumMediaFile(file));
+    if (!files.length) { state.toast = "所选内容中没有可导入的图片或视频"; renderShellNavigation(); return; }
     const queueEntries = files.map((file) => ({ fileName: file.name, status: "reading-metadata" }));
     state.queue.unshift(...queueEntries);
-    state.toast = `已读取 ${files.length} 张图片，正在解析元数据...`;
+    state.toast = `已读取 ${files.length} 个文件，正在解析元数据...`;
     renderShellNavigation();
     const items = [];
     for (let index = 0; index < files.length; index += 1) {
@@ -1487,7 +1487,7 @@
         queueEntries[index].error = error.message || String(error);
       }
       if ((index + 1) % 10 === 0 || index === files.length - 1) {
-        state.toast = `正在解析图片元数据：${index + 1}/${files.length}`;
+        state.toast = `正在解析拍摄信息：${index + 1}/${files.length}`;
         renderShellNavigation();
       }
     }
@@ -1505,7 +1505,7 @@
           entry.error = item.error || "";
           if (item.accepted) accepted += 1;
         });
-        state.toast = `正在上传图片：${Math.min(offset + chunk.length, items.length)}/${items.length}`;
+        state.toast = `正在上传相册文件：${Math.min(offset + chunk.length, items.length)}/${items.length}`;
         renderShellNavigation();
       }
     } catch (error) {
@@ -1513,7 +1513,7 @@
       state.toast = `上传失败：${error.message || error}`;
       renderShellNavigation();
     }
-    state.toast = `上传完成：${accepted}/${files.length} 张进入本地处理队列`;
+    state.toast = `上传完成：${accepted}/${files.length} 个文件进入本地处理队列`;
     await refreshData();
     state.view = "imports";
     renderShellNavigation();

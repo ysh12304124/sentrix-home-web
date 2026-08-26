@@ -67,7 +67,7 @@ class IngestionPipeline:
         metadata.setdefault("content_sha256", self._sha256(path))
         import_timings["sha256_seconds"] = round(time.perf_counter() - step_started, 4)
         step_started = time.perf_counter()
-        metadata.setdefault("exif", self._extract_exif(path) if media_type == "image" else {})
+        metadata.setdefault("exif", self.extract_capture_metadata(path, media_type))
         import_timings["exif_seconds"] = round(time.perf_counter() - step_started, 4)
         existing = self.store.find_asset_by_hash(metadata["content_sha256"], metadata.get("scope_id"))
         if existing:
@@ -76,6 +76,8 @@ class IngestionPipeline:
         for key in ("captured_at", "captured_location", "source_device_id"):
             if metadata.get(key) is None and metadata["exif"].get(key):
                 metadata[key] = metadata["exif"][key]
+        if metadata.get("source_device_id") is None and metadata["exif"].get("device"):
+            metadata["source_device_id"] = metadata["exif"]["device"]
         gps = self._gps_from_metadata(metadata)
         if gps:
             if not metadata.get("captured_location"):
@@ -145,6 +147,35 @@ class IngestionPipeline:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @classmethod
+    def extract_capture_metadata(cls, path, media_type):
+        if media_type == "image":
+            return cls._extract_exif(path)
+        if media_type == "video":
+            return cls._extract_video_capture_metadata(path)
+        return {}
+
+    @staticmethod
+    def _extract_video_capture_metadata(path):
+        try:
+            from .video.metadata import probe_video_metadata
+            meta = probe_video_metadata(path)
+            result = {}
+            if meta.captured_at:
+                result["captured_at"] = meta.captured_at
+            if meta.latitude is not None and meta.longitude is not None:
+                result["gps"] = {"latitude": meta.latitude, "longitude": meta.longitude}
+                result["captured_location"] = meta.captured_location or (
+                    f"{float(meta.latitude):.6f},{float(meta.longitude):.6f}"
+                )
+            if meta.device:
+                result["device"] = meta.device
+            if meta.creation_source:
+                result["creation_source"] = meta.creation_source
+            return {key: value for key, value in result.items() if value not in (None, "", {})}
+        except Exception:
+            return {}
 
     @staticmethod
     def _extract_exif(path):
