@@ -239,7 +239,10 @@ ROLE_INFERENCE = {
     # Search validation is a bounded classification pass, not free-form
     # reasoning. Keep the JSON response short so one vision batch does not
     # consume the Agent wall-time budget.
-    "search_validation": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 320},
+    # Validation emits one short JSON row per candidate. Keep the completion
+    # budget below the 12B server context ceiling; tools.py also splits a
+    # batch if a deployment reports a tighter prompt budget.
+    "search_validation": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 192},
     "answer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "writer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "verify": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
