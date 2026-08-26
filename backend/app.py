@@ -1089,16 +1089,12 @@ def bind_cloud_runtime(request: CloudRuntimeBindRequest):
     new_gamma.bind_store(store)
     with runtime_lock:
         previous_pipeline = pipeline
-        # The cloud profile is text-only (DeepSeek chat/V3). Keep the
-        # existing local vision-capable gamma for ingestion/semantic
-        # enrichment; only the interactive Agent runtime switches to cloud.
-        vision_gamma = getattr(previous_pipeline, "gamma", None)
-        if vision_gamma is None:
-            raise HTTPException(status_code=503, detail="local vision runtime is unavailable")
+        # The configured Doubao profile is vision-capable. Bind the same
+        # cloud client to Agent and ingestion so this run has no local LLM.
         gamma = new_gamma
         pipeline = IngestionPipeline(
             store,
-            gamma=vision_gamma,
+            gamma=new_gamma,
             asr=previous_pipeline.asr,
             face=previous_pipeline.face,
             clip=previous_pipeline.clip,
