@@ -58,6 +58,7 @@
     confirmRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/confirm`, { method: "POST" }),
     retractRelationship: (id) => request(`/api/relationships/${encodeURIComponent(id)}/retract`, { method: "POST" }),
     confirmPerson: (id, name, familyRole = "") => request(`/api/persons/${encodeURIComponent(id)}/confirm`, { method: "POST", body: JSON.stringify({ name, family_role: familyRole }) }),
+    batchConfirmPeople: (items) => request("/api/people/batch-confirm", { method: "POST", body: JSON.stringify({ items }) }),
     renamePerson: (id, payload) => request(`/api/people/${encodeURIComponent(id)}/rename`, { method: "POST", body: JSON.stringify(payload) }),
     assistantTurnAsync: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner", selectedAsset = null) => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, selected_asset_handle: (selectedAsset && selectedAsset.handle) || null, selected_result_set_id: (selectedAsset && selectedAsset.result_set_id) || null, viewer_id: viewerId || "owner" }) }),
     assistantTurnPoll: (turnId) => request(`/api/assistant/turn/${encodeURIComponent(turnId)}`),
@@ -108,5 +109,14 @@
       method: "POST",
       body: JSON.stringify({ profile, wait_ready: true, ready_timeout: 900 }),
     }),
+    personInsights: (scopeId = "") => request(`/api/person-insights${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
+    startPersonInsightRun: (payload) => request("/api/person-insight-runs", { method: "POST", body: JSON.stringify(payload) }),
+    personInsightRun: (id) => request(`/api/person-insight-runs/${encodeURIComponent(id)}`),
+    decidePersonRole: (personId, payload) => request(`/api/people/${encodeURIComponent(personId)}/role-decision`, { method: "POST", body: JSON.stringify(payload) }),
+    savePersonName: (personId, name) => request(`/api/people/${encodeURIComponent(personId)}/name`, { method: "PATCH", body: JSON.stringify({ name }) }),
+    decideRelationshipHypothesis: (id, payload) => request(`/api/relationship-hypotheses/${encodeURIComponent(id)}/decision`, { method: "POST", body: JSON.stringify(payload) }),
+    personPortrait: (personId) => request(`/api/people/${encodeURIComponent(personId)}/portrait`),
+    sendPortraitFeedback: (personId, payload) => request(`/api/people/${encodeURIComponent(personId)}/portrait-feedback`, { method: "POST", body: JSON.stringify(payload) }),
+    updatePortrait: (personId, payload) => request(`/api/people/${encodeURIComponent(personId)}/portrait`, { method: "PATCH", body: JSON.stringify(payload) }),
   };
 })();

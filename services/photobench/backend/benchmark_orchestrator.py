@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import base64
 import hashlib
@@ -60,11 +61,25 @@ CUSTOM_JUDGE_PROMPT_PATH = PROJECT_ROOT / "config/custom_judge_prompt.json"
 TASK_ACTION_POLICY_PATH = PROJECT_ROOT / "config/qa_task_actions.json"
 JUDGE_PROVIDERS_PATH = PROJECT_ROOT / "config/judge_providers.json"
 EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
+# Progress is served from the in-memory run state.  Coalesce frequent snapshots
+# so disk I/O does not become part of the Agent/Judge wall-clock measurements.
+PERSIST_DEBOUNCE_SECONDS = max(
+    0.05, float(os.environ.get("PHOTOBENCH_PERSIST_DEBOUNCE_SECONDS", "0.25"))
+)
+JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "3")))
+JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "1.0")))
+JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
+    JUDGE_RETRY_BACKOFF_SECONDS,
+    float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_MAX_SECONDS", "8.0")),
+)
 
 
 def _load_judge_providers():
     try:
-        value = json.loads(JUDGE_PROVIDERS_PATH.read_text(encoding="utf-8"))
+        config_path = JUDGE_PROVIDERS_PATH
+        if not config_path.exists():
+            config_path = config_path.with_name("judge_providers.example.json")
+        value = json.loads(config_path.read_text(encoding="utf-8"))
         providers = value.get("providers") or {}
         default_id = str(value.get("default_provider_id") or next(iter(providers), ""))
         if default_id not in providers:
@@ -95,6 +110,10 @@ _, _P_URL, _P_MODEL, _P_KEY = resolve_judge_provider(None)
 DEFAULT_JUDGE_URL = os.environ.get("BENCH_JUDGE_URL") or _P_URL
 DEFAULT_VLLM_API_URL = os.environ.get("BENCH_VLLM_API_URL", "http://192.168.0.153:8500")
 DEFAULT_VLLM_BASE_URL = os.environ.get("BENCH_VLLM_BASE_URL", "http://192.168.0.153:8105/v1")
+BIG_MODEL_PROFILE_ID = "big_model"
+BIG_MODEL_BASE_URL = os.environ.get("BENCH_BIG_MODEL_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3")
+BIG_MODEL_MODEL = os.environ.get("BENCH_BIG_MODEL_MODEL", "doubao-seed-2.0-lite")
+BIG_MODEL_ENABLED = os.environ.get("BENCH_BIG_MODEL_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL") or _P_MODEL
 JUDGE_API_KEY = os.environ.get("BENCH_JUDGE_API_KEY") or _P_KEY
 
@@ -249,16 +268,122 @@ def atomic_json(path: Path, value) -> None:
     tmp.replace(path)
 
 
-def load_custom_judge_prompt() -> str | None:
+def summarize_agent2_trace(runtime_turns: list[dict]) -> dict:
+    """Aggregate optional Agent 2 telemetry while keeping historical runs valid."""
+    decisions = []
+    statuses: dict[str, int] = {}
+    terminal_reasons: dict[str, int] = {}
+    budget_outcomes = []
+    entries = 0
+    partial_entries = 0
+    available = False
+    last_task_declaration = None
+    last_task_state = None
+    last_evidence_ledger = None
+
+    for turn in runtime_turns or []:
+        trace = turn.get("agent2_trace") if isinstance(turn, dict) else None
+        if not isinstance(trace, dict) or not trace:
+            continue
+        available = True
+        decisions.extend(item for item in trace.get("planner_decisions") or [] if isinstance(item, dict))
+        if trace.get("task_declaration"):
+            last_task_declaration = trace.get("task_declaration")
+        if trace.get("task_state"):
+            last_task_state = trace.get("task_state")
+        if trace.get("evidence_ledger"):
+            last_evidence_ledger = trace.get("evidence_ledger")
+
+        status_counts = trace.get("requirement_status_counts") or {}
+        if not status_counts:
+            for requirement in ((trace.get("task_state") or {}).get("requirements") or []):
+                if isinstance(requirement, dict) and requirement.get("status"):
+                    status = str(requirement["status"])
+                    status_counts[status] = status_counts.get(status, 0) + 1
+        for status, count in status_counts.items():
+            try:
+                statuses[str(status)] = statuses.get(str(status), 0) + int(count)
+            except (TypeError, ValueError):
+                continue
+        coverage = trace.get("evidence_coverage") or {}
+        if not coverage:
+            ledger_entries = ((trace.get("evidence_ledger") or {}).get("entries") or [])
+            coverage = {
+                "entries": len(ledger_entries),
+                "partial_entries": sum(
+                    1 for entry in ledger_entries if isinstance(entry, dict)
+                    and int((entry.get("coverage") or {}).get("processed") or 0)
+                    < int((entry.get("coverage") or {}).get("requested") or 0)
+                ),
+            }
+        entries += int(coverage.get("entries") or 0)
+        partial_entries += int(coverage.get("partial_entries") or 0)
+        reason = str(trace.get("terminal_reason") or "")
+        if reason:
+            terminal_reasons[reason] = terminal_reasons.get(reason, 0) + 1
+        budget = trace.get("budget_outcome")
+        if isinstance(budget, dict):
+            budget_outcomes.append(dict(budget))
+    res = {
+        "available": available,
+        "planner_decision_count": len(decisions),
+        "planner_fallback_count": sum(1 for item in decisions if item.get("status") == "fallback"),
+        "requirement_status_counts": statuses,
+        "evidence_coverage": {"entries": entries, "partial_entries": partial_entries},
+        "terminal_reasons": terminal_reasons,
+        "budget_outcomes": budget_outcomes,
+    }
+    if last_task_declaration:
+        res["task_declaration"] = last_task_declaration
+    if last_task_state:
+        res["task_state"] = last_task_state
+    if last_evidence_ledger:
+        res["evidence_ledger"] = last_evidence_ledger
+    if decisions:
+        res["planner_decisions"] = decisions
+    return res
+
+
+JUDGE_PROMPT_KINDS: dict[str, str] = {
+    "answer_quality": JUDGE_PROMPT,
+    "task_decision": TASK_JUDGE_PROMPT,
+    "evidence": EVIDENCE_JUDGE_PROMPT,
+}
+
+
+def _read_custom_judge_prompt_file() -> dict:
     if CUSTOM_JUDGE_PROMPT_PATH.exists():
         try:
-            return json.loads(CUSTOM_JUDGE_PROMPT_PATH.read_text(encoding="utf-8")).get("judge_prompt") or None
+            data = json.loads(CUSTOM_JUDGE_PROMPT_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, OSError):
-            return None
-    return None
+            return {}
+    return {}
 
-def save_custom_judge_prompt(prompt: str) -> None:
-    atomic_json(CUSTOM_JUDGE_PROMPT_PATH, {"judge_prompt": prompt})
+
+def load_custom_judge_prompts() -> dict[str, str | None]:
+    data = _read_custom_judge_prompt_file()
+    legacy = data.get("judge_prompt") or None
+    return {
+        "answer_quality": data.get("answer_quality") or legacy,
+        "task_decision": data.get("task_decision") or None,
+        "evidence": data.get("evidence") or None,
+    }
+
+
+def load_custom_judge_prompt() -> str | None:
+    """Legacy helper: answer-quality prompt only."""
+    return load_custom_judge_prompts().get("answer_quality")
+
+
+def save_custom_judge_prompt(prompt: str, kind: str = "answer_quality") -> None:
+    if kind not in JUDGE_PROMPT_KINDS:
+        raise ValueError(f"unknown judge prompt kind: {kind}")
+    data = _read_custom_judge_prompt_file()
+    if "judge_prompt" in data:  # migrate legacy single-prompt key
+        data.setdefault("answer_quality", data.pop("judge_prompt"))
+    data[kind] = prompt.strip() or None  # empty string restores the default
+    atomic_json(CUSTOM_JUDGE_PROMPT_PATH, data)
 
 
 def judge_score_consistency(score: int | None, reason: str) -> bool:
@@ -409,7 +534,15 @@ def upload_files(url: str, fields: dict, files: list[tuple[str, str, bytes]], ti
         return json.loads(resp.read())
 
 
-def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -> dict:
+RUN_MODES = ("full", "reuse", "build")
+CURRENT_MODEL_SELECTION = "__current__"
+
+
+class RunCancelledError(RuntimeError):
+    """Raised when the orchestrator cancels while waiting on a remote call."""
+
+
+def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, cancelled=None) -> dict:
     """Resolve the asynchronous Sentrix assistant-turn response when necessary."""
     turn_id = response.get("turn_id")
     if not turn_id or response.get("status") not in {"running", "pending"}:
@@ -418,6 +551,8 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -
     deadline = time.monotonic() + timeout
     poll_url = f"{base_url.rstrip('/')}/api/assistant/turn/{quote(str(turn_id))}"
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            raise RunCancelledError(f"run cancelled while waiting for assistant turn {turn_id}")
         state = request_json(poll_url, timeout=min(30, max(1, int(deadline - time.monotonic()))))
         status = str(state.get("status") or "").lower()
         if status in {"complete", "completed", "done", "success"}:
@@ -431,38 +566,138 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -
     raise TimeoutError(f"assistant turn {turn_id} did not complete within {timeout}s")
 
 
-def _extract_image_ids(result: dict) -> list[str]:
-    """Collect images returned by retrieval tools without scanning unrelated payload data."""
+def _extract_image_sets(result: dict) -> dict[str, list[str]]:
+    """Separate retrieval candidates, evidence sources, and user delivery.
+
+    Debug candidate fields are intentionally used only for retrieval accounting;
+    they must never silently become the user-facing delivery set.
+    """
+    retrieved: list[str] = []
+    evidence: list[str] = []
     ids: list[str] = []
+    selected_handles: list[str] = []
 
-    def visit(value):
-        if isinstance(value, dict):
-            for key in ("asset_ids", "image_ids"):
-                if isinstance(value.get(key), list):
-                    ids.extend(str(x) for x in value[key])
-            for key in ("image_id", "asset_id", "file_name", "path"):
-                if value.get(key):
-                    ids.append(str(value[key]))
-                    break
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
+    def add(values, target):
+        if isinstance(values, list):
+            target.extend(str(value) for value in values if value)
 
-    for key in ("image_results", "evidence", "retrieved_images", "images"):
-        visit(result.get(key))
-    task_state = result.get("task_state") or result.get("taskState") or {}
-    if isinstance(task_state, dict):
-        for tool_result in task_state.get("tool_results") or task_state.get("toolResults") or []:
-            if not isinstance(tool_result, dict):
-                continue
-            for key in ("asset_ids", "image_ids"):
-                values = tool_result.get(key)
-                if isinstance(values, list):
-                    ids.extend(str(value) for value in values if value)
-            visit(tool_result.get("preview"))
-    return list(dict.fromkeys(ids))
+    add(result.get("retrieved_asset_ids"), retrieved)
+    add(result.get("evidence_asset_ids"), evidence)
+    add(result.get("source_asset_ids"), evidence)
+    add(result.get("selected_image_ids"), ids)
+    grounding = result.get("answer_grounding") or result.get("answerGrounding") or {}
+    if isinstance(grounding, dict):
+        add(grounding.get("retrieved_asset_ids"), retrieved)
+        add(grounding.get("evidence_asset_ids"), evidence)
+        add(grounding.get("selected_asset_ids"), ids)
+        values = grounding.get("selected_image_handles") or grounding.get("selectedImageHandles")
+        if isinstance(values, list):
+            selected_handles.extend(str(value) for value in values if value)
+    delivery = result.get("image_delivery") or result.get("imageDelivery") or {}
+    if isinstance(delivery, dict):
+        add(delivery.get("selected_asset_ids") or delivery.get("asset_ids"), ids)
+    # Legacy top-level fields are retained only because they already represent
+    # an explicit user-facing image payload, not an arbitrary nested search trace.
+    for item in result.get("retrieved_images") or []:
+        if isinstance(item, dict) and item.get("asset_id"):
+            ids.append(str(item["asset_id"]))
+
+    # Resolve explicitly selected handles through debug preview projections.
+    # The full debug_asset_ids list is deliberately ignored.
+    for trace in result.get("tool_trace") or []:
+        if not isinstance(trace, dict):
+            continue
+        add(trace.get("debug_asset_ids"), retrieved)
+        # Debug previews are candidate projections, not evidence sources.
+        add(trace.get("debug_preview_asset_ids"), retrieved)
+        # Debug preview is only a candidate projection, not evidence.
+        observation = trace.get("observation") or trace.get("result") or {}
+        if isinstance(observation, dict):
+            add(observation.get("retrieved_asset_ids") or observation.get("asset_ids"), retrieved)
+            add(observation.get("evidence_asset_ids"), evidence)
+            add(observation.get("source_asset_ids"), evidence)
+            for row in (observation.get("items") or observation.get("rows") or []):
+                if isinstance(row, dict) and row.get("asset_id"):
+                    evidence.append(str(row["asset_id"]))
+                    retrieved.append(str(row["asset_id"]))
+        handles = trace.get("debug_preview_handles") or []
+        preview_ids = trace.get("debug_preview_asset_ids") or []
+        if not handles or not preview_ids:
+            continue
+        mapping = {str(handle): str(preview_ids[index])
+                   for index, handle in enumerate(handles)
+                   if index < len(preview_ids) and preview_ids[index]}
+        ids.extend(mapping[handle] for handle in selected_handles if handle in mapping)
+    # Explicit delivery is also evidence, but only after the independent sets
+    # have been collected. This preserves the subset invariant.
+    evidence.extend(ids)
+    retrieved.extend(evidence)
+    return {
+        "retrieved_asset_ids": list(dict.fromkeys(retrieved)),
+        "evidence_asset_ids": list(dict.fromkeys(evidence)),
+        "selected_asset_ids": list(dict.fromkeys(ids)),
+    }
+
+
+def _extract_image_ids(result: dict) -> list[str]:
+    """Backward-compatible delivery-only projection."""
+    return _extract_image_sets(result)["selected_asset_ids"]
+
+
+def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
+    """Build exact reusable album/model bases from persisted run-to-scope links."""
+    runs_by_scope = {}
+    for run in runs or []:
+        if not isinstance(run, dict) or not run.get("scope_id"):
+            continue
+        runs_by_scope.setdefault(str(run["scope_id"]), []).append(run)
+    groups = {}
+    for space in spaces or []:
+        if not isinstance(space, dict) or not space.get("id"):
+            continue
+        scope_id = str(space["id"])
+        linked = sorted(runs_by_scope.get(scope_id, []),
+                        key=lambda item: str(item.get("started_at") or item.get("created_at") or ""),
+                        reverse=True)
+        source = linked[0] if linked else {}
+        album_id = str(source.get("album_id") or "").strip()
+        model_candidates = sorted({str(run.get("model_profile") or "").strip()
+                                   for run in linked if run.get("model_profile")},
+                                  key=len, reverse=True)
+        space_name = str(space.get("name") or "").lower()
+        model_profile = next((model for model in model_candidates
+                              if safe_slug(model).lower() in space_name), "")
+        model_profile = model_profile or str(source.get("model_profile") or "").strip()
+        if not album_id or not model_profile:
+            name = str(space.get("name") or "")
+            match = re.search(r"PhotoBench-\d{8}-\d{6}-(?P<album>.+?)-(?P<model>(?:qwen|gemma|llama|phi|mistral|current|big_model)[^-]*)$", name, re.I)
+            if match:
+                album_id = album_id or match.group("album")
+                model_profile = model_profile or match.group("model")
+        if not album_id or not model_profile:
+            continue
+        key = (album_id, model_profile)
+        matching_runs = [run for run in linked
+                         if str(run.get("album_id") or "") == album_id
+                         and str(run.get("model_profile") or "") == model_profile]
+        group = groups.setdefault(key, {
+            "base_id": f"{album_id}::{model_profile}",
+            "album_id": album_id,
+            "model_profile": model_profile,
+            "scope_id": scope_id,
+            "scope_name": space.get("name") or scope_id,
+            "created_at": space.get("created_at") or "",
+            "source_run_ids": [],
+            "ready": str(space.get("status") or "active") == "active",
+        })
+        if str(space.get("created_at") or "") > str(group.get("created_at") or ""):
+            group.update({"scope_id": scope_id, "scope_name": space.get("name") or scope_id,
+                          "created_at": space.get("created_at") or ""})
+        group["source_run_ids"] = sorted(set(group["source_run_ids"] + [
+            str(run.get("run_id")) for run in matching_runs if run.get("run_id")
+        ]))
+    return sorted(groups.values(), key=lambda item: (
+        str(item.get("album_id") or ""), str(item.get("model_profile") or "")))
 
 
 def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> list[dict]:
@@ -813,26 +1048,43 @@ class BenchmarkRun:
                  qa_set: str, sentrix_url: str, judge_url: str, vllm_api_url: str,
                  vllm_target_id: str, vllm_model_base_url: str, results_root: Path,
                  judge_system_prompt: str = JUDGE_PROMPT, judge_model: str = JUDGE_MODEL,
-                 judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False):
+                 judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False,
+                 task_judge_system_prompt: str = "", evidence_judge_system_prompt: str = "",
+                 mode: str = "full", existing_scope_id: str = "",
+                 scope_reused_from_runs: list | None = None,
+                 use_current_model: bool = False, current_model_snapshot: dict | None = None,
+                 use_cloud_model: bool = False):
+        if mode not in RUN_MODES:
+            raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
+        if mode == "reuse" and not existing_scope_id:
+            raise ValueError("existing_scope_id is required when mode=reuse")
+        self.mode = mode
+        self.existing_scope_id = str(existing_scope_id).strip()
         self.run_id = run_id
         self.album_id = album_id
         self.manifest = manifest
         self.model_profile = model_profile
+        self.use_current_model = bool(use_current_model)
+        self.use_cloud_model = bool(use_cloud_model)
+        self.current_model_snapshot = dict(current_model_snapshot or {})
         self.qa_set = qa_set
         self.sentrix_url = sentrix_url.rstrip("/")
         base = judge_url.rstrip("/")
         # Cloud providers (e.g. DashScope) include /v1 in the base URL;
         # local LM Studio servers do not. Normalize to avoid double /v1.
-        self.judge_url = base.removesuffix("/v1")
+        self.judge_url = base
         self.judge_model = judge_model
         self.judge_api_key = judge_api_key
         self.judge_system_prompt = judge_system_prompt
+        self.task_judge_system_prompt = task_judge_system_prompt
+        self.evidence_judge_system_prompt = evidence_judge_system_prompt
         self.vllm_api_url = vllm_api_url.rstrip("/")
         self.vllm_target_id = vllm_target_id
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
         self.results_root = results_root
         self.lock = threading.RLock()
-        self.delete_scope_after_run = bool(delete_scope_after_run)
+        # 复用/构建模式的产物相册必须保留，绝不允许 delete_scope 清掉。
+        self.delete_scope_after_run = bool(delete_scope_after_run) and mode == "full"
 
         album_base = BENCHMARK_DATA_ROOT / album_id
         self.album_dir = album_base
@@ -843,8 +1095,16 @@ class BenchmarkRun:
 
         self.state: dict = {
             "run_id": run_id,
+            "mode": mode,
+            "scope_source": None,
             "album_id": album_id,
             "model_profile": model_profile,
+            "model_source": "cloud_api" if self.use_cloud_model else (
+                "current" if self.use_current_model else "managed"
+            ),
+            "model_backend": "openai" if self.use_cloud_model else "vllm",
+            "model_name": BIG_MODEL_MODEL if self.use_cloud_model else model_profile,
+            "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
             "judge_model": judge_model,
             "judge_url": self.judge_url,
@@ -861,28 +1121,86 @@ class BenchmarkRun:
             "finished_at": None,
            "scope_id": None,
            "scope_name": None,
+           "existing_scope_id": self.existing_scope_id or None,
+           "scope_reused_from_runs": list(scope_reused_from_runs or []),
            "phases": {},
             "items": [],
             "summary": {},
+            "run_valid": False,
             "fatal_error": None,
         }
         self._gpu_sampling_started = False
         self._gpu_sampler = GpuSampler(vllm_api_url, on_sample=self._persist_gpu_sample)
         self._cancel = threading.Event()
         self._phase_started_perf: dict[str, float] = {}
+        self._persist_condition = threading.Condition(self.lock)
+        self._persist_requested = 0
+        self._persist_written = 0
+        self._persist_error: Exception | None = None
+        self._persist_stopping = False
+        self._persist_thread = threading.Thread(
+            target=self._persist_loop,
+            name=f"persist-{run_id}",
+            daemon=True,
+        )
+        self._persist_thread.start()
 
     @property
     def run_dir(self) -> Path:
         return self.results_root / self.run_id
 
-    def persist(self):
-        with self.lock:
-            stored = {k: v for k, v in self.state.items()}
-            atomic_json(self.run_dir / "run.json", stored)
-            items = stored.get("items") or []
-            path = self.run_dir / "results.jsonl"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in items), encoding="utf-8")
+    def _write_persisted_snapshot(self, stored: dict) -> None:
+        atomic_json(self.run_dir / "run.json", stored)
+        items = stored.get("items") or []
+        path = self.run_dir / "results.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in items), encoding="utf-8")
+
+    def _persist_loop(self) -> None:
+        while True:
+            with self._persist_condition:
+                while self._persist_written >= self._persist_requested and not self._persist_stopping:
+                    self._persist_condition.wait()
+                if self._persist_stopping and self._persist_written >= self._persist_requested:
+                    return
+                # Coalesce progress updates arriving in the same short interval.
+                target = self._persist_requested
+                self._persist_condition.wait(timeout=PERSIST_DEBOUNCE_SECONDS)
+                target = self._persist_requested
+                stored = copy.deepcopy(self.state)
+            try:
+                self._write_persisted_snapshot(stored)
+            except Exception as exc:
+                with self._persist_condition:
+                    self._persist_error = exc
+                    self._persist_written = max(self._persist_written, target)
+                    self._persist_condition.notify_all()
+                continue
+            with self._persist_condition:
+                self._persist_written = max(self._persist_written, target)
+                self._persist_condition.notify_all()
+
+    def persist(self, wait: bool = False) -> None:
+        """Schedule a snapshot; optionally wait until this request reaches disk."""
+        with self._persist_condition:
+            if self._persist_error is not None and wait:
+                raise RuntimeError(f"benchmark state persistence failed: {self._persist_error}")
+            self._persist_requested += 1
+            target = self._persist_requested
+            self._persist_condition.notify()
+            if not wait:
+                return
+            while self._persist_written < target:
+                self._persist_condition.wait()
+            if self._persist_error is not None:
+                raise RuntimeError(f"benchmark state persistence failed: {self._persist_error}")
+
+    def _stop_persist_writer(self) -> None:
+        self.persist(wait=True)
+        with self._persist_condition:
+            self._persist_stopping = True
+            self._persist_condition.notify_all()
+        self._persist_thread.join(timeout=10)
 
     def _gpu_samples_path(self) -> Path:
         return self.run_dir / "gpu_samples.jsonl"
@@ -908,8 +1226,28 @@ class BenchmarkRun:
         else:
             self.state["status"] = "cancelling"
         self._cancel_remote_batch(source)
-        with self.lock:
-            self.persist()
+        self._reclaim_vllm_after_cancel()
+        self.persist(wait=True)
+
+    def _reclaim_vllm_after_cancel(self) -> None:
+        """Best-effort: terminate a vLLM instance this run started (loading or serving).
+
+        Without this, cancelling during model_deploy leaves the load running on the
+        GPU and the manager keeps serving a model nobody asked for.
+        """
+        if self.use_current_model or self.use_cloud_model:
+            return
+        try:
+            state = request_json(f"{self.vllm_api_url}/state", timeout=5) or {}
+        except Exception:
+            return
+        run_scope_models = state.get("profile")
+        if run_scope_models and run_scope_models == self.model_profile:
+            try:
+                request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+                self.state["cancel_vllm_stopped"] = now_iso()
+            except Exception as exc:
+                self.state["cancel_vllm_stop_error"] = str(exc)[:300]
 
     def _cancel_remote_batch(self, source: str) -> None:
         batch_id = self.state.get("batch_id")
@@ -947,6 +1285,13 @@ class BenchmarkRun:
 
     def _hardware_snapshot(self) -> dict:
         """Use existing Manager endpoints; absence is recorded, never inferred from logs."""
+        if self.use_cloud_model:
+            return {
+                "captured_at": now_iso(),
+                "source": "cloud_api",
+                "status": "not_applicable",
+                "reason": "cloud_api_has_no_local_gpu_metrics",
+            }
         snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
         try:
             snapshot["manager"] = request_json(f"{self.vllm_api_url}/state", timeout=10)
@@ -966,16 +1311,18 @@ class BenchmarkRun:
         if self._cancel.is_set():
             self.state["status"] = "cancelled"
             self.state["finished_at"] = self.state.get("finished_at") or now_iso()
-            self.persist()
+            self.persist(wait=True)
+            self._stop_persist_writer()
             return
         self.state["started_at"] = now_iso()
         self.state["status"] = "running"
         self.state["hardware_snapshots"]["start"] = self._hardware_snapshot()
         self._current_phase = None
         self.persist()
-        phases = [
+        all_phases = [
             ("model_deploy", self._phase_model_deploy),
             ("scope_setup", self._phase_scope_setup),
+            ("scope_attach", self._phase_scope_attach),
             ("identity_seed", self._phase_identity_seed),
             ("photo_import", self._phase_photo_import),
             ("pipeline_processing", self._phase_processing),
@@ -983,6 +1330,8 @@ class BenchmarkRun:
             ("gpu_metrics", self._phase_gpu_metrics),
             ("aggregate", self._phase_aggregate),
         ]
+        selected_phase_names = self._selected_phase_names()
+        phases = [(name, fn) for name, fn in all_phases if name in selected_phase_names]
         try:
             for name, fn in phases:
                 if self._cancel.is_set():
@@ -995,9 +1344,15 @@ class BenchmarkRun:
                 self.state["status"] = "cancelled"
             else:
                 self.state["status"] = "completed"
+        except RunCancelledError:
+            if self._current_phase:
+                self._record_phase(self._current_phase, "status", "cancelled")
+            self.state["status"] = "cancelled"
         except Exception as e:
             if self._current_phase:
-                self._record_phase(self._current_phase, "status", "failed")
+                phase_state = self.state["phases"].get(self._current_phase) or {}
+                if phase_state.get("status") != "stalled":
+                    self._record_phase(self._current_phase, "status", "failed")
                 self._record_phase(self._current_phase, "error", str(e))
                 self._record_phase(self._current_phase, "finished_at", now_iso())
             self.state["status"] = "failed"
@@ -1005,7 +1360,8 @@ class BenchmarkRun:
             self.state["fatal_error"] = str(e)
             traceback.print_exc()
         finally:
-            self._gpu_sampler.stop()
+            if not self.use_cloud_model:
+                self._gpu_sampler.stop()
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
             if self._gpu_sampling_started and gpu_phase.get("status") != "done":
@@ -1013,10 +1369,24 @@ class BenchmarkRun:
                 partial.update({"status": "partial", "partial": True, "finished_at": now_iso()})
                 self.state["phases"]["gpu_metrics"] = partial
             self.state["finished_at"] = now_iso()
-            with self.lock:
-                self.persist()
+            self.persist(wait=True)
             if self.delete_scope_after_run:
                 self._cleanup_scope()
+            self._stop_persist_writer()
+
+    def _selected_phase_names(self) -> list[str]:
+        # 工作模式决定阶段编排；当前模型模式不拥有模型生命周期，因此没有部署阶段。
+        phase_names_by_mode = {
+            "full": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                     "pipeline_processing", "qa_eval", "gpu_metrics", "aggregate"],
+            "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                      "pipeline_processing", "gpu_metrics", "aggregate"],
+            "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
+        }
+        selected = phase_names_by_mode[self.mode]
+        if self.use_current_model:
+            selected = [name for name in selected if name != "model_deploy"]
+        return selected
 
     def _cleanup_scope(self):
         """Delete the PhotoBench-created memory space after the run finishes."""
@@ -1037,13 +1407,81 @@ class BenchmarkRun:
             self.state["scope_cleanup"] = {
                 "status": "failed", "scope_id": scope_id, "error": str(exc),
             }
-        with self.lock:
-            self.persist()
+        self.persist(wait=True)
 
     # ---- Phase implementations ----
 
+    def _wait_model_ready(self, ready_timeout: int = 600, health_timeout: int = 180):
+        """Poll manager state + model endpoint until ready; cancel stops the load."""
+        deadline = time.monotonic() + ready_timeout
+        while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                self._stop_managed_vllm()
+                return RunCancelledError("cancelled while loading model")
+            try:
+                state = request_json(f"{self.vllm_api_url}/state", timeout=10) or {}
+            except Exception as exc:
+                state = {}
+                if time.monotonic() >= deadline:
+                    return exc
+            served_names = {state.get("profile"), state.get("served_model_name")}
+            if self.model_profile in served_names:
+                base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
+                root = base.rstrip("/").removesuffix("/v1")
+                probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
+                if probe is None:
+                    return None
+            if self._cancel.wait(2):
+                self._stop_managed_vllm()
+                return RunCancelledError("cancelled while loading model")
+        return TimeoutError(f"model not ready within {ready_timeout}s")
+
+    def _probe_model_endpoint(self, state: dict, model_api_root: str, timeout: int = 180, once: bool = False):
+        """Return None when the model endpoint answers; keep retrying until deadline."""
+        deadline = time.monotonic() + timeout
+        health_error = None
+        while True:
+            if self._cancel.is_set():
+                return RunCancelledError("cancelled during model health check")
+            try:
+                request_json(f"{model_api_root}/v1/chat/completions",
+                              {"model": state.get("served_model_name", self.model_profile),
+                               "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                              "POST", 30)
+                return None
+            except Exception as exc:
+                health_error = exc
+                if once or time.monotonic() >= deadline:
+                    if once:
+                        return health_error
+                    raise RuntimeError(
+                        f"vLLM model endpoint did not become ready within {timeout}s: {health_error}"
+                    ) from exc
+                if self._cancel.wait(2):
+                    return RunCancelledError("cancelled during model health check")
+
+    def _stop_managed_vllm(self):
+        try:
+            request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+        except Exception:
+            pass
+
     def _phase_model_deploy(self):
         self._phase_start("model_deploy")
+        if self.use_cloud_model:
+            runtime = request_json(
+                f"{self.sentrix_url}/api/model-profiles/bind-cloud-runtime",
+                {"profile": BIG_MODEL_PROFILE_ID}, "POST", 30,
+            )
+            self._phase_done("model_deploy", {
+                "source": "cloud_api",
+                "deployment_mode": "remote_api",
+                "manager_status": "not_applicable",
+                "health_check": "skipped",
+                "model_probe": "skipped",
+                "runtime": runtime,
+            })
+            return
         t0 = time.perf_counter()
         # 1. Stop (unload)
         t_stop0 = time.perf_counter()
@@ -1054,7 +1492,8 @@ class BenchmarkRun:
         t_stop = time.perf_counter() - t_stop0
 
         # 1b. Cooldown — give 153 GPU time to free VRAM before next load
-        time.sleep(5)
+        if self._cancel.wait(5):
+            raise RunCancelledError("cancelled during cooldown")
 
         # 2. Start (load to VRAM) — exponential backoff retry on transient 502/timeout
         backoff_schedule = [10, 30, 60, 180]  # seconds between attempts
@@ -1062,45 +1501,41 @@ class BenchmarkRun:
         t_load0 = time.perf_counter()
         start_error = None
         for attempt in range(max_attempts):
+            if self._cancel.is_set():
+                raise RunCancelledError("cancelled before model start")
             try:
+                # Fire-and-poll: wait_ready=false returns immediately after spawn;
+                # readiness is tracked below with cancel-aware polling so a stop
+                # request can terminate a half-loaded model instead of blocking.
                 request_json(f"{self.vllm_api_url}/start",
-                              {"profile": self.model_profile, "wait_ready": True, "ready_timeout": 600},
-                              "POST", 700)
-                start_error = None
-                break
+                              {"profile": self.model_profile, "wait_ready": False},
+                              "POST", 120)
+                start_error = self._wait_model_ready()
+                if start_error is None:
+                    break
+            except RunCancelledError:
+                raise
             except Exception as exc:
                 start_error = exc
-                if attempt < max_attempts - 1:
-                    wait = backoff_schedule[attempt]
-                    time.sleep(wait)
+            if attempt < max_attempts - 1:
+                wait = backoff_schedule[attempt]
+                if self._cancel.wait(wait):
+                    raise RunCancelledError("cancelled during start backoff")
         if start_error is not None:
             raise RuntimeError(
                 f"vLLM /start failed after {max_attempts} attempts: {start_error}"
             ) from start_error
         t_load = time.perf_counter() - t_load0
 
-        # 3. Health check
+        # 3. Health check (cancel-aware)
         state = request_json(f"{self.vllm_api_url}/state", timeout=10)
         port = state.get("port", 8105)
         base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
         t_health0 = time.perf_counter()
-        health_deadline = time.monotonic() + 180
-        health_error = None
-        while True:
-            try:
-                request_json(f"{model_api_root}/v1/chat/completions",
-                              {"model": state.get("served_model_name", self.model_profile),
-                               "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                              "POST", 30)
-                break
-            except Exception as exc:
-                health_error = exc
-                if time.monotonic() >= health_deadline:
-                    raise RuntimeError(
-                        f"vLLM model endpoint did not become ready within 180s: {health_error}"
-                    ) from exc
-                time.sleep(2)
+        health_error = self._probe_model_endpoint(state, model_api_root)
+        if health_error is not None:
+            raise health_error
         t_health = time.perf_counter() - t_health0
 
         # 4. Sync .100 Sentrix gamma client to the new model (no restart)
@@ -1158,9 +1593,35 @@ class BenchmarkRun:
                               {"name": scope_name}, "POST", 30)
         scope_id = result.get("id") or result.get("scope_id")
         self.state["scope_id"] = scope_id
-        self.state["scope_name"] = result.get("name") or scope_name
+        self.state["scope_name"] = result.get("name") or scope_id
+        self.state["scope_source"] = "created"
         t1 = time.perf_counter()
         self._phase_done("scope_setup", {"scope_id": scope_id, "scope_name": self.state["scope_name"], "create_seconds": round(t1 - t0, 3)})
+
+    def _phase_scope_attach(self):
+        """reuse 模式：绑定一个已存在的相册 scope，不创建、不删除。"""
+        self._phase_start("scope_attach")
+        t0 = time.perf_counter()
+        scope_id = self.existing_scope_id
+        # 后端没有 GET /api/memory-spaces/{id} 单查（405），从列表中定位。
+        spaces = request_json(f"{self.sentrix_url}/api/memory-spaces", timeout=30)
+        if isinstance(spaces, dict):
+            spaces = spaces.get("spaces") or spaces.get("items") or []
+        result = next((s for s in (spaces or []) if s.get("id") == scope_id), None)
+        if not result:
+            raise ValueError(f"memory space not found on backend: {scope_id}")
+        self.state["scope_id"] = scope_id
+        self.state["scope_name"] = result.get("name") or scope_id
+        self.state["scope_source"] = "reused"
+        t1 = time.perf_counter()
+        self._phase_done("scope_attach", {
+            "scope_id": scope_id,
+            "scope_name": self.state["scope_name"],
+            "scope_kind": result.get("kind"),
+            "scope_created_at": result.get("created_at"),
+            "attach_seconds": round(t1 - t0, 3),
+            "reused_from_runs": self.state.get("scope_reused_from_runs") or [],
+        })
 
     def _phase_identity_seed(self):
         self._phase_start("identity_seed")
@@ -1216,26 +1677,61 @@ class BenchmarkRun:
         t0 = time.perf_counter()
         photo_paths = [self.album_dir / p for p in self.manifest["photos"]]
         chunk_size = max(1, int(os.getenv("PHOTOBENCH_IMPORT_CHUNK_SIZE", "8")))
+        upload_workers = max(1, int(os.getenv("PHOTOBENCH_IMPORT_UPLOAD_WORKERS", "2")))
         batch_id = f"batch_{uuid.uuid4().hex[:12]}"
         self.state["batch_id"] = batch_id
         self.persist()
         items = []
-        for offset in range(0, len(photo_paths), chunk_size):
-            if self._cancel.is_set():
-                break
-            chunk = photo_paths[offset:offset + chunk_size]
-            files = [("files", p.name, p.read_bytes()) for p in chunk]
+
+        def upload_chunk(chunk_index, chunk):
+            # Read bytes inside the bounded worker. Queued chunks retain only
+            # paths, so a large album does not become a second in-memory copy.
+            files = [("files", path.name, path.read_bytes()) for path in chunk]
             result = upload_files(
                 f"{self.sentrix_url}/api/import",
                 {"scope_id": self.state["scope_id"], "batch_id": batch_id,
                  "deferBatchComplete": "true"},
                 files, 600,
             )
-            items.extend(result.get("items", []))
-            if self._cancel.is_set():
-                self._cancel_remote_batch(self.state.get("cancel_source") or "api")
-                self.persist()
-                break
+            return chunk_index, result
+
+        chunks = [
+            (index, photo_paths[offset:offset + chunk_size])
+            for index, offset in enumerate(range(0, len(photo_paths), chunk_size))
+        ]
+        results_by_chunk = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=upload_workers, thread_name_prefix="photobench-upload"
+        ) as executor:
+            pending = {
+                executor.submit(upload_chunk, chunk_index, chunk): chunk_index
+                for chunk_index, chunk in chunks
+            }
+            for future in concurrent.futures.as_completed(tuple(pending)):
+                pending.pop(future, None)
+                chunk_index, result = future.result()
+                results_by_chunk[chunk_index] = result
+                completed_items = [
+                    item for index in sorted(results_by_chunk)
+                    for item in results_by_chunk[index].get("items", [])
+                ]
+                self._record_phase("photo_import", "total_photos", len(photo_paths))
+                self._record_phase(
+                    "photo_import", "accepted_count",
+                    sum(1 for item in completed_items if item.get("accepted")),
+                )
+                if self._cancel.is_set():
+                    for remaining in pending:
+                        remaining.cancel()
+                    break
+
+        if self._cancel.is_set():
+            self._cancel_remote_batch(self.state.get("cancel_source") or "api")
+            self.persist()
+            return
+
+        for chunk_index in sorted(results_by_chunk):
+            items.extend(results_by_chunk[chunk_index].get("items", []))
         if self._cancel.is_set():
             return
         request_json(
@@ -1250,20 +1746,28 @@ class BenchmarkRun:
             "accepted_count": accepted,
             "batch_id": batch_id,
             "chunk_size": chunk_size,
-            "chunk_count": (len(photo_paths) + chunk_size - 1) // chunk_size,
+            "chunk_count": len(chunks),
+            "upload_workers": upload_workers,
         })
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        self._reset_gpu_samples_file()
-        self._gpu_sampling_started = True
-        self._gpu_sampler.start()
+        if not self.use_cloud_model:
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         t0 = time.perf_counter()
         scope_id = self.state["scope_id"]
         poll_count = 0
         batch_data = {}
         total = 0
         processed = 0
+        try:
+            stall_timeout_seconds = max(0, int(os.getenv(
+                "PHOTOBENCH_PIPELINE_STALL_TIMEOUT_SECONDS", "1200"
+            )))
+        except ValueError:
+            stall_timeout_seconds = 1200
         while True:
             if self._cancel.is_set():
                 break
@@ -1274,11 +1778,6 @@ class BenchmarkRun:
             total = len(assets)
             processed = len([a for a in assets if a.get("status") == "processed"])
             failed = len([a for a in assets if a.get("status") == "failed"])
-            self._record_phase("pipeline_processing", "status", "running")
-            self._record_phase("pipeline_processing", "progress", {
-                "total": total, "processed": processed, "pending": len(pending), "failed": failed,
-                "poll_count": poll_count,
-            })
             batch_data = {}
             batch_id = self.state.get("batch_id")
             if batch_id:
@@ -1290,10 +1789,80 @@ class BenchmarkRun:
                         self._record_phase("pipeline_processing", "pipeline_metrics", batch_metrics)
                 except Exception:
                     batch_data = {}
-            self.persist()
             batch_status = (batch_data.get("batch") or {}).get("status")
-            if (not pending and batch_status in {"completed", "complete", "failed"}) or poll_count > 600:
-                break
+            status_counts = {}
+            for asset in assets:
+                status = str(asset.get("status") or "unknown")
+                status_counts[status] = status_counts.get(status, 0) + 1
+            # Compare each asset's state instead of only aggregate counts. Two assets
+            # can transition in opposite directions during one poll and leave the
+            # counts unchanged even though the pipeline is making progress.
+            asset_status_signature = tuple(sorted(
+                (str(asset.get("id") or asset.get("asset_id") or asset.get("path") or index),
+                 str(asset.get("status") or "unknown"))
+                for index, asset in enumerate(assets)
+            ))
+            progress_signature = (asset_status_signature, batch_status)
+            now = time.monotonic()
+            if getattr(self, "_pipeline_progress_signature", None) != progress_signature:
+                self._pipeline_progress_signature = progress_signature
+                self._pipeline_last_progress_at = now
+                self._pipeline_last_progress_wall = now_iso()
+            last_progress_at = getattr(self, "_pipeline_last_progress_at", now)
+            no_progress_seconds = max(0.0, now - last_progress_at)
+            self._record_phase("pipeline_processing", "status", "running")
+            self._record_phase("pipeline_processing", "progress", {
+                "total": total, "processed": processed, "pending": len(pending), "failed": failed,
+                "poll_count": poll_count,
+                "status_counts": status_counts,
+                "last_progress_at": getattr(self, "_pipeline_last_progress_wall", now_iso()),
+                "no_progress_seconds": round(no_progress_seconds, 1),
+            })
+            self.persist()
+            if batch_status == "failed":
+                raise RuntimeError(
+                    f"Sentrix ingest batch failed: batch={batch_id or '-'}, "
+                    f"processed={processed}/{total}, pending={len(pending)}, failed={failed}"
+                )
+            if not pending and batch_status in {"completed", "complete"}:
+                stable_polls = getattr(self, "_pipeline_stable_polls", 0) + 1
+                self._pipeline_stable_polls = stable_polls
+                # Confirm a stable zero-pending snapshot twice: asset status rows can
+                # land after the batch flips to completed (upload/pipeline overlap).
+                if stable_polls >= 2:
+                    break
+                self._cancel.wait(3)
+                continue
+            self._pipeline_stable_polls = 0
+            batch_still_open_without_assets = (
+                total == 0 and batch_status not in {"completed", "complete", "failed"}
+            )
+            if (
+                stall_timeout_seconds > 0
+                and not batch_still_open_without_assets
+                and no_progress_seconds >= stall_timeout_seconds
+            ):
+                stall_progress = {
+                    "total": total,
+                    "processed": processed,
+                    "pending": len(pending),
+                    "failed": failed,
+                    "poll_count": poll_count,
+                    "status_counts": status_counts,
+                    "batch_status": batch_status,
+                    "last_progress_at": getattr(self, "_pipeline_last_progress_wall", None),
+                    "no_progress_seconds": round(no_progress_seconds, 1),
+                    "stall_timeout_seconds": stall_timeout_seconds,
+                }
+                self._record_phase("pipeline_processing", "status", "stalled")
+                self._record_phase("pipeline_processing", "stalled_at", now_iso())
+                self._record_phase("pipeline_processing", "stalled_progress", stall_progress)
+                self.persist()
+                raise RuntimeError(
+                    f"pipeline processing stalled: no asset status change for "
+                    f"{no_progress_seconds:.0f}s (threshold {stall_timeout_seconds}s); "
+                    f"processed={processed}/{total}, pending={len(pending)}, failed={failed}"
+                )
             if self._cancel.wait(3):
                 break
         t1 = time.perf_counter()
@@ -1308,6 +1877,11 @@ class BenchmarkRun:
 
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
+        # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
+        if not self.use_cloud_model and not self._gpu_sampling_started:
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         scope_id = self.state["scope_id"]
         assets_data = request_json(f"{self.sentrix_url}/api/assets?scope_id={scope_id}&limit=2000", timeout=60)
         assets = assets_data.get("assets", [])
@@ -1317,18 +1891,219 @@ class BenchmarkRun:
             assets_by_name.setdefault(name, []).append(a)
 
         t0 = time.perf_counter()
-        for row in self.qa_rows:
-            item = self._evaluate_one(row, assets_by_name)
+        qa_concurrency = self._resolve_qa_concurrency()
+        judge_concurrency = self._resolve_judge_concurrency(qa_concurrency)
+        agent_phase_started_perf = time.perf_counter()
+        agent_phase_started_epoch = round(time.time(), 3)
+        with self.lock:
+            self.state["qa_concurrency"] = qa_concurrency
+            self.state["judge_concurrency"] = judge_concurrency
+        total_qa = len(self.qa_rows)
+        self._qa_submitted = 0
+        self._qa_agent_completed = 0
+        self._qa_judge_submitted = 0
+        self._qa_judge_completed = 0
+        self._qa_judge_skipped = 0
+        self._record_phase("qa_eval", "agent_phase_started_at", now_iso())
+        self._record_phase("qa_eval", "agent_phase_started_at_epoch", agent_phase_started_epoch)
+        self._record_phase("qa_eval", "agent_total", total_qa)
+        self._record_phase("qa_eval", "judge_total", total_qa)
+
+        def record_qa_progress():
+            agent_done = getattr(self, "_qa_agent_completed", 0)
+            judge_done = getattr(self, "_qa_judge_completed", 0)
+            judge_submitted = getattr(self, "_qa_judge_submitted", 0)
+            self._record_phase("qa_eval", "progress", {
+                "total": total_qa,
+                # User-facing completion means Judge reached a terminal state.
+                "completed": judge_done,
+                "agent_completed": agent_done,
+                "agent_total": total_qa,
+                "agent_in_flight": max(0, total_qa - agent_done),
+                "judge_completed": judge_done,
+                "judge_total": total_qa,
+                "judge_submitted": judge_submitted,
+                "judge_skipped": getattr(self, "_qa_judge_skipped", 0),
+                "judge_in_flight": max(0, judge_submitted - (judge_done - getattr(self, "_qa_judge_skipped", 0))),
+                "qa_concurrency": qa_concurrency,
+                "judge_concurrency": judge_concurrency,
+            })
+
+        pool_rows = list(enumerate(self.qa_rows))
+        agent_futures = {}
+        judge_futures = {}
+        judge_phase_started_perf = None
+        judge_phase_started_epoch = None
+
+        # The Agent pool is deliberately independent from the cloud Judge pool.
+        # A completed Agent future returns immediately, releasing its model slot;
+        # its item is then queued for Judge work in the second pool.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=qa_concurrency, thread_name_prefix="qa-agent"
+        ) as agent_executor, concurrent.futures.ThreadPoolExecutor(
+            max_workers=judge_concurrency, thread_name_prefix="qa-judge"
+        ) as judge_executor:
+            agent_futures = {
+                agent_executor.submit(self._evaluate_one, row, assets_by_name): index
+                for index, row in pool_rows
+            }
+            self._qa_submitted = total_qa
+            record_qa_progress()
+
+            # One completion loop services both pools.  This keeps Agent and
+            # Judge truly pipelined: a finished Judge is merged immediately,
+            # even while other Agent futures are still running.
+            pending = {future: ("agent", index) for future, index in agent_futures.items()}
+            agent_phase_recorded = False
+
+            def record_agent_phase_finished() -> None:
+                nonlocal agent_phase_recorded
+                if agent_phase_recorded:
+                    return
+                agent_phase_recorded = True
+                agent_phase_finished_perf = time.perf_counter()
+                agent_phase_finished_epoch = round(time.time(), 3)
+                agent_phase_wall_ms = round(
+                    (agent_phase_finished_perf - agent_phase_started_perf) * 1000, 1
+                )
+                self._record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+                self._record_phase("qa_eval", "agent_phase_finished_at_epoch", agent_phase_finished_epoch)
+                self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
+                self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
+                self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
+                if not self.use_cloud_model:
+                    self._gpu_sampler.stop()
+
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    kind, index = pending.pop(future)
+                    if kind == "agent":
+                        try:
+                            item = future.result()
+                            agent_failed = bool(item.get("failed")) or bool(item.get("error"))
+                        except Exception as exc:
+                            item = {"index": index, "error": repr(exc), "failed": True}
+                            agent_failed = True
+                        item["_index"] = index
+                        if agent_failed:
+                            # There is no Agent answer for Judge to score.
+                            item["judge_status"] = "skipped"
+                            self._qa_judge_skipped += 1
+                            self._qa_judge_completed += 1
+                        else:
+                            if judge_phase_started_perf is None:
+                                judge_phase_started_perf = time.perf_counter()
+                                judge_phase_started_epoch = round(time.time(), 3)
+                                self._record_phase("qa_eval", "judge_phase_started_at", now_iso())
+                                self._record_phase("qa_eval", "judge_phase_started_at_epoch", judge_phase_started_epoch)
+                            item.setdefault("timing_breakdown", {}).setdefault("timeline", {})[
+                                "judge_queued_at_epoch"
+                            ] = round(time.time(), 3)
+                            self._qa_judge_submitted += 1
+                            judge_item = copy.deepcopy(item)
+                            judge_future = judge_executor.submit(
+                                self._judge_item, judge_item, self.qa_rows[index], assets_by_name,
+                            )
+                            judge_futures[judge_future] = index
+                            pending[judge_future] = ("judge", index)
+                        with self.lock:
+                            self.state["items"].append(item)
+                            self._qa_agent_completed += 1
+                            record_qa_progress()
+                            self.persist()
+                        if not any(k == "agent" for k, _ in pending.values()):
+                            record_agent_phase_finished()
+                    else:
+                        try:
+                            judged_item = future.result()
+                            with self.lock:
+                                item = next((candidate for candidate in self.state["items"]
+                                             if candidate.get("_index") == index), None)
+                                if item is not None and isinstance(judged_item, dict):
+                                    item.update({
+                                        key: value for key, value in judged_item.items()
+                                        if key != "_index"
+                                    })
+                        except Exception as exc:
+                            with self.lock:
+                                item = next((candidate for candidate in self.state["items"]
+                                             if candidate.get("_index") == index), None)
+                                if item is not None:
+                                    item.update({
+                                        "judge": {"score": None, "reason": f"judge_error: {exc}"},
+                                        "task_judge": {"actual_action": None, "correct": None,
+                                                        "reason": f"judge_error: {exc}"},
+                                        "evidence_judge": {"score": None, "reason": "judge_error"},
+                                        "judge_status": "failed",
+                                    })
+                        self._qa_judge_completed += 1
+                        with self.lock:
+                            record_qa_progress()
+                            self.persist()
+
+            record_agent_phase_finished()
+
+            if judge_phase_started_perf is not None:
+                judge_phase_finished_perf = time.perf_counter()
+                judge_phase_finished_epoch = round(time.time(), 3)
+                judge_phase_wall_ms = round((judge_phase_finished_perf - judge_phase_started_perf) * 1000, 1)
+                self._record_phase("qa_eval", "judge_phase_finished_at", now_iso())
+                self._record_phase("qa_eval", "judge_phase_finished_at_epoch", judge_phase_finished_epoch)
+                self._record_phase("qa_eval", "judge_phase_total_seconds", round(judge_phase_wall_ms / 1000, 3))
+                self._record_phase("qa_eval", "judge_phase_wall_ms", judge_phase_wall_ms)
+
             with self.lock:
-                self.state["items"].append(item)
+                self.state["items"].sort(key=lambda it: it.get("_index", 0))
+                for it in self.state["items"]:
+                    it.pop("_index", None)
+                executed = sum(1 for it in self.state["items"]
+                               if it.get("execution_status") == "completed")
+                self.state["run_valid"] = bool(
+                    len(self.state["items"]) == total_qa and executed == total_qa
+                )
+                record_qa_progress()
                 self.persist()
 
         t1 = time.perf_counter()
-        self._gpu_sampler.stop()
-        self._phase_done("qa_eval", {"total_seconds": round(t1 - t0, 1)})
+        self._phase_done("qa_eval", {
+            "total_seconds": round(t1 - t0, 1),
+            "qa_concurrency": qa_concurrency,
+            "judge_concurrency": judge_concurrency,
+        })
+
+    def _resolve_qa_concurrency(self) -> int:
+        """QA-level concurrency: default follows the serving model's max_num_seqs snapshot."""
+        env_value = str(os.getenv("PHOTOBENCH_QA_CONCURRENCY") or "").strip()
+        if env_value:
+            try:
+                return max(1, int(env_value))
+            except ValueError:
+                pass
+        try:
+            snapshot = (self.state.get("phases") or {}).get("model_deploy", {}).get("model_state") or {}
+            if not snapshot:
+                snapshot = (self.state.get("current_model_snapshot") or {}).get("state") or {}
+            return max(1, int(snapshot.get("max_num_seqs") or 1))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _resolve_judge_concurrency(qa_concurrency: int) -> int:
+        """Judge uses a separate cloud-API pool and never consumes Agent slots."""
+        env_value = str(os.getenv("PHOTOBENCH_JUDGE_CONCURRENCY") or "").strip()
+        if env_value:
+            try:
+                return max(1, int(env_value))
+            except ValueError:
+                pass
+        return max(1, int(qa_concurrency or 1))
 
     def _evaluate_one(self, row: dict, assets_by_name: dict) -> dict:
         t0 = time.perf_counter()
+        timeline = {"started_at_epoch": round(time.time(), 3)}
         conversation = row.get("conversation") or []
         if conversation and not isinstance(conversation, list):
             raise ValueError("conversation must be a list")
@@ -1337,13 +2112,14 @@ class BenchmarkRun:
         reference = str(row["answer"])
         gt_ids = [str(v) for v in row.get("retrieval_image_ids", [])]
         item = {"qa_id": row.get("qa_id"), "question": query, "reference_answer": reference,
-                "retrieval_image_ids": gt_ids}
+                "retrieval_image_ids": gt_ids, "execution_status": "scheduled"}
         for field in ("task_type", "question_type", "angle", "difficulty", "answerability",
                       "scope", "scope_anchor", "required_evidence_sources", "query_anchors",
                       "expected_action"):
             if row.get(field) is not None:
                 item[field] = row[field]
         try:
+            item["execution_status"] = "started"
             t_agent0 = time.perf_counter()
             conversation_id = str(uuid.uuid4())
             turn_records = []
@@ -1355,10 +2131,9 @@ class BenchmarkRun:
                     "message": message, "scope_id": self.state["scope_id"],
                     "conversation_id": conversation_id, "viewer_id": "owner", "include_debug": True,
                 }, "POST", 300)
-                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900)
-                turn_metrics = resp.get("model_call_metrics", [])
-                turn_trace = resp.get("retrieval_trace") or resp.get("retrievalTrace") or []
-                turn_tools = resp.get("tool_trace") or resp.get("toolTrace") or []
+                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900,
+                                               cancelled=self._cancel.is_set)
+                turn_metrics, turn_trace, turn_tools = self._normalize_turn_traces(resp)
                 _, turn_observations = self._extract_tool_perf(resp.get("task_state") or {})
                 for metric in turn_metrics:
                     if isinstance(metric, dict):
@@ -1381,6 +2156,7 @@ class BenchmarkRun:
                                         if turn_index < len(conversation) and isinstance(conversation[turn_index], dict)
                                         else row.get("expected_action")),
                     "answer": str(resp.get("answer") or ""),
+                    "agent2_trace": resp.get("agent2_trace") or resp.get("agent2Trace") or {},
                     "agent_status": resp.get("tool_loop_status") or (resp.get("telemetry") or {}).get("status"),
                     "termination_reason": resp.get("termination_reason") or resp.get("terminationReason") or "",
                     "turn_outcome": resp.get("turn_outcome") or _derive_turn_outcome(resp),
@@ -1400,18 +2176,30 @@ class BenchmarkRun:
                 call_metrics,
             )
             tool_trace = self._attach_tool_observations(tool_trace, all_tool_observations)
+            call_metrics, tool_trace = self._annotate_agent_loop_timings(call_metrics, tool_trace)
             answer = str(resp.get("answer") or "")
 
-            # Extract predicted images — recursive walk to catch any nesting
-            predicted_images = _extract_image_ids(resp)
+            # Keep retrieval, evidence, and final delivery independent. The
+            # retrieval metric must not punish the UI for showing only a few
+            # representative sources.
+            image_sets = _extract_image_sets(resp)
+            predicted_images = image_sets["selected_asset_ids"]
+            retrieved_images = image_sets["retrieved_asset_ids"]
+            evidence_images = image_sets["evidence_asset_ids"]
 
             # Match against GT
             gt_names = {Path(v).name for v in gt_ids}
             predicted_image_records = _resolve_predicted_images(predicted_images, assets_by_name)
+            retrieved_image_records = _resolve_predicted_images(retrieved_images, assets_by_name)
+            evidence_image_records = _resolve_predicted_images(evidence_images, assets_by_name)
             pred_names = {image["file_name"] for image in predicted_image_records}
-            matched = sorted(gt_names & pred_names)
+            retrieved_names = {image["file_name"] for image in retrieved_image_records}
+            evidence_names = {image["file_name"] for image in evidence_image_records}
+            matched = sorted(gt_names & retrieved_names)
+            delivery_matched = sorted(gt_names & pred_names)
+            evidence_matched = sorted(gt_names & evidence_names)
             recall = len(matched) / len(gt_names) if gt_names else None
-            precision = len(matched) / len(pred_names) if pred_names else (0.0 if gt_names else None)
+            precision = len(matched) / len(retrieved_names) if retrieved_names else (0.0 if gt_names else None)
             f1 = (2 * precision * recall / (precision + recall)) if precision is not None and recall is not None and precision + recall else 0.0 if gt_names else None
             gt_images = []
             for image_id in gt_ids:
@@ -1422,101 +2210,47 @@ class BenchmarkRun:
                     "image_id": image_id,
                     "file_name": file_name,
                     "asset_id": asset_id,
-                    "matched": file_name in pred_names,
+                    "matched": file_name in retrieved_names,
                     "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous",
                 })
 
-            # Judges consume distinct evidence: answer quality uses the reference;
-            # evidence grounding uses only this turn's retrieved images.
-            t_judge0 = time.perf_counter()
-            for index, record in enumerate(turn_records):
-                expected = record.get("expected_action")
-                turn_definition = (conversation[index]
-                                   if index < len(conversation) and isinstance(conversation[index], dict)
-                                   else {})
-                turn_reference = str(turn_definition.get("reference_answer") or "")
-                if not turn_reference:
-                    turn_reference = (
-                        "应要求用户提供至少一个具体、可用于后续检索的锚点；询问形式不限。"
-                        if expected == "clarify" else reference
-                    )
-                conv_ctx = turn_records[:index + 1]
-                record["task_judge"] = self._judge_task_action(
-                    record["message"], record["answer"], expected,
-                    record["agent_status"], record["termination_reason"],
-                    task_type=row.get("task_type"),
-                    question_type=row.get("question_type"),
-                    answerability=row.get("answerability"),
-                    reference=turn_reference,
-                    conversation=conv_ctx,
-                )
-                # Run answer-quality and evidence judges concurrently
-                should_judge_evidence = (
-                    EVIDENCE_JUDGE_ENABLED
-                    and record.get("predicted_images") and record.get("answer")
-                    and record["task_judge"].get("actual_action") != "clarify"
-                )
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                    quality_future = pool.submit(
-                        self._judge, record["message"], turn_reference, record["answer"],
-                        expected_action=expected,
-                        task_type=row.get("task_type"),
-                        question_type=row.get("question_type"),
-                        answerability=row.get("answerability"),
-                        conversation=conv_ctx,
-                    ) if expected in ANSWER_QUALITY_RUBRICS else None
-                    evidence_future = pool.submit(
-                        self._judge_evidence,
-                        record["message"], record["answer"],
-                        record.get("predicted_images") or [],
-                        assets_by_name, self.sentrix_url, conversation=conv_ctx,
-                    ) if should_judge_evidence else None
-                record["judge"] = quality_future.result() if quality_future else {"score": None, "reason": "not_labeled"}
-                record["evidence_judge"] = evidence_future.result() if evidence_future else {"score": None, "reason": "not_applicable"}
-            task_judges = [record["task_judge"] for record in turn_records]
-            task_judge = task_judges[-1] if task_judges else {"actual_action": None, "correct": None}
-            judge = turn_records[-1]["judge"] if turn_records else {"score": None, "reason": "not_applicable"}
-            evidence_judge = turn_records[-1]["evidence_judge"] if turn_records else {"score": None, "reason": "not_applicable"}
-            judge_ms = round((time.perf_counter() - t_judge0) * 1000, 1)
-
-            # Aggregate LLM metrics from call_metrics
+            # Agent phase ends before any Judge request starts.  Judge is queued
+            # by _phase_qa_eval in a separate executor after this item returns.
+            timeline["agent_finished_at_epoch"] = round(time.time(), 3)
+            timeline["agent_finished_at"] = now_iso()
             llm_summary = self._summarize_call_metrics(call_metrics)
-            wall_clock_ms = round((time.perf_counter() - t0) * 1000, 1)
-            model_ms = llm_summary.get("total_ms_sum") if llm_summary else None
-            tool_ms = None
-            if tool_trace_present:
-                tool_ms = round(sum(
-                    float(trace.get("latency_s") or 0) * 1000
-                    for trace in tool_trace if isinstance(trace, dict)
-                ), 1)
-            attributed = sum(value for value in (model_ms, tool_ms, judge_ms) if value is not None)
-            timing_breakdown = {
-                "wall_clock_ms": wall_clock_ms,
-                "agent_wall_ms": agent_wall_ms,
-                "model_ms": model_ms,
-                "tool_ms": tool_ms,
-                "judge_ms": judge_ms,
-                "other_ms": round(max(0.0, wall_clock_ms - attributed), 1)
-                    if tool_trace_present else None,
-                "agent_overhead_ms": round(max(0.0, agent_wall_ms - (model_ms or 0) - (tool_ms or 0)), 1)
-                    if tool_trace_present else None,
-                "orchestrator_overhead_ms": round(max(0.0, wall_clock_ms - agent_wall_ms - judge_ms), 1),
-                "tool_trace_recorded": tool_trace_present,
-            }
+            wall_clock_ms = agent_wall_ms
+            timing_breakdown = self._build_timing_breakdown(
+                call_metrics, tool_trace, wall_clock_ms, agent_wall_ms, None,
+                timeline, tool_trace_present,
+            )
 
             item.update({
                 "answer": answer, "predicted_images": predicted_image_records,
+                "retrieved_candidate_images": retrieved_image_records,
+                "evidence_source_images": evidence_image_records,
                 "predicted_file_names": sorted(pred_names),
-                "matched_file_names": matched, "retrieval_recall": recall,
+                "retrieved_file_names": sorted(retrieved_names),
+                "evidence_source_file_names": sorted(evidence_names),
+                "matched_file_names": matched,
+                "retrieved_matched_file_names": matched,
+                "evidence_matched_file_names": evidence_matched,
+                "delivery_matched_file_names": delivery_matched,
+                "selected_delivery_file_names": sorted(pred_names),
+                "retrieved_asset_ids": image_sets["retrieved_asset_ids"],
+                "evidence_asset_ids": image_sets["evidence_asset_ids"],
+                "selected_asset_ids": image_sets["selected_asset_ids"],
+                "retrieval_recall": recall,
                 "retrieval_precision": precision, "retrieval_f1": f1,
                 "gt_images": gt_images,
-                "judge": judge, "task_judge": task_judge,
-                "task_judges": task_judges, "conversation": turn_records if conversation else [],
+                "judge": {"score": None, "reason": "pending_judge"},
+                "task_judge": {"actual_action": None, "correct": None, "reason": "pending_judge"},
+                "task_judges": [], "conversation": turn_records if conversation else [],
                 "runtime_turns": turn_records,
                 "conversation_id": conversation_id if conversation else None,
                 "conversation_turn_count": len(turn_records) if conversation else 1,
                 "conversation_context_mode": "shared_conversation_id" if conversation else "single_turn",
-                "evidence_judge": evidence_judge, "judge_ms": judge_ms,
+                "evidence_judge": {"score": None, "reason": "pending_judge"}, "judge_ms": None,
                 "wall_clock_ms": wall_clock_ms,
                 "model_call_metrics": call_metrics,
                 "execution_trace": execution_trace,
@@ -1530,16 +2264,123 @@ class BenchmarkRun:
                 "agent_status": resp.get("tool_loop_status") or (resp.get("telemetry") or {}).get("status"),
                 "agent_reason": resp.get("tool_loop_reason") or (resp.get("telemetry") or {}).get("reason") or "",
                 "answer_grounding": resp.get("answer_grounding") or resp.get("answerGrounding") or {},
+                "agent2_trace": summarize_agent2_trace(turn_records),
                 "timing_breakdown": timing_breakdown,
+                "tool_trace_recorded": tool_trace_present,
+                "judge_status": "pending",
             })
             item["delivery_status"] = resp.get("delivery_status") or {}
             item["agent_stability"] = self._agent_stability(item)
             item["attribution"] = self._derive_attribution(item)
+            item["execution_status"] = "completed"
         except Exception as e:
+            message = str(e).lower()
+            if "timed out" in message or "timeout" in message:
+                item["execution_status"] = "timeout"
+            else:
+                item["execution_status"] = "failed"
             item.update({"error": str(e), "retrieval_recall": 0,
                          "retrieval_precision": None, "retrieval_f1": None,
                          "judge": {"score": None, "reason": "error"},
                          "wall_clock_ms": round((time.perf_counter() - t0) * 1000, 1)})
+        return item
+
+    def _judge_item(self, item: dict, row: dict, assets_by_name: dict) -> dict:
+        """Score one completed Agent answer in the independent Judge pool."""
+        t_judge0 = time.perf_counter()
+        timing = item.get("timing_breakdown") or {}
+        timeline = dict(timing.get("timeline") or {})
+        judge_started_epoch = round(time.time(), 3)
+        timeline["judge_started_at_epoch"] = judge_started_epoch
+        timeline["judge_started_at"] = now_iso()
+        queued_epoch = timeline.get("judge_queued_at_epoch")
+        if isinstance(queued_epoch, (int, float)):
+            timeline["judge_queue_wait_ms"] = round(max(0.0, judge_started_epoch - queued_epoch) * 1000, 1)
+
+        conversation = row.get("conversation") or []
+        reference = str(item.get("reference_answer") or row.get("answer") or "")
+        turn_records = item.get("runtime_turns") or []
+        for index, record in enumerate(turn_records):
+            expected = record.get("expected_action")
+            turn_definition = (conversation[index]
+                               if index < len(conversation) and isinstance(conversation[index], dict)
+                               else {})
+            turn_reference = str(turn_definition.get("reference_answer") or "")
+            if not turn_reference:
+                turn_reference = (
+                    "应要求用户提供至少一个具体、可用于后续检索的锚点；询问形式不限。"
+                    if expected == "clarify" else reference
+                )
+            conv_ctx = turn_records[:index + 1]
+            record["task_judge"] = self._judge_task_action(
+                record["message"], record["answer"], expected,
+                record.get("agent_status"), record.get("termination_reason"),
+                task_type=row.get("task_type"),
+                question_type=row.get("question_type"),
+                answerability=row.get("answerability"),
+                reference=turn_reference,
+                conversation=conv_ctx,
+            )
+            # Answer quality and evidence calls for the same turn remain parallel.
+            should_judge_evidence = (
+                EVIDENCE_JUDGE_ENABLED
+                and record.get("predicted_images") and record.get("answer")
+                and record["task_judge"].get("actual_action") != "clarify"
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                quality_future = pool.submit(
+                    self._judge, record["message"], turn_reference, record["answer"],
+                    expected_action=expected,
+                    task_type=row.get("task_type"),
+                    question_type=row.get("question_type"),
+                    answerability=row.get("answerability"),
+                    conversation=conv_ctx,
+                ) if expected in ANSWER_QUALITY_RUBRICS else None
+                evidence_future = pool.submit(
+                    self._judge_evidence,
+                    record["message"], record["answer"],
+                    record.get("predicted_images") or [],
+                    assets_by_name, self.sentrix_url, conversation=conv_ctx,
+                ) if should_judge_evidence else None
+            record["judge"] = quality_future.result() if quality_future else {"score": None, "reason": "not_labeled"}
+            record["evidence_judge"] = evidence_future.result() if evidence_future else {"score": None, "reason": "not_applicable"}
+
+        task_judges = [record.get("task_judge") or {} for record in turn_records]
+        task_judge = task_judges[-1] if task_judges else {"actual_action": None, "correct": None}
+        judge = turn_records[-1].get("judge") if turn_records else {"score": None, "reason": "not_applicable"}
+        evidence_judge = turn_records[-1].get("evidence_judge") if turn_records else {"score": None, "reason": "not_applicable"}
+        judge_ms = round((time.perf_counter() - t_judge0) * 1000, 1)
+        judge_finished_epoch = round(time.time(), 3)
+        timeline["judge_finished_at_epoch"] = judge_finished_epoch
+        timeline["judge_finished_at"] = now_iso()
+        queue_wait_ms = timeline.get("judge_queue_wait_ms")
+        if not isinstance(queue_wait_ms, (int, float)):
+            queue_wait_ms = 0.0
+        agent_wall_ms = self._numeric_ms(timing.get("agent_wall_ms")) or 0.0
+        wall_clock_ms = round(agent_wall_ms + queue_wait_ms + judge_ms, 1)
+        call_metrics = item.get("model_call_metrics") or []
+        tool_trace = item.get("tool_trace") or []
+        timing_breakdown = self._build_timing_breakdown(
+            call_metrics, tool_trace, wall_clock_ms, agent_wall_ms, judge_ms,
+            timeline, bool(item.get("tool_trace_recorded")), queue_wait_ms,
+        )
+        all_judge_outputs = [judge, evidence_judge, *task_judges]
+        judge_terminal_status = "failed" if any(
+            isinstance(value, dict) and value.get("judge_status") == "failed"
+            for value in all_judge_outputs
+        ) else "completed"
+        item.update({
+            "judge": judge or {"score": None, "reason": "not_applicable"},
+            "task_judge": task_judge,
+            "task_judges": task_judges,
+            "evidence_judge": evidence_judge or {"score": None, "reason": "not_applicable"},
+            "judge_ms": judge_ms,
+            "wall_clock_ms": wall_clock_ms,
+            "judge_status": judge_terminal_status,
+            "timing_breakdown": timing_breakdown,
+        })
+        item["agent_stability"] = self._agent_stability(item)
+        item["attribution"] = self._derive_attribution(item)
         return item
 
     @staticmethod
@@ -1563,6 +2404,137 @@ class BenchmarkRun:
         }
 
     @staticmethod
+    def _numeric_ms(value) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
+    @classmethod
+    def _annotate_agent_loop_timings(cls, model_calls: list, tool_trace: list) -> tuple[list[dict], list[dict]]:
+        """Record model + child-tool duration without flattening nested work.
+
+        ``total_ms`` remains the raw model request duration.  The new
+        ``agent_loop_total_ms`` is the end-to-end duration for that model round
+        plus directly attached tools.  Tool-internal model calls stay nested in
+        their parent tool and are not added as another top-level loop.
+        """
+        calls = [dict(call) for call in model_calls if isinstance(call, dict)]
+        tools = [dict(trace) for trace in tool_trace if isinstance(trace, dict)]
+        by_call: dict[int, list[dict]] = {}
+        for trace in tools:
+            try:
+                index = int(trace.get("model_call_index"))
+            except (TypeError, ValueError):
+                continue
+            duration_ms = cls._numeric_ms(trace.get("duration_ms"))
+            if duration_ms is None:
+                latency_s = cls._numeric_ms(trace.get("latency_s"))
+                duration_ms = latency_s * 1000 if latency_s is not None else None
+            if duration_ms is not None:
+                trace["duration_ms"] = round(duration_ms, 1)
+            by_call.setdefault(index, []).append(trace)
+
+        for index, call in enumerate(calls):
+            model_ms = cls._numeric_ms(call.get("total_ms"))
+            if model_ms is None:
+                continue
+            ttft_ms = cls._numeric_ms(call.get("ttft_ms"))
+            child_tools = by_call.get(index, [])
+            tool_ms = round(sum(float(tool.get("duration_ms") or 0) for tool in child_tools), 1)
+            generation_ms = round(max(0.0, model_ms - (ttft_ms or 0)), 1) if ttft_ms is not None else model_ms
+            call["agent_loop_total_ms"] = round(model_ms + tool_ms, 1)
+            call["agent_loop_timing"] = {
+                "model_ms": round(model_ms, 1),
+                "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+                "model_generation_ms": generation_ms,
+                "tool_ms": tool_ms if child_tools else 0.0,
+                "tool_count": len(child_tools),
+                "tools": [
+                    {"tool": tool.get("tool") or "未知工具", "duration_ms": tool.get("duration_ms")}
+                    for tool in child_tools
+                ],
+            }
+        return calls, tools
+
+    @classmethod
+    def _build_timing_breakdown(cls, model_calls: list, tool_trace: list,
+                                wall_clock_ms: float, agent_wall_ms: float,
+                                judge_ms: float, timeline: dict,
+                                tool_trace_present: bool,
+                                judge_queue_wait_ms: float = 0.0) -> dict:
+        """Build the two-level latency contract used by the UI.
+
+        QA children are Agent Loops, Judge, and residual overhead.  Each Agent
+        Loop exposes TTFT, model generation, and direct child tools.  A tool's
+        own latency already includes any nested work, so nested model calls are
+        intentionally excluded from the QA-level children.
+        """
+        loops = []
+        total_tool_ms = 0.0
+        for index, call in enumerate(model_calls):
+            call_type = str(call.get("call_type") or "agent")
+            if call_type in {"tool_internal", "faithfulness_judge"}:
+                continue
+            loop_ms = cls._numeric_ms(call.get("agent_loop_total_ms"))
+            model_ms = cls._numeric_ms(call.get("total_ms"))
+            if loop_ms is None or model_ms is None:
+                continue
+            timing = call.get("agent_loop_timing") or {}
+            tool_ms = cls._numeric_ms(timing.get("tool_ms")) or 0.0
+            total_tool_ms += tool_ms
+            observation = call.get("call_observation") or {}
+            label = observation.get("label") or {
+                "planner": "Agent 2.0 目标分解与规划",
+                "agent": "Agent 决策 / 回答",
+                "recovery": "Agent 恢复调用",
+                "writer": "最终回答重写",
+            }.get(call_type, call_type)
+            loops.append({
+                "index": index,
+                "label": label,
+                "call_type": call_type,
+                "step_id": call.get("step_id"),
+                "conversation_turn": call.get("conversation_turn"),
+                "duration_ms": loop_ms,
+                "model_ms": round(model_ms, 1),
+                "ttft_ms": timing.get("ttft_ms"),
+                "model_generation_ms": timing.get("model_generation_ms"),
+                "tool_ms": tool_ms,
+                "tool_count": timing.get("tool_count", 0),
+            })
+        loop_sum_ms = round(sum(float(loop["duration_ms"]) for loop in loops), 1)
+        agent_overhead_ms = round(max(0.0, agent_wall_ms - loop_sum_ms), 1)
+        judge_value = cls._numeric_ms(judge_ms)
+        queue_value = cls._numeric_ms(judge_queue_wait_ms) or 0.0
+        other_ms = round(max(0.0, wall_clock_ms - loop_sum_ms - (judge_value or 0) - queue_value), 1)
+        model_ms = round(sum(float(loop["model_ms"]) for loop in loops), 1) if loops else None
+        tool_ms = round(total_tool_ms, 1) if tool_trace_present else None
+        return {
+            "wall_clock_ms": wall_clock_ms,
+            "timeline": timeline,
+            "agent_wall_ms": agent_wall_ms,
+            "model_ms": model_ms,
+            "tool_ms": tool_ms,
+            "judge_ms": judge_value,
+            "judge_queue_wait_ms": queue_value if queue_value > 0 else None,
+            "other_ms": other_ms if tool_trace_present else None,
+            "agent_overhead_ms": agent_overhead_ms if tool_trace_present else None,
+            "orchestrator_overhead_ms": round(max(0.0, wall_clock_ms - agent_wall_ms - queue_value - (judge_value or 0)), 1),
+            "tool_trace_recorded": tool_trace_present,
+            "agent_loop_timing_recorded": bool(loops),
+            "agent_loops": loops,
+            "agent_loop_sum_ms": loop_sum_ms if loops else None,
+            "qa_components": ([
+                *[{"kind": "agent_loop", **loop} for loop in loops],
+                *([{"kind": "judge", "label": "Judge", "duration_ms": judge_value}] if judge_value else []),
+                *([{"kind": "judge_queue", "label": "Judge 排队 / 编排", "duration_ms": queue_value}] if queue_value > 0 else []),
+                *([{"kind": "other", "label": "其他", "duration_ms": other_ms}] if other_ms > 0 else []),
+            ] if loops else []),
+        }
+
+    @staticmethod
     def _bind_tool_calls_to_model_rounds(tool_trace: list, retrieval_trace: list,
                                          model_calls: list | int | None = None) -> list[dict]:
         """Attach tools by step ID first, with ordered fallback for historical runs."""
@@ -1578,6 +2550,7 @@ class BenchmarkRun:
                 continue
             key = (call.get("conversation_turn"), str(call.get("step_id")))
             call_index_by_step[key] = index
+            call_index_by_step[("any", str(call.get("step_id")))] = index
         for trace in bound:
             parent_step_id = trace.get("parent_step_id")
             key = (trace.get("conversation_turn"), str(parent_step_id))
@@ -1591,18 +2564,37 @@ class BenchmarkRun:
                         trace["model_call_index"] = 0
                         trace["round_binding_source"] = "inferred_single_model_call"
             return bound
-        model_index = -1
+        model_index = None
+        ordered_call_index = 0
         tool_index = 0
         for step in retrieval_trace:
             if not isinstance(step, dict):
                 continue
             stage = step.get("stage") or step.get("type")
-            if stage == "model":
-                model_index += 1
+            step_id = step.get("step_id")
+            step_key = (step.get("conversation_turn"), str(step_id))
+            mapped_index = call_index_by_step.get(step_key)
+            if mapped_index is None:
+                mapped_index = call_index_by_step.get(("any", str(step_id)))
+            if stage in {"planner", "model", "writer", "judge"}:
+                if mapped_index is not None:
+                    model_index = mapped_index
+                    ordered_call_index = max(ordered_call_index, mapped_index + 1)
+                elif ordered_call_index < model_call_count:
+                    model_index = ordered_call_index
+                    ordered_call_index += 1
             elif stage == "tool" and tool_index < len(bound):
-                if model_index >= 0 and bound[tool_index].get("model_call_index") is None:
+                if model_index is not None and model_index >= 0 and bound[tool_index].get("model_call_index") is None:
                     bound[tool_index]["model_call_index"] = model_index
                     bound[tool_index]["round_binding_source"] = "retrieval_trace"
+                    if step.get("parent_step_id") is not None:
+                        bound[tool_index]["parent_step_id"] = step.get("parent_step_id")
+                elif model_index is not None and model_index >= 0 and step.get("parent_step_id") is not None:
+                    # The execution trace is authoritative when older Sentrix
+                    # responses carried a stale positional model_call_index.
+                    bound[tool_index]["model_call_index"] = model_index
+                    bound[tool_index]["round_binding_source"] = "retrieval_trace_parent"
+                    bound[tool_index]["parent_step_id"] = step.get("parent_step_id")
                 tool_index += 1
         if model_call_count == 1:
             for trace in bound:
@@ -1780,6 +2772,49 @@ class BenchmarkRun:
         return calls
 
     @staticmethod
+    def _normalize_turn_traces(response: dict) -> tuple[list, list, list]:
+        """Normalize the response into one authoritative ordered trace.
+
+        ``debug_trace`` is the only response field that contains tool
+        arguments, parent step IDs, and the full observation.  Use it as the
+        fallback when the compact retrieval/tool summaries are absent.
+        """
+        response = response if isinstance(response, dict) else {}
+        metrics = response.get("model_call_metrics") or []
+        debug = response.get("debug_trace") or []
+        execution = response.get("retrieval_trace") or response.get("retrievalTrace") or []
+        if not execution and isinstance(debug, list):
+            execution = debug
+        compact_tools = response.get("tool_trace") or response.get("toolTrace") or []
+        debug_tools = []
+        if isinstance(debug, list):
+            debug_tools = [
+                step for step in debug
+                if isinstance(step, dict)
+                and str(step.get("type") or step.get("stage") or "") == "tool"
+            ]
+        # The compact trace carries timing/summary fields, while debug_trace
+        # carries the authoritative arguments, parent_step_id and full
+        # observation. Merge them by execution order so 8771 shows one
+        # complete, internally consistent tool record.
+        if debug_tools:
+            tools = []
+            for index, debug_tool in enumerate(debug_tools):
+                merged = dict(debug_tool)
+                if isinstance(compact_tools, list) and index < len(compact_tools):
+                    compact = compact_tools[index]
+                    if isinstance(compact, dict):
+                        for key, value in compact.items():
+                            if key not in {"observation", "arguments", "parent_step_id", "step_id", "tool", "tool_name"}:
+                                merged.setdefault(key, value)
+                tools.append(merged)
+        else:
+            tools = compact_tools
+        return list(metrics) if isinstance(metrics, list) else [], \
+            list(execution) if isinstance(execution, list) else [], \
+            list(tools) if isinstance(tools, list) else []
+
+    @staticmethod
     def _extract_tool_perf(task_state: dict) -> tuple[dict, list[dict]]:
         """Extract tool-internal metrics already returned in task_state.tool_results."""
         perf = {}
@@ -1906,8 +2941,7 @@ class BenchmarkRun:
                          {"role": "user", "content": judge_text}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
-                               self._judge_headers())
+            raw, retry_attempts = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             start, end = text.find("{"), text.rfind("}")
             try:
@@ -1929,8 +2963,7 @@ class BenchmarkRun:
                     "messages": [{"role": "system", "content": retry_system}, payload["messages"][1]],
                 }
                 try:
-                    retry_raw = request_json(f"{self.judge_url}/v1/chat/completions", retry_payload, "POST", 180,
-                                             self._judge_headers())
+                    retry_raw, _ = self._judge_request(retry_payload)
                     retry_text = str(retry_raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
                     retry_parsed = self._parse_judge_json(retry_text)
                     retry_score = retry_parsed.get("score") if retry_parsed.get("score") in {0, 1, 2} else None
@@ -1949,9 +2982,12 @@ class BenchmarkRun:
                 "reason": reason,
                 "input": payload,
                 "raw_text": text,
+                "judge_status": "completed",
+                "judge_retry_attempts": retry_attempts,
             }
         except Exception as e:
-            return {"score": None, "reason": f"judge_error: {e}", "input": payload}
+            return {"score": None, "reason": f"judge_error: {e}", "input": payload,
+                    "judge_status": "failed"}
 
     def _judge_task_action(self, question: str, answer: str, expected_action: str | None,
                            agent_status: str | None, termination_reason: str,
@@ -1985,12 +3021,11 @@ class BenchmarkRun:
                   "结合 GT 能力边界，只判断当前模型回答实际表现为直接回答、拒答还是澄清。只输出 JSON。")
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": TASK_JUDGE_PROMPT},
+            "enable_thinking": False, "messages": [{"role": "system", "content": getattr(self, "task_judge_system_prompt", None) or TASK_JUDGE_PROMPT},
                          {"role": "user", "content": prompt}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
-                               self._judge_headers())
+            raw, _ = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
             actual = parsed.get("actual_action") if parsed.get("actual_action") in {"answer", "refuse", "clarify", "none"} else None
@@ -2002,10 +3037,12 @@ class BenchmarkRun:
                 "reason": str(parsed.get("reason") or text[:200]),
                 "input": payload,
                 "raw_text": text,
+                "judge_status": "completed",
             }
         except Exception as exc:
             return {"expected_action": expected_action, "actual_action": None, "correct": None,
-                    "reason": f"judge_error: {exc}", "input": payload}
+                    "reason": f"judge_error: {exc}", "input": payload,
+                    "judge_status": "failed"}
 
     def _judge_evidence(self, question: str, answer: str, predicted_images: list[dict],
                         assets_by_name: dict, sentrix_url: str,
@@ -2029,25 +3066,25 @@ class BenchmarkRun:
                     {"score": 0, "reason": "no_image_evidence", "input": None})
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": EVIDENCE_JUDGE_PROMPT},
+            "enable_thinking": False, "messages": [{"role": "system", "content": getattr(self, "evidence_judge_system_prompt", None) or EVIDENCE_JUDGE_PROMPT},
                          {"role": "user", "content": content}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
-                               self._judge_headers())
+            raw, _ = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
             applicable = parsed.get("applicable") is not False
             if not applicable:
                 return {"score": None, "applicable": False,
                         "reason": str(parsed.get("reason") or "no_visual_claims"),
-                        "input": payload, "raw_text": text}
+                        "input": payload, "raw_text": text, "judge_status": "completed"}
             score = parsed.get("score") if parsed.get("score") in {0, 1, 2} else None
             return {"score": score, "applicable": True,
                     "reason": str(parsed.get("reason") or text[:200]),
-                    "input": payload, "raw_text": text}
+                    "input": payload, "raw_text": text, "judge_status": "completed"}
         except Exception as exc:
-            return {"score": None, "reason": f"judge_error: {exc}", "input": payload}
+            return {"score": None, "reason": f"judge_error: {exc}", "input": payload,
+                    "judge_status": "failed"}
 
     @staticmethod
     def _parse_judge_json(text: str) -> dict:
@@ -2057,6 +3094,38 @@ class BenchmarkRun:
         except json.JSONDecodeError:
             value = {}
         return value if isinstance(value, dict) else {}
+
+    def _judge_chat_url(self) -> str:
+        url = self.judge_url.rstrip("/")
+        if url.endswith("/chat/completions"):
+            return url
+        if url.endswith("/v1") or url.endswith("/v3") or url.endswith("/v2"):
+            return f"{url}/chat/completions"
+        return f"{url}/v1/chat/completions"
+
+    def _judge_request(self, payload: dict, timeout: int = 180) -> tuple[dict, int]:
+        """Call remote Judge with bounded exponential-backoff retries."""
+        last_error = None
+        for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
+            try:
+                response = request_json(
+                    self._judge_chat_url(), payload, "POST", timeout,
+                    self._judge_headers(),
+                )
+                if not isinstance(response, dict):
+                    raise ValueError("judge response is not an object")
+                return response, attempt
+            except Exception as exc:
+                last_error = exc
+                if attempt >= JUDGE_RETRY_ATTEMPTS:
+                    break
+                delay = min(JUDGE_RETRY_BACKOFF_MAX_SECONDS,
+                            JUDGE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                if self._cancel.wait(delay):
+                    raise RunCancelledError("cancelled while retrying Judge request") from exc
+        raise RuntimeError(
+            f"judge request failed after {JUDGE_RETRY_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     def _judge_headers(self) -> dict[str, str]:
         api_key = getattr(self, "judge_api_key", JUDGE_API_KEY)
@@ -2101,6 +3170,13 @@ class BenchmarkRun:
 
     def _phase_gpu_metrics(self):
         self._phase_start("gpu_metrics")
+        if self.use_cloud_model:
+            self._phase_done("gpu_metrics", {
+                "status": "skipped",
+                "source": "cloud_api",
+                "reason": "cloud_api_has_no_local_gpu_metrics",
+            })
+            return
         agg = self._gpu_sampler.aggregate()
         self._phase_done("gpu_metrics", agg)
 
@@ -2134,8 +3210,9 @@ class BenchmarkRun:
                     context_tokens.append(prompt + completion)
 
         summary = {
-            "total": len(self.qa_rows),
-            "completed": len(items),
+            # build 模式不做 QA；total 置 0 避免前端把未执行的题数渲染成 0/N。
+            "total": len(self.qa_rows) if self.mode != "build" else 0,
+            "completed": sum(1 for item in items if item.get("judge_status") in {"completed", "failed", "skipped"}),
             "retrieval_recall_mean": round(sum(recalls) / len(recalls), 3) if recalls else None,
             "judge_distribution": distribution,
             "judge_valid_count": denom,
@@ -2154,7 +3231,7 @@ class BenchmarkRun:
             "llm_context_tokens_p95": nearest_rank_percentile(context_tokens, 0.95),
             "llm_context_samples_count": len(context_tokens),
         }
-        summary.update(self._capability_summary(items))
+        summary.update(self._capability_summary(items, self.state.get("phases") or {}))
         summary["benchmark_e2e_latency_excluding_judge_ms"] = self._benchmark_e2e_latency_excluding_judge_ms(
             self.state.get("phases") or {}, items,
         )
@@ -2162,29 +3239,25 @@ class BenchmarkRun:
         self._phase_done("aggregate", {"summary": summary})
 
     @classmethod
-    def _capability_summary(cls, items: list[dict]) -> dict:
-        answer_judges = [judge for item in items for judge in (
-            [turn.get("judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else [item.get("judge") or {}]
-        )]
+    def _capability_summary(cls, items: list[dict], phases: dict | None = None) -> dict:
+        # Canonical metric: per-qa_id, take the final (item-level) judge only.
+        # Multi-turn conversation items used to be flattened into one judge per
+        # turn, inflating the denominator beyond the number of questions.
+        answer_judges = [item.get("judge") or {} for item in items]
         answer_scores = [score for judge in answer_judges if (score := judge_score_for_summary(judge)) is not None]
         answer_dist = {str(score): answer_scores.count(score) for score in (0, 1, 2)}
         retrieval_items = [item for item in items if item.get("retrieval_image_ids")]
-        tp = sum(len(item.get("matched_file_names") or []) for item in retrieval_items)
-        predicted = sum(len(item.get("predicted_file_names") or []) for item in retrieval_items)
+        tp = sum(len(item.get("retrieved_matched_file_names") or item.get("matched_file_names") or []) for item in retrieval_items)
+        predicted = sum(len(item.get("retrieved_file_names") or item.get("predicted_file_names") or []) for item in retrieval_items)
         gt = sum(len(item.get("retrieval_image_ids") or []) for item in retrieval_items)
         precision = tp / predicted if predicted else (0.0 if gt else None)
         recall = tp / gt if gt else None
         f1 = 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else (0.0 if gt else None)
-        evidence_judges = [judge for item in items for judge in (
-            [turn.get("evidence_judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else [item.get("evidence_judge") or {}]
-        )]
+        evidence_judges = [item.get("evidence_judge") or {} for item in items]
         evidence_scores = [judge.get("score") for judge in evidence_judges if judge.get("score") in {0, 1, 2}]
         evidence_dist = {str(score): evidence_scores.count(score) for score in (0, 1, 2)}
         action_judges = [judge for item in items for judge in (
-            [turn.get("task_judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else item.get("task_judges") or [item.get("task_judge") or {}]
+            item.get("task_judges") or [item.get("task_judge") or {}]
         ) if judge.get("expected_action") in {"answer", "refuse", "clarify"}]
         action_valid = [value for value in action_judges if value.get("correct") in {True, False}]
         parse_totals = [item.get("agent_stability", {}).get("json_parse_total") for item in items]
@@ -2195,6 +3268,60 @@ class BenchmarkRun:
         completion_valid = [value for value in completion if isinstance(value, bool)]
         wall_times = [float(item["wall_clock_ms"]) for item in items
                       if isinstance(item.get("wall_clock_ms"), (int, float))]
+        judge_times = [float((item.get("timing_breakdown") or {}).get("judge_ms"))
+                       for item in items
+                       if isinstance((item.get("timing_breakdown") or {}).get("judge_ms"), (int, float))]
+        # New runs record the real Agent-only phase wall clock.  This is the
+        # concurrency throughput metric: Agent phase wall / number of QA items.
+        # It must not be reconstructed by subtracting Judge intervals, because
+        # cloud Judge calls can overlap other Agent requests.
+        judge_exclusive_ms = None
+        agent_throughput_ms = None
+        agent_throughput_mode = "historical_interval_estimate"
+        agent_phase_wall_ms = cls._numeric_ms((phases or {}).get("qa_eval", {}).get("agent_phase_wall_ms"))
+        agent_phase_count = (phases or {}).get("qa_eval", {}).get("agent_completed")
+        if not isinstance(agent_phase_count, int) or agent_phase_count <= 0:
+            agent_phase_count = len(items)
+        timelines = [(item.get("timing_breakdown") or {}).get("timeline") or {} for item in items]
+        spans = [(tl.get("started_at_epoch"), tl.get("judge_started_at_epoch"), tl.get("judge_finished_at_epoch")) for tl in timelines]
+        ends = []
+        for s, item in zip(spans, items):
+            wall_ms = (item.get("timing_breakdown") or {}).get("wall_clock_ms")
+            if isinstance(s[0], (int, float)) and isinstance(wall_ms, (int, float)):
+                ends.append(s[0] + float(wall_ms) / 1000)
+        phase = (phases or {}).get("qa_eval") or {}
+        try:
+            phase_start = datetime.fromisoformat(str(phase.get("started_at"))).timestamp()
+            phase_end = datetime.fromisoformat(str(phase.get("finished_at"))).timestamp()
+        except (TypeError, ValueError, OSError):
+            phase_start = phase_end = None
+        valid_item_spans = [s for s in spans if isinstance(s[0], (int, float))]
+        if phase_end is not None and phase_start is not None and phase_end > phase_start:
+            wall_start, wall_end = phase_start, phase_end
+        elif valid_item_spans and ends:
+            wall_start = min(s[0] for s in valid_item_spans)
+            wall_end = max(e for e in ends if isinstance(e, (int, float)))
+        else:
+            wall_start = wall_end = None
+        judge_spans = sorted((s[1], s[2]) for s in spans
+                             if isinstance(s[1], (int, float)) and isinstance(s[2], (int, float)) and s[2] > s[1])
+        if wall_start is not None and wall_end is not None and judge_spans:
+            merged: list[list[float]] = []
+            for a, b in judge_spans:
+                if merged and a <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            judge_exclusive_ms = round(sum(b - a for a, b in merged) * 1000, 1)
+        if agent_phase_wall_ms is not None and agent_phase_wall_ms > 0 and agent_phase_count > 0:
+            agent_throughput_ms = round(agent_phase_wall_ms / agent_phase_count, 1)
+            agent_throughput_mode = "measured_agent_phase"
+        elif wall_start is not None and wall_end is not None and judge_spans and items:
+            # Compatibility fallback for old runs that had no Agent/Judge
+            # boundary.  Keep it explicitly marked as an estimate.
+            agent_throughput_ms = round(max(0.0, (wall_end - wall_start) * 1000 - (judge_exclusive_ms or 0)) / len(items), 1)
+        judge_phase = (phases or {}).get("qa_eval") or {}
+        judge_phase_wall_ms = cls._numeric_ms(judge_phase.get("judge_phase_wall_ms"))
         agent_wall_times = [float((item.get("timing_breakdown") or {}).get("agent_wall_ms"))
                             for item in items
                             if isinstance((item.get("timing_breakdown") or {}).get("agent_wall_ms"), (int, float))]
@@ -2233,21 +3360,44 @@ class BenchmarkRun:
             "e2e_latency_max_ms": max(wall_times) if wall_times else None,
             "agent_task_latency_mean_ms": round(sum(agent_wall_times) / len(agent_wall_times), 1)
                 if agent_wall_times else None,
+            "judge_llm_latency_mean_ms": round(sum(judge_times) / len(judge_times), 1)
+                if judge_times else None,
+            "judge_exclusive_wall_ms": judge_exclusive_ms,
+            "judge_phase_wall_ms": judge_phase_wall_ms,
+            "judge_concurrency": judge_phase.get("judge_concurrency"),
+            "agent_throughput_latency_ms": agent_throughput_ms,
+            "agent_throughput_latency_mode": agent_throughput_mode,
+            "agent_phase_wall_ms": agent_phase_wall_ms,
+            "agent_phase_completed_count": agent_phase_count if agent_phase_wall_ms is not None else None,
+            "agent_throughput_qa_per_s": round(1000 * agent_phase_count / agent_phase_wall_ms, 3)
+                if agent_phase_wall_ms and agent_phase_count else None,
+            "agent_throughput_latency_sample_count": agent_phase_count if agent_phase_wall_ms is not None else len(judge_spans),
+            "agent_throughput_latency_total_count": len(items),
             "agent_loop_calls_mean": round(sum(agent_loop_counts) / len(agent_loop_counts), 3)
                 if agent_loop_counts else None,
+            "agent2_trace": summarize_agent2_trace([
+                turn for item in items for turn in (item.get("runtime_turns") or [item])
+            ]),
         }
 
     @staticmethod
     def _benchmark_e2e_latency_excluding_judge_ms(phases: dict, items: list[dict]) -> float | None:
-        """Wall time from data import through QA completion, excluding Judge calls."""
+        """Wall time from data import through Agent completion, excluding Judge.
+
+        New runs have an explicit Agent phase boundary.  Only historical runs
+        without that boundary use the old per-item subtraction fallback.
+        """
         started_at = (phases.get("identity_seed") or {}).get("started_at")
-        finished_at = (phases.get("qa_eval") or {}).get("finished_at")
+        qa_phase = phases.get("qa_eval") or {}
+        finished_at = qa_phase.get("agent_phase_finished_at") or qa_phase.get("finished_at")
         if not started_at or not finished_at:
             return None
         try:
             wall_ms = (datetime.fromisoformat(str(finished_at)) - datetime.fromisoformat(str(started_at))).total_seconds() * 1000
         except (TypeError, ValueError):
             return None
+        if qa_phase.get("agent_phase_finished_at"):
+            return round(max(0.0, wall_ms), 1)
         judge_values = [(item.get("timing_breakdown") or {}).get("judge_ms") for item in items]
         if items and not all(isinstance(value, (int, float)) for value in judge_values):
             return None
@@ -2444,18 +3594,73 @@ class OrchestratorRepository:
         return None
 
     def query_profiles(self, vllm_api_url: str) -> dict:
+        profiles = []
+        error = None
         try:
-            profiles = request_json(f"{vllm_api_url.rstrip('/')}/profiles", timeout=15)
-            state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10)
-            return {"profiles": profiles, "current": state}
+            remote_profiles = request_json(f"{vllm_api_url.rstrip('/')}/profiles", timeout=15)
+            if isinstance(remote_profiles, list):
+                profiles = remote_profiles
+            elif isinstance(remote_profiles, dict):
+                profiles = remote_profiles.get("profiles") or []
         except Exception as e:
-            return {"profiles": [], "current": {}, "error": str(e)}
+            error = str(e)
+        if BIG_MODEL_ENABLED and not any(
+            isinstance(item, dict) and item.get("id") == BIG_MODEL_PROFILE_ID
+            for item in profiles
+        ):
+            profiles.append({
+                "id": BIG_MODEL_PROFILE_ID,
+                "model": BIG_MODEL_MODEL,
+                "served_model_name": BIG_MODEL_MODEL,
+                "base_url": BIG_MODEL_BASE_URL,
+                "source": "cloud_api",
+                "available": True,
+                "notes": "external OpenAI-compatible API",
+            })
+        result = {"profiles": profiles}
+        if error:
+            result["error"] = error
+        return result
+
+    def query_current_model(self, vllm_api_url: str, model_base_url: str) -> dict:
+        state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10) or {}
+        profile = str(state.get("profile") or "").strip()
+        served_name = str(state.get("served_model_name") or "").strip()
+        model_id = profile or served_name
+        if not model_id or not served_name:
+            raise ValueError("vLLM Manager has no running model")
+        live_models = request_json(f"{model_base_url.rstrip('/')}/models", timeout=15) or {}
+        served_models = [
+            str(item.get("id")) for item in live_models.get("data") or []
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if served_name not in served_models:
+            raise ValueError(
+                f"vLLM state is stale or mismatched: expected {served_name}, "
+                f"live endpoint serves {served_models or 'nothing'}"
+            )
+        return {
+            "model_id": model_id,
+            "served_model_name": served_name,
+            "verified_at": now_iso(),
+            "served_models": served_models,
+            "state": state,
+        }
 
     def start_memory_profile(self, payload: dict) -> dict:
         """Replay saved questions to measure comparable memory without changing QA results."""
         run_ids = [str(value) for value in payload.get("run_ids") or []]
         if not run_ids:
             raise ValueError("run_ids is required")
+        with self.lock:
+            cloud_runs = []
+            for rid in run_ids:
+                run = self.runs.get(rid)
+                state = run.state if isinstance(run, BenchmarkRun) else run or {}
+                if state.get("model_source") == "cloud_api":
+                    cloud_runs.append(rid)
+        if cloud_runs:
+            raise ValueError("cloud API model does not support local GPU memory profiling")
         target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
         manager_url = str(target["manager_url"]).rstrip("/")
         sentrix_url = str(payload.get("sentrix_url") or DEFAULT_SENTRIX_URL).rstrip("/")
@@ -2615,25 +3820,62 @@ class OrchestratorRepository:
             result["summary"] = self._effective_summary(state)
             return result
 
-    def export_sft(self, run_id: str, min_score: int | None = None) -> dict:
-        """导出轨迹（每步模型调用的 prompt -> response）用于轨迹训练。
+    def export_sft(self, run_id: str, scores: list[int] | None = None,
+                   min_score: int | None = None) -> dict:
+        """导出完整思考轨迹：每题全部 debug_trace 步（含提示词/工具参数/工具结果/守卫/judge）、
+        agent2_trace（task_state/evidence_ledger/answer_context/stage_timing）与评测元数据。
 
-        min_score: None 导出全部；1 只导出答案评分 >=1 的题目；2 只导出评分 =2 的题目。
+        scores: 非空时只导出答案评分落在该集合内的题目（勾选过滤，勾选什么导出什么）。
+        min_score: 兼容旧参数；非 None 时只导出评分 >= min_score 的题目。
         """
+        import ast as _ast
+        def _parse(value):
+            if isinstance(value, dict) or not isinstance(value, str) or not value.strip():
+                return value
+            try:
+                return _ast.literal_eval(value)
+            except Exception:
+                return value
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
                 raise KeyError(run_id)
             state = run.state if isinstance(run, BenchmarkRun) else run
+            items_out = []
             samples = []
+            include = set(scores) if scores else None
             for item in (state.get("items") or []):
-                if min_score is not None:
+                if include is not None:
+                    item_score = (item.get("judge") or {}).get("score")
+                    if item_score not in include:
+                        continue
+                elif min_score is not None:
                     item_score = (item.get("judge") or {}).get("score")
                     if item_score is None or item_score < min_score:
                         continue
                 qa_id = item.get("qa_id")
-                turns = item.get("runtime_turns") or []
-                for turn in turns:
+                turns_out = []
+                for turn in (item.get("runtime_turns") or []):
+                    steps_out = []
+                    for step in (turn.get("debug_trace") or []):
+                        if not isinstance(step, dict):
+                            continue
+                        st = dict(step)
+                        if isinstance(st.get("arguments"), str):
+                            st["arguments"] = _parse(st["arguments"])
+                        if isinstance(st.get("observation"), str):
+                            st["observation"] = _parse(st["observation"])
+                        steps_out.append(st)
+                    turns_out.append({
+                        "turn": turn.get("index"),
+                        "message": turn.get("message"),
+                        "expected_action": turn.get("expected_action"),
+                        "answer": turn.get("answer"),
+                        "agent_status": turn.get("agent_status"),
+                        "turn_outcome": turn.get("turn_outcome"),
+                        "steps": steps_out,
+                    })
+                    # SFT prompt->response 样本（兼容旧格式；完整轨迹见 items）
                     for step in (turn.get("debug_trace") or []):
                         if not isinstance(step, dict) or step.get("type") != "model":
                             continue
@@ -2646,11 +3888,35 @@ class OrchestratorRepository:
                         samples.append({
                             "qa_id": qa_id,
                             "turn": turn.get("index"),
-                            "step": step.get("status", "complete"),
+                            "step": step.get("step_id") or step.get("status", "complete"),
                             "messages": messages,
                         })
-            return {"run_id": run_id, "count": len(samples), "samples": samples,
-                    "min_score": min_score, "filtered": min_score is not None}
+                items_out.append({
+                    "qa_id": qa_id,
+                    "question": item.get("question"),
+                    "expected_action": item.get("expected_action"),
+                    "answer": item.get("answer"),
+                    "judge": item.get("judge"),
+                    "task_judge": item.get("task_judge"),
+                    "retrieval": {k: item.get(k) for k in (
+                        "retrieval_recall", "retrieval_precision", "retrieval_f1",
+                        "gt_images", "predicted_images", "predicted_file_names",
+                        "matched_file_names")},
+                    "agent_status": item.get("agent_status"),
+                    "termination_reason": item.get("termination_reason"),
+                    "turn_outcome": item.get("turn_outcome"),
+                    "timing_breakdown": item.get("timing_breakdown"),
+                    "agent_stability": item.get("agent_stability"),
+                    "answer_grounding": item.get("answer_grounding"),
+                    "tool_trace": item.get("tool_trace"),
+                    "agent2_trace": item.get("agent2_trace"),
+                    "turns": turns_out,
+                })
+            return {"run_id": run_id, "count": len(samples), "item_count": len(items_out),
+                    "items": items_out, "samples": samples,
+                    "scores": sorted(include) if include is not None else None,
+                    "min_score": min_score,
+                    "filtered": (include is not None or min_score is not None)}
 
     def get_run_items(self, run_id: str, page: int = 1, page_size: int = 20,
                       search: str = "", score: str = "", task_type: str = "",
@@ -2845,7 +4111,7 @@ class OrchestratorRepository:
                     attribution_layers[str(key)] = attribution_layers.get(str(key), 0) + 1
         saved.update({
             "total": saved.get("total", state.get("qa_count") or len(items)),
-            "completed": len(items),
+            "completed": sum(1 for item in items if item.get("judge_status") in {"completed", "failed", "skipped"}),
             "judge_valid_count": len(scores),
             "judge_distribution": distribution,
             "retrieval_recall_mean": saved.get("retrieval_recall_mean", round(sum(recalls) / len(recalls), 3) if recalls else None),
@@ -2867,7 +4133,7 @@ class OrchestratorRepository:
             "attribution": {"primary": attribution_primary, "layer_failures": attribution_layers},
             "delivery_breakdown": saved.get("delivery_breakdown", cls._aggregate_delivery(items)),
         })
-        for key, value in BenchmarkRun._capability_summary(items).items():
+        for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
             if saved.get(key) is None:
                 saved[key] = value
         if saved.get("benchmark_e2e_latency_excluding_judge_ms") is None:
@@ -2976,7 +4242,7 @@ class OrchestratorRepository:
                 else (round(sum(recalls) / len(recalls), 3) if recalls else None),
             "answer_quality_mean": round(sum(scores) / len(scores), 3) if scores else None,
         })
-        for key, value in BenchmarkRun._capability_summary(items).items():
+        for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
             if saved.get(key) is None:
                 saved[key] = value
         return saved
@@ -3102,7 +4368,7 @@ class OrchestratorRepository:
             "exact_accuracy": round(distribution["2"] / denom, 3) if denom else None,
             "core_accuracy": round((distribution["1"] + distribution["2"]) / denom, 3) if denom else None,
         })
-        summary.update(BenchmarkRun._capability_summary(items))
+        summary.update(BenchmarkRun._capability_summary(items, state.get("phases") or {}))
         state["summary"] = summary
         aggregate = (state.get("phases") or {}).get("aggregate")
         if aggregate:
@@ -3115,6 +4381,13 @@ class OrchestratorRepository:
         judge_url = str(payload.get("judge_url") or resolved_judge_url).rstrip("/")
         judge_model = str(payload.get("judge_model") or resolved_judge_model)
         judge_api_key = str(payload.get("judge_api_key") or resolved_judge_api_key)
+        saved_custom = load_custom_judge_prompts()
+        task_system_prompt = payload.get("task_system_prompt")
+        task_system_prompt = (str(task_system_prompt).strip() or saved_custom.get("task_decision")
+                              or TASK_JUDGE_PROMPT)
+        evidence_system_prompt = payload.get("evidence_system_prompt")
+        evidence_system_prompt = (str(evidence_system_prompt).strip() or saved_custom.get("evidence")
+                                  or EVIDENCE_JUDGE_PROMPT)
         if not system_prompt:
             raise ValueError("system_prompt is required")
         if len(system_prompt) > 50000:
@@ -3210,9 +4483,11 @@ class OrchestratorRepository:
                         self._persist_run_state(run_id, current, current_state)
 
                     judge_runner = BenchmarkRun.__new__(BenchmarkRun)
-                    judge_runner.judge_url = judge_url.rstrip("/").removesuffix("/v1")
+                    judge_runner.judge_url = judge_url.rstrip("/")
                     judge_runner.judge_model = judge_model
                     judge_runner.judge_api_key = judge_api_key
+                    judge_runner.task_judge_system_prompt = task_system_prompt
+                    judge_runner.evidence_judge_system_prompt = evidence_system_prompt
                     conversation_context = saved_turns[:turn_index + 1] if turn_index is not None else None
                     agent_status_rj = saved_turn.get("agent_status") or item.get("agent_status")
                     termination_reason_rj = saved_turn.get("termination_reason") or item.get("termination_reason") or ""
@@ -3346,8 +4621,24 @@ class OrchestratorRepository:
 
     def start_suite(self, payload: dict) -> dict:
         album_id = payload.get("album_id", "album3-14")
-        qa_set = payload.get("qa_set", "compact-10q")
+        mode = str(payload.get("mode") or "full").strip().lower()
+        if mode not in RUN_MODES:
+            raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
+        manifest_early = self.get_manifest(album_id)
+        if not manifest_early:
+            raise ValueError(f"manifest not found for album: {album_id}")
+        qa_set = payload.get("qa_set") or (
+            # build 模式不做 QA，允许不选；默认取 manifest 第一个仅用于加载结构。
+            next(iter(manifest_early.get("qa_sets") or {}), "")
+        )
+        if not qa_set:
+            raise ValueError(f"album {album_id} has no qa_sets in manifest")
+        existing_scope_id = str(payload.get("existing_scope_id") or "").strip()
+        if mode == "reuse" and not existing_scope_id:
+            raise ValueError("existing_scope_id is required when mode=reuse")
         models = payload.get("models", [])
+        if not isinstance(models, list) or not models:
+            raise ValueError("models must contain at least one model")
         sentrix_url = payload.get("sentrix_url", DEFAULT_SENTRIX_URL)
         judge_provider_id = str(payload.get("judge_provider_id") or DEFAULT_JUDGE_PROVIDER_ID)
         _, resolved_judge_url, resolved_judge_model, resolved_judge_api_key = resolve_judge_provider(judge_provider_id)
@@ -3356,11 +4647,38 @@ class OrchestratorRepository:
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
         # The benchmark uses the fixed primary Manager target.  Do not allow a
         # per-request URL to split the orchestrator and Sentrix runtime.
-        target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
-        vllm_api_url = str(target["manager_url"])
-        vllm_model_base_url = str(target["model_base_url"])
-        delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
+        if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
+            raise ValueError("big_model cannot be combined with current model")
+        managed_models = [model for model in models if model != BIG_MODEL_PROFILE_ID]
+        if managed_models:
+            target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+            vllm_api_url = str(target["manager_url"])
+            vllm_model_base_url = str(target["model_base_url"])
+        else:
+            target_id = ""
+            vllm_api_url = ""
+            vllm_model_base_url = ""
         dirty_statuses = {"running", "pending", "cancelling"}
+        with self.lock:
+            busy = [
+                rid for rid, run in self.runs.items()
+                if (run.state.get("status") if isinstance(run, BenchmarkRun)
+                    else run.get("status")) in dirty_statuses
+            ]
+        if busy:
+            raise ValueError(f"another benchmark suite is still active: {', '.join(busy)}")
+        use_current_model = CURRENT_MODEL_SELECTION in models
+        if use_current_model and len(models) != 1:
+            raise ValueError("current model cannot be combined with managed model profiles")
+        current_model_snapshot = None
+        if use_current_model:
+            current_model_snapshot = self.query_current_model(vllm_api_url, vllm_model_base_url)
+            models = [current_model_snapshot["model_id"]]
+            request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-runtime", {
+                "manager_url": vllm_api_url,
+                "model_base_url": vllm_model_base_url,
+            }, "POST", 30)
+        delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
         with self.lock:
             busy = [
                 rid
@@ -3374,20 +4692,41 @@ class OrchestratorRepository:
             if not manifest:
                 raise ValueError(f"manifest not found for album: {album_id}")
 
+            # reuse 模式：反查该 scope 由哪些历史 run 创建，写进新 run 做来源关联。
+            scope_reused_from_runs: list = []
+            if mode == "reuse":
+                for rid, run in self.runs.items():
+                    state = run.state if isinstance(run, BenchmarkRun) else run
+                    if (state.get("scope_id") == existing_scope_id
+                            and state.get("scope_source") == "created"
+                            and state.get("mode") in ("full", "build")):
+                        scope_reused_from_runs.append(rid)
+                scope_reused_from_runs.sort()
+
             suite_id = f"suite-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
             created_runs = []
             for model in models:
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                run_id = f"{ts}-{safe_slug(album_id)}-{safe_slug(model)}-{uuid.uuid4().hex[:6]}"
+                mode_tag = "" if mode == "full" else f"-{mode}"
+                run_id = f"{ts}-{safe_slug(album_id)}-{safe_slug(model)}{mode_tag}-{uuid.uuid4().hex[:6]}"
                 run = BenchmarkRun(
                     run_id=run_id, album_id=album_id, manifest=manifest,
                     model_profile=model, qa_set=qa_set,
-                    sentrix_url=sentrix_url, judge_url=judge_url, vllm_api_url=vllm_api_url,
-                    vllm_target_id=target_id, vllm_model_base_url=vllm_model_base_url,
+                    sentrix_url=sentrix_url, judge_url=judge_url,
+                    vllm_api_url=vllm_api_url if model != BIG_MODEL_PROFILE_ID else "",
+                    vllm_target_id=target_id if model != BIG_MODEL_PROFILE_ID else "",
+                    vllm_model_base_url=vllm_model_base_url if model != BIG_MODEL_PROFILE_ID else "",
                     results_root=self.results_root,
                     judge_system_prompt=load_custom_judge_prompt() or JUDGE_PROMPT,
+                    task_judge_system_prompt=load_custom_judge_prompts().get("task_decision") or TASK_JUDGE_PROMPT,
+                    evidence_judge_system_prompt=load_custom_judge_prompts().get("evidence") or EVIDENCE_JUDGE_PROMPT,
                     judge_model=judge_model, judge_api_key=judge_api_key_suite,
                     delete_scope_after_run=delete_scope_after_run,
+                    mode=mode, existing_scope_id=existing_scope_id,
+                    scope_reused_from_runs=scope_reused_from_runs,
+                    use_current_model=use_current_model,
+                    current_model_snapshot=current_model_snapshot,
+                    use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
                 )
                 self.runs[run_id] = run
                 created_runs.append(run_id)
@@ -3405,7 +4744,9 @@ class OrchestratorRepository:
 
         threading.Thread(target=_run_sequentially, name=f"suite-{suite_id}", daemon=True).start()
         return {"suite_id": suite_id, "run_ids": created_runs, "album_id": album_id,
-                "models": models, "qa_set": qa_set}
+                "models": models, "qa_set": qa_set, "mode": mode,
+                "existing_scope_id": existing_scope_id or None,
+                "current_model_snapshot": current_model_snapshot}
 
 
 # ---------------------------------------------------------------------------
@@ -3432,6 +4773,20 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/memory-spaces":
+                # 复用相册测评的相册下拉数据：转发 Sentrix 后端列表（新创建的在前）。
+                params = parse_qs(parsed.query)
+                sentrix_base = (params.get("sentrix_url") or [DEFAULT_SENTRIX_URL])[0].rstrip("/")
+                spaces = request_json(f"{sentrix_base}/api/memory-spaces", timeout=30)
+                if isinstance(spaces, dict):
+                    spaces = spaces.get("spaces") or spaces.get("items") or []
+                spaces = sorted(
+                    spaces or [],
+                    key=lambda s: str(s.get("created_at") or ""), reverse=True,
+                )
+                self._json({"spaces": spaces, "reuse_bases": _build_reuse_bases(
+                    spaces, self.repo.list_runs())})
+                return
             if parsed.path == "/api/config":
                 self._json({
                     "default_sentrix_url": DEFAULT_SENTRIX_URL,
@@ -3484,14 +4839,14 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 rows = load_jsonl(qa_path)
                 self._json({"album_id": album_id, "qa_set": qa_set, "items": rows})
                 return
-            if parsed.path.startswith("/api/albums/") and "/photos/" in parsed.path:
-                parts = parsed.path.removeprefix("/api/albums/").split("/photos/", 1)
-                if len(parts) == 2:
+            if parsed.path.startswith("/api/albums/"):
+                parts = parsed.path.removeprefix("/api/albums/").split("/", 2)
+                if len(parts) == 3 and parts[1] in {"photos", "faces"}:
                     album_id = unquote(parts[0])
-                    file_name = unquote(parts[1])
-                    photo_path = BENCHMARK_DATA_ROOT / album_id / "photos" / file_name
-                    if photo_path.is_file():
-                        self._serve_file(photo_path)
+                    file_name = unquote(parts[2])
+                    media_path = BENCHMARK_DATA_ROOT / album_id / parts[1] / file_name
+                    if media_path.is_file():
+                        self._serve_file(media_path)
                         return
                 self._json({"error": "photo not found"}, 404)
                 return
@@ -3521,9 +4876,11 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))
                 _q = parse_qs(parsed.query)
+                _raw_scores = (_q.get("scores") or [""])[0]
+                scores = [int(x) for x in _raw_scores.split(",") if x.strip() in {"0", "1", "2"}]
                 _raw = (_q.get("min_score") or [""])[0]
                 min_score = int(_raw) if _raw in {"1", "2"} else None
-                payload = self.repo.export_sft(run_id, min_score=min_score)
+                payload = self.repo.export_sft(run_id, scores=scores or None, min_score=min_score)
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -3531,6 +4888,25 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if parsed.path == "/api/judge-prompts":
+                custom = load_custom_judge_prompts()
+                self._json({
+                    "kinds": [
+                        {
+                            "kind": kind,
+                            "label": label,
+                            "default": JUDGE_PROMPT_KINDS[kind],
+                            "custom": custom.get(kind),
+                        }
+                        for kind, label in (
+                            ("answer_quality", "回答质量 Judge"),
+                            ("task_decision", "任务判断 Judge"),
+                            ("evidence", "证据核验 Judge"),
+                        )
+                    ],
+                    "storage_path": str(CUSTOM_JUDGE_PROMPT_PATH),
+                })
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/judge-prompt"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/judge-prompt"))
@@ -3579,6 +4955,20 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 save_custom_judge_prompt(prompt)
                 self._json({"status": "ok"})
                 return
+            if parsed.path == "/api/judge-prompts":
+                payload = self._payload()
+                kind = str(payload.get("kind") or "").strip()
+                prompt = str(payload.get("system_prompt") or "").strip()
+                if kind not in JUDGE_PROMPT_KINDS:
+                    raise ValueError(f"kind must be one of {sorted(JUDGE_PROMPT_KINDS)}")
+                if not prompt:
+                    raise ValueError("system_prompt is required (empty string to restore default is not allowed here)")
+                if len(prompt) > 50000:
+                    raise ValueError("system_prompt is too long")
+                save_custom_judge_prompt(prompt, kind)
+                self._json({"status": "ok", "kind": kind,
+                            "custom": load_custom_judge_prompts().get(kind)})
+                return
             payload = self._payload()
             if parsed.path.endswith("/rejudge") and parsed.path.startswith("/api/runs/"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/rejudge"))
@@ -3589,6 +4979,13 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/profiles":
                 target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
                 result = self.repo.query_profiles(str(target["manager_url"]))
+                result.update({"target_id": target_id, "target": target})
+                self._json(result)
+            elif self.path == "/api/current-model":
+                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                result = self.repo.query_current_model(
+                    str(target["manager_url"]), str(target["model_base_url"]),
+                )
                 result.update({"target_id": target_id, "target": target})
                 self._json(result)
             elif self.path == "/api/memory-profile":

@@ -30,6 +30,9 @@ class BgeM3TextQueryEmbedder:
         self._timeout = float(os.getenv("SENTRIX_TEXT_EMBEDDER_TIMEOUT", "10"))
         self._failures = 0
         self._tripped_at = 0.0
+        self._health_checked_at = 0.0
+        self._health_value = False
+        self._health_ttl = float(os.getenv("SENTRIX_TEXT_EMBEDDER_HEALTH_TTL", "10"))
 
     @property
     def model_id(self):
@@ -40,19 +43,44 @@ class BgeM3TextQueryEmbedder:
         return 1024
 
     @property
+    def circuit_open(self):
+        return bool(self._tripped_at and time.monotonic() - self._tripped_at < 30.0)
+
+    def status(self) -> dict:
+        """Expose sidecar health and breaker state for retrieval diagnostics."""
+        return {
+            "configured": True,
+            "available": bool(self.available),
+            "model_id": self.model_id,
+            "dimension": self.dimension,
+            "consecutive_failures": self._failures,
+            "circuit_open": self.circuit_open,
+            "health_checked": bool(self._health_checked_at),
+        }
+
+    @property
     def available(self):
         if httpx is None:
             return False
         if self._tripped_at and time.monotonic() - self._tripped_at < 30.0:
             return False
+        now = time.monotonic()
+        if now - self._health_checked_at < self._health_ttl:
+            return self._health_value
         try:
             response = httpx.get(f"{self._base_url}/health", timeout=1.5)
-            return response.status_code == 200
+            self._health_checked_at = now
+            self._health_value = response.status_code == 200
+            return self._health_value
         except Exception:
+            self._health_checked_at = now
+            self._health_value = False
             return False
 
     def _record_failure(self):
         self._failures += 1
+        self._health_value = False
+        self._health_checked_at = 0.0
         if self._failures >= 3:
             self._tripped_at = time.monotonic()
             self._failures = 0
@@ -60,6 +88,8 @@ class BgeM3TextQueryEmbedder:
     def _record_success(self):
         self._failures = 0
         self._tripped_at = 0.0
+        self._health_value = True
+        self._health_checked_at = time.monotonic()
 
     def embed_query(self, text: str) -> list[float]:
         if httpx is None:

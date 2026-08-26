@@ -1,14 +1,76 @@
 import json
 import math
+import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+from functools import wraps
 
 from .geocoding import format_gps_prefix
 from .semantic_taxonomy import ATMOSPHERE_PRIMARY_ALIASES, ATMOSPHERE_PRIMARY_TYPES, OTHER, normalize_semantic_analysis
+
+
+# 检索可观测性（进程级共享）：worker 各自新建 MemoryStore 连接执行检索，
+# 而 /api/health 只读模块级 store，实例级状态会漏掉 worker 侧的降级。
+_VECTOR_METRICS_GUARD = threading.Lock()
+_VECTOR_SEARCH_HISTORY = deque(maxlen=128)
+_VECTOR_DEGRADED_SINCE = None
+
+
+def _percentile(values, pct):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * (len(ordered) - 1)))))
+    return round(ordered[index], 1)
+
+
+def _record_vector_search(route, elapsed_ms, status):
+    global _VECTOR_DEGRADED_SINCE
+    backend = (status or {}).get("backend") or "unknown"
+    enabled = True
+    try:
+        from .qdrant_memory import _enabled as qdrant_enabled
+        enabled = qdrant_enabled()
+    except Exception:
+        pass
+    degraded = enabled and backend in {"sqlite", "sqlite_fallback"}
+    entry = {
+        "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "route": route,
+        "backend": backend,
+        "ms": round(elapsed_ms, 1),
+        "error": (status or {}).get("error"),
+    }
+    with _VECTOR_METRICS_GUARD:
+        _VECTOR_SEARCH_HISTORY.append(entry)
+        if degraded:
+            if _VECTOR_DEGRADED_SINCE is None:
+                _VECTOR_DEGRADED_SINCE = entry["ts"]
+        else:
+            _VECTOR_DEGRADED_SINCE = None
+
+
+def vector_search_metrics():
+    with _VECTOR_METRICS_GUARD:
+        history = list(_VECTOR_SEARCH_HISTORY)
+        degraded_since = _VECTOR_DEGRADED_SINCE
+    samples = [float(item["ms"]) for item in history if item.get("ms") is not None]
+    return {
+        "total_searches": len(history),
+        "active_backend": history[-1]["backend"] if history else None,
+        "active_route": history[-1]["route"] if history else None,
+        "last_search_at": history[-1]["ts"] if history else None,
+        "latency_p50_ms": _percentile(samples, 50),
+        "latency_p95_ms": _percentile(samples, 95),
+        "degraded_since": degraded_since,
+        "recent": history[-8:],
+    }
 
 
 def make_id(prefix):
@@ -27,6 +89,44 @@ def parse_time(value):
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def _defer_entity_maintenance_commits(method):
+    """Commit an observation's derived entity graph once after all writes succeed."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        previous = getattr(self, "_defer_entity_maintenance_commits", False)
+        self._defer_entity_maintenance_commits = True
+        try:
+            result = method(self, *args, **kwargs)
+            _commit_with_retry(self.connection, "entity-maintenance")
+            self._flush_pending_qdrant_upserts()
+            return result
+        except Exception:
+            self.connection.rollback()
+            raise
+        finally:
+            self._defer_entity_maintenance_commits = previous
+
+    return wrapped
+
+
+_SQLITE_COMMIT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.5, 1.0)
+
+
+def _commit_with_retry(connection, label="sqlite-commit"):
+    """Retry only the commit boundary; callers remain responsible for idempotency."""
+    delays = (0.0, *_SQLITE_COMMIT_RETRY_DELAYS)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            connection.commit()
+            return
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).lower() or attempt == len(delays) - 1:
+                raise
+            print(f"[sqlite-commit-retry] {label} attempt={attempt + 1}", flush=True)
 
 
 def json_value(value, fallback):
@@ -215,6 +315,7 @@ class MemoryStore:
 
     def __init__(self, path):
         self.path = str(path)
+        self._last_vector_search = {"backend": "sqlite", "error": None}
         self.connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
@@ -241,6 +342,29 @@ class MemoryStore:
 
     def close(self):
         self.connection.close()
+
+    @contextmanager
+    def transaction(self):
+        """Group related writes into one SQLite transaction.
+
+        Nested callers share the outer transaction. Methods that normally
+        commit immediately route through _commit so pipeline batches can
+        defer the fsync and release the SQLite writer lock once.
+        """
+        depth = int(getattr(self, "_transaction_depth", 0) or 0)
+        self._transaction_depth = depth + 1
+        try:
+            yield self
+        except Exception:
+            if depth == 0:
+                self.connection.rollback()
+            raise
+        else:
+            if depth == 0:
+                _commit_with_retry(self.connection, "transaction")
+                self._flush_pending_qdrant_upserts()
+        finally:
+            self._transaction_depth = depth
 
     def apply_authorized_revision(self, *, proposal_id, confirmation_token, actor):
         """Plan §6 Memory Kernel entry point.
@@ -276,6 +400,7 @@ class MemoryStore:
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'household',
+                include_in_people INTEGER NOT NULL DEFAULT 1,
                 source_path TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL,
@@ -329,6 +454,7 @@ class MemoryStore:
                 confidence REAL NOT NULL DEFAULT 0,
                 raw_json TEXT NOT NULL DEFAULT '{}',
                 canonical_json TEXT NOT NULL DEFAULT '{}',
+                detail_json TEXT NOT NULL DEFAULT '{}',
                 source_owner_id TEXT,
                 inferred_captured_by TEXT,
                 clothing_json TEXT NOT NULL DEFAULT '[]',
@@ -507,6 +633,7 @@ class MemoryStore:
                 embedding_model TEXT NOT NULL DEFAULT 'unknown',
                 embedding_version TEXT NOT NULL DEFAULT 'unknown',
                 embedding_quality_signal REAL NOT NULL DEFAULT 0,
+                validity TEXT NOT NULL DEFAULT 'uncertain',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS face_prototypes (
@@ -913,10 +1040,129 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_person_patterns_person ON person_patterns(person_id, pattern_type);
             CREATE INDEX IF NOT EXISTS idx_person_patterns_scope ON person_patterns(scope_id, pattern_type);
             CREATE INDEX IF NOT EXISTS idx_query_gaps_status ON query_gaps(status);
+            CREATE TABLE IF NOT EXISTS person_insight_runs (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                status TEXT NOT NULL DEFAULT 'queued',
+                current_stage TEXT NOT NULL DEFAULT 'queued',
+                config_json TEXT NOT NULL DEFAULT '{}',
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS person_moments (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                run_id TEXT REFERENCES person_insight_runs(id),
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                cluster_id TEXT NOT NULL REFERENCES face_clusters(id),
+                event_id TEXT NOT NULL REFERENCES events(id),
+                observation_id TEXT NOT NULL REFERENCES observations(id),
+                asset_id TEXT NOT NULL REFERENCES assets(id),
+                face_instance_id TEXT NOT NULL REFERENCES face_instances(id),
+                action_text TEXT NOT NULL DEFAULT '',
+                interaction_target_ids_json TEXT NOT NULL DEFAULT '[]',
+                interaction_text TEXT NOT NULL DEFAULT '',
+                participation_style TEXT NOT NULL DEFAULT '',
+                visible_affect TEXT NOT NULL DEFAULT '',
+                social_role_cues_json TEXT NOT NULL DEFAULT '[]',
+                narrative_note TEXT NOT NULL DEFAULT '',
+                selection_json TEXT NOT NULL DEFAULT '{}',
+                confidence REAL NOT NULL DEFAULT 0,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(person_id, observation_id, prompt_version)
+            );
+            CREATE TABLE IF NOT EXISTS person_role_hypotheses (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                run_id TEXT REFERENCES person_insight_runs(id),
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                relative_to_person_id TEXT REFERENCES entities(id),
+                role TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_moment_ids_json TEXT NOT NULL DEFAULT '[]',
+                reason_summary TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'suggested',
+                revision INTEGER NOT NULL DEFAULT 1,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS relationship_hypotheses (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                run_id TEXT REFERENCES person_insight_runs(id),
+                subject_person_id TEXT NOT NULL REFERENCES entities(id),
+                predicate TEXT NOT NULL,
+                object_person_id TEXT NOT NULL REFERENCES entities(id),
+                inverse_predicate TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_moment_ids_json TEXT NOT NULL DEFAULT '[]',
+                reason_summary TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'suggested',
+                revision INTEGER NOT NULL DEFAULT 1,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(subject_person_id != object_person_id)
+            );
+            CREATE TABLE IF NOT EXISTS person_portrait_revisions (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                person_id TEXT NOT NULL REFERENCES entities(id),
+                revision INTEGER NOT NULL,
+                portrait_text TEXT NOT NULL,
+                themes_json TEXT NOT NULL DEFAULT '[]',
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                trigger_type TEXT NOT NULL,
+                model_name TEXT NOT NULL DEFAULT 'unknown',
+                prompt_version TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                user_feedback TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(person_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_person_insight_runs_scope
+                ON person_insight_runs(scope_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_person_moments_person
+                ON person_moments(person_id, status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_person_moments_event
+                ON person_moments(event_id, person_id);
+            CREATE INDEX IF NOT EXISTS idx_person_roles_person
+                ON person_role_hypotheses(person_id, status, rank);
+            CREATE INDEX IF NOT EXISTS idx_relationship_hypotheses_scope
+                ON relationship_hypotheses(scope_id, status);
+            CREATE INDEX IF NOT EXISTS idx_person_portraits_person
+                ON person_portrait_revisions(person_id, revision DESC);
             """
         )
         self.connection.commit()
+        self._ensure_columns("memory_spaces", {"include_in_people": "INTEGER NOT NULL DEFAULT 1"})
+        self._ensure_columns("observations", {"detail_json": "TEXT NOT NULL DEFAULT '{}'"})
+        self._ensure_columns("face_instances", {"validity": "TEXT NOT NULL DEFAULT 'uncertain'"})
+        self._ensure_columns("entities", {
+            "identity_state": "TEXT NOT NULL DEFAULT 'clustered'",
+            "role_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "name_state": "TEXT NOT NULL DEFAULT 'anonymous'",
+        })
+        self._ensure_columns("relationships", {
+            "inverse_predicate": "TEXT",
+        })
+        self._migrate_evaluation_spaces()
         self._migrate_legacy_persons()
+        self._migrate_person_identity_states()
 
     def _ensure_columns(self, table, columns):
         existing = {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -980,6 +1226,20 @@ class MemoryStore:
         if violations:
             raise RuntimeError("face instance migration produced foreign-key violations")
 
+    def _migrate_evaluation_spaces(self):
+        """One-time backfill: evaluation/benchmark spaces never appear in people views.
+
+        Later spaces are flagged via include_in_people at creation time; this
+        backfill covers the historical PhotoBench/photobench/e2b spaces by name
+        so the people view is not polluted by benchmark face clusters.
+        """
+        self.connection.execute(
+            """UPDATE memory_spaces SET include_in_people = 0
+            WHERE name LIKE 'PhotoBench%' OR name LIKE 'photobench%'
+            OR id LIKE '%_e2b' OR id LIKE 'photobench%'"""
+        )
+        self.connection.commit()
+
     def _migrate_legacy_persons(self):
         """Keep the first prototype's person candidates visible in the native entity view."""
         rows = self._rows("SELECT * FROM persons")
@@ -994,16 +1254,57 @@ class MemoryStore:
             )
         self.connection.commit()
 
+    def _migrate_person_identity_states(self):
+        """Derive identity/role/name confirmation states from legacy user-confirmed fields.
+
+        The migration only reads fields that users explicitly confirmed in the past:
+        a confirmed status, a non-empty family role, and a non-placeholder canonical
+        name. It never invents facts and must be idempotent, so re-running it is a no-op.
+        """
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE entities SET identity_state = 'stable', updated_at = ?
+            WHERE entity_type = 'person' AND status = 'confirmed' AND identity_state != 'stable'""",
+            (timestamp,),
+        )
+        self.connection.execute(
+            """UPDATE entities SET role_state = 'confirmed', updated_at = ?
+            WHERE entity_type = 'person' AND family_role IS NOT NULL AND family_role != ''
+            AND role_state != 'confirmed'""",
+            (timestamp,),
+        )
+        self.connection.execute(
+            """UPDATE entities SET name_state = 'confirmed', updated_at = ?
+            WHERE entity_type = 'person' AND status = 'confirmed'
+            AND canonical_name IS NOT NULL AND canonical_name != ''
+            AND canonical_name NOT LIKE '待确认%' AND canonical_name NOT LIKE '人物%'
+            AND canonical_name NOT LIKE '核心人物%' AND canonical_name NOT LIKE '未命名%'
+            AND name_state != 'confirmed'""",
+            (timestamp,),
+        )
+        self.connection.commit()
+
     def count(self, table):
         if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "entity_merge_candidates", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "dialogue_states", "rebuild_runs", "stories", "invites", "trips"}:
             raise ValueError("unsupported table")
-        return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchall()[0][0]
 
-    def create_memory_space(self, scope_id, name, kind="household", source_path=None):
+    def create_memory_space(self, scope_id, name, kind="household", source_path=None, include_in_people=True):
         timestamp = now_iso()
+        for attempt in range(5):
+            try:
+                self._insert_memory_space(scope_id, name, kind, source_path, include_in_people, timestamp)
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 4:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+        return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
+
+    def _insert_memory_space(self, scope_id, name, kind, source_path, include_in_people, timestamp):
         self.connection.execute(
-            """INSERT INTO memory_spaces(id, name, kind, source_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO memory_spaces(id, name, kind, include_in_people, source_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
             name = CASE
                 WHEN memory_spaces.name IS NULL OR trim(memory_spaces.name) = ''
@@ -1012,11 +1313,11 @@ class MemoryStore:
                 ELSE memory_spaces.name
             END,
             kind = excluded.kind,
+            include_in_people = excluded.include_in_people,
             source_path = excluded.source_path, updated_at = excluded.updated_at""",
-            (scope_id, name, kind, source_path, timestamp, timestamp),
+            (scope_id, name, kind, int(bool(include_in_people)), source_path, timestamp, timestamp),
         )
-        self.connection.commit()
-        return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
+        self._commit()
 
     def list_memory_spaces(self, status="active"):
         if status:
@@ -1024,11 +1325,37 @@ class MemoryStore:
         return self._rows("SELECT * FROM memory_spaces ORDER BY created_at")
 
     def _row(self, query, params=()):
-        row = self.connection.execute(query, params).fetchone()
-        return dict(row) if row else None
+        rows = self.connection.execute(query, params).fetchall()
+        return dict(rows[0]) if rows else None
 
     def _rows(self, query, params=()):
         return [dict(row) for row in self.connection.execute(query, params).fetchall()]
+
+    def _commit(self):
+        if not getattr(self, "_defer_entity_maintenance_commits", False) and not getattr(self, "_transaction_depth", 0):
+            _commit_with_retry(self.connection)
+
+    def _queue_qdrant_upsert(self, payload):
+        pending = getattr(self, "_pending_qdrant_upserts", None)
+        if pending is None:
+            pending = []
+            self._pending_qdrant_upserts = pending
+        pending.append(payload)
+
+    def _flush_pending_qdrant_upserts(self):
+        pending = getattr(self, "_pending_qdrant_upserts", None)
+        if not pending:
+            return
+        self._pending_qdrant_upserts = []
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is None:
+                return
+            for payload in pending:
+                accelerator.upsert(**payload)
+        except Exception as error:
+            print(f"[qdrant-derived-write] deferred upsert failed: {type(error).__name__}: {error}", flush=True)
 
     def _decode(self, row, fields):
         if not row:
@@ -1061,7 +1388,7 @@ class MemoryStore:
                 metadata.get("source_frame_index"), metadata.get("source_scene_index"), timestamp, timestamp,
             ),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_asset(asset_id)
 
     def get_asset(self, asset_id):
@@ -1120,7 +1447,7 @@ class MemoryStore:
                 now_iso(), asset_id,
             ),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_asset(asset_id)
 
     def create_ingest_batch(self, batch_id, scope_id="home-default"):
@@ -1202,6 +1529,15 @@ class MemoryStore:
         self.connection.commit()
         return self.get_ingest_batch(batch_id)
 
+    def reopen_ingest_batch(self, batch_id):
+        """Reopen a completed batch so recovered assets can be finalized."""
+        self.connection.execute(
+            "UPDATE ingest_batches SET status = 'complete', updated_at = ? WHERE id = ? AND status = 'completed'",
+            (now_iso(), str(batch_id)),
+        )
+        self.connection.commit()
+        return self.get_ingest_batch(batch_id)
+
     def batch_event_ids(self, batch_id):
         rows = self._rows(
             """SELECT DISTINCT eo.event_id FROM event_observations eo
@@ -1232,6 +1568,9 @@ class MemoryStore:
         if face_ids:
             face_placeholders = ",".join("?" for _ in face_ids)
             self.connection.execute(f"DELETE FROM face_prototypes WHERE face_instance_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM person_appearance_evidence WHERE face_instance_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM entity_mentions WHERE face_instance_id IN ({face_placeholders})", face_ids)
+            self.connection.execute(f"DELETE FROM person_moments WHERE face_instance_id IN ({face_placeholders})", face_ids)
             self.connection.execute(f"DELETE FROM memory_vectors WHERE source_type = 'face_instance' AND source_id IN ({face_placeholders})", face_ids)
             self.connection.execute(f"DELETE FROM face_instances WHERE id IN ({face_placeholders})", face_ids)
         self.connection.execute(
@@ -1245,10 +1584,11 @@ class MemoryStore:
         self.connection.execute(f"DELETE FROM entity_mentions WHERE observation_id IN ({placeholders})", observation_ids)
         self.connection.execute(f"DELETE FROM observations WHERE id IN ({placeholders})", observation_ids)
         for event_id in event_ids:
-            if self.connection.execute("SELECT COUNT(*) FROM event_observations WHERE event_id = ?", (event_id,)).fetchone()[0] == 0:
+            if self.connection.execute("SELECT COUNT(*) FROM event_observations WHERE event_id = ?", (event_id,)).fetchall()[0][0] == 0:
                 self.connection.execute("DELETE FROM event_entities WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM event_participants WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM event_revisions WHERE event_id = ?", (event_id,))
+                self.connection.execute("DELETE FROM person_event_memory WHERE event_id = ?", (event_id,))
                 self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.commit()
 
@@ -1423,8 +1763,8 @@ class MemoryStore:
             """INSERT INTO observations(
                 id, scope_id, asset_id, captured_at, source_type, caption, activity, place,
                 people_json, objects_json, ocr_text, event_type, transcript, confidence, raw_json,
-                canonical_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                canonical_json, detail_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 observation_id,
                 scope_id,
@@ -1442,6 +1782,7 @@ class MemoryStore:
                 float(data.get("confidence", 0) or 0),
                 json_value(data.get("raw"), {}),
                 json_value(data.get("canonical"), {}),
+                json_value(data.get("detail"), {}),
                 data.get("source_owner_id"),
                 data.get("inferred_captured_by"),
                 json_value(data.get("clothing"), []),
@@ -1451,16 +1792,17 @@ class MemoryStore:
                 timestamp,
             ),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_observation(observation_id)
 
     def get_observation(self, observation_id):
-        result = self._decode(self._row("SELECT * FROM observations WHERE id = ?", (observation_id,)), ["people_json", "objects_json", "raw_json", "canonical_json", "clothing_json", "spatial_relations_json"])
+        result = self._decode(self._row("SELECT * FROM observations WHERE id = ?", (observation_id,)), ["people_json", "objects_json", "raw_json", "canonical_json", "detail_json", "clothing_json", "spatial_relations_json"])
         if result:
             result["people"] = result.get("people_json", [])
             result["objects"] = result.get("objects_json", [])
             result["raw"] = result.get("raw_json", {})
             result["canonical"] = result.get("canonical_json", {})
+            result["detail"] = result.get("detail_json", {})
             result["clothing"] = result.get("clothing_json", [])
             result["spatial_relations"] = result.get("spatial_relations_json", [])
         return result
@@ -1469,10 +1811,11 @@ class MemoryStore:
         observation = self.get_observation(observation_id)
         if not observation:
             return None
-        canonical = {**(observation.get("canonical") or {}), **{key: value for key, value in details.items() if value not in (None, "", [], {})}}
-        assignments = ["canonical_json = ?", "revision = revision + 1"]
-        params = [json_value(canonical, {})]
-        for key, column in (("objects", "objects_json"), ("clothing", "clothing_json"), ("spatial_relations", "spatial_relations_json")):
+        canonical = {**(observation.get("canonical") or {}), **{key: value for key, value in details.items() if key != "detail" and value not in (None, "", [], {})}}
+        detail = {**(observation.get("detail") or {}), **(details.get("detail") or {})}
+        assignments = ["canonical_json = ?", "detail_json = ?", "revision = revision + 1"]
+        params = [json_value(canonical, {}), json_value(detail, {})]
+        for key, column in (("people", "people_json"), ("objects", "objects_json"), ("clothing", "clothing_json"), ("spatial_relations", "spatial_relations_json")):
             if key in details:
                 assignments.append(f"{column} = ?")
                 params.append(json_value(details[key], []))
@@ -1483,7 +1826,7 @@ class MemoryStore:
         assignments.extend(["updated_at = ?"])
         params.extend([now_iso(), observation_id])
         self.connection.execute(f"UPDATE observations SET {', '.join(assignments)} WHERE id = ?", params)
-        self.connection.commit()
+        self._commit()
         mentioned = self._rows("SELECT DISTINCT entity_id FROM entity_mentions WHERE observation_id = ?", (observation_id,))
         for item in mentioned:
             self.rebuild_person_memory(item["entity_id"])
@@ -1494,18 +1837,21 @@ class MemoryStore:
         return self._rows("SELECT entity_id, confidence FROM entity_mentions WHERE observation_id = ?",
                           (observation_id,))
 
-    def list_observations(self, limit=100, scope_id=None):
-        if scope_id:
+    def list_observations(self, limit=100, scope_id=None, asset_id=None):
+        if asset_id:
+            rows = self._rows("SELECT * FROM observations WHERE asset_id = ? ORDER BY created_at DESC LIMIT ?", (asset_id, limit))
+        elif scope_id:
             rows = self._rows("SELECT * FROM observations WHERE scope_id = ? ORDER BY created_at DESC LIMIT ?", (scope_id, limit))
         else:
             rows = self._rows("SELECT * FROM observations ORDER BY created_at DESC LIMIT ?", (limit,))
         values = []
         for row in rows:
-            value = self._decode(row, ["people_json", "objects_json", "raw_json", "canonical_json", "clothing_json", "spatial_relations_json"])
+            value = self._decode(row, ["people_json", "objects_json", "raw_json", "canonical_json", "detail_json", "clothing_json", "spatial_relations_json"])
             value["people"] = value.get("people_json", [])
             value["objects"] = value.get("objects_json", [])
             value["raw"] = value.get("raw_json", {})
             value["canonical"] = value.get("canonical_json", {})
+            value["detail"] = value.get("detail_json", {})
             value["clothing"] = value.get("clothing_json", [])
             value["spatial_relations"] = value.get("spatial_relations_json", [])
             values.append(value)
@@ -1607,7 +1953,9 @@ class MemoryStore:
         # group shots, and different camera angles need not look alike. Split
         # only when independent semantic evidence also conflicts and no known
         # person/object bridges the candidate event.
-        if visual_available and semantic_conflict and visual_similarity < 0.45 and not corroborated:
+        if semantic_conflict and not corroborated and (
+            not visual_available or visual_similarity < 0.45
+        ):
             split_guard = "semantic_visual_conflict"
         visual_boost = (
             max(0.0, min(1.0, (visual_similarity - 0.70) / 0.30))
@@ -1756,9 +2104,11 @@ class MemoryStore:
         location_score = max((max(0.0, 1.0 - min(value, 1000.0) / 1000.0) for value in distances), default=0.0)
         left_vectors, right_vectors = self._event_asset_vectors(left), self._event_asset_vectors(right)
         visual_score = max((self._cosine(a, b) for a in left_vectors for b in right_vectors), default=0.0)
-        semantic_score = self._set_overlap(self._event_semantic_values(left), self._event_semantic_values(right))
+        left_semantic, right_semantic = self._event_semantic_values(left), self._event_semantic_values(right)
+        semantic_score = self._set_overlap(left_semantic, right_semantic)
+        semantic_conflict = bool(left_semantic and right_semantic and not semantic_score)
         face_overlap = bool(self._event_face_clusters(left).intersection(self._event_face_clusters(right)))
-        merge = time_score >= 0.70 and (
+        merge = not semantic_conflict and time_score >= 0.70 and (
             (location_score >= 0.65 and (visual_score >= 0.55 or semantic_score > 0 or face_overlap))
             or (visual_score >= 0.80 and (semantic_score > 0 or face_overlap))
             or (location_score >= 0.85 and semantic_score > 0)
@@ -1766,6 +2116,7 @@ class MemoryStore:
         return {
             "merge": merge, "time": time_score, "location": location_score,
             "visual_similarity": visual_score, "semantic": semantic_score,
+            "semantic_conflict": semantic_conflict,
             "face_overlap": face_overlap,
             "total": 0.35 * time_score + 0.25 * location_score + 0.25 * visual_score + 0.10 * semantic_score + (0.05 if face_overlap else 0.0),
         }
@@ -1875,7 +2226,7 @@ class MemoryStore:
                 "UPDATE events SET aggregation_score = ?, aggregation_breakdown_json = ? WHERE id = ?",
                 (float(event.get("aggregation_score", 0) or 0), json_value(event.get("aggregation_breakdown", {}), {}), event_id),
             )
-        self.connection.commit()
+        self._commit()
         self.select_event_cover(event_id)
         self._refresh_event_participants([observation["id"]])
         return self.get_event(event_id)
@@ -1895,13 +2246,22 @@ class MemoryStore:
             row["cover_selection"] = row.get("cover_selection_json", {})
             row["source_metadata"] = row.get("source_metadata_json", {})
             if row.get("source_type") == "video_scene":
+                derived_assets = self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
+                # WebP imports created before scene_index was persisted still
+                # belong to this event through event_observations.  Keep them
+                # visible while new imports use the indexed fast path above.
+                if not derived_assets:
+                    derived_assets = [
+                        self.get_asset(asset_id) for asset_id in row.get("asset_ids", [])
+                        if (self.get_asset(asset_id) or {}).get("derived_kind") == "video_keyframe_webp"
+                    ]
                 row["keyframe_assets"] = [
                     {key: asset.get(key) for key in (
                         "id", "file_name", "media_type", "status", "captured_at", "captured_location",
                         "parent_asset_id", "derived_kind", "source_timestamp_sec", "source_frame_index",
                         "source_scene_index",
                     )}
-                    for asset in self.list_derived_assets(row.get("source_asset_id"), row.get("source_scene_index"))
+                    for asset in derived_assets if asset
                 ]
                 source_video = self.get_asset(row.get("source_asset_id")) or {}
                 row["source_video"] = {key: source_video.get(key) for key in (
@@ -1918,14 +2278,16 @@ class MemoryStore:
             "INSERT OR IGNORE INTO event_observations(event_id, observation_id) VALUES (?, ?)",
             (event_id, observation_id),
         )
-        self.connection.commit()
+        self._commit()
         self.select_event_cover(event_id)
         self._refresh_event_participants([observation_id])
         return self.get_event(event_id)
 
     def list_derived_assets(self, parent_asset_id, scene_index=None):
         params = [parent_asset_id]
-        where = "parent_asset_id = ? AND derived_kind = 'video_keyframe'"
+        # Support both the legacy image keyframes and the current WebP
+        # keyframes produced by the hybrid extraction pipeline.
+        where = "parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')"
         if scene_index is not None:
             where += " AND source_scene_index = ?"
             params.append(int(scene_index))
@@ -1983,7 +2345,7 @@ class MemoryStore:
             (video_asset_id,),
         )
         self.connection.execute(
-            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind = 'video_keyframe'",
+            "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')",
             (video_asset_id,),
         )
         self.connection.commit()
@@ -2021,7 +2383,7 @@ class MemoryStore:
             "UPDATE events SET cover_asset_id = ?, cover_selection_json = ?, updated_at = ? WHERE id = ?",
             (asset["id"], json_value(selection, {}), now_iso(), event_id),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_event(event_id)
 
     def upsert_event_participant(self, event_id, person_id, role, evidence_ids=None, confidence=0.5):
@@ -2043,7 +2405,7 @@ class MemoryStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (make_id("event_person"), event_id, person_id, role, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
             )
-        self.connection.commit()
+        self._commit()
         self._maintain_event_cooccurrence_candidates(event_id)
         return self.list_event_participants(event_id)
 
@@ -2149,7 +2511,7 @@ class MemoryStore:
             "UPDATE events SET summary = ?, place = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
             (summary, place, now_iso(), event_id),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_event(event_id)
 
     def get_semantic_profile(self, person_id):
@@ -2378,6 +2740,49 @@ class MemoryStore:
             "claims": self.list_semantic_claims(person_id),
         }
 
+    def person_profile_digest(self, person_id, scope_id=None):
+        """Assemble a high-dimensional person profile for agent recall: identity,
+        relationships, behavior patterns, recent events and semantic claims."""
+        entity = self.get_entity(person_id)
+        if not entity or entity.get("entity_type") != "person":
+            return None
+        memory = self.get_person_memory(person_id, scope_id)
+        profile = memory.get("profile") or {}
+        relationships = []
+        for rel in self.list_person_relationships(scope_id):
+            if rel.get("subject_entity_id") == person_id:
+                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("object_name"), "id": rel.get("id"), "status": rel.get("status")})
+            elif rel.get("object_entity_id") == person_id:
+                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("subject_name"), "id": rel.get("id"), "status": rel.get("status")})
+        pattern_groups = {}
+        for pattern in memory.get("patterns") or []:
+            pattern_groups.setdefault(pattern.get("pattern_type"), []).append(
+                {"value": pattern.get("value_text"), "count": pattern.get("support_count") or 0}
+            )
+        top_patterns = []
+        for key in ("activity", "place", "co_person", "clothing"):
+            items = sorted(pattern_groups.get(key, []), key=lambda item: -item["count"])[:3]
+            if items:
+                top_patterns.append({"type": key, "items": items})
+        recent_events = sorted(memory.get("event_memory") or [], key=lambda e: e.get("time_start") or "", reverse=True)[:5]
+        recent_events = [{"title": e.get("activity_text") or e.get("title") or "", "time_start": e.get("time_start")} for e in recent_events]
+        claims = [claim for claim in (memory.get("claims") or []) if claim.get("status") in ("active", "pending")]
+        claims_top = [{"dimension": c.get("dimension"), "predicate": c.get("predicate"), "value": c.get("value_text"), "confidence": c.get("confidence")} for c in claims[:12]]
+        return {
+            "person": entity.get("canonical_name"),
+            "family_role": entity.get("family_role") or "",
+            "status": entity.get("status"),
+            "summary_zh": profile.get("summary_zh") or "",
+            "preference_summary_zh": profile.get("preference_summary_zh") or "",
+            "activity_summary_zh": profile.get("activity_summary_zh") or "",
+            "place_summary_zh": profile.get("place_summary_zh") or "",
+            "appearance_summary_zh": profile.get("appearance_summary_zh") or "",
+            "relationships": relationships,
+            "patterns": top_patterns,
+            "recent_events": recent_events,
+            "claims": claims_top,
+        }
+
     def _rebuild_person_event_memory(self, person_id, event_ids, mentions_by_event):
         self.connection.execute("DELETE FROM person_event_memory WHERE person_id = ?", (person_id,))
         entity = self.get_entity(person_id) or {}
@@ -2581,11 +2986,23 @@ class MemoryStore:
             f"{event.get('time_start') or '时间未知'} 在{event.get('place') or '地点未知'}：{event.get('activity') or event.get('title') or '家庭记录'}"
             for event in event_rows[:12]
         )
+        pref_by_type = {}
+        for pattern in patterns:
+            pref_by_type.setdefault(pattern.get("pattern_type"), []).append(
+                (pattern.get("value_text"), pattern.get("support_count") or 0)
+            )
+        pref_parts = []
+        for label, key in (("常去地点", "place"), ("常做活动", "activity"), ("常同行", "co_person")):
+            items = sorted(pref_by_type.get(key, []), key=lambda item: -item[1])[:3]
+            if items:
+                pref_parts.append(label + "：" + "、".join(f"{value}({count})" for value, count in items))
+        preference_summary = "；".join(pref_parts) or "暂无可归属的行为规律证据"
         profile = self.upsert_semantic_profile(person_id, {
             "summary_zh": summary,
             "activity_summary_zh": activity_summary or "暂无已确认活动",
             "place_summary_zh": "、".join(places[:12]),
             "appearance_summary_zh": "、".join(clothing_values[:12]) or "暂无可归属的人物级衣物证据",
+            "preference_summary_zh": preference_summary,
             "scope_id": entity.get("scope_id") or "home-default",
             "event_memory_json": event_memory,
             "patterns_json": patterns,
@@ -2780,8 +3197,19 @@ class MemoryStore:
                 "INSERT INTO event_entities(event_id, entity_id, relation, evidence_ids_json, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (event_id, entity_id, relation, json_value(evidence_ids, []), float(confidence or 0), timestamp, timestamp),
             )
-        self.connection.commit()
-        return self.list_event_entities(event_id)
+        self._commit()
+        row = self._row(
+            """SELECT ee.*, e.id AS entity_id_value, e.entity_type, e.canonical_name, e.status, e.summary
+            FROM event_entities ee JOIN entities e ON e.id = ee.entity_id
+            WHERE ee.event_id = ? AND ee.entity_id = ? AND ee.relation = ?""",
+            (event_id, entity_id, relation),
+        )
+        if not row:
+            return None
+        value = self._decode(row, ["evidence_ids_json"])
+        value["id"] = value.pop("entity_id_value")
+        value["evidence_count"] = len(value["evidence_ids_json"])
+        return self.public_entity(value)
 
     def list_event_entities(self, event_id):
         rows = self._rows(
@@ -2845,7 +3273,7 @@ class MemoryStore:
                     "INSERT INTO event_revisions(id, event_id, field_name, old_value, new_value, source, created_at) VALUES (?, ?, ?, ?, ?, 'user', ?)",
                     (make_id("event_revision"), event_id, key, str(event.get(key) or ""), str(value or ""), now_iso()),
                 )
-        self.connection.commit()
+        self._commit()
         return self.get_event(event_id)
 
     def _fact_row(self, row):
@@ -3006,17 +3434,86 @@ class MemoryStore:
                 scope_id = excluded.scope_id, vector_json = excluded.vector_json, metadata_json = excluded.metadata_json, updated_at = excluded.updated_at""",
             (make_id("vec"), metadata["scope_id"], space, source_type, source_id, json_value(values, []), model_name, json_value(metadata, {}), timestamp, timestamp),
         )
-        self.connection.commit()
-        return self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
+        self._commit()
+        row = self._row("SELECT * FROM memory_vectors WHERE space = ? AND source_type = ? AND source_id = ? AND model_name = ?", (space, source_type, source_id, model_name))
+        payload = {
+            "row_id": row["id"], "scope_id": row["scope_id"], "space": space,
+            "source_type": source_type, "source_id": source_id, "vector": values,
+            "model_name": model_name, "metadata": metadata,
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+        self._queue_qdrant_upsert(payload)
+        if not getattr(self, "_transaction_depth", 0) and not getattr(self, "_defer_entity_maintenance_commits", False):
+            self._flush_pending_qdrant_upserts()
+        return row
 
-    def search_vectors(self, space, vector, limit=10, scope_id=None):
+    def search_vectors(self, space, vector, limit=10, scope_id=None, model_name=None, route=None):
+        started = time.perf_counter()
+        try:
+            return self._search_vectors_impl(space, vector, limit=limit, scope_id=scope_id, model_name=model_name)
+        finally:
+            _record_vector_search(route or "default", (time.perf_counter() - started) * 1000.0,
+                                  dict(self._last_vector_search))
+
+    def _search_vectors_impl(self, space, vector, limit=10, scope_id=None, model_name=None):
         query = self._normalise_vector(vector)
+        if not query:
+            self._last_vector_search = {"backend": "noop", "error": None}
+            return []
+        try:
+            from .qdrant_memory import get_qdrant_index
+            accelerator = get_qdrant_index(self.path)
+            if accelerator is not None:
+                matching = accelerator.matching_collections(
+                    space=space, dimension=len(query), model_name=model_name,
+                    scope_id=scope_id,
+                )
+                accelerated = accelerator.search(
+                    space=space, vector=query, limit=max(limit * 4, limit),
+                    scope_id=scope_id, model_name=model_name,
+                )
+                if accelerated:
+                    row_ids = [item.get("id") for item in accelerated if item.get("id")]
+                    placeholders = ",".join("?" for _ in row_ids)
+                    current_ids = {
+                        row["id"] for row in self._rows(
+                            f"SELECT id FROM memory_vectors WHERE id IN ({placeholders})", row_ids
+                        )
+                    } if row_ids else set()
+                    if len(current_ids) != len(accelerated):
+                        self._last_vector_search = {
+                            "backend": "sqlite_fallback",
+                            "error": "qdrant returned stale points",
+                        }
+                        return self.search_vectors_sqlite(
+                            space, query, limit=limit, scope_id=scope_id,
+                            model_name=model_name, normalized=True,
+                        )
+                    self._last_vector_search = {"backend": "qdrant", "error": None}
+                    return accelerated[:max(1, limit)]
+                self._last_vector_search = {
+                    "backend": "sqlite_fallback",
+                    "error": "qdrant_no_collection" if not matching else "qdrant_empty",
+                }
+        except Exception as error:
+            self._last_vector_search = {
+                "backend": "sqlite_fallback",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        return self.search_vectors_sqlite(space, query, limit=limit, scope_id=scope_id,
+                                          model_name=model_name, normalized=True)
+
+    def search_vectors_sqlite(self, space, vector, limit=10, scope_id=None,
+                              model_name=None, normalized=False):
+        query = list(vector or []) if normalized else self._normalise_vector(vector)
         if not query:
             return []
         results = []
         rows = self._rows(
-            "SELECT * FROM memory_vectors WHERE space = ?" + (" AND scope_id = ?" if scope_id else ""),
-            (space, scope_id) if scope_id else (space,),
+            "SELECT * FROM memory_vectors WHERE space = ?"
+            + (" AND scope_id = ?" if scope_id else "")
+            + (" AND model_name = ?" if model_name else ""),
+            tuple([space] + ([scope_id] if scope_id else []) + ([model_name] if model_name else [])),
         )
         for row in rows:
             try:
@@ -3027,7 +3524,52 @@ class MemoryStore:
             result = self._decode(row, ["metadata_json"])
             result["score"] = score
             results.append(result)
+        if self._last_vector_search.get("backend") != "sqlite_fallback":
+            self._last_vector_search = {"backend": "sqlite", "error": None}
         return sorted(results, key=lambda item: item["score"], reverse=True)[:max(1, limit)]
+
+    def vector_search_status(self):
+        status = dict(self._last_vector_search)
+        accelerator = None
+        try:
+            from .qdrant_memory import get_qdrant_index, _enabled as _qdrant_enabled
+            accelerator = get_qdrant_index(self.path)
+            status["qdrant_enabled"] = _qdrant_enabled()
+            if accelerator is not None:
+                status.update(accelerator.collection_stats())
+                status["active_backend"] = self._last_vector_search.get("backend")
+        except Exception as error:
+            status.setdefault("error", f"{type(error).__name__}: {error}")
+        status["qdrant_available"] = accelerator is not None
+        status["degraded"] = bool(status.get("qdrant_enabled")) and accelerator is None
+        if status.get("degraded"):
+            status["degraded_reason"] = "qdrant_unavailable_or_lock"
+        elif status.get("qdrant_enabled") and status.get("active_backend") in {
+                "sqlite", "sqlite_fallback"}:
+            status["degraded_reason"] = "qdrant_search_fallback"
+        else:
+            status["degraded_reason"] = ""
+        status.update(vector_search_metrics())
+        try:
+            from .qdrant_memory import qdrant_lock_status
+            status["qdrant_lock"] = qdrant_lock_status()
+        except Exception:
+            pass
+        return status
+
+    def has_vector_model(self, space, model_name, dimension=None):
+        row = self._row(
+            "SELECT vector_json FROM memory_vectors WHERE space = ? AND model_name = ? LIMIT 1",
+            (space, model_name),
+        )
+        if not row:
+            return False
+        if dimension is None:
+            return True
+        try:
+            return len(json.loads(row["vector_json"] or "[]")) == int(dimension)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
 
     def create_entity(self, name, entity_type="person", status="pending", family_role=None, confidence=0.0, summary="", scope_id="home-default"):
         entity_id = make_id("entity")
@@ -3037,7 +3579,7 @@ class MemoryStore:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (scope_id or "home-default", entity_id, entity_type, name, status, family_role, summary, float(confidence or 0), timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
         return self.get_entity(entity_id)
 
     def _find_or_create_entity(self, name, entity_type, scope_id, confidence, summary):
@@ -3054,10 +3596,57 @@ class MemoryStore:
                 "UPDATE entities SET confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
                 (float(confidence or 0), now_iso(), existing["id"]),
             )
-            self.connection.commit()
+            self._commit()
             return self.get_entity(existing["id"])
         return self.create_entity(name, entity_type, "pending", confidence=confidence, summary=summary, scope_id=scope_id)
 
+    def _find_or_create_entities_batch(self, specs, scope_id, confidence):
+        """Prefetch known entities, then create only missing names."""
+        unique_specs = []
+        seen = set()
+        for entity_type, name, summary in specs:
+            key = (entity_type, str(name or '').strip())
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            unique_specs.append((key[0], key[1], summary))
+        if not unique_specs:
+            return {}
+        grouped = {}
+        for entity_type, name, _summary in unique_specs:
+            grouped.setdefault(entity_type, []).append(name)
+        entities = {}
+        for entity_type, names in grouped.items():
+            placeholders = ','.join('?' for _ in names)
+            rows = self._rows(
+                f"""SELECT * FROM entities
+                WHERE scope_id = ? AND entity_type = ? AND canonical_name IN ({placeholders})
+                AND status != 'rejected'
+                ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'confirmed' THEN 1 ELSE 2 END,
+                         updated_at DESC""",
+                [scope_id or 'home-default', entity_type, *names],
+            )
+            for row in rows:
+                entities.setdefault((entity_type, row['canonical_name']), row)
+        existing = [entities[(entity_type, name)] for entity_type, name, _summary in unique_specs if (entity_type, name) in entities]
+        timestamp = now_iso()
+        if existing:
+            self.connection.executemany(
+                "UPDATE entities SET confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
+                [(float(confidence or 0), timestamp, row['id']) for row in existing],
+            )
+            for row in existing:
+                entities[(row['entity_type'], row['canonical_name'])] = self.get_entity(row['id'])
+        for entity_type, name, summary in unique_specs:
+            key = (entity_type, name)
+            if key not in entities:
+                entities[key] = self.create_entity(
+                    name, entity_type, 'pending', confidence=confidence,
+                    summary=summary, scope_id=scope_id,
+                )
+        return entities
+
+    @_defer_entity_maintenance_commits
     def maintain_observation_entities(self, observation_id, event_id=None):
         """Create evidence-backed non-person entities from existing observations."""
         observation = self.get_observation(observation_id)
@@ -3107,25 +3696,39 @@ class MemoryStore:
             ("atmosphere", atmosphere_names, "由图片观察到的画面氛围"),
             ("time", captured_day, "由原始拍摄时间维护") if captured_day else ("time", [], ""),
         ]
-        entities = []
-        place_entity = None
-        time_entity = None
+        specs = []
         for entity_type, names, summary in values:
             for name in names if isinstance(names, list) else [names]:
-                entity = self._find_or_create_entity(name, entity_type, scope_id, observation.get("confidence", 0), summary)
-                if not entity:
+                specs.append((entity_type, name, summary))
+        entity_lookup = self._find_or_create_entities_batch(
+            specs, scope_id, observation.get("confidence", 0),
+        )
+        entities = []
+        entity_ids = set()
+        observation_confidence = float(observation.get("confidence", 0) or 0)
+        observation_timestamp = now_iso()
+        observation_links = []
+        place_entity = None
+        time_entity = None
+        for entity_type, names, _summary in values:
+            for name in names if isinstance(names, list) else [names]:
+                entity = entity_lookup.get((entity_type, str(name or "").strip()))
+                if not entity or entity["id"] in entity_ids:
                     continue
-                self.connection.execute(
-                    """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
-                    VALUES (?, ?, ?, 'observation_extraction', ?) ON CONFLICT(entity_id, observation_id)
-                    DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
-                    (entity["id"], observation_id, float(observation.get("confidence", 0) or 0), now_iso()),
-                )
+                observation_links.append((entity["id"], observation_id, observation_confidence, observation_timestamp))
                 if entity_type == "place":
                     place_entity = entity
                 if entity_type == "time":
                     time_entity = entity
+                entity_ids.add(entity["id"])
                 entities.append(entity)
+        if observation_links:
+            self.connection.executemany(
+                """INSERT INTO entity_observations(entity_id, observation_id, confidence, source, created_at)
+                VALUES (?, ?, ?, 'observation_extraction', ?) ON CONFLICT(entity_id, observation_id)
+                DO UPDATE SET confidence = MAX(confidence, excluded.confidence)""",
+                observation_links,
+            )
         evidence_ids = [observation_id, event_id] if event_id else [observation_id]
         if place_entity:
             if gps_place:
@@ -3241,7 +3844,7 @@ class MemoryStore:
                     entity["id"], "记录于", time_entity["id"], [observation_id, event_id] if event_id else [observation_id],
                     observation.get("confidence", 0),
                 )
-        self.connection.commit()
+        self._commit()
         return entities
 
     def reindex_observation_entities(self, scope_id=None):
@@ -3332,17 +3935,90 @@ class MemoryStore:
 
     def list_entities(self, status=None, scope_id=None, public=True):
         params = [status] if status else []
-        where = "WHERE status = ?" if status else "WHERE status NOT IN ('rejected', 'superseded')"
+        excluded = "(SELECT id FROM memory_spaces WHERE include_in_people = 0)"
+        where = (
+            "WHERE status = ? AND scope_id NOT IN " + excluded
+            if status
+            else "WHERE status NOT IN ('rejected', 'superseded') AND scope_id NOT IN " + excluded
+        )
         if scope_id:
             where += " AND scope_id = ?"
             params.append(scope_id)
         entities = self._rows(f"SELECT * FROM entities {where} ORDER BY updated_at DESC", params)
+        if entities:
+            self._decorate_entities(entities, [entity["id"] for entity in entities])
+        return [self.public_entity(entity) for entity in entities] if public else entities
+
+    def _decorate_entities(self, entities, ids):
+        """Fill derived per-entity fields with batched queries instead of N+1 lookups."""
+        placeholders = ",".join("?" * len(ids))
+        cluster_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"SELECT entity_id, COUNT(*) AS c FROM face_clusters WHERE entity_id IN ({placeholders}) GROUP BY entity_id", ids
+            )
+        }
+        cluster_rows_by_entity = {}
+        for row in self._rows(
+            f"SELECT entity_id, member_count, confidence, status FROM face_clusters WHERE entity_id IN ({placeholders})", ids
+        ):
+            cluster_rows_by_entity.setdefault(row["entity_id"], []).append(row)
+        photo_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"""SELECT fc.entity_id, COUNT(DISTINCT a.id) AS c FROM face_instances fi
+                JOIN face_clusters fc ON fc.id = fi.cluster_id JOIN assets a ON a.id = fi.asset_id
+                WHERE fc.entity_id IN ({placeholders}) AND fc.status != 'rejected' GROUP BY fc.entity_id""", ids
+            )
+        }
+        mention_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"SELECT entity_id, COUNT(*) AS c FROM entity_mentions WHERE entity_id IN ({placeholders}) GROUP BY entity_id", ids
+            )
+        }
+        evidence_counts = {
+            row["entity_id"]: row["c"] for row in self._rows(
+                f"SELECT entity_id, COUNT(*) AS c FROM entity_observations WHERE entity_id IN ({placeholders}) GROUP BY entity_id", ids
+            )
+        }
+        relationship_counts = {}
+        for row in self._rows(
+            f"""SELECT subject_entity_id AS eid, COUNT(*) AS c FROM relationships
+            WHERE subject_entity_id IN ({placeholders}) AND status != 'retracted' GROUP BY subject_entity_id""", ids
+        ):
+            relationship_counts[row["eid"]] = relationship_counts.get(row["eid"], 0) + row["c"]
+        for row in self._rows(
+            f"""SELECT object_entity_id AS eid, COUNT(*) AS c FROM relationships
+            WHERE object_entity_id IN ({placeholders}) AND status != 'retracted' GROUP BY object_entity_id""", ids
+        ):
+            relationship_counts[row["eid"]] = relationship_counts.get(row["eid"], 0) + row["c"]
+        avatars = {
+            row["entity_id"]: row["id"] for row in self._rows(
+                f"""SELECT entity_id, id FROM (
+                    SELECT fc.entity_id, fi.id,
+                           ROW_NUMBER() OVER (PARTITION BY fc.entity_id ORDER BY fi.detection_confidence DESC, fi.created_at ASC) AS rn
+                    FROM face_instances fi JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    WHERE fc.entity_id IN ({placeholders}) AND fc.status != 'rejected'
+                ) WHERE rn = 1""", ids
+            )
+        }
+        previews = {
+            row["entity_id"]: row for row in self._rows(
+                f"""SELECT entity_id, asset_id, file_name, media_type FROM (
+                    SELECT eob.entity_id, a.id AS asset_id, a.file_name, a.media_type,
+                           ROW_NUMBER() OVER (PARTITION BY eob.entity_id ORDER BY o.captured_at DESC, o.id DESC) AS rn
+                    FROM entity_observations eob JOIN observations o ON o.id = eob.observation_id
+                    JOIN assets a ON a.id = o.asset_id
+                    WHERE eob.entity_id IN ({placeholders})
+                ) WHERE rn = 1""", ids
+            )
+        }
         for entity in entities:
-            entity["cluster_count"] = self.connection.execute("SELECT COUNT(*) FROM face_clusters WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
-            entity["mention_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_mentions WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
-            entity["evidence_count"] = self.connection.execute("SELECT COUNT(*) FROM entity_observations WHERE entity_id = ?", (entity["id"],)).fetchone()[0]
-            entity["relationship_count"] = self.connection.execute("SELECT COUNT(*) FROM relationships WHERE (subject_entity_id = ? OR object_entity_id = ?) AND status != 'retracted'", (entity["id"], entity["id"])).fetchone()[0]
-            cluster_rows = self._rows("SELECT member_count, confidence, status FROM face_clusters WHERE entity_id = ?", (entity["id"],))
+            entity_id = entity["id"]
+            entity["cluster_count"] = cluster_counts.get(entity_id, 0)
+            entity["photo_count"] = photo_counts.get(entity_id, 0)
+            entity["mention_count"] = mention_counts.get(entity_id, 0)
+            entity["evidence_count"] = evidence_counts.get(entity_id, 0)
+            entity["relationship_count"] = relationship_counts.get(entity_id, 0)
+            cluster_rows = cluster_rows_by_entity.get(entity_id, [])
             if entity["entity_type"] == "person":
                 entity["reviewable"] = entity["status"] == "confirmed" or any(
                     row["status"] != "rejected" and int(row.get("member_count", 0) or 0) > 0
@@ -3353,23 +4029,12 @@ class MemoryStore:
                 )
             else:
                 entity["reviewable"] = entity["evidence_count"] > 0
-            avatar = self._row(
-                """SELECT fi.id FROM face_instances fi JOIN face_clusters fc ON fc.id = fi.cluster_id
-                WHERE fc.entity_id = ? AND fc.status != 'rejected' ORDER BY fi.detection_confidence DESC, fi.created_at ASC LIMIT 1""",
-                (entity["id"],),
-            )
-            entity["avatar_face_instance_id"] = avatar["id"] if avatar else None
-            preview = self._row(
-                """SELECT a.id AS asset_id, a.file_name, a.media_type
-                FROM entity_observations eob JOIN observations o ON o.id = eob.observation_id
-                JOIN assets a ON a.id = o.asset_id
-                WHERE eob.entity_id = ? ORDER BY o.captured_at DESC, o.id DESC LIMIT 1""",
-                (entity["id"],),
-            )
+            entity["avatar_face_instance_id"] = avatars.get(entity_id)
+            preview = previews.get(entity_id)
             entity["preview_asset_id"] = preview["asset_id"] if preview else None
             entity["preview_file_name"] = preview["file_name"] if preview else None
             entity["preview_media_type"] = preview["media_type"] if preview else None
-        return [self.public_entity(entity) for entity in entities] if public else entities
+        return entities
 
     def _semantic_entity_key(self, entity_type, name, entity=None):
         """Return an explainable semantic concept for automatic grouping."""
@@ -3681,7 +4346,7 @@ class MemoryStore:
                     aliases.append(old_name)
                 self.set_entity_property(entity_id, "aliases", aliases)
             self.connection.execute(
-                "UPDATE entities SET canonical_name = ?, updated_at = ? WHERE id = ?",
+                "UPDATE entities SET canonical_name = ?, name_state = 'confirmed', updated_at = ? WHERE id = ?",
                 (new_name, timestamp, entity_id),
             )
             self._record_entity_revision(entity_id, "canonical_name", old_name, new_name, "user_rename")
@@ -3865,10 +4530,10 @@ class MemoryStore:
             VALUES (?, ?, ?, 0, ?, ?, ?)""",
             (scope_id or "home-default", cluster_id, json_value(values, []), float(confidence or 0), timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
         entity = self.create_entity(f"待确认人物簇 · {cluster_id}", "person", "pending", None, float(confidence or 0), "由 buffalo_l embedding 生成，等待用户确认", scope_id=scope_id)
         self.connection.execute("UPDATE face_clusters SET entity_id = ? WHERE id = ?", (entity["id"], cluster_id))
-        self.connection.commit()
+        self._commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,))
 
     def _record_entity_revision(self, entity_id, field_name, old_value, new_value, source, evidence_ids=None):
@@ -3939,7 +4604,7 @@ class MemoryStore:
                 "UPDATE entity_properties SET confidence = MAX(confidence, ?), evidence_ids_json = ?, updated_at = ? WHERE id = ?",
                 (float(confidence or 0), json_value(list(dict.fromkeys(json.loads(current["evidence_ids_json"] or "[]") + evidence_ids)), []), now_iso(), current["id"]),
             )
-            self.connection.commit()
+            self._commit()
             return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (current["id"],)))
         timestamp = now_iso()
         status = "active" if not current else "pending"
@@ -3952,7 +4617,7 @@ class MemoryStore:
              json_value(evidence_ids, []), current["id"] if current else None,
              int(current["revision"] or 0) + 1 if current else 1, timestamp, timestamp),
         )
-        self.connection.commit()
+        self._commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (property_id,)))
 
     def maintain_entity_property_values(self, entity_id, property_key, values, confidence=0.0, evidence_ids=None, source="derived"):
@@ -3970,7 +4635,7 @@ class MemoryStore:
             "UPDATE entity_properties SET value_json = ?, confidence = MAX(confidence, ?), evidence_ids_json = ?, updated_at = ? WHERE id = ?",
             (json_value(merged, []), float(confidence or 0), json_value(list(dict.fromkeys(old_evidence + list(evidence_ids or []))), []), now_iso(), current["id"]),
         )
-        self.connection.commit()
+        self._commit()
         return self._property_row(self._row("SELECT * FROM entity_properties WHERE id = ?", (current["id"],)))
 
     def set_entity_property(self, entity_id, property_key, value, evidence_ids=None):
@@ -4068,23 +4733,24 @@ class MemoryStore:
                 pose_bucket_value = pose_bucket(pose)
         embedding_model = str(face.get("embedding_model") or model_name or "unknown")
         embedding_version = str(face.get("embedding_version") or "legacy")
-        identity_eligible = bool(identity_eligible)
+        validity = str(face.get("face_validity") or "verified")
+        identity_eligible = bool(identity_eligible) and validity == "verified"
         if not identity_eligible:
             instance_id = make_id("face")
             self.connection.execute(
                 """INSERT INTO face_instances(
                     id, asset_id, observation_id, cluster_id, bbox_json, embedding_json,
                     detection_confidence, quality, pose_json, area_ratio, sharpness,
-                    pose_bucket, embedding_model, embedding_version, embedding_quality_signal, created_at
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pose_bucket, embedding_model, embedding_version, embedding_quality_signal, validity, created_at
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     instance_id, asset_id, observation_id, json_value(face.get("bbox"), []), json_value(embedding, []),
                     float(face.get("confidence", 0) or 0), float(quality or 0), json_value(pose, []), float(face.get("area_ratio", 0) or 0),
                     float(face.get("sharpness", 0) or 0), str(pose_bucket_value or "unknown"), embedding_model, embedding_version,
-                    float(face.get("quality_signal", 0) or 0), now_iso(),
+                    float(face.get("quality_signal", 0) or 0), validity, now_iso(),
                 ),
             )
-            self.connection.commit()
+            self._commit()
             self.upsert_vector(
                 "visual", "face_instance", instance_id, embedding, embedding_model,
                 {"asset_id": asset_id, "observation_id": observation_id, "model_version": embedding_version,
@@ -4121,17 +4787,17 @@ class MemoryStore:
             """INSERT INTO face_instances(
                 id, asset_id, observation_id, cluster_id, bbox_json, embedding_json,
                 detection_confidence, quality, pose_json, area_ratio, sharpness,
-                pose_bucket, embedding_model, embedding_version, embedding_quality_signal, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                pose_bucket, embedding_model, embedding_version, embedding_quality_signal, validity, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 instance_id, asset_id, observation_id, best["id"], json_value(face.get("bbox"), []), json_value(embedding, []),
                 float(face.get("confidence", 0) or 0), float(quality or 0), json_value(pose, []), float(face.get("area_ratio", 0) or 0),
                 float(face.get("sharpness", 0) or 0), str(pose_bucket_value or "unknown"), embedding_model, embedding_version,
-                float(face.get("quality_signal", 0) or 0), now_iso(),
+                float(face.get("quality_signal", 0) or 0), validity, now_iso(),
             ),
         )
         self._refresh_face_prototypes(best["id"])
-        self.connection.commit()
+        self._commit()
         self.upsert_vector("visual", "face_instance", instance_id, embedding, embedding_model, {"cluster_id": best["id"], "asset_id": asset_id, "observation_id": observation_id, "model_version": embedding_version, "quality": float(quality or 0), "pose_bucket": pose_bucket_value})
         entity = self.get_entity(best.get("entity_id")) if best.get("entity_id") else None
         if entity and entity.get("status") == "confirmed":
@@ -4146,7 +4812,7 @@ class MemoryStore:
             (make_id("mention"), entity["id"], observation_id, face_instance_id, float(confidence or 0), now_iso()),
         )
         self._add_entity_to_observation(observation_id, entity)
-        self.connection.commit()
+        self._commit()
 
     def _refresh_face_prototypes(self, cluster_id):
         rows = self._rows(
@@ -4190,7 +4856,8 @@ class MemoryStore:
             """SELECT fi.id, fi.cluster_id, fi.embedding_json, fi.quality, fi.detection_confidence,
             fi.pose_bucket, fi.embedding_model, fi.embedding_version
             FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
-            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL AND fi.quality >= ?"""
+            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL AND fi.quality >= ?
+            AND fi.validity = 'verified'"""
             + (" AND a.scope_id = ?" if scope_id else ""),
             (minimum_quality, scope_id) if scope_id else (minimum_quality,),
         )
@@ -4264,12 +4931,84 @@ class MemoryStore:
                 (timestamp, cluster_id),
             )
         self._sync_face_entity_statuses(timestamp)
+        attached = self._attach_uncertain_faces(scope_id)
         self.connection.commit()
         return {
             "instances": len(instances), "clusters": len(result.clusters),
             "threshold": threshold, "minimum_quality": minimum_quality,
             "noise": sum(1 for cluster in result.clusters if cluster.noise),
+            "attached_uncertain": attached,
         }
+
+    def _attach_uncertain_faces(self, scope_id=None):
+        """P0-c: attach uncertain evidence faces to strong verified clusters when
+        their embedding is highly similar to a cluster representative. This
+        recovers small/ambiguous real faces without ever creating a new cluster
+        from an uncertain candidate."""
+        threshold = float(os.getenv("FACE_ATTACH_THRESHOLD", "0.75"))
+        if threshold <= 0:
+            return 0
+        scope_filter = " AND a.scope_id = ?" if scope_id else ""
+        scope_param = (scope_id,) if scope_id else ()
+        rows = self._rows(
+            """SELECT fi.id, fi.embedding_json, a.scope_id
+            FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
+            WHERE fi.validity = 'uncertain' AND fi.embedding_json != '[]' AND fi.cluster_id IS NULL"""
+            + scope_filter,
+            scope_param,
+        )
+        attached = 0
+        affected = set()
+        for row in rows:
+            embedding = json.loads(row["embedding_json"] or "[]")
+            if not embedding:
+                continue
+            target = self._find_attach_cluster(embedding, row["scope_id"], threshold)
+            if target:
+                self.connection.execute(
+                    "UPDATE face_instances SET cluster_id = ? WHERE id = ?", (target, row["id"])
+                )
+                affected.add(target)
+                attached += 1
+        for cluster_id in affected:
+            count = self._row("SELECT COUNT(*) AS c FROM face_instances WHERE cluster_id = ?", (cluster_id,))
+            self.connection.execute(
+                "UPDATE face_clusters SET member_count = ? WHERE id = ?", (count["c"], cluster_id)
+            )
+            self._refresh_face_prototypes(cluster_id)
+        return attached
+
+    def _find_attach_cluster(self, embedding, scope_id, threshold):
+        clusters = self._rows(
+            """SELECT c.id, c.representative_embedding_json, c.member_count
+            FROM face_clusters c
+            WHERE c.scope_id = ? AND c.status = 'confirmed' AND c.member_count >= 2""",
+            (scope_id,),
+        )
+        ranked = []
+        for cluster in clusters:
+            prototypes = self._rows(
+                "SELECT embedding_json FROM face_prototypes WHERE cluster_id = ?",
+                (cluster["id"],),
+            )
+            representatives = [
+                json.loads(item["embedding_json"] or "[]")
+                for item in prototypes
+            ]
+            if not representatives:
+                representatives = [json.loads(cluster["representative_embedding_json"] or "[]")]
+            scores = [self._cosine(embedding, representative) for representative in representatives
+                      if representative and len(representative) == len(embedding)]
+            if scores:
+                ranked.append((max(scores), cluster["id"]))
+        ranked.sort(reverse=True)
+        if not ranked or ranked[0][0] < threshold:
+            return None
+        # A small margin is required even for a confirmed person: uncertain
+        # detections must not be silently attached to a near-tie.
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.08:
+            return None
+        return ranked[0][1]
 
     def _sync_face_entity_statuses(self, timestamp=None):
         """Hide pending entities whose candidate face clusters were retired."""
@@ -4279,7 +5018,7 @@ class MemoryStore:
             active_count = self.connection.execute(
                 "SELECT COUNT(*) FROM face_clusters WHERE entity_id = ? AND status IN ('pending', 'confirmed') AND member_count > 0",
                 (entity["id"],),
-            ).fetchone()[0]
+            ).fetchall()[0][0]
             if active_count == 0 and entity["status"] != "confirmed":
                 self.connection.execute(
                     "UPDATE entities SET status = 'rejected', summary = ?, updated_at = ? WHERE id = ?",
@@ -4288,13 +5027,20 @@ class MemoryStore:
 
     def list_face_clusters(self, status=None):
         params = [status] if status else []
-        where = "WHERE fc.status = ?" if status else "WHERE fc.status != 'rejected'"
+        where = (
+            "WHERE fc.status = ? AND ms.include_in_people = 1"
+            if status
+            else "WHERE fc.status != 'rejected' AND ms.include_in_people = 1"
+        )
         rows = self._rows(f"""SELECT fc.*, e.canonical_name, e.family_role, e.status AS entity_status
-            FROM face_clusters fc LEFT JOIN entities e ON e.id = fc.entity_id {where} ORDER BY fc.updated_at DESC""", params)
+            FROM face_clusters fc
+            LEFT JOIN entities e ON e.id = fc.entity_id
+            JOIN memory_spaces ms ON ms.id = fc.scope_id
+            {where} ORDER BY fc.updated_at DESC""", params)
         for row in rows:
             row["reviewable"] = row.get("status") != "rejected" and int(row.get("member_count", 0) or 0) > 0
             row["single_sample"] = row.get("status") == "pending" and int(row.get("member_count", 0) or 0) <= 1
-            row["samples"] = self._rows("""SELECT fi.id, fi.asset_id, fi.observation_id, fi.bbox_json, fi.detection_confidence, a.file_name, a.media_type
+            row["samples"] = self._rows("""SELECT fi.id, fi.asset_id, fi.observation_id, fi.bbox_json, fi.detection_confidence, fi.quality, a.file_name, a.media_type
                 FROM face_instances fi JOIN assets a ON a.id = fi.asset_id WHERE fi.cluster_id = ? ORDER BY fi.created_at DESC LIMIT 12""", (row["id"],))
         return rows
 
@@ -4696,30 +5442,34 @@ class MemoryStore:
         return self.get_event(target_event_id)
 
     def _refresh_event_participants(self, observation_ids):
+        # Group observations first: one event summary/transaction per affected event.
+        event_observations = {}
         for observation_id in set(observation_ids):
-            rows = self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,))
-            for row in rows:
-                event = self.get_event(row["event_id"])
-                participants = event.get("participants") or []
-                observation = self.get_observation(observation_id) or {}
-                merged = participants[:]
-                for key in self._confirmed_entity_ids_for_observation(observation_id):
-                    entity = self.get_entity(key)
-                    person = {"entity_id": key, "name": entity["canonical_name"], "status": "confirmed"}
-                    if not any((item.get("entity_id") if isinstance(item, dict) else item) == key for item in merged):
-                        merged.append(person)
-                    self.upsert_event_participant(row["event_id"], key, "visible_subject", [observation_id], 0.75)
-                asset = self.get_asset(observation.get("asset_id")) or {}
-                source_owner_id = asset.get("source_owner_id")
-                source_owner = self.get_entity(source_owner_id) if source_owner_id else None
-                if source_owner and source_owner.get("status") == "confirmed":
-                    self.upsert_event_participant(row["event_id"], source_owner_id, "captured_by", [observation_id], float(asset.get("source_confidence", 0.5) or 0.5))
-                self.connection.execute("UPDATE events SET participants_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?", (json_value(merged, []), now_iso(), event["id"]))
-                # A WorldMM Scene owns authoritative absolute boundaries and the
-                # original video's GPS/place. Generic image-event refresh may
-                # enrich participants, but must not replace that provenance.
+            for row in self._rows("SELECT event_id FROM event_observations WHERE observation_id = ?", (observation_id,)):
+                event_observations.setdefault(row["event_id"], set()).add(observation_id)
+        with self.transaction():
+            for event_id, event_observation_ids in event_observations.items():
+                event = self.get_event(event_id)
+                if not event:
+                    continue
+                merged = list(event.get("participants") or [])
+                for observation_id in event_observation_ids:
+                    observation = self.get_observation(observation_id) or {}
+                    for key in self._confirmed_entity_ids_for_observation(observation_id):
+                        entity = self.get_entity(key)
+                        if not entity:
+                            continue
+                        if not any((item.get("entity_id") if isinstance(item, dict) else item) == key for item in merged):
+                            merged.append({"entity_id": key, "name": entity["canonical_name"], "status": "confirmed"})
+                        self.upsert_event_participant(event_id, key, "visible_subject", [observation_id], 0.75)
+                    asset = self.get_asset(observation.get("asset_id")) or {}
+                    source_owner_id = asset.get("source_owner_id")
+                    source_owner = self.get_entity(source_owner_id) if source_owner_id else None
+                    if source_owner and source_owner.get("status") == "confirmed":
+                        self.upsert_event_participant(event_id, source_owner_id, "captured_by", [observation_id], float(asset.get("source_confidence", 0.5) or 0.5))
+                self.connection.execute("UPDATE events SET participants_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?", (json_value(merged, []), now_iso(), event_id))
                 if event.get("source_type") != "video_scene":
-                    self.refresh_event_summary(row["event_id"])
+                    self.refresh_event_summary(event_id)
 
     def reject_face_cluster(self, cluster_id):
         """Delete a face cluster that is not a person. Confirmed clusters refuse."""
@@ -4776,7 +5526,7 @@ class MemoryStore:
             confidence=float(relationship.get("confidence") or 0.75),
             confidence_source="user-confirmed",
         )
-        self.connection.commit()
+        self._commit()
         return claim
 
     def create_relationship(self, subject_entity_id, predicate, object_entity_id, evidence_ids=None, confidence=0.5, status="pending"):
@@ -4792,14 +5542,36 @@ class MemoryStore:
             merged = list(dict.fromkeys(old_evidence + evidence_ids))
             next_status = "active" if status == "active" else existing["status"]
             self.connection.execute("UPDATE relationships SET status = ?, evidence_ids_json = ?, confidence = MAX(confidence, ?), updated_at = ?, revision = revision + 1 WHERE id = ?", (next_status, json_value(merged, []), float(confidence or 0), now_iso(), existing["id"]))
-            self.connection.commit()
-            return next((item for item in self.list_relationships() if item["id"] == existing["id"]), None)
+            self._commit()
+            if next_status == "active":
+                self.maintain_relationship_claim({
+                    "subject_entity_id": subject_entity_id,
+                    "predicate": predicate,
+                    "object_entity_id": object_entity_id,
+                    "evidence_ids_json": merged,
+                    "confidence": float(confidence or 0) or 0.75,
+                })
+            return self._decode(
+                self._row("SELECT * FROM relationships WHERE id = ?", (existing["id"],)),
+                ["evidence_ids_json"],
+            )
         relationship_id = make_id("rel")
         revision = 1
         self.connection.execute("""INSERT INTO relationships(id, scope_id, subject_entity_id, predicate, object_entity_id, status, confidence, evidence_ids_json, supersedes_relationship_id, revision, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""", (relationship_id, scope_id, subject_entity_id, predicate, object_entity_id, status, float(confidence or 0), json_value(evidence_ids, []), revision, now_iso(), now_iso()))
-        self.connection.commit()
-        return self.list_relationships()[0]
+        self._commit()
+        if status == "active":
+            self.maintain_relationship_claim({
+                "subject_entity_id": subject_entity_id,
+                "predicate": predicate,
+                "object_entity_id": object_entity_id,
+                "evidence_ids_json": evidence_ids,
+                "confidence": float(confidence or 0) or 0.75,
+            })
+        return self._decode(
+            self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,)),
+            ["evidence_ids_json"],
+        )
 
     def confirm_relationship(self, relationship_id):
         relationship = self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
@@ -4865,3 +5637,586 @@ class MemoryStore:
         self.connection.execute("INSERT INTO invites(id, label, token, created_at) VALUES (?, ?, ?, ?)", (invite_id, label or "家庭成员", token, now_iso()))
         self.connection.commit()
         return self._row("SELECT * FROM invites WHERE id = ?", (invite_id,))
+
+    def _scope_for(self, kind, record_id):
+        if not record_id:
+            return None
+        table = {
+            "entity": "entities",
+            "person": "entities",
+            "cluster": "face_clusters",
+            "event": "events",
+            "observation": "observations",
+            "asset": "assets",
+        }.get(kind)
+        if not table:
+            raise ValueError(f"unknown scope kind: {kind}")
+        rows = self.connection.execute(
+            f"SELECT scope_id FROM {table} WHERE id = ?", (record_id,)
+        ).fetchall()
+        return rows[0]["scope_id"] if rows else None
+
+    def _face_instance_scope(self, face_instance_id):
+        rows = self.connection.execute(
+            "SELECT asset_id FROM face_instances WHERE id = ?", (face_instance_id,)
+        ).fetchall()
+        return self._scope_for("asset", rows[0]["asset_id"]) if rows else None
+
+    def _person_moment_row(self, row):
+        if not row:
+            return None
+        result = dict(row)
+        result["interaction_target_ids"] = json.loads(result.pop("interaction_target_ids_json") or "[]")
+        result["social_role_cues"] = json.loads(result.pop("social_role_cues_json") or "[]")
+        result["selection"] = json.loads(result.pop("selection_json") or "{}")
+        return result
+
+    def create_person_insight_run(self, scope_id, config):
+        run_id = make_id("insight")
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO person_insight_runs(id, scope_id, status, current_stage, config_json, stats_json, created_at, updated_at)
+            VALUES (?, ?, 'queued', 'queued', ?, '{}', ?, ?)""",
+            (run_id, scope_id, json_value(config, {}), timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self.get_person_insight_run(run_id)
+
+    def update_person_insight_run(self, run_id, *, status=None, stage=None, stats=None, error=None):
+        fields = {"updated_at": now_iso()}
+        if status is not None:
+            fields["status"] = status
+        if stage is not None:
+            fields["current_stage"] = stage
+        if stats is not None:
+            fields["stats_json"] = json_value(stats, {})
+        if error is not None:
+            fields["error"] = error
+        if status == "completed":
+            fields["completed_at"] = now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        self.connection.execute(
+            f"UPDATE person_insight_runs SET {assignments} WHERE id = ?",
+            (*fields.values(), run_id),
+        )
+        self.connection.commit()
+        return self.get_person_insight_run(run_id)
+
+    def get_person_insight_run(self, run_id):
+        row = self._row("SELECT * FROM person_insight_runs WHERE id = ?", (run_id,))
+        if not row:
+            return None
+        row["config"] = json.loads(row.pop("config_json") or "{}")
+        row["stats"] = json.loads(row.pop("stats_json") or "{}")
+        return row
+
+    def latest_person_insight_run(self, scope_id):
+        row = self._row(
+            "SELECT id FROM person_insight_runs WHERE scope_id = ? ORDER BY created_at DESC LIMIT 1",
+            (scope_id,),
+        )
+        return self.get_person_insight_run(row["id"]) if row else None
+
+    def upsert_person_moment(self, data):
+        person_id = data["person_id"]
+        cluster_id = data.get("cluster_id")
+        event_id = data.get("event_id")
+        observation_id = data["observation_id"]
+        asset_id = data["asset_id"]
+        face_instance_id = data.get("face_instance_id")
+        scopes = [self._scope_for("entity", person_id)]
+        for kind, record_id in (
+            ("cluster", cluster_id),
+            ("event", event_id),
+            ("observation", observation_id),
+            ("asset", asset_id),
+        ):
+            if record_id:
+                scopes.append(self._scope_for(kind, record_id))
+        if face_instance_id:
+            scopes.append(self._face_instance_scope(face_instance_id))
+        scopes = [scope for scope in scopes if scope]
+        if len(set(scopes)) > 1:
+            raise ValueError("person moment must reference entities in the same memory space")
+        scope_id = scopes[0] if scopes else "home-default"
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO person_moments(
+                id, scope_id, run_id, person_id, cluster_id, event_id, observation_id, asset_id,
+                face_instance_id, action_text, interaction_target_ids_json, interaction_text,
+                participation_style, visible_affect, social_role_cues_json, narrative_note,
+                selection_json, confidence, model_name, prompt_version, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            ON CONFLICT(person_id, observation_id, prompt_version) DO UPDATE SET
+                action_text = excluded.action_text,
+                interaction_target_ids_json = excluded.interaction_target_ids_json,
+                interaction_text = excluded.interaction_text,
+                participation_style = excluded.participation_style,
+                visible_affect = excluded.visible_affect,
+                social_role_cues_json = excluded.social_role_cues_json,
+                narrative_note = excluded.narrative_note,
+                selection_json = excluded.selection_json,
+                confidence = excluded.confidence,
+                model_name = excluded.model_name,
+                updated_at = excluded.updated_at""",
+            (
+                make_id("moment"), scope_id, data.get("run_id"), person_id, cluster_id,
+                event_id, observation_id, asset_id, face_instance_id,
+                data.get("action_text") or "", json_value(data.get("interaction_target_ids"), []),
+                data.get("interaction_text") or "", data.get("participation_style") or "",
+                data.get("visible_affect") or "", json_value(data.get("social_role_cues"), []),
+                data.get("narrative_note") or "", json_value(data.get("selection"), {}),
+                float(data.get("confidence") or 0), data.get("model_name") or "unknown",
+                data["prompt_version"], timestamp, timestamp,
+            ),
+        )
+        self.connection.commit()
+        row = self._row(
+            """SELECT * FROM person_moments WHERE person_id = ? AND observation_id = ? AND prompt_version = ?""",
+            (person_id, observation_id, data["prompt_version"]),
+        )
+        return self._person_moment_row(row)
+
+    def list_person_moments(self, person_id=None, scope_id=None, status="active"):
+        clauses, params = [], []
+        if person_id is not None:
+            clauses.append("person_id = ?")
+            params.append(person_id)
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._rows(
+            f"SELECT * FROM person_moments {where} ORDER BY created_at DESC",
+            tuple(params),
+        )
+        return [self._person_moment_row(row) for row in rows]
+
+    @staticmethod
+    def _role_hypothesis_row(row):
+        if not row:
+            return None
+        result = dict(row)
+        result["evidence_event_ids"] = json.loads(result.pop("evidence_event_ids_json") or "[]")
+        result["evidence_moment_ids"] = json.loads(result.pop("evidence_moment_ids_json") or "[]")
+        return result
+
+    def get_role_hypothesis(self, hypothesis_id):
+        return self._role_hypothesis_row(
+            self._row("SELECT * FROM person_role_hypotheses WHERE id = ?", (hypothesis_id,))
+        )
+
+    def replace_role_hypotheses(self, scope_id, run_id, rows):
+        for row in rows:
+            if self._scope_for("entity", row["person_id"]) != scope_id:
+                raise ValueError("role hypothesis person is not in the same memory space")
+            relative_to = row.get("relative_to_person_id")
+            if relative_to and self._scope_for("entity", relative_to) != scope_id:
+                raise ValueError("role hypothesis relative person is not in the same memory space")
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND status = 'suggested'""",
+            (timestamp, scope_id),
+        )
+        inserted = []
+        for row in rows:
+            hypothesis_id = make_id("role_hyp")
+            self.connection.execute(
+                """INSERT INTO person_role_hypotheses(
+                    id, scope_id, run_id, person_id, relative_to_person_id, role, rank,
+                    confidence, evidence_event_ids_json, evidence_moment_ids_json,
+                    reason_summary, status, revision, model_name, prompt_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', 1, ?, ?, ?, ?)""",
+                (
+                    hypothesis_id, scope_id, run_id, row["person_id"],
+                    row.get("relative_to_person_id"), row["role"], int(row.get("rank") or 1),
+                    float(row.get("confidence") or 0), json_value(row.get("evidence_event_ids"), []),
+                    json_value(row.get("evidence_moment_ids"), []), row.get("reason_summary") or "",
+                    row.get("model_name") or "unknown", row["prompt_version"], timestamp, timestamp,
+                ),
+            )
+            inserted.append(self.get_role_hypothesis(hypothesis_id))
+        self.connection.commit()
+        return inserted
+
+    def list_role_hypotheses(self, person_id=None, scope_id=None, status=None):
+        clauses, params = [], []
+        if person_id is not None:
+            clauses.append("person_id = ?")
+            params.append(person_id)
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._rows(
+            f"SELECT * FROM person_role_hypotheses {where} ORDER BY rank, created_at",
+            tuple(params),
+        )
+        return [self._role_hypothesis_row(row) for row in rows]
+
+    @staticmethod
+    def _relationship_hypothesis_row(row):
+        if not row:
+            return None
+        result = dict(row)
+        result["evidence_event_ids"] = json.loads(result.pop("evidence_event_ids_json") or "[]")
+        result["evidence_moment_ids"] = json.loads(result.pop("evidence_moment_ids_json") or "[]")
+        return result
+
+    def get_relationship_hypothesis(self, hypothesis_id):
+        return self._relationship_hypothesis_row(
+            self._row("SELECT * FROM relationship_hypotheses WHERE id = ?", (hypothesis_id,))
+        )
+
+    def replace_relationship_hypotheses(self, scope_id, run_id, rows):
+        for row in rows:
+            if row["subject_person_id"] == row["object_person_id"]:
+                raise ValueError("relationship hypothesis needs distinct people")
+            if self._scope_for("entity", row["subject_person_id"]) != scope_id:
+                raise ValueError("relationship hypothesis subject is not in the same memory space")
+            if self._scope_for("entity", row["object_person_id"]) != scope_id:
+                raise ValueError("relationship hypothesis object is not in the same memory space")
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND status = 'suggested'""",
+            (timestamp, scope_id),
+        )
+        inserted = []
+        for row in rows:
+            hypothesis_id = make_id("rel_hyp")
+            self.connection.execute(
+                """INSERT INTO relationship_hypotheses(
+                    id, scope_id, run_id, subject_person_id, predicate, object_person_id,
+                    inverse_predicate, confidence, evidence_event_ids_json,
+                    evidence_moment_ids_json, reason_summary, status, revision, model_name,
+                    prompt_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'suggested', 1, ?, ?, ?, ?)""",
+                (
+                    hypothesis_id, scope_id, run_id, row["subject_person_id"],
+                    row["predicate"], row["object_person_id"], row["inverse_predicate"],
+                    float(row.get("confidence") or 0), json_value(row.get("evidence_event_ids"), []),
+                    json_value(row.get("evidence_moment_ids"), []), row.get("reason_summary") or "",
+                    row.get("model_name") or "unknown", row["prompt_version"], timestamp, timestamp,
+                ),
+            )
+            inserted.append(self.get_relationship_hypothesis(hypothesis_id))
+        self.connection.commit()
+        return inserted
+
+    def list_relationship_hypotheses(self, scope_id, status=None):
+        if status is not None:
+            rows = self._rows(
+                "SELECT * FROM relationship_hypotheses WHERE scope_id = ? AND status = ? ORDER BY confidence DESC",
+                (scope_id, status),
+            )
+        else:
+            rows = self._rows(
+                "SELECT * FROM relationship_hypotheses WHERE scope_id = ? ORDER BY confidence DESC",
+                (scope_id,),
+            )
+        return [self._relationship_hypothesis_row(row) for row in rows]
+
+    @staticmethod
+    def _portrait_row(row):
+        if not row:
+            return None
+        result = dict(row)
+        result["themes"] = json.loads(result.pop("themes_json") or "[]")
+        result["evidence_refs"] = json.loads(result.pop("evidence_refs_json") or "[]")
+        return result
+
+    def get_portrait_revision(self, revision_id):
+        return self._portrait_row(
+            self._row("SELECT * FROM person_portrait_revisions WHERE id = ?", (revision_id,))
+        )
+
+    def create_portrait_revision(self, person_id, payload):
+        current = self.get_active_portrait(person_id)
+        if current and current.get("status") == "user_locked":
+            return current
+        revision = (current or {}).get("revision", 0) + 1
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                "UPDATE person_portrait_revisions SET status = 'superseded', updated_at = ? WHERE id = ?",
+                (timestamp, current["id"]),
+            )
+        revision_id = make_id("portrait")
+        scope_id = self._scope_for("entity", person_id) or "home-default"
+        self.connection.execute(
+            """INSERT INTO person_portrait_revisions(
+                id, scope_id, person_id, revision, portrait_text, themes_json, evidence_refs_json,
+                trigger_type, model_name, prompt_version, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (
+                revision_id, scope_id, person_id, revision, payload["portrait_text"],
+                json_value(payload.get("themes"), []), json_value(payload.get("evidence_refs"), []),
+                payload.get("trigger_type") or "manual", payload.get("model_name") or "unknown",
+                payload["prompt_version"], timestamp, timestamp,
+            ),
+        )
+        self.connection.commit()
+        return self.get_portrait_revision(revision_id)
+
+    def get_active_portrait(self, person_id):
+        row = self._row(
+            """SELECT * FROM person_portrait_revisions
+            WHERE person_id = ? AND status IN ('active', 'user_locked')
+            ORDER BY revision DESC LIMIT 1""",
+            (person_id,),
+        )
+        return self._portrait_row(row)
+
+    def list_portrait_revisions(self, person_id):
+        rows = self._rows(
+            "SELECT * FROM person_portrait_revisions WHERE person_id = ? ORDER BY revision DESC",
+            (person_id,),
+        )
+        return [self._portrait_row(row) for row in rows]
+
+    def set_portrait_feedback(self, revision_id, feedback):
+        self.connection.execute(
+            "UPDATE person_portrait_revisions SET user_feedback = ?, updated_at = ? WHERE id = ?",
+            (feedback, now_iso(), revision_id),
+        )
+        self.connection.commit()
+        return self.get_portrait_revision(revision_id)
+
+    def set_portrait_lock(self, revision_id, locked):
+        status = "user_locked" if locked else "active"
+        self.connection.execute(
+            "UPDATE person_portrait_revisions SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now_iso(), revision_id),
+        )
+        self.connection.commit()
+        return self.get_portrait_revision(revision_id)
+
+    def update_person_identity_state(self, person_id, *, name=None, role=None,
+                                     identity_state=None, role_state=None, name_state=None):
+        updates = {}
+        if role is not None:
+            updates["family_role"] = role
+        if name is not None:
+            updates["canonical_name"] = name
+        if identity_state is not None:
+            updates["identity_state"] = identity_state
+        if role_state is not None:
+            updates["role_state"] = role_state
+        if name_state is not None:
+            updates["name_state"] = name_state
+        if updates:
+            updates["updated_at"] = now_iso()
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            self.connection.execute(
+                f"UPDATE entities SET {assignments} WHERE id = ?",
+                (*updates.values(), person_id),
+            )
+            self.connection.commit()
+        return self.get_entity(person_id)
+
+    def confirm_role_hypothesis(self, hypothesis_id, *, role=None, is_self=False, actor="user"):
+        hypothesis = self.get_role_hypothesis(hypothesis_id)
+        if not hypothesis:
+            return None
+        person_id = hypothesis["person_id"]
+        person = self.get_entity(person_id)
+        if not person:
+            return None
+        from .person_graph import ROLE_OPTIONS
+
+        chosen_role = str(role or hypothesis.get("role") or "").strip()
+        if chosen_role not in ROLE_OPTIONS:
+            raise ValueError(f"unknown role: {chosen_role}")
+        timestamp = now_iso()
+        old_role = person.get("family_role")
+        updates = {"role_state": "confirmed", "updated_at": timestamp}
+        if is_self:
+            updates["family_role"] = "本人"
+        elif chosen_role != "无法判断":
+            updates["family_role"] = chosen_role
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        self.connection.execute(
+            f"UPDATE entities SET {assignments} WHERE id = ?",
+            (*updates.values(), person_id),
+        )
+        if updates.get("family_role"):
+            self._record_entity_revision(
+                person_id, "family_role", old_role, updates["family_role"], actor
+            )
+        self.connection.execute(
+            "UPDATE person_role_hypotheses SET status = 'confirmed', updated_at = ? WHERE id = ?",
+            (timestamp, hypothesis_id),
+        )
+        self.connection.execute(
+            """UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE person_id = ? AND id != ? AND status = 'suggested'""",
+            (timestamp, person_id, hypothesis_id),
+        )
+        self.connection.commit()
+        return self.get_entity(person_id)
+
+    def reject_role_hypothesis(self, hypothesis_id):
+        rows = self.connection.execute(
+            "SELECT status FROM person_role_hypotheses WHERE id = ?", (hypothesis_id,)
+        ).fetchall()
+        if not rows:
+            return None
+        self.connection.execute(
+            "UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ? WHERE id = ?",
+            (now_iso(), hypothesis_id),
+        )
+        self.connection.commit()
+        return {"id": hypothesis_id, "status": "superseded"}
+
+    def confirm_relationship_hypothesis(self, hypothesis_id, actor="user"):
+        hypothesis = self.get_relationship_hypothesis(hypothesis_id)
+        if not hypothesis:
+            return None
+        subject_id = hypothesis["subject_person_id"]
+        object_id = hypothesis["object_person_id"]
+        predicate = hypothesis["predicate"]
+        evidence = hypothesis.get("evidence_moment_ids") or hypothesis.get("evidence_event_ids") or []
+        relationship = self.create_relationship(
+            subject_id, predicate, object_id,
+            evidence_ids=evidence,
+            confidence=hypothesis.get("confidence") or 0.5,
+            status="active",
+        )
+        if relationship:
+            self.connection.execute(
+                "UPDATE relationships SET inverse_predicate = ? WHERE id = ?",
+                (hypothesis.get("inverse_predicate"), relationship["id"]),
+            )
+        timestamp = now_iso()
+        self.connection.execute(
+            "UPDATE relationship_hypotheses SET status = 'confirmed', updated_at = ? WHERE id = ?",
+            (timestamp, hypothesis_id),
+        )
+        self.connection.execute(
+            """UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND id != ? AND status = 'suggested' AND (
+                (subject_person_id = ? AND object_person_id = ?)
+                OR (subject_person_id = ? AND object_person_id = ?)
+            )""",
+            (timestamp, hypothesis["scope_id"], hypothesis_id,
+             subject_id, object_id, object_id, subject_id),
+        )
+        self.connection.commit()
+        return self.get_relationship_hypothesis(hypothesis_id)
+
+    def reject_relationship_hypothesis(self, hypothesis_id):
+        rows = self.connection.execute(
+            "SELECT status FROM relationship_hypotheses WHERE id = ?", (hypothesis_id,)
+        ).fetchall()
+        if not rows:
+            return None
+        self.connection.execute(
+            "UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ? WHERE id = ?",
+            (now_iso(), hypothesis_id),
+        )
+        self.connection.commit()
+        return {"id": hypothesis_id, "status": "superseded"}
+
+    def supersede_conflicting_hypotheses(self, person_id):
+        person = self.get_entity(person_id)
+        if not person:
+            return []
+        scope_id = person.get("scope_id") or "home-default"
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE person_role_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE person_id = ? AND status = 'suggested'""",
+            (timestamp, person_id),
+        )
+        self.connection.execute(
+            """UPDATE relationship_hypotheses SET status = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND status = 'suggested'
+            AND (subject_person_id = ? OR object_person_id = ?)""",
+            (timestamp, scope_id, person_id, person_id),
+        )
+        rows = self._rows(
+            """SELECT DISTINCT person_id FROM (
+                SELECT subject_person_id AS person_id FROM relationship_hypotheses
+                WHERE object_person_id = ? AND status IN ('suggested', 'confirmed')
+                UNION
+                SELECT object_person_id AS person_id FROM relationship_hypotheses
+                WHERE subject_person_id = ? AND status IN ('suggested', 'confirmed')
+            )""",
+            (person_id, person_id),
+        )
+        self.connection.commit()
+        return [row["person_id"] for row in rows]
+
+    def mark_portraits_stale(self, person_ids):
+        count = 0
+        for person_id in person_ids or []:
+            if not person_id:
+                continue
+            self.connection.execute(
+                """UPDATE person_portrait_revisions SET status = 'stale', updated_at = ?
+                WHERE person_id = ? AND status = 'active'""",
+                (now_iso(), person_id),
+            )
+            count += 1
+        self.connection.commit()
+        return count
+
+    def person_candidate_features(self, scope_id):
+        """Aggregate per-cluster core-person features, rooted at face_clusters.scope_id."""
+        rows = self._rows(
+            """SELECT
+                c.id AS cluster_id,
+                COALESCE(c.entity_id, c.id) AS person_id,
+                c.member_count AS member_count,
+                COUNT(DISTINCT substr(o.captured_at, 1, 10)) AS date_count,
+                COUNT(DISTINCT eo.event_id) AS event_count,
+                (
+                    SELECT COUNT(DISTINCT ep.person_id)
+                    FROM event_participants ep
+                    WHERE ep.event_id IN (
+                        SELECT DISTINCT eo2.event_id
+                        FROM event_observations eo2
+                        JOIN face_instances fi2 ON fi2.observation_id = eo2.observation_id
+                        WHERE fi2.cluster_id = c.id
+                    )
+                ) AS co_person_count,
+                COUNT(DISTINCT COALESCE(e.place, '') || '|' || COALESCE(e.activity, '')) AS scene_count,
+                (
+                    SELECT AVG(quality) FROM (
+                        SELECT fi3.quality AS quality
+                        FROM face_instances fi3
+                        WHERE fi3.cluster_id = c.id
+                        ORDER BY fi3.quality DESC
+                        LIMIT 3
+                    )
+                ) AS quality,
+                CASE WHEN ent.status = 'confirmed' THEN 1 ELSE 0 END AS confirmed
+            FROM face_clusters c
+            LEFT JOIN face_instances fi ON fi.cluster_id = c.id
+            LEFT JOIN observations o ON o.id = fi.observation_id
+            LEFT JOIN event_observations eo ON eo.observation_id = o.id
+            LEFT JOIN events e ON e.id = eo.event_id
+            LEFT JOIN entities ent ON ent.id = c.entity_id
+            WHERE c.scope_id = ? AND c.status != 'rejected'
+            GROUP BY c.id""",
+            (scope_id,),
+        )
+        return [{
+            "person_id": row["person_id"],
+            "cluster_id": row["cluster_id"],
+            "date_count": int(row["date_count"] or 0),
+            "event_count": int(row["event_count"] or 0),
+            "member_count": int(row["member_count"] or 0),
+            "co_person_count": int(row["co_person_count"] or 0),
+            "scene_count": int(row["scene_count"] or 0),
+            "quality": float(row["quality"] or 0),
+            "confirmed": bool(row["confirmed"]),
+        } for row in rows]

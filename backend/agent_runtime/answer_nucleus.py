@@ -18,7 +18,7 @@ from typing import Any
 
 # 硬值类型：出现这些类型的值必须原样保留
 HARD_KINDS = {"count", "date", "first", "last", "result_total",
-              "price", "phone", "year", "boolean"}
+              "price", "phone", "year", "boolean", "place"}
 
 # 价格/电话/年份提取（与 final_guard._check_ocr_hard_values 对齐）
 _PRICE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:元|块|¥|￥)")
@@ -28,9 +28,10 @@ _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 # 简单确定性问题分类
 _Q_COUNT = re.compile(r"多少张|几张|多少个|多少条|几段|几首|多少份|几份|几张照片|数量")
 _Q_DATE = re.compile(r"哪天|哪一天|几号|什么日期|日期是|拍摄日期|哪天拍的|什么时候拍的|具体时间")
-_Q_YEAR = re.compile(r"哪一年|哪年|什么年份|年份|创始于|成立于|创立于|始于|开业|创立|创建于|几几年")
+_Q_YEAR = re.compile(r"哪一年|哪年|什么年份|年份|成立于|创立于|开业|创建于|几几年")
 _Q_BOOL = re.compile(r"有没有|是不是|是否|有没有拍|是否存在|有没有去过|有没有去过")
 _Q_PRICE = re.compile(r"多少钱|售价|价格|费用|收费|卖多少钱|多少钱一杯|多少钱一份|多少钱一(?:杯|份|听|瓶)")
+_Q_WHERE = re.compile(r"在哪里|在哪|哪儿|哪里|什么地点|哪个地方|在什么地方|在哪儿")
 
 
 @dataclass
@@ -130,6 +131,13 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                 kind="result_total", value=total, unit="张",
                 certainty=certainty, source=tr.get("tool_call_id") or "search_memories",
                 display=str(total)))
+            group_count = tr.get("group_photo_count")
+            if isinstance(group_count, int) and group_count >= 0:
+                sizes = tr.get("group_photo_sizes") or []
+                nucleus.values.append(NucleusValue(
+                    kind="count", value=group_count, unit="张",
+                    certainty="confirmed", source=tr.get("tool_call_id") or "search_memories",
+                    label="不同人数合影", display=str(group_count)))
         # 3) read_photo_text：OCR 硬值（价格/电话/年份/数字）
         #    优先用结构化 exact_values（带 label/provider/confidence），缺失时回退 ocr_text 正则。
         if tr.get("tool") == "read_photo_text":
@@ -169,7 +177,8 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                         nucleus.values.append(NucleusValue(
                             kind="year", value=m.group(1), certainty="confirmed",
                             source="ocr", display=m.group(1)))
-        # 4) 地点（GPS 反编码，条件匹配）
+        # 4) 地点（GPS 反编码，条件匹配）；where 题把匹配照片地点绑为硬值防编造
+        _place_counter: dict[str, int] = {}
         if tr.get("tool") == "search_memories":
             for p in (tr.get("preview") or []) or []:
                 place = str(p.get("place") or "").strip()
@@ -180,6 +189,14 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                     nucleus.values.append(NucleusValue(
                         kind="place", value=place, certainty="confirmed",
                         source="search_memories", display=place))
+                if len(place) >= 2:
+                    _place_counter[place] = _place_counter.get(place, 0) + 1
+        if _Q_WHERE.search(question) and _place_counter:
+            top_place, top_n = max(_place_counter.items(), key=lambda kv: kv[1])
+            if top_n >= 2 and top_place not in [v.display for v in nucleus.all("place")]:
+                nucleus.values.append(NucleusValue(
+                    kind="place", value=top_place, certainty="confirmed",
+                    source="search_memories_majority", display=top_place))
 
     # 5) 当前关注人物
     active = task_state.get("active_person")
@@ -235,10 +252,10 @@ def render_simple(nucleus: AnswerNucleus, kind: str, question: str = "") -> str 
         vs = nucleus.all("year")
         if not vs:
             return None
-        # 优先 label 含创始/创立/成立/始于/开业 的年份（如 '创始于1974年'）
+        # 优先 label 含创立/成立/始于/开业/创建 的年份
         best = None
         for v in vs:
-            if re.search(r"创始|创立|成立|始于|开业|创建", v.label or ""):
+            if re.search(r"创立|成立|始于|开业|创建", v.label or ""):
                 best = v
                 break
         v = best or vs[0]

@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -37,12 +38,29 @@ class IngestionPipeline:
         from .video import VideoMemoryAdapter
         self.video_memory_adapter = VideoMemoryAdapter()
 
-    def create_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
+    def _text_embed(self, text: str):
+        """文本嵌入：SENTRIX_TEXT_EMBEDDER=bge 时走 bge sidecar，否则 clip。返回 (vector, model_name)。"""
+        if os.getenv("SENTRIX_TEXT_EMBEDDER", "clip").strip().lower() == "bge":
+            try:
+                import httpx
+                url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
+                resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=15)
+                resp.raise_for_status()
+                vec = (resp.json() or {}).get("vector")
+                if vec:
+                    return vec, os.getenv("SENTRIX_TEXT_EMBED_MODEL", "BAAI/bge-m3")
+            except Exception:
+                pass
+        return self.clip.embed_text(str(text)), self.clip.model_name
+
+    def prepare_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
+        """Prepare file metadata without mutating SQLite.
+
+        Hashing, EXIF parsing and offline geocoding can be relatively slow, so
+        callers may run this phase outside the process-wide SQLite write guard.
+        """
         path = Path(path)
-        asset_id = make_id("asset")
         media_type = media_type or self._media_type(path)
-        # Import metadata is provenance only. Model hints and benchmark labels
-        # must never enter the memory graph through the asset boundary.
         metadata = {key: value for key, value in (metadata or {}).items() if key in IMPORT_METADATA_KEYS}
         import_timings = dict(metadata.get("import_timings") or {})
         step_started = time.perf_counter()
@@ -53,15 +71,13 @@ class IngestionPipeline:
         import_timings["exif_seconds"] = round(time.perf_counter() - step_started, 4)
         existing = self.store.find_asset_by_hash(metadata["content_sha256"], metadata.get("scope_id"))
         if existing:
-            return existing
+            return {"existing": existing, "path": path, "file_name": file_name or path.name,
+                    "media_type": media_type, "mime_type": mime_type, "metadata": metadata}
         for key in ("captured_at", "captured_location", "source_device_id"):
             if metadata.get(key) is None and metadata["exif"].get(key):
                 metadata[key] = metadata["exif"][key]
         gps = self._gps_from_metadata(metadata)
         if gps:
-            # Keep the raw GPS coordinate as the event-clustering location
-            # anchor (the original logic); reverse_geocode stays a display-only
-            # semantic place and must not overwrite the coordinate.
             if not metadata.get("captured_location"):
                 metadata["captured_location"] = f"{float(gps['latitude']):.6f},{float(gps['longitude']):.6f}"
             if "reverse_geocode" not in metadata:
@@ -71,20 +87,42 @@ class IngestionPipeline:
                 if location_context:
                     metadata["reverse_geocode"] = location_context
         metadata["import_timings"] = import_timings
+        return {"existing": None, "path": path, "file_name": file_name or path.name,
+                "media_type": media_type, "mime_type": mime_type, "metadata": metadata}
+
+    def create_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None, prepared=None):
+        prepared = prepared or self.prepare_asset(path, file_name, media_type, mime_type, metadata)
+        existing = prepared.get("existing")
+        if existing:
+            return existing
+        asset_id = make_id("asset")
+        metadata = dict(prepared.get("metadata") or {})
+        import_timings = dict(metadata.get("import_timings") or {})
         step_started = time.perf_counter()
-        created = self.store.create_asset(
-            asset_id,
-            file_name or path.name,
-            media_type,
-            str(path),
-            mime_type or guess_mime_type(path),
-            path.stat().st_size,
-            metadata,
-            scope_id=metadata.get("scope_id"),
-        )
-        import_timings["database_create_seconds"] = round(time.perf_counter() - step_started, 4)
-        import_timings["asset_create_seconds"] = round(sum(import_timings.values()), 4)
-        return self.store.update_asset(created["id"], created.get("status") or "queued", {"import_timings": import_timings})
+        with self.store.transaction():
+            created = self.store.create_asset(
+                asset_id,
+                prepared.get("file_name") or Path(prepared["path"]).name,
+                prepared["media_type"],
+                str(prepared["path"]),
+                prepared.get("mime_type") or guess_mime_type(prepared["path"]),
+                Path(prepared["path"]).stat().st_size,
+                metadata,
+                scope_id=metadata.get("scope_id"),
+            )
+            import_timings["database_create_seconds"] = round(time.perf_counter() - step_started, 4)
+            import_timings["asset_create_seconds"] = round(sum(import_timings.values()), 4)
+            return self.store.update_asset(created["id"], created.get("status") or "queued", {"import_timings": import_timings})
+
+    def create_assets(self, prepared_assets):
+        """Persist a prepared import chunk in one SQLite transaction."""
+        created = []
+        with self.store.transaction():
+            for prepared in prepared_assets or []:
+                created.append(self.create_asset(
+                    prepared["path"], prepared=prepared,
+                ))
+        return created
 
     @staticmethod
     def _gps_from_metadata(metadata):
@@ -149,7 +187,7 @@ class IngestionPipeline:
     def _media_type(self, path):
         return media_type_for_path(path)
 
-    def process(self, asset_id, summarize_event=True, forced_event_id=None):
+    def process(self, asset_id, summarize_event=True, forced_event_id=None, image_analysis=None):
         asset = self.store.get_asset(asset_id)
         if not asset:
             raise KeyError(asset_id)
@@ -162,7 +200,7 @@ class IngestionPipeline:
         started_at = time.perf_counter()
         try:
             if asset["media_type"] == "image":
-                result = self._image_observation(asset)
+                result = self._image_observation(asset, precomputed_analysis=image_analysis)
             elif asset["media_type"] == "audio":
                 result = self._audio_observation(asset)
             else:
@@ -193,10 +231,16 @@ class IngestionPipeline:
             )
             fact_text = " ".join(f"{item.get('subject', '')} {item.get('predicate', '')} {item.get('object', '')}" for item in result.get("facts", []))
             clothing_text = " ".join(str(item) for item in (observation.get("clothing") or []))
-            text_embedding = self.clip.embed_text(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text])))
-            self.store.upsert_vector("episodic", "observation", observation["id"], text_embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event["id"]})
-            self.store.upsert_vector("episodic", "event", event["id"], text_embedding, self.clip.model_name, {"observation_id": observation["id"]})
-            self.store.upsert_vector("semantic", "observation", observation["id"], text_embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event["id"]})
+            detail = observation.get("detail") or {}
+            detail_text = " ".join(
+                (str(item.get("text") or item.get("label") or "")
+                 if isinstance(item, dict) else str(item))
+                for item in (detail.get("visible_details") or [])
+            ) if isinstance(detail, dict) else ""
+            text_embedding, text_model = self._text_embed(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text, detail_text])))
+            self.store.upsert_vector("episodic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
+            self.store.upsert_vector("episodic", "event", event["id"], text_embedding, text_model, {"observation_id": observation["id"]})
+            self.store.upsert_vector("semantic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
             fact_ids = []
             scope_id = observation.get("scope_id") or (self.store.get_asset(asset_id) or {}).get("scope_id")
             for fact in result.get("facts", []):
@@ -268,6 +312,11 @@ class IngestionPipeline:
         }
 
     def commit_fast_image(self, asset_id, prepared, started_at=None):
+        """Commit one fast result as one SQLite transaction."""
+        with self.store.transaction():
+            return self._commit_fast_image(asset_id, prepared, started_at=started_at)
+
+    def _commit_fast_image(self, asset_id, prepared, started_at=None):
         """Commit prepared face/CLIP evidence in deterministic image order."""
         asset = self.store.get_asset(asset_id)
         if not asset:
@@ -351,21 +400,53 @@ class IngestionPipeline:
         })
         vision_seconds = time.perf_counter() - vision_started
         analysis = normalize_semantic_analysis(analysis)
+        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
+        analysis["detail"] = {
+            "schema_version": 1,
+            **detail,
+            "caption": analysis.get("caption", ""),
+            "activity": analysis.get("activity", ""),
+            "place": analysis.get("place", ""),
+            "people": analysis.get("people", []),
+            "objects": analysis.get("objects", []),
+            "clothing": analysis.get("clothing", []),
+            "emotions": analysis.get("emotions", []),
+            "spatial_relations": analysis.get("spatial_relations", []),
+            "ocr_text": analysis.get("ocr_text", ""),
+            "event_type": analysis.get("event_type", ""),
+            "facts": analysis.get("facts", []),
+        }
         analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
         analysis["location_context"] = metadata.get("reverse_geocode") or {}
         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
         objects = analysis.get("objects") or []
-        object_text = " ".join(
-            item if isinstance(item, str) else " ".join(str(item.get(key, "")) for key in ("label", "primary", "details") if item.get(key))
-            for item in objects
+
+        def object_text(item):
+            if isinstance(item, str):
+                return item
+            if isinstance(item, dict):
+                return " ".join(
+                    str(item.get(key, ""))
+                    for key in ("label", "primary", "details")
+                    if item.get(key)
+                )
+            return str(item)
+
+        object_text = " ".join(object_text(item) for item in objects)
+        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
+        detail_text = " ".join(
+            (str(item.get("text") or item.get("label") or "")
+             if isinstance(item, dict) else str(item))
+            for item in (detail.get("visible_details") or [])
         )
-        text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text]))
+        text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text, detail_text]))
         embedding_started = time.perf_counter()
-        embedding = self.clip.embed_text(text)
+        embedding, embedding_model = self._text_embed(text)
         embedding_seconds = time.perf_counter() - embedding_started
         return {
             "analysis": analysis,
             "embedding": embedding,
+            "embedding_model": embedding_model,
             "timings": {
                 "vlm_image_description_seconds": round(vision_seconds, 4),
                 "text_embedding_seconds": round(embedding_seconds, 4),
@@ -374,6 +455,13 @@ class IngestionPipeline:
         }
 
     def commit_semantic_image(self, asset_id, prepared, summarize_event=False, started_at=None):
+        """Commit one semantic result as one SQLite transaction."""
+        with self.store.transaction():
+            return self._commit_semantic_image(
+                asset_id, prepared, summarize_event=summarize_event, started_at=started_at
+            )
+
+    def _commit_semantic_image(self, asset_id, prepared, summarize_event=False, started_at=None):
         """Commit prepared semantic data after ordered face/event clustering."""
         asset = self.store.get_asset(asset_id)
         metadata = (asset or {}).get("metadata_json") or {}
@@ -391,11 +479,12 @@ class IngestionPipeline:
         entity_ids = [item["id"] for item in self.store.maintain_observation_entities(observation_id, event_id)]
         entity_maintenance_seconds = time.perf_counter() - step_started
         embedding = prepared["embedding"]
+        embedding_model = prepared.get("embedding_model") or self.clip.model_name
         step_started = time.perf_counter()
-        self.store.upsert_vector("episodic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
-        self.store.upsert_vector("semantic", "observation", observation_id, embedding, self.clip.model_name, {"asset_id": asset_id, "event_id": event_id})
+        self.store.upsert_vector("episodic", "observation", observation_id, embedding, embedding_model, {"asset_id": asset_id, "event_id": event_id})
+        self.store.upsert_vector("semantic", "observation", observation_id, embedding, embedding_model, {"asset_id": asset_id, "event_id": event_id})
         if event_id:
-            self.store.upsert_vector("episodic", "event", event_id, embedding, self.clip.model_name, {"observation_id": observation_id})
+            self.store.upsert_vector("episodic", "event", event_id, embedding, embedding_model, {"observation_id": observation_id})
             # Fast-path events keep placeholder place ("其他或不确定"); sync the
             # visual place after enrichment so later participant refreshes do not
             # rewrite summaries with a blank location.
@@ -427,6 +516,20 @@ class IngestionPipeline:
             "semantic_enrichment_seconds": timings["semantic_enrichment_seconds"],
         })
 
+    def _persist_event_summary(self, event_id, result):
+        """Persist one event projection and its vector in one SQLite transaction."""
+        with self.store.transaction():
+            updated = self.store.update_event(event_id, {
+                "title": result.get("title"),
+                "event_type": result.get("event_type"),
+                "activity": result.get("activity"),
+                "summary": result.get("summary"),
+            })
+            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
+            vector, vector_model = self._text_embed(event_text)
+            self.store.upsert_vector("episodic", "event", event_id, vector, vector_model, {"summary_model": result.get("model"), "event_summary": True})
+            return updated
+
     def summarize_event(self, event_id):
         detail = self.store.get_event_detail(event_id)
         if not detail or not detail["observations"] or not hasattr(self.gamma, "summarize_event"):
@@ -455,29 +558,18 @@ class IngestionPipeline:
 
         try:
             result = self.gamma.summarize_event(detail["event"], detail["observations"])
+            # Some local-model responses decode as a bare string despite the
+            # structured event-summary contract. Treat that as an incomplete
+            # model response and use the deterministic projection instead of
+            # failing the whole asset's semantic stage.
+            if not isinstance(result, dict):
+                result = fallback_projection()
             if str(result.get("title") or "").strip() in {"待总结事件", "待确认的家庭记录", "待判断"}:
                 result = fallback_projection()
-            updated = self.store.update_event(event_id, {
-                "title": result.get("title"),
-                "event_type": result.get("event_type"),
-                "activity": result.get("activity"),
-                "summary": result.get("summary"),
-            })
-            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
-            vector = self.clip.embed_text(event_text)
-            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result.get("model"), "event_summary": True})
-            return updated
+            return self._persist_event_summary(event_id, result)
         except Exception:
             result = fallback_projection()
-            updated = self.store.update_event(event_id, {
-                "title": result["title"], "event_type": result["event_type"],
-                "activity": result["activity"], "summary": result["summary"],
-            })
-            event_text = " ".join(filter(None, [updated.get("title"), updated.get("event_type"), updated.get("activity"), updated.get("summary")]))
-            vector = self.clip.embed_text(event_text)
-            self.store.upsert_vector("episodic", "event", event_id, vector, self.clip.model_name, {"summary_model": result["model"], "event_summary": True})
-            return updated
-
+            return self._persist_event_summary(event_id, result)
     def summarize_events(self, scope_id=None):
         return [self.summarize_event(event["id"]) for event in self.store.list_events(1000, scope_id)]
 
@@ -506,9 +598,50 @@ class IngestionPipeline:
             return batch
         for event_id in self.store.batch_event_ids(batch_id):
             self.summarize_event(event_id)
-        return self.store.finish_ingest_batch(batch_id)
+        batch = self.store.finish_ingest_batch(batch_id)
+        scope_id = (batch or {}).get("scope_id")
+        if scope_id:
+            self._maybe_trigger_person_insight(scope_id)
+        return batch
 
-    def _image_observation(self, asset):
+    def _maybe_trigger_person_insight(self, scope_id):
+        """Trigger an incremental person-insight run only for allowlisted scopes.
+
+        A run only starts when new events arrived since the previous run's event
+        watermark; otherwise the live portraits are left untouched.
+        """
+        allowlist = {
+            item.strip() for item in os.getenv("SENTRIX_PERSON_INSIGHT_SCOPES", "").split(",")
+            if item.strip()
+        }
+        if scope_id not in allowlist:
+            return None
+        event_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE scope_id = ?", (scope_id,)
+        ).fetchone()[0]
+        latest = self.store.latest_person_insight_run(scope_id)
+        watermark = int(((latest or {}).get("stats") or {}).get("event_watermark", 0))
+        if latest is not None and event_count <= watermark:
+            return None
+        run = self.store.create_person_insight_run(scope_id, {
+            "max_core_people": 10, "trigger_type": "ingest",
+        })
+
+        def execute():
+            from .person_insights import PersonInsightService
+
+            worker = MemoryStore(self.store.path)
+            try:
+                PersonInsightService(worker, self.gamma).run(
+                    run["id"], scope_id, {"max_core_people": 10, "trigger_type": "ingest"}
+                )
+            finally:
+                worker.close()
+
+        threading.Thread(target=execute, daemon=True).start()
+        return run
+
+    def _image_observation(self, asset, precomputed_analysis=None):
         path = asset["path"]
         captured_at = asset.get("captured_at") or file_time(path)
         metadata = {
@@ -527,7 +660,15 @@ class IngestionPipeline:
         # Model adapters do not write to MemoryStore. Keep SQLite writes and
         # event selection on this caller thread after all three complete.
         parallel = os.getenv("SENTRIX_PARALLEL_IMAGE_ANALYSIS", "true").lower() in {"1", "true", "yes"}
-        if parallel:
+        if precomputed_analysis is not None:
+            analysis = dict(precomputed_analysis)
+            vision_seconds = float(analysis.pop("_vision_seconds", 0.0) or 0.0)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sentrix-image") as executor:
+                face_future = executor.submit(timed, lambda: self.face.detect(path))
+                clip_future = executor.submit(timed, lambda: self.clip.embed_image(path))
+                faces, face_seconds = face_future.result()
+                clip_embedding, clip_seconds = clip_future.result()
+        elif parallel:
             with ThreadPoolExecutor(max_workers=3, thread_name_prefix="sentrix-image") as executor:
                 vision_future = executor.submit(timed, lambda: self.gamma.analyze_image(path, metadata))
                 face_future = executor.submit(timed, lambda: self.face.detect(path))
@@ -540,6 +681,22 @@ class IngestionPipeline:
             faces, face_seconds = timed(lambda: self.face.detect(path))
             clip_embedding, clip_seconds = timed(lambda: self.clip.embed_image(path))
         analysis = normalize_semantic_analysis(analysis)
+        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
+        analysis["detail"] = {
+            "schema_version": 1,
+            **detail,
+            "caption": analysis.get("caption", ""),
+            "activity": analysis.get("activity", ""),
+            "place": analysis.get("place", ""),
+            "people": analysis.get("people", []),
+            "objects": analysis.get("objects", []),
+            "clothing": analysis.get("clothing", []),
+            "emotions": analysis.get("emotions", []),
+            "spatial_relations": analysis.get("spatial_relations", []),
+            "ocr_text": analysis.get("ocr_text", ""),
+            "event_type": analysis.get("event_type", ""),
+            "facts": analysis.get("facts", []),
+        }
         analysis["clip_embedding"] = clip_embedding
         analysis["processing_timings"] = {
             "vision_seconds": round(vision_seconds, 4),
@@ -555,7 +712,7 @@ class IngestionPipeline:
             key: analysis.get(key)
             for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "spatial_relations", "emotions", "ocr_text", "event_type")
         }
-        analysis["source_type"] = "image"
+        analysis["source_type"] = "video_event" if precomputed_analysis is not None else "image"
         analysis["face_candidates"] = faces
         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key not in {"clip_embedding", "face_candidates", "location_context"}}, "location_context": metadata["location_context"], "face_candidates": [{key: value for key, value in face.items() if key != "embedding"} for face in faces], "models": {"vision": self.gamma.model, "face_detector": "buffalo_l", "face_embedding": sorted({face.get("embedding_model", "unknown") for face in faces}), "image_embedding": self.clip.model_name}}
         return analysis

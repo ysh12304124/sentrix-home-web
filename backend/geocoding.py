@@ -216,6 +216,12 @@ _PLACE_ADMIN_SUFFIXES = ("省", "市", "区", "县", "地区", "自治州", "盟
 # 常见国际/跨境目的地中英别名（GeoNames 反编码返回英文，中文查询需别名桥接）。
 # 这是通用双语地名知识，不是测评答案。
 _PLACE_ALIASES = {
+    # High-frequency Chinese landmark -> administrative-area aliases.  These
+    # are geographic normalization data, not answer text; they let a landmark
+    # query use the asset's authoritative reverse-geocode record when the
+    # caption itself does not name the landmark.
+    "赵州桥": ["赵县"],
+    "三峡坝址": ["夷陵区"],
     "清迈": ["Chiang Mai", "Hang Dong"],
     "泰国": ["Thailand", "TH"],
     "曼谷": ["Bangkok"],

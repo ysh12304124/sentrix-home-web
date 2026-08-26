@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import itertools
-import math
 from dataclasses import dataclass, field
 
 from .face_embeddings import normalize_embedding

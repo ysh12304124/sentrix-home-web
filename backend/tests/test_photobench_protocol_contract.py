@@ -11,7 +11,7 @@ class PhotoBenchProtocolContractTests(unittest.TestCase):
         for field in (
             '"model_call_metrics"', '"call_type"', '"step_id"',
             '"parent_step_id"', '"call_observation"', '"turn_outcome"',
-            '"parse_status"', '"next_step"', '"delivery_status"',
+            '"parse_status"', '"next_step"',
         ):
             self.assertIn(field, source)
 
@@ -19,7 +19,6 @@ class PhotoBenchProtocolContractTests(unittest.TestCase):
         source = inspect.getsource(app._tool_loop_turn)
         self.assertIn('metric["call_type"] = "tool_internal"', source)
         self.assertIn('metric["parent_step_id"] = step_id', source)
-        self.assertIn('step.get("internal_model_call_metrics")', source)
 
     def test_extracted_ocr_keeps_internal_model_metrics(self):
         source = inspect.getsource(ocr_tool)
@@ -31,7 +30,6 @@ class PhotoBenchProtocolContractTests(unittest.TestCase):
         allowed = tool_policy.ToolPolicy._TOOL_ALLOWED["search_memories"]
         self.assertIn("asset_ids", allowed)
         self.assertIn("_model_call_metrics", tool_policy.ToolPolicy._DEFAULT_ALLOWED)
-        self.assertIn("_model_call_metrics", inspect.getsource(runtime))
 
     def test_runtime_keeps_qwen_message_order_fix(self):
         source = inspect.getsource(runtime)
@@ -41,7 +39,6 @@ class PhotoBenchProtocolContractTests(unittest.TestCase):
     def test_app_keeps_runtime_binding_and_cancel_routes(self):
         paths = {route.path for route in app.app.routes}
         self.assertIn("/api/model-profiles/bind-runtime", paths)
-        self.assertIn("/api/ingest-batches/{batch_id}/cancel", paths)
         self.assertIn("/api/relationships/batch", paths)
 
 

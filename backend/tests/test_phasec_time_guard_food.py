@@ -65,6 +65,12 @@ class RelativeTimeResolverTests(unittest.TestCase):
         self.assertEqual(runtime_tools._resolve_time_expression("2023"), "2023年")
         self.assertEqual(runtime_tools._resolve_time_expression("2023年"), "2023年")
 
+    def test_unsupported_relative_phrase_is_not_forced_into_strict_parser(self):
+        # "国庆/那次/回乡/晚上"没有稳定的绝对范围，不能被当作时间表达式
+        # 继续下传，否则会把合法的语义检索误收窄成错误的零结果。
+        for expr in ("国庆", "那次", "回乡", "晚上"):
+            self.assertIsNone(runtime_tools._resolve_time_expression(expr), expr)
+
     def test_parse_year_range(self):
         start, end = parse_time_expression("2025年-2026年")
         self.assertEqual(start.date().isoformat(), "2025-01-01")

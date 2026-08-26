@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 
 const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
@@ -31,7 +31,17 @@ const sentrixUrl = ref("");
 const judgeUrl = ref("");
 const vllmTargetId = ref("");
 const rejudgePrompt = ref("");
+const judgePromptKinds = ref([]);
+const activePromptKind = ref("answer_quality");
+const promptDrafts = reactive({ answer_quality: "", task_decision: "", evidence: "" });
 const judgeProviderId = ref("");
+watch(judgeProviderId, (newId) => {
+  const provider = (config.value?.judge_providers || []).find((p) => p.id === newId);
+  if (provider?.url) {
+    judgeUrl.value = provider.url;
+  }
+});
+
 const suiteRunning = ref(false);
 const rejudgeSubmitting = ref(false);
 const reviewSaving = ref(false);
@@ -70,7 +80,7 @@ const fmtMs = (value) => value == null ? "-" : value >= 1000 ? `${(value / 1000)
 const fmtPct = (value) => value == null ? "-" : `${(Number(value) * 100).toFixed(1)}%`;
 const fmtTokens = (value) => value == null || !Number.isFinite(Number(value)) ? "-" : `${Math.round(Number(value)).toLocaleString("en-US")} token`;
 const scoreClass = (score) => score === 2 ? "score-2" : score === 1 ? "score-1" : score === 0 ? "score-0" : "score-none";
-const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", interrupted: "中断", cancelled: "已取消", partial: "部分采样", not_run: "未执行" }[status] || status || "等待");
+const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", interrupted: "中断", cancelled: "已取消", partial: "部分采样", not_run: "未执行", skipped: "不适用" }[status] || status || "等待");
 function setModelSelected(modelId, checked) {
   if (checked) selectedModels.add(modelId);
   else selectedModels.delete(modelId);
@@ -117,7 +127,7 @@ function effectiveRunSummary(run) {
   const evidenceScores = items.map((item) => item.evidence_judge?.score).filter((score) => [0, 1, 2].includes(score));
   const retrievalItems = items.filter((item) => Array.isArray(item.retrieval_image_ids) && item.retrieval_image_ids.length);
   const retrievalTp = retrievalItems.reduce((sum, item) => sum + (item.matched_file_names || []).length, 0);
-  const retrievalPredicted = retrievalItems.reduce((sum, item) => sum + (item.predicted_file_names || []).length, 0);
+  const retrievalPredicted = retrievalItems.reduce((sum, item) => sum + (item.retrieved_file_names || []).length, 0);
   const retrievalGt = retrievalItems.reduce((sum, item) => sum + (item.retrieval_image_ids || []).length, 0);
   const retrievalPrecision = retrievalPredicted ? retrievalTp / retrievalPredicted : (retrievalGt ? 0 : null);
   const retrievalRecall = retrievalGt ? retrievalTp / retrievalGt : null;
@@ -187,6 +197,13 @@ function effectiveRunSummary(run) {
     llm_context_tokens_max: saved.llm_context_tokens_max ?? (contextTokens.length ? Math.max(...contextTokens) : null),
     llm_context_tokens_p95: saved.llm_context_tokens_p95 ?? nearestRankPercentile(contextTokens, 0.95),
     llm_context_samples_count: saved.llm_context_samples_count ?? contextTokens.length,
+    agent_throughput_latency_mode: saved.agent_throughput_latency_mode
+      ?? (run?.phases?.qa_eval?.agent_phase_wall_ms != null ? "measured_agent_phase" : "historical_interval_estimate"),
+    agent_phase_wall_ms: saved.agent_phase_wall_ms ?? run?.phases?.qa_eval?.agent_phase_wall_ms ?? null,
+    agent_phase_completed_count: saved.agent_phase_completed_count ?? run?.phases?.qa_eval?.agent_completed ?? null,
+    agent_throughput_qa_per_s: saved.agent_throughput_qa_per_s ?? null,
+    judge_phase_wall_ms: saved.judge_phase_wall_ms ?? run?.phases?.qa_eval?.judge_phase_wall_ms ?? null,
+    judge_concurrency: saved.judge_concurrency ?? run?.phases?.qa_eval?.judge_concurrency ?? run?.judge_concurrency ?? null,
   };
 }
 function resultPhaseStatus(phase) {
@@ -216,14 +233,27 @@ function itemParseRate(item) {
   if (stability.json_parse_total == null) return "未记录";
   return `${stability.json_parse_success ?? 0}/${stability.json_parse_total} 次模型输出解析为合法动作 (${fmtPct(stability.json_parse_rate)})`;
 }
-function completionLabel(item) {
-  const completed = item?.agent_stability?.completed_within_steps;
-  if (completed === true) return "完成";
-  if (completed === false) {
-    const reason = normalizedTerminationReason(item) || item?.agent_status;
-    return reason ? `未完成（${reason}）` : "未完成";
+function executionState(item) {
+  const stability = item?.agent_stability || {};
+  const status = String(item?.agent_status || item?.guard_debug?.status || "").toLowerCase();
+  const termination = String(item?.termination_reason || item?.guard_debug?.termination_reason || "").toLowerCase();
+  const turns = Array.isArray(item?.runtime_turns) ? item.runtime_turns : [];
+  const outcome = String(item?.turn_outcome || turns[turns.length - 1]?.turn_outcome || "").toLowerCase();
+  const failure = [status, termination, outcome].some((value) => /error|failed|failure|timeout|cancel|blocked|parse_failure|model_error/.test(value));
+  const partial = [status, termination, outcome].some((value) => /partial|limit|budget|incomplete|tool_call_limit|step_limit/.test(value));
+  if (failure) return { key: "failed", label: "执行失败" };
+  if (partial) return { key: "partial", label: "部分完成" };
+  if (outcome === "final_answer" || ["complete", "completed", "done", "success"].includes(status)
+      || ["complete", "completed", "done", "success"].includes(termination)
+      || stability.completed_within_steps === true) {
+    return { key: "complete", label: "已完成" };
   }
-  return "未记录";
+  if (status || termination || outcome || stability.completed_within_steps === false) return { key: "unknown", label: "状态待确认" };
+  return { key: "unknown", label: "未记录" };
+}
+function executionStateClass(item) { return `status-${executionState(item).key}`; }
+function completionLabel(item) {
+  return executionState(item).label;
 }
 function taskDecisionLabel(item) {
   const judge = item?.task_judge || {};
@@ -249,25 +279,50 @@ function turnScore(score) {
 }
 function albumLocalUrl(fileName) {
   const album = activeRun.value?.album_id || "";
-  return (album && fileName) ? `/api/albums/${encodeURIComponent(album)}/photos/${encodeURIComponent(fileName)}` : "";
+  const collection = /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(String(fileName || "")) ? "faces" : "photos";
+  return (album && fileName) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(fileName)}` : "";
 }
 function decorateImages(list) {
   return (list || []).map((img) => {
     if (img?.media_url) return img;
     const parts = (img?.image_id || "").split("/");
-    const album = parts.length === 2 ? parts[0] : (activeRun.value?.album_id || "");
     const file = parts.length === 2 ? parts[1] : (img?.file_name || "");
-    const local = (album && file) ? `/api/albums/${encodeURIComponent(album)}/photos/${encodeURIComponent(file)}` : "";
+    const album = activeRun.value?.album_id || (parts.length === 2 ? parts[0] : "");
+    const collection = /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(file) ? "faces" : "photos";
+    const local = (album && file) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(file)}` : "";
     return local ? { ...img, media_url: local } : img;
   });
 }
 function itemImages(item, gt = false) {
   if (gt) {
     if (item.gt_images?.length) return decorateImages(item.gt_images);
-    return (item.retrieval_image_ids || []).map((id) => ({ image_id: id, file_name: id.split("/").pop(), matched: (item.matched_file_names || []).includes(id.split("/").pop()) }));
+    return decorateImages((item.retrieval_image_ids || []).map((id) => ({ image_id: id, file_name: id.split("/").pop(), matched: (item.matched_file_names || []).includes(id.split("/").pop()) })));
+  }
+  // Model recall is the upstream evidence projection, not only explicit
+  // delivery images. Keep the smaller delivery subset available separately.
+  if (item.evidence_source_images?.length) return decorateImages(item.evidence_source_images);
+  if (item.evidence_source_file_names?.length) {
+    return decorateImages(item.evidence_source_file_names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) })));
   }
   if (item.predicted_images?.length) return decorateImages(item.predicted_images);
-  return (item.predicted_file_names || []).map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+  if (item.predicted_file_names?.length) {
+    return item.predicted_file_names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+  }
+  // A validator may leave all candidates as candidate_only.  They are not
+  // answer evidence, but hiding them makes a healthy retrieval look empty
+  // in the evaluation UI.  Show a bounded representative window here; the
+  // full candidate set remains in retrieval metrics and the trace.
+  if (item.retrieved_candidate_images?.length) {
+    return decorateImages(item.retrieved_candidate_images.slice(0, 6));
+  }
+  return (item.retrieved_file_names || []).slice(0, 6)
+    .map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+}
+function itemEvidenceImages(item) {
+  const images = item?.evidence_source_images || [];
+  if (images.length) return decorateImages(images);
+  const names = item?.evidence_source_file_names || [];
+  return decorateImages(names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) })));
 }
 function isDirectEvidence(item, imageId) {
   return (item?.answer_evidence_image_ids || []).includes(imageId)
@@ -285,6 +340,15 @@ function closeJudgeInput() { judgeModal.value = null; }
 function toolBindingLabel(trace) {
   if (trace?.round_binding_source === "step_id") return "按步骤 ID 精确绑定";
   return trace?.round_binding_source === "inferred_single_model_call" ? "单轮数据推断归属" : "按执行轨迹绑定";
+}
+function retrievalBackendLabel(trace) {
+  const channels = trace?.retrieval_timing?.channels || {};
+  const backends = [...new Set(Object.values(channels).map((channel) => channel && channel.backend).filter(Boolean))];
+  return backends.length ? backends.join("/") : "";
+}
+function retrievalBackendDegraded(trace) {
+  const label = retrievalBackendLabel(trace);
+  return Boolean(label) && label.split("/").some((backend) => backend !== "qdrant");
 }
 function judgeRoundState(item) {
   const task = activeRejudge.value;
@@ -331,6 +395,31 @@ function fmtMemory(value) {
   return `${(Number(value) / 1024).toFixed(2)} GiB`;
 }
 function gpuMetricRows(phase = {}) {
+  if (phase.memory_pressure) {
+    const mp = phase.memory_pressure || {};
+    const used = phase.memory_used_gib || {};
+    const comp = phase.compressed_gib || {};
+    const swap = phase.swap_used_gib || {};
+    const thermal = phase.thermal_state || {};
+    const cpu = phase.cpu_percent || {};
+    const modelMem = phase.model_process_memory_used_mib || {};
+    const arb = phase.arbiter_summary || {};
+    const arbDist = arb.state_distribution || {};
+    const arbLabel = Object.keys(arbDist).length ? Object.entries(arbDist).map(([k, v]) => `${k}=${v}`).join(" ") : "-";
+    const thermalLabel = (v) => v == null ? "-" : (["nominal", "fair", "serious", "critical"][Math.round(v)] ?? `${v}`);
+    return [
+      ["内存压力", fmtNumber(mp.mean), `峰值 ${fmtNumber(mp.peak)} · P95 ${fmtNumber(mp.p95)}`, true],
+      ["整机内存占用", used.mean == null ? "-" : `${Number(used.mean).toFixed(2)} GiB`, `峰值 ${used.peak == null ? "-" : `${Number(used.peak).toFixed(2)} GiB`} · P95 ${used.p95 == null ? "-" : `${Number(used.p95).toFixed(2)} GiB`}`],
+      ["压缩内存", comp.mean == null ? "-" : `${Number(comp.mean).toFixed(2)} GiB`, `峰值 ${comp.peak == null ? "-" : `${Number(comp.peak).toFixed(2)} GiB`} · macOS 内存压缩器占用`],
+      ["Swap 用量", swap.mean == null ? "-" : `${Number(swap.mean).toFixed(2)} GiB`, `峰值 ${swap.peak == null ? "-" : `${Number(swap.peak).toFixed(2)} GiB`} · 换页开始即压力信号`],
+      ["散热状态", thermal.mean == null ? "-" : thermalLabel(thermal.mean), `峰值 ${thermal.peak == null ? "-" : thermalLabel(thermal.peak)} · NSProcessInfo.thermalState`, true],
+      ["CPU 占用", cpu.mean == null ? "-" : fmtNumber(cpu.mean, "%"), `峰值 ${cpu.peak == null ? "-" : fmtNumber(cpu.peak, "%")} · 全核采样`],
+      ["模型进程内存", modelMem.mean == null ? "-" : fmtMemory(modelMem.mean), `峰值 ${modelMem.peak == null ? "-" : fmtMemory(modelMem.peak)} · mlx 进程 RSS（Metal 分配不在其中）`],
+      ["调度状态", arbLabel, `worker_scale 均值 ${arb.worker_scale_mean == null ? "-" : arb.worker_scale_mean} · 预占峰值 ${arb.preempt_count_max ?? 0}`, true],
+      ["Import/Agent 活跃峰值", `import ${arb.import_active_peak ?? 0} · agent ${arb.agent_vlm_active_peak ?? 0}`, "采样期内 VLM 令牌持有峰值"],
+      ["采样数量", phase.samples_count == null ? "-" : `${phase.samples_count} 次`, "macOS 系统采样点"],
+    ];
+  }
   const temp = phase.temperature_c || {};
   const util = phase.gpu_utilization_pct || {};
   const memory = phase.memory_used_mib || {};
@@ -352,8 +441,34 @@ function gpuMetricRows(phase = {}) {
     ["SM 时钟", fmtNumber(clock.mean, "MHz"), `峰值 ${fmtNumber(clock.peak, "MHz")} · P95 ${fmtNumber(clock.p95, "MHz")}`],
   ];
 }
+function comparableMemoryProfile(run) {
+  if (!run) return null;
+  if (run?.memory_profile) return { ...run.memory_profile, source: "replay" };
+  const gpu = run?.phases?.gpu_metrics;
+  if (!gpu) return { source: "pending", status: "pending", memory_profile: {}, questions_completed: run.summary?.completed, questions_total: run.summary?.total };
+  if (!gpu?.memory_profile) return { source: "pending", status: gpu.status, memory_profile: {}, questions_completed: run.summary?.completed, questions_total: run.summary?.total };
+  return {
+    status: gpu.status,
+    source: "gpu_metrics",
+    memory_profile: gpu.memory_profile,
+    model_process_memory_used_mib: gpu.model_process_memory_used_mib,
+    questions_completed: run.summary?.completed,
+    questions_total: run.summary?.total,
+  };
+}
 function memoryProfileRows(profile = {}) {
   const memory = profile.memory_profile || {};
+  const isBenchmarkGpuProfile = profile.source === "gpu_metrics";
+  if (memory.method === "macos_unified_memory_v1") {
+    return [
+      ["内存占用峰值", memory.memory_used_peak_gib == null ? "-" : `${Number(memory.memory_used_peak_gib).toFixed(2)} GiB`, "16GB 统一内存整机峰值", true],
+      ["模型进程空闲占用", memory.idle_model_process_memory_gib == null ? "-" : `${Number(memory.idle_model_process_memory_gib).toFixed(2)} GiB`, "mlx 进程 RSS 采样最小值"],
+      ["Swap 峰值", memory.swap_used_peak_gib == null ? "-" : `${Number(memory.swap_used_peak_gib).toFixed(2)} GiB`, "换页压力信号"],
+      ["压缩内存峰值", memory.compressed_peak_gib == null ? "-" : `${Number(memory.compressed_peak_gib).toFixed(2)} GiB`, "macOS 内存压缩器峰值"],
+      ["复测进度", `${profile.questions_completed ?? 0}/${profile.questions_total ?? 0} 题`, `请求失败 ${profile.failed_requests ?? 0} · 答案不保存`],
+      ["原测评数据一致性", profile.items_integrity_ok === true ? "通过" : profile.status === "completed" ? "未通过" : "待完成", profile.answers_persisted === false ? "原答案未写入" : "记录状态异常"],
+    ];
+  }
   const processMemory = profile.model_process_memory_used_mib || {};
   return [
     ["可比较工作负载显存", memory.comparable_workload_memory_gib == null ? "-" : `${Number(memory.comparable_workload_memory_gib).toFixed(2)} GiB`, "固定基础占用 + 本次 KV Cache 实际峰值", true],
@@ -362,8 +477,12 @@ function memoryProfileRows(profile = {}) {
     ["KV Cache 实际峰值", memory.kv_cache_used_peak_gib == null ? "-" : `${Number(memory.kv_cache_used_peak_gib).toFixed(3)} GiB`, `使用率峰值 ${fmtNumber(memory.kv_cache_usage_peak_pct, "%")}`],
     ["模型权重", memory.weight_gib == null ? "-" : `${Number(memory.weight_gib).toFixed(2)} GiB`, `激活峰值 ${memory.peak_activation_gib == null ? "-" : `${memory.peak_activation_gib} GiB`} · CUDA Graph ${memory.cuda_graph_gib == null ? "-" : `${memory.cuda_graph_gib} GiB`}`],
     ["vLLM 进程预留显存", fmtMemory(processMemory.peak), `空载 ${memory.idle_process_memory_gib == null ? "-" : `${Number(memory.idle_process_memory_gib).toFixed(2)} GiB`} · 不用于跨模型需求比较`],
-    ["复测进度", `${profile.questions_completed ?? 0}/${profile.questions_total ?? 0} 题`, `请求失败 ${profile.failed_requests ?? 0} · 答案不保存`],
-    ["原测评数据一致性", profile.items_integrity_ok === true ? "通过" : profile.status === "completed" ? "未通过" : "待完成", profile.answers_persisted === false ? "原答案未写入" : "记录状态异常"],
+    isBenchmarkGpuProfile
+      ? ["评测采样覆盖", `${profile.questions_completed ?? "-"}/${profile.questions_total ?? "-"} 题`, "来自本次正式评测 GPU 采样"]
+      : ["复测进度", `${profile.questions_completed ?? 0}/${profile.questions_total ?? 0} 题`, `请求失败 ${profile.failed_requests ?? 0} · 答案不保存`],
+    isBenchmarkGpuProfile
+      ? ["数据来源", "正式评测采样", "与本次 run 的 QA/GPU 采样同时记录"]
+      : ["原测评数据一致性", profile.items_integrity_ok === true ? "通过" : profile.status === "completed" ? "未通过" : "待完成", profile.answers_persisted === false ? "原答案未写入" : "记录状态异常"],
   ];
 }
 function aggregateMetricRows(phase = {}) {
@@ -373,19 +492,31 @@ function aggregateMetricRows(phase = {}) {
   const summary = effectiveRunSummary(activeRun.value);
   const dist = summary.judge_distribution || {};
   const evidenceDist = summary.evidence_distribution || {};
+  const throughputSamples = Number(summary.agent_throughput_latency_sample_count);
+  const throughputTotal = Number(summary.agent_throughput_latency_total_count ?? summary.total);
+  const throughputNote = summary.agent_throughput_latency_mode === "measured_agent_phase"
+    ? `Agent 阶段实际墙钟 ÷ ${summary.agent_phase_completed_count ?? throughputTotal} 题 · 并发 ${activeRun.value?.qa_concurrency ?? "-"} · 不含 Judge，Judge 可与 Agent 并行`
+    : Number.isFinite(throughputSamples) && Number.isFinite(throughputTotal)
+      ? `历史记录按 Agent/Judge 时间线回退估算 · ${throughputSamples}/${throughputTotal} 题，不能视为实测`
+      : "历史记录未保存 Agent 独立阶段墙钟";
   return [
     ["图片检索 Precision", fmtPct(summary.retrieval_precision_micro), `图片级微平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT 图`, true],
-    ["图片检索 Recall", fmtPct(summary.retrieval_recall_micro), "图片级微平均；列表为题均宏平均", true],
-    ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Judge 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
+    ["图片检索 Recall", fmtPct(summary.retrieval_recall_micro), "图片级微平均；与评测记录列表同口径", true],
+    ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
     ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
-    ["Token 用量", summary.prompt_tokens_total == null && summary.completion_tokens_total == null ? "未记录" : `${summary.prompt_tokens_total ?? "-"} / ${summary.completion_tokens_total ?? "-"}`, "输入 / 输出 token", true],
-    ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), "每道 QA 从输入到最终回答的平均 Agent 总耗时，不含 Judge", true],
-    ["平均任务调用轮数", summary.agent_loop_calls_mean == null ? "未记录" : `${Number(summary.agent_loop_calls_mean).toFixed(2)} 轮`, "仅 Agent/Recovery，不含 L2 Judge、Final Writer 和工具内部模型", true],
+    ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "历史记录未保存解析轨迹" : `${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个需解析模型输出`, true],
+    ["Agent 并发吞吐折算时延", fmtMs(summary.agent_throughput_latency_ms), throughputNote, true],
+    ["平均调用轮数", summary.agent_loop_calls_mean == null ? "未记录" : `${Number(summary.agent_loop_calls_mean).toFixed(2)} 轮`, "仅 Agent/Recovery，不含 L2 Judge、Final Writer 和工具内部模型", true],
+    ["累计输入 token", fmtTokens(summary.prompt_tokens_total), "所有主 Agent 模型调用输入 token 累计", true],
+    ["累计输出 token", fmtTokens(summary.completion_tokens_total), "所有主 Agent 模型调用输出 token 累计", true],
+    ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), activeRun.value?.qa_concurrency > 1
+      ? `每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）；并发 ${activeRun.value.qa_concurrency} 负载下含排队与批内干扰，勿与串行 run 直接对比`
+      : "每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）", true],
     ["图片检索 F1", fmtPct(summary.retrieval_f1_micro), "微平均，平衡噪声与漏召回"],
+    ["Judge LLM 平均时延", fmtMs(summary.judge_llm_latency_mean_ms), `每题 Judge 评分调用平均耗时 · Judge 阶段墙钟 ${fmtMs(summary.judge_phase_wall_ms)}`],
     ["任务判断准确率", fmtPct(summary.task_decision_accuracy), `标注 ${summary.task_decision_labeled_count ?? 0} 题 · Judge 有效 ${summary.task_decision_valid_count ?? 0} 题`],
     ["证据对应均分", summary.evidence_mean == null ? "未记录" : `${summary.evidence_mean} / 2`, `0:${evidenceDist["0"] || 0} · 1:${evidenceDist["1"] || 0} · 2:${evidenceDist["2"] || 0}`],
     ["证据完全支持率", fmtPct(summary.evidence_fully_supported_rate), "证据 Judge = 2"],
-    ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "历史记录未保存解析轨迹" : `${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个需解析模型输出`],
     ["端到端测评总时延（不含 Judge）", fmtMs(summary.benchmark_e2e_latency_excluding_judge_ms), "身份/关系及图片导入开始至全部 QA 完成，已扣除 Judge 时延"],
     ["完全准确率", fmtPct(summary.exact_accuracy), "Judge 评分为 2 的比例"],
     ["核心准确率", fmtPct(summary.core_accuracy), "Judge 评分为 1 或 2 的比例"],
@@ -422,7 +553,9 @@ function conversationTurnNumber(value, fallback = 0) {
   return Number.isInteger(turn) && turn >= 0 ? turn : fallback;
 }
 function agentLoopGroups(item) {
-  const savedCalls = itemCallMetrics(item).map((call, globalIndex) => ({ ...call, _globalCallIndex: globalIndex }));
+  const savedCalls = itemCallMetrics(item)
+    .map((call, globalIndex) => ({ ...call, _globalCallIndex: globalIndex }))
+    .filter((call) => callType(call) !== "tool_internal");
   const traceModels = itemExecutionTrace(item).filter((step) => ["model", "writer", "judge"].includes(String(step.stage || step.type || "")));
   const turns = conversationTurns(item);
   const knownTurns = new Set();
@@ -432,6 +565,7 @@ function agentLoopGroups(item) {
   if (!knownTurns.size) knownTurns.add(0);
   const metricKeys = new Set(savedCalls.map((call) => `${conversationTurnNumber(call.conversation_turn)}:${call.step_id || ""}`));
   const traceOnlyCalls = traceModels.filter((step) => {
+    if (String(step.call_type || "") === "tool_internal") return false;
     const key = `${conversationTurnNumber(step.conversation_turn)}:${step.step_id || ""}`;
     return (step.status === "error" || step.status === "failed" || step.parse_status === "failed") && !metricKeys.has(key);
   }).map((step, index) => {
@@ -466,10 +600,7 @@ function turnTerminationLabel(turn) {
   })[reason] || reason || "未记录";
 }
 function turnCompletionLabel(turn) {
-  if (turn?.turn_outcome === "final_answer" && turn?.agent_status !== "error") return "完成";
-  if (turn?.answer && ["complete", "completed", "done", "success"].includes(String(turn?.agent_status || "").toLowerCase())) return "完成";
-  if (turn?.agent_status || turn?.termination_reason || turn?.turn_outcome) return `未完成（${turnTerminationLabel(turn)}）`;
-  return "未记录";
+  return executionState(turn).label;
 }
 function turnRecoveryCount(group) {
   return group?.calls?.filter((call) => callType(call) === "recovery").length ?? 0;
@@ -522,6 +653,7 @@ function callType(call) {
 function callTypeLabel(call) {
   if (call?.call_observation?.label) return call.call_observation.label;
   return ({
+    planner: "Agent 2.0 目标分解与规划",
     agent: "Agent 决策 / 回答",
     recovery: "Agent 恢复调用",
     writer: "最终回答重写",
@@ -533,6 +665,7 @@ function callTypeLabel(call) {
 function callTypeDescription(call) {
   if (call?.call_observation?.purpose) return call.call_observation.purpose;
   return ({
+    planner: "解析用户目标并声明最小充分证据需求（TaskState/EvidenceLedger）",
     agent: "模型选择工具或直接生成回答",
     recovery: "由解析失败、重复工具或 Guard 纠正触发",
     writer: "仅按受控事实重写最终回答，不调用工具",
@@ -542,7 +675,7 @@ function callTypeDescription(call) {
   })[callType(call)] || "后端记录的模型调用类型";
 }
 function showToolBranch(call) {
-  return !["writer", "faithfulness_judge", "tool_internal"].includes(callType(call));
+  return !["planner", "writer", "faithfulness_judge", "tool_internal"].includes(callType(call));
 }
 function noToolLabel(call) {
   if (callType(call) === "agent") return "该调用直接生成回答，未触发工具。";
@@ -580,6 +713,142 @@ function itemToolTrace(item) {
 }
 function itemDetail(summary) { return qaDetails[summary?.index] || null; }
 
+function toolExecutionSteps(item) {
+  return itemExecutionTrace(item).filter((step) => String(step.stage || step.type || "") === "tool");
+}
+
+function callIndexForStep(item, stepId, conversationTurn) {
+  if (!stepId) return null;
+  const calls = itemCallMetrics(item);
+  const exact = calls.findIndex((call) => String(call.step_id || "") === String(stepId)
+    && (conversationTurn == null || conversationTurnNumber(call.conversation_turn) === conversationTurnNumber(conversationTurn)));
+  if (exact >= 0) return exact;
+  const fallback = calls.findIndex((call) => String(call.step_id || "") === String(stepId));
+  return fallback >= 0 ? fallback : null;
+}
+
+function normalizedToolCallIndex(item, trace, traceIndex) {
+  const parentStepId = trace?.parent_step_id;
+  const parentIndex = callIndexForStep(item, parentStepId, trace?.conversation_turn);
+  if (parentIndex != null) return parentIndex;
+  const sameTurnTraces = itemToolTrace(item).filter((candidate) => trace?.conversation_turn == null
+    || conversationTurnNumber(candidate.conversation_turn) === conversationTurnNumber(trace.conversation_turn));
+  const localTraceIndex = sameTurnTraces.indexOf(trace);
+  const executionStep = toolExecutionSteps(item).filter((step) => trace?.conversation_turn == null
+    || conversationTurnNumber(step.conversation_turn) === conversationTurnNumber(trace.conversation_turn))[localTraceIndex >= 0 ? localTraceIndex : traceIndex];
+  const executionIndex = callIndexForStep(item, executionStep?.parent_step_id, trace?.conversation_turn);
+  if (executionIndex != null) return executionIndex;
+  const savedIndex = Number(trace?.model_call_index);
+  return Number.isInteger(savedIndex) ? savedIndex : null;
+}
+
+function toolsForGroupedCall(item, call) {
+  const turnIndex = conversationTurnNumber(call?.conversation_turn);
+  return itemToolTrace(item).filter((trace, traceIndex) => {
+    const sameTurn = conversationTurnNumber(trace.conversation_turn) === turnIndex;
+    return sameTurn && normalizedToolCallIndex(item, trace, traceIndex) === Number(call?._globalCallIndex);
+  });
+}
+
+function toolDurationMs(trace) {
+  const duration = Number(trace?.duration_ms);
+  if (Number.isFinite(duration) && duration >= 0) return duration;
+  const latency = Number(trace?.latency_s);
+  return Number.isFinite(latency) && latency >= 0 ? latency * 1000 : null;
+}
+
+function toolLatencySegments(trace) {
+  const timing = trace?.retrieval_timing || {};
+  const segments = [];
+  const add = (kind, label, value) => {
+    const ms = Number(value);
+    if (Number.isFinite(ms) && ms > 0) segments.push({ kind, label, ms });
+  };
+  add("nested-tool", "查询构建", timing.query_build_ms);
+  Object.entries(timing.channels || {}).forEach(([channel, value]) => {
+    add("nested-tool", channel, value?.latency_ms);
+  });
+  add("nested-tool", "融合", timing.fusion_ms);
+  add("nested-tool", "后处理", timing.postprocess_ms);
+  const total = Number(timing.total_ms);
+  const accounted = segments.reduce((sum, segment) => sum + segment.ms, 0);
+  if (Number.isFinite(total) && total > accounted + 0.5) segments.push({ kind: "other", label: "工具其他", ms: total - accounted });
+  return segments;
+}
+
+function callAgentLoopTiming(item, call) {
+  const modelMs = Number(call?.total_ms);
+  const validModelMs = Number.isFinite(modelMs) && modelMs >= 0 ? modelMs : null;
+  const saved = call?.agent_loop_timing || {};
+  const tools = toolsForGroupedCall(item, call);
+  const toolMs = Number.isFinite(Number(saved.tool_ms))
+    ? Number(saved.tool_ms)
+    : tools.reduce((sum, trace) => sum + (toolDurationMs(trace) || 0), 0);
+  const ttftMs = Number(call?.ttft_ms);
+  const validTtftMs = Number.isFinite(ttftMs) && ttftMs >= 0 ? ttftMs : null;
+  const generationMs = Number.isFinite(Number(saved.model_generation_ms))
+    ? Number(saved.model_generation_ms)
+    : validModelMs == null ? null : Math.max(0, validModelMs - (validTtftMs || 0));
+  const totalMs = Number.isFinite(Number(call?.agent_loop_total_ms))
+    ? Number(call.agent_loop_total_ms)
+    : validModelMs == null ? null : validModelMs + toolMs;
+  return { modelMs: validModelMs, ttftMs: validTtftMs, generationMs, toolMs, totalMs, tools };
+}
+
+function callLatencySegments(item, call) {
+  const timing = callAgentLoopTiming(item, call);
+  const segments = [];
+  if (timing.ttftMs != null && timing.ttftMs > 0) segments.push({ kind: "ttft", label: "TTFT", ms: timing.ttftMs });
+  if (timing.generationMs != null && timing.generationMs > 0) segments.push({ kind: "generation", label: "模型生成 / 回答", ms: timing.generationMs });
+  timing.tools.forEach((trace, index) => {
+    const ms = toolDurationMs(trace);
+    if (ms != null && ms > 0) segments.push({ kind: "tool", label: trace.tool || `工具 ${index + 1}`, ms, trace });
+  });
+  const accounted = segments.reduce((sum, segment) => sum + segment.ms, 0);
+  if (timing.totalMs != null && timing.totalMs > accounted + 0.5) {
+    segments.push({ kind: "other", label: "Agent 编排", ms: timing.totalMs - accounted });
+  }
+  return segments;
+}
+
+function latencySegmentTitle(segment) {
+  const detail = segment.trace?.retrieval_timing?.total_ms != null
+    ? `\n检索内部耗时 ${fmtMs(segment.trace.retrieval_timing.total_ms)}` : "";
+  return `${segment.label} · ${fmtMs(segment.ms)}${detail}`;
+}
+
+function qaLatencySegments(item) {
+  const loops = agentLoopGroups(item).flatMap((group) => group.calls).map((call, index) => {
+    const timing = callAgentLoopTiming(item, call);
+    return timing.totalMs == null ? null : {
+      kind: "agent-loop",
+      label: `Agent Loop ${index + 1} · ${callTypeLabel(call)}`,
+      shortLabel: `Loop ${index + 1}`,
+      ms: timing.totalMs,
+      call,
+    };
+  }).filter(Boolean);
+  const breakdown = itemTimingBreakdown(item);
+  const loopMs = loops.reduce((sum, segment) => sum + segment.ms, 0);
+  const judgeMs = Number(breakdown.judge_ms);
+  if (Number.isFinite(judgeMs) && judgeMs > 0) loops.push({ kind: "judge", label: "Judge", shortLabel: "Judge", ms: judgeMs });
+  const judgeQueueMs = Number(breakdown.judge_queue_wait_ms);
+  if (Number.isFinite(judgeQueueMs) && judgeQueueMs > 0) {
+    loops.push({ kind: "judge-queue", label: "Judge 排队 / 编排", shortLabel: "Judge 排队", ms: judgeQueueMs });
+  }
+  const wallMs = Number(breakdown.wall_clock_ms);
+  const otherMs = Number.isFinite(wallMs)
+    ? Math.max(0, wallMs - loopMs - (Number.isFinite(judgeMs) ? judgeMs : 0) - (Number.isFinite(judgeQueueMs) ? judgeQueueMs : 0))
+    : 0;
+  if (otherMs > 0.5) loops.push({ kind: "other", label: "其他未归因时延", shortLabel: "其他", ms: otherMs });
+  return loops;
+}
+
+function latencySegmentStyle(segment, segments) {
+  const total = segments.reduce((sum, value) => sum + value.ms, 0) || 1;
+  return { flex: `${Math.max(segment.ms, 0.1)} 1 0%`, "--segment-share": `${(segment.ms / total) * 100}%` };
+}
+
 function runtimeDebugTurns(item) {
   const turns = item?.runtime_turns || [];
   return Array.isArray(turns) ? turns.filter((turn) => turn && Array.isArray(turn.debug_trace)) : [];
@@ -615,18 +884,30 @@ function debugStepsForCall(item, call) {
 }
 
 function debugStepForCallInGroup(item, group, call) {
+  const turnIndex = conversationTurnNumber(call?.conversation_turn);
+  const steps = debugTraceForTurn(item, turnIndex);
+  if (call?.step_id) {
+    const matched = steps.find((s) => s?.step_id === call.step_id);
+    if (matched) return matched;
+  }
   const ctype = callType(call);
+  if (ctype === "planner") {
+    return steps.find((s) => s?.type === "planner" || s?.call_type === "planner") || null;
+  }
   if (ctype === "faithfulness_judge") {
-    const judges = debugStepsForCall(item, call);
+    const judges = steps.filter((s) => s?.type === "judge" || s?.call_type === "faithfulness_judge");
     const index = group.calls.filter((c) => callType(c) === "faithfulness_judge").indexOf(call);
     return judges[index] || null;
   }
   if (ctype === "agent" || ctype === "recovery") {
-    const models = debugStepsForCall(item, call);
+    const models = steps.filter((s) => s?.type === "model" && s?.call_type !== "faithfulness_judge" && s?.call_type !== "planner");
     const index = group.calls.filter((c) => ["agent", "recovery"].includes(callType(c))).indexOf(call);
     return models[index] || null;
   }
-  return null;
+  // Fallback match by index if legacy
+  const index = group.calls.indexOf(call);
+  const models = steps.filter((s) => s?.type === "model" || s?.type === "planner" || s?.type === "judge");
+  return models[index] || null;
 }
 
 function debugToolsForCall(item, group, call) {
@@ -637,6 +918,85 @@ function debugToolsForCall(item, group, call) {
   return steps.filter((s) => s?.type === "tool"
     && String(s?.parent_step_id) === String(modelStep.step_id));
 }
+function debugPromptAnnotations(item, group, call) {
+  return debugStepForCallInGroup(item, group, call)?.prompt_annotations || [];
+}
+function getAgent2Trace(item) {
+  if (!item) return null;
+  if (item.agent2_trace && (item.agent2_trace.task_declaration || item.agent2_trace.task_state || item.agent2_trace.evidence_ledger)) {
+    return item.agent2_trace;
+  }
+  const turns = item.runtime_turns || item.conversation || [];
+  for (const t of turns) {
+    if (t?.agent2_trace && (t.agent2_trace.task_declaration || t.agent2_trace.task_state || t.agent2_trace.evidence_ledger)) {
+      return t.agent2_trace;
+    }
+  }
+  return item.agent2_trace || null;
+}
+function getAgent2Requirements(item) {
+  const trace = getAgent2Trace(item);
+  if (!trace) return [];
+  return trace.task_state?.requirements || trace.task_declaration?.requirements || trace.requirements || [];
+}
+function getAgent2LedgerEntries(item) {
+  const trace = getAgent2Trace(item);
+  if (!trace) return [];
+  return trace.evidence_ledger?.entries || [];
+}
+
+function formatAgent2EvidenceValue(value) {
+  if (value == null) return "已记录证据，但没有提取出的文本值";
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return "已记录证据，但没有提取出的文本值";
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      return value;
+    }
+  }
+  const formatted = JSON.stringify(value, null, 2);
+  return formatted ?? String(value);
+}
+
+function agent2EvidenceRows(value) {
+  return Math.max(3, formatAgent2EvidenceValue(value).split("\n").length);
+}
+function agent2EvidenceHeight(value) {
+  return String(agent2EvidenceRows(value) * 15.5 + 16) + "px";
+}
+function agent2RequirementStatusLabel(status) {
+  return ({ satisfied: "已满足", partially_supported: "部分满足", open: "待满足", failed: "未满足" })[status] || status || "未记录";
+}
+function agent2RequirementStatusClass(status) {
+  return status === "satisfied" ? "status-complete" : status === "partially_supported" ? "status-partial" : "status-failed";
+}
+function agent2EvidenceTypeLabel(type) {
+  return ({
+    // Legacy aliases kept for historical runs.
+    visual: "视觉", text: "文字 / OCR", temporal: "时间", geographic: "地点",
+    identity: "身份", semantic: "语义",
+    // Canonical Agent2 evidence types emitted by the backend.
+    memory_asset: "照片 / 视频", memory_reference: "记忆引用",
+    visual_observation: "视觉观察", visible_text: "可见文字 / OCR",
+    structured_fact: "结构化事实", temporal_metadata: "时间元数据",
+    location_metadata: "地点元数据", confirmed_identity: "已确认身份",
+    user_statement: "用户陈述", transcript: "转写文本",
+  })[type] || type || "证据";
+}
+function agent2RequirementSummary(item) {
+  const requirements = getAgent2Requirements(item);
+  const satisfied = requirements.filter((req) => req.status === "satisfied").length;
+  const partial = requirements.filter((req) => req.status === "partially_supported").length;
+  return `${satisfied}/${requirements.length} 项满足${partial ? `，${partial} 项部分满足` : ""}`;
+}
+function agent2DecisionSummary(item) {
+  const decisions = getAgent2Trace(item)?.planner_decisions || [];
+  const decision = decisions[decisions.length - 1] || {};
+  return decision.status === "accepted" ? "规划已接受" : decision.status === "fallback" ? "规划失败，已回退主流程" : decision.status || "已记录";
+}
+
 function attributionSummary(item) {
   const attribution = item?.attribution || {};
   const layers = attribution.layers || {};
@@ -652,17 +1012,8 @@ function attributionClass(status) { return status === "fail" ? "score-0" : statu
 function toolsForCall(item, callIndex) {
   return itemToolTrace(item).filter((trace) => Number(trace.model_call_index) === callIndex);
 }
-function toolsForGroupedCall(item, call) {
-  if (call?._traceOnly) return [];
-  const turnIndex = conversationTurnNumber(call?.conversation_turn);
-  return itemToolTrace(item).filter((trace) => {
-    const sameTurn = conversationTurnNumber(trace.conversation_turn) === turnIndex;
-    if (trace.parent_step_id && call?.step_id) return sameTurn && String(trace.parent_step_id) === String(call.step_id);
-    return Number(trace.model_call_index) === Number(call?._globalCallIndex);
-  });
-}
 function unboundTools(item) {
-  return itemToolTrace(item).filter((trace) => !Number.isInteger(Number(trace.model_call_index)));
+  return itemToolTrace(item).filter((trace, traceIndex) => normalizedToolCallIndex(item, trace, traceIndex) == null);
 }
 function toolStatusLabel(trace) {
   const status = trace?.status || "未知";
@@ -715,6 +1066,12 @@ function normalizedTerminationReason(item) {
   if (/token budget preflight failed|tokenize-current|502 Bad Gateway/i.test(reason)) return "上下文 token 预检失败（tokenize 接口 502）";
   return item?.guard_debug?.termination_reason || item?.termination_reason || "-";
 }
+function terminationDisplayLabel(item) {
+  const raw = normalizedTerminationReason(item);
+  if (raw === "complete" || (raw === "-" && executionState(item).key === "complete")) return "正常完成";
+  if (raw === "-") return "未记录";
+  return turnTerminationLabel({ ...item, termination_reason: raw });
+}
 function hasToolTrace(item) {
   return Object.prototype.hasOwnProperty.call(item || {}, "tool_trace")
     || item?.timing_breakdown?.tool_trace_recorded === true;
@@ -763,7 +1120,17 @@ function phaseSummary(key, phase) {
   }
   if (key === "photo_import") return `导入 ${phase.accepted_count ?? 0}/${phase.total_photos ?? "?"} 张 · ${fmtSeconds(phaseSeconds(phase, "upload_seconds"))}`;
   if (key === "pipeline_processing" && phase.progress) return `${phase.progress.processed || 0}/${phase.progress.total || 0} 资产完成 · ${phase.progress.failed || 0} 失败 · 阶段墙钟 ${fmtSeconds(phaseSeconds(phase))}`;
-  if (key === "qa_eval") return `${activeRun.value?.item_count || 0} 题 · ${fmtSeconds(phaseSeconds(phase))}`;
+  if (key === "qa_eval") {
+    const p = phase.progress;
+    if (p && (p.completed != null || p.in_flight != null)) {
+      const agentText = `Agent ${p.agent_completed ?? p.completed ?? 0}/${p.agent_total ?? p.total ?? "?"}`;
+      const judgeText = `Judge ${p.judge_completed ?? 0}/${p.judge_total ?? p.total ?? "?"}`;
+      const concurrencyText = p.qa_concurrency > 1 || p.judge_concurrency > 1
+        ? ` · 并发 Agent ${p.qa_concurrency ?? "-"} / Judge ${p.judge_concurrency ?? "-"}` : "";
+      return `${agentText} · ${judgeText}${concurrencyText} · ${fmtSeconds(phaseSeconds(phase))}`;
+    }
+    return `${activeRun.value?.item_count || 0} 题 · ${fmtSeconds(phaseSeconds(phase))}`;
+  }
   const elapsed = phaseSeconds(phase);
   if (elapsed != null) return `耗时 ${fmtSeconds(elapsed)}`;
   return "";
@@ -805,6 +1172,14 @@ function pipelineMetricRows(phase = {}) {
 }
 
 async function loadRuns() { runs.value = (await api("/api/runs")).runs || []; }
+function runProgressLabel(run) {
+  if (run?.mode === "build") return "—";
+  const progress = run?.phases?.qa_eval?.progress;
+  if (progress && progress.judge_total != null) {
+    return `${progress.judge_completed ?? 0}/${progress.judge_total}`;
+  }
+  return `${run?.summary?.completed || 0}/${run?.summary?.total || run?.qa_count || 0}`;
+}
 async function loadQaPage(page = qaPage.value.page || 1) {
   if (!activeRunId.value) return;
   const runId = activeRunId.value;
@@ -892,21 +1267,117 @@ async function changeQaPage(page) {
 async function changeQaPageSize() { await loadQaPage(1); }
 async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
 async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
-function resetJudgePrompt() { rejudgePrompt.value = config.value?.judge_prompt || ""; }
+const PROMPT_KIND_LABELS = { answer_quality: "回答质量", task_decision: "任务判断", evidence: "证据核验" };
+function promptKindMeta(kind) { return judgePromptKinds.value.find((k) => k.kind === kind) || null; }
+async function loadJudgePrompts() {
+  try {
+    const data = await fetch("/api/judge-prompts").then((r) => r.json());
+    judgePromptKinds.value = data.kinds || [];
+    for (const meta of judgePromptKinds.value) {
+      promptDrafts[meta.kind] = meta.custom || meta.default || "";
+    }
+    rejudgePrompt.value = promptDrafts.answer_quality || "";
+  } catch { /* keep defaults from config */ }
+}
+function switchPromptKind(kind) {
+  activePromptKind.value = kind;
+  rejudgePrompt.value = promptDrafts[kind] || "";
+}
+function resetJudgePrompt() {
+  const meta = promptKindMeta(activePromptKind.value);
+  rejudgePrompt.value = meta?.default || config.value?.judge_prompt || "";
+  promptDrafts[activePromptKind.value] = rejudgePrompt.value;
+}
 
-const exportScoreFilter = ref("all");
+const exportScores = ref(["0", "1", "2"]);
 const deleteScopeAfterRun = ref(false);
+
+// ---- 工作模式：全链路 / 复用相册测评 / 构建相册 ----
+const RUN_MODES_UI = [
+  { id: "full", label: "全链路测试", hint: "新建相册 → 身份预置 → 照片导入 → 流水线处理 → QA 测评", button: "启动评测" },
+  { id: "reuse", label: "复用相册测评", hint: "选择后端已有相册，跳过导入与处理，直接 QA 测评（相册不会被删除）", button: "启动复用测评" },
+  { id: "build", label: "构建相册", hint: "新建相册并完成身份预置、导入与数据处理；产物相册保留供复用，不做 QA 测评", button: "启动相册构建" },
+];
+const runMode = ref("full");
+const runModeMeta = computed(() => RUN_MODES_UI.find((m) => m.id === runMode.value) || RUN_MODES_UI[0]);
+const memorySpaces = ref([]);
+const reuseBases = ref([]);
+const memorySpacesLoading = ref(false);
+const existingScopeId = ref("");
+const selectedReuseBaseId = ref("");
+const scopeAlbumHint = ref("");
+async function loadMemorySpaces() {
+  memorySpacesLoading.value = true;
+  try {
+    const data = await fetch(`/api/memory-spaces?sentrix_url=${encodeURIComponent(sentrixUrl.value)}`).then((r) => r.json());
+    memorySpaces.value = data.spaces || [];
+    reuseBases.value = data.reuse_bases || [];
+  } catch { memorySpaces.value = []; reuseBases.value = []; }
+  finally { memorySpacesLoading.value = false; }
+}
+const selectedSpace = computed(() => memorySpaces.value.find((s) => s.id === existingScopeId.value) || null);
+const selectedReuseBase = computed(() => reuseBases.value.find((item) => item.base_id === selectedReuseBaseId.value) || null);
+// 隐藏"照片"下拉后，QA 题目与 GT 对照的数据集依据从所选现有相册自动推断：
+// 优先查 run 历史（scope_id → album_id），再按相册名子串匹配（长 id 优先），最后保持当前选择。
+function inferAlbumForScope(space) {
+  if (!space) return null;
+  const run = runs.value.find((r) => r.scope_id === space.id && (r.mode === "build" || r.mode === "full" || !r.mode));
+  if (run?.album_id && manifests.value.some((m) => m.album_id === run.album_id)) return run.album_id;
+  const name = String(space.name || "");
+  const candidates = manifests.value.map((m) => m.album_id).filter((id) => name.includes(id));
+  if (candidates.length) return candidates.sort((a, b) => b.length - a.length)[0];
+  return null;
+}
+watch(existingScopeId, () => {
+  if (runMode.value !== "reuse") return;
+  const album = inferAlbumForScope(selectedSpace.value);
+  if (album) {
+    selectedAlbum.value = album;
+    scopeAlbumHint.value = `题目对照数据集：${album}`;
+  } else {
+    scopeAlbumHint.value = "未能自动匹配数据集，题目对照沿用当前 QA 数据集所属数据";
+  }
+});
+watch(selectedReuseBaseId, () => {
+  if (runMode.value !== "reuse") return;
+  const base = selectedReuseBase.value;
+  if (!base) return;
+  existingScopeId.value = base.scope_id || "";
+  if (base.album_id) {
+    selectedAlbum.value = base.album_id;
+    const manifest = manifests.value.find((item) => item.album_id === base.album_id);
+    const options = Object.keys(manifest?.qa_sets || {});
+    if (options.length && !options.includes(selectedQa.value)) selectedQa.value = options[0];
+  }
+  scopeAlbumHint.value = `复用基座：${base.album_id} · ${base.model_profile}；QA 数据集：${base.album_id}`;
+});
+function onModeChange() {
+  existingScopeId.value = "";
+  selectedReuseBaseId.value = "";
+  scopeAlbumHint.value = "";
+  if (runMode.value === "reuse" && !memorySpaces.value.length) loadMemorySpaces();
+}
+const startDisabledReason = computed(() => {
+  if (hasRunning.value || suiteRunning.value) return "已有任务运行中";
+  if (!selectedModels.size) return "请先选择模型";
+  if (runMode.value === "reuse" && !existingScopeId.value) return "请先选择要复用的相册";
+  return "";
+});
+const modeLabel = (mode) => (({ full: "全链路", reuse: "复用测评", build: "构建相册" })[mode || "full"] || mode);
+const modeBadgeClass = (mode) => (({ full: "mode-full", reuse: "mode-reuse", build: "mode-build" })[mode || "full"] || "mode-full");
 function exportSftTraces() {
   if (!activeRunId.value) return;
-  const filter = exportScoreFilter.value === "all" ? "" : `?min_score=${exportScoreFilter.value}`;
-  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft${filter}`, "_blank");
+  const scores = exportScores.value;
+  if (!scores.length) { window.alert("请至少勾选一个评分再导出"); return; }
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft?scores=${scores.join(",")}`, "_blank");
 }
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
   if (!prompt) { window.alert("提示词不能为空"); return; }
   try {
-    await post("/api/judge-prompt", { system_prompt: prompt });
-    window.alert("已保存，后续评测将使用此提示词");
+    await post("/api/judge-prompts", { kind: activePromptKind.value, system_prompt: prompt });
+    promptDrafts[activePromptKind.value] = prompt;
+    window.alert(`已保存「${PROMPT_KIND_LABELS[activePromptKind.value] || activePromptKind.value}」提示词，重新评分与后续评测将使用它`);
   } catch (e) { window.alert("保存失败：" + e.message); }
 }
 async function startRejudge() {
@@ -917,18 +1388,22 @@ async function startRejudge() {
   try {
    await post(`/api/runs/${encodeURIComponent(activeRunId.value)}/rejudge`, {
     judge_url: judgeUrl.value,
-    system_prompt: rejudgePrompt.value,
+    system_prompt: promptDrafts.answer_quality || rejudgePrompt.value,
+    task_system_prompt: promptDrafts.task_decision || undefined,
+    evidence_system_prompt: promptDrafts.evidence || undefined,
     });
     await loadRuns(); await loadActiveRun(); startPolling();
   } catch (e) { error.value = e.message; }
   finally { rejudgeSubmitting.value = false; }
 }
 async function startSuite() {
-  if (hasRunning.value || suiteRunning.value) return;
-  if (!selectedModels.size) { window.alert("请至少选择一个模型"); return; }
+  const blocked = startDisabledReason.value;
+  if (blocked && !blocked.includes("运行中")) { window.alert(blocked); return; }
+  if (blocked) return;
+  if (runMode.value === "build" && !window.confirm("构建相册模式只导入并处理数据，不做 QA 测评；产物相册会保留。确定开始？")) return;
   suiteRunning.value = true;
   try {
-   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: selectedQa.value, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: deleteScopeAfterRun.value });
+   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, judge_provider_id: judgeProviderId.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -956,18 +1431,36 @@ function startPolling() {
   };
   poll();
 }
+const arbiterStatus = ref(null);
+let arbiterTimer = null;
+async function loadArbiterStatus() {
+  if (!sentrixUrl.value) return;
+  try {
+    const resp = await fetch(`${sentrixUrl.value.replace(/\/$/, "")}/api/arbiter/status`, { signal: AbortSignal.timeout(3000) });
+    if (resp.ok) arbiterStatus.value = await resp.json();
+  } catch (_) { /* backend 暂不可达时保持上次值 */ }
+}
+function arbStateLabel(s) {
+  return ({idle: "空闲", import_running: "导入运行中", agent_active: "Agent 活跃", preempting: "抢占中"})[s] || s || "-";
+}
+function thermalStateLabel(v) {
+  return ({0: "nominal", 1: "fair", 2: "serious", 3: "critical"})[v] ?? "-";
+}
 async function init() {
   try {
     config.value = await api("/api/config");
     vllmTargets.value = config.value.vllm_targets || {};
     vllmTargetId.value = config.value.default_vllm_target_id || Object.keys(vllmTargets.value)[0] || "";
     sentrixUrl.value = config.value.default_sentrix_url; judgeUrl.value = config.value.default_judge_url; rejudgePrompt.value = config.value.custom_judge_prompt || config.value.judge_prompt || "";
+    await loadJudgePrompts();
     judgeProviderId.value = config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
     manifests.value = (await api("/api/manifests")).manifests || [];
     await loadRuns(); await loadProfiles();
     const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
     if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
+  loadArbiterStatus();
+  arbiterTimer = setInterval(loadArbiterStatus, 3000);
 }
 const qaBrowserOptions = computed(() => manifests.value.find((m) => m.album_id === qaBrowserAlbum.value)?.qa_sets || []);
 async function loadQaBrowser() {
@@ -1001,7 +1494,7 @@ function qaReferenceLabel(turn) {
   return turn?.expected_action === "clarify" ? "参考澄清示例" : "参考回答";
 }
 onMounted(init);
-onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); });
+onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if (arbiterTimer) clearInterval(arbiterTimer); });
 </script>
 
 <template>
@@ -1011,25 +1504,54 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
       <button :class="['view-tab', { active: activeView === 'qa-browser' }]" @click="activeView = 'qa-browser'; loadQaBrowser()">QA 数据集浏览</button>
     </nav>
     <template v-if="activeView === 'runs'">
+    <section v-if="arbiterStatus" class="section arbiter-section">
+      <div class="section-head">
+        <h2>实时调度状态（VLMArbiter）</h2>
+        <span class="live-badge">每 3s 刷新</span>
+      </div>
+      <div class="arbiter-grid">
+        <div class="arbiter-cell"><span>调度器状态</span><strong>{{ arbStateLabel(arbiterStatus.state) }}</strong></div>
+        <div class="arbiter-cell"><span>Worker 系数</span><strong>{{ arbiterStatus.worker_scale }}</strong></div>
+        <div class="arbiter-cell"><span>内存压力</span><strong>{{ fmtNumber(arbiterStatus.memory_pressure) }}</strong></div>
+        <div class="arbiter-cell"><span>门控 soft / hard</span><strong>{{ arbiterStatus.memory_gate_threshold }} / {{ arbiterStatus.memory_critical_threshold }}</strong></div>
+        <div class="arbiter-cell"><span>散热状态</span><strong>{{ thermalStateLabel(arbiterStatus.thermal_state) }}</strong></div>
+        <div class="arbiter-cell"><span>Import 活跃</span><strong>{{ arbiterStatus.import_active }}</strong></div>
+        <div class="arbiter-cell"><span>Agent VLM 活跃</span><strong>{{ arbiterStatus.agent_vlm_active }}</strong></div>
+        <div class="arbiter-cell"><span>预占次数</span><strong>{{ arbiterStatus.preempt_count }}</strong></div>
+      </div>
+    </section>
     <section class="section config-section">
       <div class="section-head">
 <h2>评测配置</h2>
 <span v-if="hasRunning" class="live-badge">实时更新中</span>
 </div>
       <div class="config-grid">
-        <label>相册<select v-model="selectedAlbum">
+        <label>工作模式<select v-model="runMode" :disabled="suiteRunning || hasRunning" @change="onModeChange">
+<option v-for="mode in RUN_MODES_UI" :key="mode.id" :value="mode.id">{{ mode.label }}</option>
+</select>
+<span class="config-help mode-hint">{{ runModeMeta.hint }}</span>
+</label>
+        <label v-if="runMode !== 'reuse'">照片<select v-model="selectedAlbum">
 <option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} ({{ manifest.face_count }}人 / {{ manifest.photo_count }}图)</option>
 </select>
+<span v-if="runMode === 'build'" class="config-help">图片与身份来源，处理后相册保留</span>
 </label>
-        <label>QA 数据集<select v-model="selectedQa">
+        <label v-if="runMode === 'reuse'">复用基座<select v-model="selectedReuseBaseId" :disabled="memorySpacesLoading">
+<option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (reuseBases.length ? '请选择相册基座（相册 + 模型）' : '无可复用基座（检查 Sentrix 后端地址）') }}</option>
+<option v-for="base in reuseBases" :key="base.base_id" :value="base.base_id">{{ base.album_id }} · {{ base.model_profile }} · {{ base.scope_name }}</option>
+</select>
+<span class="config-help">{{ scopeAlbumHint || '选择后直接复用已生成相册，不重新处理照片' }}</span>
+</label>
+        <label v-if="runMode !== 'build'">QA 数据集<select v-model="selectedQa">
 <option v-for="qa in qaOptions" :key="qa" :value="qa">{{ qa }}</option>
 </select>
+<span v-if="runMode === 'reuse'" class="config-help">题目与对照随所选现有相册自动匹配</span>
 </label>
         <label>Sentrix 后端<input v-model="sentrixUrl" type="text" />
 </label>
        <label>Judge 服务<input v-model="judgeUrl" type="text" />
 </label>
-        <label>Judge 模型<select v-model="judgeProviderId">
+        <label v-if="runMode !== 'build'">Judge 模型<select v-model="judgeProviderId">
 <option v-for="provider in (config?.judge_providers || [])" :key="provider.id" :value="provider.id">{{ provider.label }}</option>
 </select>
 <span class="config-help">{{ (config?.judge_providers || []).find((p) => p.id === judgeProviderId)?.model || '-' }}</span>
@@ -1043,12 +1565,12 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
       <div class="model-picker">
 <span class="field-label">选择模型（可多选，串行测试）</span>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
-<input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="!profile.available">（不可用）</span>
+<input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="profile.source === 'cloud_api'">（云端 API）</span><span v-if="!profile.available">（不可用）</span>
 </label>
 </div>
       <div class="actions">
-<label class="check"><input type="checkbox" v-model="deleteScopeAfterRun" :disabled="suiteRunning || hasRunning" />完成后删除相册</label>
-<button class="btn" :disabled="suiteRunning || hasRunning" @click="startSuite">{{ hasRunning ? '已有任务运行中' : '启动评测' }}</button>
+<label v-if="runMode === 'full'" class="check"><input type="checkbox" v-model="deleteScopeAfterRun" :disabled="suiteRunning || hasRunning" />完成后删除相册</label>
+<button class="btn" :disabled="Boolean(startDisabledReason)" @click="startSuite">{{ hasRunning ? '已有任务运行中' : runModeMeta.button }}</button>
 <button class="btn warn" :disabled="!hasRunning" @click="stopSuite">停止全部</button>
 <button class="btn ghost" @click="loadProfiles">刷新模型列表</button>
 </div>
@@ -1070,7 +1592,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 <th>耗时</th>
 <th>状态</th>
 <th>进度</th>
-<th>题均召回率</th>
+<th>图片级召回率</th>
 <th>质量均分</th>
 <th>
 </th>
@@ -1080,6 +1602,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 <tr v-for="run in runs" :key="run.run_id" class="run-row" :class="{ selected: activeRunId === run.run_id }" @click="selectRun(run)">
 <td>
 <b>{{ modelName(run) }}</b>
+<span class="mode-badge" :class="modeBadgeClass(run.mode)">{{ modeLabel(run.mode) }}</span>
 </td>
 <td class="muted small">{{ albumName(run) }}</td>
 <td class="muted small">{{ fmtDate(run.started_at) }}</td>
@@ -1087,8 +1610,8 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 <td>
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
-<td>{{ run.summary?.completed || 0 }}/{{ run.summary?.total || run.qa_count || 0 }}</td>
-<td>{{ fmtPct(run.summary?.retrieval_recall_mean) }}</td>
+<td>{{ runProgressLabel(run) }}</td>
+<td>{{ fmtPct(run.summary?.retrieval_recall_micro) }}</td>
 <td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>
@@ -1102,19 +1625,23 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
     <section id="detail-region">
 <div v-if="!activeRun" class="section muted">点击上方列表中的某条记录查看详情</div>
 <section v-else class="section detail-section">
-      <div class="section-head">
-<h2>{{ modelName(activeRun) }} · {{ albumName(activeRun) }} · {{ qaName(activeRun) }}</h2>
-<span class="phase-status" :class="activeRun.status">{{ statusLabel(activeRun.status) }}</span>
-<span class="field-label">导出轨迹</span>
-<select v-model="exportScoreFilter" class="input compact">
-  <option value="all">全部</option>
-  <option value="1">1 分及以上</option>
-  <option value="2">2 分</option>
-</select>
-<button class="btn compact" @click="exportSftTraces">导出 SFT json</button>
-</div>
-      <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}</p>
-      <section class="rejudge-card">
+      <div class="section-head detail-section-head">
+        <h2>{{ modelName(activeRun) }} · {{ albumName(activeRun) }} · {{ qaName(activeRun) }}</h2>
+        <div class="detail-head-tools">
+          <span class="phase-status" :class="activeRun.status">{{ statusLabel(activeRun.status) }}</span>
+          <div class="export-control">
+            <span class="field-label">导出轨迹</span>
+            <span class="export-score-filter">
+              <label class="checkbox-inline"><input type="checkbox" value="0" v-model="exportScores">0 分</label>
+              <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
+              <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
+            </span>
+            <button class="btn compact" @click="exportSftTraces">导出 SFT JSON</button>
+          </div>
+        </div>
+      </div>
+      <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}<template v-if="activeRun.mode === 'reuse'"> · 复用相册 {{ activeRun.scope_name || activeRun.scope_id || activeRun.existing_scope_id }}<span v-if="(activeRun.scope_reused_from_runs || []).length">（源自 run {{ activeRun.scope_reused_from_runs.join('、') }}）</span><span v-else>（外部创建，非编排器产物）</span></template><template v-else-if="activeRun.mode === 'build'"> · 产出相册 {{ activeRun.scope_id || '-' }}（已保留，可在复用测评中使用）</template></p>
+      <section v-if="activeRun.mode !== 'build'" class="rejudge-card">
         <div class="rejudge-head">
 <div>
 <h3>重新 Judge 评分</h3>
@@ -1122,7 +1649,14 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 </div>
 <span v-if="activeRejudge" class="phase-status" :class="activeRejudge.status">{{ statusLabel(activeRejudge.status) }}</span>
 </div>
-        <label class="rejudge-prompt">Judge System Prompt<textarea v-model="rejudgePrompt" :disabled="activeRejudge?.status === 'running'" rows="8" spellcheck="false">
+        <div class="prompt-kind-tabs">
+          <button v-for="meta in judgePromptKinds" :key="meta.kind" type="button"
+                  class="btn ghost compact prompt-kind-tab" :class="{ active: activePromptKind === meta.kind }"
+                  @click="switchPromptKind(meta.kind)">
+            {{ PROMPT_KIND_LABELS[meta.kind] || meta.kind }}<span v-if="meta.custom" class="custom-badge">已自定义</span>
+          </button>
+        </div>
+        <label class="rejudge-prompt">Judge System Prompt（{{ PROMPT_KIND_LABELS[activePromptKind] || activePromptKind }}）<textarea v-model="rejudgePrompt" :disabled="activeRejudge?.status === 'running'" rows="8" spellcheck="false">
 </textarea>
 </label>
         <div class="rejudge-toolbar">
@@ -1176,7 +1710,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 <b>GPU 指标</b>
 <span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.gpu_metrics)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.gpu_metrics)) }}</span>
 </div>
-<p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics)) }} · 模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率</p>
+<p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics)) }} · {{ activeRun.phases?.gpu_metrics?.memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
 <div class="phase-metrics">
 <div v-for="row in gpuMetricRows(activeRun.phases?.gpu_metrics)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
@@ -1185,15 +1719,15 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
 </div>
 </div>
 </article>
-        <article v-if="activeRun.memory_profile" class="phase-card result-phase-card gpu-result-card">
+        <article class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
-<b>可比较显存复测</b>
-<span class="phase-status" :class="activeRun.memory_profile.status">{{ statusLabel(activeRun.memory_profile.status) }}</span>
+<b>{{ comparableMemoryProfile(activeRun)?.source === 'replay' ? '可比较显存复测' : '可比较显存' }}</b>
+<span class="phase-status" :class="comparableMemoryProfile(activeRun)?.status || 'pending'">{{ statusLabel(comparableMemoryProfile(activeRun)?.status || 'pending') }}</span>
 </div>
-<p class="metric-calc-time">复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答。可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
-<p v-if="activeRun.memory_profile.error" class="error">{{ activeRun.memory_profile.error }}</p>
+<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun)?.source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : comparableMemoryProfile(activeRun)?.source === 'replay' ? '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' : '本次 run 的 GPU 采样结束后生成；' }}可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
+<p v-if="comparableMemoryProfile(activeRun).error" class="error">{{ comparableMemoryProfile(activeRun).error }}</p>
 <div class="phase-metrics">
-<div v-for="row in memoryProfileRows(activeRun.memory_profile)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<div v-for="row in memoryProfileRows(comparableMemoryProfile(activeRun) || {})" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
 <strong>{{ row[1] }}</strong>
 <small>{{ row[2] }}</small>
@@ -1354,12 +1888,15 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                     <span><small>步数内完成</small><b>{{ completionLabel(itemDetail(summary)) }}</b></span>
                   </div>
                   <h4>模型召回图片（{{ itemImages(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="image in itemImages(itemDetail(summary))" :key="image.asset_id || image.file_name" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div><span v-if="!itemImages(itemDetail(summary)).length" class="muted small">模型没有返回可识别的图片</span></div>
+                  <div class="image-grid"><div v-for="image in itemImages(itemDetail(summary))" :key="image.asset_id || image.file_name" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div><span v-if="!itemImages(itemDetail(summary)).length" class="muted small">模型没有返回可识别的图片</span></div>
+                  <h4>回答来源图片（{{ itemEvidenceImages(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="image in itemEvidenceImages(itemDetail(summary)).slice(0, 3)" :key="`evidence-${image.asset_id || image.file_name}`" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div><span v-if="!itemEvidenceImages(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
+                  <details v-if="itemEvidenceImages(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceImages(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="image in itemEvidenceImages(itemDetail(summary)).slice(3)" :key="`evidence-more-${image.asset_id || image.file_name}`" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div></div></details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>
                   <h4>检索 GT 图片（{{ itemImages(itemDetail(summary), true).length }}）</h4>
-                  <div class="image-grid"><div v-for="image in itemImages(itemDetail(summary), true)" :key="image.asset_id || image.file_name" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}<em v-if="image.matched === false"> · 未召回</em></span></div></div>
+                  <div class="image-grid"><div v-for="image in itemImages(itemDetail(summary), true)" :key="image.asset_id || image.file_name" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}<em v-if="image.matched === false"> · 未召回</em></span></div></div>
                   <h4 v-if="judgeReason(itemDetail(summary).judge)">回答质量评分说明</h4><p v-if="judgeReason(itemDetail(summary).judge)" class="muted">{{ judgeReason(itemDetail(summary).judge) }}</p>
                   <h4 v-if="judgeReason(itemDetail(summary).task_judge)">任务判断说明</h4><p v-if="judgeReason(itemDetail(summary).task_judge)" class="muted">{{ judgeReason(itemDetail(summary).task_judge) }}</p>
                   <h4 v-if="judgeReason(itemDetail(summary).evidence_judge)">图片证据评分说明</h4><p v-if="judgeReason(itemDetail(summary).evidence_judge)" class="muted">{{ judgeReason(itemDetail(summary).evidence_judge) }}</p>
@@ -1368,6 +1905,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
               <section class="qa-performance">
                 <div class="timing-breakdown">
                   <span>端到端 <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).wall_clock_ms) }}</b></span><span>Agent 总耗时 <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).agent_wall_ms) }}</b></span><span>模型 <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).model_ms) }}</b></span><span>工具 <b>{{ hasToolTrace(itemDetail(summary)) ? fmtMs(itemTimingBreakdown(itemDetail(summary)).tool_ms) : "未记录" }}</b></span><span>Judge <b>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).judge_ms) }}</b></span><span>其他 <b>{{ hasToolTrace(itemDetail(summary)) ? fmtMs(itemTimingBreakdown(itemDetail(summary)).other_ms) : "未记录" }}</b></span>
+                </div>
+                <div v-if="qaLatencySegments(itemDetail(summary)).length" class="latency-composition qa-latency-composition">
+                  <div class="latency-composition-head"><strong>QA 样本时延组成</strong><span>{{ fmtMs(itemTimingBreakdown(itemDetail(summary)).wall_clock_ms) }}</span></div>
+                  <div class="latency-bar" role="img" aria-label="QA 样本时延组成">
+                    <span v-for="(segment, segmentIndex) in qaLatencySegments(itemDetail(summary))" :key="`${segment.kind}-${segmentIndex}`" class="latency-segment" :class="`latency-segment-${segment.kind}`" :style="latencySegmentStyle(segment, qaLatencySegments(itemDetail(summary)))" :data-tooltip="`${segment.label} · ${fmtMs(segment.ms)}`"><b>{{ fmtMs(segment.ms) }}</b></span>
+                  </div>
+                  <div class="latency-segment-legend"><span v-for="(segment, segmentIndex) in qaLatencySegments(itemDetail(summary))" :key="`${segment.kind}-legend-${segmentIndex}`"><i :class="`latency-dot latency-dot-${segment.kind}`"></i>{{ segment.shortLabel }} {{ fmtMs(segment.ms) }}</span></div>
                 </div>
                 <div v-if="agentLoopGroups(itemDetail(summary)).some((group) => group.calls.length)" class="agent-loop-groups">
                   <section v-for="group in agentLoopGroups(itemDetail(summary))" :key="group.turnIndex" class="agent-loop-group">
@@ -1378,26 +1922,41 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                     <div v-if="group.calls.length" class="call-tree">
                       <details v-for="(call, callIndex) in group.calls" :key="`${group.turnIndex}-${call.step_id || call._globalCallIndex || callIndex}`" :class="['call-node', `call-type-${callType(call)}`, { 'trace-only-call': call._traceOnly }]">
                         <summary>
-                          <span class="call-round">{{ callIndex + 1 }}</span><strong>{{ callTypeLabel(call) }}</strong><span v-if="['agent','recovery'].includes(callType(call))" :class="['call-outcome', callOutcomeClass(call)]">{{ callOutcome(call) }}</span><span>{{ call.role || "-" }} · {{ call.model || modelName(activeRun) }}</span><span>TTFT {{ fmtMs(call.ttft_ms) }}</span><span>总时延 {{ fmtMs(call.total_ms) }}</span><span>Token {{ call.preflight_prompt_tokens ?? call.prompt_tokens ?? "-" }} / {{ call.completion_tokens ?? "-" }}</span><span>{{ fmtTokenRate(call.tokens_per_second) }}</span><span class="stream-state" :class="{ streamed: call.streamed === true }">{{ callStatus(call) }}</span>
+                          <span class="call-round">{{ callIndex + 1 }}</span><strong>{{ callTypeLabel(call) }}</strong><span v-if="['agent','recovery'].includes(callType(call))" :class="['call-outcome', callOutcomeClass(call)]">{{ callOutcome(call) }}</span><span>{{ call.role || "-" }} · {{ call.model || modelName(activeRun) }}</span><span>TTFT {{ fmtMs(call.ttft_ms) }}</span><span>Agent Loop 总时延 {{ fmtMs(callAgentLoopTiming(itemDetail(summary), call).totalMs) }}</span><span>模型 {{ fmtMs(call.total_ms) }}</span><span>Token {{ call.preflight_prompt_tokens ?? call.prompt_tokens ?? "-" }} / {{ call.completion_tokens ?? "-" }}</span><span>{{ fmtTokenRate(call.tokens_per_second) }}</span><span class="stream-state" :class="{ streamed: call.streamed === true }">{{ callStatus(call) }}</span>
                         </summary>
-                        <div class="call-node-body">
-                          <div class="call-purpose-grid"><span><small>用途</small><b>{{ callTypeDescription(call) }}</b></span><span><small>触发</small><b>{{ callObservation(call).trigger }}</b></span><span><small>结果</small><b>{{ callObservation(call).outcome }}</b></span><span><small>记录来源</small><b>{{ callObservation(call).source }}</b></span></div>
+                          <div class="call-node-body">
+                            <div v-if="callLatencySegments(itemDetail(summary), call).length" class="latency-composition call-latency-composition">
+                              <div class="latency-composition-head"><strong>Agent Loop 时延组成</strong><span>{{ fmtMs(callAgentLoopTiming(itemDetail(summary), call).totalMs) }}</span></div>
+                              <div class="latency-bar" role="img" aria-label="Agent Loop 时延组成">
+                                <span v-for="(segment, segmentIndex) in callLatencySegments(itemDetail(summary), call)" :key="`${segment.kind}-${segmentIndex}`" class="latency-segment" :class="`latency-segment-${segment.kind}`" :style="latencySegmentStyle(segment, callLatencySegments(itemDetail(summary), call))" :data-tooltip="latencySegmentTitle(segment)"><b>{{ fmtMs(segment.ms) }}</b></span>
+                              </div>
+                              <div class="latency-segment-legend"><span v-for="(segment, segmentIndex) in callLatencySegments(itemDetail(summary), call)" :key="`${segment.kind}-legend-${segmentIndex}`"><i :class="`latency-dot latency-dot-${segment.kind}`"></i>{{ segment.label }} {{ fmtMs(segment.ms) }}</span></div>
+                            </div>
+                            <div class="call-purpose-grid"><span><small>用途</small><b>{{ callTypeDescription(call) }}</b></span><span><small>触发</small><b>{{ callObservation(call).trigger }}</b></span><span><small>结果</small><b>{{ callObservation(call).outcome }}</b></span><span><small>记录来源</small><b>{{ callObservation(call).source }}</b></span></div>
                           <div class="call-budget-line"><span>请求预算</span><b>{{ callBudget(call) }}</b><span v-if="call.step_id">步骤 {{ call.step_id }}</span><span v-if="callObservation(call).relatedTool !== '-'">关联工具 {{ callObservation(call).relatedTool }}</span><span v-if="callObservation(call).parentStep !== '-'">父步骤 {{ callObservation(call).parentStep }}</span></div>
                           <details v-if="debugStepForCallInGroup(itemDetail(summary), group, call)" class="debug-inline">
                             <summary>完整输入 / 输出</summary>
-                            <div v-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'model'">
+                            <div v-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'judge' || debugStepForCallInGroup(itemDetail(summary), group, call).call_type === 'faithfulness_judge'">
+                              <p class="muted small">评判结论</p><pre>{{ JSON.stringify({ faithful: debugStepForCallInGroup(itemDetail(summary), group, call).faithful, problems: debugStepForCallInGroup(itemDetail(summary), group, call).problems }, null, 2) }}</pre>
+                              <p v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt" class="muted small">评判提示词</p><pre v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt">{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt, null, 2) }}</pre>
+                              <p v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw" class="muted small">评判原始回答</p><pre v-if="debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw">{{ debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw }}</pre>
+                            </div>
+                            <div v-else>
+                              <p v-if="debugPromptAnnotations(itemDetail(summary), group, call).length" class="muted small">内部控制消息（不是用户原话）</p><pre v-if="debugPromptAnnotations(itemDetail(summary), group, call).length">{{ JSON.stringify(debugPromptAnnotations(itemDetail(summary), group, call), null, 2) }}</pre>
                               <p class="muted small">完整提示词</p><pre>{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).prompt, null, 2) }}</pre>
                               <p class="muted small">模型原始回答</p><pre>{{ debugStepForCallInGroup(itemDetail(summary), group, call).raw_full || debugStepForCallInGroup(itemDetail(summary), group, call).raw }}</pre>
-                            </div>
-                            <div v-else-if="debugStepForCallInGroup(itemDetail(summary), group, call).type === 'judge'">
-                              <p class="muted small">评判结论</p><pre>{{ JSON.stringify({ faithful: debugStepForCallInGroup(itemDetail(summary), group, call).faithful, problems: debugStepForCallInGroup(itemDetail(summary), group, call).problems }, null, 2) }}</pre>
-                              <p class="muted small">评判提示词</p><pre>{{ JSON.stringify(debugStepForCallInGroup(itemDetail(summary), group, call).debug?.prompt, null, 2) }}</pre>
-                              <p class="muted small">评判原始回答</p><pre>{{ debugStepForCallInGroup(itemDetail(summary), group, call).debug?.raw }}</pre>
                             </div>
                           </details>
                           <div v-if="showToolBranch(call) && toolsForGroupedCall(itemDetail(summary), call).length" class="tool-tree">
                             <details v-for="(trace, toolIndex) in toolsForGroupedCall(itemDetail(summary), call)" :key="toolIndex" class="tool-node">
-                              <summary><strong>{{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span class="binding-source">{{ toolBindingLabel(trace) }}</span></summary>
+                              <summary><strong>{{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span class="binding-source">{{ toolBindingLabel(trace) }}</span><span v-if="retrievalBackendLabel(trace)" class="retrieval-backend" :class="{ degraded: retrievalBackendDegraded(trace) }">检索后端 {{ retrievalBackendLabel(trace) }}</span></summary>
+                              <div v-if="toolLatencySegments(trace).length" class="latency-composition nested-tool-latency">
+                                <div class="latency-composition-head"><strong>工具内部时延组成</strong><span>{{ fmtMs(toolDurationMs(trace)) }}</span></div>
+                                <div class="latency-bar" role="img" aria-label="工具内部时延组成">
+                                  <span v-for="(segment, segmentIndex) in toolLatencySegments(trace)" :key="`${segment.kind}-${segmentIndex}`" class="latency-segment" :class="`latency-segment-${segment.kind}`" :style="latencySegmentStyle(segment, toolLatencySegments(trace))" :data-tooltip="`${segment.label} · ${fmtMs(segment.ms)}`"><b>{{ fmtMs(segment.ms) }}</b></span>
+                                </div>
+                                <div class="latency-segment-legend"><span v-for="(segment, segmentIndex) in toolLatencySegments(trace)" :key="`${segment.kind}-legend-${segmentIndex}`"><i :class="`latency-dot latency-dot-${segment.kind}`"></i>{{ segment.label }} {{ fmtMs(segment.ms) }}</span></div>
+                              </div>
                               <details v-if="debugToolsForCall(itemDetail(summary), group, call)[toolIndex]" class="debug-inline">
                                 <summary>完整工具输入 / 输出</summary>
                                 <p class="muted small">工具输入</p><pre>{{ JSON.stringify(debugToolsForCall(itemDetail(summary), group, call)[toolIndex].arguments, null, 2) }}</pre>
@@ -1410,27 +1969,42 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); })
                       </details>
                     </div>
                     <p v-else class="qa-performance-empty">本轮没有保存模型调用性能或失败轨迹。</p>
-                    <details v-if="group.turn.agent_status || group.turn.termination_reason || group.turn.turn_outcome" class="call-node guard-node turn-guard-node">
-                      <summary><strong>第 {{ group.turnIndex + 1 }} 轮结束状态</strong><span>{{ turnCompletionLabel(group.turn) }}</span></summary>
-                      <div class="guard-grid"><span>运行状态 <b>{{ group.turn.agent_status || "未记录" }}</b></span><span>终止原因 <b>{{ turnTerminationLabel(group.turn) }}</b></span><span>轮次结果 <b>{{ group.turn.turn_outcome || "未记录" }}</b></span><span>JSON 解析 <b>{{ group.turn.parse_status || "未记录" }}</b></span><span>恢复次数 <b>{{ turnRecoveryCount(group) }}</b></span><span>下一步 <b>{{ group.turn.next_step || "未记录" }}</b></span></div>
-                    </details>
+                    <div v-if="group.turn.agent_status || group.turn.termination_reason || group.turn.turn_outcome" :class="['turn-status-strip', executionStateClass(group.turn)]">
+                      <strong>第 {{ group.turnIndex + 1 }} 轮状态</strong><span class="status-pill">{{ turnCompletionLabel(group.turn) }}</span><span>运行状态 <b>{{ group.turn.agent_status || "未记录" }}</b></span><span>终止原因 <b>{{ turnTerminationLabel(group.turn) }}</b></span><span>JSON 解析 <b>{{ group.turn.parse_status || "未记录" }}</b></span><span>恢复 <b>{{ turnRecoveryCount(group) }} 次</b></span>
+                    </div>
                   </section>
                 </div>
                 <p v-else class="qa-performance-empty">该历史结果未记录主模型调用性能或失败轨迹。</p>
                 <details v-if="unboundTools(itemDetail(summary)).length" class="call-node unbound-tools">
                   <summary><strong>未绑定模型轮次的工具序列</strong><span>{{ unboundTools(itemDetail(summary)).length }} 次 · 历史数据未保存精确轮次关系</span></summary>
-                  <div class="call-node-body tool-tree"><details v-for="(trace, toolIndex) in unboundTools(itemDetail(summary))" :key="toolIndex" class="tool-node"><summary><strong>#{{ toolIndex + 1 }} {{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span></summary></details></div>
+                  <div class="call-node-body tool-tree"><details v-for="(trace, toolIndex) in unboundTools(itemDetail(summary))" :key="toolIndex" class="tool-node"><summary><strong>#{{ toolIndex + 1 }} {{ trace.tool || "未知工具" }}</strong><span>{{ toolStatusLabel(trace) }}</span><span>总耗时 {{ trace.latency_s == null ? "-" : fmtMs(Number(trace.latency_s) * 1000) }}</span><span v-if="retrievalBackendLabel(trace)" class="retrieval-backend" :class="{ degraded: retrievalBackendDegraded(trace) }">检索后端 {{ retrievalBackendLabel(trace) }}</span></summary></details></div>
                 </details>
-                <details v-if="guardSummary(itemDetail(summary)).recorded" class="call-node guard-node final-agent-status"><summary><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong><span>{{ completionLabel(itemDetail(summary)) }}</span></summary><div class="guard-grid"><span>运行状态 <b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span>终止原因 <b>{{ guardSummary(itemDetail(summary)).termination || "正常完成" }}</b></span><span>恢复次数 <b>{{ guardSummary(itemDetail(summary)).recoveries }}</b></span><span>运行详情 <b>{{ itemDetail(summary).agent_reason || "-" }}</b></span></div></details>
+                <section v-if="guardSummary(itemDetail(summary)).recorded" :class="['execution-status-panel', executionStateClass(itemDetail(summary))]">
+                  <div class="execution-status-head"><div><small>执行结果</small><strong>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮状态汇总" : "Agent 结束状态" }}</strong></div><span class="status-pill">{{ completionLabel(itemDetail(summary)) }}</span></div>
+                  <div class="execution-status-grid"><span><small>运行状态</small><b>{{ guardSummary(itemDetail(summary)).status }}</b></span><span><small>终止原因</small><b>{{ terminationDisplayLabel(itemDetail(summary)) }}</b></span><span><small>恢复次数</small><b>{{ guardSummary(itemDetail(summary)).recoveries }} 次</b></span><span><small>JSON 解析</small><b>{{ itemParseRate(itemDetail(summary)) }}</b></span><span class="execution-status-wide"><small>运行说明</small><b>{{ itemDetail(summary).agent_reason || "本轮 Agent 已按正常流程结束" }}</b></span></div>
+                </section>
               </section>
+              <!-- Agent 2.0 的首轮规划与证据账本是第一步调用的审计结果，直接展示摘要。 -->
+              <details v-if="getAgent2Trace(itemDetail(summary))" class="agent2-summary-panel">
+                <summary class="agent2-summary-toggle">
+                  <span class="agent2-toggle-copy"><small>首轮规划调用 · Agent 2.0 Shadow</small><strong>目标分解与证据账本详情</strong><span>回答前先把用户目标拆成可验证的证据需求，再记录工具带回的证据</span></span>
+                  <span class="agent2-counters"><span>{{ agent2RequirementSummary(itemDetail(summary)) }}</span><span>{{ getAgent2LedgerEntries(itemDetail(summary)).length }} 条证据</span><span>{{ agent2DecisionSummary(itemDetail(summary)) }}</span></span>
+                </summary>
+                <div class="agent2-summary-body">
+                <div class="agent2-overview-grid"><span><small>目标</small><b>{{ getAgent2Trace(itemDetail(summary))?.task_declaration?.goal || "未记录" }}</b></span><span><small>作用域</small><b>{{ getAgent2Trace(itemDetail(summary))?.task_declaration?.scope_id || "未记录" }}</b></span><span><small>需求数</small><b>{{ getAgent2Requirements(itemDetail(summary)).length }} 项证据需求</b></span><span><small>证据数</small><b>{{ getAgent2LedgerEntries(itemDetail(summary)).length }} 条账本记录</b></span></div>
+                <div v-if="getAgent2Requirements(itemDetail(summary)).length" class="agent2-detail-section"><div class="agent2-section-label">证据需求</div><div class="agent2-requirement-list"><div v-for="(req, rIdx) in getAgent2Requirements(itemDetail(summary))" :key="rIdx" class="agent2-requirement"><div class="agent2-requirement-head"><b>{{ req.id }}</b><span>{{ agent2EvidenceTypeLabel(req.evidence_type) }}</span><em :class="agent2RequirementStatusClass(req.status)">{{ agent2RequirementStatusLabel(req.status) }}</em></div><p>{{ req.description || "未记录需求描述" }}</p><small>证据引用：{{ (req.evidence_refs || []).join("、") || "暂无" }}<span v-if="req.unmet_reason"> · 未满足原因：{{ req.unmet_reason }}</span></small></div></div></div>
+                <div v-if="getAgent2LedgerEntries(itemDetail(summary)).length" class="agent2-detail-section"><div class="agent2-section-label">证据账本</div><div class="agent2-evidence-list"><div v-for="(entry, eIdx) in getAgent2LedgerEntries(itemDetail(summary))" :key="eIdx" class="agent2-evidence"><div class="agent2-evidence-head"><b>{{ entry.capability || agent2EvidenceTypeLabel(entry.evidence_type) }}</b><span>{{ agent2EvidenceTypeLabel(entry.evidence_type) }}</span><em>{{ entry.certainty || "未定" }}</em></div><textarea class="agent2-json-view" readonly wrap="off" :rows="agent2EvidenceRows(entry.extracted_value ?? entry.value ?? null)" :style="{ height: agent2EvidenceHeight(entry.extracted_value ?? entry.value ?? null) }" :value="formatAgent2EvidenceValue(entry.extracted_value ?? entry.value ?? null)" aria-label="证据账本 JSON 内容"></textarea><small>来源：{{ (entry.provenance_refs || entry.input_refs || []).join("、") || entry.tool_call_id || "未记录" }}<span v-if="entry.asset_id"> · 图片：{{ entry.asset_id }}</span><span v-if="entry.unmatched_reason"> · {{ entry.unmatched_reason === "evidence_incompatible" ? "非当前需求证据" : entry.unmatched_reason }}</span></small></div></div></div>
+                </div>
+              </details>
+
               <details v-if="runtimeDebugTurns(itemDetail(summary)).length" class="call-node debug-trace-node">
-                <summary><strong>完整运行时轨迹（提示词 / 回答 / 工具输入输出 / 评判）</strong><span>{{ runtimeDebugTurns(itemDetail(summary)).length }} 轮</span></summary>
+                <summary><strong>调试详情：完整运行时轨迹</strong><span>{{ runtimeDebugTurns(itemDetail(summary)).length }} 轮用户问答 · 提示词 / 回答 / 工具输入输出 / 评判</span></summary>
                 <div class="debug-trace-body">
                   <details v-for="(turn, turnIndex) in runtimeDebugTurns(itemDetail(summary))" :key="turnIndex" class="debug-turn">
-                    <summary>第 {{ turn.index + 1 }} 轮 · {{ turn.message || "问答" }}</summary>
+                    <summary><span class="debug-turn-index">第 {{ turn.index + 1 }} 轮</span><strong>{{ turn.message || "问答" }}</strong><span class="debug-turn-meta">{{ turn.debug_trace.length }} 个步骤</span></summary>
                     <div class="debug-steps">
                       <details v-for="(step, stepIndex) in turn.debug_trace" :key="stepIndex" class="debug-step" :class="'debug-step-' + (step.type || 'step')">
-                        <summary><strong>{{ step.type === 'model' ? '模型步骤' : step.type === 'tool' ? '工具步骤' : step.type === 'judge' ? '评判步骤' : step.type }}</strong><span>{{ step.status || '' }}</span></summary>
+                        <summary><span class="debug-step-index">{{ stepIndex + 1 }}</span><strong>{{ step.type === 'model' ? '模型步骤' : step.type === 'tool' ? '工具步骤' : step.type === 'judge' ? '评判步骤' : step.type }}</strong><span class="debug-step-status">{{ step.status || '已记录' }}</span></summary>
                         <div v-if="step.type === 'model'">
                           <p class="muted small">提示词</p><pre>{{ JSON.stringify(step.prompt, null, 2) }}</pre>
                           <p class="muted small">模型回答</p><pre>{{ step.raw_full || step.raw }}</pre>

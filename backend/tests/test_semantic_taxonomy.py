@@ -97,6 +97,15 @@ class SemanticTaxonomyTests(unittest.TestCase):
             ["工业设备与设施", "自然景观与地貌", "艺术与展品", "演出与活动用品"],
         )
 
+    def test_malformed_scalar_objects_are_dropped_from_downstream_field(self):
+        result = normalize_semantic_analysis({
+            "objects": [1, {"label": "手机"}, None, True],
+        })
+
+        self.assertEqual(len(result["objects"]), 1)
+        self.assertEqual(result["objects"][0]["label"], "手机")
+        self.assertEqual(result["raw_labels"]["objects"], ["1", "True"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from .final_writer import sanitize_internal_refs
+
 _OPERATION_LABEL = {
     "count": "数量",
     "media": "照片数量",
@@ -48,21 +50,25 @@ def render_emergency_summary(task_state: dict, *, reason: str = "") -> str:
     if result_total is not None:
         if result_total == 0:
             parts.append("检索没有找到符合条件的照片。")
-        else:
-            remaining = task_state.get("result_remaining") or 0
-            parts.append(f"找到 {result_total} 张接近的照片。")
-            if satisfaction == "candidate_only":
-                parts.append("这几张只是接近，还不能完全确认。")
-            elif satisfaction == "partial_support":
-                parts.append("部分信息能对上，还有细节不能完全确认。")
+        # A positive search total is retrieval telemetry, not a user answer
+        # fact.  The bounded evidence preview is already exposed separately;
+        # do not turn a broad candidate pool into "找到 N 张" fallback text.
+        elif satisfaction == "candidate_only":
+            parts.append("找到了一些相关照片，但还不能完全确认。")
+        elif satisfaction == "partial_support":
+            parts.append("找到了一些相关照片，部分信息能对上，还有细节不能完全确认。")
     for tr in task_state.get("tool_results") or []:
         if tr.get("tool") == "inspect_photo" and (tr.get("inspect_text") or "").strip():
             handle = tr.get("inspect_handle") or ""
-            parts.append(f"照片{(' ' + handle) if handle else ''}复核：{tr['inspect_text']}")
+            display_handle = sanitize_internal_refs(handle)
+            if display_handle == "这张照片":
+                parts.append(f"{display_handle}复核：{tr['inspect_text']}")
+            else:
+                parts.append(f"照片{(' ' + display_handle) if display_handle else ''}复核：{tr['inspect_text']}")
         if tr.get("tool") == "get_original_photos" and tr.get("total"):
             parts.append("原图交付已授权。")
     if not parts:
         parts.append("这次处理没有完成，没有产生可确认的结果。")
     tail = _REASON_TAIL.get(reason, _DEFAULT_TAIL if not reason else
                             f"这次处理因故没有完整完成，可以继续问我。")
-    return "；".join(parts) + tail
+    return sanitize_internal_refs("；".join(parts) + tail)
