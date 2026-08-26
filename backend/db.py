@@ -217,13 +217,46 @@ class MemoryStore:
     def __init__(self, path):
         self.path = str(path)
         self._last_vector_search = {"backend": "sqlite", "error": None}
-        self.connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys = ON")
+        self._local = threading.local()
+        self._connections = []
+        self._connections_guard = threading.Lock()
+        self._memory_uri = None
+        self._memory_anchor = None
+        if self.path == ":memory:":
+            # Shared-cache memory databases keep one logical database while
+            # FastAPI's thread pool gets an isolated connection per worker.
+            self._memory_uri = f"file:sentrix-{uuid.uuid4().hex}?mode=memory&cache=shared"
+            self._memory_anchor = self._new_connection()
         with self._schema_lock(path):
+            self.connection.execute("PRAGMA foreign_keys = ON")
             self.connection.execute("PRAGMA busy_timeout = 30000")
-            self.connection.execute("PRAGMA journal_mode = WAL")
+            if self.path != ":memory:":
+                self.connection.execute("PRAGMA journal_mode = WAL")
             self._create_schema()
+
+    def _new_connection(self):
+        if self._memory_uri:
+            connection = sqlite3.connect(
+                self._memory_uri, timeout=30, check_same_thread=False, uri=True
+            )
+        else:
+            connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        if self._memory_uri is None:
+            connection.execute("PRAGMA journal_mode = WAL")
+        with self._connections_guard:
+            self._connections.append(connection)
+        return connection
+
+    @property
+    def connection(self):
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            connection = self._new_connection()
+            self._local.connection = connection
+        return connection
 
     def get_setting(self, key, default=None):
         row = self._row("SELECT value FROM runtime_settings WHERE key = ?", (key,))
@@ -242,7 +275,12 @@ class MemoryStore:
         return [{"key": r["key"], "value": r["value"], "updated_at": r["updated_at"]} for r in rows]
 
     def close(self):
-        self.connection.close()
+        with self._connections_guard:
+            connections = list(self._connections)
+            self._connections.clear()
+        for connection in connections:
+            connection.close()
+        self._memory_anchor = None
 
     def apply_authorized_revision(self, *, proposal_id, confirmation_token, actor):
         """Plan §6 Memory Kernel entry point.
