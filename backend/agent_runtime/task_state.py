@@ -34,9 +34,9 @@ TASK_TERMINAL_STATES = frozenset({
 })
 
 _TRANSITIONS = {
-    "open": {"running", "ambiguous", "unsupported", "blocked_budget", "partially_supported", "unresolved", "unavailable"},
-    "running": {"satisfied", "partially_supported", "unresolved", "ambiguous", "unsupported", "blocked_budget", "unavailable"},
-    "partially_supported": {"running", "satisfied", "unresolved", "blocked_budget", "unavailable"},
+    "open": {"running", "ambiguous", "unsupported", "blocked_budget", "partially_supported", "unresolved", "unavailable", "contradicted"},
+    "running": {"satisfied", "partially_supported", "unresolved", "ambiguous", "unsupported", "blocked_budget", "unavailable", "contradicted"},
+    "partially_supported": {"running", "satisfied", "unresolved", "blocked_budget", "unavailable", "contradicted"},
     "satisfied": set(),
     "ambiguous": set(),
     "unsupported": set(),
@@ -207,6 +207,20 @@ class TaskState:
         except KeyError as exc:
             raise ValueError(f"unknown requirement: {requirement_id}") from exc
 
+    def required_states(self) -> tuple[RequirementState, ...]:
+        """Return required evidence states in declaration order."""
+        return tuple(state for state in self.requirements.values()
+                     if state.requirement.required)
+
+    def unattempted_required(self) -> tuple[RequirementState, ...]:
+        """Return required evidence needs with no recorded attempt."""
+        return tuple(state for state in self.required_states()
+                     if state.attempt_count <= 0)
+
+    def all_required_attempted(self) -> bool:
+        """Whether every required evidence need has been tried at least once."""
+        return not self.unattempted_required()
+
     def mark_running(self, requirement_id: str) -> None:
         state = self.requirement(requirement_id)
         self._transition(requirement_id, "running")
@@ -247,6 +261,17 @@ class TaskState:
         self._transition(requirement_id, "partially_supported")
         requirement.evidence_refs = tuple(evidence_refs)
         requirement.coverage_status = "supported"
+
+    def mark_contradicted(self, requirement_id: str, *, evidence_refs: tuple[str, ...]) -> None:
+        if not evidence_refs:
+            raise ValueError("contradicted requirement needs evidence refs")
+        requirement = self.requirement(requirement_id)
+        if requirement.status == "open":
+            self.mark_running(requirement_id)
+        self._transition(requirement_id, "contradicted")
+        requirement.evidence_refs = tuple(evidence_refs)
+        requirement.coverage_status = "contradicted"
+        requirement.failure_reason = ""
 
     def mark_evidence_failed(self, requirement_id: str, *, reason: str,
                              evidence_refs: tuple[str, ...] = ()) -> None:

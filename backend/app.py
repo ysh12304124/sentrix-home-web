@@ -972,12 +972,18 @@ def delete_memory_space(scope_id: str):
 
 
 _OCR_SETTING_KEY = "ocr.small_enabled"
+_OCR_SETTING_EXPLICIT_KEY = "ocr.small_enabled.explicit"
 
 
 def _ocr_settings():
     from .agent_runtime.tools import small_ocr_available
+    from .agent_runtime.ocr_tool import resolve_small_ocr_enabled
     available = small_ocr_available()
-    enabled = store.get_setting(_OCR_SETTING_KEY, "true" if available else "false").lower() in {"1", "true", "on"}
+    enabled = resolve_small_ocr_enabled(
+        store.get_setting(_OCR_SETTING_KEY),
+        store.get_setting(_OCR_SETTING_EXPLICIT_KEY),
+        available=available,
+    )
     return {
         "small_ocr_enabled": enabled,
         "small_ocr_available": available,
@@ -998,6 +1004,7 @@ def get_ocr_settings():
 @app.put("/api/settings/ocr")
 def put_ocr_settings(payload: OCRSettingsPayload):
     store.set_setting(_OCR_SETTING_KEY, "true" if payload.small_ocr_enabled else "false")
+    store.set_setting(_OCR_SETTING_EXPLICIT_KEY, "true")
     return _ocr_settings()
 
 
@@ -2400,9 +2407,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             model_call_metrics.extend(metrics)
         return text
 
-    from .agent_runtime.tools import small_ocr_available
-    _ocr_setting = store.get_setting(
-        "ocr.small_enabled", "true" if small_ocr_available() else "false").lower() in {"1", "true", "on"}
+    _ocr_setting = _ocr_settings()["small_ocr_enabled"]
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            ocr_settings={"small_ocr_enabled": _ocr_setting},
                            scope_id=scope_id, viewer_id=viewer_id,
@@ -2555,7 +2560,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             # summary; this is still server-side debug data and never enters
             # the model-visible observation path.
             "observation": observation,
-            "latency_s": step.get("latency_s"), "reason": step.get("reason") or "",
+            "latency_s": step.get("latency_s"),
+            "reason": step.get("reason") or step.get("error") or "",
             "error": step.get("error") or "",
             "retrieval_timing": observation.get("retrieval_timing"),
         }
@@ -2570,6 +2576,10 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         tool_trace.append(tool_record)
     return {
         "answer": turn.final_answer,
+        "final_answer": turn.final_answer,
+        "answer_source": turn.answer_source,
+        "writer_call_id": turn.writer_call_id,
+        "writer_status": turn.writer_status,
         "model_call_metrics": ordered_metrics,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
@@ -2965,6 +2975,23 @@ def assistant_response(result):
             item for item in (grounding.get("evidence_images") or [])
             if isinstance(item, dict) and item.get("asset_id")
         ]
+        # Older/partial turns may persist only evidence_asset_ids and omit the
+        # richer evidence_images projection. Rebuild the same small source
+        # cards from the authoritative store so 4174/8771 never shows a blank
+        # image area merely because serialization dropped the optional field.
+        if not evidence_images:
+            for asset_id in (grounding.get("evidence_asset_ids") or grounding.get("evidence_sources") or [])[:12]:
+                try:
+                    asset = store.get_asset(str(asset_id))
+                except Exception:
+                    asset = None
+                if asset:
+                    evidence_images.append({
+                        "asset_id": str(asset_id),
+                        "file_name": asset.get("file_name") or "",
+                        "captured_at": asset.get("captured_at") or "",
+                        "media_url": f"/api/assets/{asset_id}/file",
+                    })
         selected_ids = {str(value) for value in (grounding.get("selected_asset_ids") or []) if value}
         if selected_ids:
             selected = [item for item in evidence_images if str(item.get("asset_id")) in selected_ids]
@@ -3161,14 +3188,10 @@ async def ingest(
         "captured_at": capturedAt,
         "captured_location": capturedLocation,
         "content_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
-        "exif": pipeline.extract_capture_metadata(destination, media_type),
+        "exif": pipeline._extract_exif(destination) if media_type == "image" else {},
     }
     metadata["captured_at"] = metadata["captured_at"] or metadata["exif"].get("captured_at")
-    metadata["captured_location"] = metadata["captured_location"] or metadata["exif"].get("captured_location")
     metadata["source_device_id"] = metadata["source_device_id"] or metadata["exif"].get("device")
-    gps = pipeline._gps_from_metadata(metadata)
-    if gps and not metadata.get("captured_location"):
-        metadata["captured_location"] = f"{float(gps['latitude']):.6f},{float(gps['longitude']):.6f}"
     # Deduplication is scoped to the album: the same photo may legitimately
     # appear in a different memory space without being treated as a duplicate.
     existing = store.find_asset_by_hash(metadata["content_sha256"], scope)

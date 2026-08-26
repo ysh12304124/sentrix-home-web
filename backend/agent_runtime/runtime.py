@@ -138,6 +138,13 @@ def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None
         normalized["asset_handle"] = preview_handles[0]
         return normalized, None
     if requested not in preview_handles:
+        if legacy_image_id and requested == legacy_image_id:
+            # Legacy image_id values are private result-set references rather
+            # than model-visible handles. Rebind only this legacy form to the
+            # first visible asset; explicit stale asset_handle values remain
+            # untouched so policy can reject them safely.
+            normalized["asset_handle"] = preview_handles[0]
+            return normalized, requested
         # Never silently inspect a different image when a stale handle is
         # supplied. Preserve the requested handle so policy/tool feedback can
         # force a fresh search or a visible-handle retry.
@@ -347,12 +354,11 @@ def _next_resolution_handle(task, tool: str) -> str | None:
     preview = [str(handle) for handle in (task.result_preview or []) if handle]
     if not preview:
         return None
-    if tool != "inspect_photo":
-        return preview[0]
     inspected = {
-        str(result.get("inspect_handle"))
+        str(result.get("inspect_handle") or result.get("asset_handle"))
         for result in (task.tool_results or [])
-        if result.get("tool") == "inspect_photo" and result.get("inspect_handle")
+        if result.get("tool") == tool
+        and (result.get("inspect_handle") or result.get("asset_handle"))
     }
     return next((handle for handle in preview if handle not in inspected), None)
 
@@ -364,6 +370,9 @@ class RuntimeTurn:
     steps: list = field(default_factory=list)
     public_progress: list = field(default_factory=list)
     final_answer: str = ""
+    answer_source: str = ""
+    writer_call_id: str = ""
+    writer_status: str = "not_called"
     status: str = "pending"   # complete | partial | timeout | error
     reason: str = ""
     task_state: dict = field(default_factory=dict)
@@ -407,10 +416,15 @@ def public_agent2_trace(trace: dict | None) -> dict:
         < int((entry.get("coverage") or {}).get("requested") or 0)
     )
     return {
+        "trace_version": int(trace.get("trace_version") or 1),
         "requirements": public_requirements,
         "requirement_status_counts": status_counts,
         "evidence_coverage": {"entries": len(entries), "partial_entries": partial_entries},
         "planner_decisions": list(trace.get("planner_decisions") or []),
+        "planner_revisions": list(trace.get("planner_revisions") or []),
+        "answer_source": str(trace.get("answer_source") or ""),
+        "writer_call_id": str(trace.get("writer_call_id") or ""),
+        "writer_status": str(trace.get("writer_status") or "not_called"),
         "terminal_reason": str(trace.get("terminal_reason") or ""),
         "budget_outcome": dict(trace.get("budget_outcome") or {}),
     }
@@ -434,10 +448,42 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
     provenance_refs = tuple(str(ref) for ref in provenance_refs if ref)
     question_text = str(question or getattr(task_state, "user_goal", "") or "")
 
+    def can_attempt_requirement(evidence_type: str) -> bool:
+        """Whether this concrete tool operation can attempt an evidence type.
+
+        Tool contracts deliberately allow one capability to cover multiple
+        evidence types.  The selected operation is narrower: a metadata
+        ``place`` request is not an attempt to obtain a date.  Treating it as
+        one closes a requirement after the wrong tool call and lets the final
+        writer run without the missing evidence.
+        """
+        if not spec.can_satisfy(evidence_type):
+            return False
+        operation = str(
+            observation.get("metadata_operation") or observation.get("operation") or ""
+        ).strip().lower()
+        if spec.name == "query_memory_metadata":
+            operation_types = {
+                "date": {"structured_fact", "temporal_metadata"},
+                "first": {"structured_fact", "temporal_metadata"},
+                "last": {"structured_fact", "temporal_metadata"},
+                "place": {"structured_fact", "location_metadata"},
+                "event": {"structured_fact"},
+                "count": {"structured_fact"},
+            }
+            return evidence_type in operation_types.get(operation, set())
+        if spec.name == "query_memory_facts":
+            if operation in {"date", "first", "last"}:
+                return evidence_type in {"structured_fact", "temporal_metadata"}
+            if operation == "group" and str(observation.get("group_by") or "").lower() == "place":
+                return evidence_type in {"structured_fact", "location_metadata"}
+            return evidence_type == "structured_fact"
+        return True
+
     def mark_failure(reason: str) -> bool:
         recorded = False
         for state in task_state.requirements.values():
-            if not spec.can_satisfy(state.requirement.evidence_type):
+            if not can_attempt_requirement(state.requirement.evidence_type):
                 continue
             if state.status not in {"open", "running", "partially_supported"}:
                 continue
@@ -574,20 +620,11 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                             "asset_id": asset_id,
                             "certainty": "supported",
                         })
-                if ocr_intent(question_text):
-                    # Ingestion OCR is a usable text source when the more
-                    # expensive tile OCR times out. Preserve only the exact
-                    # stored text fragment; never let the writer infer a
-                    # different slogan from the scene description.
-                    text_match = re.search(r"文字：(.+)$", summary)
-                    if text_match and text_match.group(1).strip():
-                        evidence_rows.append({
-                            "evidence_type": "visible_text",
-                            "value": text_match.group(1).strip()[:600],
-                            "subject": "照片中已记录的文字",
-                            "asset_id": asset_id,
-                            "certainty": "supported",
-                        })
+                # Search summaries are candidate context, not a text-reading
+                # result.  Even when ingestion appended a ``文字：...``
+                # fragment, it may be truncated or attached to the wrong
+                # preview asset.  A visible_text requirement can only close
+                # after read_photo_text returns a source-bound observation.
             for person in item.get("people") or []:
                 if not isinstance(person, dict) or person.get("identity_status") != "confirmed":
                     continue
@@ -630,8 +667,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                              else ""),
                 "certainty": "supported",
             })
-        location_question = bool(re.search(
-            r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text))
+        location_question = (not question_text or bool(re.search(
+            r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text)))
         places = [item for item in assets if item.get("place")]
         # GPS/reverse-geocode is a direct structured field.  For a location
         # question the highest-ranked preview may therefore be used as a
@@ -649,8 +686,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 "subject": "照片地点",
                 "asset_id": places[0].get("asset_id") or places[0].get("asset") or "",
             })
-        date_question = bool(re.search(
-            r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text))
+        date_question = (not question_text or bool(re.search(
+            r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text)))
         dates = [item for item in assets if item.get("captured_at")]
         if dates and not preview_evidence_allowed and date_question:
             dates = dates[:1]
@@ -669,7 +706,7 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             # to structured_fact so the authoritative writer can answer the
             # requested year instead of treating a valid dated candidate as
             # an unresolved visual match.
-            if date_question:
+            if question_text and date_question:
                 evidence_rows.append({
                     "evidence_type": "structured_fact",
                     "value": [{"asset": item.get("asset_id") or item.get("asset") or item.get("handle"),
@@ -683,15 +720,19 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         # A visual inspection can directly disprove a requested scene. That
         # negative observation is useful for recovery, but must not satisfy a
         # positive visual requirement merely because it is non-empty.
-        negative_visual = bool(value and re.search(
-            r"(?:没有|未发现|未看到|不存在|不包含|看不到|无法确认|不是).{0,24}",
+        contradicted_visual = bool(value and re.search(
+            r"(?:没有|未发现|未看到|不存在|不包含|不是).{0,24}",
             str(value), re.I))
-        if value and not negative_visual:
+        unknown_visual = bool(value and re.search(
+            r"(?:看不到|无法确认|看不清|不确定).{0,24}", str(value), re.I))
+        if value and not unknown_visual:
             evidence_rows.append({"evidence_type": "visual_observation", "value": value,
                                   "subject": str(observation.get("question") or "照片视觉细节"),
                                   "asset_id": str(observation.get("_source_asset_id")
                                                   or observation.get("asset_handle")
-                                                  or (input_refs[0] if input_refs else ""))})
+                                                  or (input_refs[0] if input_refs else "")),
+                                  "certainty": ("contradicted" if contradicted_visual
+                                                else "supported")})
         for identity in observation.get("photo_identities") or []:
             if not isinstance(identity, dict) or identity.get("identity_status") != "confirmed":
                 continue
@@ -709,6 +750,32 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 "asset_id": str(identity.get("asset_id") or observation.get("_source_asset_id")
                                 or observation.get("asset_handle") or ""),
                 "certainty": "confirmed",
+            })
+        # Preserve the complete face-to-identity map for multi-person photos.
+        # Confirmed names are attached to their face_id; unknown faces remain
+        # explicit and must not be promoted to named identities.
+        face_candidates = observation.get("face_candidates") or []
+        if face_candidates:
+            source_asset = str(observation.get("_source_asset_id")
+                               or observation.get("asset_id")
+                               or observation.get("asset_handle")
+                               or (input_refs[0] if input_refs else ""))
+            confirmed_faces = [face for face in face_candidates
+                               if isinstance(face, dict)
+                               and face.get("identity_status") == "confirmed"]
+            evidence_rows.append({
+                "evidence_type": "photo_identity",
+                "value": {
+                    "faces": face_candidates,
+                    "target_person": str(observation.get("target_person") or ""),
+                    "target_face_id": str(observation.get("selected_face_id")
+                                           or observation.get("target_face_id") or ""),
+                    "confirmed_count": len(confirmed_faces),
+                    "unconfirmed_count": max(0, len(face_candidates) - len(confirmed_faces)),
+                },
+                "subject": "照片逐人人脸映射",
+                "asset_id": source_asset,
+                "certainty": "supported" if confirmed_faces else "uncertain",
             })
     elif spec.name == "read_photo_text":
         value = observation.get("full_text") or observation.get("exact_values") or observation.get("text")
@@ -900,6 +967,7 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         return mark_failure(reason)
 
     recorded = False
+    matched_requirement_ids: set[str] = set()
     for row in evidence_rows:
         evidence_type = row["evidence_type"]
         row_coverage = coverage
@@ -925,6 +993,24 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             }
             if str(row.get("asset_id") or "") in validated:
                 row_coverage = Coverage(requested=1, processed=1)
+        # A person requirement that asks about a group is only partially
+        # supported when the photo has unnamed companions. Counting one
+        # confirmed identity as complete evidence was the source of false
+        # ``satisfied`` states for questions such as "四个兄弟是谁".
+        if evidence_type == "photo_identity" and spec.name in {
+                "inspect_photo", "query_photo_people", "search_memories"}:
+            value = row.get("value") or {}
+            if isinstance(value, dict):
+                confirmed_count = int(value.get("confirmed_count") or len(value.get("people") or []))
+                unknown_count = int(value.get("unconfirmed_count")
+                                    or value.get("unconfirmed_people_count") or 0)
+                if unknown_count and re.search(
+                        r"四个|几个人|都有谁|哪几个人|分别|每个|所有.*人物|人物身份|兄弟",
+                        question_text):
+                    row_coverage = Coverage(
+                        requested=max(1, confirmed_count + unknown_count),
+                        processed=confirmed_count,
+                    )
         active = [state for state in task_state.requirements.values()
                   if state.requirement.evidence_type == evidence_type
                   and state.requirement.required
@@ -951,6 +1037,7 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         # bridesmaid-attire requirement). Keep it as an unmatched observation
         # so the model/auto resolver must issue a targeted inspection.
         if (evidence_type == "visual_observation" and len(active) == 1
+                and str(row.get("certainty") or "") != "contradicted"
                 and subject in {"请描述这张照片", "描述这张照片", "照片视觉细节"}):
             refs = ()
         evidence_conflict = False
@@ -974,6 +1061,7 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 if prior_positive:
                     refs = ()
                     evidence_conflict = True
+        matched_requirement_ids.update(refs)
         try:
             evidence_ledger.append(LedgerEntry(
                 tool_call_id=tool_call_id,
@@ -982,7 +1070,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 input_refs=input_refs,
                 provenance_refs=all_provenance,
                 certainty=("uncertain" if evidence_conflict
-                           else str(observation.get("certainty") or "supported")),
+                           else str(row.get("certainty")
+                                    or observation.get("certainty") or "supported")),
                 coverage=row_coverage,
                 failure_reason=(str(observation.get("reason") or "")
                                 if row_coverage.failed else ""),
@@ -1020,6 +1109,10 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                             reason="partial_coverage",
                             evidence_refs=(tool_call_id,))
                         outcome = "failed"
+                elif str(row.get("certainty") or "") == "contradicted":
+                    task_state.mark_contradicted(
+                        state.requirement.id, evidence_refs=(tool_call_id,))
+                    outcome = "contradicted"
                 else:
                     task_state.mark_satisfied(state.requirement.id, evidence_refs=(tool_call_id,))
                     outcome = "satisfied"
@@ -1031,6 +1124,46 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "evidence_type": evidence_type,
                     "coverage": row_coverage.as_dict(),
                 })
+    # An observation can contain a compatible field for only one of several
+    # declared requirements. Record a failed attempt for every other
+    # compatible requirement so the final gate can distinguish “tried and
+    # unresolved” from “never tried”.
+    for state in task_state.requirements.values():
+        requirement = state.requirement
+        if (not requirement.required
+                or not can_attempt_requirement(requirement.evidence_type)
+                or state.status not in {"open", "running", "partially_supported"}
+                or requirement.id in matched_requirement_ids):
+            continue
+        reason = "evidence_incompatible" if evidence_rows else "no_evidence_returned"
+        try:
+            evidence_ledger.append(LedgerEntry(
+                tool_call_id=tool_call_id,
+                capability=spec.name,
+                evidence_type=requirement.evidence_type,
+                input_refs=input_refs,
+                provenance_refs=all_provenance,
+                certainty="uncertain",
+                coverage=Coverage(requested=1, failed=1),
+                failure_reason=reason,
+                provenance_scope_id=evidence_ledger.scope_id,
+                requirement_refs=(requirement.id,),
+                subject="未匹配的证据需求尝试",
+                unmatched_reason=reason,
+            ))
+        except ValueError as exc:
+            if "duplicate tool call" not in str(exc):
+                raise
+        task_state.mark_evidence_failed(requirement.id, reason=reason,
+                                        evidence_refs=(tool_call_id,))
+        task_state.record_attempt(requirement.id, {
+            "tool": spec.name,
+            "input_refs": list(input_refs),
+            "question": str(observation.get("question") or ""),
+            "outcome": "failed",
+            "reason": reason,
+        })
+        recorded = True
     return recorded
 
 
@@ -1136,8 +1269,11 @@ def _promote_structured_sources_to_result_set(task: TaskState, observation: dict
                 rs.asset_ids = merged
                 rs.total = len(merged)
                 rs.shown = min(6, len(merged))
-                rs_store.save(rs)
-        task.result_preview = [f"photo_{i + 1}" for i in range(min(20, len(rs.asset_ids)))]
+            public = list(dict.fromkeys([*rs.visible_asset_ids(), *ids]))
+            rs.set_public_view(public)
+            rs_store.save(rs)
+        task.result_preview = [
+            f"photo_{i + 1}" for i in range(min(20, len(rs.visible_asset_ids())))]
     except Exception:
         return
 
@@ -1225,19 +1361,44 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     evidence_count = max(evidence_count, len(evidence_assets))
     evidence_images: list[dict] = []
     rs = None
+    try:
+        from . import tools as runtime_tools
+        rs_store = getattr(runtime_tools, "_RUNTIME", {}).get("result_sets")
+        rs = rs_store.get(task.current_result_set) if rs_store and task.current_result_set else None
+    except Exception:
+        rs = None
+    # Tool adapters may carry a public ``photo_N`` handle as a source ref
+    # (notably read_photo_text/inspect_photo). Resolve it against the current
+    # ResultSet before building image URLs; never send a handle to store.get_asset
+    # as if it were a database id.
+    if rs is not None:
+        visible_ids = list(rs.visible_asset_ids())
+        def resolve_ref(value):
+            text = str(value or "")
+            if text in visible_ids:
+                return text
+            if text.startswith("photo_"):
+                try:
+                    index = int(text.removeprefix("photo_")) - 1
+                except ValueError:
+                    index = -1
+                if 0 <= index < len(visible_ids):
+                    return str(visible_ids[index])
+            return text
+        retrieved_assets = list(dict.fromkeys(resolve_ref(aid) for aid in retrieved_assets if aid))
+        source_assets = list(dict.fromkeys(resolve_ref(aid) for aid in source_assets if aid))
+        evidence_assets = list(dict.fromkeys(resolve_ref(aid) for aid in evidence_assets if aid))
     if evidence_assets:
         try:
             from . import tools as runtime_tools
             store = getattr(runtime_tools, "_RUNTIME", {}).get("store")
-            rs_store = getattr(runtime_tools, "_RUNTIME", {}).get("result_sets")
-            rs = rs_store.get(task.current_result_set) if rs_store and task.current_result_set else None
             for aid in evidence_assets[:12]:
                 asset = store.get_asset(aid) if store else None
                 if not asset:
                     continue
                 handle = ""
-                if rs is not None and aid in (rs.asset_ids or []):
-                    handle = f"photo_{list(rs.asset_ids).index(aid) + 1}"
+                if rs is not None and aid in rs.visible_asset_ids():
+                    handle = f"photo_{rs.visible_asset_ids().index(aid) + 1}"
                 evidence_images.append({
                     "asset_id": aid,
                     "handle": handle,
@@ -1263,15 +1424,22 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     evidence_asset_set = set(evidence_assets)
     valid_selected_ids = [str(aid) for aid in (selected_image_ids or [])
                           if aid and str(aid) in evidence_asset_set]
+    if not valid_selected_ids and evidence_assets:
+        valid_selected_ids = evidence_assets[:3]
     valid_selected_handles = list(selected_image_handles or [])
     if rs is not None:
         valid_selected_handles = [handle for handle in valid_selected_handles
                                   if any(str(aid) in evidence_asset_set
-                                         and f"photo_{list(rs.asset_ids).index(aid) + 1}" == str(handle)
-                                         for aid in (rs.asset_ids or []))]
+                                         and f"photo_{rs.visible_asset_ids().index(aid) + 1}" == str(handle)
+                                         for aid in rs.visible_asset_ids())]
     else:
         # A handle without its originating result set cannot be resolved safely.
         valid_selected_handles = []
+    if rs is not None and not valid_selected_handles:
+        valid_selected_handles = [
+            f"photo_{rs.visible_asset_ids().index(aid) + 1}"
+            for aid in valid_selected_ids if aid in rs.visible_asset_ids()
+        ]
     return {
         "required": used_evidence,
         "display_mode": display_mode,
@@ -1284,6 +1452,9 @@ def _build_answer_grounding(*, message: str, task: TaskState,
         "selected_asset_ids": valid_selected_ids,
         "retrieved_asset_ids": list(dict.fromkeys(retrieved_assets)),
         "evidence_asset_ids": list(dict.fromkeys(evidence_assets)),
+        "retrieved_candidates": list(dict.fromkeys(retrieved_assets)),
+        "evidence_sources": list(dict.fromkeys(evidence_assets)),
+        "selected_delivery": list(dict.fromkeys(valid_selected_ids)),
         "evidence_images": evidence_images,
     }
 
@@ -1310,19 +1481,20 @@ def _detect_policy_refusal(message: str) -> str | None:
     return None
 
 def _agent2_answer_context_ready(task_state, answer_context: dict) -> bool:
-    """Return true when at least one required field is grounded enough to write.
+    """Allow grounded writing only after every required need is terminal.
 
-    A single unresolved ancillary requirement must not discard a directly
-    supported answer (for example, a GPS location while visual confirmation
-    of the scene is still pending). The writer receives only the grounded
-    fields and is instructed to state the remaining uncertainty.
+    A failed attempt remains ``running`` while the runtime can retry it. The
+    writer must not consume that partial context; otherwise it can emit a final
+    answer before the evidence loop has actually closed.
     """
     if not answer_context.get("facts"):
         return False
     states = [state for state in getattr(task_state, "requirements", {}).values()
               if getattr(state.requirement, "required", True)]
-    return any(state.status in {"satisfied", "partially_supported"}
-               for state in states)
+    if not states or any(getattr(state, "status", "open") in {
+            "open", "running", "partially_supported"} for state in states):
+        return False
+    return all(getattr(state, "attempt_count", 0) > 0 for state in states)
 
 
 def _refresh_agent2_status(task_state, evidence_ledger) -> str:
@@ -1585,7 +1757,11 @@ class AgentRuntime:
             from .task_state import TaskState as Agent2TaskState
 
             planner_step_id = "planner_step_0"
-            planner_result = GoalPlanner(chat_fn=self.chat_fn).declare(
+            planner_result = GoalPlanner(
+                chat_fn=self.chat_fn,
+                enable_format_rewrite=bool(
+                    self.profile.features.get("agent2_authoritative")),
+            ).declare(
                 message, scope_id=self.scope_id, history=history,
                 include_debug=self.include_debug, step_id=planner_step_id)
             decision = {"kind": "declare"}
@@ -1594,14 +1770,20 @@ class AgentRuntime:
                 agent2_evidence_ledger = EvidenceLedger(scope_id=self.scope_id)
                 decision["status"] = "accepted"
                 turn.agent2_trace = {
+                    "trace_version": 2,
                     "task_declaration": planner_result.declaration.as_dict(),
                     "task_state": agent2_task_state.as_dict(),
                     "evidence_ledger": agent2_evidence_ledger.as_dict(),
                     "planner_decisions": [decision],
+                    "planner_revisions": [],
                 }
             else:
                 decision.update({"status": "fallback", "reason": planner_result.fallback_reason})
-                turn.agent2_trace = {"planner_decisions": [decision]}
+                turn.agent2_trace = {
+                    "trace_version": 2,
+                    "planner_decisions": [decision],
+                    "planner_revisions": [],
+                }
 
             planner_step = {
                 "type": "planner",
@@ -1925,8 +2107,13 @@ class AgentRuntime:
                 else:
                     turn.budget.record_model_step()
                     try:
+                        writer_call_id = f"writer_{sum(1 for step in turn.steps if step.get('type') == 'writer') + 1}"
+                        turn.writer_call_id = writer_call_id
+                        turn.writer_status = "running"
                         if turn.agent2_trace:
                             turn.agent2_trace["writer_input"] = answer_writer_messages
+                            turn.agent2_trace["writer_call_id"] = writer_call_id
+                            turn.agent2_trace["writer_status"] = "running"
                         raw_writer = self.chat_fn(
                             answer_writer_messages,
                             call_type="writer",
@@ -1934,6 +2121,8 @@ class AgentRuntime:
                         ) or ""
                         from .final_writer import clean_writer_output
                         turn.final_answer = clean_writer_output(raw_writer)
+                        turn.answer_source = "writer"
+                        turn.writer_status = "succeeded" if turn.final_answer else "empty"
                         # The single evidence writer can still choose a generic
                         # refusal when 12B sees rich facts. Apply the same
                         # claim-completeness policy used by the normal final
@@ -1977,12 +2166,14 @@ class AgentRuntime:
                             "status": "generated",
                             "call_type": "writer",
                             "step_id": "answer_writer",
+                            "writer_call_id": writer_call_id,
                             "raw": raw_writer[:500],
                             **({"prompt": answer_writer_messages, "raw_full": raw_writer}
                                if self.include_debug else {}),
                         })
                         if turn.agent2_trace:
                             turn.agent2_trace["writer_output"] = turn.final_answer
+                            turn.agent2_trace["writer_status"] = turn.writer_status
                         writer_problems = guard.check(
                             turn.final_answer,
                             task_state={
@@ -2031,6 +2222,10 @@ class AgentRuntime:
                             turn.reason = "" if turn.final_answer else "empty_answer_writer"
                         break
                     except Exception as exc:
+                        turn.writer_status = "failed"
+                        if turn.agent2_trace:
+                            turn.agent2_trace["writer_status"] = "failed"
+                            turn.agent2_trace["writer_error"] = str(exc)
                         turn.steps.append({"type": "writer", "status": "failed",
                                            "call_type": "writer", "reason": str(exc)})
                         answer_writer_pending = False
@@ -2218,26 +2413,54 @@ class AgentRuntime:
                             for state in agent2_task_state.requirements.values()
                             if state.requirement.required and state.status != "satisfied"
                         ]
+                        unattempted = list(agent2_task_state.unattempted_required()) \
+                            if hasattr(agent2_task_state, "unattempted_required") else [
+                                state for state in agent2_task_state.requirements.values()
+                                if state.requirement.required and getattr(state, "attempt_count", 0) <= 0
+                            ]
                         has_partial_answer = any(
                             state.requirement.required and state.status == "satisfied"
                             for state in agent2_task_state.requirements.values()
                         )
-                        if (agent2_status == "in_progress" and available
-                                and turn.budget.can_model_step()
-                                and not has_partial_answer):
+                        if unattempted and available and turn.budget.can_model_step():
+                            pending = [
+                                f"{state.requirement.id}:{state.requirement.evidence_type}"
+                                for state in unattempted
+                            ]
                             final_gate.update({
-                                "decision": "continue",
+                                "decision": "continue_unattempted",
                                 "available_tools": [spec.name for spec in available],
+                                "unattempted_requirements": pending,
                             })
                             messages.append({"role": "assistant", "content": _model_visible_action(action)})
                             messages.append({"role": "user", "content": (
-                                "任务证据尚未闭合，不能输出确定性 final。"
-                                f"未满足需求：{', '.join(pending)}。"
+                                "还有声明的证据需求尚未尝试，不能输出 final。"
+                                f"未尝试需求：{', '.join(pending)}。"
                                 f"当前可用工具：{', '.join(spec.name for spec in available)}。"
-                                "请选择一个工具继续获取实际证据。"
+                                "请选择一个兼容工具继续获取实际证据；工具结果失败也要如实记录。"
                             )})
                             continue
-                        if has_partial_answer:
+                        if unattempted:
+                            final_gate.update({
+                                "decision": "block_unattempted",
+                                "available_tools": [spec.name for spec in available],
+                                "unattempted_requirements": [
+                                    state.requirement.id for state in unattempted
+                                ],
+                            })
+                            turn.final_answer = "现有证据不足，无法确认。"
+                            turn.status = "partial"
+                            turn.reason = "agent2_unattempted_evidence"
+                            turn.termination_reason = "evidence_gate_blocked_unattempted"
+                            break
+                        grounded_context = answer_context
+                        if grounded_context is None:
+                            try:
+                                grounded_context = agent2_evidence_ledger.build_answer_context(
+                                    message, agent2_task_state)
+                            except Exception:
+                                grounded_context = {}
+                        if has_partial_answer or grounded_context.get("facts"):
                             # A required ancillary field (for example venue)
                             # may remain unresolved while the user-requested
                             # field (for example confirmed people) is already
@@ -2419,7 +2642,9 @@ class AgentRuntime:
                                     _wr_step["prompt"] = _wr_debug.get("messages")
                                     _wr_step["raw_full"] = rewritten
                                 turn.steps.append(_wr_step)
-                                turn.final_answer = naturalize_answer(rewritten)
+                                from .final_writer import clean_writer_output
+                                turn.final_answer = naturalize_answer(
+                                    clean_writer_output(rewritten))
                     except Exception:
                         pass
                 try:
@@ -2530,7 +2755,8 @@ class AgentRuntime:
                                     if rewritten and rewritten != turn.final_answer:
                                         turn.steps.append({"type": "writer",
                                                            "status": "rewritten_style"})
-                                        turn.final_answer = rewritten
+                                        from .final_writer import clean_writer_output
+                                        turn.final_answer = clean_writer_output(rewritten)
                             except Exception:
                                 pass
                         turn.status = "complete"
@@ -2990,6 +3216,15 @@ class AgentRuntime:
             message=message, task=task, selected_handle=selected_handle,
             selected_image_handles=turn.selected_image_handles,
             selected_image_ids=turn.selected_image_ids)
+        if not turn.answer_source and turn.final_answer:
+            writer_steps = [step for step in turn.steps
+                            if step.get("type") == "writer"
+                            and step.get("status") in {"generated", "rewritten"}]
+            turn.answer_source = "writer" if writer_steps else "model"
+        if turn.agent2_trace:
+            turn.agent2_trace.setdefault("answer_source", turn.answer_source)
+            turn.agent2_trace.setdefault("writer_call_id", turn.writer_call_id)
+            turn.agent2_trace.setdefault("writer_status", turn.writer_status)
         # Enumeration answers should deliver every bounded source row that
         # carries a distinct group size, even if the model selected only one
         # image in its final JSON.
@@ -3057,10 +3292,19 @@ class AgentRuntime:
                     selected_image_handles=turn.selected_image_handles,
                     selected_image_ids=turn.selected_image_ids)
         turn.termination_reason = _classify_termination(turn)
+        if turn.agent2_trace.get("writer_output"):
+            turn.answer_source = "writer"
+            turn.writer_status = "succeeded"
+        elif turn.final_answer:
+            turn.answer_source = "model_final_candidate"
+        else:
+            turn.answer_source = "emergency_fallback"
         if turn.agent2_trace:
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 turn.agent2_trace["task_state"] = agent2_task_state.as_dict()
                 turn.agent2_trace["evidence_ledger"] = agent2_evidence_ledger.as_dict()
+                turn.agent2_trace["ledger_entries"] = list(
+                    turn.agent2_trace["evidence_ledger"].get("entries") or [])
             if self.profile.features.get("agent2_authoritative"):
                 turn.agent2_trace["terminal_reason"] = (
                     "task_complete" if agent2_task_state is not None
@@ -3070,6 +3314,8 @@ class AgentRuntime:
             else:
                 turn.agent2_trace["terminal_reason"] = "shadow_only"
             turn.agent2_trace["budget_outcome"] = turn.budget.as_dict()
+            turn.agent2_trace["answer_source"] = turn.answer_source
+            turn.agent2_trace["writer_status"] = turn.writer_status
             turn.agent2_trace["stage_timing_ms"] = {
                 k: round(v, 1) for k, v in sorted(_stage_timing_ms.items())}
         self.chat_fn = _orig_chat_fn

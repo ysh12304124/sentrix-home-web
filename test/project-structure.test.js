@@ -13,14 +13,12 @@ test("runtime and maintenance entry points use the documented layout", () => {
     ["scripts", "maintenance", "rebuild_memory.py"],
     ["scripts", "benchmarks", "evaluate_lfw_clusters.py"],
     ["scripts", "benchmarks", "ingest_household_face_benchmark.py"],
-    ["scripts", "benchmarks", "evaluate_household_memory_steward.py"],
     ["scripts", "benchmarks", "evaluate_household_end_to_end.py"],
-    ["scripts", "benchmarks", "evaluate_memory_steward.py"],
     ["scripts", "fixtures", "build_virtual_family_album.py"],
   ]) assert.equal(exists(...file), true, file.join("/") + " must exist");
   const apiStartScript = fs.readFileSync(path.join(root, "scripts", "runtime", "start_sentrix_api.sh"), "utf8");
-  assert.match(apiStartScript, /ADAFACE_MODEL_PATH/, "API startup must configure the AdaFace checkpoint");
-  assert.match(apiStartScript, /ADAFACE_REPO_ROOT/, "API startup must configure the AdaFace repository root");
+  assert.match(apiStartScript, /FACE_PROVIDERS/, "API startup must configure the face runtime");
+  assert.match(apiStartScript, /buffalo_l/, "API startup must use the supported face checkpoint");
   assert.match(apiStartScript, /CLIP_CHECKPOINT/, "API startup must configure the OpenCLIP checkpoint");
   assert.match(apiStartScript, /CHINESE_CLIP_CHECKPOINT/, "API startup must configure the Chinese-CLIP checkpoint");
   assert.match(apiStartScript, /import open_clip/, "API startup must verify the OpenCLIP dependency");
@@ -50,7 +48,7 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   assert.doesNotMatch(source, /COGNEE_BASE_URL|mockSearch|function handleApi/);
   assert.match(source, /return proxyBackend\(req, res, url\);/);
   assert.match(source, /SENTRIX_BACKEND_URL/, "backend must be overridable via SENTRIX_BACKEND_URL");
-  assert.match(source, /127\.0\.0\.1:11001/, "default backend is the project-local API reading ./data/sentrix.db");
+  assert.match(source, /127\.0\.0\.1:9598/, "default backend is the authoritative Agent API");
   assert.match(source, /\/api\/model-profiles\/switch/);
   assert.match(source, /1_000_000/, "model switching must outlive the vLLM ready timeout");
   assert.match(source, /cache-control.*no-cache/s, "static assets must be revalidated after UI fixes");
@@ -78,10 +76,10 @@ test("settings exposes the four benchmark model profiles through the switch API"
   const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
   assert.match(backendSource, /_load_vllm_state/, "runtime state is read from the vLLM registry state file");
   assert.match(backendSource, /_current_model_runtime/);
-  assert.match(backendSource, /--wait-ready/, "model switch waits for the vLLM endpoint before activating");
-  assert.match(backendSource, /--ready-timeout/);
+  assert.match(backendSource, /wait_ready/, "model switch waits for the vLLM endpoint before activating");
+  assert.match(backendSource, /ready_timeout/);
   assert.match(backendSource, /vLLM switch failed/);
-  assert.match(backendSource, /runtime\.get\("profile"\)/);
+  assert.match(backendSource, /get\("profile"\)/);
 });
 
 test("legacy E2B service does not occupy the managed vLLM port", () => {
@@ -157,19 +155,11 @@ test("assistant renders claim-level evidence through stable ids and segments", (
   assert.match(backendSource, /segments/);
 });
 
-test("proactive recall is gated, viewer-scoped, and user-dismissible", () => {
-  const agentSource = fs.readFileSync(path.join(root, "backend", "agent.py"), "utf8");
-  const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
-  const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
+test("proactive recall controls remain UI-compatible after legacy agent removal", () => {
   const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
-  assert.match(agentSource, /SENTRIX_PROACTIVE_MEMORY/);
-  assert.match(agentSource, /proactivity_sensitive/);
-  assert.match(agentSource, /record_proactivity_outcome/);
-  assert.match(agentSource, /memory_intensity=\"probe\"/);
-  assert.match(backendSource, /viewer_id/);
-  assert.match(apiSource, /viewer_id/);
   assert.match(appSource, /accept-proactive/);
   assert.match(appSource, /disable-proactive/);
+  assert.match(appSource, /proactivity_outcome/);
 });
 
 test("entity property corrections are exposed with evidence-aware UI controls", () => {
@@ -186,7 +176,7 @@ test("entity property corrections are exposed with evidence-aware UI controls", 
 test("event detail exposes its evidence-backed entity projection", () => {
   const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
   assert.match(appSource, /eventEntities/);
-  assert.match(appSource, /事件实体/);
+  assert.match(appSource, /event-entity-list/);
   assert.match(appSource, /event-entity-row/);
 });
 

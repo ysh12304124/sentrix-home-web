@@ -32,6 +32,14 @@ LITE_TOOL_SCHEMAS = {
         "- query_memory_facts: 查询统计与结构化事实（总数/最早/最近/分组）。\n"
         '  输入: {"operation": "count|first|last|date|group|meal|list", "filters": {"time": "时间", "person": "人物", "media": "video/image"}}'
     ),
+    "query_memory_metadata": (
+        "- query_memory_metadata: 查询照片的结构化时间、地点、事件元数据。\n"
+        '  输入: {"operation": "date|place|event|count|first|last", "filters": {"time": "时间", "place": "地点", "person": "人物", "media": "image|video"}}'
+    ),
+    "query_photo_people": (
+        "- query_photo_people: 读取当前预览中一张照片自己的已确认人物和未确认同行者。\n"
+        '  输入: {"asset_handle": "photo_1", "result_set_id": "..."}'
+    ),
     "inspect_photo": (
         "- inspect_photo: 复核照片视觉细节（人物/衣服颜色/物品/动作）。\n"
         '  输入: {"asset_handle": "photo_1", "question": "观察问题"}'
@@ -90,6 +98,8 @@ def build_jit_system_prompt(
         tool_descriptions = "\n".join([
             LITE_TOOL_SCHEMAS["search_memories"],
             LITE_TOOL_SCHEMAS["query_memory_facts"],
+            LITE_TOOL_SCHEMAS["query_memory_metadata"],
+            LITE_TOOL_SCHEMAS["query_photo_people"],
             LITE_TOOL_SCHEMAS["inspect_photo"],
             LITE_TOOL_SCHEMAS["read_photo_text"],
         ])

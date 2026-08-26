@@ -8,7 +8,7 @@ from backend.db import MemoryStore
 
 
 def load_cover_maintenance():
-    path = Path(__file__).resolve().parents[2] / "scripts" / "maintenance" / "backfill_event_covers.py"
+    path = Path(__file__).resolve().parents[1] / "scripts" / "maintenance" / "backfill_event_covers.py"
     spec = importlib.util.spec_from_file_location("backfill_event_covers", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
