@@ -88,6 +88,14 @@ class EventSummaryQATests(unittest.TestCase):
         self.assertEqual(result["metadata_operation"], "timeline")
         self.assertEqual(result["total"], 1)
 
+    def test_creative_writer_prompt_requests_an_editing_deliverable(self):
+        from backend.agent_runtime.final_writer import build_answer_writer_messages
+        messages = build_answer_writer_messages(
+            "我想把这段内容剪成旅行Vlog，帮我理故事线",
+            {"facts": [{"value": "机场办理登机：旅客排队", "certainty": "confirmed"}]},
+        )
+        self.assertIn("可执行方案", messages[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

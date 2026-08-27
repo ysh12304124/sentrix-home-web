@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from .task_state import TaskState
 from .tool_registry import get_tool, ToolSpec, list_tools
@@ -118,6 +119,11 @@ def build_jit_system_prompt(
     else:
         state_desc += "所有证据已确认充分，请直接整理 final 回答。"
     parts.append(state_desc)
+    if re.search(r"剪成|剪辑|故事线|章节|旁白|分镜|开场|片头|蒙太奇|b-?roll|短视频|脚本|标题|转场|配乐|选素材|剪片|vlog|视频结构", goal, re.I):
+        parts.append(
+            "这是视频创作编排任务。读取时间线后输出可执行方案：标题/章节、镜头顺序、每段用途、旁白或字幕、转场建议；"
+            "不要只复述检索结果，也不要因为没有单张图片而拒答。只能把摘要明确支持的内容写成事实，推测内容标注待确认。"
+        )
 
     # 3. JIT 只依据统一注册表和未满足需求提供工具，不按问题关键词
     # 硬编码“先 search 再 inspect”的流程。模型仍然决定下一步调用哪个工具。

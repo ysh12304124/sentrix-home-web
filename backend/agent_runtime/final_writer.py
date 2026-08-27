@@ -48,6 +48,10 @@ _PHOTO_HANDLE_RE = re.compile(
     r"(?<![A-Za-z0-9_])photo_\d+(?![A-Za-z0-9_])",
     re.I,
 )
+_CREATIVE_VIDEO_RE = re.compile(
+    r"剪成|剪辑|故事线|章节|旁白|分镜|开场|片头|蒙太奇|b-?roll|短视频|脚本|标题|转场|配乐|选素材|剪片|vlog|视频结构",
+    re.I,
+)
 
 
 def sanitize_internal_refs(text: str) -> str:
@@ -430,6 +434,12 @@ def build_answer_writer_messages(message: str, answer_context: dict) -> list[dic
         "\n10. 下面的事实材料是唯一可用证据，只输出最终回答文本，不要输出 JSON、工具调用、"
         "证据编号或内部字段名。\n"
     )
+    if _CREATIVE_VIDEO_RE.search(str(message or "")):
+        system += (
+            "11. 这是视频创作任务。不要只回答‘找到/看不出来’，要把 facts 中的事件按时间组织成可执行方案，"
+            "至少给出：建议标题、章节顺序、每章应使用的事件/画面、旁白或字幕方向；用户要求选镜头时优先列出事件标题和时间。"
+            "事实没有覆盖的内容要标注‘需要回看原片确认’，不要自行补写。\n"
+        )
     user = (
         "用户问题：\n" + str(message or "") +
         "\n\n最小答案材料：\n" + json.dumps(payload, ensure_ascii=False, default=str) +
