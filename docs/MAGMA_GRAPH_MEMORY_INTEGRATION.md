@@ -25,9 +25,10 @@ SQLite 记忆库。这里的“图”是视频记忆图，不是图片文件、�
 关系只从已有事实生成：`BELONGS_TO_SESSION`、`PART_OF`、单向
 `PRECEDES`、`REFERS_TO` 和 `RELATED_TO`。关键帧顺序优先使用
 `source_timestamp_sec`，再用 `captured_at`、`source_frame_index` 和稳定 ID
-消歧；视频场景顺序使用 `source_scene_index/source_start_sec`。相邻不等于因果，
-因此当前构建不会写入 `CAUSAL`、`LEADS_TO` 或 `ENABLES` 边，统计中的
-`causal_edges` 固定应为 0。
+消歧；视频场景顺序使用 `source_scene_index/source_start_sec`。相邻不等于因果。
+视频相邻场景会生成单独的 `LEADS_TO_CANDIDATE` 待确认候选，但只有来源元数据
+明确提供 `causal_edges`/`causal_relations` 时才生成正式的 `CAUSAL:LEADS_TO`
+或 `CAUSAL:ENABLES`，因此 `causal_edges` 仍可能为 0。
 
 ## 派生表与重建
 
@@ -46,7 +47,7 @@ SQLite 记忆库。这里的“图”是视频记忆图，不是图片文件、�
 
 后端权威入口是 `backend/app.py`：
 
-- `GET /api/graph-memory/stats?scope_id=home-default`
+- `GET /api/graph-memory/stats?scope_id=home-default`（含 `causal_edges` 正式边和 `causal_candidates` 待确认候选）
 - `POST /api/graph-memory/rebuild`，body：`{"scope_id":"home-default"}`
 - `POST /api/graph-memory/query`，body：`query/scope_id/limit/expand_depth/node_types`
 - `GET /api/graph-memory/nodes/{node_id}?scope_id=home-default`

@@ -1075,6 +1075,41 @@ def _event_resolution(question: str, store, scope_id: str) -> dict | None:
     return None
 
 
+def _event_summary_terms(query: str) -> list[str]:
+    """Extract meaningful phrase terms for Chinese event-summary lookup.
+
+    This is intentionally generic and data-driven. It does not contain album
+    names, benchmark answers, or scene-specific vocabulary.
+    """
+    text = str(query or "").strip().casefold()
+    if not text:
+        return []
+    stop = {
+        "视频", "录像", "相册", "记忆", "摘要", "事件", "场景", "内容",
+        "里面", "里边", "什么", "哪些", "哪个", "怎么", "如何", "有没有",
+        "请问", "告诉", "一下", "时候", "后来", "然后", "先后", "是否",
+    }
+    terms: list[str] = []
+    # Keep ASCII words here; Unicode ``\w`` would capture the whole Chinese
+    # sentence as one token and make matching depend on an accidental exact
+    # sentence copy. Chinese phrases are generated from n-grams below.
+    for token in re.findall(r"[A-Za-z0-9_\-]+", text):
+        if len(token) >= 2 and token not in stop and token not in terms:
+            terms.append(token)
+    for chunk in re.findall(r"[\u4e00-\u9fff]+", text):
+        for length in (4, 3, 2):
+            for index in range(max(0, len(chunk) - length + 1)):
+                term = chunk[index:index + length]
+                if len(term) < length or term in stop:
+                    continue
+                # Function-word ngrams are too weak to select an event.
+                if any(mark in term for mark in ("了", "的", "吗", "呢", "么")):
+                    continue
+                if term not in terms:
+                    terms.append(term)
+    return terms
+
+
 def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
     """Fallback event anchor using distinctive Chinese terms in summaries.
 
@@ -2684,18 +2719,26 @@ def _query_memory_metadata(arguments: dict, *, context: dict | None = None) -> d
         filters = dict(arguments.get("filters") or {})
         if arguments.get("place") and not filters.get("place"):
             filters["place"] = arguments.get("place")
-        query = str(arguments.get("query") or "").strip().lower()
+        # Event-summary QA must work with natural Chinese questions. The old
+        # implementation used ``query.split()``; a Chinese sentence has no
+        # spaces, so it required the entire question to occur verbatim in one
+        # summary and returned zero rows for normal questions.
+        query = str(arguments.get("query") or arguments.get("question") or "").strip().lower()
+        if not query:
+            query = str(((context or {}).get("task_state") or {}).get("user_goal") or "").strip().lower()
+        query_terms = _event_summary_terms(query)
         rows = store.connection.execute(
             "SELECT e.id, e.title, e.event_type, e.time_start, e.time_end, e.place, "
             "e.activity, e.summary, e.cover_asset_id "
             "FROM events e WHERE e.scope_id=? AND e.status='active' ORDER BY e.time_start",
             (scope_id,),
         ).fetchall() if store is not None else []
-        items = []
+        scored_items = []
         for row in rows:
             values = " ".join(str(row[key] or "").lower() for key in
                                ("title", "event_type", "place", "activity", "summary"))
-            if query and not any(token in values for token in query.split() if token):
+            matched_terms = [term for term in query_terms if term in values]
+            if query and query_terms and not matched_terms:
                 continue
             member_rows = store.connection.execute(
                 "SELECT o.asset_id FROM event_observations eo "
@@ -2741,7 +2784,13 @@ def _query_memory_metadata(arguments: dict, *, context: dict | None = None) -> d
                 ([str(item["asset_id"])] if item["asset_id"] else [])
                 + member_asset_ids
             ))
-            items.append(item)
+            # Longer phrases carry more meaning than incidental two-character
+            # overlaps. Keep all equal-scoring rows, then apply a bounded
+            # result window so one broad video question cannot flood context.
+            score = sum(len(term) ** 2 for term in set(matched_terms))
+            scored_items.append((score, item))
+        scored_items.sort(key=lambda pair: (-pair[0], pair[1].get("time_start") or "", pair[1].get("event_id") or ""))
+        items = [item for _score, item in scored_items[:30]]
         source_ids = list(dict.fromkeys(
             asset_id for item in items for asset_id in item.get("source_asset_ids", [])
         ))

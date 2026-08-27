@@ -165,6 +165,7 @@ button { cursor: pointer; }
 .graph-memory-flow b { color: var(--green); }
 .graph-memory-relation-tags { display: flex; flex-wrap: wrap; gap: 5px; }
 .graph-memory-relation-tag { padding: 4px 7px; border-radius: 999px; background: #eaf2fb; color: #557ba7; font: 700 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.graph-memory-relation-tag.candidate { background: #fff2d8; color: #a46b20; }
 .graph-memory-mapping > small { display: block; margin-top: 9px; color: var(--muted); font-size: 9px; }
 .graph-memory-node-list { display: grid; gap: 7px; }
 .graph-memory-node-row { display: flex; align-items: flex-start; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }

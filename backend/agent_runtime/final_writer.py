@@ -209,7 +209,27 @@ def build_final_context(message: str, task: dict) -> dict:
             else:
                 resolution_state = "unresolved"
                 unknowns.append("照片里没有识别到可用的文字。")
-    # query_memory_facts 确定性事实
+        elif tool == "query_memory_metadata":
+            # Event summaries are structured memory evidence, not a photo
+            # candidate. Put the actual title/summary into the writer context
+            # so an event-level question does not fall through to “照片里看
+            # 不出来” merely because no single frame was inspected.
+            operation = str(tr.get("metadata_operation") or tr.get("operation") or "").lower()
+            if operation == "event":
+                values = tr.get("items") or tr.get("value") or []
+                if isinstance(values, dict):
+                    values = [values]
+                for item in values[:12]:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    summary = str(item.get("summary") or "").strip()
+                    if title or summary:
+                        facts.append({
+                            "value": (f"{title}：{summary}" if title and summary else title or summary)[:700],
+                            "certainty": "confirmed", "source": "event_summary",
+                        })
+        # query_memory_facts 确定性事实
     op = task.get("fact_operation")
     value = task.get("fact_value")
     if op in {"count", "media"} and isinstance(value, int):

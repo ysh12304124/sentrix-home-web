@@ -78,6 +78,7 @@ class GraphMemoryTests(unittest.TestCase):
         try:
             result = service.rebuild(self.scope)
             self.assertEqual(result["causal_edges"], 0)
+            self.assertEqual(result["causal_candidates"], 1)
             self.assertEqual(result["node_counts"]["EPISODE"], 2)
             self.assertEqual(result["node_counts"]["SESSION"], 2)
             self.assertEqual(result["node_counts"]["EVENT"], 3)
