@@ -33,8 +33,8 @@ LITE_TOOL_SCHEMAS = {
         '  输入: {"operation": "count|first|last|date|group|meal|list", "filters": {"time": "时间", "person": "人物", "media": "video/image"}}'
     ),
     "query_memory_metadata": (
-        "- query_memory_metadata: 查询视频/事件摘要及结构化元数据。视频里做了什么、展示了什么、先后发生了什么时优先用 operation=event；\n"
-        '  输入: {"operation": "event|date|place|count", "query": "视频或事件关键词"}'
+        "- query_memory_metadata: 查询视频/事件摘要及结构化元数据。视频里做了什么、展示了什么、先后发生了什么时用 operation=event；要编排故事线、章节、旁白或剪辑方案时用 operation=timeline 读取完整时间线；\n"
+        '  输入: {"operation": "event|timeline|date|place|count", "query": "视频或事件关键词"}'
     ),
     "inspect_photo": (
         "- inspect_photo: 复核照片视觉细节（人物/衣服颜色/物品/动作）。\n"

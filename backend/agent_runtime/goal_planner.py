@@ -29,6 +29,7 @@ _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精�
 - 用户没有明确要求“历史对话/之前说过什么”时，不要声明 user_statement。
 - 地点问题声明 location_metadata；照片内容/颜色/动作声明 visual_observation；照片文字/数字声明 visible_text。
 - 如果问题问视频/事件“做了什么、展示了什么、发生了什么、先后做了什么”，声明 structured_fact，优先读取事件摘要；只有问题明确问单张画面中可见的颜色、物体细节或人数时才声明 visual_observation。
+- 如果用户说“剪成、剪辑、故事线、章节、旁白、分镜、开场、蒙太奇、B-roll、短视频、脚本、标题或转场”，这是视频创作编排任务，声明 structured_fact；先读取完整视频事件时间线，再给出可执行的剪辑方案，不要只检索一张照片。
 - 身份问题只有在需要确认照片中的人名时才声明 photo_identity；不要用 visual_observation 代替身份。
 - 同一种 evidence_type 只声明一次；不要为了同一个答案同时声明多个等价需求。
 每个 requirement 都必须能由注册表中的工具直接或通过 prerequisite 获得。
@@ -73,6 +74,16 @@ def _event_summary_intent(text: str) -> bool:
     if re.search(r"写着|写了什么|什么字|文字|招牌|价格|多少钱|读出|读到|原价|售价", text):
         return False
     return bool(re.search(r"做了什么|展示了什么|展示什么|发生了什么|包括什么|有哪些|什么物品|什么东西|过程|先后|后来", text))
+
+
+def _creative_video_intent(text: str) -> bool:
+    """Recognize requests to transform video memory into an editing deliverable."""
+    text = str(text or "")
+    if re.search(r"照片上|图片上|这张照片|画面上|写了什么|多少钱|价格是多少", text):
+        return False
+    return bool(re.search(
+        r"剪成|剪辑|故事线|章节|旁白|分镜|开场|片头|蒙太奇|b-?roll|短视频|脚本|标题|转场|配乐|选素材|剪片|vlog|视频结构",
+        text, re.I))
 
 
 @dataclass(frozen=True)
@@ -181,7 +192,7 @@ class GoalPlanner:
         # such as “物品/清单” for a photo-text task. Event summaries are the
         # authoritative structured source for “what happened/showed”; keep OCR
         # only for questions explicitly asking for visible text or prices.
-        if _event_summary_intent(default_goal):
+        if _event_summary_intent(default_goal) or _creative_video_intent(default_goal):
             for item in normalized_reqs:
                 if item["evidence_type"] in {"visual_observation", "visible_text", "memory_asset"}:
                     item["evidence_type"] = "structured_fact"

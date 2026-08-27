@@ -1576,15 +1576,17 @@ class AgentRuntime:
         agent2_task_state = None
         agent2_evidence_ledger = None
         event_summary_request = False
+        creative_video_request = False
         if (self.profile.features.get("agent2_authoritative")
                 or self.profile.features.get("agent2_shadow")):
             # The authoritative profile uses this planner/task state as the
             # production decision path. The shadow flag is retained only for
             # replay compatibility with historical profiles.
             from .evidence_ledger import EvidenceLedger
-            from .goal_planner import GoalPlanner, _event_summary_intent
+            from .goal_planner import GoalPlanner, _creative_video_intent, _event_summary_intent
 
             event_summary_request = _event_summary_intent(message)
+            creative_video_request = _creative_video_intent(message)
             from .task_state import TaskState as Agent2TaskState
 
             planner_step_id = "planner_step_0"
@@ -2699,12 +2701,13 @@ class AgentRuntime:
             # event summaries, while photo/text questions remain on their
             # normal visual/OCR paths.
             if (self.profile.features.get("agent2_authoritative")
-                    and event_summary_request
+                    and (event_summary_request or creative_video_request)
                     and tool_name in {"query_memory_facts", "search_memories",
                                       "inspect_photo", "read_photo_text"}):
-                routing_correction = f"{tool_name}->query_memory_metadata(event)"
+                operation = "timeline" if creative_video_request else "event"
+                routing_correction = f"{tool_name}->query_memory_metadata({operation})"
                 tool_name = "query_memory_metadata"
-                arguments = {"operation": "event", "query": message}
+                arguments = {"operation": operation, "query": "" if creative_video_request else message}
             # 模型有时把参数包在 arguments.schema 里，统一展开（工具契约兼容层）
             if isinstance(arguments.get("schema"), dict):
                 arguments = {**arguments, **arguments["schema"]}

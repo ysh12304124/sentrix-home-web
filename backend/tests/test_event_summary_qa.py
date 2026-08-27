@@ -3,7 +3,7 @@ import unittest
 
 from backend.agent_runtime import tools
 from backend.agent_runtime.final_writer import build_final_context
-from backend.agent_runtime.goal_planner import GoalPlanner
+from backend.agent_runtime.goal_planner import GoalPlanner, _creative_video_intent
 
 
 class _Store:
@@ -74,6 +74,19 @@ class EventSummaryQATests(unittest.TestCase):
             scope_id="album-test", default_goal="展示购物清单时有什么物品",
         )
         self.assertEqual(payload["declaration"]["requirements"][0]["evidence_type"], "structured_fact")
+
+    def test_video_creation_request_is_recognized_as_a_timeline_task(self):
+        self.assertTrue(_creative_video_intent("我想把这段内容剪成出发去韩国的一天，帮我理一下故事线"))
+        self.assertTrue(_creative_video_intent("帮我写这段旅行视频的旁白和章节"))
+        self.assertFalse(_creative_video_intent("这张照片上写了多少钱"))
+
+    def test_timeline_operation_reads_all_events_without_keyword_filter(self):
+        result = tools._query_memory_metadata(
+            {"operation": "timeline"},
+            context={"scope_id": "album-test"},
+        )
+        self.assertEqual(result["metadata_operation"], "timeline")
+        self.assertEqual(result["total"], 1)
 
 
 if __name__ == "__main__":

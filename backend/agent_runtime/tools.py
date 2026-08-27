@@ -2713,7 +2713,7 @@ def _query_memory_metadata(arguments: dict, *, context: dict | None = None) -> d
             operation = "event"
     # Event is a first-class structured record, not a media-list alias.  The
     # event summary and its cover/member assets are the source for event QA.
-    if operation == "event":
+    if operation in {"event", "timeline"}:
         store = _RUNTIME.get("store")
         scope_id = (context or {}).get("scope_id") or ""
         filters = dict(arguments.get("filters") or {})
@@ -2726,7 +2726,7 @@ def _query_memory_metadata(arguments: dict, *, context: dict | None = None) -> d
         query = str(arguments.get("query") or arguments.get("question") or "").strip().lower()
         if not query:
             query = str(((context or {}).get("task_state") or {}).get("user_goal") or "").strip().lower()
-        query_terms = _event_summary_terms(query)
+        query_terms = [] if operation == "timeline" else _event_summary_terms(query)
         rows = store.connection.execute(
             "SELECT e.id, e.title, e.event_type, e.time_start, e.time_end, e.place, "
             "e.activity, e.summary, e.cover_asset_id "
@@ -2790,13 +2790,13 @@ def _query_memory_metadata(arguments: dict, *, context: dict | None = None) -> d
             score = sum(len(term) ** 2 for term in set(matched_terms))
             scored_items.append((score, item))
         scored_items.sort(key=lambda pair: (-pair[0], pair[1].get("time_start") or "", pair[1].get("event_id") or ""))
-        items = [item for _score, item in scored_items[:30]]
+        items = [item for _score, item in scored_items[:80 if operation == "timeline" else 30]]
         source_ids = list(dict.fromkeys(
             asset_id for item in items for asset_id in item.get("source_asset_ids", [])
         ))
         return {
-            "tool": "query_memory_metadata", "metadata_operation": "event",
-            "operation": "event", "answer_type": "event_list", "value": items,
+            "tool": "query_memory_metadata", "metadata_operation": operation,
+            "operation": operation, "answer_type": "event_list", "value": items,
             "items": items, "total": len(items), "source_asset_ids": source_ids,
             "evidence_asset_ids": source_ids, "evidence_kind": "structured_event",
             "coverage": {"complete": True},
@@ -3018,9 +3018,9 @@ def register_tools():
     register(ToolSpec(
         name="query_memory_metadata",
         description=("查询照片的结构化元数据，专用于时间、地点、事件和数量。"
-                     "operation=date/place/event/count/first/last；不要用它回答衣着、场景细节等视觉问题。"
+                     "operation=date/place/event/timeline/count/first/last；timeline 用于读取完整视频事件时间线并生成剪辑编排。不要用它回答衣着、场景细节等视觉问题。"
                      "返回的事实带 source_asset_ids，可作为回答来源。"),
-        input_schema={"operation": "date|place|event|count|first|last",
+        input_schema={"operation": "date|place|event|timeline|count|first|last",
                       "filters": {"time": "", "place": "", "person": "", "media": ""}},
         executor=_query_memory_metadata, read_write="read", cost_class="cheap", readiness="ready",
         produces_evidence=("structured_fact", "temporal_metadata", "location_metadata"),

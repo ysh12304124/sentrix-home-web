@@ -215,11 +215,11 @@ def build_final_context(message: str, task: dict) -> dict:
             # so an event-level question does not fall through to “照片里看
             # 不出来” merely because no single frame was inspected.
             operation = str(tr.get("metadata_operation") or tr.get("operation") or "").lower()
-            if operation == "event":
+            if operation in {"event", "timeline"}:
                 values = tr.get("items") or tr.get("value") or []
                 if isinstance(values, dict):
                     values = [values]
-                for item in values[:12]:
+                for item in values[:60 if operation == "timeline" else 12]:
                     if not isinstance(item, dict):
                         continue
                     title = str(item.get("title") or "").strip()
