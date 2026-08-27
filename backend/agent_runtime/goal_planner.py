@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import re
 from dataclasses import dataclass
 
 from .planner_contracts import parse_planner_action
@@ -53,6 +54,25 @@ _TYPE_MAP = {
     "fact": "structured_fact",
     "count": "structured_fact",
 }
+
+
+def _event_summary_intent(text: str) -> bool:
+    """Recognize event-level video questions before the model over-selects OCR.
+
+    This is a generic boundary rule: exact text/price questions remain OCR,
+    while questions about what a video scene did or showed use event summary.
+    """
+    text = str(text or "")
+    # A question without an image anchor (for example “展示购物清单时有
+    # 什么”) is still event-level in this product; a question explicitly
+    # anchored to a photo remains visual/OCR.
+    if re.search(r"照片|图片|这张图|这张照片|画面", text):
+        return False
+    if not re.search(r"视频|录像|场景|事件|摘要|片段|清单|活动|旅行|过程", text):
+        return False
+    if re.search(r"写着|写了什么|什么字|文字|招牌|价格|多少钱|读出|读到|原价|售价", text):
+        return False
+    return bool(re.search(r"做了什么|展示了什么|展示什么|发生了什么|包括什么|有哪些|什么物品|什么东西|过程|先后|后来", text))
 
 
 @dataclass(frozen=True)
@@ -157,6 +177,16 @@ class GoalPlanner:
                 "evidence_type": "memory_asset",
                 "description": "查找相关记忆照片",
             })
+        # The model can mistake an event-level video question containing words
+        # such as “物品/清单” for a photo-text task. Event summaries are the
+        # authoritative structured source for “what happened/showed”; keep OCR
+        # only for questions explicitly asking for visible text or prices.
+        if _event_summary_intent(default_goal):
+            for item in normalized_reqs:
+                if item["evidence_type"] in {"visual_observation", "visible_text", "memory_asset"}:
+                    item["evidence_type"] = "structured_fact"
+                    item["description"] = item.get("description") or "视频事件摘要中的活动与物品"
+                    break
         decl["requirements"] = normalized_reqs
         return payload
 

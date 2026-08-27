@@ -3,6 +3,7 @@ import unittest
 
 from backend.agent_runtime import tools
 from backend.agent_runtime.final_writer import build_final_context
+from backend.agent_runtime.goal_planner import GoalPlanner
 
 
 class _Store:
@@ -62,6 +63,17 @@ class EventSummaryQATests(unittest.TestCase):
         )
         self.assertTrue(context["facts_confirmed"])
         self.assertIn("收纳盒", context["facts"][0]["value"])
+
+    def test_video_event_question_is_not_replanned_as_ocr(self):
+        payload = GoalPlanner._normalize_payload(
+            {"action": "declare", "declaration": {
+                "goal": "展示购物清单时有什么物品",
+                "scope_id": "album-test",
+                "requirements": [{"id": "req_1", "evidence_type": "visible_text", "description": "物品"}],
+            }},
+            scope_id="album-test", default_goal="展示购物清单时有什么物品",
+        )
+        self.assertEqual(payload["declaration"]["requirements"][0]["evidence_type"], "structured_fact")
 
 
 if __name__ == "__main__":
