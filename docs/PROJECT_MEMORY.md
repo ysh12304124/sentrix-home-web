@@ -116,6 +116,7 @@ backend/             FastAPI + Thin Agent 运行时 + 记忆库
   task_contracts.py  只读工具计划与白名单
   core_memory.py     核心记忆卡片（agent_core_memory_*）
   memory_corrections.py 纠正提议/授权修订（agent_memory_correction_*）
+  graph_memory.py        MAGMA 视频记忆图派生索引（不替代主检索）
   advanced_memory_tools.py 进阶记忆工具（EvidencePacket）
   claim_extractor.py / complex_answer.py / narrative_context.py
   visible_evidence.py / memory_gate.py / agent_annotations.py
@@ -132,6 +133,12 @@ docs/baseline/       阶段验收报告与实测 JSON（Thin Agent、R7-R9、12B
 docs/plans/          长期计划（semantic-entity-roadmap、digital-memory-steward）
 docs/superpowers/    设计与实施计划
 ```
+
+本仓库另有 `scripts/maintenance/rebuild_graph_memory.py` 和
+`docs/MAGMA_GRAPH_MEMORY_INTEGRATION.md`，用于显式重建 MAGMA 视频记忆图。
+图数据只写入 `graph_memory_nodes`、`graph_memory_edges`、`graph_memory_builds` 三张
+可删除派生表；`assets`、`observations`、`events`、`entities`、`relationships`、
+`memory_vectors` 等 canonical 表保持不变。
 
 ## 数据模型与证据链
 
@@ -203,6 +210,10 @@ Asset -> Observation -> FaceInstance -> PersonAppearanceEvidence -> SemanticClai
    ToolPolicy/BudgetManager 限制循环，FinalGuard + LLM judge 兜底诚实性；回答必须
    可回溯证据，缺口写入 `query_gaps`，反馈写入 `memory_feedback`。旧 Thin Agent 路径
    仅保留给 benchmark/回归测试。
+10. **视频记忆图**：`backend/graph_memory.py` 从已有视频 asset、video scene event、
+    关键帧 observation 和 entity 事实构建 `EPISODE/SESSION/EVENT/ENTITY` 派生图；
+    通过 `BELONGS_TO_SESSION`、`PART_OF`、单向 `PRECEDES`、`REFERS_TO`、
+    `RELATED_TO` 保留证据链。当前不把相邻或时间顺序推断为因果，`causal_edges=0`。
 
 ## 模块实现
 

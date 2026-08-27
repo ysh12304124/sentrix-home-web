@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from .agent_conversation import ConversationStore
 from .agent_runtime.result_set import debug_asset_projection
 from .db import MemoryStore, make_id
+from .graph_memory import GraphMemoryService
 from .event_ordering import sort_video_scene_observations
 from .image_io import (
     encode_jpeg_preview,
@@ -915,6 +916,101 @@ def health():
         "videoExtraction": _video_extraction_status(),
         "database": store.path,
     }
+
+
+def _graph_memory_service():
+    return GraphMemoryService(store.path)
+
+
+@app.get("/api/graph-memory/stats")
+def graph_memory_stats(scope_id: str = "home-default"):
+    service = _graph_memory_service()
+    try:
+        with db_write_guard("graph-memory-stats"):
+            return service.stats(scope_id)
+    finally:
+        service.close()
+
+
+@app.post("/api/graph-memory/rebuild")
+def graph_memory_rebuild(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="scope_id is required")
+    service = _graph_memory_service()
+    try:
+        with db_write_guard("graph-memory-rebuild"):
+            return service.rebuild(scope_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"graph memory rebuild failed: {error}") from error
+    finally:
+        service.close()
+
+
+@app.post("/api/graph-memory/query")
+def graph_memory_query(payload: dict):
+    payload = payload or {}
+    query = str(payload.get("query") or "").strip()
+    scope_id = str(payload.get("scope_id") or "").strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="query is required")
+    if not scope_id:
+        raise HTTPException(status_code=422, detail="scope_id is required")
+    service = _graph_memory_service()
+    try:
+        return service.search(
+            query,
+            scope_id,
+            limit=payload.get("limit", 8),
+            expand_depth=payload.get("expand_depth", 2),
+            node_types=payload.get("node_types"),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        service.close()
+
+
+@app.get("/api/graph-memory/nodes/{node_id}")
+def graph_memory_node(node_id: str, scope_id: str = "home-default"):
+    service = _graph_memory_service()
+    try:
+        value = service.get_node(node_id, scope_id)
+    finally:
+        service.close()
+    if not value:
+        raise HTTPException(status_code=404, detail="graph memory node not found")
+    return value
+
+
+@app.get("/api/graph-memory/subgraph")
+def graph_memory_subgraph(
+    node_id: str,
+    scope_id: str = "home-default",
+    max_depth: int = 2,
+    max_nodes: int = 500,
+    edge_types: str | None = None,
+    min_confidence: float = 0.0,
+):
+    service = _graph_memory_service()
+    try:
+        value = service.subgraph(
+            node_id,
+            scope_id,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            edge_types=edge_types,
+            min_confidence=min_confidence,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        service.close()
+    if not value:
+        raise HTTPException(status_code=404, detail="graph memory node not found")
+    return value
 
 @app.get("/api/hardware")
 def hardware():

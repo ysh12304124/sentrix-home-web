@@ -72,3 +72,6 @@ memory data:
 ```bash
 .venv/bin/python scripts/maintenance/rebuild_memory.py --root . --source /path/to/source-album
 ```
+
+The derived MAGMA video memory graph is documented in
+[docs/MAGMA_GRAPH_MEMORY_INTEGRATION.md](docs/MAGMA_GRAPH_MEMORY_INTEGRATION.md).
