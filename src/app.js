@@ -81,6 +81,7 @@
     personFilter: "all",
     saving: false,
     expandedEntityTypes: {},
+    graphMemory: null,
   };
 
   // RX-6: admin/debug presentation is opt-in (URL ?debug=1 or localStorage).
@@ -1076,6 +1077,25 @@
       const relationRows = (graph.relationships || []).filter((item) => item.status !== "retracted").map((item) => `<div class="fact-review-row"><div><strong>${escapeHtml(item.subject_name)} ${escapeHtml(item.predicate)} ${escapeHtml(item.object_name)}</strong><small>${escapeHtml(item.status)} · 已由你维护</small></div><div class="review-actions"><button class="text-button" data-action="edit-family-relation" data-relation-id="${escapeHtml(item.id)}">编辑</button><button class="button small ghost" data-action="delete-family-relation" data-relation-id="${escapeHtml(item.id)}">删除</button></div></div>`).join("");
       const form = nodes.length >= 2 ? `<form id="modal-form" class="relation-form"><label>人物A<select name="person_a" required>${personOptions}</select></label><label>家庭关系<select name="relation">${relationSelect}</select><input name="relation_custom" placeholder="或自定义关系，如：养父" value="${editing && !relationOptions.includes(editing.predicate) ? escapeHtml(editing.predicate) : ""}" /></label><label>人物B<select name="person_b" required>${personOptions}</select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="clear-relation-edit">取消</button><button type="submit" class="button primary">${editing ? "保存修改" : "添加关系"}</button></div></form>` : "";
       body = `<div class="modal-kicker">FAMILY GRAPH</div><h2>家庭关系图</h2><p class="modal-lead">这里只显示你已确认的人物与家庭关系。关系写入后会进入本地记忆，家庭助手也能回忆这些关系。</p>${graphBody}<div class="family-graph-toolbar"><div class="section-head"><div><p class="section-kicker">维护家庭关系</p><h3>${editing ? "编辑关系" : "添加关系"}</h3></div></div>${form}<div class="section-head" style="margin-top:18px"><div><p class="section-kicker">已建立的关系</p><h3>${(graph.relationships || []).filter((item) => item.status !== "retracted").length} 条</h3></div></div><div class="fact-review-list">${relationRows || emptyState("还没有家庭关系", "从上方选择两个人并填写家庭角色，关系会出现在这张图上。")}</div></div>`;
+    } else if (modal.type === "graph-memory") {
+      const graph = modal.graph || {};
+      const stats = graph.stats || {};
+      const query = graph.query || {};
+      const anchors = query.anchors || [];
+      const expanded = query.expanded || [];
+      const nodeLabel = (node) => node.title || node.content || node.source_id || node.node_id;
+      const nodeSource = (node) => {
+        const attrs = node.attributes || {};
+        if (attrs.event_id) return `<button class="text-button" data-action="open-event" data-event-id="${escapeHtml(attrs.event_id)}">查看事件 ${icon("→")}</button>`;
+        if (attrs.asset_id) return `<button class="text-button" data-action="open-asset" data-asset-id="${escapeHtml(attrs.asset_id)}">查看视频/证据 ${icon("→")}</button>`;
+        return "";
+      };
+      const nodeRow = (node, extra = "") => `<div class="graph-memory-node-row"><div class="graph-memory-node-type ${escapeHtml((node.node_type || "").toLowerCase())}">${escapeHtml(node.node_type || "NODE")}</div><div class="graph-memory-node-copy"><strong>${escapeHtml(nodeLabel(node))}</strong><small>${escapeHtml(node.source_type || "derived")} · ${escapeHtml(node.source_id || "")} ${extra ? `· ${escapeHtml(extra)}` : ""}</small>${nodeSource(node)}</div><span class="graph-memory-score">${node.depth != null ? `深度 ${node.depth}` : `分数 ${Number(node.graph_score || 0).toFixed(2)}`}</span></div>`;
+      const edgeLabels = ["PART_OF", "BELONGS_TO_SESSION", "PRECEDES", "REFERS_TO", "RELATED_TO"];
+      const relationTags = edgeLabels.map((label) => `<span class="graph-memory-relation-tag">${label}</span>`).join("");
+      const latest = stats.latest_build || {};
+      const scopeLabel = graph.scopeId === "home-default" && !state.scopeId ? "home-default（全部相册入口）" : graph.scopeId;
+      body = `<div class="modal-kicker">TASK DYNAMIC LINKS · VIDEO MEMORY GRAPH</div><div class="graph-memory-heading"><div><h2>任务动态联系</h2><p class="modal-lead">这是视频记忆图的整合详情：原始视频、视频场景、关键帧观察和实体通过可回溯关系连接起来。</p></div><span class="graph-memory-task-badge">任务动态联系</span></div><div class="detail-facts"><span>范围 · ${escapeHtml(scopeLabel)}</span><span>构建 · ${escapeHtml(latest.status || "未记录")}</span><span>因果边 · ${stats.causal_edges || 0}</span></div><div class="graph-memory-stats"><article><strong>${stats.nodes || 0}</strong><span>记忆节点</span></article><article><strong>${stats.edges || 0}</strong><span>关系边</span></article><article><strong>${stats.node_counts?.EPISODE || 0}</strong><span>视频/空间 EPISODE</span></article><article><strong>${stats.node_counts?.SESSION || 0}</strong><span>视频 SESSION</span></article><article><strong>${stats.node_counts?.EVENT || 0}</strong><span>关键帧 EVENT</span></article><article><strong>${stats.node_counts?.ENTITY || 0}</strong><span>关联 ENTITY</span></article></div><div class="graph-memory-mapping"><div class="section-head"><div><p class="section-kicker">整合结构</p><h3>视频记忆链路</h3></div></div><div class="graph-memory-flow"><span>EPISODE</span><b>→</b><span>SESSION</span><b>→</b><span>EVENT</span><b>→</b><span>ENTITY</span></div><div class="graph-memory-relation-tags">${relationTags}</div><small>时间顺序只生成单向 PRECEDES；当前不把相邻片段推断为因果。</small></div><div class="section-head"><div><p class="section-kicker">任务动态锚点</p><h3>${anchors.length} 个匹配节点 · 扩展 ${expanded.length} 个联系</h3></div><span class="result-count">查询：${escapeHtml(query.query || "视频")}</span></div><div class="graph-memory-node-list">${anchors.length ? anchors.map((node) => nodeRow(node, "锚点")).join("") : emptyState("暂时没有匹配锚点", "图索引已经建立，换一个视频场景、人物或活动关键词再试。")}</div>${expanded.length ? `<details class="graph-memory-expanded" open><summary>展开任务动态联系（${expanded.length}）</summary><div class="graph-memory-node-list">${expanded.slice(0, 12).map((node) => nodeRow(node, `扩展 ${node.depth} 层`)).join("")}</div>${expanded.length > 12 ? `<small class="muted">仅展示前 12 个扩展节点，完整图仍保留在本地索引中。</small>` : ""}</details>` : ""}<div class="modal-actions"><button class="button primary" data-action="close-modal">完成</button></div>`;
     } else if (modal.type === "import-picker") {
       body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
@@ -1265,6 +1285,14 @@
     if (eventDate) eventDate.addEventListener("change", (event) => { state.eventDate = event.target.value || ""; renderView(); });
     document.querySelectorAll("[data-asset-filter]").forEach((element) => element.addEventListener("click", () => { state.assetFilter = element.dataset.assetFilter; renderView(); }));
     document.querySelectorAll("[data-person-filter]").forEach((element) => element.addEventListener("click", () => { state.personFilter = element.dataset.personFilter; renderView(); }));
+    const relationshipButton = document.querySelector('.segmented [data-action="relationship-graph"]');
+    if (state.view === "people" && relationshipButton && !document.querySelector('[data-action="graph-memory"]')) {
+      const graphMemoryButton = document.createElement("button");
+      graphMemoryButton.className = "graph-memory-tab";
+      graphMemoryButton.dataset.action = "graph-memory";
+      graphMemoryButton.innerHTML = '<span class="graph-memory-tab-dot"></span>任务动态联系';
+      relationshipButton.insertAdjacentElement("afterend", graphMemoryButton);
+    }
     const spaceSelect = document.getElementById("space-select");
     if (spaceSelect) spaceSelect.addEventListener("change", async (event) => { state.scopeId = event.target.value; window.localStorage?.setItem("sentrix.scopeId", state.scopeId); state.modal = null; state.conversationId = ""; state.searchResult = null; state.assistantMessages = []; state.activeConversationSummary = ""; state.selectedAsset = null; await refreshData(); });
     const form = document.getElementById("search-form");
@@ -1612,6 +1640,22 @@
   async function openEntityGroup(groupId) {
     openModal({ type: "loading" }, { push: true });
     try { const detail = await window.sentrixApi.entityGroup(groupId, state.scopeId); openModal({ type: "entity-group", detail }); } catch { state.toast = "无法读取语义实体组"; state.modal = null; renderShellNavigation(); }
+  }
+
+  async function openGraphMemory() {
+    const scopeId = state.scopeId || "home-default";
+    openModal({ type: "loading" }, { push: true });
+    try {
+      const [stats, query] = await Promise.all([
+        window.sentrixApi.graphMemoryStats(scopeId),
+        window.sentrixApi.graphMemoryQuery({ query: "视频", scope_id: scopeId, limit: 6, expand_depth: 2, node_types: ["EVENT", "SESSION", "EPISODE", "ENTITY"] }),
+      ]);
+      openModal({ type: "graph-memory", graph: { scopeId, stats, query } });
+    } catch (error) {
+      state.modal = null;
+      state.toast = `无法读取视频记忆图：${error.message}`;
+      renderShellNavigation();
+    }
   }
 
   async function handleModalSubmit(event) {
@@ -2067,6 +2111,7 @@
     if (action === "clear-event-date") { state.eventDate = ""; renderView(); return; }
     if (action === "recheck") { await fetch("/api/maintenance/recheck", { method: "POST" }); state.toast = "已提交失败任务重试"; return refreshData(); }
     if (action === "relationship-graph") { openModal({ type: "loading" }, { push: true }); try { const graph = await window.sentrixApi.relationships(state.scopeId, "person"); return openModal({ type: "family-graph", graph }); } catch (error) { state.modal = null; state.toast = `无法读取家庭关系：${error.message}`; return renderShellNavigation(); } }
+    if (action === "graph-memory") return openGraphMemory();
   }
 
   const initialHash = window.location.hash.replace(/^#\/?/, "");
