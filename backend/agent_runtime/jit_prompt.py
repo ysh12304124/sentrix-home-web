@@ -29,7 +29,7 @@ LITE_TOOL_SCHEMAS = {
         '  输入: {"query": "关键词", "filters": {"time": "<问题中的时间，缺省省略>", "person": "人物", "place": "地点"}}'
     ),
     "query_memory_facts": (
-        "- query_memory_facts: 查询统计与结构化事实（总数/最早/最近/分组）。\n"
+        "- query_memory_facts: 查询统计与结构化事实（总数/最早/最近/分组）；不要用它回答视频场景做了什么或展示了什么。\n"
         '  输入: {"operation": "count|first|last|date|group|meal|list", "filters": {"time": "时间", "person": "人物", "media": "video/image"}}'
     ),
     "query_memory_metadata": (

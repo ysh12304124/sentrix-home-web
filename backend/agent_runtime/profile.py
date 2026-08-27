@@ -25,7 +25,7 @@ class ProfileConfig:
 PROFILES = {
     "goal_driven_candidate": ProfileConfig(
         name="goal_driven_candidate",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
+        tools=("query_memory_facts", "query_memory_metadata", "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,
@@ -40,7 +40,7 @@ PROFILES = {
     ),
     "goal_driven_shadow": ProfileConfig(
         name="goal_driven_shadow",
-        tools=("query_memory_facts", "search_memories", "get_original_photos", "get_result_page",
+        tools=("query_memory_facts", "query_memory_metadata", "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history", "get_person_profile"),
         max_model_steps=8,
         max_tool_calls=6,
