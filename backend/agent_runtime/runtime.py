@@ -1575,13 +1575,16 @@ class AgentRuntime:
         task = TaskState.from_dict(task_state, user_goal=message)
         agent2_task_state = None
         agent2_evidence_ledger = None
+        event_summary_request = False
         if (self.profile.features.get("agent2_authoritative")
                 or self.profile.features.get("agent2_shadow")):
             # The authoritative profile uses this planner/task state as the
             # production decision path. The shadow flag is retained only for
             # replay compatibility with historical profiles.
             from .evidence_ledger import EvidenceLedger
-            from .goal_planner import GoalPlanner
+            from .goal_planner import GoalPlanner, _event_summary_intent
+
+            event_summary_request = _event_summary_intent(message)
             from .task_state import TaskState as Agent2TaskState
 
             planner_step_id = "planner_step_0"
@@ -2689,6 +2692,19 @@ class AgentRuntime:
             tool_name = action.get("tool") or ""
             raw_arguments = dict(action.get("arguments") or {})
             arguments = raw_arguments
+            routing_correction = ""
+            # Small local models can still pick the legacy list/count tool even
+            # after the planner has declared structured event evidence. Keep
+            # this boundary deterministic: event-level questions must read
+            # event summaries, while photo/text questions remain on their
+            # normal visual/OCR paths.
+            if (self.profile.features.get("agent2_authoritative")
+                    and event_summary_request
+                    and tool_name in {"query_memory_facts", "search_memories",
+                                      "inspect_photo", "read_photo_text"}):
+                routing_correction = f"{tool_name}->query_memory_metadata(event)"
+                tool_name = "query_memory_metadata"
+                arguments = {"operation": "event", "query": message}
             # 模型有时把参数包在 arguments.schema 里，统一展开（工具契约兼容层）
             if isinstance(arguments.get("schema"), dict):
                 arguments = {**arguments, **arguments["schema"]}
@@ -2806,6 +2822,8 @@ class AgentRuntime:
                 "task_status_before": agent2_status_before,
                 "requirement_status_before": agent2_requirements_before,
             })
+            if routing_correction:
+                turn.steps[-1]["routing_correction"] = routing_correction
             if corrected_handle and self.include_debug:
                 turn.steps[-1]["requested_asset_handle"] = corrected_handle
             emit_text = public_status
