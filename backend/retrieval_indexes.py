@@ -218,7 +218,15 @@ class RetrievalIndex:
             () if scope_id is None else (scope_id,),
         )
         try:
-            self.connection.execute("DELETE FROM observation_search_fts")
+            # Keep the FTS projection scoped exactly like
+            # ``observation_search_terms``.  A scoped rebuild previously
+            # erased every album's FTS rows, then restored only one album,
+            # leaving all other lexical retrieval channels silently empty.
+            self.connection.execute(
+                "DELETE FROM observation_search_fts" if scope_id is None
+                else "DELETE FROM observation_search_fts WHERE scope_id = ?",
+                () if scope_id is None else (scope_id,),
+            )
         except Exception:
             pass
         self.connection.commit()

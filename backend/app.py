@@ -3487,16 +3487,29 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
 
 @app.post("/api/maintenance/recheck")
 def recheck(background_tasks: BackgroundTasks, scope_id: str | None = None):
-    clauses = ["status IN ('queued', 'failed', 'semantic_enriching', 'video-queued', 'video-processing-failed')"]
+    # processing/semantic_enriching 是处理中断遗留的中间状态（SQLite 写锁竞争 /
+    # worker 重启时遗留），recheck 必须覆盖并先重置为 queued 再重新处理；
+    # 否则这些资产永久卡住，scope 永不 complete（实测 album3-kling 导入卡死）。
+    clauses = ["status IN ('queued', 'failed', 'processing', 'semantic_enriching', 'video-queued', 'video-processing-failed')"]
     params = []
     if scope_id:
         clauses.append("scope_id = ?")
         params.append(scope_id)
     assets = [store.get_asset(row["id"]) for row in store._rows(
         "SELECT id FROM assets WHERE " + " AND ".join(clauses) + " ORDER BY created_at", params)]
+    recovered = 0
+    for item in assets:
+        if item["status"] in PIPELINE_STALE_STATUSES:
+            store.cleanup_asset_derivatives(item["id"])
+            store.update_asset(item["id"], "queued", {
+                "error": None, "failed_stage": None,
+                "pipeline_attempts": 0, "pipeline_retry_count": 0,
+                "pipeline_recovered_from_status": item["status"],
+            })
+            recovered += 1
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
-    return {"accepted": len(assets), "status": "recheck-queued"}
+    return {"accepted": len(assets), "status": "recheck-queued", "recovered_from_stale": recovered}
 
 
 @app.post("/api/maintenance/summarize-events")

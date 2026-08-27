@@ -179,6 +179,15 @@ class EvidenceRetrievalKernel:
         except Exception:
             authorized_count = 0
         recall_limit = max(requested_limit, authorized_count, 1)
+        # The fused ranking is the single post-recall reducer.  Keep every
+        # channel's complete authorized recall for ranking, then hand the
+        # model/Agent a bounded candidate head.  A fixed score cut is
+        # deliberately avoided here: absolute thresholds cannot adapt to
+        # per-query score distributions and silently drop recalled GT
+        # (measured on album3-max 100QA: threshold prefilter dropped
+        # asset recall from 0.971 to 0.893, while rank top-50 kept 0.971).
+        import os
+        candidate_limit = max(1, int(os.getenv("SENTRIX_SEARCH_CANDIDATE_TOP_K", "30")))
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
         min_retrieval_score = 0.0
@@ -230,7 +239,7 @@ class EvidenceRetrievalKernel:
 
         primary_fusion_started = time.monotonic()
         primary_items = self._evaluate_fused(
-            rank(channel_hits, strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+            rank(channel_hits, strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
             spec, packet, filters, all_authorized, scope_id, skip_assets=set())
         primary_fusion_ms = round((time.monotonic() - primary_fusion_started) * 1000, 1)
 
@@ -259,7 +268,7 @@ class EvidenceRetrievalKernel:
             adjacency_fusion_started = time.monotonic()
             adjacency_items = self._evaluate_fused(
                 rank({expander.name: channel_hits[expander.name] for expander in expanders},
-                     strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+                     strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
                 spec, packet, filters, all_authorized, scope_id, skip_assets=already)
             adjacency_fusion_ms = round((time.monotonic() - adjacency_fusion_started) * 1000, 1)
         else:

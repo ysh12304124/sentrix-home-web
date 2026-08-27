@@ -19,15 +19,24 @@ class AnswerGroundingTest(unittest.TestCase):
         self.assertEqual(g["display_mode"], "none")
 
     def test_explicit_image_request_grid(self):
+        # 证据来自 search_memories（找图唯一入口）；聚合工具 query_memory_facts 不再贡献可见图。
         task = _task(current_result_set="rs_x", result_preview=["photo_1", "photo_2"],
-                     result_total=2, tool_results=[{"tool": "query_memory_metadata", "evidence_asset_ids": ["asset_1"]}])
+                     result_total=2, tool_results=[{"tool": "search_memories", "evidence_asset_ids": ["asset_1"], "retrieved_asset_ids": ["asset_1"]}])
         g = _build_answer_grounding(message="把照片给我看看", task=task)
         self.assertEqual(g["display_mode"], "result_grid")
 
     def test_implicit_evidence_collapsed(self):
-        task = _task(current_result_set="rs_x", result_preview=["photo_1"], result_total=1, tool_results=[{"tool": "query_memory_metadata", "evidence_asset_ids": ["asset_1"]}])
+        # 同上：证据必须来自 search；仅聚合工具的来源图不进入模型可见证据。
+        task = _task(current_result_set="rs_x", result_preview=["photo_1"], result_total=1, tool_results=[{"tool": "search_memories", "evidence_asset_ids": ["asset_1"], "retrieved_asset_ids": ["asset_1"]}])
         g = _build_answer_grounding(message="去年去过哪里", task=task)
         self.assertEqual(g["display_mode"], "collapsed")
+
+    def test_facts_do_not_inject_visible_images(self):
+        # 聚合工具（query_memory_facts）即使带 source_asset_ids，也不注入模型可见证据。
+        task = _task(current_result_set="rs_x", result_preview=["photo_1"], result_total=1,
+                     tool_results=[{"tool": "query_memory_facts", "evidence_asset_ids": ["asset_1", "asset_2"], "source_asset_ids": ["asset_1", "asset_2"]}])
+        g = _build_answer_grounding(message="国庆一共多少张", task=task)
+        self.assertEqual(g["display_mode"], "none")
 
     def test_inline_question_selected_photo(self):
         task = _task(current_result_set="rs_x", result_preview=["photo_1"], result_total=1, tool_results=[{"tool": "inspect_photo", "asset_id": "asset_1", "inspect_handle": "photo_1", "inspect_text": "两个人"}])
@@ -67,7 +76,7 @@ class TaskStateRestoreTest(unittest.TestCase):
             user_goal="把照片给我看看")
         self.assertEqual(task.result_preview, ["photo_1", "photo_2"])
         self.assertEqual(task.result_total, 2)
-        task.tool_results = [{"tool": "query_memory_metadata", "evidence_asset_ids": ["asset_1"]}]
+        task.tool_results = [{"tool": "search_memories", "evidence_asset_ids": ["asset_1"], "retrieved_asset_ids": ["asset_1"]}]
         g = _build_answer_grounding(message="把刚才的照片给我看看", task=task)
         self.assertEqual(g["display_mode"], "result_grid")
 

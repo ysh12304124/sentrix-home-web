@@ -94,7 +94,11 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
             task, ledger, spec, tool_call_id="inspect_1", input_refs=("photo_1",),
             observation={"observation": "这张照片中没有船。",
                          "_source_asset_id": "asset_1", "certainty": "supported"}))
-        self.assertEqual(task.requirement("scene").status, "contradicted")
+        # 单张图的否定只构成负向证据（P3.1）：需求进入 failed 终态（已尝试
+        # 未确认，不放大为全局 contradicted），ledger 仍记录该 asset 的
+        # contradicted 证据。
+        self.assertEqual(task.requirement("scene").status, "failed")
+        self.assertEqual(task.requirement("scene").attempt_count, 1)
         self.assertEqual(ledger.entries[0].certainty, "contradicted")
         self.assertEqual(ledger.entries[0].asset_id, "asset_1")
 

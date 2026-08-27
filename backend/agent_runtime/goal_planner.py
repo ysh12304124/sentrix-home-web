@@ -24,6 +24,8 @@ _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精�
 {evidence_types}
 
 只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据重复声明。规则：
+- goal 必须用简体中文描述用户目标（家庭记忆系统使用中文，英文目标会导致语义检索
+  与中文图片描述失配、召回失败）；描述要保留完整语义，不要压缩成几个词。
 - 数量、是否存在、分组等结构化问题声明 structured_fact；拍摄时间/日期/年份声明 temporal_metadata；只有用户明确要求找出照片时才增加 memory_asset。
 - 用户没有明确要求“历史对话/之前说过什么”时，不要声明 user_statement。
 - 地点问题声明 location_metadata；照片内容/颜色/动作声明 visual_observation；照片文字/数字声明 visible_text。

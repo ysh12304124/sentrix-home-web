@@ -615,6 +615,12 @@ def _extract_image_sets(result: dict) -> dict[str, list[str]]:
         add(trace.get("debug_asset_ids"), retrieved)
         # Debug previews are candidate projections, not evidence sources.
         add(trace.get("debug_preview_asset_ids"), retrieved)
+        # 聚合工具（query_memory_facts）只提供文本统计/枚举清单，绝不产生照片候选。
+        # 检索候选（retrieved）与证据（evidence）只统计 search_memories 等找图工具，
+        # 与"非 search 工具不影响模型可见召回图"的设计一致；否则 operation=list 的
+        # 全库 items 会被误算成候选（实测 82/86 张）。
+        if str(trace.get("tool") or "") == "query_memory_facts":
+            continue
         # Debug preview is only a candidate projection, not evidence.
         observation = trace.get("observation") or trace.get("result") or {}
         if isinstance(observation, dict):

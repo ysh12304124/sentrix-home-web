@@ -153,7 +153,8 @@ def build_final_context(message: str, task: dict) -> dict:
                         "person_name": name, "asset_id": item.get("asset_id"),
                     })
         elif tool == "inspect_photo":
-            text = (tr.get("inspect_text") or "").strip()
+            # inspect_photo 实际返回 observation 字段（历史曾用 inspect_text）。
+            text = (tr.get("inspect_text") or tr.get("observation") or "").strip()
             if text:
                 handle = tr.get("inspect_handle") or ""
                 facts.append({

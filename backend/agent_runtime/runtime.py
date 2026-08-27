@@ -14,6 +14,10 @@ import time
 from dataclasses import dataclass, field
 
 from .budget_manager import BudgetState
+
+# 单个需求的最大取证尝试次数：达到仍未 satisfied → failed 终态（已尝试未确认），
+# 避免模型反复 search 无证据而一直 running、耗尽预算导致"未完成"。
+_MAX_REQUIREMENT_ATTEMPTS = 3
 from .jit_prompt import build_jit_system_prompt
 from .answer_nucleus import (build_nucleus, classify_deterministic,
                              render_simple)
@@ -66,15 +70,18 @@ def _natural_partial(task_state: dict, problems=None) -> str:
                 if len(place) >= 2 and place not in places:
                     places.append(place)
         if tr.get("tool") == "inspect_photo":
-            inspect_text = (tr.get("inspect_observation") or "").strip()
+            # inspect_photo 实际返回 observation 字段（历史曾用 inspect_observation/inspect_text）。
+            inspect_text = (tr.get("inspect_observation") or tr.get("observation") or "").strip()
             # Older replay traces only have inspect_text; do not treat an
             # uncertain failure summary as a visual observation.
             if not inspect_text and str(tr.get("certainty") or "supported").lower() != "uncertain":
                 inspect_text = (tr.get("inspect_text") or "").strip()
             if inspect_text:
                 extras.append(f"照片复核能看到：{inspect_text[:80]}")
-        if tr.get("tool") == "read_photo_text" and (tr.get("ocr_text") or "").strip():
-            extras.append(f"照片里读到的文字：{tr['ocr_text'][:80]}")
+        if tr.get("tool") == "read_photo_text":
+            ocr_text = (tr.get("full_text") or tr.get("ocr_text") or "").strip()
+            if ocr_text:
+                extras.append(f"照片里读到的文字：{ocr_text[:80]}")
     if places:
         extras.append("能确认的地点：" + "、".join(places[:3]))
     if extras:
@@ -217,7 +224,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 规则：
 - 需要家庭记忆事实时调用工具；不需要时直接 final。
 - 声称"没有找到/找不到/不存在相关记录"之前，必须先至少调用一次检索工具
-  （search_memories / query_memory_facts / search_conversation_history / get_core_memory / get_person_memory）。
+  （search_memories / query_memory_facts / search_conversation_history / get_core_memory / get_person_profile）。
   未检索就断言"没有找到"会被纠正并要求重新检索。
 - 每次只输出一个 JSON 对象，直接输出，不要用 markdown 代码块（不要 ```）、不要解释、不要多余文字：
   {{"action":"tool_call","tool":"...","arguments":{{...}},"public_status":"..."}}
@@ -233,6 +240,10 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
 - 只有当 search_memories 返回 total=0 或 preview 为空时，才不能 inspect_photo；
   此时绝对不要调用 inspect_photo、不要编造 handle、不要声称找到候选照片，直接如实说没有找到符合条件的照片。
+- inspect_photo / read_photo_text 确认不了当前 handle（如 photo_1 不含目标）时，换 preview/翻页里的下一张
+  （photo_2、photo_3…）复核，不要反复检查同一张；同一张图最多复核一次。看过几张候选仍无目标时，
+  直接 final（如实说明或基于已有候选作答）。search_memories 每轮只需调用一次（返回最多 18 张候选，
+  preview 显示前几张），需要更多候选/下一页用 get_result_page 翻页，不要反复重新搜索整个相册。
 - final 时必须用 evidence_refs 列出你实际引用的工具调用编号（本轮工具调用会按顺序编号 tool_call_1、tool_call_2 …；纯聊天不引用）。
 - 只使用工具返回的事实回答，不编造数字或细节；工具没有返回的内容不要编造。
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
@@ -924,23 +935,6 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             if user_stated:
                 evidence_rows.append({"evidence_type": "user_statement",
                                       "value": cards, "subject": "长期用户表述"})
-    elif spec.name == "get_person_memory":
-        if str(observation.get("readiness") or "") == "ready":
-            person = str(observation.get("person") or "")
-            evidence_rows.append({"evidence_type": "confirmed_identity",
-                                  "value": {"person": person,
-                                            "family_role": observation.get("family_role")},
-                                  "subject": person})
-            for key, evidence_type in (("first_occurrence", "temporal_metadata"),
-                                       ("last_occurrence", "temporal_metadata"),
-                                       ("common_places", "location_metadata"),
-                                       ("asset_count", "structured_fact"),
-                                       ("events", "structured_fact"),
-                                       ("co_occurrence", "structured_fact")):
-                if observation.get(key) not in (None, "", [], {}):
-                    evidence_rows.append({"evidence_type": evidence_type,
-                                          "value": observation.get(key),
-                                          "subject": person})
     elif spec.name == "get_person_profile":
         if str(observation.get("readiness") or "") == "ready":
             person = str(observation.get("person") or "")
@@ -1110,9 +1104,15 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                             evidence_refs=(tool_call_id,))
                         outcome = "failed"
                 elif str(row.get("certainty") or "") == "contradicted":
-                    task_state.mark_contradicted(
-                        state.requirement.id, evidence_refs=(tool_call_id,))
-                    outcome = "contradicted"
+                    # 单张图的否定只构成负向证据：不把需求闭合为 contradicted
+                    #（避免单图误判放大成全局否定），而是标记为 failed 终态
+                    #（已尝试但未确认）——模型看到 failed 后对该需求不再取证，
+                    # final 如实说明。此前保持 running 会让需求无限取证耗尽预算
+                    # 导致"未完成"（实测 running 109 / insufficient_evidence 80）。
+                    task_state.mark_evidence_failed(
+                        state.requirement.id, reason="contradicted_single_asset",
+                        evidence_refs=(tool_call_id,), terminal=True)
+                    outcome = "failed"
                 else:
                     task_state.mark_satisfied(state.requirement.id, evidence_refs=(tool_call_id,))
                     outcome = "satisfied"
@@ -1124,6 +1124,14 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "evidence_type": evidence_type,
                     "coverage": row_coverage.as_dict(),
                 })
+                # 需求尝试达上限仍未满足 → failed 终态（已尝试未确认）。
+                # 否则模型会反复 search 无证据而一直 running，耗尽预算导致
+                # "未完成"（实测 running 95 / insufficient_evidence 80）。
+                if (state.status == "running"
+                        and state.attempt_count >= _MAX_REQUIREMENT_ATTEMPTS):
+                    task_state.mark_evidence_failed(
+                        state.requirement.id, reason="attempt_limit",
+                        evidence_refs=(tool_call_id,), terminal=True)
     # An observation can contain a compatible field for only one of several
     # declared requirements. Record a failed attempt for every other
     # compatible requirement so the final gate can distinguish “tried and
@@ -1230,54 +1238,6 @@ def _confirmed_facts(task_state: dict) -> list[str]:
     return facts
 
 
-def _promote_structured_sources_to_result_set(task: TaskState, observation: dict,
-                                              *, scope_id: str, query: str = "") -> None:
-    """Make structured-fact sources addressable by the same photo handles.
-
-    Metadata/fact tools may be the first successful retrieval after a semantic
-    search returned zero candidates. Their source assets must therefore be
-    merged into the current server-side ResultSet; otherwise grounding has
-    asset IDs but the UI cannot resolve a handle or media URL.
-    """
-    if not observation or not task.current_result_set:
-        return
-    ids: list[str] = []
-    for value in (observation.get("evidence_asset_ids")
-                  or observation.get("source_asset_ids") or []):
-        if value and str(value) not in ids:
-            ids.append(str(value))
-    for row in (observation.get("items") or observation.get("rows") or []):
-        if isinstance(row, dict):
-            value = row.get("asset_id") or row.get("id")
-            if value and str(value) not in ids:
-                ids.append(str(value))
-    if not ids:
-        return
-    try:
-        from . import tools as runtime_tools
-        rs_store = runtime_tools._RUNTIME.get("result_sets")
-        if rs_store is None:
-            return
-        rs = rs_store.get(task.current_result_set)
-        if rs is None:
-            rs = rs_store.new(scope_id=scope_id, query=query,
-                              asset_ids=ids, owner="owner")
-            task.current_result_set = rs.result_set_id
-        else:
-            merged = list(dict.fromkeys([*(rs.asset_ids or []), *ids]))
-            if merged != list(rs.asset_ids or []):
-                rs.asset_ids = merged
-                rs.total = len(merged)
-                rs.shown = min(6, len(merged))
-            public = list(dict.fromkeys([*rs.visible_asset_ids(), *ids]))
-            rs.set_public_view(public)
-            rs_store.save(rs)
-        task.result_preview = [
-            f"photo_{i + 1}" for i in range(min(20, len(rs.visible_asset_ids())))]
-    except Exception:
-        return
-
-
 def _build_answer_grounding(*, message: str, task: TaskState,
                             selected_handle: str | None = None,
                             selected_image_handles: list[str] | None = None,
@@ -1297,6 +1257,10 @@ def _build_answer_grounding(*, message: str, task: TaskState,
     source_assets: list[str] = []
     rep_assets: list[dict] = []
     for tr in tool_results:
+        # 聚合工具（query_memory_facts 及其并入的 event/metadata）只提供文本统计，
+        # 绝不把来源图注入模型可见证据或候选：找图唯一入口是 search_memories。
+        if str(tr.get("tool") or "") in {"query_memory_facts", "query_memory_metadata"}:
+            continue
         for aid in (tr.get("retrieved_asset_ids") or tr.get("asset_ids") or []):
             if aid and str(aid) not in retrieved_assets:
                 retrieved_assets.append(str(aid))
@@ -1426,6 +1390,20 @@ def _build_answer_grounding(*, message: str, task: TaskState,
                           if aid and str(aid) in evidence_asset_set]
     if not valid_selected_ids and evidence_assets:
         valid_selected_ids = evidence_assets[:3]
+    # Model-selected evidence can miss a GT image even though the code
+    # candidate set contains it (measured delivery recall 0.70 vs ~0.95 code
+    # candidate recall).  Backfill delivery from the code candidate order so a
+    # GT image is not dropped purely because the validator under-ranked it.
+    if (len(valid_selected_ids) < 3 and retrieved_assets
+            and display_mode != "none"):
+        # 只在答案有证据支撑、确实需要展示图时从代码候选补齐（保 GT 不丢）。
+        # display_mode=none（闲聊/拒答/无证据）绝不能因补齐而返回无关图——
+        # 无答案的题应返回空图，而不是把代码候选塞进 delivery。
+        for _aid in retrieved_assets:
+            if str(_aid) not in valid_selected_ids:
+                valid_selected_ids.append(str(_aid))
+            if len(valid_selected_ids) >= 3:
+                break
     valid_selected_handles = list(selected_image_handles or [])
     if rs is not None:
         valid_selected_handles = [handle for handle in valid_selected_handles
@@ -1614,7 +1592,7 @@ class AgentRuntime:
                 if act in ("tool_call", "final"):
                     return parsed
                 # 兼容 0.8B 等小模型把工具名直接写在 action 字段的情况（如 {"action":"search_memories", "filters":...}）
-                if act in ("search_memories", "query_memory_facts", "inspect_photo", "read_photo_text", "get_result_page", "get_original_photos", "search_conversation_history", "get_core_memory", "get_person_memory", "get_person_profile"):
+                if act in ("search_memories", "query_memory_facts", "inspect_photo", "read_photo_text", "get_result_page", "get_original_photos", "search_conversation_history", "get_core_memory", "get_person_profile"):
                     tool_name = act
                     args = {k: v for k, v in parsed.items() if k not in ("action", "public_status")}
                     # 如果有 arguments 嵌套则展开
@@ -1745,6 +1723,7 @@ class AgentRuntime:
                 _stage_timing_ms[_key] = _stage_timing_ms.get(_key, 0.0) + (time.perf_counter() - _t0) * 1000.0
         self.chat_fn = _timed_chat
         task = TaskState.from_dict(task_state, user_goal=message)
+        planner_result = None
         agent2_task_state = None
         agent2_evidence_ledger = None
         if (self.profile.features.get("agent2_authoritative")
@@ -1862,6 +1841,13 @@ class AgentRuntime:
         guard_retries = 0
         max_guard_retries = 1
         seen_tool_calls = set()
+        # 检索/复核收敛：search_memories 每轮最多 1 次（18 张候选 + get_result_page 翻页）、
+        # 同一张图最多 inspect/read_photo_text 1 次。
+        # 实测小模型反复改 query 重搜 + 死磕 photo_1，消耗完工具预算 → tool_call_limit 空答案
+        # （e8c9d4 35 题空答案，52%）。这里硬性收敛，逼模型换图复核或直接 final。
+        search_call_count = 0
+        max_search_calls = 1
+        inspected_handles: set[str] = set()
         # Read-only calls are idempotent.  Small models sometimes repeat an
         # identical call after receiving a result; reuse the prior observation
         # instead of turning a harmless retry into a terminal tool rejection.
@@ -1890,6 +1876,12 @@ class AgentRuntime:
         max_unknown_tool_retries = 1
         forced_final_attempted = False
         wants_visual = visual_intent(message)
+        # 预算 B：同一工具同一失败原因（evidence_incompatible / no_evidence_returned
+        # 等）连续 2 次就强制换动作，避免小模型在同一个失败模式上反复消耗预算，
+        # 挤掉写答案的机会（measured: 25 题 tool_call_limit 空回答）。
+        recent_tool_failures: list[tuple[str, str]] = []
+        tool_repeat_rejections = 0
+        max_tool_repeat_rejections = 2
 
         def visual_gate_requested() -> bool:
             """Use only the planner requirement on the authoritative path.
@@ -1963,6 +1955,8 @@ class AgentRuntime:
                 "task_state": task.as_dict(), "history": history,
                 "conversation_id": self.conversation_id,
                 "ocr_settings": self.ocr_settings,
+                "planner_goal": (planner_result.declaration.goal
+                                 if planner_result is not None and planner_result.ok else ""),
             })
             observation = decision.observation or {}
             call_id = f"auto_{tool_name}_{auto_resolution_attempts}"
@@ -1994,10 +1988,6 @@ class AgentRuntime:
                     }
                 return False
             task.update_from_tool(tool_name, args, observation)
-            if tool_name in {"query_memory_facts", "query_memory_metadata"}:
-                _promote_structured_sources_to_result_set(
-                    task, observation, scope_id=self.scope_id,
-                    query=str(args.get("query") or message or ""))
             task.record_tool_result(call_id, tool_name, observation)
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 record_agent2_tool_evidence(
@@ -2592,7 +2582,7 @@ class AgentRuntime:
                         if req.code == RETRIEVE_EVIDENCE:
                             messages.append({"role": "user", "content": (
                                 f"{req.reason} 这是完成回答的必要步骤：请先调用检索工具"
-                                "（search_memories / query_memory_facts / get_core_memory / get_person_memory），"
+                                "（search_memories / query_memory_facts / get_core_memory / get_person_profile），"
                                 "拿到工具结果后再输出 final。"
                             )})
                         elif req.code == DELIVER_MEDIA:
@@ -2854,11 +2844,6 @@ class AgentRuntime:
                             if auto_decision.allowed:
                                 task.update_from_tool(recovery_tool, auto_args,
                                                        auto_decision.observation or {})
-                                if recovery_tool in {"query_memory_facts", "query_memory_metadata"}:
-                                    _promote_structured_sources_to_result_set(
-                                        task, auto_decision.observation or {},
-                                        scope_id=self.scope_id,
-                                        query=str(auto_args.get("query") or message or ""))
                                 task.record_tool_result(f"recovery_{recovery_tool}", recovery_tool,
                                                         auto_decision.observation or {})
                                 if not self.profile.features.get("agent2_authoritative"):
@@ -2915,6 +2900,46 @@ class AgentRuntime:
             tool_name = action.get("tool") or ""
             raw_arguments = dict(action.get("arguments") or {})
             arguments = raw_arguments
+            # 收敛硬限制：search 每轮最多 1 次（返回 18 张候选，需要更多用 get_result_page
+            # 翻页，不要反复重搜）；同一张图最多 inspect/read_photo_text 1 次。
+            # 逼模型在已召回候选内换图复核或直接 final，而不是反复重搜/死磕同图耗尽预算。
+            if tool_name == "search_memories":
+                search_call_count += 1
+                if search_call_count > max_search_calls and turn.budget.can_model_step():
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                    messages.append({"role": "user", "content": (
+                        "search_memories 每轮只需调用一次，已返回最多 18 张候选（preview 显示前几张）。"
+                        "需要看更多候选用 get_result_page 翻页（page 从 1 开始），不要再次调用 search_memories。"
+                        "请基于当前候选：换 preview/翻页里的图用 inspect_photo 复核，或直接输出 final 回答"
+                        "（能确认就说，不能就如实说明证据不足）。"
+                    )})
+                    continue
+            if tool_name in {"inspect_photo", "read_photo_text"}:
+                _h = str(arguments.get("asset_handle") or "").strip() or "photo_1"
+                if _h in inspected_handles and turn.budget.can_model_step():
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                    messages.append({"role": "user", "content": (
+                        f"你已复核/读过 {_h}，不要重复查看同一张图。"
+                        "请换 preview/翻页里的下一张（photo_2、photo_3…）复核，或直接输出 final 回答。"
+                    )})
+                    continue
+                inspected_handles.add(_h)
+            # 预算 B：连续 2 次同工具同失败原因 → 拦截本次调用，强制换动作
+            _consecutive_failures = recent_tool_failures[-2:]
+            if (len(_consecutive_failures) == 2
+                    and _consecutive_failures[0] == _consecutive_failures[1]
+                    and _consecutive_failures[0][0] == tool_name
+                    and tool_repeat_rejections < max_tool_repeat_rejections
+                    and turn.budget.can_model_step()):
+                tool_repeat_rejections += 1
+                messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                messages.append({"role": "user", "content": (
+                    f"你已连续两次调用「{tool_name}」都因同一原因失败"
+                    f"（{_consecutive_failures[0][1]}），该工具当前拿不到新证据。"
+                    "请换一个动作：需要复核图片请调用 inspect_photo / read_photo_text，"
+                    "否则请直接输出 final 回答并说明无法确认。"
+                )})
+                continue
             # 模型有时把参数包在 arguments.schema 里，统一展开（工具契约兼容层）
             if isinstance(arguments.get("schema"), dict):
                 arguments = {**arguments, **arguments["schema"]}
@@ -3015,6 +3040,8 @@ class AgentRuntime:
                 "task_state": task.as_dict(), "history": history,
                 "conversation_id": self.conversation_id,
                 "ocr_settings": self.ocr_settings,
+                "planner_goal": (planner_result.declaration.goal
+                                 if planner_result is not None and planner_result.ok else ""),
             })
             latency = round(time.monotonic() - t0, 2)
             result = ToolResult(tool=tool_name,
@@ -3092,13 +3119,14 @@ class AgentRuntime:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="工具调用被拒绝")
                 break
             task.update_from_tool(tool_name, arguments, result.observation or {})
-            if tool_name in {"query_memory_facts", "query_memory_metadata"}:
-                _promote_structured_sources_to_result_set(
-                    task, result.observation or {}, scope_id=self.scope_id,
-                    query=str(arguments.get("query") or message or ""))
             task.record_tool_result(tool_call_id, tool_name, result.observation or {})
             if result.status == "ok":
                 tool_result_cache[call_signature] = dict(result.observation or {})
+            # 预算 B：记录失败签名（evidence_incompatible / no_evidence_returned / 工具 reason）
+            _tool_fail_reason = str((result.observation or {}).get("reason")
+                                    or (result.observation or {}).get("failure_reason") or "")
+            if _tool_fail_reason and _tool_fail_reason not in {"", "ok"}:
+                recent_tool_failures.append((tool_name, _tool_fail_reason))
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 input_refs = tuple(
                     str(value) for key, value in arguments.items()

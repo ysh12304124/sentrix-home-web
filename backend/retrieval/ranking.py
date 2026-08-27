@@ -11,6 +11,11 @@ strategies replace the single RRF path:
                    after the visual tail (recall extension, never re-ranking).
   late_fusion      per-channel calibrated-score normalization + weighted sum;
                    a weak channel below its threshold does not participate.
+  weighted_rrf     rank-based weighted RRF across every enabled channel
+                   (see fusion.fuse).  Best measured pure-code recall@K on
+                   the album3-max 100QA sweep (top-50 asset recall 0.971);
+                   used as the production ranking once candidate count is
+                   bounded by the retrieval kernel's top-K convergence.
 
 Strategy selected via ``SENTRIX_RETRIEVER_RANKING`` / RetrievalConfig.
 ``visual_backbone`` and ``late_fusion`` shadow-run alongside ``visual_only``
@@ -26,7 +31,8 @@ from .fusion import FusedCandidate
 VISUAL_ONLY = "visual_only"
 VISUAL_BACKBONE = "visual_backbone"
 LATE_FUSION = "late_fusion"
-STRATEGIES = (VISUAL_ONLY, VISUAL_BACKBONE, LATE_FUSION)
+WEIGHTED_RRF = "weighted_rrf"
+STRATEGIES = (VISUAL_ONLY, VISUAL_BACKBONE, LATE_FUSION, WEIGHTED_RRF)
 
 VISUAL_CHANNEL = "visual_ann"
 
@@ -57,6 +63,8 @@ def rank(
         return _rank_visual_backbone(channel_hits, limit)
     if strategy == LATE_FUSION:
         return _rank_late_fusion(channel_hits, limit, fusion_weights)
+    if strategy == WEIGHTED_RRF:
+        return _rank_weighted_rrf(channel_hits, limit, fusion_weights)
     # Unknown strategy falls back to visual-only (the safest default).
     return _rank_visual_only(channel_hits, limit)
 
@@ -88,6 +96,18 @@ def _rank_visual_backbone(channel_hits, limit) -> list[FusedCandidate]:
             if len(out) >= limit:
                 break
     return out[:limit]
+
+
+def _rank_weighted_rrf(channel_hits, limit, fusion_weights) -> list[FusedCandidate]:
+    """Rank-based weighted RRF across all enabled channels (fusion.fuse).
+
+    RRF is rank-based, so it is robust to the different raw-score scales of
+    each channel; the weights express each channel's observed contribution.
+    This is the strategy the pure-code sweep measured as the strongest
+    recall@K, and the one the retrieval kernel bounds by candidate top-K.
+    """
+    from .fusion import fuse
+    return fuse(channel_hits, channel_weights=fusion_weights)[:limit]
 
 
 def _rank_late_fusion(channel_hits, limit, fusion_weights) -> list[FusedCandidate]:

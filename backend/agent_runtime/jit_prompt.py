@@ -12,44 +12,47 @@ from .task_state import TaskState
 from .tool_registry import get_tool, ToolSpec, list_tools
 
 
-# 极简通用核心规则（小于 100 tokens）
+# 极简通用核心规则（约 150 tokens；工具级要求下沉到各工具描述，避免静态规则
+# 提及未暴露工具——模型只在看到工具时看到该工具的规则）
 BASE_SYSTEM_PROMPT = """你是 Sentrix 家庭记忆助手。根据当前待确认需求调用工具或给出结论。
 规则：
 1. 每次只输出一个标准 JSON 对象，不要输出 markdown 代码块或解释；
 2. 调用工具格式：{"action":"tool_call","tool":"<工具名>","arguments":{...},"public_status":"<简短状态>"}
 3. 结论输出格式：{"action":"final","answer":"<直接回答用户问题>","evidence_refs":["tool_call_1"],"selected_image_handles":["photo_1"]}；只有确实要给用户看的图片才填写 selected_image_handles，最多 6 张。
 4. 未检索相册前禁止猜测或回答；已有足够事实时直接输出 final。
-5. selected_image_handles 只能填写当前 search_memories preview 中出现的 handle；搜索候选不等于要展示的图片。"""
+5. selected_image_handles 只能填写当前照片预览中出现的 handle；搜索候选不等于要展示的图片。
+6. 不要重复调用相同工具和参数；只使用工具返回的事实回答，不编造数字或细节。
+7. 内部检索词汇（query_satisfaction、candidate_only、检索结果、匹配程度等）不得原样出现在回答里，用自然语言转译；不确定性用四级：确定→直接给答案、较可能→"看起来是…"、不确定→"可能…还不能完全确定"、无依据→"现有记录里看不出来"。
+8. 检索满足度与照片复核是两层，分开表述：检索层说语义条件（活动/地点/时间）是否确认；复核层（看照片细节）说照片里直接可见的内容；照片里看到的不能把"候选"说成"已确认"。"""
 
 
 # 工具极简契约定义（每个工具仅保留最精简输入格式，<40 tokens）
 LITE_TOOL_SCHEMAS = {
     "search_memories": (
-        "- search_memories: 检索照片。返回照片预览（含地点/拍摄时间/handle）。\n"
-        '  输入: {"query": "关键词", "filters": {"time": "<问题中的时间，缺省省略>", "person": "人物", "place": "地点"}}'
+        "- search_memories: 检索照片，每轮只调一次（返回最多 18 张候选，预览每张含地点/时间/描述/handle）。"
+        "问'哪些/几种/所有不同场地或对象'等枚举聚合类问题时直接看预览描述+翻页批量判断，不要逐张 inspect；"
+        "需要更多候选用 get_result_page 翻页；返回 recommended_handle 时优先复核该图。\n"
+        '  输入: {"query": "关键词", "filters": {"time": "<问题时间，缺省省略>", "person": "人物", "place": "地点"}}'
     ),
     "query_memory_facts": (
-        "- query_memory_facts: 查询统计与结构化事实（总数/最早/最近/分组）。\n"
-        '  输入: {"operation": "count|first|last|date|group|meal|list", "filters": {"time": "时间", "person": "人物", "media": "video/image"}}'
-    ),
-    "query_memory_metadata": (
-        "- query_memory_metadata: 查询照片的结构化时间、地点、事件元数据。\n"
-        '  输入: {"operation": "date|place|event|count|first|last", "filters": {"time": "时间", "place": "地点", "person": "人物", "media": "image|video"}}'
+        "- query_memory_facts: 全量聚合统计与结构化事实（总数/最早/最近/分组/事件）。\n"
+        '  输入: {"operation": "count|first|last|date|group|meal|list|event", "filters": {"time": "时间", "person": "人物", "media": "video/image"}}'
     ),
     "query_photo_people": (
         "- query_photo_people: 读取当前预览中一张照片自己的已确认人物和未确认同行者。\n"
         '  输入: {"asset_handle": "photo_1", "result_set_id": "..."}'
     ),
     "inspect_photo": (
-        "- inspect_photo: 复核照片视觉细节（人物/衣服颜色/物品/动作）。\n"
+        "- inspect_photo: 复核照片视觉细节（人物/衣服颜色/物品/动作）。只用于看单张细节；跨图枚举/汇总用 search 预览描述。"
+        "当前 handle 不含目标就换下一张（photo_2、photo_3…）复核，同一张最多复核一次。\n"
         '  输入: {"asset_handle": "photo_1", "question": "观察问题"}'
     ),
     "read_photo_text": (
-        "- read_photo_text: 读取照片中的文字/招牌/价格/数字。\n"
+        "- read_photo_text: 读取照片中的文字/招牌/价格/数字。优先用 search 返回的 recommended_handle。\n"
         '  输入: {"asset_handle": "photo_1", "question": "读取问题"}'
     ),
     "get_result_page": (
-        "- get_result_page: 获取结果集下一页。\n"
+        "- get_result_page: 查看 search_memories 结果集的下一页（每页最多 6 张）。不要重复 search，改变查询条件才重搜。\n"
         '  输入: {"result_set_id": "...", "page": 2}'
     ),
     "get_original_photos": (
@@ -63,10 +66,6 @@ LITE_TOOL_SCHEMAS = {
     "get_core_memory": (
         "- get_core_memory: 读取长期家庭记忆。\n"
         '  输入: {"subject": "人物名", "topic": "话题"}'
-    ),
-    "get_person_memory": (
-        "- get_person_memory: 读取人物结构化记忆。\n"
-        '  输入: {"person": "人物名", "operation": "overview|events|common_places"}'
     ),
     "get_person_profile": (
         "- get_person_profile: 读取人物高维画像（家庭角色/关系/行为规律/近期事件）。\n"
@@ -98,7 +97,6 @@ def build_jit_system_prompt(
         tool_descriptions = "\n".join([
             LITE_TOOL_SCHEMAS["search_memories"],
             LITE_TOOL_SCHEMAS["query_memory_facts"],
-            LITE_TOOL_SCHEMAS["query_memory_metadata"],
             LITE_TOOL_SCHEMAS["query_photo_people"],
             LITE_TOOL_SCHEMAS["inspect_photo"],
             LITE_TOOL_SCHEMAS["read_photo_text"],

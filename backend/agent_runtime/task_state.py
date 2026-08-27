@@ -34,15 +34,16 @@ TASK_TERMINAL_STATES = frozenset({
 })
 
 _TRANSITIONS = {
-    "open": {"running", "ambiguous", "unsupported", "blocked_budget", "partially_supported", "unresolved", "unavailable", "contradicted"},
-    "running": {"satisfied", "partially_supported", "unresolved", "ambiguous", "unsupported", "blocked_budget", "unavailable", "contradicted"},
-    "partially_supported": {"running", "satisfied", "unresolved", "blocked_budget", "unavailable", "contradicted"},
+    "open": {"running", "ambiguous", "unsupported", "blocked_budget", "partially_supported", "unresolved", "unavailable", "contradicted", "failed"},
+    "running": {"satisfied", "partially_supported", "unresolved", "ambiguous", "unsupported", "blocked_budget", "unavailable", "contradicted", "failed"},
+    "partially_supported": {"running", "satisfied", "unresolved", "blocked_budget", "unavailable", "contradicted", "failed"},
     "satisfied": set(),
     "ambiguous": set(),
     "unsupported": set(),
     "unresolved": set(),
     "blocked_budget": set(),
     "unavailable": set(),
+    "failed": set(),
 }
 
 
@@ -274,8 +275,17 @@ class TaskState:
         requirement.failure_reason = ""
 
     def mark_evidence_failed(self, requirement_id: str, *, reason: str,
-                             evidence_refs: tuple[str, ...] = ()) -> None:
-        """Keep a failed requirement active while recording why the attempt failed."""
+                             evidence_refs: tuple[str, ...] = (),
+                             terminal: bool = False) -> None:
+        """需求尝试失败。
+
+        terminal=False（默认）：保持 running + coverage failed，允许受限恢复
+        （bounded recovery，例如 OCR 第一次失败可换图重试）。
+        terminal=True：进入 failed 终态——需求已尝试未满足，模型看到 failed
+        后不再取证，final 如实说明。用于"单图否定"等不应无限重试的情形，
+        否则需求保持 running 会反复取证耗尽预算导致"未完成"
+        （实测 insufficient_evidence 80 / running 109）。
+        """
         requirement = self.requirement(requirement_id)
         if requirement.status == "open":
             self.mark_running(requirement_id)
@@ -283,6 +293,8 @@ class TaskState:
             self._transition(requirement_id, "running")
         if requirement.status not in {"running", "partially_supported"}:
             return
+        if terminal:
+            self._transition(requirement_id, "failed")
         requirement.evidence_refs = tuple(evidence_refs)
         requirement.coverage_status = "failed"
         requirement.failure_reason = str(reason or "evidence_failed")
