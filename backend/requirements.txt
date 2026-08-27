@@ -9,6 +9,7 @@ insightface>=1.0,<2
 onnxruntime-gpu>=1.23,<2
 funasr>=1.2,<2
 torch>=2.2,<3
+torchvision>=0.17,<1
 transformers>=5,<6
 torchaudio>=2.2,<3
 pytorch-lightning>=2.5,<3

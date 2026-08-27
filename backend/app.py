@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from .agent_conversation import ConversationStore
 from .agent_runtime.result_set import debug_asset_projection
 from .db import MemoryStore, make_id
+from .event_ordering import sort_video_scene_observations
 from .image_io import (
     encode_jpeg_preview,
     ensure_heif_support,
@@ -804,6 +805,20 @@ def _sync_vllm_state_on_startup():
 
 def _video_extraction_status():
     algorithm = os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm").strip().lower()
+    if algorithm == "mlt_semantic":
+        return {
+            "adapter": "mlt_semantic_memory",
+            "algorithm": algorithm,
+            "status": "available",
+            "package": "backend/video/mlt_keyframe.py",
+            "sampleFps": os.getenv("SENTRIX_VIDEO_MLT_SAMPLE_FPS", "2"),
+            "vlmWindow": os.getenv("SENTRIX_VIDEO_MLT_VLM_WINDOW", "5"),
+            "vlmStride": os.getenv("SENTRIX_VIDEO_MLT_VLM_STRIDE", "4"),
+            "slidingWindows": True,
+            "memoryMerge": True,
+            "memoryGeneratedInMergeCall": True,
+            "duplicateFrameRemoval": True,
+        }
     if algorithm == "hybrid_webp":
         return {
             "adapter": "hybrid_webp_memory", "algorithm": algorithm, "status": "available",
@@ -1241,6 +1256,12 @@ def event_detail(event_id: str):
     value = store.get_event_detail(event_id)
     if not value:
         raise HTTPException(status_code=404, detail="event not found")
+    event = value.get("event") or {}
+    if event.get("source_type") == "video_scene":
+        value["observations"] = sort_video_scene_observations(
+            value.get("observations"),
+            event.get("keyframe_assets"),
+        )
     return value
 
 

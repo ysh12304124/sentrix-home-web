@@ -413,7 +413,8 @@ class LocalQwen3VLBackend:
             requested = (vision_options or {}).get("num_predict")
             if requested is None and role in ROLE_INFERENCE:
                 requested = ROLE_INFERENCE[role]["num_predict"]
-            max_new_tokens = min(1024, max(64, int(requested or 768)))
+            generation_cap = max(1024, int(os.getenv("SENTRIX_QWEN3_VL_MAX_NEW_TOKENS", "2048")))
+            max_new_tokens = min(generation_cap, max(64, int(requested or 768)))
             with self._generation_lock, torch.inference_mode():
                 generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
             trimmed = [output[len(source):] for source, output in zip(inputs.input_ids, generated)]
@@ -1138,6 +1139,21 @@ class GammaClient:
 
     def analyze_video_event(self, paths, metadata=None, yolo_semantics=None):
         """Describe one ordered video event from transient evidence images."""
+        metadata = metadata or {}
+        try:
+            event_duration = max(0.0, float(metadata.get("end_sec", 0)) - float(metadata.get("start_sec", 0)))
+            video_duration = float(metadata.get("video_duration_sec", 0) or 0)
+        except (TypeError, ValueError):
+            event_duration = 0.0
+            video_duration = 0.0
+        short_event = 0.0 < video_duration < 30.0 or event_duration < 30.0
+        short_event_rule = (
+            "短视频只增加可分析候选帧，不增加必须保存的帧数。请返回能够覆盖完整描述的最小语义图片集合："
+            "如果一张图已经支持全部人物、动作、环境和物品描述，必须只返回1张；"
+            "只有新增人物、动作阶段、视角或物体状态无法由已选图片支持时，才返回第2或第3张。"
+            if short_event else
+            "请始终返回能够覆盖完整描述的最小语义图片集合，避免保存同一视角或同一动作的重复图片。"
+        )
         images = []
         for path in list(paths or [])[:5]:
             encoded, mime_type = self._encode_core_image(Path(path))
@@ -1146,10 +1162,11 @@ class GammaClient:
             raise ValueError("video event analysis requires at least one evidence image")
         prompt = """你是家庭视频事件观察器。输入是同一连续事件中按时间顺序排列的3至5张临时证据图。
 综合全部图片和YOLO时间序列语义，描述事件期间可验证的人物、物品、环境与活动变化；不能只描述第一张或最后一张，不能猜测姓名或关系。忽略单纯的站立、坐着、抬手等低信息动作，除非它们对事件变化不可缺少。
-caption 和 activity 必须由选中的证据图片直接支持，不得描述已经离开画面的活动。返回 representative_indices：能够覆盖 caption、activity 和事件中不同阶段的最小图片序号集合，从0开始，最多3张。单一活动或相似画面只能选1张；只有出现不同地点、不同活动阶段且单图无法覆盖时才选2至3张，例如“泳池环境”和“烧烤操作”应各选一张。禁止选择重复画面。
+ caption 和 activity 必须由选中的证据图片直接支持，不得描述已经离开画面的活动。返回 representative_indices：能够覆盖 caption、activity 和事件中不同阶段的最小图片序号集合，从0开始，最多3张。单一活动或相似画面只能选1张；只有出现不同视觉场景、不同活动阶段或明显镜头转场时才选2至3张。前后背景结构发生实质变化时分别保留证据；同一固定视野内仅主体位置变化时仍只选1张。同一固定视野中没有人物时，只选物体、结构和环境细节最丰富且清晰的一张；同一固定视野下增加/减少人物也不算新阶段，优先保留可见人数最多、随后画面要素最丰富且清晰的一张。禁止选择重复画面。不要使用 GPS、reverse_geocode 或 place 字段判断是否发生场景变化，场景变化必须依据图片和 detail.regions、caption、activity 中的视觉语义变化。
+""" + short_event_rule + """
 严格返回简体中文 JSON：caption（160字内）、activity（60字内）、place（40字内）、scene_type、semantic、people（最多20项）、objects（最多60项）、clothing（最多20项）、emotions（最多20项）、spatial_relations（最多60项）、ocr_text（1000字内）、event_type、facts（最多12项）、detail（visible_details/regions/text_blocks/uncertainties）、representative_indices（整数数组，1至3项）。
 图片顺序和事件上下文：""" + json.dumps({
-            "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
+            "metadata": metadata, "yolo_timeline": yolo_semantics or {},
         }, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt, images, self._core_vision_options()))
         parsed["people"] = as_list(parsed.get("people"))
@@ -1186,6 +1203,144 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
         parsed["model"] = self.model
         parsed["video_event_evidence_count"] = len(images)
         return parsed
+
+    def analyze_video_scene_window(self, paths, metadata=None):
+        """Partition 3-5 adjacent MLT frames and generate each group's memory once."""
+        images = []
+        for path in list(paths or [])[:5]:
+            encoded, mime_type = self._encode_core_image(Path(path))
+            images.append({"base64": encoded, "mime_type": mime_type})
+        if not images:
+            raise ValueError("video scene window analysis requires at least one image")
+        prompt = """你是家庭视频场景记忆生成器。输入是按时间顺序排列的3至5张图片，每张是MLT算法给出的相邻候选场景代表帧。
+你必须在同一次回答中完成两件事：
+1. 将全部图片划分为一个或多个连续场景组；同一地点、背景结构和主体活动连续，仅视角、距离、姿态或短暂遮挡变化时应合并。地点、室内外、背景结构或主体活动明显变化时必须分开，即使人物相同也不能合并。不要把“同一人物从甲地移动到乙地”当成同一场景。每张图片必须且只能属于一个组，组内索引必须连续。
+2. 为每个组直接生成最终家庭记忆。不能只给合并结论，不能猜测姓名或关系；忽略低信息的站立、坐着、抬手，除非它们体现事件变化。
+每组选择能够支撑记忆的最少代表帧，单一场景通常1张，确有不同阶段时最多3张。
+严格返回紧凑的单行简体中文 JSON，顶层只有 groups。groups 每项只允许以下字段，不要输出其他字段：
+indices（整数数组）、merge_reason（50字内）、frame_observations（组内每帧一项，仅含index、caption〔60字内〕、activity〔20字内〕、place〔20字内〕、people〔最多6项〕、objects〔最多10项〕）、caption（100字内）、activity（30字内）、place（20字内）、people（最多8项）、objects（最多15项）、event_type（20字内）、representative_indices（窗口图片索引，1至3项）、confidence（0到1）。
+所有索引从0开始；groups必须按时间顺序完整覆盖0到最后一张图片，不得遗漏、重复或跨组交错。
+优先保证所有图片完整覆盖；空数组和空字符串字段必须省略。多帧组的 merge_reason 不得出现“不同地点、从某地到某地、室内外变化、活动切换”等与合并矛盾的理由。
+场景时间与算法边界证据：""" + json.dumps(metadata or {}, ensure_ascii=False)
+        options = self._core_vision_options()
+        options["num_predict"] = int(os.getenv("SENTRIX_VIDEO_MLT_MAX_TOKENS", "1800"))
+        parsed = parse_json_response(self.chat(prompt, images, options))
+        raw_groups = parsed.get("groups") if isinstance(parsed.get("groups"), list) else []
+        groups = []
+        used = set()
+        for raw in raw_groups:
+            if not isinstance(raw, dict):
+                continue
+            indices = []
+            for value in raw.get("indices") or []:
+                try:
+                    index = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(images) and index not in used and index not in indices:
+                    indices.append(index)
+            indices.sort()
+            if not indices or indices != list(range(indices[0], indices[-1] + 1)):
+                continue
+            used.update(indices)
+            memory = dict(raw)
+            memory["indices"] = indices
+            selected = []
+            for value in raw.get("representative_indices") or []:
+                try:
+                    index = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if index in indices and index not in selected:
+                    selected.append(index)
+            memory["representative_indices"] = (selected or [indices[len(indices) // 2]])[:3]
+            frame_observations = []
+            for observation in raw.get("frame_observations") or []:
+                if not isinstance(observation, dict):
+                    continue
+                try:
+                    observation_index = int(observation.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if observation_index not in indices:
+                    continue
+                frame_observations.append({
+                    "index": observation_index,
+                    "caption": str(observation.get("caption") or "")[:160],
+                    "activity": str(observation.get("activity") or "")[:60],
+                    "place": str(observation.get("place") or "")[:40],
+                    "people": as_list(observation.get("people"))[:12],
+                    "objects": as_list(observation.get("objects"))[:20],
+                })
+            memory["frame_observations"] = frame_observations
+            for key in ("people", "objects", "clothing", "emotions", "spatial_relations"):
+                memory[key] = as_list(memory.get(key))
+            memory["facts"] = normalize_fact_confidences(memory.get("facts"), 0.65)
+            detail = memory.get("detail") if isinstance(memory.get("detail"), dict) else {}
+            memory["detail"] = {
+                "schema_version": 1,
+                "visible_details": as_list(detail.get("visible_details")),
+                "regions": as_list(detail.get("regions")),
+                "text_blocks": as_list(detail.get("text_blocks")),
+                "uncertainties": as_list(detail.get("uncertainties")),
+            }
+            normalize_analysis_fields(memory)
+            memory = normalize_semantic_analysis(memory)
+            memory["confidence"] = normalize_confidence(memory.get("confidence"), 0.65)
+            memory["model"] = self.model
+            groups.append(memory)
+        for index in range(len(images)):
+            if index not in used:
+                groups.append({
+                    "indices": [index], "merge_reason": "模型未覆盖该帧，保守保持独立",
+                    "caption": "视频中的独立场景", "activity": "", "place": "",
+                    "scene_type": "其他或不确定", "semantic": {}, "people": [], "objects": [],
+                    "clothing": [], "emotions": [], "spatial_relations": [], "ocr_text": "",
+                    "event_type": "视频场景", "facts": [],
+                    "detail": {"schema_version": 1, "visible_details": [], "regions": [],
+                               "text_blocks": [], "uncertainties": ["模型未返回完整分组"]},
+                    "representative_indices": [index], "confidence": 0.35, "model": self.model,
+                })
+        groups.sort(key=lambda value: value["indices"][0])
+        return {"groups": groups, "model": self.model, "window_evidence_count": len(images)}
+
+    def review_video_scene_boundary(self, left_path, right_path, metadata=None):
+        """Ask the vision model to validate one proposed temporal boundary.
+
+        The prefilter proposes boundaries from generic visual signals.  This
+        second pass prevents an action/object label change from splitting a
+        continuous camera view, while still allowing a real shot or
+        environment change to remain separate.
+        """
+        metadata = metadata or {}
+        images = []
+        for path in (left_path, right_path):
+            encoded, mime_type = self._encode_core_image(Path(path))
+            images.append({"base64": encoded, "mime_type": mime_type})
+        prompt = """你是视频场景边界审核器。输入两张按时间相邻的候选边界画面。
+只判断视觉连续性，不依据 GPS、地点字段、文件名或单纯物体/人物名称变化。
+same_scene=true 的条件：机位、背景结构、主要环境和视野布局连续；人物增减、动作变化、物体名称变化本身不算新场景。
+same_scene=false 的条件：明显换房间/环境、镜头切换、背景结构或视野发生实质变化。
+请返回严格 JSON：same_scene（布尔）、confidence（0到1）、background_continuity（0到1）、reason（不超过50字）。""" + json.dumps({"metadata": metadata}, ensure_ascii=False)
+        parsed = parse_json_response(self.chat(prompt, images, self._core_vision_options()))
+        same_scene = parsed.get("same_scene")
+        if not isinstance(same_scene, bool):
+            same_scene = str(same_scene).strip().lower() in {"true", "1", "yes", "是"}
+        try:
+            confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        try:
+            background_continuity = max(0.0, min(1.0, float(parsed.get("background_continuity", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            background_continuity = 0.0
+        return {
+            "same_scene": same_scene,
+            "confidence": confidence,
+            "background_continuity": background_continuity,
+            "reason": str(parsed.get("reason") or ""),
+            "model": self.model,
+        }
 
     def analyze_image_focus(self, path, dimension, metadata=None):
         file_path = Path(path)
@@ -1644,7 +1799,16 @@ class FaceAdapter:
                     self._recognition_session = self._load_buffalo_recognition()
             if self._app is None:
                 return []
-            detections = self._retina.detect(image)
+            try:
+                detections = self._retina.detect(image)
+            except Exception:
+                # RetinaFace is an optional high-recall pass.  If its model is
+                # unavailable, keep the standard buffalo_l/SCRFD detector as
+                # a usable generic fallback instead of returning no faces at
+                # all.  This is especially important for derived video frames:
+                # cover ranking and person evidence must use the same detector
+                # path as ordinary imported images.
+                return self._detect_scrfd_full_frame(image)
             image_height, image_width = image.shape[:2]
             min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
             verified_scrfd_score = float(os.getenv("FACE_VERIFIED_SCRFD_SCORE", "0.7"))
@@ -1748,6 +1912,50 @@ class FaceAdapter:
         except Exception as error:
             self.error = str(error)
             return []
+
+    def _detect_scrfd_full_frame(self, image):
+        """Use buffalo_l/SCRFD directly when the optional RetinaFace model is absent."""
+        if self._app is None:
+            return []
+        image_height, image_width = image.shape[:2]
+        results = []
+        with self._face_analysis_lock:
+            faces = self._app.get(image)
+        for face in faces or []:
+            bbox = [float(value) for value in face.bbox]
+            width = max(0.0, bbox[2] - bbox[0])
+            height = max(0.0, bbox[3] - bbox[1])
+            if min(width, height) < int(os.getenv("FACE_MIN_SIZE", "64")):
+                continue
+            score = float(face.det_score)
+            landmarks = [[float(point[0]), float(point[1])] for point in face.kps] if getattr(face, "kps", None) is not None else []
+            embedding = face.embedding.tolist() if getattr(face, "embedding", None) is not None else []
+            area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
+            try:
+                crop = align_face_crop(image, bbox, landmarks)
+                raw_sharpness = _laplacian_variance(crop)
+            except Exception:
+                raw_sharpness = 0.0
+            sharpness = _normalize_sharpness(raw_sharpness)
+            pose = [float(value) for value in face.pose] if getattr(face, "pose", None) is not None else []
+            quality = compute_face_quality(score, area_ratio, sharpness, pose)
+            results.append({
+                "bbox": bbox,
+                "confidence": score,
+                "quality": quality,
+                "area_ratio": area_ratio,
+                "sharpness": sharpness,
+                "raw_sharpness": raw_sharpness,
+                "pose": pose,
+                "landmarks": landmarks,
+                "embedding": embedding,
+                "embedding_model": "buffalo_l",
+                "embedding_version": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
+                "identity_ready": bool(embedding),
+                "face_validity": "verified" if score >= float(os.getenv("FACE_VERIFIED_SCRFD_SCORE", "0.7")) else "uncertain",
+                "identity_eligible": bool(embedding) and score >= float(os.getenv("FACE_VERIFIED_SCRFD_SCORE", "0.7")) and area_ratio >= float(os.getenv("FACE_VERIFIED_MIN_AREA", "0.003")),
+            })
+        return results
 
     @staticmethod
     def _bbox_agreement(retina_bbox, scrfd_bbox, center_ratio=1.0, iou_threshold=0.05):

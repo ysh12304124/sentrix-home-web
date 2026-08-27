@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -42,6 +43,201 @@ _LOW_INFO_ACTIONS = {
 }
 
 
+def _semantic_scene_transition(event_analysis, evidence_paths, selected_indices, max_persistent):
+    """Add endpoint evidence only for an algorithmic visual transition.
+
+    The event VLM sees several ordered candidate images.  Its selected index
+    list is authoritative for ordinary repeated views, but small models can
+    still return one index across a visible camera/environment transition. In
+    that case, use the first and last candidates only when generic image
+    comparison confirms the change. GPS, place names, and content-specific
+    vocabularies are intentionally absent from this rule.
+    """
+    evidence_count = len(evidence_paths or [])
+    if evidence_count < 2 or len(selected_indices) >= 2:
+        return selected_indices, False
+    relation = "unknown"
+    visual_signal = False
+    try:
+        from .hybrid_keyframe import _background_relation, _visual_distance
+        visual_inputs_valid = all(Path(str(path)).is_file() for path in (evidence_paths[0], evidence_paths[-1]))
+        if visual_inputs_valid:
+            relation = _background_relation(
+                {"webp_path": str(evidence_paths[0])},
+                {"webp_path": str(evidence_paths[-1])},
+            )
+        visual_signal = visual_inputs_valid and relation == "environment_change"
+        if visual_inputs_valid and relation == "same_environment_view_change":
+            visual_signal = _visual_distance(evidence_paths[0], evidence_paths[-1]) >= 0.90
+    except Exception:
+        visual_signal = False
+    if not visual_signal:
+        return selected_indices, False
+    forced = list(dict.fromkeys([0, evidence_count - 1, *selected_indices]))
+    return sorted(forced[:max_persistent]), True
+
+
+def _timeline_people_count(timeline, timestamp):
+    """Return the nearest detector count for an evidence timestamp."""
+    nearest = _timeline_row(timeline, timestamp)
+    if nearest is None:
+        return None
+    try:
+        if nearest.get("people_count") is not None:
+            return int(nearest["people_count"])
+    except (TypeError, ValueError):
+        pass
+    labels = {str(value).strip().lower() for value in nearest.get("labels") or []}
+    return 1 if labels & {"person", "people", "child", "children", "人", "儿童", "小孩"} else 0
+
+
+def _timeline_row(timeline, timestamp):
+    """Return the nearest coarse semantic row for an evidence timestamp."""
+    nearest = None
+    nearest_delta = None
+    for row in timeline or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_time = float(row.get("sec", row.get("timestamp", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        delta = abs(row_time - float(timestamp))
+        if nearest_delta is None or delta < nearest_delta:
+            nearest, nearest_delta = row, delta
+    return nearest
+
+
+def _collapse_same_view_people_change(evidence_paths, evidence_records, selected_indices, timeline):
+    """Collapse a same-view selection to one information-dense frame.
+
+    This is deliberately a visual-background rule.  It does not use GPS,
+    place, or the event's merged people list. People count is the primary
+    score; visible detector elements and encoded sharpness break ties. This
+    also handles no-person scenes where a single frame has richer content.
+    """
+    if len(selected_indices) < 2 or len(evidence_paths) < 2:
+        return selected_indices, False
+    try:
+        from .hybrid_keyframe import _background_relation
+        relation = _background_relation(
+            {"webp_path": str(evidence_paths[0])},
+            {"webp_path": str(evidence_paths[-1])},
+        )
+    except Exception:
+        return selected_indices, False
+    if relation != "same_view":
+        return selected_indices, False
+    scores = {}
+    for index in selected_indices:
+        timestamp = (evidence_records[index] or {}).get("source_timestamp_sec", 0)
+        row = _timeline_row(timeline, timestamp) or {}
+        people = _timeline_people_count(timeline, timestamp)
+        try:
+            elements = int(row.get("element_count", len(row.get("labels") or [])) or 0)
+        except (TypeError, ValueError):
+            elements = len(row.get("labels") or [])
+        try:
+            bytes_score = Path(str(evidence_paths[index])).stat().st_size / 250000.0
+        except OSError:
+            bytes_score = 0.0
+        scores[index] = (people if people is not None else 0, elements, bytes_score)
+    if len(scores) < 2:
+        return selected_indices, False
+    best = max(selected_indices, key=lambda index: (*scores[index], -index))
+    return [best], True
+
+
+def _boundary_evidence(item, side):
+    """Return the closest transient evidence image to a proposed boundary."""
+    representative = item.get("representative") or {}
+    records = [value for value in representative.get("vlm_evidence") or [] if value.get("webp_path")]
+    if records:
+        records.sort(key=lambda value: float(value.get("source_timestamp_sec", 0) or 0))
+        record = records[-1] if side == "right" else records[0]
+        path = Path(str(record["webp_path"])).resolve()
+        if path.is_file():
+            return path
+    path = Path(str(representative.get("webp_path") or "")).resolve()
+    return path if path.is_file() else None
+
+
+def _review_scene_boundaries(merged, gamma):
+    """Let the vision model audit proposed boundaries before frame selection.
+
+    The prefilter remains the recall-oriented proposal stage.  The model is a
+    second, boundary-aware judge: it can join adjacent states when the view
+    and background are continuous, even if an object/action label changed.
+    """
+    if len(merged) < 2 or not hasattr(gamma, "review_video_scene_boundary"):
+        return merged, []
+    reviewed = []
+    result = []
+    for current in merged:
+        if not result:
+            result.append(current)
+            continue
+        previous = result[-1]
+        left_path = _boundary_evidence(previous, "right")
+        right_path = _boundary_evidence(current, "left")
+        review = None
+        same_visual_view = False
+        relation = "unknown"
+        try:
+            from .hybrid_keyframe import _background_relation
+            if left_path and right_path:
+                relation = _background_relation(
+                    {"webp_path": str(left_path)}, {"webp_path": str(right_path)},
+                )
+                same_visual_view = relation != "environment_change"
+        except Exception:
+            relation = "unknown"
+        if left_path and right_path and same_visual_view:
+            try:
+                review = gamma.review_video_scene_boundary(
+                    left_path, right_path,
+                    {"left_end_sec": previous.get("end_sec"), "right_start_sec": current.get("start_sec")},
+                )
+            except Exception as error:
+                review = {"same_scene": None, "error": str(error)}
+        approved = bool(
+            review and review.get("same_scene") is True
+            and (
+                float(review.get("confidence", 0) or 0) >= 0.55
+                or float(review.get("background_continuity", 0) or 0) >= 0.60
+            )
+        )
+        reviewed.append({
+            "left_event_id": previous.get("event_id"),
+            "right_event_id": current.get("event_id"),
+            "visual_relation": relation,
+            "model": review or {"same_scene": None, "reason": "no usable boundary evidence"},
+            "merged": approved,
+        })
+        if not approved:
+            result.append(current)
+            continue
+        previous["end_sec"] = current.get("end_sec", previous.get("end_sec"))
+        previous["source_event_ids"] = list(dict.fromkeys(
+            list(previous.get("source_event_ids") or []) + list(current.get("source_event_ids") or [])
+        ))
+        previous["source_frame_count"] = int(previous.get("source_frame_count") or 0) + int(current.get("source_frame_count") or 0)
+        previous["duplicate_frame_count"] = int(previous.get("duplicate_frame_count") or 0) + int(current.get("duplicate_frame_count") or 0)
+        previous["objects"] = list(dict.fromkeys(list(previous.get("objects") or []) + list(current.get("objects") or [])))
+        previous["actions"] = list(dict.fromkeys(list(previous.get("actions") or []) + list(current.get("actions") or [])))
+        previous["expressions"] = list(dict.fromkeys(list(previous.get("expressions") or []) + list(current.get("expressions") or [])))
+        previous["yolo_timeline"] = list(previous.get("yolo_timeline") or []) + list(current.get("yolo_timeline") or [])
+        left_ev = (previous.get("representative") or {}).get("vlm_evidence") or []
+        right_ev = (current.get("representative") or {}).get("vlm_evidence") or []
+        combined = {str(value.get("webp_path")): value for value in (left_ev + right_ev) if value.get("webp_path")}
+        combined_values = sorted(combined.values(), key=lambda value: float(value.get("source_timestamp_sec", 0) or 0))
+        if previous.get("representative") is not None:
+            previous["representative"]["vlm_evidence"] = combined_values[-5:]
+        previous["representatives"] = [previous.get("representative")]
+        previous["boundary_model_review"] = list(previous.get("boundary_model_review") or []) + [review]
+    return result, reviewed
+
+
 def _event_title(item):
     actions = [str(value) for value in item.get("actions") or []
                if str(value).strip().lower() not in _LOW_INFO_ACTIONS]
@@ -52,6 +248,40 @@ def _event_title(item):
     if objects:
         return f"场景：{objects[0]}"
     return "视频片段"
+
+
+def _frame_analysis_from_event(event_analysis, evidence_index):
+    """Ground one retained image in its own window observation, not the whole event."""
+    observation = None
+    for value in event_analysis.get("frame_observations") or []:
+        if not isinstance(value, dict):
+            continue
+        try:
+            if int(value.get("index")) == int(evidence_index):
+                observation = value
+                break
+        except (TypeError, ValueError):
+            continue
+    if observation is None:
+        return event_analysis
+    frame_analysis = dict(event_analysis)
+    for key in ("caption", "activity", "place"):
+        frame_analysis[key] = str(observation.get(key) or "")
+    frame_analysis["people"] = list(observation.get("people") or [])
+    frame_analysis["objects"] = list(observation.get("objects") or [])
+    frame_analysis["clothing"] = []
+    frame_analysis["emotions"] = []
+    frame_analysis["spatial_relations"] = []
+    frame_analysis["ocr_text"] = ""
+    frame_analysis["semantic"] = {}
+    frame_analysis["facts"] = []
+    frame_analysis["detail"] = {
+        "schema_version": 1, "visible_details": [], "regions": [], "text_blocks": [],
+        "uncertainties": ["该观察仅对应当前保留帧"],
+    }
+    frame_analysis.pop("representative_indices", None)
+    frame_analysis.pop("coverage_required_indices", None)
+    return frame_analysis
 
 
 def _browser_preview(video_path, target, codec):
@@ -120,6 +350,10 @@ class VideoMemoryAdapter:
             algorithm = self._keyframe_algorithm()
             if algorithm == "hybrid_webp":
                 return self._process_hybrid_webp(
+                    asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started,
+                )
+            if algorithm == "mlt_semantic":
+                return self._process_mlt_semantic(
                     asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started,
                 )
             if algorithm != "worldmm":
@@ -208,22 +442,78 @@ class VideoMemoryAdapter:
         except Exception as error:
             data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
             shutil.rmtree(data_root / "derived" / "video" / asset_id / "hybrid-webp" / "vlm-evidence", ignore_errors=True)
+            shutil.rmtree(data_root / "derived" / "video" / asset_id / "mlt-semantic" / "vlm-evidence", ignore_errors=True)
             return store.update_asset(asset_id, "video-processing-failed", {
                 "video_stage": stage, "error_stage": stage, "error": f"{type(error).__name__}: {error}",
                 "retryable": True, "video_processing_seconds": round(time.perf_counter() - started, 3),
             })
 
     def _process_hybrid_webp(self, asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started):
-        """Run the fixed hybrid extractor and import only valid WebP representatives."""
-        from .hybrid_keyframe import run as run_hybrid_keyframes
+        return self._process_webp_keyframes(
+            asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started,
+            extractor="hybrid_webp",
+        )
+
+    def _process_mlt_semantic(self, asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started):
+        return self._process_webp_keyframes(
+            asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started,
+            extractor="mlt_semantic",
+        )
+
+    def _process_webp_keyframes(self, asset, pipeline, metadata, captured_at, location_label,
+                                reverse_geocode, started, extractor):
+        """Extract scenes, reconcile overlapping 3-5-frame VLM windows, then import memories."""
 
         store = pipeline.store
         asset_id = asset["id"]
         data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
-        output = data_root / "derived" / "video" / asset_id / "hybrid-webp"
-        frames, merged, manifest = run_hybrid_keyframes(asset["path"], output, asset_id)
+        window_vlm_seconds = 0.0
+        if extractor == "mlt_semantic":
+            from .mlt_keyframe import merge_and_analyze_windows, run as run_mlt_keyframes
+            output = data_root / "derived" / "video" / asset_id / "mlt-semantic"
+            frames, merged, manifest = run_mlt_keyframes(asset["path"], output, asset_id)
+            preliminary_count = len(merged)
+            window_vlm_started = time.perf_counter()
+            merged, merge_stats = merge_and_analyze_windows(
+                merged, pipeline.gamma,
+                {"source_video": asset.get("file_name"), "video_id": asset_id},
+                max_window=int(os.getenv("SENTRIX_VIDEO_MLT_VLM_WINDOW", "5")),
+                stride=int(os.getenv("SENTRIX_VIDEO_MLT_VLM_STRIDE", "4")),
+            )
+            window_vlm_seconds = time.perf_counter() - window_vlm_started
+            manifest.update({
+                "vlm_window_merge_and_memory": True,
+                "vlm_window_max_frames": min(5, max(3, int(os.getenv("SENTRIX_VIDEO_MLT_VLM_WINDOW", "5")))),
+                "preliminary_scene_count": preliminary_count,
+                "merged_scene_count": len(merged),
+                "vlm_memory_calls": merge_stats["calls"],
+                "vlm_window_seconds": round(window_vlm_seconds, 3),
+                "vlm_scenes_merged_away": merge_stats["merged_away"],
+                "mlt_strong_boundary_splits": merge_stats.get("strong_boundary_splits", 0),
+                "vlm_sliding_windows": merge_stats.get("sliding_windows", False),
+                "vlm_window_stride": merge_stats.get("window_stride"),
+                "vlm_edge_consensus": merge_stats.get("edge_consensus", []),
+                "vlm_windows": merge_stats["windows"],
+            })
+            (output / "memory_merge.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+        else:
+            from .hybrid_keyframe import run as run_hybrid_keyframes
+            output = data_root / "derived" / "video" / asset_id / "hybrid-webp"
+            frames, merged, manifest = run_hybrid_keyframes(asset["path"], output, asset_id)
         if not merged or not manifest.get("image_integrity_passed"):
-            raise RuntimeError("hybrid extractor produced no valid WebP representatives")
+            raise RuntimeError(f"{extractor} extractor produced no valid WebP representatives")
+        boundary_reviews = []
+        if extractor != "mlt_semantic":
+            merged, boundary_reviews = _review_scene_boundaries(merged, pipeline.gamma)
+            if boundary_reviews:
+                manifest["model_scene_boundary_review"] = boundary_reviews
+                manifest["model_scene_boundary_review_count"] = len(boundary_reviews)
+                manifest["model_scene_boundary_merge_count"] = sum(
+                    1 for item in boundary_reviews if item.get("merged")
+                )
+                manifest["merged_event_count_after_model_review"] = len(merged)
         store.update_asset(asset_id, "video-scene-importing", {
             "video_stage": "video-scene-importing", "keyframe_algorithm": manifest["method"],
             "keyframe_source_count": len(frames), "worldmm_scene_count": len(merged),
@@ -232,7 +522,7 @@ class VideoMemoryAdapter:
         })
         scene_ids = []
         keyframe_asset_ids = []
-        event_vlm_seconds = 0.0
+        event_vlm_seconds = window_vlm_seconds
         transient_vlm_frame_count = 0
         for scene_index, item in enumerate(merged):
             representatives = list(item.get("representatives") or [item["representative"]])
@@ -260,12 +550,15 @@ class VideoMemoryAdapter:
             transient_vlm_frame_count += len(evidence_paths)
             vlm_started = time.perf_counter()
             try:
-                if hasattr(pipeline.gamma, "analyze_video_event"):
+                if isinstance(item.get("event_analysis"), dict):
+                    event_analysis = dict(item["event_analysis"])
+                elif hasattr(pipeline.gamma, "analyze_video_event"):
                     event_analysis = pipeline.gamma.analyze_video_event(
                         evidence_paths,
                         {
                             "source_video": asset.get("file_name"),
                             "start_sec": start_sec, "end_sec": end_sec,
+                            "video_duration_sec": float(getattr(metadata, "duration_sec", 0) or 0),
                             "evidence_timestamps_sec": [
                                 float(value.get("source_timestamp_sec", start_sec) or start_sec)
                                 for value in representative.get("vlm_evidence") or []
@@ -294,13 +587,36 @@ class VideoMemoryAdapter:
                     if selected_index not in normalized_indices:
                         normalized_indices.append(selected_index)
                 event_duration = max(0.0, end_sec - start_sec)
-                max_persistent = 1 if event_duration < 12.0 else 2 if event_duration < 90.0 else 3
+                video_duration = float(getattr(metadata, "duration_sec", 0) or 0)
+                short_video = 0.0 < video_duration < 30.0
+                expanded_retention = short_video or event_duration < 30.0
+                # Short videos need more visual evidence because one primary
+                # frame can miss an action stage. The final number remains the
+                # VLM-selected minimum semantic coverage set; this only raises
+                # the candidate/maximum budget and never forces extra frames.
+                max_persistent = 3 if expanded_retention else 2 if event_duration < 90.0 else 3
                 min_persistent = 1 if event_duration < 45.0 else 2 if event_duration < 150.0 else 3
                 selected_indices = (normalized_indices or [fallback_index])[:max_persistent]
+                selected_indices, semantic_scene_changed = _semantic_scene_transition(
+                    event_analysis, evidence_paths, selected_indices, max_persistent,
+                )
                 evidence_times = [
                     float(value.get("source_timestamp_sec", start_sec) or start_sec)
                     for value in evidence_records
                 ]
+                selected_indices, same_view_collapsed = _collapse_same_view_people_change(
+                    evidence_paths, evidence_records, selected_indices, item.get("yolo_timeline") or [],
+                ) if not semantic_scene_changed else (selected_indices, False)
+                if extractor == "mlt_semantic":
+                    required_indices = []
+                    for value in event_analysis.get("coverage_required_indices") or []:
+                        try:
+                            index = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= index < len(evidence_paths) and index not in required_indices:
+                            required_indices.append(index)
+                    selected_indices = list(dict.fromkeys(selected_indices + required_indices))[:max_persistent]
                 if event_duration >= 45.0 and len(evidence_paths) >= 2:
                     edge_indices = [0, len(evidence_paths) - 1]
                     middle_choices = [index for index in selected_indices if index not in edge_indices]
@@ -343,7 +659,7 @@ class VideoMemoryAdapter:
             event = store.create_video_scene_event({
                 "scope_id": asset.get("scope_id"),
                 "title": _event_title(item),
-                "summary": f"{start_sec:.1f}s~{end_sec:.1f}s；合并 {item['source_frame_count']} 个片段，保留信息帧 {len(representatives)} 张",
+                "summary": f"{start_sec:.1f}s~{end_sec:.1f}s；合并 {item.get('mlt_scene_count') or item['source_frame_count']} 个片段，保留信息帧 {len(representatives)} 张",
                 "time_start": _captured_at(captured_at, start_sec), "time_end": _captured_at(captured_at, end_sec),
                 "place": location_label, "source_asset_id": asset_id, "source_scene_index": scene_index,
                 "source_start_sec": start_sec, "source_end_sec": end_sec,
@@ -352,6 +668,15 @@ class VideoMemoryAdapter:
                     "memory_duplicate_frame_removal": True, "source_event_ids": item["source_event_ids"],
                     "source_frame_count": item["source_frame_count"], "duplicate_frame_count": item["duplicate_frame_count"],
                     "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
+                    "mlt_scene_count": item.get("mlt_scene_count"),
+                    "vlm_merge_reason": item.get("vlm_merge_reason"),
+                    "semantic_scene_changed": semantic_scene_changed,
+                    "semantic_scene_change_rule": (
+                        "visual_semantic_transition" if semantic_scene_changed
+                        else "same_view_information_max" if same_view_collapsed
+                        else "vlm_minimal_coverage"
+                    ),
+                    "model_scene_boundary_review": item.get("boundary_model_review") or [],
                     "frame_observations": item.get("frame_observations") or [],
                     "event_detail": {
                         key: event_analysis.get(key)
@@ -388,14 +713,58 @@ class VideoMemoryAdapter:
                     }, "reverse_geocode": reverse_geocode,
                 }
                 store.create_asset(keyframe_id, target.name, "image", str(target), "image/webp", target.stat().st_size, provenance, scope_id=asset.get("scope_id"))
+                frame_analysis = (
+                    _frame_analysis_from_event(
+                        event_analysis, representative.get("vlm_selected_evidence_index", evidence_index),
+                    ) if extractor == "mlt_semantic" else event_analysis
+                )
+                # Keep the combined VLM result for the event summary, but do
+                # not copy one multi-frame description onto every retained
+                # image. When more than one frame survived because the video
+                # has a semantic scene transition, each frame gets its own
+                # image-grounded observation.
+                if extractor != "mlt_semantic" and len(representatives) > 1 and hasattr(pipeline.gamma, "analyze_image"):
+                    try:
+                        frame_analysis = pipeline.gamma.analyze_image(str(target), {
+                            "file_name": target.name,
+                            "captured_at": provenance["captured_at"],
+                            "captured_location": asset.get("captured_location") or "",
+                            "source_video": asset.get("file_name"),
+                            "source_timestamp_sec": provenance["source_timestamp_sec"],
+                            "source_scene_index": scene_index,
+                            "location_context": reverse_geocode or {},
+                        })
+                    except Exception:
+                        frame_analysis = event_analysis
                 processed = pipeline.process(
                     keyframe_id, summarize_event=False, forced_event_id=event["id"],
-                    image_analysis=event_analysis,
+                    image_analysis=frame_analysis,
                 )
                 if processed.get("status") != "processed":
                     raise RuntimeError(f"WebP keyframe processing failed: {keyframe_id}")
                 keyframe_asset_ids.append(keyframe_id)
-            pipeline.summarize_event(event["id"])
+            if extractor == "mlt_semantic":
+                # The 3-5-frame window call already produced the final memory.
+                # Persist its event projection directly instead of issuing a
+                # second LLM summary request for the same evidence.
+                caption = str(event_analysis.get("caption") or "").strip()
+                activity = str(event_analysis.get("activity") or "").strip()
+                event_type = str(event_analysis.get("event_type") or "视频场景").strip()
+                title = (event_type if event_type not in {"视频场景", "家庭记录"} else activity) or caption or "视频场景"
+                projection = {
+                    "title": title[:20],
+                    "event_type": event_type[:20],
+                    "activity": (activity or event_type)[:20],
+                    "summary": (caption or activity or event_type)[:240],
+                    "confidence": event_analysis.get("confidence", 0.65),
+                    "model": event_analysis.get("model") or "mlt_window_memory",
+                }
+                if hasattr(pipeline, "_persist_event_summary"):
+                    pipeline._persist_event_summary(event["id"], projection)
+                else:
+                    store.update_event(event["id"], projection)
+            else:
+                pipeline.summarize_event(event["id"])
         shutil.rmtree(output / "vlm-evidence", ignore_errors=True)
         elapsed = round(time.perf_counter() - started, 3)
         return store.update_asset(asset_id, "processed", {
@@ -410,6 +779,13 @@ class VideoMemoryAdapter:
             "video_processing_seconds": elapsed, "memory_event_merge": True,
             "memory_duplicate_frame_removal": True, "memory_image_integrity_passed": True,
             "event_vlm_seconds": round(event_vlm_seconds, 3),
+            "vlm_window_seconds": round(window_vlm_seconds, 3),
+            "preliminary_scene_count": manifest.get("preliminary_scene_count", len(merged)),
+            "vlm_memory_calls": manifest.get("vlm_memory_calls", 0),
+            "vlm_scenes_merged_away": manifest.get("vlm_scenes_merged_away", 0),
+            "mlt_strong_boundary_splits": manifest.get("mlt_strong_boundary_splits", 0),
+            "vlm_sliding_windows": manifest.get("vlm_sliding_windows", False),
+            "vlm_window_stride": manifest.get("vlm_window_stride"),
             "transient_vlm_frame_count": transient_vlm_frame_count,
             "persistent_keyframe_count": len(keyframe_asset_ids),
             "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "0"), "vlm_device": "per-keyframe-pipeline",
