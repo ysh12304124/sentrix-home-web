@@ -1,0 +1,8 @@
+{
+  "sentrix_url": "http://192.168.0.153:8091",
+  "judge_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+  "judge_model": "doubao-seed-2.0-lite",
+  "vllm_manager_url": "http://192.168.0.153:8500",
+  "model_base_url": "http://192.168.0.153:8100/v1",
+  "judge_provider_id": "volcengine-doubao-seed-2.0-lite"
+}

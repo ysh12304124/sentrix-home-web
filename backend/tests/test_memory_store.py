@@ -1,4 +1,5 @@
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import unittest
 from datetime import timezone
@@ -14,6 +15,23 @@ class MemoryStoreTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.temp_dir.cleanup()
+
+    def test_shared_connection_reads_and_scope_creation_are_serialized(self):
+        started = threading.Event()
+
+        def create_scope():
+            started.set()
+            return self.store.create_memory_space("scope-lock-test", "并发锁测试")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with self.store._connection_lock:
+                future = executor.submit(create_scope)
+                self.assertTrue(started.wait(timeout=1))
+                self.assertFalse(future.done())
+                self.assertIsNone(self.store._row(
+                    "SELECT id FROM memory_spaces WHERE id = ?", ("scope-lock-test",),
+                ))
+            self.assertEqual(future.result(timeout=2)["id"], "scope-lock-test")
 
     def test_observations_merge_into_same_event_by_time_and_place(self):
         asset_one = self.store.create_asset("a1", "one.jpg", "image", "/tmp/one.jpg")

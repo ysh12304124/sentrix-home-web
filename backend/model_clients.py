@@ -258,6 +258,20 @@ def _openai_thinking_kwargs():
     return {"enable_thinking": value in {"1", "true", "yes", "on"}}
 
 
+def _cloud_thinking_kwargs(endpoint_base=None):
+    """Disable provider-side reasoning for cloud APIs by default.
+
+    Ark's OpenAI-compatible Doubao endpoint uses ``thinking.type`` rather
+    than the vLLM ``chat_template_kwargs`` switch.  Keep the fallback field
+    used by other OpenAI-compatible cloud providers without changing local
+    vLLM payloads.
+    """
+    endpoint = str(endpoint_base or "").lower()
+    if "volces.com" in endpoint or "volcengine.com" in endpoint:
+        return {"thinking": {"type": "disabled"}}
+    return {"enable_thinking": False}
+
+
 def build_image_prompt(metadata=None):
     prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
 严格返回简体中文 JSON 对象。place 和 semantic.place.primary 必须只依据图片视觉证据，不能用 GPS 或地点上下文覆盖；地点上下文只能作为候选背景。
@@ -780,7 +794,9 @@ class GammaClient:
             "stream_options": {"include_usage": True},
             "temperature": temperature,
         }
-        if self.api_mode != "generic":
+        if is_cloud_api:
+            payload.update(_cloud_thinking_kwargs(endpoint_base))
+        elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
@@ -950,7 +966,9 @@ class GammaClient:
             "stream_options": {"include_usage": True} if use_stream else None,
             "temperature": 0,
         }
-        if self.api_mode != "generic":
+        if self.runtime_source == "cloud_api":
+            payload.update(_cloud_thinking_kwargs(endpoint_base))
+        elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
             payload["response_format"] = {"type": "json_object"}
@@ -1167,7 +1185,41 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
 图片顺序和事件上下文：""" + json.dumps({
             "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
         }, ensure_ascii=False)
-        parsed = parse_json_response(self.chat(prompt, images, self._core_vision_options()))
+        evidence_indices = list(range(len(images)))
+        fallback_reason = None
+        try:
+            response = self.chat(prompt, images, self._core_vision_options())
+        except ModelError as error:
+            match = re.search(r"At most\s+(\d+)\s+image(?:\(s\))?", str(error), flags=re.IGNORECASE)
+            image_limit = int(match.group(1)) if match else 0
+            if image_limit < 1 or image_limit >= len(images):
+                raise
+            if image_limit == 1:
+                evidence_indices = [0]
+            else:
+                evidence_indices = [
+                    round(index * (len(images) - 1) / (image_limit - 1))
+                    for index in range(image_limit)
+                ]
+            limited_images = [images[index] for index in evidence_indices]
+            retry_prompt = prompt + "\n当前模型图片上限较低，本次按时间均匀抽取了 " + str(len(limited_images)) + " 张证据图。"
+            response = self.chat(retry_prompt, limited_images, self._core_vision_options())
+        parsed = parse_json_response(response)
+        meaningful = any(parsed.get(key) not in (None, "", []) for key in (
+            "caption", "activity", "people", "objects", "facts", "detail",
+        ))
+        if not meaningful and len(evidence_indices) > 3:
+            selected_positions = [0, len(evidence_indices) // 2, len(evidence_indices) - 1]
+            evidence_indices = [evidence_indices[index] for index in selected_positions]
+            limited_images = [images[index] for index in evidence_indices]
+            retry_prompt = (
+                prompt
+                + "\n首次多图结果无法解析，本次按时间均匀选取 3 张证据图重试。"
+                + "必须在输出上限内完成合法 JSON，优先保证 caption、activity 和 representative_indices 完整。"
+            )
+            response = self.chat(retry_prompt, limited_images, self._core_vision_options())
+            parsed = parse_json_response(response)
+            fallback_reason = "unparseable_multi_image_response"
         parsed["people"] = as_list(parsed.get("people"))
         parsed["objects"] = as_list(parsed.get("objects"))
         parsed["clothing"] = as_list(parsed.get("clothing"))
@@ -1192,15 +1244,20 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
         representative_indices = []
         for value in raw_indices:
             try:
-                index = max(0, min(len(images) - 1, int(value)))
+                index = max(0, min(len(evidence_indices) - 1, int(value)))
             except (TypeError, ValueError):
                 continue
-            if index not in representative_indices:
-                representative_indices.append(index)
-        parsed["representative_indices"] = (representative_indices or [0])[:3]
+            source_index = evidence_indices[index]
+            if source_index not in representative_indices:
+                representative_indices.append(source_index)
+        parsed["representative_indices"] = (representative_indices or [evidence_indices[0]])[:3]
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
         parsed["model"] = self.model
-        parsed["video_event_evidence_count"] = len(images)
+        parsed["video_event_evidence_count"] = len(evidence_indices)
+        parsed["video_event_source_evidence_count"] = len(images)
+        parsed["video_event_evidence_indices"] = evidence_indices
+        if fallback_reason:
+            parsed["video_event_fallback_reason"] = fallback_reason
         return parsed
 
     def analyze_image_focus(self, path, dimension, metadata=None):

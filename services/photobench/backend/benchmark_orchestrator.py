@@ -1126,6 +1126,97 @@ def _resolve_gt_media(gt_refs: list[dict], assets_by_name: dict,
     return result
 
 
+def _qa_scope_id_for_album(spaces: list[dict], album_id: str) -> str | None:
+    """Choose the newest Sentrix scope whose name identifies this benchmark album."""
+    target = safe_slug(album_id).casefold()
+    candidates = []
+    for space in spaces or []:
+        if not isinstance(space, dict) or not space.get("id"):
+            continue
+        name = str(space.get("name") or "")
+        slug = safe_slug(name).casefold()
+        if not target or target not in slug:
+            continue
+        exact = 1 if re.search(rf"(?:^|[-_]){re.escape(target)}(?:[-_]|$)", slug) else 0
+        candidates.append((exact, str(space.get("created_at") or ""), str(space["id"])))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][2]
+
+
+def _resolve_qa_media_rows(sentrix_url: str, album_id: str, rows: list[dict]) -> tuple[list[dict], dict]:
+    """Resolve portable QA media refs against the configured Sentrix backend."""
+    refs_by_key = {}
+    for row in rows:
+        for prefix in ("retrieval", "answer_evidence"):
+            for ref in _normalize_media_refs(row, prefix):
+                refs_by_key[_media_key(ref["media_type"], ref["media_id"])] = ref
+        for claim in row.get("answer_claims") or []:
+            if isinstance(claim, dict):
+                for ref in _normalize_media_refs(claim, "evidence"):
+                    refs_by_key[_media_key(ref["media_type"], ref["media_id"])] = ref
+    if not refs_by_key:
+        return rows, {"status": "no_media", "resolved_count": 0, "missing_count": 0, "ambiguous_count": 0}
+    base = normalize_service_url(sentrix_url)
+    if not base:
+        return rows, {"status": "sentrix_url_missing", "resolved_count": 0,
+                      "missing_count": len(refs_by_key), "ambiguous_count": 0}
+    try:
+        spaces_data = request_json(f"{base}/api/memory-spaces?limit=1000", timeout=20)
+        spaces = spaces_data.get("spaces") if isinstance(spaces_data, dict) else spaces_data
+        scope_id = _qa_scope_id_for_album(spaces or [], album_id)
+        query = f"{base}/api/assets?limit=1000"
+        if scope_id:
+            query += f"&scope_id={quote(scope_id)}"
+        assets_data = request_json(query, timeout=30)
+        assets = assets_data.get("assets") if isinstance(assets_data, dict) else assets_data
+    except Exception as exc:
+        return rows, {"status": "sentrix_unavailable", "error": str(exc),
+                      "resolved_count": 0, "missing_count": len(refs_by_key), "ambiguous_count": 0}
+    index = {}
+    for asset in assets or []:
+        if not isinstance(asset, dict) or not asset.get("id"):
+            continue
+        name = str(asset.get("file_name") or "")
+        kind = _infer_media_type(name, asset.get("media_type") or asset.get("asset_type"))
+        index.setdefault(_media_key(kind, name), []).append(asset)
+    resolved = {}
+    counts = {"resolved_count": 0, "missing_count": 0, "ambiguous_count": 0}
+    for key, ref in refs_by_key.items():
+        candidates = index.get(key, [])
+        item = {**ref, "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous"}
+        if len(candidates) == 1:
+            asset = candidates[0]
+            item.update({"asset_id": str(asset["id"]),
+                         "file_name": asset.get("file_name") or ref["media_id"],
+                         "media_url": f"{base}/api/assets/{quote(str(asset['id']))}/file"})
+            counts["resolved_count"] += 1
+        elif candidates:
+            item["candidate_asset_ids"] = [str(asset["id"]) for asset in candidates]
+            counts["ambiguous_count"] += 1
+        else:
+            counts["missing_count"] += 1
+        resolved[key] = item
+
+    def attach(record: dict, prefix: str) -> None:
+        refs = _normalize_media_refs(record, prefix)
+        if refs:
+            record[f"{prefix}_media_refs"] = [resolved[_media_key(ref["media_type"], ref["media_id"])] for ref in refs]
+
+    enriched = []
+    for row in rows:
+        item = copy.deepcopy(row)
+        attach(item, "retrieval")
+        attach(item, "answer_evidence")
+        for claim in item.get("answer_claims") or []:
+            if isinstance(claim, dict):
+                attach(claim, "evidence")
+        enriched.append(item)
+    return enriched, {"status": "resolved", "scope_id": scope_id, **counts,
+                      "total_refs": len(refs_by_key)}
+
+
 def _execution_failure(agent_status: str | None, termination_reason: str | None) -> bool:
     status = str(agent_status or "").lower()
     termination = str(termination_reason or "").lower()
@@ -5650,7 +5741,10 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     self._json({"error": "qa file not found"}, 404)
                     return
                 rows = load_jsonl(qa_path)
-                self._json({"album_id": album_id, "qa_set": qa_set, "items": rows})
+                sentrix_url = (query.get("sentrix_url") or [DEFAULT_SENTRIX_URL])[0]
+                rows, media_resolution = _resolve_qa_media_rows(sentrix_url, album_id, rows)
+                self._json({"album_id": album_id, "qa_set": qa_set, "items": rows,
+                            "media_resolution": media_resolution, "media_source": "sentrix"})
                 return
             if parsed.path.startswith("/api/albums/"):
                 parts = parsed.path.removeprefix("/api/albums/").split("/", 2)

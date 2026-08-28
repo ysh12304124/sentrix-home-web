@@ -73,6 +73,7 @@ const qaBrowserSearch = ref("");
 const qaBrowserTag = ref("");
 const qaBrowserLoading = ref(false);
 const qaBrowserError = ref("");
+const qaBrowserMediaResolution = ref(null);
 const error = ref("");
 const lightbox = ref(null);
 const judgeModal = ref(null);
@@ -158,7 +159,7 @@ function mediaKey(ref) {
 }
 function mediaRefs(item, prefix = "retrieval") {
   const typed = item?.[`${prefix}_media_refs`];
-  if (Array.isArray(typed)) return typed.map((ref) => ({ media_type: inferMediaType(ref?.media_id, ref?.media_type), media_id: String(ref?.media_id || "") })).filter((ref) => ref.media_id);
+  if (Array.isArray(typed)) return typed.map((ref) => ({ ...ref, media_type: inferMediaType(ref?.media_id, ref?.media_type), media_id: String(ref?.media_id || "") })).filter((ref) => ref.media_id);
   const refs = [
     ...((item?.[`${prefix}_image_ids`] || []).map((media_id) => ({ media_type: inferMediaType(media_id), media_id }))),
     ...((item?.[`${prefix}_video_ids`] || []).map((media_id) => ({ media_type: "video", media_id }))),
@@ -1740,9 +1741,10 @@ async function loadQaBrowser() {
   qaBrowserLoading.value = true;
   qaBrowserError.value = "";
   try {
-    const data = await api(`/api/qa-dataset?album_id=${encodeURIComponent(qaBrowserAlbum.value)}&qa_set=${encodeURIComponent(qaBrowserSet.value)}`);
+    const data = await api(`/api/qa-dataset?album_id=${encodeURIComponent(qaBrowserAlbum.value)}&qa_set=${encodeURIComponent(qaBrowserSet.value)}&sentrix_url=${encodeURIComponent(sentrixUrl.value.trim())}`);
     qaBrowserItems.value = data.items || [];
-  } catch (e) { qaBrowserError.value = e.message; qaBrowserItems.value = []; }
+    qaBrowserMediaResolution.value = data.media_resolution || null;
+  } catch (e) { qaBrowserError.value = e.message; qaBrowserItems.value = []; qaBrowserMediaResolution.value = null; }
   finally { qaBrowserLoading.value = false; }
 }
 function qaTypeLabel(t) {
@@ -1753,10 +1755,6 @@ function qaActionBadge(a) {
 }
 function qaAnswerabilityLabel(v) {
   return ({answerable:"可回答",unanswerable:"不可回答",ambiguous:"有歧义",unsafe_request:"不安全请求",answerable_after_clarification:"澄清后可回答",mixed:"混合"}[v]) || v || "-";
-}
-function qaPhotoUrl(albumId, relPath) {
-  const fileName = relPath.split("/").pop();
-  return `/api/albums/${encodeURIComponent(albumId)}/photos/${encodeURIComponent(fileName)}`;
 }
 function qaEvidenceRefs(item) {
   return mediaRefs(item, "retrieval");
@@ -1769,10 +1767,11 @@ function qaHasVideoEvidence(item) {
   return qaEvidenceRefs(item).some((ref) => ref.media_type === "video");
 }
 function qaMediaUrl(albumId, item, media) {
-  const mediaId = typeof media === "string" ? media : media?.media_id;
-  if (!qaIsVideoEvidence(item, media)) return qaPhotoUrl(albumId, mediaId);
-  const fileName = /\.mp4$/i.test(String(mediaId)) ? String(mediaId).split("/").pop() : `${mediaId}.mp4`;
-  return `/api/albums/${encodeURIComponent(albumId)}/videos/${encodeURIComponent(fileName)}`;
+  if (typeof media !== "string" && media?.media_url) return media.media_url;
+  const assetId = typeof media === "string" ? "" : media?.asset_id;
+  return assetId && sentrixUrl.value
+    ? `${sentrixUrl.value.replace(/\/$/, "")}/api/assets/${encodeURIComponent(assetId)}/file`
+    : "";
 }
 function qaClaimMediaRefs(claim) {
   return mediaRefs(claim, "evidence");
@@ -2417,6 +2416,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <button class="btn ghost" @click="loadQaBrowser">刷新数据</button>
         </div>
         <p v-if="qaBrowserError" class="error">{{ qaBrowserError }}</p>
+        <p v-else-if="qaBrowserMediaResolution && qaBrowserMediaResolution.status !== 'no_media'" class="muted small qa-media-source-status">
+          媒体来源：Sentrix 后端 · 已解析 {{ qaBrowserMediaResolution.resolved_count || 0 }} · 缺失 {{ qaBrowserMediaResolution.missing_count || 0 }} · 不唯一 {{ qaBrowserMediaResolution.ambiguous_count || 0 }}
+        </p>
         <div v-if="qaBrowserLoading" class="qa-browser-empty">正在加载数据集…</div>
         <div v-else class="qa-browser-list">
           <article v-for="(item, idx) in visibleQaBrowserItems" :key="item.qa_id || idx" class="qa-review-card">
@@ -2455,8 +2457,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                 <div class="qa-evidence-head"><div><span>RETRIEVAL GROUND TRUTH</span><strong>检索 GT 媒体</strong><small>问题对应的直接证据</small></div><b>{{ qaEvidenceRefs(item).length }}</b></div>
                 <div class="gt-gallery" :class="{ 'video-gallery': qaHasVideoEvidence(item) }">
                   <div v-for="media in qaEvidenceRefs(item)" :key="mediaKey(media)" class="gt-thumb-card" :class="{ 'direct-evidence': isDirectEvidence(item, media), 'video-evidence': qaIsVideoEvidence(item, media) }">
-                    <video v-if="qaIsVideoEvidence(item, media)" :src="qaMediaUrl(qaBrowserAlbum, item, media)" controls playsinline preload="none"></video>
-                    <button v-else class="gt-image-button" type="button" @click="lightbox = { url: qaMediaUrl(qaBrowserAlbum, item, media), name: media.media_id.split('/').pop() }"><img :src="qaMediaUrl(qaBrowserAlbum, item, media)" :alt="media.media_id" loading="lazy" /></button>
+                    <video v-if="qaIsVideoEvidence(item, media) && qaMediaUrl(qaBrowserAlbum, item, media)" :src="qaMediaUrl(qaBrowserAlbum, item, media)" controls playsinline preload="none"></video>
+                    <button v-else-if="qaMediaUrl(qaBrowserAlbum, item, media)" class="gt-image-button" type="button" @click="lightbox = { url: qaMediaUrl(qaBrowserAlbum, item, media), name: media.media_id.split('/').pop() }"><img :src="qaMediaUrl(qaBrowserAlbum, item, media)" :alt="media.media_id" loading="lazy" /></button>
+                    <span v-else class="image-empty">{{ media.mapping_status === 'ambiguous' ? '媒体标识不唯一' : 'Sentrix 后端未找到' }}</span>
                     <span>{{ media.media_id.split('/').pop() }}<em>{{ qaIsVideoEvidence(item, media) ? '视频证据' : isDirectEvidence(item, media) ? '直接证据' : '事件相关' }}</em></span>
                   </div>
                 </div>

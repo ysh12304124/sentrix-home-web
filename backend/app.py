@@ -3086,44 +3086,58 @@ def assistant_response(result):
     # never promote raw candidates; selected assets win, otherwise expose only
     # the first three evidence sources.
     grounding = result.get("answer_grounding") or {}
-    if not result.get("image_results") and isinstance(grounding, dict):
-        evidence_images = [
-            item for item in (grounding.get("evidence_images") or [])
+    if isinstance(grounding, dict):
+        evidence_media = [
+            dict(item) for item in (
+                grounding.get("evidence_media") or grounding.get("evidence_images") or [])
             if isinstance(item, dict) and item.get("asset_id")
         ]
-        # Older/partial turns may persist only evidence_asset_ids and omit the
-        # richer evidence_images projection. Rebuild the same small source
-        # cards from the authoritative store so 4174/8771 never shows a blank
-        # image area merely because serialization dropped the optional field.
-        if not evidence_images:
-            for asset_id in (grounding.get("evidence_asset_ids") or grounding.get("evidence_sources") or [])[:12]:
-                try:
-                    asset = store.get_asset(str(asset_id))
-                except Exception:
-                    asset = None
-                if asset:
-                    evidence_images.append({
-                        "asset_id": str(asset_id),
-                        "file_name": asset.get("file_name") or "",
-                        "captured_at": asset.get("captured_at") or "",
-                        "media_url": f"/api/assets/{asset_id}/file",
-                    })
+        known_ids = {str(item.get("asset_id")) for item in evidence_media}
+        evidence_ids = grounding.get("evidence_asset_ids") or grounding.get("evidence_sources") or []
+        for asset_id in evidence_ids[:12]:
+            asset_id = str(asset_id)
+            if asset_id in known_ids:
+                continue
+            try:
+                asset = store.get_asset(asset_id)
+            except Exception:
+                asset = None
+            if asset:
+                evidence_media.append({
+                    "asset_id": asset_id,
+                    "file_name": asset.get("file_name") or "",
+                    "captured_at": asset.get("captured_at") or "",
+                    "media_type": asset.get("media_type") or "image",
+                    "media_url": f"/api/assets/{asset_id}/file",
+                })
+                known_ids.add(asset_id)
         selected_ids = {str(value) for value in (grounding.get("selected_asset_ids") or []) if value}
         if selected_ids:
-            selected = [item for item in evidence_images if str(item.get("asset_id")) in selected_ids]
-            evidence_images = selected or evidence_images
+            selected = [item for item in evidence_media if str(item.get("asset_id")) in selected_ids]
+            evidence_media = selected or evidence_media
         projected = []
-        for item in evidence_images[:3]:
+        for item in evidence_media[:3]:
             asset_id = str(item.get("asset_id"))
-            media_url = item.get("media_url") or f"/api/assets/{asset_id}/file"
+            asset = None
+            if not item.get("media_type"):
+                try:
+                    asset = store.get_asset(asset_id)
+                except Exception:
+                    pass
+            media_type = str(item.get("media_type") or (asset or {}).get("media_type") or "image")
             projected.append({
                 "asset_id": asset_id,
-                "file_name": item.get("file_name") or "",
-                "media_url": media_url,
-                "display_handle": item.get("handle") or "原始图片",
-                "captured_at": item.get("captured_at") or "",
+                "file_name": item.get("file_name") or (asset or {}).get("file_name") or "",
+                "media_type": media_type,
+                "media_url": item.get("media_url") or f"/api/assets/{asset_id}/file",
+                "display_handle": item.get("handle") or ("原始视频" if media_type == "video" else "原始图片"),
+                "captured_at": item.get("captured_at") or (asset or {}).get("captured_at") or "",
             })
-        result["image_results"] = projected
+        if not result.get("media_results"):
+            result["media_results"] = projected
+        if not result.get("image_results"):
+            result["image_results"] = [item for item in projected if item["media_type"] == "image"]
+        result["mediaResults"] = result.get("media_results") or []
     result["terminationReason"] = result.get("termination_reason", "")
     result["claimVerifications"] = result["claim_verifications"]
     result["claimVerificationStatus"] = result["claim_verification_status"]

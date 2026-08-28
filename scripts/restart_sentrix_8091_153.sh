@@ -26,6 +26,7 @@ LOG_FILE="logs/sentrix-api-8091.log"
 PROBE_SCRIPT="scripts/probe_sentrix_retrieval.py"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
+cd "$PROJECT_DIR"
 
 echo "== 步骤 1/5: 检查活跃 run =="
 ACTIVE=$(curl -s -m 5 http://127.0.0.1:8771/api/runs | python3 -c 'import json,sys; runs=json.load(sys.stdin); items=runs if isinstance(runs,list) else runs.get("runs",[]); print(len([r for r in items if r.get("status") in ("running","pending","queued")]))' 2>/dev/null || echo -1)
@@ -51,7 +52,7 @@ if [[ -n "$REMAIN" ]]; then
 else
   echo "旧进程已全灭（无残留）"
 fi
-OTHERS=$(pgrep -af 'uvicorn [b]ackend.app' | grep -v -- '--port 8091' | wc -l)
+OTHERS=$(pgrep -af 'uvicorn [b]ackend.app' | grep -v -- '--port 8091' | wc -l) || OTHERS=0
 echo "其他 backend.app 实例保留: $OTHERS 个（8099/9598/11001/11011 等，分属不同项目）"
 
 echo "== 步骤 3.5/5: 确保常用测试集视觉向量一致（chinese_clip 补齐 + 同步 Qdrant）=="

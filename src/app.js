@@ -254,11 +254,12 @@
     return `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">${escapeHtml(title)}</p><h3>${values.length} 项</h3></div></div><div class="evidence-list">${values.slice(0, 12).map(evidenceCard).join("")}</div></section>`;
   }
 
-  function imageResults(result) {
-    const images = result?.image_results || [];
-    if (!images.length) return "";
-    const rows = images.map((item) => {
-      const label = item.display_handle || "原始图片";
+  function mediaResults(result) {
+    const media = result?.media_results || result?.mediaResults || result?.image_results || [];
+    if (!media.length) return "";
+    const rows = media.map((item) => {
+      const mediaType = item.media_type === "video" ? "video" : "image";
+      const label = item.display_handle || (mediaType === "video" ? "原始视频" : "原始图片");
       const aspects = [
         ...(item.supported_aspects || []).map((aspect) => `对上了：${aspect}`),
         ...(item.uncertain_aspects || []).map((aspect) => `还不能确认：${aspect}`),
@@ -267,9 +268,12 @@
         ? aspects.map(escapeHtml).join(" · ")
         : (item.captured_at || item.caption || "可回看的原始证据");
       const dup = item.near_duplicate_size > 1 ? `<small class="image-dup">另有 ${item.near_duplicate_size - 1} 张相似照片</small>` : "";
+      if (mediaType === "video") {
+        return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
+      }
       return `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
     }).join("");
-    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关图片</p><h3>${images.length} 张</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
+    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关媒体</p><h3>${media.length} 项</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
   }
 
   function traceLabel(item) {
@@ -457,13 +461,14 @@
     const ordered = result.evidence_order || [];
     const order = ordered.length && isAdmin ? `<details class="algorithm-evidence admin-only"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
     const directEvidence = Boolean(result.original_evidence_requested || presentation.direct_original_evidence);
-    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
-    const optionalImages = directEvidence ? "" : imageResults(result);
+    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${mediaResults(result) || evidence || gapContent}</section>` : "";
+    const optionalMedia = directEvidence ? "" : mediaResults(result);
     const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
     const toolSamples = toolLoopEvidence(result);
     const toolEvidence = toolSamples.length ? `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">本次依据（工具结果）</p><h3>${toolSamples.length} 项</h3></div></div><div class="evidence-list">${toolSamples.map(evidenceCard).join("")}</div></section>` : "";
+    const resultMedia = result.media_results || result.mediaResults || result.image_results || [];
     const evidenceCount = grounding.evidence_count != null ? grounding.evidence_count
-      : (primary.length + (result.image_results || []).length + toolSamples.length);
+      : (primary.length + resultMedia.length + toolSamples.length);
     const hasToolEvidence = toolSamples.length > 0;
     const hasResultSet = Boolean((result.task_state || {}).current_result_set && (result.task_state || {}).result_total > 0);
     // RX-6: a chat turn (memory_used === false) never shows an evidence entry; tool-loop turns use task_state evidence.
@@ -471,7 +476,7 @@
     const hasGap = result.evidence_status === "gap" || (!evidenceCount && result.tool_loop_status === "complete");
     const resultSetBlock = displayMode === "collapsed" ? resultSetCard(result) : "";
     const basisOpen = displayMode === "result_grid" || hasGap || (displayMode !== "collapsed" && evidenceCount > 0);
-    const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalImages}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalMedia}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     if (displayMode === "none") return `${followups}${gapContent}`;
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
