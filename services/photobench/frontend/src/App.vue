@@ -1419,11 +1419,25 @@ async function changeQaPage(page) {
 async function changeQaPageSize() { await loadQaPage(1); }
 async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
 async function loadProfiles() {
+  if (!vllmManagerUrl.value.trim()) {
+    profiles.value = [];
+    selectedModels.forEach((modelId) => {
+      if (modelId !== "__current__") selectedModels.delete(modelId);
+    });
+    return;
+  }
   profiles.value = (await post("/api/profiles", {
     vllm_target_id: vllmTargetId.value,
     vllm_manager_url: vllmManagerUrl.value.trim(),
     model_base_url: modelEndpointUserEdited.value ? modelEndpoint.value.trim() : "",
   })).profiles || [];
+}
+function onModelManagerInput() {
+  markConnectionConfigDirty();
+  profiles.value = [];
+  selectedModels.forEach((modelId) => {
+    if (modelId !== "__current__") selectedModels.delete(modelId);
+  });
 }
 function markConnectionConfigDirty() {
   if (loading.value) return;
@@ -1562,8 +1576,9 @@ function onModeChange() {
 }
 const startDisabledReason = computed(() => {
   if (hasRunning.value || suiteRunning.value) return "已有任务运行中";
+  if (!modelEndpoint.value.trim()) return "请先填写模型服务地址";
   if (!selectedModels.size) return "请先选择模型";
-  if (selectedModels.has("__current__") && !modelEndpoint.value.trim()) return "请先填写模型服务地址";
+  if ([...selectedModels].some((modelId) => modelId !== "__current__") && !vllmManagerUrl.value.trim()) return "选择注册表模型需要模型管理器地址";
   if (runMode.value === "reuse" && !existingScopeId.value) return "请先选择要复用的相册";
   return "";
 });
@@ -1703,7 +1718,7 @@ async function init() {
     connectionConfigState.value = "saved";
     connectionConfigMessage.value = "已读取配置文件";
     manifests.value = (await api("/api/manifests")).manifests || [];
-    await loadRuns(); await loadProfiles();
+    await loadRuns(); if (vllmManagerUrl.value.trim()) await loadProfiles();
     const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
     if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
@@ -1800,9 +1815,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
     <section class="section config-section">
       <div class="section-head">
 <h2>评测配置</h2>
+<div class="section-head-actions">
 <span v-if="hasRunning" class="live-badge">实时更新中</span>
+<button class="btn ghost compact" type="button" :disabled="connectionConfigState === 'saving'" @click="saveConnectionConfig">{{ connectionConfigState === 'saving' ? '保存中…' : '保存测评配置' }}</button>
+<span class="config-save-status" :class="`state-${connectionConfigState}`">{{ connectionConfigMessage }}</span>
 </div>
-      <div class="config-grid">
+</div>
+      <div class="config-groups">
+        <div class="config-group">
+          <div class="config-group-head"><div><strong>任务范围</strong><span>选择本次要构建或测评的数据范围</span></div></div>
+          <div class="config-grid config-grid-scope">
         <label>工作模式<select v-model="runMode" :disabled="suiteRunning || hasRunning" @change="onModeChange">
 <option v-for="mode in RUN_MODES_UI" :key="mode.id" :value="mode.id">{{ mode.label }}</option>
 </select>
@@ -1824,6 +1846,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </select>
 <span v-if="runMode === 'reuse'" class="config-help">题目与对照随所选现有相册自动匹配</span>
 </label>
+          </div>
+        </div>
+        <div class="config-group">
+          <div class="config-group-head"><div><strong>评测服务</strong><span>配置 Sentrix 后端、Judge 评分服务及认证信息</span></div></div>
+          <div class="config-grid config-grid-judge">
         <label>Sentrix 后端<input v-model="sentrixUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.0.153:8091" />
 </label>
        <label>Judge 服务<input v-model="judgeUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.1.65:1234/v1" />
@@ -1835,18 +1862,14 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <input v-model="judgeApiKey" type="password" autocomplete="new-password" @input="judgeApiKeyDirty = true; markConnectionConfigDirty()" placeholder="留空表示不使用或保留已保存值" />
           <span class="config-help">仅保存到评测编排器本机环境变量；{{ config?.runtime_config?.judge_api_key_set ? `已配置（${config.runtime_config.judge_api_key_hint}）` : '当前未配置' }}。</span>
 </label>
-        <label v-if="runMode !== 'build'">Judge 配置预设<select v-model="judgeProviderId" @change="markConnectionConfigDirty">
-<option v-for="provider in (config?.judge_providers || [])" :key="provider.id" :value="provider.id">{{ provider.label }}</option>
-</select>
-<span class="config-help">预设只用于快速填充；保存后以 URL / model / key 当前值为准。</span>
-</label>
-        <label>模型管理器（可选）
-          <input v-model="vllmManagerUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.0.153:8500；llama.cpp/Ollama 可留空" />
-          <span class="config-help">普通 profile 用于读取/切换模型；复用外部模型时可留空。</span>
-</label>
+          </div>
+        </div>
+        <div class="config-group config-group-model">
+          <div class="config-group-head"><div><strong>模型服务</strong><span>模型服务地址必填；模型管理器仅用于扫描注册表和切换模型</span></div></div>
+          <div class="config-model-endpoint">
         <label>模型服务地址
+          <div class="endpoint-line">
           <input v-model="modelEndpoint" type="text" @input="onModelEndpointInput" placeholder="例如 192.168.0.153:8100 或 http://192.168.0.153:8100/v1" />
-          <span class="config-help">填写模型服务的 IP:端口；可带或不带 /v1，实际请求会自动补齐。</span>
           <div class="current-model-control">
             <button class="current-model-trigger" type="button" :class="{ active: currentModelPopoverOpen }" :disabled="currentModelLoading" @click="currentModelInfo ? currentModelPopoverOpen = !currentModelPopoverOpen : loadCurrentModel()">
               <span class="current-model-icon">{{ currentModelLoading ? '…' : '↗' }}</span>
@@ -1867,25 +1890,38 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               <button class="popover-refresh" type="button" @click="loadCurrentModel">重新获取</button>
             </div>
           </div>
+          </div>
+          <span class="config-help">填写模型服务的 IP:端口；可带或不带 /v1，实际请求会自动补齐。</span>
           <span v-if="currentModelError" class="config-help error">{{ currentModelError }}</span>
 </label>
       </div>
-<div class="model-picker">
-<span class="field-label">选择模型（可多选，串行测试）</span>
-<label class="check" :class="{ active: selectedModels.has('__current__') }">
-<input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!currentModelInfo" @change="setModelSelected('__current__', $event.target.checked)" />复用当前运行模型<span v-if="currentModelInfo">（{{ currentModelInfo.served_model_name }}，不启停）</span><span v-else>（先获取模型信息）</span>
-</label>
+          <div class="config-model-manager">
+            <label>模型管理器地址（可选）
+              <input v-model="vllmManagerUrl" type="text" @input="onModelManagerInput" @change="loadProfiles" placeholder="例如 192.168.0.153:8500；无管理器可留空" />
+              <span class="config-help">填写后从 Manager 的模型注册表自动扫描；留空时不显示普通模型选择。</span>
+            </label>
+            <button class="btn ghost compact model-registry-refresh" type="button" :disabled="!vllmManagerUrl.trim()" @click="loadProfiles">刷新模型注册表</button>
+          </div>
+          <div class="model-current-choice">
+            <span class="field-label">当前运行模型</span>
+            <label class="check" :class="{ active: selectedModels.has('__current__') }">
+              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!currentModelInfo" @change="setModelSelected('__current__', $event.target.checked)" />复用当前运行模型<span v-if="currentModelInfo">（{{ currentModelInfo.served_model_name }}，不启停）</span><span v-else>（先获取模型信息）</span>
+            </label>
+          </div>
+          <div v-if="vllmManagerUrl.trim()" class="model-picker">
+<span class="field-label">模型注册表（可多选，串行测试）</span>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
 <input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="profile.source === 'cloud_api'">（云端 API）</span><span v-if="!profile.available">（不可用）</span>
 </label>
-</div>
+<span v-if="!profiles.length" class="config-help">尚未从模型管理器注册表加载模型，请点击“刷新模型注册表”。</span>
+          </div>
+          <div v-else class="model-manager-empty">未配置模型管理器。当前可通过上方“获取当前运行模型”查询并复用单个外部模型，普通注册表模型选择已隐藏。</div>
+        </div>
+      </div>
       <div class="actions">
 <label v-if="runMode === 'full'" class="check"><input type="checkbox" v-model="deleteScopeAfterRun" :disabled="suiteRunning || hasRunning" />完成后删除相册</label>
-<button class="btn ghost" type="button" :disabled="connectionConfigState === 'saving'" @click="saveConnectionConfig">{{ connectionConfigState === 'saving' ? '保存中…' : '保存连接配置' }}</button>
-<span class="config-save-status" :class="`state-${connectionConfigState}`">{{ connectionConfigMessage }}</span>
 <button class="btn" :disabled="Boolean(startDisabledReason)" @click="startSuite">{{ hasRunning ? '已有任务运行中' : runModeMeta.button }}</button>
 <button class="btn warn" :disabled="!hasRunning" @click="stopSuite">停止全部</button>
-<button class="btn ghost" @click="loadProfiles">刷新模型列表</button>
 </div>
       <p v-if="error" class="error">{{ error }}</p>
     </section>

@@ -4343,19 +4343,6 @@ class OrchestratorRepository:
                 profiles = remote_profiles.get("profiles") or []
         except Exception as e:
             error = str(e)
-        if BIG_MODEL_ENABLED and not any(
-            isinstance(item, dict) and item.get("id") == BIG_MODEL_PROFILE_ID
-            for item in profiles
-        ):
-            profiles.append({
-                "id": BIG_MODEL_PROFILE_ID,
-                "model": BIG_MODEL_MODEL,
-                "served_model_name": BIG_MODEL_MODEL,
-                "base_url": BIG_MODEL_BASE_URL,
-                "source": "cloud_api",
-                "available": True,
-                "notes": "external OpenAI-compatible API",
-            })
         result = {"profiles": profiles}
         if error:
             result["error"] = error
@@ -5432,6 +5419,8 @@ class OrchestratorRepository:
         if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
             raise ValueError("big_model cannot be combined with current model")
         managed_models = [model for model in models if model != BIG_MODEL_PROFILE_ID]
+        if managed_models and not vllm_manager_url:
+            raise ValueError("选择模型注册表中的模型时必须提供模型管理器地址")
         if managed_models:
             target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
             vllm_api_url = vllm_manager_url or str(target["manager_url"])
