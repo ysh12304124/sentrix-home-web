@@ -400,10 +400,29 @@ def _writer_system() -> str:
             in {"1", "true", "on"} else _WRITER_SYSTEM)
 
 
+_SUPPORTED_CERTAINTIES = {"supported", "confirmed", "full_support"}
+
+
+def _facts_with_valid(facts):
+    """Attach a binary valid flag (derived from certainty) to each writer fact.
+
+    Mirrors the tool-result call_status signal: the writer sees which facts are
+    reliable (supported) and which are merely candidate/uncertain, instead of a
+    multi-level certainty it has to re-read. Derived, so the original evidence
+    stays untouched.
+    """
+    out = []
+    for fact in facts or []:
+        fact = dict(fact)
+        fact["valid"] = str(fact.get("certainty") or "") in _SUPPORTED_CERTAINTIES
+        out.append(fact)
+    return out
+
+
 def build_answer_writer_messages(message: str, answer_context: dict) -> list[dict]:
     """Build the existing writer's minimal evidence-only answer prompt."""
     payload = {
-        "facts": answer_context.get("facts") or [],
+        "facts": _facts_with_valid(answer_context.get("facts")),
         "unknowns": answer_context.get("unknowns") or [],
         "conflicts": answer_context.get("conflicts") or [],
     }

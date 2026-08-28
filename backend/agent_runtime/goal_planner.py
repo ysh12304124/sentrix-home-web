@@ -85,7 +85,7 @@ class GoalPlanner:
             {"role": "user", "content": message},
         ]
         if history:
-            messages.insert(1, {"role": "system", "content": "历史对话背景：\n" + history})
+            messages[0]["content"] = messages[0]["content"] + "\n\n历史对话背景：\n" + history
         prompt_copy = copy.deepcopy(messages) if include_debug else None
         try:
             sig = inspect.signature(self.chat_fn)

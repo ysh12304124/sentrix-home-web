@@ -101,6 +101,14 @@ def _model_visible_observation(observation: dict | None) -> dict:
         "retrieval_timing", "debug", "telemetry", "trace",
         "raw_candidate_count", "validation_candidate_count", "validation_batches",
         "retrieval_channels", "validation_rows",
+        # [契约瘦身] 检索内部/统计/诊断字段——给代码和审计,模型决策用不到。
+        # 保留 group_photo_*（合影人数类问题的直接事实）。
+        "mode", "gaps", "answerability", "condition_summary", "can_inspect",
+        "inspect_hint", "recommended_resolution", "evidence_count",
+        "retrieved_total", "evidence_total", "selected_total",
+        "candidate_window", "relaxation_level", "validation_status",
+        "validation_error", "ranked_asset_ids", "selected_asset_ids",
+        "evidence_status", "reference_resolution",
     }
     compact = {key: value for key, value in observation.items() if key not in hidden}
     preview = compact.get("preview")
@@ -110,9 +118,13 @@ def _model_visible_observation(observation: dict | None) -> dict:
             compact["recommended_handle"] = compact["preview"][0].get("handle")
         # Asset IDs are server-side provenance. Handles remain the only stable
         # references visible to the Agent; benchmark/debug projections resolve
-        # the handle mapping outside the model prompt.
+        # the handle mapping outside the model prompt. Candidate-level fields
+        # the model does not need (rank, selection_reason, video source
+        # plumbing, status flags) stay server-side too.
+        _PREVIEW_VISIBLE_KEYS = ("handle", "captured_at", "place", "media_kind",
+                                 "people", "evidence_summary")
         compact["preview"] = [
-            {key: value for key, value in item.items() if key != "asset_id"}
+            {key: value for key, value in item.items() if key in _PREVIEW_VISIBLE_KEYS}
             if isinstance(item, dict) else item
             for item in compact["preview"]
         ]
@@ -124,6 +136,20 @@ def _model_visible_observation(observation: dict | None) -> dict:
                 "_retrieved_asset_ids", "_preview_asset_ids", "_source_asset_id"):
         compact.pop(key, None)
     return compact
+
+
+def _visible_observation_with_status(observation, *, status="ok", error=None):
+    """Add the uniform call_status (success/invalid) the Agent sees for a tool result.
+
+    Tool observations do not share a status vocabulary across tools; the Agent
+    only needs a binary signal of whether the call itself was accepted. denied /
+    error calls additionally surface a reason so the Agent can change strategy.
+    """
+    obs = _model_visible_observation(observation)
+    obs["call_status"] = "success" if status == "ok" else "invalid"
+    if status != "ok":
+        obs.setdefault("reason", error or "tool call not allowed")
+    return obs
 
 
 def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None) -> tuple[dict, str | None]:
@@ -681,14 +707,14 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         location_question = (not question_text or bool(re.search(
             r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text)))
         places = [item for item in assets if item.get("place")]
-        # GPS/reverse-geocode is a direct structured field.  For a location
-        # question the highest-ranked preview may therefore be used as a
-        # source even before visual validation; do not promote the rest of a
-        # broad candidate pool.
-        if places and not preview_evidence_allowed and location_question:
+        # GPS/reverse-geocode is a direct structured field of the photo itself,
+        # not a model guess. "Photo X was taken in P" is a fact regardless of
+        # whether X is the right photo for the question, so it may anchor a
+        # location requirement even before visual validation. Only the
+        # top-ranked candidate is promoted — promoting the whole candidate
+        # pool would surface a many-place "answer" from an unvalidated set.
+        if not preview_evidence_allowed:
             places = places[:1]
-        elif not preview_evidence_allowed:
-            places = []
         if places:
             evidence_rows.append({
                 "evidence_type": "location_metadata",
@@ -700,10 +726,12 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         date_question = (not question_text or bool(re.search(
             r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text)))
         dates = [item for item in assets if item.get("captured_at")]
-        if dates and not preview_evidence_allowed and date_question:
+        # Same reasoning: EXIF captured_at is a deterministic timestamp of the
+        # photo, not a candidate guess, so it anchors temporal_metadata even
+        # when the retrieval was not validated. Keep only the top candidate to
+        # avoid conflicting dates from an unvalidated pool.
+        if not preview_evidence_allowed:
             dates = dates[:1]
-        elif not preview_evidence_allowed:
-            dates = []
         if dates:
             evidence_rows.append({
                 "evidence_type": "temporal_metadata",
@@ -1800,12 +1828,17 @@ class AgentRuntime:
             system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
                                             current_time=current_time_line())
         messages = [{"role": "system", "content": system}]
+        # [Qwen 兼容] Qwen3.5/3.8 chat template 严格要求 system 只能出现在第一条
+        # （任何后续 system 直接 raise "System message must be at the beginning"）。
+        # result_set/history/summary/active_lines 全部合并进第一条 system，不追加
+        # 第二条 system。合并内容另存一份，供工具执行后刷新 JIT 时保留。
+        system_extra = []
         if task.current_result_set:
             # B3.1：跨 turn 续接同一结果集，让模型知道当前可分页的结果集
             from .tools import result_set_context
             ctx = result_set_context(task.current_result_set, self.scope_id)
             if ctx:
-                messages.append({"role": "system", "content": ctx})
+                system_extra.append(ctx)
         if selected_handle:
             # Phase C C15：用户点选了结果集里的照片，模型可直接用该 handle 复核/交付原图
             ctx = f"用户当前选中了照片（handle={selected_handle}）"
@@ -1814,11 +1847,11 @@ class AgentRuntime:
             ctx += ("。问'这张/原图/里面有几个人'时，直接用 "
                     f"get_original_photos(handle={selected_handle}) 或 "
                     f"inspect_photo(asset_handle={selected_handle})，不要重新全库搜索。")
-            messages.append({"role": "system", "content": ctx})
+            system_extra.append(ctx)
         if history:
-            messages.append({"role": "system", "content": f"最近对话：\n{history}"})
+            system_extra.append(f"最近对话：\n{history}")
         if conversation_summary:
-            messages.append({"role": "system", "content": f"本会话摘要：\n{conversation_summary}"})
+            system_extra.append(f"本会话摘要：\n{conversation_summary}")
         active_lines = []
         if task.active_person:
             active_lines.append(f"当前关注人物：{task.active_person}")
@@ -1831,7 +1864,10 @@ class AgentRuntime:
         if task.open_questions:
             active_lines.append("未解决问题：" + "、".join(str(q) for q in task.open_questions[:5]))
         if active_lines:
-            messages.append({"role": "system", "content": "当前上下文：\n" + "\n".join(active_lines)})
+            system_extra.append("当前上下文：\n" + "\n".join(active_lines))
+        if system_extra:
+            messages[0]["content"] = system + "\n\n" + "\n\n".join(system_extra)
+        self._system_extra_parts = system_extra
         messages.append({"role": "user", "content": message})
         self._emit_progress(turn, progress_callback, stage="thinking", status="running",
                             text="正在理解你的问题…")
@@ -2060,7 +2096,7 @@ class AgentRuntime:
             # normal user turn that remains model-visible.
             messages.append({"role": "user", "content": (
                 f"工具 {tool_name}（{call_id}）返回：\n" +
-                json.dumps(_model_visible_observation(observation), ensure_ascii=False)
+                json.dumps(_visible_observation_with_status(observation), ensure_ascii=False)
             )})
             return True
 
@@ -2090,10 +2126,23 @@ class AgentRuntime:
         answer_context = None
         answer_writer_pending = False
         answer_writer_messages = None
+        writer_soft_reminded = 0
         while True:
             if answer_writer_pending and answer_writer_messages:
                 if not turn.budget.can_model_step():
                     answer_writer_pending = False
+                elif writer_soft_reminded < 2:
+                    # [2.2] 软提醒代替强制 writer 接管:证据已齐备时引导模型
+                    # 基于完整对话自己输出 final,保留模型已掌握的上下文,
+                    # 也避免证据被异常判定时 writer 基于错误材料生成。
+                    # 软提醒后模型仍调工具则继续循环;累计提醒 2 次仍不
+                    # final 才兜底 writer。
+                    writer_soft_reminded += 1
+                    answer_writer_pending = False
+                    messages.append({"role": "user", "content": (
+                        "所需证据已齐备。请直接整理并输出 final 回答，不要再调用新工具。"
+                    )})
+                    continue
                 else:
                     turn.budget.record_model_step()
                     try:
@@ -2438,11 +2487,10 @@ class AgentRuntime:
                                     state.requirement.id for state in unattempted
                                 ],
                             })
-                            turn.final_answer = "现有证据不足，无法确认。"
-                            turn.status = "partial"
-                            turn.reason = "agent2_unattempted_evidence"
-                            turn.termination_reason = "evidence_gate_blocked_unattempted"
-                            break
+                            # [2.3] 软放行:不再替换模型答案、不终止循环——保留已产出的
+                            # final_answer,由后续 G3 保存 + guard/judge 质量检查兜底。
+                            # gate 职责收窄为"无依据禁猜",不再否决有理有据的答案。
+                            turn.soft_gate_release = "unattempted_evidence"
                         grounded_context = answer_context
                         if grounded_context is None:
                             try:
@@ -2463,13 +2511,12 @@ class AgentRuntime:
                         else:
                             final_gate.update({
                                 "decision": "block",
+                                "soft_release": True,
                                 "available_tools": [spec.name for spec in available],
                             })
-                            turn.final_answer = "现有证据不足，无法确认。"
-                            turn.status = "partial"
-                            turn.reason = "agent2_insufficient_evidence"
-                            turn.termination_reason = "evidence_gate_blocked"
-                            break
+                            # [2.3] 软放行:不再替换答案、不 break——模型答案由 G3 保存,
+                            # 真实性由 guard/judge 兜底。
+                            turn.soft_gate_release = "insufficient_evidence"
                 # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
                 if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
                     open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
@@ -2857,8 +2904,10 @@ class AgentRuntime:
                                                  "content": _model_visible_action(action)})
                                 messages.append({"role": "user", "content": (
                                     f"工具 {recovery_tool}（恢复结果）返回：\n" +
-                                    json.dumps(_model_visible_observation(
-                                        auto_decision.observation), ensure_ascii=False)
+                                    json.dumps(_visible_observation_with_status(
+                                        auto_decision.observation,
+                                        status=("ok" if auto_decision.allowed else "denied"),
+                                        error=auto_decision.error), ensure_ascii=False)
                                 )})
                                 messages.append({"role": "user", "content": (
                                     "我重新读取了一次照片，请基于新的工具观察，直接输出一个修正后的 final。"
@@ -2967,7 +3016,7 @@ class AgentRuntime:
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     messages.append({"role": "user", "content": (
                         f"工具 {tool_name}（缓存结果）返回：\n" +
-                        json.dumps(_model_visible_observation(cached_observation), ensure_ascii=False)
+                        json.dumps(_visible_observation_with_status(cached_observation), ensure_ascii=False)
                     )})
                     messages.append({"role": "user", "content": (
                         "这是你刚才相同工具调用的已缓存结果，不需要再次调用。"
@@ -3070,6 +3119,17 @@ class AgentRuntime:
                 stage="tool_result" if result.status == "ok" else "tool_error",
                 status=result.status, text=emit_text)
             if not decision.allowed:
+                # [选B] denied 调用也必须让模型可见（call_status=invalid）——静默吞掉会让
+                # 模型以为自己成功、无法调整策略，SFT 轨迹里也永远学不到"无效调用"。
+                denied_obs = {"call_status": "invalid",
+                              "reason": str(result.error or decision.reason
+                                            or "tool call not allowed")}
+                messages.append({"role": "assistant",
+                                 "content": _model_visible_action(action)})
+                messages.append({"role": "user", "content": (
+                    f"工具 {tool_name} 返回：\n" +
+                    json.dumps(denied_obs, ensure_ascii=False)
+                )})
                 if agent2_task_state is not None:
                     turn.steps[-1]["standardized_evidence"] = []
                     turn.steps[-1]["evidence_ids"] = []
@@ -3185,7 +3245,7 @@ class AgentRuntime:
             # Observation 进入下一步模型上下文
             # Candidate 模式下根据最新 TaskState 动态更新首条 JIT System Prompt
             if is_candidate_mode and agent2_task_state is not None:
-                messages[0]["content"] = build_jit_system_prompt(
+                _new_jit = build_jit_system_prompt(
                     task_state=agent2_task_state,
                     current_time_str=current_time_line(),
                     tool_results=task.tool_results,
@@ -3193,13 +3253,20 @@ class AgentRuntime:
                     is_candidate=True,
                     allowed_tool_names=self.profile.tools,
                 )
+                # 保留已合并的 result_set/history/summary/active_lines——Qwen
+                # 只允许第一条 system,不能把 history 再拆成第二条 system。
+                _extra = list(getattr(self, "_system_extra_parts", None) or [])
+                if _extra:
+                    _new_jit = _new_jit + "\n\n" + "\n\n".join(_extra)
+                messages[0]["content"] = _new_jit
             messages.append({"role": "assistant", "content": _model_visible_action(action)})
             # See the strict-provider compatibility note above: observations
             # use a regular user turn because the assistant action is not a
             # native tool_calls object.
             messages.append({"role": "user", "content": (
                 f"工具 {tool_name} 返回：\n" +
-                json.dumps(_model_visible_observation(result.observation), ensure_ascii=False)
+                json.dumps(_visible_observation_with_status(
+                    result.observation, status=result.status, error=result.error), ensure_ascii=False)
             )})
             if self.profile.features.get("agent2_authoritative"):
                 failed_resolution = None

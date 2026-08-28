@@ -4737,6 +4737,76 @@ class OrchestratorRepository:
                 return _ast.literal_eval(value)
             except Exception:
                 return value
+        decoder = json.JSONDecoder()
+        _SUPPORTED_CERTAINTIES = {"supported", "confirmed", "full_support"}
+
+        def _inject_tool_call_status(messages, tool_steps):
+            """Backfill the uniform call_status into '工具 xx 返回' user turns.
+
+            Live runs already carry it (runtime injects it); old runs recorded
+            before the field existed get it derived from the matching tool step.
+            Tool calls and their result turns are appended in lock-step, so the
+            step order matches the message order.
+            """
+            out = []
+            ti = 0
+            for m in messages:
+                if not isinstance(m, dict):
+                    out.append(m)
+                    continue
+                content = str(m.get("content") or "")
+                if (m.get("role") == "user" and content.startswith("工具 ")
+                        and "返回：" in content):
+                    sep = "返回：\n"
+                    idx = content.find(sep)
+                    if idx >= 0 and ti < len(tool_steps):
+                        obs_part = content[idx + len(sep):]
+                        try:
+                            obs = json.loads(obs_part)
+                            if isinstance(obs, dict) and "call_status" not in obs:
+                                st = tool_steps[ti].get("status") or "ok"
+                                obs["call_status"] = "success" if st == "ok" else "invalid"
+                                if st != "ok" and not obs.get("reason"):
+                                    obs["reason"] = tool_steps[ti].get("error") \
+                                        or "tool call not allowed"
+                                m = dict(m)
+                                m["content"] = content[:idx + len(sep)] + \
+                                    json.dumps(obs, ensure_ascii=False)
+                        except Exception:
+                            pass
+                        ti += 1
+                out.append(m)
+            return out
+
+        def _inject_writer_valid(messages):
+            """Backfill binary valid onto writer facts (old runs lack the field)."""
+            out = []
+            for m in messages:
+                if not isinstance(m, dict):
+                    out.append(m)
+                    continue
+                content = str(m.get("content") or "")
+                if m.get("role") == "user" and "最小答案材料" in content:
+                    jstart = content.find('{"facts"')
+                    if jstart >= 0:
+                        try:
+                            obj, end = decoder.raw_decode(content[jstart:])
+                            if isinstance(obj, dict) and isinstance(obj.get("facts"), list):
+                                changed = False
+                                for fact in obj["facts"]:
+                                    if isinstance(fact, dict) and "valid" not in fact:
+                                        fact["valid"] = str(fact.get("certainty") or "") \
+                                            in _SUPPORTED_CERTAINTIES
+                                        changed = True
+                                if changed:
+                                    m = dict(m)
+                                    m["content"] = content[:jstart] + \
+                                        json.dumps(obj, ensure_ascii=False) + \
+                                        content[jstart + end:]
+                        except Exception:
+                            pass
+                out.append(m)
+            return out
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
@@ -4755,71 +4825,52 @@ class OrchestratorRepository:
                     if item_score is None or item_score < min_score:
                         continue
                 qa_id = item.get("qa_id")
-                turns_out = []
+                planner = {"prompt": None, "raw": None, "declaration": None}
+                model_samples = []
+                writer_samples = []
                 for turn in (item.get("runtime_turns") or []):
-                    steps_out = []
-                    for step in (turn.get("debug_trace") or []):
+                    debug_trace = turn.get("debug_trace") or []
+                    tool_steps = [s for s in debug_trace
+                                  if isinstance(s, dict) and s.get("type") == "tool"]
+                    for step in debug_trace:
                         if not isinstance(step, dict):
                             continue
-                        st = dict(step)
-                        if isinstance(st.get("arguments"), str):
-                            st["arguments"] = _parse(st["arguments"])
-                        if isinstance(st.get("observation"), str):
-                            st["observation"] = _parse(st["observation"])
-                        steps_out.append(st)
-                    turns_out.append({
-                        "turn": turn.get("index"),
-                        "message": turn.get("message"),
-                        "expected_action": turn.get("expected_action"),
-                        "answer": turn.get("answer"),
-                        "agent_status": turn.get("agent_status"),
-                        "turn_outcome": turn.get("turn_outcome"),
-                        "steps": steps_out,
-                    })
-                    # SFT prompt->response 样本（兼容旧格式；完整轨迹见 items）
-                    for step in (turn.get("debug_trace") or []):
-                        if not isinstance(step, dict) or step.get("type") != "model":
+                        if step.get("type") == "planner":
+                            planner["prompt"] = step.get("prompt")
+                            planner["raw"] = step.get("raw_full") or step.get("raw")
                             continue
                         prompt = step.get("prompt")
                         response = step.get("raw_full") or step.get("raw")
                         if not prompt or not isinstance(response, str) or not response.strip():
                             continue
                         messages = list(prompt) if isinstance(prompt, list) else []
-                        messages.append({"role": "assistant", "content": response})
-                        samples.append({
-                            "qa_id": qa_id,
-                            "turn": turn.get("index"),
-                            "step": step.get("step_id") or step.get("status", "complete"),
-                            "messages": messages,
-                        })
+                        if step.get("type") == "writer":
+                            messages = _inject_writer_valid(messages)
+                            messages.append({"role": "assistant", "content": response})
+                            writer_samples.append({
+                                "step": step.get("step_id") or "answer_writer",
+                                "kind": "writer",
+                                "messages": messages,
+                            })
+                        elif step.get("type") == "model":
+                            messages = _inject_tool_call_status(messages, tool_steps)
+                            messages.append({"role": "assistant", "content": response})
+                            model_samples.append({
+                                "step": step.get("step_id") or "model",
+                                "kind": "model",
+                                "messages": messages,
+                            })
+                planner["declaration"] = (item.get("agent2_trace") or {}).get("task_declaration")
+                samples_out = [*model_samples, *writer_samples]
                 items_out.append({
                     "qa_id": qa_id,
                     "question": item.get("question"),
-                    "expected_action": item.get("expected_action"),
-                    "answer": item.get("answer"),
-                    "judge": item.get("judge"),
-                    "task_judge": item.get("task_judge"),
-                    "retrieval": {k: item.get(k) for k in (
-                        "retrieval_recall", "retrieval_precision", "retrieval_f1",
-                        "media_retrieval_recall", "media_retrieval_precision", "media_retrieval_f1",
-                        "image_retrieval_recall", "image_retrieval_precision", "image_retrieval_f1",
-                        "video_retrieval_recall", "video_retrieval_precision", "video_retrieval_f1",
-                        "retrieval_media_refs", "answer_evidence_media_refs",
-                        "gt_media", "predicted_media", "retrieved_candidate_media", "evidence_source_media",
-                        "gt_images", "predicted_images", "predicted_file_names",
-                        "matched_file_names")},
-                    "agent_status": item.get("agent_status"),
-                    "termination_reason": item.get("termination_reason"),
-                    "turn_outcome": item.get("turn_outcome"),
-                    "timing_breakdown": item.get("timing_breakdown"),
-                    "agent_stability": item.get("agent_stability"),
-                    "answer_grounding": item.get("answer_grounding"),
-                    "tool_trace": item.get("tool_trace"),
-                    "agent2_trace": item.get("agent2_trace"),
-                    "turns": turns_out,
+                    "planner": planner,
+                    "samples": samples_out,
                 })
-            return {"run_id": run_id, "count": len(samples), "item_count": len(items_out),
-                    "items": items_out, "samples": samples,
+            return {"run_id": run_id, "count": sum(len(it["samples"]) for it in items_out),
+                    "item_count": len(items_out),
+                    "items": items_out,
                     "scores": sorted(include) if include is not None else None,
                     "min_score": min_score,
                     "filtered": (include is not None or min_score is not None)}
