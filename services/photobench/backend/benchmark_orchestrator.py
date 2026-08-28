@@ -20,8 +20,10 @@ import json
 import math
 import mimetypes
 import os
+import random
 import re
 import shutil
+import shlex
 import socket
 import ssl
 import threading
@@ -40,7 +42,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "results"
 DEFAULT_WEB_ROOT = PROJECT_ROOT / "frontend/dist"
-DEFAULT_SENTRIX_URL = os.environ.get("BENCH_SENTRIX_URL", "http://192.168.0.153:8091")
+RUNTIME_CONNECTION_CONFIG_PATH = PROJECT_ROOT / "config/runtime_connection.json"
+RUNTIME_CONNECTION_CONFIG_LOCK = threading.RLock()
+
+
+def _load_runtime_connection_config() -> dict:
+    try:
+        value = json.loads(RUNTIME_CONNECTION_CONFIG_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+RUNTIME_CONNECTION_CONFIG = _load_runtime_connection_config()
+DEFAULT_SENTRIX_URL = (
+    os.environ.get("BENCH_SENTRIX_URL")
+    or str(RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or "")
+    or "http://192.168.0.153:8091"
+)
 
 
 def local_lan_ip() -> str:
@@ -66,12 +85,23 @@ EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
 PERSIST_DEBOUNCE_SECONDS = max(
     0.05, float(os.environ.get("PHOTOBENCH_PERSIST_DEBOUNCE_SECONDS", "0.25"))
 )
-JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "3")))
-JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "1.0")))
+JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "6")))
+JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "5.0")))
 JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
     JUDGE_RETRY_BACKOFF_SECONDS,
-    float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_MAX_SECONDS", "8.0")),
+    float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_MAX_SECONDS", "60.0")),
 )
+JUDGE_REQUEST_INTERVAL_SECONDS = max(
+    0.0, float(os.environ.get("PHOTOBENCH_JUDGE_REQUEST_INTERVAL_SECONDS", "0.5"))
+)
+
+
+def _judge_thinking_kwargs(judge_url: str | None) -> dict:
+    """Disable cloud-provider reasoning while preserving local judge payloads."""
+    endpoint = str(judge_url or "").lower()
+    if "volces.com" in endpoint or "volcengine.com" in endpoint:
+        return {"thinking": {"type": "disabled"}}
+    return {"enable_thinking": False}
 
 
 def _load_judge_providers():
@@ -90,11 +120,19 @@ def _load_judge_providers():
 
 
 def _public_judge_providers(providers: dict[str, dict]) -> list[dict]:
-    return [
-        {"id": pid, "label": p.get("label") or pid, "model": p.get("model") or "",
-         "url": p.get("url") or "", "supports_vision": p.get("supports_vision", False)}
-        for pid, p in sorted(providers.items())
-    ]
+    result = []
+    for pid, provider in sorted(providers.items()):
+        _, url, model, api_key = resolve_judge_provider(pid)
+        result.append({
+            "id": pid,
+            "label": provider.get("label") or pid,
+            "model": model,
+            "url": url,
+            "supports_vision": provider.get("supports_vision", False),
+            "api_key_set": bool(api_key),
+            "api_key_hint": _secret_hint(api_key),
+        })
+    return result
 
 
 def resolve_judge_provider(provider_id: str | None) -> tuple[str, str, str, str]:
@@ -102,20 +140,71 @@ def resolve_judge_provider(provider_id: str | None) -> tuple[str, str, str, str]
     provider = JUDGE_PROVIDERS.get(selected)
     if not provider:
         raise ValueError(f"unknown judge provider: {selected}")
-    return selected, str(provider.get("url") or ""), str(provider.get("model") or ""), str(provider.get("api_key") or "")
+    configured_id = str(RUNTIME_CONNECTION_CONFIG.get("judge_provider_id") or "").strip()
+    use_runtime_override = not configured_id or selected == configured_id
+    url = str(provider.get("url") or "")
+    model = str(provider.get("model") or "")
+    if use_runtime_override:
+        url = str(RUNTIME_CONNECTION_CONFIG.get("judge_url") or url)
+        model = str(RUNTIME_CONNECTION_CONFIG.get("judge_model") or model)
+    api_key = os.getenv("BENCH_JUDGE_API_KEY")
+    if api_key is None:
+        api_key = str(provider.get("api_key") or "")
+    return selected, url, model, api_key
 
 
 DEFAULT_JUDGE_PROVIDER_ID, JUDGE_PROVIDERS = _load_judge_providers()
+_configured_judge_provider_id = str(RUNTIME_CONNECTION_CONFIG.get("judge_provider_id") or "").strip()
+if _configured_judge_provider_id in JUDGE_PROVIDERS:
+    DEFAULT_JUDGE_PROVIDER_ID = _configured_judge_provider_id
 _, _P_URL, _P_MODEL, _P_KEY = resolve_judge_provider(None)
-DEFAULT_JUDGE_URL = os.environ.get("BENCH_JUDGE_URL") or _P_URL
-DEFAULT_VLLM_API_URL = os.environ.get("BENCH_VLLM_API_URL", "http://192.168.0.153:8500")
-DEFAULT_VLLM_BASE_URL = os.environ.get("BENCH_VLLM_BASE_URL", "http://192.168.0.153:8105/v1")
+DEFAULT_JUDGE_URL = (
+    os.environ.get("BENCH_JUDGE_URL")
+    or str(RUNTIME_CONNECTION_CONFIG.get("judge_url") or "")
+    or _P_URL
+)
+DEFAULT_VLLM_API_URL = (
+    os.environ.get("BENCH_VLLM_API_URL")
+    or (str(RUNTIME_CONNECTION_CONFIG.get("vllm_manager_url"))
+        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://192.168.0.153:8500")
+)
+DEFAULT_VLLM_BASE_URL = (
+    os.environ.get("BENCH_VLLM_BASE_URL")
+    or (str(RUNTIME_CONNECTION_CONFIG.get("model_base_url"))
+        if "model_base_url" in RUNTIME_CONNECTION_CONFIG else "")
+    or ""
+)
 BIG_MODEL_PROFILE_ID = "big_model"
 BIG_MODEL_BASE_URL = os.environ.get("BENCH_BIG_MODEL_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3")
 BIG_MODEL_MODEL = os.environ.get("BENCH_BIG_MODEL_MODEL", "doubao-seed-2.0-lite")
 BIG_MODEL_ENABLED = os.environ.get("BENCH_BIG_MODEL_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
-JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL") or _P_MODEL
-JUDGE_API_KEY = os.environ.get("BENCH_JUDGE_API_KEY") or _P_KEY
+JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL") or str(RUNTIME_CONNECTION_CONFIG.get("judge_model") or "") or _P_MODEL
+JUDGE_API_KEY = os.environ.get("BENCH_JUDGE_API_KEY") if os.environ.get("BENCH_JUDGE_API_KEY") is not None else _P_KEY
+
+
+def _secret_hint(value: str | None) -> str:
+    secret = str(value or "")
+    if not secret:
+        return ""
+    if len(secret) <= 4:
+        return "*" * len(secret)
+    return f"{secret[:2]}{'*' * min(8, len(secret) - 4)}{secret[-2:]}"
+
+
+def _write_local_env_secret(name: str, value: str) -> None:
+    """Update one secret in the evaluator's localhost dotenv file."""
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{name} must be a single-line value")
+    env_path = PROJECT_ROOT / ".env.local"
+    existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    prefix = f"{name}="
+    lines = [line for line in existing if not line.startswith(prefix)]
+    if value:
+        lines.append(f"{name}={shlex.quote(value)}")
+    temporary = env_path.with_name(f"{env_path.name}.tmp.{os.getpid()}")
+    temporary.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, env_path)
 
 
 def load_vllm_targets() -> tuple[str, dict[str, dict]]:
@@ -131,6 +220,10 @@ def load_vllm_targets() -> tuple[str, dict[str, dict]]:
 
 
 DEFAULT_VLLM_TARGET_ID, VLLM_TARGETS = load_vllm_targets()
+if not DEFAULT_VLLM_BASE_URL and "model_base_url" not in RUNTIME_CONNECTION_CONFIG:
+    DEFAULT_VLLM_BASE_URL = str(
+        VLLM_TARGETS.get(DEFAULT_VLLM_TARGET_ID, {}).get("model_base_url") or ""
+    ).rstrip("/")
 
 
 def resolve_vllm_target(target_id: str | None) -> tuple[str, dict]:
@@ -139,6 +232,92 @@ def resolve_vllm_target(target_id: str | None) -> tuple[str, dict]:
     if not target:
         raise ValueError(f"unknown vLLM target: {selected}")
     return selected, target
+
+
+def normalize_model_base_url(value: str | None) -> str:
+    """Normalize a user-entered model endpoint to an OpenAI /v1 base URL."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "http://" + raw
+    raw = raw.rstrip("/")
+    return raw if re.search(r"/v\d+$", raw, flags=re.IGNORECASE) else f"{raw}/v1"
+
+
+def normalize_service_url(value: str | None) -> str:
+    """Normalize a user-entered HTTP service URL without adding an API path."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "http://" + raw
+    return raw.rstrip("/")
+
+
+def _validated_service_url(value: str | None, label: str, *, optional: bool = False) -> str:
+    normalized = normalize_service_url(value)
+    if not normalized and optional:
+        return ""
+    parsed = urlparse(normalized)
+    if not parsed.netloc:
+        raise ValueError(f"{label} must be a host:port or HTTP(S) URL")
+    return normalized
+
+
+def public_runtime_connection_config() -> dict:
+    return {
+        "sentrix_url": DEFAULT_SENTRIX_URL,
+        "judge_url": DEFAULT_JUDGE_URL,
+        "judge_model": JUDGE_MODEL,
+        "judge_api_key_set": bool(JUDGE_API_KEY),
+        "judge_api_key_hint": _secret_hint(JUDGE_API_KEY),
+        "vllm_manager_url": (
+            str(RUNTIME_CONNECTION_CONFIG["vllm_manager_url"])
+            if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else DEFAULT_VLLM_API_URL
+        ),
+        "model_base_url": (
+            str(RUNTIME_CONNECTION_CONFIG["model_base_url"])
+            if "model_base_url" in RUNTIME_CONNECTION_CONFIG else DEFAULT_VLLM_BASE_URL
+        ),
+        "judge_provider_id": DEFAULT_JUDGE_PROVIDER_ID,
+    }
+
+
+def persist_runtime_connection_config(payload: dict) -> dict:
+    """Persist only non-secret connection settings and return their effective values."""
+    provider_id = str(payload.get("judge_provider_id") or DEFAULT_JUDGE_PROVIDER_ID).strip()
+    if provider_id not in JUDGE_PROVIDERS:
+        raise ValueError(f"unknown judge provider: {provider_id}")
+    values = {
+        "sentrix_url": _validated_service_url(payload.get("sentrix_url"), "Sentrix URL"),
+        "judge_url": _validated_service_url(payload.get("judge_url"), "Judge URL"),
+        "judge_model": str(payload.get("judge_model") or "").strip(),
+        "vllm_manager_url": _validated_service_url(
+            payload.get("vllm_manager_url"), "vLLM Manager URL", optional=True
+        ),
+        "model_base_url": normalize_model_base_url(payload.get("model_base_url")),
+        "judge_provider_id": provider_id,
+    }
+    if not values["judge_model"]:
+        raise ValueError("Judge model is required")
+    temporary = RUNTIME_CONNECTION_CONFIG_PATH.with_name(
+        f"{RUNTIME_CONNECTION_CONFIG_PATH.name}.tmp.{os.getpid()}"
+    )
+    with RUNTIME_CONNECTION_CONFIG_LOCK:
+        RUNTIME_CONNECTION_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, RUNTIME_CONNECTION_CONFIG_PATH)
+        RUNTIME_CONNECTION_CONFIG.clear()
+        RUNTIME_CONNECTION_CONFIG.update(values)
+        global JUDGE_API_KEY, JUDGE_MODEL
+        if "judge_api_key" in payload:
+            secret = str(payload.get("judge_api_key") or "")
+            _write_local_env_secret("BENCH_JUDGE_API_KEY", secret)
+            os.environ["BENCH_JUDGE_API_KEY"] = secret
+            JUDGE_API_KEY = secret
+        JUDGE_MODEL = values["judge_model"]
+    return public_runtime_connection_config()
 
 JUDGE_PROMPT = """你是通用对话任务的回答质量评测员。根据截至当前轮的完整对话、当前问题、预期行为、可回答性、模型回答和参考答案，对“模型是否有效完成用户本轮任务”打 0/1/2 分。
 
@@ -427,8 +606,24 @@ def request_json(url: str, payload=None, method: str = "GET", timeout: int = 120
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")[:2000]
+        detail = raw.strip()
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                detail = parsed.get("detail") or parsed.get("error") or parsed.get("message") or parsed
+            else:
+                detail = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if isinstance(detail, (dict, list)):
+            detail = json.dumps(detail, ensure_ascii=False)
+        detail = str(detail or exc.reason or "request failed")[:1000]
+        raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {detail}") from exc
 
 
 def request_text(url: str, timeout: int = 120) -> str:
@@ -571,7 +766,58 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, c
     raise TimeoutError(f"assistant turn {turn_id} did not complete within {timeout}s")
 
 
-def _extract_image_sets(result: dict) -> dict[str, list[str]]:
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+
+
+def _infer_media_type(value: object, explicit: object = None) -> str:
+    media_type = str(explicit or "").strip().lower()
+    if media_type in {"image", "video"}:
+        return media_type
+    text = str(value or "").strip()
+    suffix = Path(text.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS or re.fullmatch(r"video-\d+", Path(text).name, re.I):
+        return "video"
+    return "image"
+
+
+def _media_key(media_type: object, media_id: object) -> tuple[str, str]:
+    """Return the stable comparison key used by GT and retrieved assets."""
+    kind = _infer_media_type(media_id, media_type)
+    name = Path(str(media_id or "").split("?", 1)[0].split("#", 1)[0]).name
+    canonical = Path(name).stem if kind == "video" else name
+    return kind, canonical.casefold()
+
+
+def _normalize_media_refs(record: dict, prefix: str = "retrieval") -> list[dict[str, str]]:
+    """Read typed refs first, then deterministically upgrade legacy ID fields."""
+    refs = record.get(f"{prefix}_media_refs")
+    candidates: list[tuple[object, object]] = []
+    if isinstance(refs, list):
+        for ref in refs:
+            if isinstance(ref, dict):
+                candidates.append((ref.get("media_type"), ref.get("media_id") or ref.get("id")))
+    else:
+        for value in record.get(f"{prefix}_image_ids") or []:
+            candidates.append((None, value))
+        for value in record.get(f"{prefix}_video_ids") or []:
+            candidates.append(("video", value))
+
+    normalized = []
+    seen = set()
+    for explicit_type, value in candidates:
+        media_id = str(value or "").strip()
+        if not media_id:
+            continue
+        media_type = _infer_media_type(media_id, explicit_type)
+        key = _media_key(media_type, media_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"media_type": media_type, "media_id": media_id})
+    return normalized
+
+
+def _extract_media_sets(result: dict) -> dict[str, list[str]]:
     """Separate retrieval candidates, evidence sources, and user delivery.
 
     Debug candidate fields are intentionally used only for retrieval accounting;
@@ -650,9 +896,14 @@ def _extract_image_sets(result: dict) -> dict[str, list[str]]:
     }
 
 
+def _extract_image_sets(result: dict) -> dict[str, list[str]]:
+    """Backward-compatible alias for callers predating mixed-media support."""
+    return _extract_media_sets(result)
+
+
 def _extract_image_ids(result: dict) -> list[str]:
     """Backward-compatible delivery-only projection."""
-    return _extract_image_sets(result)["selected_asset_ids"]
+    return _extract_media_sets(result)["selected_asset_ids"]
 
 
 def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
@@ -711,8 +962,8 @@ def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
         str(item.get("album_id") or ""), str(item.get("model_profile") or "")))
 
 
-def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> list[dict]:
-    """Resolve returned asset IDs into the stable fields required by the UI."""
+def _resolve_predicted_media(asset_ids: list[str], assets_by_name: dict) -> list[dict]:
+    """Resolve returned asset IDs into typed records required by metrics and UI."""
     assets_by_id = {
         str(asset["id"]): (file_name, asset)
         for file_name, assets in assets_by_name.items()
@@ -720,16 +971,146 @@ def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> lis
         if asset.get("id")
     }
     resolved = []
-    for image_id in image_ids:
-        match = assets_by_id.get(str(image_id))
+    for asset_id in asset_ids:
+        match = assets_by_id.get(str(asset_id))
         if not match:
             continue
         file_name, asset = match
-        image = {"asset_id": str(image_id), "file_name": file_name}
+        media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
+        media = {
+            "asset_id": str(asset_id),
+            "file_name": file_name,
+            "media_type": media_type,
+            "media_id": Path(file_name).stem if media_type == "video" else file_name,
+        }
         if asset.get("media_url"):
-            image["media_url"] = asset["media_url"]
-        resolved.append(image)
+            media["media_url"] = asset["media_url"]
+        resolved.append(media)
     return resolved
+
+
+def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> list[dict]:
+    """Backward-compatible image-only projection."""
+    return [{key: item[key] for key in ("asset_id", "file_name", "media_url") if key in item}
+            for item in _resolve_predicted_media(image_ids, assets_by_name)
+            if item.get("media_type") == "image"]
+
+
+def _resolve_album_media_file(album_id: str, media_dir: str, file_name: str) -> Path | None:
+    media_root = (BENCHMARK_DATA_ROOT / album_id / media_dir).resolve()
+    media_path = (media_root / file_name).resolve()
+    if not media_path.is_relative_to(media_root) or not media_path.is_file():
+        return None
+    return media_path
+
+
+def _metric_triplet(gt_keys: set[tuple[str, str]], predicted_keys: set[tuple[str, str]]) -> dict:
+    matched = gt_keys & predicted_keys
+    recall = len(matched) / len(gt_keys) if gt_keys else None
+    precision = len(matched) / len(predicted_keys) if predicted_keys else (0.0 if gt_keys else None)
+    f1 = (2 * precision * recall / (precision + recall)) \
+        if precision is not None and recall is not None and precision + recall \
+        else (0.0 if gt_keys else None)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "matched": len(matched),
+        "predicted": len(predicted_keys),
+        "gt": len(gt_keys),
+    }
+
+
+def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict]) -> dict[str, dict]:
+    gt_keys = {_media_key(ref.get("media_type"), ref.get("media_id")) for ref in gt_refs}
+    predicted_keys = {
+        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
+        for item in predicted_media
+    }
+    result = {"media": _metric_triplet(gt_keys, predicted_keys)}
+    for media_type in ("image", "video"):
+        result[media_type] = _metric_triplet(
+            {key for key in gt_keys if key[0] == media_type},
+            {key for key in predicted_keys if key[0] == media_type},
+        )
+    return result
+
+
+def _micro_metrics_from_counts(items: list[dict], field: str) -> dict:
+    rows = [item.get(field) for item in items if isinstance(item.get(field), dict)
+            and int((item.get(field) or {}).get("gt") or 0) > 0]
+    gt = sum(int(row.get("gt") or 0) for row in rows)
+    predicted = sum(int(row.get("predicted") or 0) for row in rows)
+    matched = sum(int(row.get("matched") or 0) for row in rows)
+    precision = matched / predicted if predicted else (0.0 if gt else None)
+    recall = matched / gt if gt else None
+    f1 = 2 * precision * recall / (precision + recall) \
+        if precision is not None and recall is not None and precision + recall \
+        else (0.0 if gt else None)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "metric_count": len(rows),
+        "matched": matched,
+        "predicted": predicted,
+        "gt": gt,
+    }
+
+
+def _macro_metrics_from_counts(items: list[dict], field: str) -> dict:
+    rows = [item.get(field) for item in items if isinstance(item.get(field), dict)
+            and int((item.get(field) or {}).get("gt") or 0) > 0]
+    values = {"precision": [], "recall": [], "f1": []}
+    for row in rows:
+        gt = int(row.get("gt") or 0)
+        predicted = int(row.get("predicted") or 0)
+        matched = int(row.get("matched") or 0)
+        precision = matched / predicted if predicted else 0.0
+        recall = matched / gt
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        values["precision"].append(precision)
+        values["recall"].append(recall)
+        values["f1"].append(f1)
+    return {metric: sum(samples) / len(samples) if samples else None
+            for metric, samples in values.items()} | {"metric_count": len(rows)}
+
+
+def _retrieval_metric_eligible(item: dict) -> bool:
+    return str(item.get("answerability") or "").strip().lower() != "unanswerable"
+
+
+def _resolve_gt_media(gt_refs: list[dict], assets_by_name: dict,
+                      retrieved_media: list[dict]) -> list[dict]:
+    asset_index: dict[tuple[str, str], list[dict]] = {}
+    for file_name, assets in assets_by_name.items():
+        for asset in assets:
+            media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
+            asset_index.setdefault(_media_key(media_type, file_name), []).append(asset)
+    retrieved_keys = {
+        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
+        for item in retrieved_media
+    }
+    result = []
+    for ref in gt_refs:
+        media_type = ref["media_type"]
+        media_id = ref["media_id"]
+        key = _media_key(media_type, media_id)
+        candidates = asset_index.get(key, [])
+        file_name = Path(media_id).name
+        if media_type == "video" and Path(file_name).suffix.lower() not in VIDEO_EXTENSIONS:
+            file_name = f"{file_name}.mp4"
+        result.append({
+            "media_type": media_type,
+            "media_id": media_id,
+            "image_id": media_id if media_type == "image" else None,
+            "video_id": media_id if media_type == "video" else None,
+            "file_name": file_name,
+            "asset_id": candidates[0].get("id") if len(candidates) == 1 else None,
+            "matched": key in retrieved_keys,
+            "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous",
+        })
+    return result
 
 
 def _execution_failure(agent_status: str | None, termination_reason: str | None) -> bool:
@@ -1107,6 +1488,8 @@ class BenchmarkRun:
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
         self.results_root = results_root
         self.lock = threading.RLock()
+        self._judge_rate_lock = threading.Lock()
+        self._judge_next_request_at = 0.0
         # 复用/构建模式的产物相册必须保留，绝不允许 delete_scope 清掉。
         self.delete_scope_after_run = bool(delete_scope_after_run) and mode == "full"
 
@@ -1307,6 +1690,10 @@ class BenchmarkRun:
             for k, v in extra.items():
                 self._record_phase(phase, k, v)
 
+    def _phase_partial(self, phase: str, extra: dict | None = None):
+        self._phase_done(phase, extra)
+        self._record_phase(phase, "status", "partial")
+
     def _hardware_snapshot(self) -> dict:
         """Use existing Manager endpoints; absence is recorded, never inferred from logs."""
         if self.use_cloud_model:
@@ -1315,6 +1702,13 @@ class BenchmarkRun:
                 "source": "cloud_api",
                 "status": "not_applicable",
                 "reason": "cloud_api_has_no_local_gpu_metrics",
+            }
+        if not self.vllm_api_url:
+            return {
+                "captured_at": now_iso(),
+                "source": "external",
+                "status": "not_applicable",
+                "reason": "external model endpoint has no manager metrics",
             }
         snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
         try:
@@ -1367,7 +1761,11 @@ class BenchmarkRun:
                     self._record_phase(self._current_phase, "status", "cancelled")
                 self.state["status"] = "cancelled"
             else:
-                self.state["status"] = "completed"
+                has_partial_phase = any(
+                    phase.get("status") == "partial"
+                    for phase in (self.state.get("phases") or {}).values()
+                )
+                self.state["status"] = "completed_with_errors" if has_partial_phase else "completed"
         except RunCancelledError:
             if self._current_phase:
                 self._record_phase(self._current_phase, "status", "cancelled")
@@ -1384,7 +1782,7 @@ class BenchmarkRun:
             self.state["fatal_error"] = str(e)
             traceback.print_exc()
         finally:
-            if not self.use_cloud_model:
+            if not self.use_cloud_model and self.vllm_api_url:
                 self._gpu_sampler.stop()
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
@@ -1700,30 +2098,75 @@ class BenchmarkRun:
         self._phase_start("photo_import")
         t0 = time.perf_counter()
         media_relpaths = album_media_entries(self.manifest)
+        total_media_count = len(media_relpaths)
         media_paths = [self.album_dir / p for p in media_relpaths]
         missing = [rel for rel, path in zip(media_relpaths, media_paths) if not path.is_file()]
-        if missing:
-            raise FileNotFoundError(f"album media missing: {missing[:8]}")
+        media_paths = [path for path in media_paths if path.is_file()]
         photo_count = len(self.manifest.get("photos") or [])
         video_count = len(self.manifest.get("videos") or [])
         chunk_size = max(1, int(os.getenv("PHOTOBENCH_IMPORT_CHUNK_SIZE", "8")))
         upload_workers = max(1, int(os.getenv("PHOTOBENCH_IMPORT_UPLOAD_WORKERS", "2")))
+        max_upload_attempts = max(1, int(os.getenv("PHOTOBENCH_IMPORT_MAX_ATTEMPTS", "3")))
         batch_id = f"batch_{uuid.uuid4().hex[:12]}"
         self.state["batch_id"] = batch_id
         self.persist()
-        items = []
+        items = [{
+            "accepted": False,
+            "fileName": rel,
+            "status": "missing",
+            "error_type": "FileNotFoundError",
+            "error": "Media file listed in manifest does not exist",
+        } for rel in missing]
 
         def upload_chunk(chunk_index, chunk):
             # Read bytes inside the bounded worker. Queued chunks retain only
             # paths, so a large album does not become a second in-memory copy.
-            files = [("files", path.name, path.read_bytes()) for path in chunk]
-            result = upload_files(
-                f"{self.sentrix_url}/api/import",
-                {"scope_id": self.state["scope_id"], "batch_id": batch_id,
-                 "deferBatchComplete": "true"},
-                files, 600,
-            )
-            return chunk_index, result
+            pending_paths = list(chunk)
+            results_by_name = {}
+            for attempt in range(1, max_upload_attempts + 1):
+                try:
+                    files = [("files", path.name, path.read_bytes()) for path in pending_paths]
+                    result = upload_files(
+                        f"{self.sentrix_url}/api/import",
+                        {"scope_id": self.state["scope_id"], "batch_id": batch_id,
+                         "deferBatchComplete": "true"},
+                        files, 600,
+                    )
+                    returned = {
+                        str(item.get("fileName") or item.get("file_name") or ""): item
+                        for item in (result.get("items") or []) if isinstance(item, dict)
+                    }
+                except Exception as exc:
+                    returned = {
+                        path.name: {
+                            "accepted": False,
+                            "fileName": path.name,
+                            "status": "failed",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                        for path in pending_paths
+                    }
+
+                retry_paths = []
+                for path in pending_paths:
+                    item = dict(returned.get(path.name) or {
+                        "accepted": False,
+                        "fileName": path.name,
+                        "status": "failed",
+                        "error_type": "missing_response_item",
+                        "error": "Sentrix import response omitted this media file",
+                    })
+                    item["upload_attempts"] = attempt
+                    if item.get("accepted") or item.get("status") == "rejected" or attempt == max_upload_attempts:
+                        results_by_name[path.name] = item
+                    else:
+                        retry_paths.append(path)
+                if not retry_paths:
+                    break
+                time.sleep(min(2 ** (attempt - 1), 4))
+                pending_paths = retry_paths
+            return chunk_index, {"items": [results_by_name[path.name] for path in chunk]}
 
         chunks = [
             (index, media_paths[offset:offset + chunk_size])
@@ -1734,12 +2177,21 @@ class BenchmarkRun:
             max_workers=upload_workers, thread_name_prefix="photobench-upload"
         ) as executor:
             pending = {
-                executor.submit(upload_chunk, chunk_index, chunk): chunk_index
+                executor.submit(upload_chunk, chunk_index, chunk): (chunk_index, chunk)
                 for chunk_index, chunk in chunks
             }
             for future in concurrent.futures.as_completed(tuple(pending)):
-                pending.pop(future, None)
-                chunk_index, result = future.result()
+                chunk_index, chunk = pending.pop(future)
+                try:
+                    _, result = future.result()
+                except Exception as exc:
+                    result = {"items": [{
+                        "accepted": False,
+                        "fileName": path.name,
+                        "status": "failed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    } for path in chunk]}
                 results_by_chunk[chunk_index] = result
                 completed_items = [
                     item for index in sorted(results_by_chunk)
@@ -1747,7 +2199,7 @@ class BenchmarkRun:
                 ]
                 self._record_phase("photo_import", "total_photos", photo_count)
                 self._record_phase("photo_import", "total_videos", video_count)
-                self._record_phase("photo_import", "total_media", len(media_paths))
+                self._record_phase("photo_import", "total_media", total_media_count)
                 self._record_phase(
                     "photo_import", "accepted_count",
                     sum(1 for item in completed_items if item.get("accepted")),
@@ -1766,27 +2218,46 @@ class BenchmarkRun:
             items.extend(results_by_chunk[chunk_index].get("items", []))
         if self._cancel.is_set():
             return
-        request_json(
-            f"{self.sentrix_url}/api/ingest-batches/{quote(batch_id)}/complete",
-            method="POST", timeout=60,
-        )
-        t1 = time.perf_counter()
         accepted = sum(1 for i in items if i.get("accepted"))
-        self._phase_done("photo_import", {
+        self.state["import_accepted_count"] = accepted
+        if accepted:
+            request_json(
+                f"{self.sentrix_url}/api/ingest-batches/{quote(batch_id)}/complete",
+                method="POST", timeout=60,
+            )
+        t1 = time.perf_counter()
+        rejected = [item for item in items if not item.get("accepted")]
+        phase_result = {
             "upload_seconds": round(t1 - t0, 1),
             "total_photos": photo_count,
             "total_videos": video_count,
-            "total_media": len(media_paths),
+            "total_media": total_media_count,
             "accepted_count": accepted,
+            "failed_count": len(rejected),
+            "error": f"{len(rejected)} media file(s) could not be imported" if rejected else None,
+            "error_details": [{
+                "sample_id": item.get("fileName") or item.get("file_name") or "unknown",
+                "status": item.get("status") or "failed",
+                "error_type": item.get("error_type") or "import_error",
+                "reason": str(item.get("error") or "Sentrix rejected the media file"),
+            } for item in rejected],
             "batch_id": batch_id,
             "chunk_size": chunk_size,
             "chunk_count": len(chunks),
             "upload_workers": upload_workers,
-        })
+            "max_upload_attempts": max_upload_attempts,
+            "retried_file_count": sum(
+                1 for item in items if int(item.get("upload_attempts") or 1) > 1
+            ),
+        }
+        if rejected:
+            self._phase_partial("photo_import", phase_result)
+        else:
+            self._phase_done("photo_import", phase_result)
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        if not self.use_cloud_model:
+        if not self.use_cloud_model and self.vllm_api_url:
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -1796,6 +2267,29 @@ class BenchmarkRun:
         batch_data = {}
         total = 0
         processed = 0
+        failed = 0
+        terminal_pipeline_error = None
+        assets = []
+        pending = []
+        if self.state.get("import_accepted_count") == 0:
+            self._phase_partial("pipeline_processing", {
+                "total_seconds": 0.0,
+                "poll_iterations": 0,
+                "processed_photo_count": 0,
+                "failed_asset_count": 0,
+                "skipped_asset_count": 0,
+                "error": "No imported media assets were available for processing",
+                "error_details": [{
+                    "sample_id": "media_batch",
+                    "status": "skipped",
+                    "error_type": "empty_import",
+                    "reason": "All media files failed during the import stage",
+                }],
+                "progress": {"total": 0, "processed": 0, "pending": 0, "failed": 0, "skipped": 0},
+                "average_seconds_per_photo": None,
+                "pipeline_metrics": {},
+            })
+            return
         try:
             stall_timeout_seconds = max(0, int(os.getenv(
                 "PHOTOBENCH_PIPELINE_STALL_TIMEOUT_SECONDS", "1200"
@@ -1824,6 +2318,7 @@ class BenchmarkRun:
                 except Exception:
                     batch_data = {}
             batch_status = (batch_data.get("batch") or {}).get("status")
+            pipeline_metrics = batch_data.get("pipeline_metrics") or {}
             status_counts = {}
             for asset in assets:
                 status = str(asset.get("status") or "unknown")
@@ -1853,11 +2348,12 @@ class BenchmarkRun:
                 "no_progress_seconds": round(no_progress_seconds, 1),
             })
             self.persist()
-            if batch_status == "failed":
-                raise RuntimeError(
-                    f"Sentrix ingest batch failed: batch={batch_id or '-'}, "
-                    f"processed={processed}/{total}, pending={len(pending)}, failed={failed}"
+            if batch_status == "failed" or pipeline_metrics.get("status") == "failed":
+                terminal_pipeline_error = str(
+                    pipeline_metrics.get("error")
+                    or f"Sentrix ingest batch entered status {batch_status}"
                 )
+                break
             if not pending and batch_status in {"completed", "complete"}:
                 stable_polls = getattr(self, "_pipeline_stable_polls", 0) + 1
                 self._pipeline_stable_polls = stable_polls
@@ -1892,27 +2388,69 @@ class BenchmarkRun:
                 self._record_phase("pipeline_processing", "stalled_at", now_iso())
                 self._record_phase("pipeline_processing", "stalled_progress", stall_progress)
                 self.persist()
-                raise RuntimeError(
+                terminal_pipeline_error = (
                     f"pipeline processing stalled: no asset status change for "
                     f"{no_progress_seconds:.0f}s (threshold {stall_timeout_seconds}s); "
                     f"processed={processed}/{total}, pending={len(pending)}, failed={failed}"
                 )
+                break
             if self._cancel.wait(3):
                 break
         t1 = time.perf_counter()
         total_seconds = round(t1 - t0, 1)
-        self._phase_done("pipeline_processing", {
+        failed_assets = [a for a in assets if a.get("status") in PIPELINE_FAILED_STATUSES]
+        skipped_assets = list(pending) if terminal_pipeline_error else []
+
+        def failure_detail(asset, default_reason):
+            metadata = asset.get("metadata_json") or {}
+            return {
+                "sample_id": asset.get("file_name") or asset.get("id") or "unknown",
+                "asset_id": asset.get("id"),
+                "status": asset.get("status") or "failed",
+                "error_type": metadata.get("failed_stage") or "pipeline_error",
+                "reason": str(metadata.get("error") or default_reason),
+            }
+
+        error_details = [
+            failure_detail(asset, "Asset processing failed") for asset in failed_assets
+        ] + [
+            failure_detail(asset, terminal_pipeline_error or "Batch processing stopped")
+            for asset in skipped_assets
+        ]
+        final_progress = {
+            "total": total,
+            "processed": processed,
+            "pending": 0 if terminal_pipeline_error else len(pending),
+            "failed": len(failed_assets),
+            "skipped": len(skipped_assets),
+            "poll_count": poll_count,
+            "status_counts": {
+                **((self.state.get("phases", {}).get("pipeline_processing", {}).get("progress") or {}).get("status_counts") or {}),
+            },
+        }
+        phase_result = {
             "total_seconds": total_seconds,
             "poll_iterations": poll_count,
             "processed_photo_count": processed,
+            "failed_asset_count": len(failed_assets),
+            "skipped_asset_count": len(skipped_assets),
+            "error": terminal_pipeline_error or (
+                f"{len(failed_assets)} asset(s) failed after retries" if failed_assets else None
+            ),
+            "error_details": error_details,
+            "progress": final_progress,
             "average_seconds_per_photo": round(total_seconds / processed, 3) if processed else None,
             "pipeline_metrics": batch_data.get("pipeline_metrics") or {},
-        })
+        }
+        if error_details or terminal_pipeline_error:
+            self._phase_partial("pipeline_processing", phase_result)
+        else:
+            self._phase_done("pipeline_processing", phase_result)
 
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
         # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
-        if not self.use_cloud_model and not self._gpu_sampling_started:
+        if not self.use_cloud_model and self.vllm_api_url and not self._gpu_sampling_started:
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -2005,7 +2543,7 @@ class BenchmarkRun:
                 self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
                 self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
                 self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
-                if not self.use_cloud_model:
+                if not self.use_cloud_model and self.vllm_api_url:
                     self._gpu_sampler.stop()
 
             while pending:
@@ -2102,11 +2640,27 @@ class BenchmarkRun:
                 self.persist()
 
         t1 = time.perf_counter()
-        self._phase_done("qa_eval", {
+        failed_items = [item for item in self.state["items"] if (
+            item.get("execution_status") in {"failed", "timeout"}
+            or item.get("judge_status") == "failed"
+        )]
+        qa_phase_result = {
             "total_seconds": round(t1 - t0, 1),
             "qa_concurrency": qa_concurrency,
             "judge_concurrency": judge_concurrency,
-        })
+            "failed_count": len(failed_items),
+            "error": f"{len(failed_items)} QA sample(s) failed or timed out" if failed_items else None,
+            "error_details": [{
+                "sample_id": item.get("qa_id") or item.get("id") or f"QA #{index + 1}",
+                "status": item.get("execution_status") or item.get("judge_status") or "failed",
+                "error_type": "judge_error" if item.get("judge_status") == "failed" else "agent_error",
+                "reason": str(item.get("error") or (item.get("judge") or {}).get("reason") or "QA execution failed"),
+            } for index, item in enumerate(failed_items)],
+        }
+        if failed_items:
+            self._phase_partial("qa_eval", qa_phase_result)
+        else:
+            self._phase_done("qa_eval", qa_phase_result)
 
     def _resolve_qa_concurrency(self) -> int:
         """QA-level concurrency: default follows the serving model's max_num_seqs snapshot."""
@@ -2133,7 +2687,7 @@ class BenchmarkRun:
                 return max(1, int(env_value))
             except ValueError:
                 pass
-        return max(1, int(qa_concurrency or 1))
+        return min(8, max(1, int(qa_concurrency or 1)))
 
     def _evaluate_one(self, row: dict, assets_by_name: dict) -> dict:
         t0 = time.perf_counter()
@@ -2144,12 +2698,23 @@ class BenchmarkRun:
         messages = [str(turn.get("message") or "").strip() for turn in conversation if isinstance(turn, dict)]
         query = messages[-1] if messages else str(row["question"])
         reference = str(row["answer"])
-        gt_ids = [str(v) for v in row.get("retrieval_image_ids", [])]
+        gt_refs = _normalize_media_refs(row, "retrieval")
+        gt_image_ids = [ref["media_id"] for ref in gt_refs if ref["media_type"] == "image"]
+        gt_video_ids = [ref["media_id"] for ref in gt_refs if ref["media_type"] == "video"]
+        answer_refs = _normalize_media_refs(row, "answer_evidence") or gt_refs
+        answer_image_ids = [ref["media_id"] for ref in answer_refs if ref["media_type"] == "image"]
+        answer_video_ids = [ref["media_id"] for ref in answer_refs if ref["media_type"] == "video"]
         item = {"qa_id": row.get("qa_id"), "question": query, "reference_answer": reference,
-                "retrieval_image_ids": gt_ids, "execution_status": "scheduled"}
-        for field in ("task_type", "question_type", "angle", "difficulty", "answerability",
+                "retrieval_media_refs": gt_refs,
+                "retrieval_image_ids": gt_image_ids,
+                "retrieval_video_ids": gt_video_ids,
+                "answer_evidence_media_refs": answer_refs,
+                "answer_evidence_image_ids": answer_image_ids,
+                "answer_evidence_video_ids": answer_video_ids,
+                "execution_status": "scheduled"}
+        for field in ("task_type", "question_type", "tags", "angle", "difficulty", "answerability",
                       "scope", "scope_anchor", "required_evidence_sources", "query_anchors",
-                      "expected_action"):
+                      "expected_action", "answer_claims", "alternative_evidence_media_sets"):
             if row.get(field) is not None:
                 item[field] = row[field]
         try:
@@ -2196,6 +2761,7 @@ class BenchmarkRun:
                     "turn_outcome": resp.get("turn_outcome") or _derive_turn_outcome(resp),
                     "parse_status": _derive_parse_status(resp),
                     "next_step": _derive_next_step(resp),
+                    "predicted_media": _resolve_predicted_media(_extract_image_ids(resp), assets_by_name),
                     "predicted_images": _resolve_predicted_images(_extract_image_ids(resp), assets_by_name),
                 })
             agent_wall_ms = round((time.perf_counter() - t_agent0) * 1000, 1)
@@ -2216,37 +2782,36 @@ class BenchmarkRun:
             # Keep retrieval, evidence, and final delivery independent. The
             # retrieval metric must not punish the UI for showing only a few
             # representative sources.
-            image_sets = _extract_image_sets(resp)
-            predicted_images = image_sets["selected_asset_ids"]
-            retrieved_images = image_sets["retrieved_asset_ids"]
-            evidence_images = image_sets["evidence_asset_ids"]
+            media_sets = _extract_media_sets(resp)
+            selected_media = _resolve_predicted_media(media_sets["selected_asset_ids"], assets_by_name)
+            retrieved_media = _resolve_predicted_media(media_sets["retrieved_asset_ids"], assets_by_name)
+            evidence_media = _resolve_predicted_media(media_sets["evidence_asset_ids"], assets_by_name)
 
             # Match against GT
-            gt_names = {Path(v).name for v in gt_ids}
-            predicted_image_records = _resolve_predicted_images(predicted_images, assets_by_name)
-            retrieved_image_records = _resolve_predicted_images(retrieved_images, assets_by_name)
-            evidence_image_records = _resolve_predicted_images(evidence_images, assets_by_name)
-            pred_names = {image["file_name"] for image in predicted_image_records}
-            retrieved_names = {image["file_name"] for image in retrieved_image_records}
-            evidence_names = {image["file_name"] for image in evidence_image_records}
-            matched = sorted(gt_names & retrieved_names)
-            delivery_matched = sorted(gt_names & pred_names)
-            evidence_matched = sorted(gt_names & evidence_names)
-            recall = len(matched) / len(gt_names) if gt_names else None
-            precision = len(matched) / len(retrieved_names) if retrieved_names else (0.0 if gt_names else None)
-            f1 = (2 * precision * recall / (precision + recall)) if precision is not None and recall is not None and precision + recall else 0.0 if gt_names else None
-            gt_images = []
-            for image_id in gt_ids:
-                file_name = Path(image_id).name
-                candidates = assets_by_name.get(file_name, [])
-                asset_id = candidates[0].get("id") if len(candidates) == 1 else None
-                gt_images.append({
-                    "image_id": image_id,
-                    "file_name": file_name,
-                    "asset_id": asset_id,
-                    "matched": file_name in retrieved_names,
-                    "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous",
-                })
+            metrics = _modality_metrics(gt_refs, retrieved_media)
+            gt_media = _resolve_gt_media(gt_refs, assets_by_name, retrieved_media)
+            retrieved_keys = {
+                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                for value in retrieved_media
+            }
+            evidence_keys = {
+                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                for value in evidence_media
+            }
+            selected_keys = {
+                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                for value in selected_media
+            }
+            matched = sorted(entry["file_name"] for entry in gt_media
+                             if _media_key(entry["media_type"], entry["media_id"]) in retrieved_keys)
+            evidence_matched = sorted(entry["file_name"] for entry in gt_media
+                                      if _media_key(entry["media_type"], entry["media_id"]) in evidence_keys)
+            delivery_matched = sorted(entry["file_name"] for entry in gt_media
+                                      if _media_key(entry["media_type"], entry["media_id"]) in selected_keys)
+            pred_names = {value["file_name"] for value in selected_media}
+            retrieved_names = {value["file_name"] for value in retrieved_media}
+            evidence_names = {value["file_name"] for value in evidence_media}
+            gt_images = [value for value in gt_media if value["media_type"] == "image"]
 
             # Agent phase ends before any Judge request starts.  Judge is queued
             # by _phase_qa_eval in a separate executor after this item returns.
@@ -2260,9 +2825,13 @@ class BenchmarkRun:
             )
 
             item.update({
-                "answer": answer, "predicted_images": predicted_image_records,
-                "retrieved_candidate_images": retrieved_image_records,
-                "evidence_source_images": evidence_image_records,
+                "answer": answer,
+                "predicted_media": selected_media,
+                "retrieved_candidate_media": retrieved_media,
+                "evidence_source_media": evidence_media,
+                "predicted_images": [value for value in selected_media if value["media_type"] == "image"],
+                "retrieved_candidate_images": [value for value in retrieved_media if value["media_type"] == "image"],
+                "evidence_source_images": [value for value in evidence_media if value["media_type"] == "image"],
                 "predicted_file_names": sorted(pred_names),
                 "retrieved_file_names": sorted(retrieved_names),
                 "evidence_source_file_names": sorted(evidence_names),
@@ -2271,11 +2840,26 @@ class BenchmarkRun:
                 "evidence_matched_file_names": evidence_matched,
                 "delivery_matched_file_names": delivery_matched,
                 "selected_delivery_file_names": sorted(pred_names),
-                "retrieved_asset_ids": image_sets["retrieved_asset_ids"],
-                "evidence_asset_ids": image_sets["evidence_asset_ids"],
-                "selected_asset_ids": image_sets["selected_asset_ids"],
-                "retrieval_recall": recall,
-                "retrieval_precision": precision, "retrieval_f1": f1,
+                "retrieved_asset_ids": media_sets["retrieved_asset_ids"],
+                "evidence_asset_ids": media_sets["evidence_asset_ids"],
+                "selected_asset_ids": media_sets["selected_asset_ids"],
+                "media_retrieval_counts": metrics["media"],
+                "image_retrieval_counts": metrics["image"],
+                "video_retrieval_counts": metrics["video"],
+                "media_retrieval_recall": metrics["media"]["recall"],
+                "media_retrieval_precision": metrics["media"]["precision"],
+                "media_retrieval_f1": metrics["media"]["f1"],
+                "image_retrieval_recall": metrics["image"]["recall"],
+                "image_retrieval_precision": metrics["image"]["precision"],
+                "image_retrieval_f1": metrics["image"]["f1"],
+                "video_retrieval_recall": metrics["video"]["recall"],
+                "video_retrieval_precision": metrics["video"]["precision"],
+                "video_retrieval_f1": metrics["video"]["f1"],
+                # Compatibility aliases are total-media metrics for typed runs.
+                "retrieval_recall": metrics["media"]["recall"],
+                "retrieval_precision": metrics["media"]["precision"],
+                "retrieval_f1": metrics["media"]["f1"],
+                "gt_media": gt_media,
                 "gt_images": gt_images,
                 "judge": {"score": None, "reason": "pending_judge"},
                 "task_judge": {"actual_action": None, "correct": None, "reason": "pending_judge"},
@@ -2315,6 +2899,10 @@ class BenchmarkRun:
                 item["execution_status"] = "failed"
             item.update({"error": str(e), "retrieval_recall": 0,
                          "retrieval_precision": None, "retrieval_f1": None,
+                         "media_retrieval_recall": 0 if gt_refs else None,
+                         "media_retrieval_precision": None, "media_retrieval_f1": None,
+                         "image_retrieval_recall": 0 if gt_image_ids else None,
+                         "video_retrieval_recall": 0 if gt_video_ids else None,
                          "judge": {"score": None, "reason": "error"},
                          "wall_clock_ms": round((time.perf_counter() - t0) * 1000, 1)})
         return item
@@ -2971,7 +3559,8 @@ class BenchmarkRun:
                       '{"score":0|1|2,"reason":"简短中文理由"}')
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 1024,
-            "enable_thinking": False, "messages": [{"role": "system", "content": system_prompt},
+            **_judge_thinking_kwargs(getattr(self, "judge_url", "")),
+            "messages": [{"role": "system", "content": system_prompt},
                          {"role": "user", "content": judge_text}],
         }
         try:
@@ -3055,7 +3644,8 @@ class BenchmarkRun:
                   "结合 GT 能力边界，只判断当前模型回答实际表现为直接回答、拒答还是澄清。只输出 JSON。")
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": getattr(self, "task_judge_system_prompt", None) or TASK_JUDGE_PROMPT},
+            **_judge_thinking_kwargs(getattr(self, "judge_url", "")),
+            "messages": [{"role": "system", "content": getattr(self, "task_judge_system_prompt", None) or TASK_JUDGE_PROMPT},
                          {"role": "user", "content": prompt}],
         }
         try:
@@ -3100,7 +3690,8 @@ class BenchmarkRun:
                     {"score": 0, "reason": "no_image_evidence", "input": None})
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": getattr(self, "evidence_judge_system_prompt", None) or EVIDENCE_JUDGE_PROMPT},
+            **_judge_thinking_kwargs(getattr(self, "judge_url", "")),
+            "messages": [{"role": "system", "content": getattr(self, "evidence_judge_system_prompt", None) or EVIDENCE_JUDGE_PROMPT},
                          {"role": "user", "content": content}],
         }
         try:
@@ -3142,6 +3733,7 @@ class BenchmarkRun:
         last_error = None
         for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
             try:
+                self._wait_for_judge_request_slot()
                 response = request_json(
                     self._judge_chat_url(), payload, "POST", timeout,
                     self._judge_headers(),
@@ -3153,13 +3745,49 @@ class BenchmarkRun:
                 last_error = exc
                 if attempt >= JUDGE_RETRY_ATTEMPTS:
                     break
-                delay = min(JUDGE_RETRY_BACKOFF_MAX_SECONDS,
-                            JUDGE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                delay = self._judge_retry_delay(exc, attempt)
                 if self._cancel.wait(delay):
                     raise RunCancelledError("cancelled while retrying Judge request") from exc
         raise RuntimeError(
             f"judge request failed after {JUDGE_RETRY_ATTEMPTS} attempts: {last_error}"
         ) from last_error
+
+    def _wait_for_judge_request_slot(self) -> None:
+        """Space cloud requests across Judge workers to avoid synchronized bursts."""
+        if JUDGE_REQUEST_INTERVAL_SECONDS <= 0:
+            return
+        rate_lock = getattr(self, "_judge_rate_lock", None)
+        if rate_lock is None:
+            rate_lock = self._judge_rate_lock = threading.Lock()
+            self._judge_next_request_at = 0.0
+        with rate_lock:
+            current = time.monotonic()
+            wait_seconds = max(0.0, getattr(self, "_judge_next_request_at", 0.0) - current)
+            self._judge_next_request_at = max(
+                current, getattr(self, "_judge_next_request_at", 0.0)
+            ) + JUDGE_REQUEST_INTERVAL_SECONDS
+        if wait_seconds and self._cancel.wait(wait_seconds):
+            raise RunCancelledError("cancelled while waiting for Judge rate limit")
+
+    @staticmethod
+    def _judge_retry_delay(error: Exception, attempt: int) -> float:
+        delay = min(
+            JUDGE_RETRY_BACKOFF_MAX_SECONDS,
+            JUDGE_RETRY_BACKOFF_SECONDS * (2 ** max(0, attempt - 1)),
+        )
+        current: BaseException | None = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, urllib.error.HTTPError):
+                raw = str(current.headers.get("Retry-After") or "").strip()
+                try:
+                    delay = max(delay, float(raw))
+                except ValueError:
+                    pass
+                break
+            current = current.__cause__ or current.__context__
+        return delay + random.uniform(0.0, min(2.0, delay * 0.2))
 
     def _judge_headers(self) -> dict[str, str]:
         api_key = getattr(self, "judge_api_key", JUDGE_API_KEY)
@@ -3204,11 +3832,15 @@ class BenchmarkRun:
 
     def _phase_gpu_metrics(self):
         self._phase_start("gpu_metrics")
-        if self.use_cloud_model:
+        if self.use_cloud_model or not self.vllm_api_url:
             self._phase_done("gpu_metrics", {
                 "status": "skipped",
-                "source": "cloud_api",
-                "reason": "cloud_api_has_no_local_gpu_metrics",
+                "source": "cloud_api" if self.use_cloud_model else "external",
+                "reason": (
+                    "cloud_api_has_no_local_gpu_metrics"
+                    if self.use_cloud_model else
+                    "external_model_endpoint_has_no_manager_metrics"
+                ),
             })
             return
         agg = self._gpu_sampler.aggregate()
@@ -3280,13 +3912,44 @@ class BenchmarkRun:
         answer_judges = [item.get("judge") or {} for item in items]
         answer_scores = [score for judge in answer_judges if (score := judge_score_for_summary(judge)) is not None]
         answer_dist = {str(score): answer_scores.count(score) for score in (0, 1, 2)}
-        retrieval_items = [item for item in items if item.get("retrieval_image_ids")]
-        tp = sum(len(item.get("retrieved_matched_file_names") or item.get("matched_file_names") or []) for item in retrieval_items)
-        predicted = sum(len(item.get("retrieved_file_names") or item.get("predicted_file_names") or []) for item in retrieval_items)
-        gt = sum(len(item.get("retrieval_image_ids") or []) for item in retrieval_items)
-        precision = tp / predicted if predicted else (0.0 if gt else None)
-        recall = tp / gt if gt else None
-        f1 = 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else (0.0 if gt else None)
+        metric_items = [item for item in items if _retrieval_metric_eligible(item)]
+        excluded_unanswerable_count = len(items) - len(metric_items)
+        typed_retrieval_items = [item for item in metric_items if "retrieval_media_refs" in item]
+        if typed_retrieval_items:
+            media_metrics = _micro_metrics_from_counts(typed_retrieval_items, "media_retrieval_counts")
+            image_metrics = _micro_metrics_from_counts(typed_retrieval_items, "image_retrieval_counts")
+            video_metrics = _micro_metrics_from_counts(typed_retrieval_items, "video_retrieval_counts")
+            media_macro = _macro_metrics_from_counts(typed_retrieval_items, "media_retrieval_counts")
+            image_macro = _macro_metrics_from_counts(typed_retrieval_items, "image_retrieval_counts")
+            video_macro = _macro_metrics_from_counts(typed_retrieval_items, "video_retrieval_counts")
+            precision, recall, f1 = (
+                media_metrics["precision"], media_metrics["recall"], media_metrics["f1"])
+            retrieval_metric_count = media_metrics["metric_count"]
+        else:
+            # Historical results predate typed refs and are strictly image-only.
+            retrieval_items = [item for item in metric_items if item.get("retrieval_image_ids")]
+            tp = sum(len(item.get("retrieved_matched_file_names") or item.get("matched_file_names") or []) for item in retrieval_items)
+            predicted = sum(len(item.get("retrieved_file_names") or item.get("predicted_file_names") or []) for item in retrieval_items)
+            gt = sum(len(item.get("retrieval_image_ids") or []) for item in retrieval_items)
+            precision = tp / predicted if predicted else (0.0 if gt else None)
+            recall = tp / gt if gt else None
+            f1 = 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else (0.0 if gt else None)
+            retrieval_metric_count = len(retrieval_items)
+            media_metrics = None
+            image_metrics = {"precision": precision, "recall": recall, "f1": f1,
+                             "metric_count": retrieval_metric_count}
+            video_metrics = None
+            legacy_values = {
+                metric: [item.get(f"retrieval_{metric}") for item in retrieval_items
+                         if isinstance(item.get(f"retrieval_{metric}"), (int, float))]
+                for metric in ("precision", "recall", "f1")
+            }
+            image_macro = {metric: sum(values) / len(values) if values else None
+                           for metric, values in legacy_values.items()} | {
+                               "metric_count": len(legacy_values["recall"])
+                           }
+            media_macro = image_macro
+            video_macro = None
         evidence_judges = [item.get("evidence_judge") or {} for item in items]
         evidence_scores = [judge.get("score") for judge in evidence_judges if judge.get("score") in {0, 1, 2}]
         evidence_dist = {str(score): evidence_scores.count(score) for score in (0, 1, 2)}
@@ -3374,7 +4037,34 @@ class BenchmarkRun:
             "retrieval_precision_micro": round(precision, 3) if precision is not None else None,
             "retrieval_recall_micro": round(recall, 3) if recall is not None else None,
             "retrieval_f1_micro": round(f1, 3) if f1 is not None else None,
-            "retrieval_metric_count": len(retrieval_items),
+            "retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro["precision"] is not None else None,
+            "retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro["recall"] is not None else None,
+            "retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro["f1"] is not None else None,
+            "retrieval_recall_mean": round(media_macro["recall"], 3) if media_macro["recall"] is not None else None,
+            "retrieval_metric_count": retrieval_metric_count,
+            "retrieval_metric_scope": "all_media" if typed_retrieval_items else "legacy_image_only",
+            "retrieval_excluded_unanswerable_count": excluded_unanswerable_count,
+            "media_retrieval_precision_micro": round(media_metrics["precision"], 3) if media_metrics and media_metrics["precision"] is not None else None,
+            "media_retrieval_recall_micro": round(media_metrics["recall"], 3) if media_metrics and media_metrics["recall"] is not None else None,
+            "media_retrieval_f1_micro": round(media_metrics["f1"], 3) if media_metrics and media_metrics["f1"] is not None else None,
+            "media_retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro["precision"] is not None else None,
+            "media_retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro["recall"] is not None else None,
+            "media_retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro["f1"] is not None else None,
+            "media_retrieval_metric_count": media_metrics["metric_count"] if media_metrics else None,
+            "image_retrieval_precision_micro": round(image_metrics["precision"], 3) if image_metrics and image_metrics["precision"] is not None else None,
+            "image_retrieval_recall_micro": round(image_metrics["recall"], 3) if image_metrics and image_metrics["recall"] is not None else None,
+            "image_retrieval_f1_micro": round(image_metrics["f1"], 3) if image_metrics and image_metrics["f1"] is not None else None,
+            "image_retrieval_precision_macro": round(image_macro["precision"], 3) if image_macro["precision"] is not None else None,
+            "image_retrieval_recall_macro": round(image_macro["recall"], 3) if image_macro["recall"] is not None else None,
+            "image_retrieval_f1_macro": round(image_macro["f1"], 3) if image_macro["f1"] is not None else None,
+            "image_retrieval_metric_count": image_metrics["metric_count"] if image_metrics else None,
+            "video_retrieval_precision_micro": round(video_metrics["precision"], 3) if video_metrics and video_metrics["precision"] is not None else None,
+            "video_retrieval_recall_micro": round(video_metrics["recall"], 3) if video_metrics and video_metrics["recall"] is not None else None,
+            "video_retrieval_f1_micro": round(video_metrics["f1"], 3) if video_metrics and video_metrics["f1"] is not None else None,
+            "video_retrieval_precision_macro": round(video_macro["precision"], 3) if video_macro and video_macro["precision"] is not None else None,
+            "video_retrieval_recall_macro": round(video_macro["recall"], 3) if video_macro and video_macro["recall"] is not None else None,
+            "video_retrieval_f1_macro": round(video_macro["f1"], 3) if video_macro and video_macro["f1"] is not None else None,
+            "video_retrieval_metric_count": video_metrics["metric_count"] if video_metrics else None,
             "evidence_distribution": evidence_dist,
             "evidence_valid_count": len(evidence_scores),
             "evidence_mean": round(sum(evidence_scores) / len(evidence_scores), 3) if evidence_scores else None,
@@ -3457,7 +4147,7 @@ class OrchestratorRepository:
 
     @staticmethod
     def _load_qa_metadata() -> dict[str, dict]:
-        fields = ("task_type", "question_type", "angle", "difficulty", "answerability",
+        fields = ("task_type", "question_type", "tags", "angle", "difficulty", "answerability",
                   "scope", "scope_anchor", "required_evidence_sources", "query_anchors",
                   "expected_action", "answer", "conversation")
         result = {}
@@ -3493,6 +4183,20 @@ class OrchestratorRepository:
     def _hydrate_qa_metadata(self, item: dict) -> dict:
         metadata = self.qa_metadata.get(str(item.get("qa_id") or "")) or {}
         hydrated = {**metadata, **item}
+        tag_fields = {
+            "task_type": "task",
+            "question_type": "question",
+            "angle": "angle",
+            "difficulty": "difficulty",
+            "answerability": "answerability",
+            "expected_action": "action",
+        }
+        tags = [str(tag).strip() for tag in (hydrated.get("tags") or []) if str(tag).strip()]
+        for field, prefix in tag_fields.items():
+            value = str(hydrated.get(field) or "").strip()
+            if value:
+                tags.append(f"{prefix}:{value}")
+        hydrated["tags"] = list(dict.fromkeys(tags))
         judge = hydrated.get("judge") or {}
         consistency_status = judge_consistency_status(judge)
         if consistency_status:
@@ -3658,28 +4362,45 @@ class OrchestratorRepository:
         return result
 
     def query_current_model(self, vllm_api_url: str, model_base_url: str) -> dict:
-        state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10) or {}
-        profile = str(state.get("profile") or "").strip()
-        served_name = str(state.get("served_model_name") or "").strip()
-        model_id = profile or served_name
-        if not model_id or not served_name:
-            raise ValueError("vLLM Manager has no running model")
-        live_models = request_json(f"{model_base_url.rstrip('/')}/models", timeout=15) or {}
+        manager_error = None
+        state = {}
+        if vllm_api_url:
+            try:
+                state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10) or {}
+            except Exception as exc:
+                manager_error = str(exc)
+        model_base_url = normalize_model_base_url(model_base_url)
+        if not model_base_url:
+            raise ValueError("model endpoint is required; enter host:port or an OpenAI /v1 URL")
+        live_models = request_json(f"{model_base_url}/models", timeout=15) or {}
         served_models = [
             str(item.get("id")) for item in live_models.get("data") or []
             if isinstance(item, dict) and item.get("id")
         ]
-        if served_name not in served_models:
+        served_name = str(state.get("served_model_name") or "").strip()
+        if served_name and served_name not in served_models:
             raise ValueError(
-                f"vLLM state is stale or mismatched: expected {served_name}, "
+                f"manager state is stale or mismatched: expected {served_name}, "
                 f"live endpoint serves {served_models or 'nothing'}"
             )
+        if not served_name:
+            if len(served_models) != 1:
+                raise ValueError(
+                    f"model endpoint must expose exactly one model when no Manager is configured; "
+                    f"found {served_models or 'nothing'}"
+                )
+            served_name = served_models[0]
+        profile = str(state.get("profile") or "").strip()
+        model_id = profile or served_name
         return {
             "model_id": model_id,
             "served_model_name": served_name,
             "verified_at": now_iso(),
             "served_models": served_models,
             "state": state,
+            "model_base_url": model_base_url,
+            "manager_available": bool(state),
+            "manager_error": manager_error,
         }
 
     def start_memory_profile(self, payload: dict) -> dict:
@@ -3935,6 +4656,11 @@ class OrchestratorRepository:
                     "task_judge": item.get("task_judge"),
                     "retrieval": {k: item.get(k) for k in (
                         "retrieval_recall", "retrieval_precision", "retrieval_f1",
+                        "media_retrieval_recall", "media_retrieval_precision", "media_retrieval_f1",
+                        "image_retrieval_recall", "image_retrieval_precision", "image_retrieval_f1",
+                        "video_retrieval_recall", "video_retrieval_precision", "video_retrieval_f1",
+                        "retrieval_media_refs", "answer_evidence_media_refs",
+                        "gt_media", "predicted_media", "retrieved_candidate_media", "evidence_source_media",
                         "gt_images", "predicted_images", "predicted_file_names",
                         "matched_file_names")},
                     "agent_status": item.get("agent_status"),
@@ -3954,7 +4680,7 @@ class OrchestratorRepository:
                     "filtered": (include is not None or min_score is not None)}
 
     def get_run_items(self, run_id: str, page: int = 1, page_size: int = 20,
-                      search: str = "", score: str = "", task_type: str = "",
+                      search: str = "", score: str = "", task_type: str = "", tag: str = "",
                       agent_status: str = "", angle: str = "", difficulty: str = "",
                       answerability: str = "", primary: str = "") -> dict:
         with self.lock:
@@ -3967,6 +4693,7 @@ class OrchestratorRepository:
             all_items = [self._hydrate_qa_metadata(item) for item in (state.get("items") or [])]
             search = str(search or "").strip().lower()
             task_type = str(task_type or "").strip()
+            tag = str(tag or "").strip()
             agent_status = str(agent_status or "").strip()
             angle = str(angle or "").strip()
             difficulty = str(difficulty or "").strip()
@@ -3979,6 +4706,7 @@ class OrchestratorRepository:
             source_indexes = []
             facets = {
                 "task_types": sorted({str(item.get("task_type")) for item in all_items if item.get("task_type")}),
+                "tags": sorted({str(tag) for item in all_items for tag in (item.get("tags") or []) if str(tag).strip()}),
                 "agent_statuses": sorted({str(item.get("agent_status")) for item in all_items if item.get("agent_status")}),
                 "angles": sorted({str(item.get("angle")) for item in all_items if item.get("angle")}),
                 "difficulties": sorted({str(item.get("difficulty")) for item in all_items if item.get("difficulty")}),
@@ -3992,6 +4720,8 @@ class OrchestratorRepository:
                 if score_filter is not None and (item.get("judge") or {}).get("score") != score_filter:
                     continue
                 if task_type and item.get("task_type") != task_type:
+                    continue
+                if tag and tag not in (item.get("tags") or []):
                     continue
                 if agent_status and item.get("agent_status") != agent_status:
                     continue
@@ -4026,6 +4756,7 @@ class OrchestratorRepository:
                     "search": search,
                     "score": score_filter,
                     "task_type": task_type,
+                    "tag": tag,
                     "agent_status": agent_status,
                     "angle": angle,
                     "difficulty": difficulty,
@@ -4074,14 +4805,26 @@ class OrchestratorRepository:
             "question": item.get("question"),
             "task_type": item.get("task_type"),
             "question_type": item.get("question_type"),
+            "tags": item.get("tags") or [],
             "angle": item.get("angle"),
             "difficulty": item.get("difficulty"),
             "answerability": item.get("answerability"),
             "retrieval_recall": item.get("retrieval_recall"),
             "retrieval_precision": item.get("retrieval_precision"),
             "retrieval_f1": item.get("retrieval_f1"),
+            "media_retrieval_recall": item.get("media_retrieval_recall"),
+            "media_retrieval_precision": item.get("media_retrieval_precision"),
+            "media_retrieval_f1": item.get("media_retrieval_f1"),
+            "image_retrieval_recall": item.get("image_retrieval_recall"),
+            "image_retrieval_precision": item.get("image_retrieval_precision"),
+            "image_retrieval_f1": item.get("image_retrieval_f1"),
+            "video_retrieval_recall": item.get("video_retrieval_recall"),
+            "video_retrieval_precision": item.get("video_retrieval_precision"),
+            "video_retrieval_f1": item.get("video_retrieval_f1"),
             "matched_count": len(item.get("matched_file_names") or []),
-            "ground_truth_count": len(item.get("retrieval_image_ids") or []),
+            "ground_truth_count": len(item.get("retrieval_media_refs") or item.get("retrieval_image_ids") or []),
+            "ground_truth_image_count": len(item.get("retrieval_image_ids") or []),
+            "ground_truth_video_count": len(item.get("retrieval_video_ids") or []),
             "judge": {
                 "score": judge.get("score"),
                 "status": judge.get("status"),
@@ -4169,7 +4912,9 @@ class OrchestratorRepository:
             "delivery_breakdown": saved.get("delivery_breakdown", cls._aggregate_delivery(items)),
         })
         for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
-            if saved.get(key) is None:
+            if (key == "retrieval_recall_mean"
+                    or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
+                    or saved.get(key) is None):
                 saved[key] = value
         if saved.get("benchmark_e2e_latency_excluding_judge_ms") is None:
             saved["benchmark_e2e_latency_excluding_judge_ms"] = BenchmarkRun._benchmark_e2e_latency_excluding_judge_ms(
@@ -4278,7 +5023,9 @@ class OrchestratorRepository:
             "answer_quality_mean": round(sum(scores) / len(scores), 3) if scores else None,
         })
         for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
-            if saved.get(key) is None:
+            if (key == "retrieval_recall_mean"
+                    or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
+                    or saved.get(key) is None):
                 saved[key] = value
         return saved
 
@@ -4680,15 +5427,15 @@ class OrchestratorRepository:
         judge_url = str(payload.get("judge_url") or resolved_judge_url).rstrip("/")
         judge_model = str(payload.get("judge_model") or resolved_judge_model)
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
-        # The benchmark uses the fixed primary Manager target.  Do not allow a
-        # per-request URL to split the orchestrator and Sentrix runtime.
+        model_base_url = normalize_model_base_url(payload.get("model_base_url"))
+        vllm_manager_url = normalize_service_url(payload.get("vllm_manager_url"))
         if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
             raise ValueError("big_model cannot be combined with current model")
         managed_models = [model for model in models if model != BIG_MODEL_PROFILE_ID]
         if managed_models:
             target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
-            vllm_api_url = str(target["manager_url"])
-            vllm_model_base_url = str(target["model_base_url"])
+            vllm_api_url = vllm_manager_url or str(target["manager_url"])
+            vllm_model_base_url = model_base_url or str(target["model_base_url"])
         else:
             target_id = ""
             vllm_api_url = ""
@@ -4707,12 +5454,21 @@ class OrchestratorRepository:
             raise ValueError("current model cannot be combined with managed model profiles")
         current_model_snapshot = None
         if use_current_model:
+            if model_base_url:
+                vllm_api_url = ""
+                vllm_model_base_url = model_base_url
             current_model_snapshot = self.query_current_model(vllm_api_url, vllm_model_base_url)
             models = [current_model_snapshot["model_id"]]
-            request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-runtime", {
-                "manager_url": vllm_api_url,
-                "model_base_url": vllm_model_base_url,
-            }, "POST", 30)
+            if model_base_url:
+                request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-external-runtime", {
+                    "base_url": current_model_snapshot["model_base_url"],
+                    "model": current_model_snapshot["served_model_name"],
+                }, "POST", 30)
+            else:
+                request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-runtime", {
+                    "manager_url": vllm_api_url,
+                    "model_base_url": vllm_model_base_url,
+                }, "POST", 30)
         delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
         with self.lock:
             busy = [
@@ -4827,8 +5583,11 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     "default_sentrix_url": DEFAULT_SENTRIX_URL,
                     "default_judge_url": DEFAULT_JUDGE_URL,
                     "default_vllm_api_url": DEFAULT_VLLM_API_URL,
+                    "default_vllm_model_base_url": DEFAULT_VLLM_BASE_URL,
                     "default_vllm_target_id": DEFAULT_VLLM_TARGET_ID,
                     "vllm_targets": VLLM_TARGETS,
+                    "runtime_config": public_runtime_connection_config(),
+                    "runtime_config_file": str(RUNTIME_CONNECTION_CONFIG_PATH),
                    "judge_model": JUDGE_MODEL,
                    "judge_prompt": JUDGE_PROMPT,
                    "custom_judge_prompt": load_custom_judge_prompt(),
@@ -4879,11 +5638,11 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 if len(parts) == 3 and parts[1] in {"photos", "faces", "videos"}:
                     album_id = unquote(parts[0])
                     file_name = unquote(parts[2])
-                    media_path = BENCHMARK_DATA_ROOT / album_id / parts[1] / file_name
-                    if media_path.is_file():
+                    media_path = _resolve_album_media_file(album_id, parts[1], file_name)
+                    if media_path:
                         self._serve_file(media_path)
                         return
-                self._json({"error": "photo not found"}, 404)
+                self._json({"error": "media not found"}, 404)
                 return
             if parsed.path == "/api/runs":
                 self._json({"runs": self.repo.list_runs()})
@@ -4901,6 +5660,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     search=(query.get("search") or [""])[0],
                     score=(query.get("score") or [""])[0],
                     task_type=(query.get("task_type") or [""])[0],
+                    tag=(query.get("tag") or [""])[0],
                     agent_status=(query.get("agent_status") or [""])[0],
                     angle=(query.get("angle") or [""])[0],
                     difficulty=(query.get("difficulty") or [""])[0],
@@ -5011,16 +5771,47 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             elif parsed.path.endswith("/reviews") and parsed.path.startswith("/api/runs/"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/reviews"))
                 self._json(self.repo.save_reviews(run_id, payload))
+            elif self.path == "/api/config":
+                saved = persist_runtime_connection_config(payload)
+                global DEFAULT_SENTRIX_URL, DEFAULT_JUDGE_URL, DEFAULT_VLLM_API_URL
+                global DEFAULT_VLLM_BASE_URL, DEFAULT_JUDGE_PROVIDER_ID
+                DEFAULT_SENTRIX_URL = saved["sentrix_url"]
+                DEFAULT_JUDGE_URL = saved["judge_url"]
+                DEFAULT_VLLM_API_URL = saved["vllm_manager_url"]
+                DEFAULT_VLLM_BASE_URL = saved["model_base_url"]
+                DEFAULT_JUDGE_PROVIDER_ID = saved["judge_provider_id"]
+                self._json({"saved": True, "runtime_config": saved})
             elif self.path == "/api/profiles":
-                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                manager_url = normalize_service_url(payload.get("vllm_manager_url"))
+                if manager_url:
+                    target_id = "external"
+                    target = {
+                        "label": "自定义模型 Manager",
+                        "manager_url": manager_url,
+                        "model_base_url": normalize_model_base_url(payload.get("model_base_url")),
+                        "kind": "external",
+                    }
+                else:
+                    target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
                 result = self.repo.query_profiles(str(target["manager_url"]))
                 result.update({"target_id": target_id, "target": target})
                 self._json(result)
             elif self.path == "/api/current-model":
-                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
-                result = self.repo.query_current_model(
-                    str(target["manager_url"]), str(target["model_base_url"]),
-                )
+                direct_base_url = normalize_model_base_url(payload.get("model_base_url"))
+                if direct_base_url:
+                    result = self.repo.query_current_model("", direct_base_url)
+                    target_id = "external"
+                    target = {
+                        "label": "外部模型服务",
+                        "model_base_url": direct_base_url,
+                        "manager_url": "",
+                        "kind": "external",
+                    }
+                else:
+                    target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                    result = self.repo.query_current_model(
+                        str(target["manager_url"]), str(target["model_base_url"]),
+                    )
                 result.update({"target_id": target_id, "target": target})
                 self._json(result)
             elif self.path == "/api/memory-profile":
@@ -5048,10 +5839,54 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def _serve_file(self, path: Path):
         if not path.is_file():
             raise FileNotFoundError(path)
-        body = path.read_bytes()
         ct = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if ct.startswith("text/") or ct == "application/javascript":
             ct += "; charset=utf-8"
+        if ct.startswith("video/"):
+            size = path.stat().st_size
+            start, end = 0, size - 1
+            range_header = self.headers.get("Range", "")
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+                if not match:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+                if match.group(1):
+                    start = int(match.group(1))
+                    end = min(int(match.group(2)) if match.group(2) else size - 1, size - 1)
+                elif match.group(2):
+                    length = min(int(match.group(2)), size)
+                    start = size - length
+                if start > end or start >= size:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+            length = end - start + 1
+            self.send_response(HTTPStatus.PARTIAL_CONTENT if range_header else HTTPStatus.OK)
+            self.send_header("Content-Type", ct)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "private, max-age=3600")
+            if range_header:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(start)
+                    remaining = length
+                    while remaining:
+                        chunk = handle.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        body = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))
