@@ -102,13 +102,8 @@
       });
       return request("/api/import", { method: "POST", body: form });
     },
-    getModelProfiles: () => request("/api/model-profiles"),
     getOcrSettings: () => request("/api/settings/ocr"),
     setOcrSettings: (enabled) => request("/api/settings/ocr", { method: "PUT", body: JSON.stringify({ small_ocr_enabled: enabled }) }),
-    switchModelProfile: (profile) => request("/api/model-profiles/switch", {
-      method: "POST",
-      body: JSON.stringify({ profile, wait_ready: true, ready_timeout: 900 }),
-    }),
     personInsights: (scopeId = "") => request(`/api/person-insights${scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : ""}`),
     startPersonInsightRun: (payload) => request("/api/person-insight-runs", { method: "POST", body: JSON.stringify(payload) }),
     personInsightRun: (id) => request(`/api/person-insight-runs/${encodeURIComponent(id)}`),

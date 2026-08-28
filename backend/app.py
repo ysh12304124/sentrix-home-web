@@ -33,6 +33,11 @@ from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, 
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
 from .person_insights import rank_core_people
+from .runtime_providers import (
+    create_runtime_providers,
+    normalize_openai_base_url,
+    normalize_service_url,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -708,14 +713,16 @@ def _profile_summary(profile_id, profile):
 
 
 def _current_model_runtime():
-    if RUNTIME_MODEL_SOURCE == "cloud_api":
+    if RUNTIME_MODEL_SOURCE in {"cloud_api", "external"}:
         return {
             "backend": getattr(gamma, "backend", "unknown"),
             "base_url": gamma.base_url, "model": gamma.model,
             "profile": RUNTIME_MODEL_PROFILE,
-            "source": "cloud_api",
+            "source": RUNTIME_MODEL_SOURCE,
             "status": "running",
             "state": None,
+            "capabilities": gamma.inference_provider.capabilities()
+                if getattr(gamma, "inference_provider", None) else {},
         }
     registry = _load_vllm_registry()
     state = _load_vllm_state(registry)
@@ -1034,6 +1041,39 @@ def current_model_profile():
     return _current_model_runtime()
 
 
+@app.get("/api/runtime-providers")
+def runtime_providers():
+    """Expose runtime capabilities without requiring lifecycle management."""
+    runtime = _current_model_runtime()
+    manager_url = RUNTIME_VLLM_API_URL or VLLM_API_URL
+    providers = create_runtime_providers(
+        gamma.base_url,
+        manager_url=manager_url,
+        api_key=getattr(gamma, "api_key", ""),
+        api_mode=getattr(gamma, "api_mode", "generic"),
+        timeout=min(30, getattr(gamma, "timeout", 30)),
+    )
+    try:
+        lifecycle = providers.lifecycle.state()
+    except Exception as exc:
+        lifecycle = {"status": "unavailable", "error": str(exc)}
+    telemetry = providers.telemetry.gpu_stats()
+    try:
+        inference_health = providers.inference.health()
+    except Exception as exc:
+        inference_health = {"status": "unavailable", "error": str(exc)}
+    return {
+        "runtime": runtime,
+        "inference": {
+            "status": inference_health.get("status", "unavailable"),
+            "health": inference_health,
+            "capabilities": providers.inference.capabilities(),
+        },
+        "lifecycle": lifecycle,
+        "telemetry": telemetry,
+    }
+
+
 @app.post("/api/model-profiles/switch")
 def switch_model_profile(request: ModelSwitchRequest):
     return _run_vllm_switch(request)
@@ -1047,14 +1087,25 @@ class RuntimeBindRequest(BaseModel):
 def bind_model_runtime(request: RuntimeBindRequest):
     """Bind Agent runtime to one fixed Manager/model-service pair for this process."""
     global RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL
-    if not request.manager_url.startswith(("http://", "https://")):
+    manager_url = normalize_service_url(request.manager_url)
+    model_base_url = normalize_openai_base_url(request.model_base_url)
+    if not manager_url:
         raise HTTPException(status_code=400, detail="invalid vLLM manager URL")
-    if request.model_base_url and not request.model_base_url.startswith(("http://", "https://")):
+    if request.model_base_url and not model_base_url:
         raise HTTPException(status_code=400, detail="invalid vLLM model URL")
     previous = (RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL)
-    RUNTIME_VLLM_API_URL = request.manager_url.rstrip("/")
-    RUNTIME_VLLM_BASE_URL = request.model_base_url.rstrip("/") if request.model_base_url else None
-    state = _load_vllm_state()
+    RUNTIME_VLLM_API_URL = manager_url
+    RUNTIME_VLLM_BASE_URL = model_base_url or None
+    providers = create_runtime_providers(
+        RUNTIME_VLLM_BASE_URL or gamma.base_url,
+        manager_url=RUNTIME_VLLM_API_URL,
+        api_key=getattr(gamma, "api_key", ""),
+        api_mode="vllm",
+    )
+    try:
+        state = providers.lifecycle.state()
+    except Exception:
+        state = None
     if not state or not state.get("pid"):
         RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL = previous
         raise HTTPException(status_code=502, detail="selected vLLM Manager has no active model")
@@ -1117,6 +1168,71 @@ def bind_cloud_runtime(request: CloudRuntimeBindRequest):
         "base_url": base_url,
         "model": model,
         "runtime": runtime,
+    }
+
+
+class ExternalRuntimeBindRequest(BaseModel):
+    base_url: str
+    model: str
+    api_mode: str = "generic"
+
+
+@app.post("/api/model-profiles/bind-external-runtime")
+def bind_external_runtime(request: ExternalRuntimeBindRequest):
+    """Bind Agent and ingestion to a pre-started OpenAI-compatible endpoint."""
+    base_url = normalize_openai_base_url(request.base_url)
+    model = str(request.model or "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="invalid external model base URL")
+    if not model:
+        raise HTTPException(status_code=400, detail="external model name is empty")
+    api_key = (
+        os.getenv("SENTRIX_EXTERNAL_API_KEY")
+        or os.getenv("SENTRIX_VLLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    ).strip()
+    api_mode = str(request.api_mode or "generic").strip().lower()
+    if api_mode not in {"generic", "vllm"}:
+        raise HTTPException(status_code=400, detail="api_mode must be generic or vllm")
+    new_gamma = GammaClient(
+        base_url=base_url,
+        model=model,
+        backend="openai",
+        api_key=api_key,
+        manager_url="",
+        runtime_source="external",
+        api_mode=api_mode,
+    )
+    try:
+        probe = new_gamma.inference_provider.list_models()
+        if model not in probe.get("models", []):
+            raise ValueError(f"model {model!r} is not served by endpoint")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"external model endpoint unavailable: {exc}") from exc
+    new_gamma.bind_store(store)
+    global gamma, pipeline, RUNTIME_MODEL_SOURCE, RUNTIME_MODEL_PROFILE
+    with runtime_lock:
+        previous_pipeline = pipeline
+        gamma = new_gamma
+        pipeline = IngestionPipeline(
+            store,
+            gamma=new_gamma,
+            asr=previous_pipeline.asr,
+            face=previous_pipeline.face,
+            clip=previous_pipeline.clip,
+        )
+        RUNTIME_MODEL_SOURCE = "external"
+        RUNTIME_MODEL_PROFILE = model
+    return {
+        "accepted": True,
+        "source": "external",
+        "backend": "openai",
+        "base_url": new_gamma.base_url,
+        "model": model,
+        "api_mode": api_mode,
+        "capabilities": new_gamma.inference_provider.capabilities(),
+        "runtime": _current_model_runtime(),
     }
 
 @app.post("/api/model-profiles/sync-runtime")

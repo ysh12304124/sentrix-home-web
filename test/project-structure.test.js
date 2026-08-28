@@ -54,32 +54,20 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   assert.match(source, /cache-control.*no-cache/s, "static assets must be revalidated after UI fixes");
 });
 
-test("settings exposes the four benchmark model profiles through the switch API", () => {
+test("settings shows the active model without exposing product-side switching", () => {
   const apiSource = fs.readFileSync(path.join(root, "src", "api.js"), "utf8");
   const appSource = fs.readFileSync(path.join(root, "src", "app.js"), "utf8");
-  for (const profile of ["gemma4-12b-it", "gemma4-e2b-it", "gemma4-e2b-it-lora-v2", "qwen3.5-0.8b-it"]) {
-    assert.match(appSource, new RegExp(profile.replace(/[.]/g, "\\.")));
-  }
-  for (const label of ["Gemma-4-12B", "Gemma-4-E2B 蒸馏前", "Gemma-4-E2B 蒸馏后+LoRA", "Qwen-3.5-0.8B"]) {
-    assert.match(appSource, new RegExp(label.replace(/[()+. ]/g, "\\$&")));
-  }
-  assert.match(apiSource, /getModelProfiles/);
-  assert.match(apiSource, /switchModelProfile/);
-  assert.match(apiSource, /\/api\/model-profiles\/switch/);
-  assert.match(appSource, /switchModelProfile\(target\)/);
-  assert.match(appSource, /current\.status === "running"/);
-  assert.match(appSource, /未托管模型/);
-  assert.match(appSource, /当前运行/);
-  assert.match(appSource, /document\.addEventListener\("change"/);
-  assert.doesNotMatch(appSource, /\["gemma4:12b", "gemma4-12b-it"\]/, "an env default must not be presented as a running profile");
+  assert.match(appSource, /state\.health\?\.models\?\.llm/);
+  assert.match(appSource, /由部署配置提供，不在产品页面切换/);
+  assert.doesNotMatch(appSource, /data-action="switch-vlm"/);
+  assert.doesNotMatch(appSource, /switchModelProfile/);
+  assert.doesNotMatch(apiSource, /switchModelProfile/);
+  assert.doesNotMatch(apiSource, /\/api\/model-profiles\/switch/);
 
   const backendSource = fs.readFileSync(path.join(root, "backend", "app.py"), "utf8");
-  assert.match(backendSource, /_load_vllm_state/, "runtime state is read from the vLLM registry state file");
+  assert.match(backendSource, /api\/runtime-providers/);
+  assert.match(backendSource, /bind-external-runtime/);
   assert.match(backendSource, /_current_model_runtime/);
-  assert.match(backendSource, /wait_ready/, "model switch waits for the vLLM endpoint before activating");
-  assert.match(backendSource, /ready_timeout/);
-  assert.match(backendSource, /vLLM switch failed/);
-  assert.match(backendSource, /get\("profile"\)/);
 });
 
 test("legacy E2B service does not occupy the managed vLLM port", () => {

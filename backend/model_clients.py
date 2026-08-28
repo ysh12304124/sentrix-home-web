@@ -11,6 +11,7 @@ from pathlib import Path
 from .face_embeddings import FaceEmbeddingUnavailable, compute_face_quality
 from .geocoding import format_gps_prefix
 from .onnx_runtime import face_gpu_inference_gate, face_onnx_provider_options, face_onnx_providers
+from .runtime_providers import OpenAICompatibleInferenceProvider, normalize_openai_base_url
 
 
 def align_face_crop(image, bbox, landmarks=None):
@@ -587,6 +588,16 @@ class GammaClient:
         # Ollama expects numeric -1 for indefinite residency; the string "-1"
         # is rejected by its request schema.
         self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
+        self.inference_provider = (
+            OpenAICompatibleInferenceProvider(
+                self._base_url_setting,
+                api_key=self.api_key,
+                api_mode=self.api_mode,
+                manager_url=self.manager_url,
+                timeout=self.timeout,
+            )
+            if self.backend == "openai" else None
+        )
 
     @staticmethod
     def _normalize_backend(value):
@@ -601,8 +612,19 @@ class GammaClient:
 
     @staticmethod
     def _normalize_openai_base_url(value):
-        value = str(value or "http://127.0.0.1:8100/v1").rstrip("/")
-        return value if re.search(r"/v\d+$", value, flags=re.IGNORECASE) else f"{value}/v1"
+        return normalize_openai_base_url(value or "http://127.0.0.1:8100/v1")
+
+    def _inference_for(self, endpoint_base):
+        endpoint_base = normalize_openai_base_url(endpoint_base)
+        if self.inference_provider and self.inference_provider.base_url == endpoint_base:
+            return self.inference_provider
+        return OpenAICompatibleInferenceProvider(
+            endpoint_base,
+            api_key=self.api_key,
+            api_mode=self.api_mode,
+            manager_url=self.manager_url,
+            timeout=self.timeout,
+        )
 
     _CACHE_TTL_SECONDS = 5.0
 
@@ -808,22 +830,15 @@ class GammaClient:
 
     def _tokenize_for_budget(self, endpoint_base, messages):
         """Ask the Manager bound to this endpoint to tokenize with the active model."""
-        manager_url = self.manager_url
-        if not manager_url:
+        provider = self._inference_for(endpoint_base)
+        if not provider.manager_url:
             return None
-        url = f"{manager_url}/tokenize-current"
         last_error = None
         for attempt in range(2):
             try:
-                response = httpx.post(
-                    url,
-                    json={"messages": messages, "add_generation_prompt": True},
-                    timeout=min(15, self.timeout),
-                )
-                response.raise_for_status()
-                value = response.json()
-                if int(value.get("prompt_tokens") or 0) < 1 or int(value.get("max_model_len") or 0) < 1:
-                    raise ValueError("invalid tokenizer budget response")
+                value = provider.token_count(messages, timeout=min(15, self.timeout))
+                if value is None:
+                    return None
                 value["token_count_source"] = "vllm_tokenize"
                 value["preflight_status"] = "ok"
                 return value
@@ -952,8 +967,7 @@ class GammaClient:
         try:
             if use_stream:
                 return self._chat_openai_stream(endpoint_base, payload, headers, role, model, json_mode)
-            response = httpx.post(f"{endpoint_base}/chat/completions", json=payload, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
+            response = self._inference_for(endpoint_base).chat(payload, timeout=self.timeout)
             data = response.json()
             text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
             if isinstance(text, list):
@@ -989,8 +1003,7 @@ class GammaClient:
         chunks = []
         prompt_tokens = None
         completion_tokens = None
-        with httpx.stream("POST", f"{endpoint_base}/chat/completions",
-                           json=payload, headers=headers, timeout=self.timeout) as response:
+        with self._inference_for(endpoint_base).chat_stream(payload, timeout=self.timeout) as response:
             if response.status_code >= 400:
                 try:
                     import sys as _sys

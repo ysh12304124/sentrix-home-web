@@ -26,6 +26,7 @@ import shutil
 import shlex
 import socket
 import ssl
+import sys
 import threading
 import time
 import traceback
@@ -37,6 +38,18 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from backend.runtime_providers import (
+    ManagerLifecycleProvider,
+    ManagerTelemetryProvider,
+    OpenAICompatibleInferenceProvider,
+    UnavailableLifecycleProvider,
+    UnavailableTelemetryProvider,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_DATA_ROOT = PROJECT_ROOT / "data"
@@ -1316,8 +1329,8 @@ def dataset_integrity(album_dir: Path, manifest: dict, qa_set: str) -> dict:
 class GpuSampler:
     """Poll device and managed-model memory at intervals."""
 
-    def __init__(self, api_url: str, interval: float = 0.5, on_sample=None):
-        self.api_url = api_url
+    def __init__(self, provider, interval: float = 0.5, on_sample=None):
+        self.provider = provider
         self.interval = interval
         self.on_sample = on_sample
         self.samples: list[dict] = []
@@ -1338,11 +1351,16 @@ class GpuSampler:
     def _run(self):
         while not self._stop.is_set():
             try:
-                data = request_json(f"{self.api_url}/gpu-stats", timeout=10)
-                try:
-                    process_memory = request_json(f"{self.api_url}/process-memory", timeout=5)
-                except Exception:
-                    process_memory = {}
+                gpu_result = self.provider.gpu_stats()
+                memory_result = self.provider.process_memory()
+                if gpu_result.get("status") != "available":
+                    self._stop.wait(self.interval)
+                    continue
+                data = gpu_result.get("data") or {}
+                process_memory = (
+                    memory_result.get("data") or {}
+                    if memory_result.get("status") == "available" else {}
+                )
                 ts = time.perf_counter()
                 for gpu in data.get("gpus", []):
                     sample = dict(gpu)
@@ -1486,6 +1504,12 @@ class BenchmarkRun:
         self.vllm_api_url = vllm_api_url.rstrip("/")
         self.vllm_target_id = vllm_target_id
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
+        if self.vllm_api_url:
+            self.lifecycle_provider = ManagerLifecycleProvider(self.vllm_api_url)
+            self.telemetry_provider = ManagerTelemetryProvider(self.vllm_api_url)
+        else:
+            self.lifecycle_provider = UnavailableLifecycleProvider()
+            self.telemetry_provider = UnavailableTelemetryProvider()
         self.results_root = results_root
         self.lock = threading.RLock()
         self._judge_rate_lock = threading.Lock()
@@ -1509,7 +1533,11 @@ class BenchmarkRun:
             "model_source": "cloud_api" if self.use_cloud_model else (
                 "current" if self.use_current_model else "managed"
             ),
-            "model_backend": "openai" if self.use_cloud_model else "vllm",
+            "model_backend": (
+                "openai" if self.use_cloud_model else
+                "openai_compatible" if self.use_current_model else
+                "vllm"
+            ),
             "model_name": BIG_MODEL_MODEL if self.use_cloud_model else model_profile,
             "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
@@ -1537,7 +1565,7 @@ class BenchmarkRun:
             "fatal_error": None,
         }
         self._gpu_sampling_started = False
-        self._gpu_sampler = GpuSampler(vllm_api_url, on_sample=self._persist_gpu_sample)
+        self._gpu_sampler = GpuSampler(self.telemetry_provider, on_sample=self._persist_gpu_sample)
         self._cancel = threading.Event()
         self._phase_started_perf: dict[str, float] = {}
         self._persist_condition = threading.Condition(self.lock)
@@ -1645,13 +1673,13 @@ class BenchmarkRun:
         if self.use_current_model or self.use_cloud_model:
             return
         try:
-            state = request_json(f"{self.vllm_api_url}/state", timeout=5) or {}
+            state = self.lifecycle_provider.state() or {}
         except Exception:
             return
         run_scope_models = state.get("profile")
         if run_scope_models and run_scope_models == self.model_profile:
             try:
-                request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+                self.lifecycle_provider.stop({"timeout": 60}, timeout=90)
                 self.state["cancel_vllm_stopped"] = now_iso()
             except Exception as exc:
                 self.state["cancel_vllm_stop_error"] = str(exc)[:300]
@@ -1712,15 +1740,21 @@ class BenchmarkRun:
             }
         snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
         try:
-            snapshot["manager"] = request_json(f"{self.vllm_api_url}/state", timeout=10)
+            snapshot["manager"] = self.lifecycle_provider.state()
         except Exception as exc:
             snapshot["manager_error"] = str(exc)
         try:
-            snapshot["gpu"] = request_json(f"{self.vllm_api_url}/gpu-stats", timeout=10).get("gpus") or []
+            gpu = self.telemetry_provider.gpu_stats()
+            snapshot["gpu"] = (gpu.get("data") or {}).get("gpus") or []
+            if gpu.get("status") != "available":
+                snapshot["gpu_status"] = gpu
         except Exception as exc:
             snapshot["gpu_error"] = str(exc)
         try:
-            snapshot["process_memory"] = request_json(f"{self.vllm_api_url}/process-memory", timeout=10)
+            memory = self.telemetry_provider.process_memory()
+            snapshot["process_memory"] = memory.get("data") if memory.get("status") == "available" else None
+            if memory.get("status") != "available":
+                snapshot["process_memory_status"] = memory
         except Exception as exc:
             snapshot["process_memory_error"] = str(exc)
         return snapshot
@@ -1841,7 +1875,7 @@ class BenchmarkRun:
                 self._stop_managed_vllm()
                 return RunCancelledError("cancelled while loading model")
             try:
-                state = request_json(f"{self.vllm_api_url}/state", timeout=10) or {}
+                state = self.lifecycle_provider.state() or {}
             except Exception as exc:
                 state = {}
                 if time.monotonic() >= deadline:
@@ -1884,7 +1918,7 @@ class BenchmarkRun:
 
     def _stop_managed_vllm(self):
         try:
-            request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+            self.lifecycle_provider.stop({"timeout": 60}, timeout=90)
         except Exception:
             pass
 
@@ -1908,7 +1942,7 @@ class BenchmarkRun:
         # 1. Stop (unload)
         t_stop0 = time.perf_counter()
         try:
-            request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+            self.lifecycle_provider.stop({"timeout": 60}, timeout=90)
         except Exception:
             pass
         t_stop = time.perf_counter() - t_stop0
@@ -1929,9 +1963,9 @@ class BenchmarkRun:
                 # Fire-and-poll: wait_ready=false returns immediately after spawn;
                 # readiness is tracked below with cancel-aware polling so a stop
                 # request can terminate a half-loaded model instead of blocking.
-                request_json(f"{self.vllm_api_url}/start",
-                              {"profile": self.model_profile, "wait_ready": False},
-                              "POST", 120)
+                self.lifecycle_provider.start(
+                    {"profile": self.model_profile, "wait_ready": False}, timeout=120,
+                )
                 start_error = self._wait_model_ready()
                 if start_error is None:
                     break
@@ -1950,7 +1984,7 @@ class BenchmarkRun:
         t_load = time.perf_counter() - t_load0
 
         # 3. Health check (cancel-aware)
-        state = request_json(f"{self.vllm_api_url}/state", timeout=10)
+        state = self.lifecycle_provider.state()
         port = state.get("port", 8105)
         base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
@@ -4333,37 +4367,28 @@ class OrchestratorRepository:
         return None
 
     def query_profiles(self, vllm_api_url: str) -> dict:
-        profiles = []
-        error = None
+        if not vllm_api_url:
+            return {"profiles": [], "status": "not_applicable", "reason": "model_manager_not_configured"}
         try:
-            remote_profiles = request_json(f"{vllm_api_url.rstrip('/')}/profiles", timeout=15)
-            if isinstance(remote_profiles, list):
-                profiles = remote_profiles
-            elif isinstance(remote_profiles, dict):
-                profiles = remote_profiles.get("profiles") or []
+            return ManagerLifecycleProvider(vllm_api_url).profiles()
         except Exception as e:
-            error = str(e)
-        result = {"profiles": profiles}
-        if error:
-            result["error"] = error
-        return result
+            return {"profiles": [], "status": "unavailable", "error": str(e)}
 
     def query_current_model(self, vllm_api_url: str, model_base_url: str) -> dict:
         manager_error = None
         state = {}
         if vllm_api_url:
             try:
-                state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10) or {}
+                state = ManagerLifecycleProvider(vllm_api_url).state() or {}
             except Exception as exc:
                 manager_error = str(exc)
         model_base_url = normalize_model_base_url(model_base_url)
         if not model_base_url:
             raise ValueError("model endpoint is required; enter host:port or an OpenAI /v1 URL")
-        live_models = request_json(f"{model_base_url}/models", timeout=15) or {}
-        served_models = [
-            str(item.get("id")) for item in live_models.get("data") or []
-            if isinstance(item, dict) and item.get("id")
-        ]
+        inference = OpenAICompatibleInferenceProvider(
+            model_base_url, manager_url=vllm_api_url, api_mode="generic", timeout=15,
+        )
+        served_models = inference.list_models().get("models") or []
         served_name = str(state.get("served_model_name") or "").strip()
         if served_name and served_name not in served_models:
             raise ValueError(
@@ -4388,6 +4413,7 @@ class OrchestratorRepository:
             "model_base_url": model_base_url,
             "manager_available": bool(state),
             "manager_error": manager_error,
+            "capabilities": inference.capabilities(),
         }
 
     def start_memory_profile(self, payload: dict) -> dict:
@@ -4446,18 +4472,19 @@ class OrchestratorRepository:
                     record = state["memory_profile"]
                     record.update({"status": "running", "started_at": now_iso()})
                     persist(rid, state)
-                sampler = GpuSampler(manager_url, interval=0.1)
+                lifecycle = ManagerLifecycleProvider(manager_url)
+                sampler = GpuSampler(ManagerTelemetryProvider(manager_url), interval=0.1)
                 completed, failed, request_count = 0, 0, 0
                 try:
                     try:
-                        request_json(f"{manager_url}/stop", {"timeout": 60}, "POST", 90)
+                        lifecycle.stop({"timeout": 60}, timeout=90)
                     except Exception:
                         pass
                     time.sleep(5)
-                    request_json(f"{manager_url}/start", {
+                    lifecycle.start({
                         "profile": profile, "wait_ready": True, "ready_timeout": 600,
-                    }, "POST", 700)
-                    model_state = request_json(f"{manager_url}/state", timeout=10)
+                    }, timeout=700)
+                    model_state = lifecycle.state()
                     request_json(f"{sentrix_url}/api/model-profiles/bind-runtime", {
                         "manager_url": manager_url,
                         "model_base_url": str(target["model_base_url"]),
