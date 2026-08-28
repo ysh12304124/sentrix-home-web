@@ -34,9 +34,15 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
 .config-model-manager { display:flex; align-items:flex-end; gap:8px; margin:0; }
 .config-model-manager>label { min-width:0; flex:1; }
 .model-registry-refresh { flex:none; margin-bottom:4px; }
-.model-current-choice { grid-column:1; display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:7px; padding-top:7px; border-top:1px solid #e7eaf2; }
-.model-current-choice .field-label { flex:none; font-weight:700; }
-.model-current-choice .check { margin:0; }
+.model-current-choice { grid-column:1; display:grid; grid-template-columns:minmax(170px,1fr) auto; align-items:end; gap:6px 8px; margin-top:7px; padding-top:7px; border-top:1px solid #e7eaf2; }
+.endpoint-model-select { min-width:0; font-weight:700; }
+.endpoint-model-select select { font-weight:400; }
+.endpoint-test-button { min-height:32px; margin-bottom:0; }
+.model-test-feedback { grid-column:1/-1; font-size:10px; line-height:1.4; overflow-wrap:anywhere; }
+.model-test-feedback.state-success { color:var(--accent2); }
+.model-test-feedback.state-error { color:var(--danger); }
+.model-test-feedback.state-testing { color:#9a6700; }
+.endpoint-reuse-check { grid-column:1/-1; width:max-content; max-width:100%; margin:0; }
 .model-picker { grid-column:1/-1; margin-top:7px; padding-top:7px; border-top:1px solid #e7eaf2; }
 .model-picker .field-label { margin-bottom:7px; font-weight:700; }
 .model-manager-empty { grid-column:2; grid-row:3; align-self:start; margin:7px 0 0; padding:7px 8px; border:1px dashed #d8ddea; border-radius:6px; color:var(--muted); background:#f5f6fa; font-size:10px; line-height:1.4; }
@@ -446,9 +452,11 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
   .section-head-actions { align-items:flex-end; flex-direction:column; gap:5px; }
   .endpoint-line { align-items:stretch; flex-direction:column; gap:6px; }
   .endpoint-line .current-model-control { margin-top:0; }
-  .current-model-popover { left:auto; right:0; }
-  .popover-arrow { left:auto; right:22px; }
+  .current-model-popover { left:0; right:auto; }
+  .popover-arrow { left:22px; right:auto; }
   .config-model-manager { align-items:stretch; flex-direction:column; }
   .model-registry-refresh { align-self:flex-start; margin:0; }
-  .model-current-choice { align-items:flex-start; flex-direction:column; gap:5px; }
+  .model-current-choice { grid-template-columns:1fr; align-items:stretch; gap:6px; }
+  .endpoint-test-button,.model-test-feedback,.endpoint-reuse-check { grid-column:1; }
+  .endpoint-test-button { justify-self:start; }
 }

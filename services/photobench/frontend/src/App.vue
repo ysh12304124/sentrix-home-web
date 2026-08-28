@@ -41,10 +41,14 @@ const vllmTargetId = ref("");
 const vllmManagerUrl = ref("");
 const modelEndpoint = ref("");
 const modelEndpointUserEdited = ref(false);
+const endpointModels = ref([]);
+const selectedEndpointModel = ref("");
 const currentModelInfo = ref(null);
 const currentModelLoading = ref(false);
 const currentModelError = ref("");
 const currentModelPopoverOpen = ref(false);
+const modelTestState = ref("idle");
+const modelTestMessage = ref("");
 const connectionConfigState = ref("idle");
 const connectionConfigMessage = ref("");
 const rejudgePrompt = ref("");
@@ -1436,6 +1440,12 @@ async function loadProfiles() {
 function onModelManagerInput() {
   markConnectionConfigDirty();
   profiles.value = [];
+  currentModelInfo.value = null;
+  currentModelPopoverOpen.value = false;
+  currentModelError.value = "";
+  modelTestState.value = "idle";
+  modelTestMessage.value = "";
+  selectedModels.delete("__current__");
   selectedModels.forEach((modelId) => {
     if (modelId !== "__current__") selectedModels.delete(modelId);
   });
@@ -1458,6 +1468,7 @@ async function saveConnectionConfig() {
         judge_model: judgeModel.value.trim(),
         vllm_manager_url: vllmManagerUrl.value.trim(),
         model_base_url: modelEndpoint.value.trim(),
+        endpoint_model: selectedEndpointModel.value,
         judge_provider_id: judgeProviderId.value,
         ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}),
       }),
@@ -1476,10 +1487,15 @@ async function saveConnectionConfig() {
     vllmManagerUrl.value = saved.vllm_manager_url || "";
     modelEndpoint.value = saved.model_base_url || "";
     modelEndpointUserEdited.value = Boolean(saved.model_base_url);
+    selectedEndpointModel.value = saved.endpoint_model || "";
+    endpointModels.value = [];
     currentModelInfo.value = null;
     currentModelError.value = "";
+    modelTestState.value = "idle";
+    modelTestMessage.value = "";
     connectionConfigState.value = "saved";
     connectionConfigMessage.value = `已保存 · ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
+    if (modelEndpoint.value.trim()) await loadCurrentModel({ openPopover: false });
   } catch (e) {
     connectionConfigState.value = "error";
     connectionConfigMessage.value = `保存失败：${e.message}`;
@@ -1580,6 +1596,7 @@ const startDisabledReason = computed(() => {
   if (!modelEndpoint.value.trim()) return "请先填写模型服务地址";
   if (!selectedModels.size) return "请先选择模型";
   if ([...selectedModels].some((modelId) => modelId !== "__current__") && !vllmManagerUrl.value.trim()) return "选择注册表模型需要模型管理器地址";
+  if (selectedModels.has("__current__") && !selectedEndpointModel.value) return "请先从模型服务中选择要复用的模型";
   if (runMode.value === "reuse" && !existingScopeId.value) return "请先选择要复用的相册";
   return "";
 });
@@ -1619,7 +1636,7 @@ async function startRejudge() {
   } catch (e) { error.value = e.message; }
   finally { rejudgeSubmitting.value = false; }
 }
-async function loadCurrentModel() {
+async function loadCurrentModel({ openPopover = true } = {}) {
   const endpoint = modelEndpoint.value.trim();
   if (!endpoint) {
     currentModelError.value = "请先填写模型服务地址，例如 192.168.0.153:8100";
@@ -1628,24 +1645,66 @@ async function loadCurrentModel() {
   currentModelLoading.value = true;
   currentModelError.value = "";
   try {
-    currentModelInfo.value = await post("/api/current-model", {
+    const requestedModel = selectedEndpointModel.value;
+    const requestBody = {
       model_base_url: endpoint,
       vllm_target_id: vllmTargetId.value,
-    });
-    currentModelPopoverOpen.value = true;
+    };
+    let result;
+    try {
+      result = await post("/api/current-model", { ...requestBody, model: requestedModel });
+    } catch (selectionError) {
+      if (!requestedModel) throw selectionError;
+      selectedEndpointModel.value = "";
+      result = await post("/api/current-model", requestBody);
+      currentModelError.value = `已清除不可用的已保存模型：${selectionError.message}`;
+    }
+    endpointModels.value = result.served_models || [];
+    if (result.served_model_name) selectedEndpointModel.value = result.served_model_name;
+    else if (!endpointModels.value.includes(requestedModel)) selectedEndpointModel.value = "";
+    currentModelInfo.value = result;
+    currentModelPopoverOpen.value = openPopover;
   } catch (e) {
     currentModelInfo.value = null;
+    endpointModels.value = [];
     currentModelPopoverOpen.value = false;
     currentModelError.value = e.message;
   } finally {
     currentModelLoading.value = false;
   }
 }
+async function onEndpointModelChange() {
+  selectedModels.delete("__current__");
+  modelTestState.value = "idle";
+  modelTestMessage.value = "";
+  markConnectionConfigDirty();
+  await loadCurrentModel({ openPopover: false });
+}
+async function testEndpointModel() {
+  if (!selectedEndpointModel.value || modelTestState.value === "testing") return;
+  modelTestState.value = "testing";
+  modelTestMessage.value = "正在发送最小 POST 请求…";
+  try {
+    const result = await post("/api/test-model", {
+      model_base_url: modelEndpoint.value.trim(),
+      model: selectedEndpointModel.value,
+    });
+    modelTestState.value = "success";
+    modelTestMessage.value = `POST 可用 · ${result.latency_ms} ms`;
+  } catch (e) {
+    modelTestState.value = "error";
+    modelTestMessage.value = `POST 测试失败：${e.message}`;
+  }
+}
 function onModelEndpointInput() {
   modelEndpointUserEdited.value = true;
+  endpointModels.value = [];
+  selectedEndpointModel.value = "";
   currentModelInfo.value = null;
   currentModelPopoverOpen.value = false;
   currentModelError.value = "";
+  modelTestState.value = "idle";
+  modelTestMessage.value = "";
   selectedModels.delete("__current__");
   markConnectionConfigDirty();
 }
@@ -1656,7 +1715,7 @@ async function startSuite() {
   if (runMode.value === "build" && !window.confirm("构建相册模式只导入并处理数据，不做 QA 测评；产物相册会保留。确定开始？")) return;
   suiteRunning.value = true;
   try {
-   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value.trim(), judge_url: judgeUrl.value.trim(), judge_model: judgeModel.value.trim(), judge_provider_id: judgeProviderId.value, ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}), vllm_target_id: vllmTargetId.value, vllm_manager_url: vllmManagerUrl.value.trim(), model_base_url: selectedModels.has("__current__") || modelEndpointUserEdited.value ? modelEndpoint.value.trim() : "", delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
+   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value.trim(), judge_url: judgeUrl.value.trim(), judge_model: judgeModel.value.trim(), judge_provider_id: judgeProviderId.value, ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}), vllm_target_id: vllmTargetId.value, vllm_manager_url: vllmManagerUrl.value.trim(), model_base_url: selectedModels.has("__current__") || modelEndpointUserEdited.value ? modelEndpoint.value.trim() : "", endpoint_model: selectedModels.has("__current__") ? selectedEndpointModel.value : "", delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -1708,6 +1767,7 @@ async function init() {
     vllmManagerUrl.value = runtimeConfig.vllm_manager_url || vllmTargets.value[vllmTargetId.value]?.manager_url || config.value.default_vllm_api_url || "";
     modelEndpoint.value = runtimeConfig.model_base_url || config.value.default_vllm_model_base_url || vllmTargets.value[vllmTargetId.value]?.model_base_url || "";
     modelEndpointUserEdited.value = Boolean(runtimeConfig.model_base_url);
+    selectedEndpointModel.value = runtimeConfig.endpoint_model || "";
     sentrixUrl.value = runtimeConfig.sentrix_url || config.value.default_sentrix_url;
     judgeUrl.value = runtimeConfig.judge_url || config.value.default_judge_url;
     judgeModel.value = runtimeConfig.judge_model || config.value.judge_model || "";
@@ -1720,6 +1780,7 @@ async function init() {
     connectionConfigMessage.value = "已读取配置文件";
     manifests.value = (await api("/api/manifests")).manifests || [];
     await loadRuns(); if (vllmManagerUrl.value.trim()) await loadProfiles();
+    if (modelEndpoint.value.trim()) await loadCurrentModel({ openPopover: false });
     const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
     if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
@@ -1872,14 +1933,14 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <div class="current-model-control">
             <button class="current-model-trigger" type="button" :class="{ active: currentModelPopoverOpen }" :disabled="currentModelLoading" @click="currentModelInfo ? currentModelPopoverOpen = !currentModelPopoverOpen : loadCurrentModel()">
               <span class="current-model-icon">{{ currentModelLoading ? '…' : '↗' }}</span>
-              <span>{{ currentModelLoading ? '正在读取' : currentModelInfo ? '当前模型' : '获取当前模型' }}</span>
+              <span>{{ currentModelLoading ? '正在读取' : currentModelInfo ? '可用模型' : '获取模型列表' }}</span>
               <span class="current-model-chevron">{{ currentModelPopoverOpen ? '⌃' : '⌄' }}</span>
             </button>
             <div v-if="currentModelInfo && currentModelPopoverOpen" class="current-model-popover" role="status" aria-live="polite">
               <span class="popover-arrow"></span>
-              <div class="current-model-popover-head"><span>CURRENT RUNTIME</span><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></div>
-              <strong>{{ currentModelInfo.served_model_name }}</strong>
-              <div class="current-model-status"><i></i>{{ currentModelInfo.manager_available ? '已读取 Manager 运行状态' : '外部端点，无模型管理器' }}</div>
+              <div class="current-model-popover-head"><span>MODEL ENDPOINT</span><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></div>
+              <strong>{{ currentModelInfo.served_model_name || `${currentModelInfo.served_models.length} 个模型待选择` }}</strong>
+              <div class="current-model-status"><i></i>{{ currentModelInfo.manager_available ? '已读取 Manager 当前运行状态' : '已连接 OpenAI-compatible 端点' }}</div>
               <dl>
                 <div><dt>模型服务</dt><dd>{{ currentModelInfo.model_base_url }}</dd></div>
                 <div v-if="currentModelInfo.state?.profile"><dt>Profile</dt><dd>{{ currentModelInfo.state.profile }}</dd></div>
@@ -1902,9 +1963,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <button class="btn ghost compact model-registry-refresh" type="button" :disabled="!vllmManagerUrl.trim()" @click="loadProfiles">刷新模型注册表</button>
           </div>
           <div class="model-current-choice">
-            <span class="field-label">当前运行模型</span>
-            <label class="check" :class="{ active: selectedModels.has('__current__') }">
-              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!currentModelInfo" @change="setModelSelected('__current__', $event.target.checked)" />复用当前运行模型<span v-if="currentModelInfo">（{{ currentModelInfo.served_model_name }}，不启停）</span><span v-else>（先获取模型信息）</span>
+            <label class="endpoint-model-select">可用模型
+              <select v-model="selectedEndpointModel" :disabled="!endpointModels.length" @change="onEndpointModelChange">
+                <option value="">{{ endpointModels.length ? '请选择模型' : '先获取模型列表' }}</option>
+                <option v-for="model in endpointModels" :key="model" :value="model">{{ model }}</option>
+              </select>
+            </label>
+            <button class="btn ghost compact endpoint-test-button" type="button" :disabled="!selectedEndpointModel || modelTestState === 'testing'" @click="testEndpointModel">{{ modelTestState === 'testing' ? '测试中…' : '测试 POST' }}</button>
+            <span v-if="modelTestMessage" class="model-test-feedback" :class="`state-${modelTestState}`">{{ modelTestMessage }}</span>
+            <label class="check endpoint-reuse-check" :class="{ active: selectedModels.has('__current__') }">
+              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ selectedEndpointModel }}，不启停）</span>
             </label>
           </div>
           <div v-if="vllmManagerUrl.trim()" class="model-picker">
@@ -1914,7 +1982,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </label>
 <span v-if="!profiles.length" class="config-help">尚未从模型管理器注册表加载模型，请点击“刷新模型注册表”。</span>
           </div>
-          <div v-else class="model-manager-empty">未配置模型管理器。当前可通过上方“获取当前运行模型”查询并复用单个外部模型，普通注册表模型选择已隐藏。</div>
+          <div v-else class="model-manager-empty">未配置模型管理器。Ollama、llama.cpp 等端点只会按请求使用上方选中的模型；测评服务不会自动启停或切换模型。</div>
         </div>
       </div>
       <div class="actions">

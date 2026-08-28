@@ -293,6 +293,7 @@ def public_runtime_connection_config() -> dict:
             str(RUNTIME_CONNECTION_CONFIG["model_base_url"])
             if "model_base_url" in RUNTIME_CONNECTION_CONFIG else DEFAULT_VLLM_BASE_URL
         ),
+        "endpoint_model": str(RUNTIME_CONNECTION_CONFIG.get("endpoint_model") or ""),
         "judge_provider_id": DEFAULT_JUDGE_PROVIDER_ID,
     }
 
@@ -310,6 +311,7 @@ def persist_runtime_connection_config(payload: dict) -> dict:
             payload.get("vllm_manager_url"), "vLLM Manager URL", optional=True
         ),
         "model_base_url": normalize_model_base_url(payload.get("model_base_url")),
+        "endpoint_model": str(payload.get("endpoint_model") or "").strip(),
         "judge_provider_id": provider_id,
     }
     if not values["judge_model"]:
@@ -4465,7 +4467,8 @@ class OrchestratorRepository:
         except Exception as e:
             return {"profiles": [], "status": "unavailable", "error": str(e)}
 
-    def query_current_model(self, vllm_api_url: str, model_base_url: str) -> dict:
+    def query_current_model(self, vllm_api_url: str, model_base_url: str,
+                            requested_model: str = "") -> dict:
         manager_error = None
         state = {}
         if vllm_api_url:
@@ -4480,24 +4483,33 @@ class OrchestratorRepository:
             model_base_url, manager_url=vllm_api_url, api_mode="generic", timeout=15,
         )
         served_models = inference.list_models().get("models") or []
+        if not served_models:
+            raise ValueError("model endpoint exposes no models")
+        requested_model = str(requested_model or "").strip()
+        if requested_model and requested_model not in served_models:
+            raise ValueError(
+                f"selected model {requested_model!r} is not exposed by the endpoint; "
+                f"available models: {served_models}"
+            )
         served_name = str(state.get("served_model_name") or "").strip()
         if served_name and served_name not in served_models:
             raise ValueError(
                 f"manager state is stale or mismatched: expected {served_name}, "
                 f"live endpoint serves {served_models or 'nothing'}"
             )
+        if served_name and requested_model and requested_model != served_name:
+            raise ValueError(
+                f"Manager reports {served_name!r} as the active model; "
+                f"cannot reuse requested model {requested_model!r} without switching it through Manager"
+            )
         if not served_name:
-            if len(served_models) != 1:
-                raise ValueError(
-                    f"model endpoint must expose exactly one model when no Manager is configured; "
-                    f"found {served_models or 'nothing'}"
-                )
-            served_name = served_models[0]
+            served_name = requested_model or (served_models[0] if len(served_models) == 1 else "")
         profile = str(state.get("profile") or "").strip()
-        model_id = profile or served_name
+        model_id = profile or served_name or None
         return {
             "model_id": model_id,
-            "served_model_name": served_name,
+            "served_model_name": served_name or None,
+            "selection_required": not bool(served_name),
             "verified_at": now_iso(),
             "served_models": served_models,
             "state": state,
@@ -4505,6 +4517,34 @@ class OrchestratorRepository:
             "manager_available": bool(state),
             "manager_error": manager_error,
             "capabilities": inference.capabilities(),
+        }
+
+    def test_model_endpoint(self, model_base_url: str, requested_model: str) -> dict:
+        snapshot = self.query_current_model("", model_base_url, requested_model)
+        served_name = str(snapshot.get("served_model_name") or "").strip()
+        if not served_name:
+            raise ValueError("select a model before testing the endpoint")
+        inference = OpenAICompatibleInferenceProvider(
+            snapshot["model_base_url"], api_mode="generic", timeout=30,
+        )
+        started = time.perf_counter()
+        response = inference.chat({
+            "model": served_name,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 1,
+            "temperature": 0,
+            "stream": False,
+        }, timeout=30)
+        body = response.json()
+        choices = body.get("choices") or [] if isinstance(body, dict) else []
+        if not choices:
+            raise ValueError("model endpoint returned no completion choices")
+        return {
+            "ok": True,
+            "model": served_name,
+            "model_base_url": snapshot["model_base_url"],
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "verified_at": now_iso(),
         }
 
     def start_memory_profile(self, payload: dict) -> dict:
@@ -5533,6 +5573,7 @@ class OrchestratorRepository:
         judge_model = str(payload.get("judge_model") or resolved_judge_model)
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
         model_base_url = normalize_model_base_url(payload.get("model_base_url"))
+        endpoint_model = str(payload.get("endpoint_model") or "").strip()
         vllm_manager_url = normalize_service_url(payload.get("vllm_manager_url"))
         if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
             raise ValueError("big_model cannot be combined with current model")
@@ -5564,12 +5605,27 @@ class OrchestratorRepository:
             raise ValueError("current model cannot be combined with managed model profiles")
         current_model_snapshot = None
         if use_current_model:
-            if model_base_url:
+            if endpoint_model:
+                target_id = "external"
                 vllm_api_url = ""
                 vllm_model_base_url = model_base_url
-            current_model_snapshot = self.query_current_model(vllm_api_url, vllm_model_base_url)
+            elif vllm_manager_url:
+                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                vllm_api_url = vllm_manager_url
+                vllm_model_base_url = model_base_url or str(target["model_base_url"])
+            else:
+                target_id = "external"
+                vllm_api_url = ""
+                vllm_model_base_url = model_base_url
+            current_model_snapshot = self.query_current_model(
+                vllm_api_url, vllm_model_base_url, endpoint_model,
+            )
+            if current_model_snapshot.get("selection_required"):
+                raise ValueError(
+                    "model endpoint exposes multiple models; select one before reusing the endpoint"
+                )
             models = [current_model_snapshot["model_id"]]
-            if model_base_url:
+            if not vllm_api_url:
                 request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-external-runtime", {
                     "base_url": current_model_snapshot["model_base_url"],
                     "model": current_model_snapshot["served_model_name"],
@@ -5912,21 +5968,30 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/current-model":
                 direct_base_url = normalize_model_base_url(payload.get("model_base_url"))
                 if direct_base_url:
-                    result = self.repo.query_current_model("", direct_base_url)
+                    manager_url = normalize_service_url(payload.get("vllm_manager_url"))
+                    result = self.repo.query_current_model(
+                        manager_url, direct_base_url, str(payload.get("model") or ""),
+                    )
                     target_id = "external"
                     target = {
-                        "label": "外部模型服务",
+                        "label": "自定义模型服务",
                         "model_base_url": direct_base_url,
-                        "manager_url": "",
+                        "manager_url": manager_url,
                         "kind": "external",
                     }
                 else:
                     target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
                     result = self.repo.query_current_model(
                         str(target["manager_url"]), str(target["model_base_url"]),
+                        str(payload.get("model") or ""),
                     )
                 result.update({"target_id": target_id, "target": target})
                 self._json(result)
+            elif self.path == "/api/test-model":
+                self._json(self.repo.test_model_endpoint(
+                    normalize_model_base_url(payload.get("model_base_url")),
+                    str(payload.get("model") or ""),
+                ))
             elif self.path == "/api/memory-profile":
                 self._json(self.repo.start_memory_profile(payload), status=202)
             elif self.path == "/api/runs":
