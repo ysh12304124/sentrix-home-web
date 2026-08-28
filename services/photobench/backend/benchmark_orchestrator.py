@@ -5418,7 +5418,10 @@ class OrchestratorRepository:
         vllm_manager_url = normalize_service_url(payload.get("vllm_manager_url"))
         if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
             raise ValueError("big_model cannot be combined with current model")
-        managed_models = [model for model in models if model != BIG_MODEL_PROFILE_ID]
+        managed_models = [
+            model for model in models
+            if model not in {BIG_MODEL_PROFILE_ID, CURRENT_MODEL_SELECTION}
+        ]
         if managed_models and not vllm_manager_url:
             raise ValueError("选择模型注册表中的模型时必须提供模型管理器地址")
         if managed_models:
