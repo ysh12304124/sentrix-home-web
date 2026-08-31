@@ -24,6 +24,8 @@ _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精�
 {evidence_types}
 
 只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据重复声明。规则：
+- goal 必须用简体中文描述用户目标（家庭记忆系统使用中文，英文目标会导致语义检索
+  与中文图片描述失配、召回失败）；描述要保留完整语义，不要压缩成几个词。
 - 数量、是否存在、分组等结构化问题声明 structured_fact；拍摄时间/日期/年份声明 temporal_metadata；只有用户明确要求找出照片时才增加 memory_asset。
 - 用户没有明确要求“历史对话/之前说过什么”时，不要声明 user_statement。
 - 地点问题声明 location_metadata；照片内容/颜色/动作声明 visual_observation；照片文字/数字声明 visible_text。
@@ -67,8 +69,9 @@ class PlannerDeclarationResult:
 
 
 class GoalPlanner:
-    def __init__(self, *, chat_fn):
+    def __init__(self, *, chat_fn, enable_format_rewrite: bool = True):
         self.chat_fn = chat_fn
+        self.enable_format_rewrite = enable_format_rewrite
 
     def declare(self, message: str, *, scope_id: str, history: str = "",
                 include_debug: bool = False, step_id: str = "planner_step_0") -> PlannerDeclarationResult:
@@ -82,7 +85,7 @@ class GoalPlanner:
             {"role": "user", "content": message},
         ]
         if history:
-            messages.insert(1, {"role": "system", "content": "历史对话背景：\n" + history})
+            messages[0]["content"] = messages[0]["content"] + "\n\n历史对话背景：\n" + history
         prompt_copy = copy.deepcopy(messages) if include_debug else None
         try:
             sig = inspect.signature(self.chat_fn)
@@ -98,7 +101,18 @@ class GoalPlanner:
             payload = self._normalize_payload(payload, scope_id=scope_id, default_goal=message)
             action = parse_planner_action(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return PlannerDeclarationResult(fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
+            rewritten = self._rewrite_json(raw, message=message) if self.enable_format_rewrite else ""
+            if not rewritten:
+                return PlannerDeclarationResult(
+                    fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
+            try:
+                payload = self._parse_json(rewritten)
+                payload = self._normalize_payload(
+                    payload, scope_id=scope_id, default_goal=message)
+                action = parse_planner_action(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return PlannerDeclarationResult(
+                    fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
         if action.kind not in {"declare", "revise"} or action.declaration is None:
             return PlannerDeclarationResult(fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
         if action.declaration.scope_id != scope_id:
@@ -167,10 +181,57 @@ class GoalPlanner:
             if text.endswith("```"):
                 text = text[:-3]
         start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end < start:
+        if start < 0:
             raise ValueError("planner did not return JSON")
-        payload = json.loads(text[start:end + 1])
+        candidate = text[start:]
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            if (exc.pos < len(candidate) - 1
+                    or GoalPlanner._root_brace_balance(candidate) != 1):
+                raise
+            payload = json.loads(candidate + "}")
         if not isinstance(payload, dict):
             raise ValueError("planner action must be an object")
         return payload
+
+    @staticmethod
+    def _root_brace_balance(text: str) -> int:
+        """Return unmatched object braces without treating quoted braces as syntax."""
+        balance = 0
+        quoted = False
+        escaped = False
+        for char in text:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+                continue
+            if char == '"':
+                quoted = True
+            elif char == "{":
+                balance += 1
+            elif char == "}":
+                balance -= 1
+        return balance
+
+    def _rewrite_json(self, raw: str, *, message: str) -> str:
+        """One semantic-preserving format rewrite; no autonomous task recovery."""
+        prompt = [
+            {"role": "system", "content":
+             "只把以下规划输出改写为合法 JSON。不得增加、删除或改变任务语义；"
+             "只输出 JSON，不要 Markdown。"},
+            {"role": "user", "content": "用户任务：\n" + message + "\n原始输出：\n" + str(raw or "")},
+        ]
+        try:
+            sig = inspect.signature(self.chat_fn)
+            if "call_type" in sig.parameters:
+                return self.chat_fn(
+                    prompt, call_type="planner_format_rewrite",
+                    step_id="planner_format_rewrite") or ""
+            return self.chat_fn(prompt) or ""
+        except Exception:
+            return ""

@@ -195,7 +195,9 @@ class ResultSetContractTests(unittest.TestCase):
             ["photo_7", "photo_14"],
         )
         self.assertEqual(requested, "photo_1")
-        self.assertEqual(arguments["asset_handle"], "photo_7")
+        # Preserve an explicit stale handle so execution can reject it and
+        # force a fresh search instead of silently inspecting another photo.
+        self.assertEqual(arguments["asset_handle"], "photo_1")
 
     def test_model_time_filter_must_match_user_wording(self):
         sanitized = runtime_tools._sanitize_model_filters(

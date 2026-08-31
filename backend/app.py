@@ -33,6 +33,11 @@ from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, 
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
 from .person_insights import rank_core_people
+from .runtime_providers import (
+    create_runtime_providers,
+    normalize_openai_base_url,
+    normalize_service_url,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -708,14 +713,16 @@ def _profile_summary(profile_id, profile):
 
 
 def _current_model_runtime():
-    if RUNTIME_MODEL_SOURCE == "cloud_api":
+    if RUNTIME_MODEL_SOURCE in {"cloud_api", "external"}:
         return {
             "backend": getattr(gamma, "backend", "unknown"),
             "base_url": gamma.base_url, "model": gamma.model,
             "profile": RUNTIME_MODEL_PROFILE,
-            "source": "cloud_api",
+            "source": RUNTIME_MODEL_SOURCE,
             "status": "running",
             "state": None,
+            "capabilities": gamma.inference_provider.capabilities()
+                if getattr(gamma, "inference_provider", None) else {},
         }
     registry = _load_vllm_registry()
     state = _load_vllm_state(registry)
@@ -972,12 +979,18 @@ def delete_memory_space(scope_id: str):
 
 
 _OCR_SETTING_KEY = "ocr.small_enabled"
+_OCR_SETTING_EXPLICIT_KEY = "ocr.small_enabled.explicit"
 
 
 def _ocr_settings():
     from .agent_runtime.tools import small_ocr_available
+    from .agent_runtime.ocr_tool import resolve_small_ocr_enabled
     available = small_ocr_available()
-    enabled = store.get_setting(_OCR_SETTING_KEY, "true" if available else "false").lower() in {"1", "true", "on"}
+    enabled = resolve_small_ocr_enabled(
+        store.get_setting(_OCR_SETTING_KEY),
+        store.get_setting(_OCR_SETTING_EXPLICIT_KEY),
+        available=available,
+    )
     return {
         "small_ocr_enabled": enabled,
         "small_ocr_available": available,
@@ -998,6 +1011,7 @@ def get_ocr_settings():
 @app.put("/api/settings/ocr")
 def put_ocr_settings(payload: OCRSettingsPayload):
     store.set_setting(_OCR_SETTING_KEY, "true" if payload.small_ocr_enabled else "false")
+    store.set_setting(_OCR_SETTING_EXPLICIT_KEY, "true")
     return _ocr_settings()
 
 
@@ -1027,6 +1041,39 @@ def current_model_profile():
     return _current_model_runtime()
 
 
+@app.get("/api/runtime-providers")
+def runtime_providers():
+    """Expose runtime capabilities without requiring lifecycle management."""
+    runtime = _current_model_runtime()
+    manager_url = RUNTIME_VLLM_API_URL or VLLM_API_URL
+    providers = create_runtime_providers(
+        gamma.base_url,
+        manager_url=manager_url,
+        api_key=getattr(gamma, "api_key", ""),
+        api_mode=getattr(gamma, "api_mode", "generic"),
+        timeout=min(30, getattr(gamma, "timeout", 30)),
+    )
+    try:
+        lifecycle = providers.lifecycle.state()
+    except Exception as exc:
+        lifecycle = {"status": "unavailable", "error": str(exc)}
+    telemetry = providers.telemetry.gpu_stats()
+    try:
+        inference_health = providers.inference.health()
+    except Exception as exc:
+        inference_health = {"status": "unavailable", "error": str(exc)}
+    return {
+        "runtime": runtime,
+        "inference": {
+            "status": inference_health.get("status", "unavailable"),
+            "health": inference_health,
+            "capabilities": providers.inference.capabilities(),
+        },
+        "lifecycle": lifecycle,
+        "telemetry": telemetry,
+    }
+
+
 @app.post("/api/model-profiles/switch")
 def switch_model_profile(request: ModelSwitchRequest):
     return _run_vllm_switch(request)
@@ -1040,14 +1087,25 @@ class RuntimeBindRequest(BaseModel):
 def bind_model_runtime(request: RuntimeBindRequest):
     """Bind Agent runtime to one fixed Manager/model-service pair for this process."""
     global RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL
-    if not request.manager_url.startswith(("http://", "https://")):
+    manager_url = normalize_service_url(request.manager_url)
+    model_base_url = normalize_openai_base_url(request.model_base_url)
+    if not manager_url:
         raise HTTPException(status_code=400, detail="invalid vLLM manager URL")
-    if request.model_base_url and not request.model_base_url.startswith(("http://", "https://")):
+    if request.model_base_url and not model_base_url:
         raise HTTPException(status_code=400, detail="invalid vLLM model URL")
     previous = (RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL)
-    RUNTIME_VLLM_API_URL = request.manager_url.rstrip("/")
-    RUNTIME_VLLM_BASE_URL = request.model_base_url.rstrip("/") if request.model_base_url else None
-    state = _load_vllm_state()
+    RUNTIME_VLLM_API_URL = manager_url
+    RUNTIME_VLLM_BASE_URL = model_base_url or None
+    providers = create_runtime_providers(
+        RUNTIME_VLLM_BASE_URL or gamma.base_url,
+        manager_url=RUNTIME_VLLM_API_URL,
+        api_key=getattr(gamma, "api_key", ""),
+        api_mode="vllm",
+    )
+    try:
+        state = providers.lifecycle.state()
+    except Exception:
+        state = None
     if not state or not state.get("pid"):
         RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL = previous
         raise HTTPException(status_code=502, detail="selected vLLM Manager has no active model")
@@ -1110,6 +1168,71 @@ def bind_cloud_runtime(request: CloudRuntimeBindRequest):
         "base_url": base_url,
         "model": model,
         "runtime": runtime,
+    }
+
+
+class ExternalRuntimeBindRequest(BaseModel):
+    base_url: str
+    model: str
+    api_mode: str = "generic"
+
+
+@app.post("/api/model-profiles/bind-external-runtime")
+def bind_external_runtime(request: ExternalRuntimeBindRequest):
+    """Bind Agent and ingestion to a pre-started OpenAI-compatible endpoint."""
+    base_url = normalize_openai_base_url(request.base_url)
+    model = str(request.model or "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="invalid external model base URL")
+    if not model:
+        raise HTTPException(status_code=400, detail="external model name is empty")
+    api_key = (
+        os.getenv("SENTRIX_EXTERNAL_API_KEY")
+        or os.getenv("SENTRIX_VLLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    ).strip()
+    api_mode = str(request.api_mode or "generic").strip().lower()
+    if api_mode not in {"generic", "vllm"}:
+        raise HTTPException(status_code=400, detail="api_mode must be generic or vllm")
+    new_gamma = GammaClient(
+        base_url=base_url,
+        model=model,
+        backend="openai",
+        api_key=api_key,
+        manager_url="",
+        runtime_source="external",
+        api_mode=api_mode,
+    )
+    try:
+        probe = new_gamma.inference_provider.list_models()
+        if model not in probe.get("models", []):
+            raise ValueError(f"model {model!r} is not served by endpoint")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"external model endpoint unavailable: {exc}") from exc
+    new_gamma.bind_store(store)
+    global gamma, pipeline, RUNTIME_MODEL_SOURCE, RUNTIME_MODEL_PROFILE
+    with runtime_lock:
+        previous_pipeline = pipeline
+        gamma = new_gamma
+        pipeline = IngestionPipeline(
+            store,
+            gamma=new_gamma,
+            asr=previous_pipeline.asr,
+            face=previous_pipeline.face,
+            clip=previous_pipeline.clip,
+        )
+        RUNTIME_MODEL_SOURCE = "external"
+        RUNTIME_MODEL_PROFILE = model
+    return {
+        "accepted": True,
+        "source": "external",
+        "backend": "openai",
+        "base_url": new_gamma.base_url,
+        "model": model,
+        "api_mode": api_mode,
+        "capabilities": new_gamma.inference_provider.capabilities(),
+        "runtime": _current_model_runtime(),
     }
 
 @app.post("/api/model-profiles/sync-runtime")
@@ -2400,9 +2523,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             model_call_metrics.extend(metrics)
         return text
 
-    from .agent_runtime.tools import small_ocr_available
-    _ocr_setting = store.get_setting(
-        "ocr.small_enabled", "true" if small_ocr_available() else "false").lower() in {"1", "true", "on"}
+    _ocr_setting = _ocr_settings()["small_ocr_enabled"]
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            ocr_settings={"small_ocr_enabled": _ocr_setting},
                            scope_id=scope_id, viewer_id=viewer_id,
@@ -2555,7 +2676,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             # summary; this is still server-side debug data and never enters
             # the model-visible observation path.
             "observation": observation,
-            "latency_s": step.get("latency_s"), "reason": step.get("reason") or "",
+            "latency_s": step.get("latency_s"),
+            "reason": step.get("reason") or step.get("error") or "",
             "error": step.get("error") or "",
             "retrieval_timing": observation.get("retrieval_timing"),
         }
@@ -2570,6 +2692,10 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         tool_trace.append(tool_record)
     return {
         "answer": turn.final_answer,
+        "final_answer": turn.final_answer,
+        "answer_source": turn.answer_source,
+        "writer_call_id": turn.writer_call_id,
+        "writer_status": turn.writer_status,
         "model_call_metrics": ordered_metrics,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
@@ -2960,27 +3086,58 @@ def assistant_response(result):
     # never promote raw candidates; selected assets win, otherwise expose only
     # the first three evidence sources.
     grounding = result.get("answer_grounding") or {}
-    if not result.get("image_results") and isinstance(grounding, dict):
-        evidence_images = [
-            item for item in (grounding.get("evidence_images") or [])
+    if isinstance(grounding, dict):
+        evidence_media = [
+            dict(item) for item in (
+                grounding.get("evidence_media") or grounding.get("evidence_images") or [])
             if isinstance(item, dict) and item.get("asset_id")
         ]
+        known_ids = {str(item.get("asset_id")) for item in evidence_media}
+        evidence_ids = grounding.get("evidence_asset_ids") or grounding.get("evidence_sources") or []
+        for asset_id in evidence_ids[:12]:
+            asset_id = str(asset_id)
+            if asset_id in known_ids:
+                continue
+            try:
+                asset = store.get_asset(asset_id)
+            except Exception:
+                asset = None
+            if asset:
+                evidence_media.append({
+                    "asset_id": asset_id,
+                    "file_name": asset.get("file_name") or "",
+                    "captured_at": asset.get("captured_at") or "",
+                    "media_type": asset.get("media_type") or "image",
+                    "media_url": f"/api/assets/{asset_id}/file",
+                })
+                known_ids.add(asset_id)
         selected_ids = {str(value) for value in (grounding.get("selected_asset_ids") or []) if value}
         if selected_ids:
-            selected = [item for item in evidence_images if str(item.get("asset_id")) in selected_ids]
-            evidence_images = selected or evidence_images
+            selected = [item for item in evidence_media if str(item.get("asset_id")) in selected_ids]
+            evidence_media = selected or evidence_media
         projected = []
-        for item in evidence_images[:3]:
+        for item in evidence_media[:3]:
             asset_id = str(item.get("asset_id"))
-            media_url = item.get("media_url") or f"/api/assets/{asset_id}/file"
+            asset = None
+            if not item.get("media_type"):
+                try:
+                    asset = store.get_asset(asset_id)
+                except Exception:
+                    pass
+            media_type = str(item.get("media_type") or (asset or {}).get("media_type") or "image")
             projected.append({
                 "asset_id": asset_id,
-                "file_name": item.get("file_name") or "",
-                "media_url": media_url,
-                "display_handle": item.get("handle") or "原始图片",
-                "captured_at": item.get("captured_at") or "",
+                "file_name": item.get("file_name") or (asset or {}).get("file_name") or "",
+                "media_type": media_type,
+                "media_url": item.get("media_url") or f"/api/assets/{asset_id}/file",
+                "display_handle": item.get("handle") or ("原始视频" if media_type == "video" else "原始图片"),
+                "captured_at": item.get("captured_at") or (asset or {}).get("captured_at") or "",
             })
-        result["image_results"] = projected
+        if not result.get("media_results"):
+            result["media_results"] = projected
+        if not result.get("image_results"):
+            result["image_results"] = [item for item in projected if item["media_type"] == "image"]
+        result["mediaResults"] = result.get("media_results") or []
     result["terminationReason"] = result.get("termination_reason", "")
     result["claimVerifications"] = result["claim_verifications"]
     result["claimVerificationStatus"] = result["claim_verification_status"]
@@ -3460,16 +3617,29 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
 
 @app.post("/api/maintenance/recheck")
 def recheck(background_tasks: BackgroundTasks, scope_id: str | None = None):
-    clauses = ["status IN ('queued', 'failed', 'semantic_enriching', 'video-queued', 'video-processing-failed')"]
+    # processing/semantic_enriching 是处理中断遗留的中间状态（SQLite 写锁竞争 /
+    # worker 重启时遗留），recheck 必须覆盖并先重置为 queued 再重新处理；
+    # 否则这些资产永久卡住，scope 永不 complete（实测 album3-kling 导入卡死）。
+    clauses = ["status IN ('queued', 'failed', 'processing', 'semantic_enriching', 'video-queued', 'video-processing-failed')"]
     params = []
     if scope_id:
         clauses.append("scope_id = ?")
         params.append(scope_id)
     assets = [store.get_asset(row["id"]) for row in store._rows(
         "SELECT id FROM assets WHERE " + " AND ".join(clauses) + " ORDER BY created_at", params)]
+    recovered = 0
+    for item in assets:
+        if item["status"] in PIPELINE_STALE_STATUSES:
+            store.cleanup_asset_derivatives(item["id"])
+            store.update_asset(item["id"], "queued", {
+                "error": None, "failed_stage": None,
+                "pipeline_attempts": 0, "pipeline_retry_count": 0,
+                "pipeline_recovered_from_status": item["status"],
+            })
+            recovered += 1
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
-    return {"accepted": len(assets), "status": "recheck-queued"}
+    return {"accepted": len(assets), "status": "recheck-queued", "recovered_from_stale": recovered}
 
 
 @app.post("/api/maintenance/summarize-events")

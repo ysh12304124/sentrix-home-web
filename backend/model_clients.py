@@ -11,6 +11,7 @@ from pathlib import Path
 from .face_embeddings import FaceEmbeddingUnavailable, compute_face_quality
 from .geocoding import format_gps_prefix
 from .onnx_runtime import face_gpu_inference_gate, face_onnx_provider_options, face_onnx_providers
+from .runtime_providers import OpenAICompatibleInferenceProvider, normalize_openai_base_url
 
 
 def align_face_crop(image, bbox, landmarks=None):
@@ -239,7 +240,10 @@ ROLE_INFERENCE = {
     # Search validation is a bounded classification pass, not free-form
     # reasoning. Keep the JSON response short so one vision batch does not
     # consume the Agent wall-time budget.
-    "search_validation": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 320},
+    # Validation emits one short JSON row per candidate. Keep the completion
+    # budget below the 12B server context ceiling; tools.py also splits a
+    # batch if a deployment reports a tighter prompt budget.
+    "search_validation": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 192},
     "answer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "writer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "verify": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
@@ -252,6 +256,20 @@ def _openai_thinking_kwargs():
     """Return the vLLM chat-template switch; reasoning is disabled by default."""
     value = os.getenv("SENTRIX_ENABLE_THINKING", "0").strip().lower()
     return {"enable_thinking": value in {"1", "true", "yes", "on"}}
+
+
+def _cloud_thinking_kwargs(endpoint_base=None):
+    """Disable provider-side reasoning for cloud APIs by default.
+
+    Ark's OpenAI-compatible Doubao endpoint uses ``thinking.type`` rather
+    than the vLLM ``chat_template_kwargs`` switch.  Keep the fallback field
+    used by other OpenAI-compatible cloud providers without changing local
+    vLLM payloads.
+    """
+    endpoint = str(endpoint_base or "").lower()
+    if "volces.com" in endpoint or "volcengine.com" in endpoint:
+        return {"thinking": {"type": "disabled"}}
+    return {"enable_thinking": False}
 
 
 def build_image_prompt(metadata=None):
@@ -584,6 +602,16 @@ class GammaClient:
         # Ollama expects numeric -1 for indefinite residency; the string "-1"
         # is rejected by its request schema.
         self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
+        self.inference_provider = (
+            OpenAICompatibleInferenceProvider(
+                self._base_url_setting,
+                api_key=self.api_key,
+                api_mode=self.api_mode,
+                manager_url=self.manager_url,
+                timeout=self.timeout,
+            )
+            if self.backend == "openai" else None
+        )
 
     @staticmethod
     def _normalize_backend(value):
@@ -598,8 +626,19 @@ class GammaClient:
 
     @staticmethod
     def _normalize_openai_base_url(value):
-        value = str(value or "http://127.0.0.1:8100/v1").rstrip("/")
-        return value if re.search(r"/v\d+$", value, flags=re.IGNORECASE) else f"{value}/v1"
+        return normalize_openai_base_url(value or "http://127.0.0.1:8100/v1")
+
+    def _inference_for(self, endpoint_base):
+        endpoint_base = normalize_openai_base_url(endpoint_base)
+        if self.inference_provider and self.inference_provider.base_url == endpoint_base:
+            return self.inference_provider
+        return OpenAICompatibleInferenceProvider(
+            endpoint_base,
+            api_key=self.api_key,
+            api_mode=self.api_mode,
+            manager_url=self.manager_url,
+            timeout=self.timeout,
+        )
 
     _CACHE_TTL_SECONDS = 5.0
 
@@ -755,7 +794,9 @@ class GammaClient:
             "stream_options": {"include_usage": True},
             "temperature": temperature,
         }
-        if self.api_mode != "generic":
+        if is_cloud_api:
+            payload.update(_cloud_thinking_kwargs(endpoint_base))
+        elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
@@ -805,22 +846,15 @@ class GammaClient:
 
     def _tokenize_for_budget(self, endpoint_base, messages):
         """Ask the Manager bound to this endpoint to tokenize with the active model."""
-        manager_url = self.manager_url
-        if not manager_url:
+        provider = self._inference_for(endpoint_base)
+        if not provider.manager_url:
             return None
-        url = f"{manager_url}/tokenize-current"
         last_error = None
         for attempt in range(2):
             try:
-                response = httpx.post(
-                    url,
-                    json={"messages": messages, "add_generation_prompt": True},
-                    timeout=min(15, self.timeout),
-                )
-                response.raise_for_status()
-                value = response.json()
-                if int(value.get("prompt_tokens") or 0) < 1 or int(value.get("max_model_len") or 0) < 1:
-                    raise ValueError("invalid tokenizer budget response")
+                value = provider.token_count(messages, timeout=min(15, self.timeout))
+                if value is None:
+                    return None
                 value["token_count_source"] = "vllm_tokenize"
                 value["preflight_status"] = "ok"
                 return value
@@ -932,7 +966,9 @@ class GammaClient:
             "stream_options": {"include_usage": True} if use_stream else None,
             "temperature": 0,
         }
-        if self.api_mode != "generic":
+        if self.runtime_source == "cloud_api":
+            payload.update(_cloud_thinking_kwargs(endpoint_base))
+        elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
             payload["response_format"] = {"type": "json_object"}
@@ -949,8 +985,7 @@ class GammaClient:
         try:
             if use_stream:
                 return self._chat_openai_stream(endpoint_base, payload, headers, role, model, json_mode)
-            response = httpx.post(f"{endpoint_base}/chat/completions", json=payload, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
+            response = self._inference_for(endpoint_base).chat(payload, timeout=self.timeout)
             data = response.json()
             text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
             if isinstance(text, list):
@@ -986,8 +1021,7 @@ class GammaClient:
         chunks = []
         prompt_tokens = None
         completion_tokens = None
-        with httpx.stream("POST", f"{endpoint_base}/chat/completions",
-                           json=payload, headers=headers, timeout=self.timeout) as response:
+        with self._inference_for(endpoint_base).chat_stream(payload, timeout=self.timeout) as response:
             if response.status_code >= 400:
                 try:
                     import sys as _sys
@@ -1151,7 +1185,41 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
 图片顺序和事件上下文：""" + json.dumps({
             "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
         }, ensure_ascii=False)
-        parsed = parse_json_response(self.chat(prompt, images, self._core_vision_options()))
+        evidence_indices = list(range(len(images)))
+        fallback_reason = None
+        try:
+            response = self.chat(prompt, images, self._core_vision_options())
+        except ModelError as error:
+            match = re.search(r"At most\s+(\d+)\s+image(?:\(s\))?", str(error), flags=re.IGNORECASE)
+            image_limit = int(match.group(1)) if match else 0
+            if image_limit < 1 or image_limit >= len(images):
+                raise
+            if image_limit == 1:
+                evidence_indices = [0]
+            else:
+                evidence_indices = [
+                    round(index * (len(images) - 1) / (image_limit - 1))
+                    for index in range(image_limit)
+                ]
+            limited_images = [images[index] for index in evidence_indices]
+            retry_prompt = prompt + "\n当前模型图片上限较低，本次按时间均匀抽取了 " + str(len(limited_images)) + " 张证据图。"
+            response = self.chat(retry_prompt, limited_images, self._core_vision_options())
+        parsed = parse_json_response(response)
+        meaningful = any(parsed.get(key) not in (None, "", []) for key in (
+            "caption", "activity", "people", "objects", "facts", "detail",
+        ))
+        if not meaningful and len(evidence_indices) > 3:
+            selected_positions = [0, len(evidence_indices) // 2, len(evidence_indices) - 1]
+            evidence_indices = [evidence_indices[index] for index in selected_positions]
+            limited_images = [images[index] for index in evidence_indices]
+            retry_prompt = (
+                prompt
+                + "\n首次多图结果无法解析，本次按时间均匀选取 3 张证据图重试。"
+                + "必须在输出上限内完成合法 JSON，优先保证 caption、activity 和 representative_indices 完整。"
+            )
+            response = self.chat(retry_prompt, limited_images, self._core_vision_options())
+            parsed = parse_json_response(response)
+            fallback_reason = "unparseable_multi_image_response"
         parsed["people"] = as_list(parsed.get("people"))
         parsed["objects"] = as_list(parsed.get("objects"))
         parsed["clothing"] = as_list(parsed.get("clothing"))
@@ -1176,15 +1244,20 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
         representative_indices = []
         for value in raw_indices:
             try:
-                index = max(0, min(len(images) - 1, int(value)))
+                index = max(0, min(len(evidence_indices) - 1, int(value)))
             except (TypeError, ValueError):
                 continue
-            if index not in representative_indices:
-                representative_indices.append(index)
-        parsed["representative_indices"] = (representative_indices or [0])[:3]
+            source_index = evidence_indices[index]
+            if source_index not in representative_indices:
+                representative_indices.append(source_index)
+        parsed["representative_indices"] = (representative_indices or [evidence_indices[0]])[:3]
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
         parsed["model"] = self.model
-        parsed["video_event_evidence_count"] = len(images)
+        parsed["video_event_evidence_count"] = len(evidence_indices)
+        parsed["video_event_source_evidence_count"] = len(images)
+        parsed["video_event_evidence_indices"] = evidence_indices
+        if fallback_reason:
+            parsed["video_event_fallback_reason"] = fallback_reason
         return parsed
 
     def analyze_image_focus(self, path, dimension, metadata=None):

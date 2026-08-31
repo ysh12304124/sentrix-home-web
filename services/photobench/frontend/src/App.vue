@@ -5,7 +5,7 @@ const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
   { key: "scope_setup", label: "创建相册" },
   { key: "identity_seed", label: "预置身份" },
-  { key: "photo_import", label: "照片导入" },
+  { key: "photo_import", label: "照片/视频导入" },
   { key: "pipeline_processing", label: "流水线处理" },
   { key: "qa_eval", label: "QA 评测" },
 ];
@@ -22,14 +22,35 @@ const qaDetails = reactive({});
 const openQaItems = reactive(new Set());
 const loadingQaItems = reactive(new Set());
 const qaPageSize = ref(20);
-const qaFilters = reactive({ search: "", score: "", task_type: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
+const qaFilters = reactive({ search: "", score: "", task_type: "", tag: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
 const reviewDrafts = reactive({});
 const selectedAlbum = ref("album3-14");
+const albumCountLabel = (manifest) => {
+  const videos = Number(manifest?.video_count || 0);
+  const base = `${manifest.face_count}人 / ${manifest.photo_count}图`;
+  return videos ? `${base} / ${videos}视频` : base;
+};
 const selectedQa = ref("compact-10q");
 const selectedModels = reactive(new Set());
 const sentrixUrl = ref("");
 const judgeUrl = ref("");
+const judgeModel = ref("");
+const judgeApiKey = ref("");
+const judgeApiKeyDirty = ref(false);
 const vllmTargetId = ref("");
+const vllmManagerUrl = ref("");
+const modelEndpoint = ref("");
+const modelEndpointUserEdited = ref(false);
+const endpointModels = ref([]);
+const selectedEndpointModel = ref("");
+const currentModelInfo = ref(null);
+const currentModelLoading = ref(false);
+const currentModelError = ref("");
+const currentModelPopoverOpen = ref(false);
+const modelTestState = ref("idle");
+const modelTestMessage = ref("");
+const connectionConfigState = ref("idle");
+const connectionConfigMessage = ref("");
 const rejudgePrompt = ref("");
 const judgePromptKinds = ref([]);
 const activePromptKind = ref("answer_quality");
@@ -39,6 +60,8 @@ watch(judgeProviderId, (newId) => {
   const provider = (config.value?.judge_providers || []).find((p) => p.id === newId);
   if (provider?.url) {
     judgeUrl.value = provider.url;
+    judgeModel.value = provider.model || judgeModel.value;
+    markConnectionConfigDirty();
   }
 });
 
@@ -50,8 +73,11 @@ const activeView = ref("runs");
 const qaBrowserAlbum = ref("album3");
 const qaBrowserSet = ref("full-album3-38q");
 const qaBrowserItems = ref([]);
+const qaBrowserSearch = ref("");
+const qaBrowserTag = ref("");
 const qaBrowserLoading = ref(false);
 const qaBrowserError = ref("");
+const qaBrowserMediaResolution = ref(null);
 const error = ref("");
 const lightbox = ref(null);
 const judgeModal = ref(null);
@@ -80,10 +106,17 @@ const fmtMs = (value) => value == null ? "-" : value >= 1000 ? `${(value / 1000)
 const fmtPct = (value) => value == null ? "-" : `${(Number(value) * 100).toFixed(1)}%`;
 const fmtTokens = (value) => value == null || !Number.isFinite(Number(value)) ? "-" : `${Math.round(Number(value)).toLocaleString("en-US")} token`;
 const scoreClass = (score) => score === 2 ? "score-2" : score === 1 ? "score-1" : score === 0 ? "score-0" : "score-none";
-const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", interrupted: "中断", cancelled: "已取消", partial: "部分采样", not_run: "未执行", skipped: "不适用" }[status] || status || "等待");
+const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", completed_with_errors: "完成但有错误", interrupted: "中断", cancelled: "已取消", partial: "部分完成", stalled: "已停滞", not_run: "未执行", skipped: "不适用" }[status] || status || "等待");
 function setModelSelected(modelId, checked) {
-  if (checked) selectedModels.add(modelId);
-  else selectedModels.delete(modelId);
+  if (checked && modelId === "__current__") {
+    selectedModels.clear();
+    selectedModels.add(modelId);
+  } else if (checked) {
+    selectedModels.delete("__current__");
+    selectedModels.add(modelId);
+  } else {
+    selectedModels.delete(modelId);
+  }
 }
 
 const qaOptions = computed(() => manifests.value.find((m) => m.album_id === selectedAlbum.value)?.qa_sets || ["compact-10q"]);
@@ -118,14 +151,58 @@ function nearestRankPercentile(values, percentile) {
   if (!valid.length) return null;
   return valid[Math.max(0, Math.min(valid.length - 1, Math.ceil(valid.length * percentile) - 1))];
 }
+function inferMediaType(value, explicit = "") {
+  if (["image", "video"].includes(String(explicit || "").toLowerCase())) return String(explicit).toLowerCase();
+  const text = String(value || "").split(/[?#]/)[0];
+  return /\.(?:mp4|mov|m4v|webm|mkv|avi)$/i.test(text) || /^video-\d+$/i.test(text.split("/").pop() || "") ? "video" : "image";
+}
+function mediaKey(ref) {
+  const mediaType = inferMediaType(ref?.media_id || ref?.file_name || ref?.image_id, ref?.media_type);
+  const name = String(ref?.media_id || ref?.file_name || ref?.image_id || "").split(/[/?#]/).filter(Boolean).pop() || "";
+  return `${mediaType}:${mediaType === "video" ? name.replace(/\.[^.]+$/, "") : name}`.toLocaleLowerCase();
+}
+function mediaRefs(item, prefix = "retrieval") {
+  const typed = item?.[`${prefix}_media_refs`];
+  if (Array.isArray(typed)) return typed.map((ref) => ({ ...ref, media_type: inferMediaType(ref?.media_id, ref?.media_type), media_id: String(ref?.media_id || "") })).filter((ref) => ref.media_id);
+  const refs = [
+    ...((item?.[`${prefix}_image_ids`] || []).map((media_id) => ({ media_type: inferMediaType(media_id), media_id }))),
+    ...((item?.[`${prefix}_video_ids`] || []).map((media_id) => ({ media_type: "video", media_id }))),
+  ];
+  return [...new Map(refs.map((ref) => [mediaKey(ref), ref])).values()];
+}
+function microMetrics(items, prefix) {
+  const rows = items.map((item) => item?.[`${prefix}_retrieval_counts`]).filter((row) => row && Number(row.gt) > 0);
+  if (!rows.length) return { precision: null, recall: null, f1: null, metricCount: 0 };
+  const gt = rows.reduce((sum, row) => sum + Number(row.gt || 0), 0);
+  const predicted = rows.reduce((sum, row) => sum + Number(row.predicted || 0), 0);
+  const matched = rows.reduce((sum, row) => sum + Number(row.matched || 0), 0);
+  const precision = predicted ? matched / predicted : (gt ? 0 : null);
+  const recall = gt ? matched / gt : null;
+  return { precision, recall, f1: precision != null && recall != null && precision + recall ? 2 * precision * recall / (precision + recall) : (gt ? 0 : null), metricCount: rows.length };
+}
+function macroMetrics(items, prefix) {
+  const rows = items.map((item) => item?.[`${prefix}_retrieval_counts`]).filter((row) => row && Number(row.gt) > 0);
+  const values = rows.map((row) => {
+    const gt = Number(row.gt || 0);
+    const predicted = Number(row.predicted || 0);
+    const matched = Number(row.matched || 0);
+    const precision = predicted ? matched / predicted : 0;
+    const recall = matched / gt;
+    const f1 = precision + recall ? 2 * precision * recall / (precision + recall) : 0;
+    return { precision, recall, f1 };
+  });
+  return { precision: averageMetric(values.map((row) => row.precision)), recall: averageMetric(values.map((row) => row.recall)), f1: averageMetric(values.map((row) => row.f1)), metricCount: values.length };
+}
 function effectiveRunSummary(run) {
   const saved = run?.summary || {};
   const items = run?.items || [];
+  const metricItems = items.filter((item) => String(item?.answerability || "").toLowerCase() !== "unanswerable");
   const judged = items.filter((item) => item.judge?.score != null && item.judge?.consistency_status !== "inconsistent");
-  const recalls = items.map((item) => item.retrieval_recall).filter((value) => Number.isFinite(Number(value)));
+  const recalls = metricItems.map((item) => item.retrieval_recall).filter((value) => Number.isFinite(Number(value)));
   const scores = judged.map((item) => Number(item.judge.score)).filter(Number.isFinite);
   const evidenceScores = items.map((item) => item.evidence_judge?.score).filter((score) => [0, 1, 2].includes(score));
-  const retrievalItems = items.filter((item) => Array.isArray(item.retrieval_image_ids) && item.retrieval_image_ids.length);
+  const typedRetrieval = items.some((item) => Object.prototype.hasOwnProperty.call(item, "retrieval_media_refs"));
+  const retrievalItems = metricItems.filter((item) => mediaRefs(item).length);
   const retrievalTp = retrievalItems.reduce((sum, item) => sum + (item.matched_file_names || []).length, 0);
   const retrievalPredicted = retrievalItems.reduce((sum, item) => sum + (item.retrieved_file_names || []).length, 0);
   const retrievalGt = retrievalItems.reduce((sum, item) => sum + (item.retrieval_image_ids || []).length, 0);
@@ -133,6 +210,12 @@ function effectiveRunSummary(run) {
   const retrievalRecall = retrievalGt ? retrievalTp / retrievalGt : null;
   const retrievalF1 = retrievalPrecision != null && retrievalRecall != null && retrievalPrecision + retrievalRecall
     ? 2 * retrievalPrecision * retrievalRecall / (retrievalPrecision + retrievalRecall) : (retrievalGt ? 0 : null);
+  const mediaMicro = microMetrics(metricItems, "media");
+  const imageMicro = microMetrics(metricItems, "image");
+  const videoMicro = microMetrics(metricItems, "video");
+  const mediaMacro = macroMetrics(metricItems, "media");
+  const imageMacro = macroMetrics(metricItems, "image");
+  const videoMacro = macroMetrics(metricItems, "video");
   const actionJudges = items.flatMap((item) => item.task_judges?.length ? item.task_judges : [item.task_judge])
     .filter((judge) => [true, false].includes(judge?.correct));
   const parseTotals = items.map((item) => item.agent_stability?.json_parse_total).filter(Number.isFinite);
@@ -163,14 +246,40 @@ function effectiveRunSummary(run) {
     total: saved.total ?? run?.qa_count ?? items.length,
     judge_valid_count: saved.judge_valid_count ?? judged.length,
     judge_distribution: dist,
-    retrieval_recall_mean: saved.retrieval_recall_mean ?? averageMetric(recalls),
+    retrieval_recall_mean: saved.retrieval_recall_macro ?? (typedRetrieval ? mediaMacro.recall : averageMetric(recalls)),
+    retrieval_precision_macro: saved.retrieval_precision_macro ?? (typedRetrieval ? mediaMacro.precision : averageMetric(retrievalItems.map((item) => item.retrieval_precision).filter(Number.isFinite))),
+    retrieval_recall_macro: saved.retrieval_recall_macro ?? (typedRetrieval ? mediaMacro.recall : averageMetric(recalls)),
+    retrieval_f1_macro: saved.retrieval_f1_macro ?? (typedRetrieval ? mediaMacro.f1 : averageMetric(retrievalItems.map((item) => item.retrieval_f1).filter(Number.isFinite))),
+    retrieval_excluded_unanswerable_count: saved.retrieval_excluded_unanswerable_count ?? (items.length - metricItems.length),
     answer_quality_mean: saved.answer_quality_mean ?? (scores.length ? averageMetric(scores) : null),
     exact_accuracy: saved.exact_accuracy ?? (scores.length ? scores.filter((score) => score === 2).length / scores.length : null),
     core_accuracy: saved.core_accuracy ?? (scores.length ? scores.filter((score) => score >= 1).length / scores.length : null),
-    retrieval_precision_micro: saved.retrieval_precision_micro ?? retrievalPrecision,
-    retrieval_recall_micro: saved.retrieval_recall_micro ?? retrievalRecall,
-    retrieval_f1_micro: saved.retrieval_f1_micro ?? retrievalF1,
+    retrieval_precision_micro: saved.retrieval_precision_micro ?? (typedRetrieval ? mediaMicro.precision : retrievalPrecision),
+    retrieval_recall_micro: saved.retrieval_recall_micro ?? (typedRetrieval ? mediaMicro.recall : retrievalRecall),
+    retrieval_f1_micro: saved.retrieval_f1_micro ?? (typedRetrieval ? mediaMicro.f1 : retrievalF1),
     retrieval_metric_count: saved.retrieval_metric_count ?? retrievalItems.length,
+    retrieval_metric_scope: saved.retrieval_metric_scope ?? (typedRetrieval ? "all_media" : "legacy_image_only"),
+    media_retrieval_precision_micro: saved.media_retrieval_precision_micro ?? (typedRetrieval ? mediaMicro.precision : null),
+    media_retrieval_recall_micro: saved.media_retrieval_recall_micro ?? (typedRetrieval ? mediaMicro.recall : null),
+    media_retrieval_f1_micro: saved.media_retrieval_f1_micro ?? (typedRetrieval ? mediaMicro.f1 : null),
+    media_retrieval_precision_macro: saved.media_retrieval_precision_macro ?? (typedRetrieval ? mediaMacro.precision : null),
+    media_retrieval_recall_macro: saved.media_retrieval_recall_macro ?? (typedRetrieval ? mediaMacro.recall : null),
+    media_retrieval_f1_macro: saved.media_retrieval_f1_macro ?? (typedRetrieval ? mediaMacro.f1 : null),
+    media_retrieval_metric_count: saved.media_retrieval_metric_count ?? (typedRetrieval ? mediaMicro.metricCount : null),
+    image_retrieval_precision_micro: saved.image_retrieval_precision_micro ?? (typedRetrieval ? imageMicro.precision : retrievalPrecision),
+    image_retrieval_recall_micro: saved.image_retrieval_recall_micro ?? (typedRetrieval ? imageMicro.recall : retrievalRecall),
+    image_retrieval_f1_micro: saved.image_retrieval_f1_micro ?? (typedRetrieval ? imageMicro.f1 : retrievalF1),
+    image_retrieval_precision_macro: saved.image_retrieval_precision_macro ?? (typedRetrieval ? imageMacro.precision : averageMetric(retrievalItems.map((item) => item.retrieval_precision).filter(Number.isFinite))),
+    image_retrieval_recall_macro: saved.image_retrieval_recall_macro ?? (typedRetrieval ? imageMacro.recall : averageMetric(recalls)),
+    image_retrieval_f1_macro: saved.image_retrieval_f1_macro ?? (typedRetrieval ? imageMacro.f1 : averageMetric(retrievalItems.map((item) => item.retrieval_f1).filter(Number.isFinite))),
+    image_retrieval_metric_count: saved.image_retrieval_metric_count ?? (typedRetrieval ? imageMicro.metricCount : retrievalItems.length),
+    video_retrieval_precision_micro: saved.video_retrieval_precision_micro ?? (typedRetrieval ? videoMicro.precision : null),
+    video_retrieval_recall_micro: saved.video_retrieval_recall_micro ?? (typedRetrieval ? videoMicro.recall : null),
+    video_retrieval_f1_micro: saved.video_retrieval_f1_micro ?? (typedRetrieval ? videoMicro.f1 : null),
+    video_retrieval_precision_macro: saved.video_retrieval_precision_macro ?? (typedRetrieval ? videoMacro.precision : null),
+    video_retrieval_recall_macro: saved.video_retrieval_recall_macro ?? (typedRetrieval ? videoMacro.recall : null),
+    video_retrieval_f1_macro: saved.video_retrieval_f1_macro ?? (typedRetrieval ? videoMacro.f1 : null),
+    video_retrieval_metric_count: saved.video_retrieval_metric_count ?? (typedRetrieval ? videoMicro.metricCount : null),
     evidence_distribution: saved.evidence_distribution ?? { 0: evidenceScores.filter((score) => score === 0).length, 1: evidenceScores.filter((score) => score === 1).length, 2: evidenceScores.filter((score) => score === 2).length },
     evidence_valid_count: saved.evidence_valid_count ?? evidenceScores.length,
     evidence_mean: saved.evidence_mean ?? (evidenceScores.length ? averageMetric(evidenceScores) : null),
@@ -219,14 +328,19 @@ function actionLabel(value) {
 }
 function evidenceScoreLabel(judge) {
   const score = judge?.score;
-  if (score === 2) return "2 分：图片支持回答";
-  if (score === 1) return "1 分：图片部分支持";
-  if (score === 0) return "0 分：图片无法支持";
+  if (score === 2) return "2 分：媒体证据支持回答";
+  if (score === 1) return "1 分：媒体证据部分支持";
+  if (score === 0) return "0 分：媒体证据无法支持";
   return judge?.reason === "not_applicable" ? "不适用" : judge?.reason === "no_answer" ? "无回答，未评分" : "未记录";
 }
 function itemRetrievalMetrics(item) {
-  if (!(item?.retrieval_image_ids || []).length) return "本题无标准图片，不计入检索指标";
-  return `精确率 ${fmtPct(item?.retrieval_precision)} · 召回率 ${fmtPct(item?.retrieval_recall)} · F1 ${fmtPct(item?.retrieval_f1)}`;
+  if (!mediaRefs(item).length) return "本题无标准媒体，不计入检索指标";
+  const total = `总媒体 P ${fmtPct(item?.media_retrieval_precision ?? item?.retrieval_precision)} · R ${fmtPct(item?.media_retrieval_recall ?? item?.retrieval_recall)} · F1 ${fmtPct(item?.media_retrieval_f1 ?? item?.retrieval_f1)}`;
+  if (!Object.prototype.hasOwnProperty.call(item || {}, "retrieval_media_refs")) return `${total} · 历史图片口径`;
+  const parts = [total];
+  if (mediaRefs(item).some((ref) => ref.media_type === "image")) parts.push(`图片 R ${fmtPct(item?.image_retrieval_recall)}`);
+  if (mediaRefs(item).some((ref) => ref.media_type === "video")) parts.push(`视频 R ${fmtPct(item?.video_retrieval_recall)}`);
+  return parts.join(" · ");
 }
 function itemParseRate(item) {
   const stability = item?.agent_stability || {};
@@ -277,56 +391,80 @@ function conversationContextLabel(turn, index) {
 function turnScore(score) {
   return [0, 1, 2].includes(score) ? `${score} 分` : "不适用";
 }
-function albumLocalUrl(fileName) {
+function albumLocalUrl(fileName, mediaType = "") {
   const album = activeRun.value?.album_id || "";
-  const collection = /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(String(fileName || "")) ? "faces" : "photos";
-  return (album && fileName) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(fileName)}` : "";
+  const video = inferMediaType(fileName, mediaType) === "video";
+  const collection = video ? "videos" : /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(String(fileName || "")) ? "faces" : "photos";
+  const mediaFile = video && !/\.(?:mp4|mov|m4v|webm|mkv|avi)$/i.test(String(fileName || "")) ? `${fileName}.mp4` : fileName;
+  return (album && mediaFile) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(mediaFile)}` : "";
 }
-function decorateImages(list) {
-  return (list || []).map((img) => {
-    if (img?.media_url) return img;
-    const parts = (img?.image_id || "").split("/");
-    const file = parts.length === 2 ? parts[1] : (img?.file_name || "");
-    const album = activeRun.value?.album_id || (parts.length === 2 ? parts[0] : "");
-    const collection = /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(file) ? "faces" : "photos";
-    const local = (album && file) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(file)}` : "";
-    return local ? { ...img, media_url: local } : img;
+function isVideoMedia(image) {
+  if (image?.media_type === "video") return true;
+  return [image?.media_id, image?.video_id, image?.image_id, image?.file_name, image?.media_url].some((value) => {
+    const text = String(value || "");
+    const fileName = text.split(/[/?#]/).filter(Boolean).pop() || "";
+    return /^video-\d+(?:\.mp4)?$/i.test(fileName) || /\.mp4(?:$|[?#])/i.test(text);
   });
 }
-function itemImages(item, gt = false) {
+function decorateMedia(list) {
+  return (list || []).map((img) => {
+    if (img?.media_url) return img;
+    const sourceId = img?.media_id || img?.image_id || img?.video_id || "";
+    const parts = sourceId.split("/");
+    const file = parts.length >= 2 ? parts[parts.length - 1] : (img?.file_name || sourceId);
+    const album = activeRun.value?.album_id || (parts.length === 2 ? parts[0] : "");
+    const video = isVideoMedia(img);
+    const collection = video ? "videos" : /^faceid_[^/]+\.(?:jpe?g|png|webp)$/i.test(file) ? "faces" : "photos";
+    const mediaFile = video && !/\.mp4$/i.test(file) ? `${file}.mp4` : file;
+    const local = (album && mediaFile) ? `/api/albums/${encodeURIComponent(album)}/${collection}/${encodeURIComponent(mediaFile)}` : "";
+    return local ? { ...img, media_type: video ? "video" : (img.media_type || "image"), media_url: local } : img;
+  });
+}
+function itemMedia(item, gt = false) {
   if (gt) {
-    if (item.gt_images?.length) return decorateImages(item.gt_images);
-    return decorateImages((item.retrieval_image_ids || []).map((id) => ({ image_id: id, file_name: id.split("/").pop(), matched: (item.matched_file_names || []).includes(id.split("/").pop()) })));
+    if (item.gt_media?.length) return decorateMedia(item.gt_media);
+    if (item.gt_images?.length && !Object.prototype.hasOwnProperty.call(item || {}, "retrieval_media_refs")) return decorateMedia(item.gt_images);
+    return decorateMedia(mediaRefs(item).map((ref) => {
+      const fileName = ref.media_type === "video" && !/\.[^.]+$/.test(ref.media_id) ? `${ref.media_id}.mp4` : ref.media_id.split("/").pop();
+      return { ...ref, file_name: fileName, matched: (item.matched_file_names || []).includes(fileName) };
+    }));
   }
-  // Model recall is the upstream evidence projection, not only explicit
-  // delivery images. Keep the smaller delivery subset available separately.
-  if (item.evidence_source_images?.length) return decorateImages(item.evidence_source_images);
+  // Model recall is the upstream evidence projection, not only explicit delivery.
+  if (item.evidence_source_media?.length) return decorateMedia(item.evidence_source_media);
+  if (item.evidence_source_images?.length) return decorateMedia(item.evidence_source_images);
   if (item.evidence_source_file_names?.length) {
-    return decorateImages(item.evidence_source_file_names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) })));
+    return decorateMedia(item.evidence_source_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
   }
-  if (item.predicted_images?.length) return decorateImages(item.predicted_images);
+  if (item.predicted_media?.length) return decorateMedia(item.predicted_media);
+  if (item.predicted_images?.length) return decorateMedia(item.predicted_images);
   if (item.predicted_file_names?.length) {
-    return item.predicted_file_names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+    return item.predicted_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
   }
   // A validator may leave all candidates as candidate_only.  They are not
   // answer evidence, but hiding them makes a healthy retrieval look empty
   // in the evaluation UI.  Show a bounded representative window here; the
   // full candidate set remains in retrieval metrics and the trace.
+  if (item.retrieved_candidate_media?.length) {
+    return decorateMedia(item.retrieved_candidate_media.slice(0, 6));
+  }
   if (item.retrieved_candidate_images?.length) {
-    return decorateImages(item.retrieved_candidate_images.slice(0, 6));
+    return decorateMedia(item.retrieved_candidate_images.slice(0, 6));
   }
   return (item.retrieved_file_names || []).slice(0, 6)
-    .map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) }));
+    .map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
 }
-function itemEvidenceImages(item) {
-  const images = item?.evidence_source_images || [];
-  if (images.length) return decorateImages(images);
+function itemEvidenceMedia(item) {
+  const media = item?.evidence_source_media || item?.evidence_source_images || [];
+  if (media.length) return decorateMedia(media);
   const names = item?.evidence_source_file_names || [];
-  return decorateImages(names.map((file_name) => ({ file_name, media_url: albumLocalUrl(file_name) })));
+  return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
 }
-function isDirectEvidence(item, imageId) {
-  return (item?.answer_evidence_image_ids || []).includes(imageId)
-    || (item?.answer_claims || []).some((claim) => (claim.evidence_image_ids || []).includes(imageId));
+function isDirectEvidence(item, media) {
+  const ref = typeof media === "string" ? { media_id: media, media_type: inferMediaType(media) } : media;
+  const key = mediaKey(ref);
+  const answerRefs = mediaRefs(item, "answer_evidence");
+  const claimRefs = (item?.answer_claims || []).flatMap((claim) => mediaRefs(claim, "evidence"));
+  return [...answerRefs, ...claimRefs].some((candidate) => mediaKey(candidate) === key);
 }
 function judgeInput(item) {
   const input = item.judge?.input || {};
@@ -499,9 +637,10 @@ function aggregateMetricRows(phase = {}) {
     : Number.isFinite(throughputSamples) && Number.isFinite(throughputTotal)
       ? `历史记录按 Agent/Judge 时间线回退估算 · ${throughputSamples}/${throughputTotal} 题，不能视为实测`
       : "历史记录未保存 Agent 独立阶段墙钟";
+  const typedMediaMetrics = summary.retrieval_metric_scope === "all_media";
   return [
-    ["图片检索 Precision", fmtPct(summary.retrieval_precision_micro), `图片级微平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT 图`, true],
-    ["图片检索 Recall", fmtPct(summary.retrieval_recall_micro), "图片级微平均；与评测记录列表同口径", true],
+    [typedMediaMetrics ? "媒体检索 Precision" : "历史图片检索 Precision", fmtPct(summary.retrieval_precision_macro), `逐 QA 求值后平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT · 排除 ${summary.retrieval_excluded_unanswerable_count ?? 0} 道不可回答题`, true],
+    [typedMediaMetrics ? "媒体检索 Recall" : "历史图片检索 Recall", fmtPct(summary.retrieval_recall_macro), typedMediaMetrics ? "每道 QA 的 Recall 等权平均；图视频按类型与稳定标识匹配" : "每道 QA 的 Recall 等权平均；历史 run 无法补算视频指标", true],
     ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
     ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
     ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "历史记录未保存解析轨迹" : `${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个需解析模型输出`, true],
@@ -512,7 +651,9 @@ function aggregateMetricRows(phase = {}) {
     ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), activeRun.value?.qa_concurrency > 1
       ? `每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）；并发 ${activeRun.value.qa_concurrency} 负载下含排队与批内干扰，勿与串行 run 直接对比`
       : "每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）", true],
-    ["图片检索 F1", fmtPct(summary.retrieval_f1_micro), "微平均，平衡噪声与漏召回"],
+    [typedMediaMetrics ? "媒体检索 F1" : "历史图片检索 F1", fmtPct(summary.retrieval_f1_macro), "逐 QA 计算 F1 后等权平均"],
+    ["图片检索 P / R / F1", `${fmtPct(summary.image_retrieval_precision_macro)} / ${fmtPct(summary.image_retrieval_recall_macro)} / ${fmtPct(summary.image_retrieval_f1_macro)}`, typedMediaMetrics ? `${summary.image_retrieval_metric_count ?? 0} 题含图片 GT · 逐 QA 平均` : "历史图片口径 · 逐 QA 平均"],
+    ["视频检索 P / R / F1", typedMediaMetrics ? `${fmtPct(summary.video_retrieval_precision_macro)} / ${fmtPct(summary.video_retrieval_recall_macro)} / ${fmtPct(summary.video_retrieval_f1_macro)}` : "未记录", typedMediaMetrics ? `${summary.video_retrieval_metric_count ?? 0} 题含视频 GT · 逐 QA 平均` : "历史 run 无 typed media，禁止推测"],
     ["Judge LLM 平均时延", fmtMs(summary.judge_llm_latency_mean_ms), `每题 Judge 评分调用平均耗时 · Judge 阶段墙钟 ${fmtMs(summary.judge_phase_wall_ms)}`],
     ["任务判断准确率", fmtPct(summary.task_decision_accuracy), `标注 ${summary.task_decision_labeled_count ?? 0} 题 · Judge 有效 ${summary.task_decision_valid_count ?? 0} 题`],
     ["证据对应均分", summary.evidence_mean == null ? "未记录" : `${summary.evidence_mean} / 2`, `0:${evidenceDist["0"] || 0} · 1:${evidenceDist["1"] || 0} · 2:${evidenceDist["2"] || 0}`],
@@ -1118,8 +1259,8 @@ function phaseSummary(key, phase) {
       : "";
     return `预置 ${phase.seeded_count ?? 0} 人${relationshipText} · ${fmtSeconds(phaseSeconds(phase, "upload_seconds"))}`;
   }
-  if (key === "photo_import") return `导入 ${phase.accepted_count ?? 0}/${phase.total_photos ?? "?"} 张 · ${fmtSeconds(phaseSeconds(phase, "upload_seconds"))}`;
-  if (key === "pipeline_processing" && phase.progress) return `${phase.progress.processed || 0}/${phase.progress.total || 0} 资产完成 · ${phase.progress.failed || 0} 失败 · 阶段墙钟 ${fmtSeconds(phaseSeconds(phase))}`;
+  if (key === "photo_import") return `导入 ${phase.accepted_count ?? 0}/${phase.total_media ?? phase.total_photos ?? "?"} 个媒体 · 失败 ${phase.failed_count ?? 0} · ${fmtSeconds(phaseSeconds(phase, "upload_seconds"))}`;
+  if (key === "pipeline_processing" && phase.progress) return `${phase.progress.processed || 0}/${phase.progress.total || 0} 资产完成 · ${phase.progress.failed || 0} 失败 · ${phase.progress.skipped || 0} 跳过 · 阶段墙钟 ${fmtSeconds(phaseSeconds(phase))}`;
   if (key === "qa_eval") {
     const p = phase.progress;
     if (p && (p.completed != null || p.in_flight != null)) {
@@ -1127,7 +1268,8 @@ function phaseSummary(key, phase) {
       const judgeText = `Judge ${p.judge_completed ?? 0}/${p.judge_total ?? p.total ?? "?"}`;
       const concurrencyText = p.qa_concurrency > 1 || p.judge_concurrency > 1
         ? ` · 并发 Agent ${p.qa_concurrency ?? "-"} / Judge ${p.judge_concurrency ?? "-"}` : "";
-      return `${agentText} · ${judgeText}${concurrencyText} · ${fmtSeconds(phaseSeconds(phase))}`;
+      const failedText = phase.failed_count ? ` · 失败 ${phase.failed_count}` : "";
+      return `${agentText} · ${judgeText}${failedText}${concurrencyText} · ${fmtSeconds(phaseSeconds(phase))}`;
     }
     return `${activeRun.value?.item_count || 0} 题 · ${fmtSeconds(phaseSeconds(phase))}`;
   }
@@ -1135,8 +1277,23 @@ function phaseSummary(key, phase) {
   if (elapsed != null) return `耗时 ${fmtSeconds(elapsed)}`;
   return "";
 }
+function phaseErrorDetails(phase) {
+  if (!phase) return [];
+  const details = Array.isArray(phase.error_details) ? phase.error_details : [];
+  if (details.length) return details;
+  return phase.error ? [{ sample_id: "阶段错误", status: phase.status || "failed", reason: phase.error }] : [];
+}
+function phaseErrorSummary(phase) {
+  const count = phaseErrorDetails(phase).length;
+  if (!count) return "";
+  const skipped = Number(phase?.skipped_asset_count || phase?.progress?.skipped || 0);
+  return skipped ? `${count} 条错误记录，${skipped} 个样本已跳过` : `${count} 条错误记录`;
+}
 function openImage(image) { const url = imageUrl(image); if (url) lightbox.value = { url, name: image.file_name || image.image_id || "图片" }; }
-function phasePercent(phase) { const p = phase?.progress; return p?.total ? Math.round((p.processed / p.total) * 100) : 0; }
+function phasePercent(phase) {
+  const p = phase?.progress;
+  return p?.total ? Math.min(100, Math.round(((Number(p.processed) || 0) + (Number(p.failed) || 0) + (Number(p.skipped) || 0)) / p.total * 100)) : 0;
+}
 function pipelineMetricRows(phase = {}) {
   const metrics = phase.pipeline_metrics || {};
   const timings = metrics.stage_timings || {};
@@ -1206,7 +1363,7 @@ async function loadQaPage(page = qaPage.value.page || 1) {
 }
 async function applyQaFilters() { await loadQaPage(1); }
 async function resetQaFilters() {
-  Object.assign(qaFilters, { search: "", score: "", task_type: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
+  Object.assign(qaFilters, { search: "", score: "", task_type: "", tag: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
   await loadQaPage(1);
 }
 async function loadActiveRun({ resetPage = false } = {}) {
@@ -1266,7 +1423,84 @@ async function changeQaPage(page) {
 }
 async function changeQaPageSize() { await loadQaPage(1); }
 async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
-async function loadProfiles() { profiles.value = (await post("/api/profiles", { vllm_target_id: vllmTargetId.value })).profiles || []; }
+async function loadProfiles() {
+  if (!vllmManagerUrl.value.trim()) {
+    profiles.value = [];
+    selectedModels.forEach((modelId) => {
+      if (modelId !== "__current__") selectedModels.delete(modelId);
+    });
+    return;
+  }
+  profiles.value = (await post("/api/profiles", {
+    vllm_target_id: vllmTargetId.value,
+    vllm_manager_url: vllmManagerUrl.value.trim(),
+    model_base_url: modelEndpointUserEdited.value ? modelEndpoint.value.trim() : "",
+  })).profiles || [];
+}
+function onModelManagerInput() {
+  markConnectionConfigDirty();
+  profiles.value = [];
+  currentModelInfo.value = null;
+  currentModelPopoverOpen.value = false;
+  currentModelError.value = "";
+  modelTestState.value = "idle";
+  modelTestMessage.value = "";
+  selectedModels.delete("__current__");
+  selectedModels.forEach((modelId) => {
+    if (modelId !== "__current__") selectedModels.delete(modelId);
+  });
+}
+function markConnectionConfigDirty() {
+  if (loading.value) return;
+  connectionConfigState.value = "dirty";
+  connectionConfigMessage.value = "有未保存修改";
+}
+async function saveConnectionConfig() {
+  if (connectionConfigState.value === "saving") return;
+  connectionConfigState.value = "saving";
+  connectionConfigMessage.value = "正在保存…";
+  try {
+    const result = await api("/api/config", {
+      method: "POST",
+      body: JSON.stringify({
+        sentrix_url: sentrixUrl.value.trim(),
+        judge_url: judgeUrl.value.trim(),
+        judge_model: judgeModel.value.trim(),
+        vllm_manager_url: vllmManagerUrl.value.trim(),
+        model_base_url: modelEndpoint.value.trim(),
+        endpoint_model: selectedEndpointModel.value,
+        judge_provider_id: judgeProviderId.value,
+        ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}),
+      }),
+    });
+    const saved = result.runtime_config || {};
+    config.value = { ...config.value, runtime_config: saved,
+      default_sentrix_url: saved.sentrix_url,
+      default_judge_url: saved.judge_url,
+      default_vllm_api_url: saved.vllm_manager_url,
+      default_vllm_model_base_url: saved.model_base_url };
+    sentrixUrl.value = saved.sentrix_url || sentrixUrl.value;
+    judgeUrl.value = saved.judge_url || judgeUrl.value;
+    judgeModel.value = saved.judge_model || judgeModel.value;
+    judgeApiKey.value = "";
+    judgeApiKeyDirty.value = false;
+    vllmManagerUrl.value = saved.vllm_manager_url || "";
+    modelEndpoint.value = saved.model_base_url || "";
+    modelEndpointUserEdited.value = Boolean(saved.model_base_url);
+    selectedEndpointModel.value = saved.endpoint_model || "";
+    endpointModels.value = [];
+    currentModelInfo.value = null;
+    currentModelError.value = "";
+    modelTestState.value = "idle";
+    modelTestMessage.value = "";
+    connectionConfigState.value = "saved";
+    connectionConfigMessage.value = `已保存 · ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
+    if (modelEndpoint.value.trim()) await loadCurrentModel({ openPopover: false });
+  } catch (e) {
+    connectionConfigState.value = "error";
+    connectionConfigMessage.value = `保存失败：${e.message}`;
+  }
+}
 const PROMPT_KIND_LABELS = { answer_quality: "回答质量", task_decision: "任务判断", evidence: "证据核验" };
 function promptKindMeta(kind) { return judgePromptKinds.value.find((k) => k.kind === kind) || null; }
 async function loadJudgePrompts() {
@@ -1294,9 +1528,9 @@ const deleteScopeAfterRun = ref(false);
 
 // ---- 工作模式：全链路 / 复用相册测评 / 构建相册 ----
 const RUN_MODES_UI = [
-  { id: "full", label: "全链路测试", hint: "新建相册 → 身份预置 → 照片导入 → 流水线处理 → QA 测评", button: "启动评测" },
+  { id: "full", label: "全链路测试", hint: "新建相册 → 身份预置 → 导入图片和视频 → 流水线处理 → QA 测评", button: "启动评测" },
   { id: "reuse", label: "复用相册测评", hint: "选择后端已有相册，跳过导入与处理，直接 QA 测评（相册不会被删除）", button: "启动复用测评" },
-  { id: "build", label: "构建相册", hint: "新建相册并完成身份预置、导入与数据处理；产物相册保留供复用，不做 QA 测评", button: "启动相册构建" },
+  { id: "build", label: "构建相册", hint: "新建相册并导入图片/视频完成数据处理；产物相册保留供复用或在线测试，不做 QA 测评", button: "启动相册构建" },
 ];
 const runMode = ref("full");
 const runModeMeta = computed(() => RUN_MODES_UI.find((m) => m.id === runMode.value) || RUN_MODES_UI[0]);
@@ -1359,7 +1593,10 @@ function onModeChange() {
 }
 const startDisabledReason = computed(() => {
   if (hasRunning.value || suiteRunning.value) return "已有任务运行中";
+  if (!modelEndpoint.value.trim()) return "请先填写模型服务地址";
   if (!selectedModels.size) return "请先选择模型";
+  if ([...selectedModels].some((modelId) => modelId !== "__current__") && !vllmManagerUrl.value.trim()) return "选择注册表模型需要模型管理器地址";
+  if (selectedModels.has("__current__") && !selectedEndpointModel.value) return "请先从模型服务中选择要复用的模型";
   if (runMode.value === "reuse" && !existingScopeId.value) return "请先选择要复用的相册";
   return "";
 });
@@ -1387,7 +1624,10 @@ async function startRejudge() {
   error.value = "";
   try {
    await post(`/api/runs/${encodeURIComponent(activeRunId.value)}/rejudge`, {
-    judge_url: judgeUrl.value,
+    judge_url: judgeUrl.value.trim(),
+    judge_model: judgeModel.value.trim(),
+    judge_provider_id: judgeProviderId.value,
+    ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}),
     system_prompt: promptDrafts.answer_quality || rejudgePrompt.value,
     task_system_prompt: promptDrafts.task_decision || undefined,
     evidence_system_prompt: promptDrafts.evidence || undefined,
@@ -1396,6 +1636,78 @@ async function startRejudge() {
   } catch (e) { error.value = e.message; }
   finally { rejudgeSubmitting.value = false; }
 }
+async function loadCurrentModel({ openPopover = true } = {}) {
+  const endpoint = modelEndpoint.value.trim();
+  if (!endpoint) {
+    currentModelError.value = "请先填写模型服务地址，例如 192.168.0.153:8100";
+    return;
+  }
+  currentModelLoading.value = true;
+  currentModelError.value = "";
+  try {
+    const requestedModel = selectedEndpointModel.value;
+    const requestBody = {
+      model_base_url: endpoint,
+      vllm_target_id: vllmTargetId.value,
+    };
+    let result;
+    try {
+      result = await post("/api/current-model", { ...requestBody, model: requestedModel });
+    } catch (selectionError) {
+      if (!requestedModel) throw selectionError;
+      selectedEndpointModel.value = "";
+      result = await post("/api/current-model", requestBody);
+      currentModelError.value = `已清除不可用的已保存模型：${selectionError.message}`;
+    }
+    endpointModels.value = result.served_models || [];
+    if (result.served_model_name) selectedEndpointModel.value = result.served_model_name;
+    else if (!endpointModels.value.includes(requestedModel)) selectedEndpointModel.value = "";
+    currentModelInfo.value = result;
+    currentModelPopoverOpen.value = openPopover;
+  } catch (e) {
+    currentModelInfo.value = null;
+    endpointModels.value = [];
+    currentModelPopoverOpen.value = false;
+    currentModelError.value = e.message;
+  } finally {
+    currentModelLoading.value = false;
+  }
+}
+async function onEndpointModelChange() {
+  selectedModels.delete("__current__");
+  modelTestState.value = "idle";
+  modelTestMessage.value = "";
+  markConnectionConfigDirty();
+  await loadCurrentModel({ openPopover: false });
+}
+async function testEndpointModel() {
+  if (!selectedEndpointModel.value || modelTestState.value === "testing") return;
+  modelTestState.value = "testing";
+  modelTestMessage.value = "正在发送最小 POST 请求…";
+  try {
+    const result = await post("/api/test-model", {
+      model_base_url: modelEndpoint.value.trim(),
+      model: selectedEndpointModel.value,
+    });
+    modelTestState.value = "success";
+    modelTestMessage.value = `POST 可用 · ${result.latency_ms} ms`;
+  } catch (e) {
+    modelTestState.value = "error";
+    modelTestMessage.value = `POST 测试失败：${e.message}`;
+  }
+}
+function onModelEndpointInput() {
+  modelEndpointUserEdited.value = true;
+  endpointModels.value = [];
+  selectedEndpointModel.value = "";
+  currentModelInfo.value = null;
+  currentModelPopoverOpen.value = false;
+  currentModelError.value = "";
+  modelTestState.value = "idle";
+  modelTestMessage.value = "";
+  selectedModels.delete("__current__");
+  markConnectionConfigDirty();
+}
 async function startSuite() {
   const blocked = startDisabledReason.value;
   if (blocked && !blocked.includes("运行中")) { window.alert(blocked); return; }
@@ -1403,7 +1715,7 @@ async function startSuite() {
   if (runMode.value === "build" && !window.confirm("构建相册模式只导入并处理数据，不做 QA 测评；产物相册会保留。确定开始？")) return;
   suiteRunning.value = true;
   try {
-   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value, judge_url: judgeUrl.value, judge_provider_id: judgeProviderId.value, vllm_target_id: vllmTargetId.value, delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
+   const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value.trim(), judge_url: judgeUrl.value.trim(), judge_model: judgeModel.value.trim(), judge_provider_id: judgeProviderId.value, ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}), vllm_target_id: vllmTargetId.value, vllm_manager_url: vllmManagerUrl.value.trim(), model_base_url: selectedModels.has("__current__") || modelEndpointUserEdited.value ? modelEndpoint.value.trim() : "", endpoint_model: selectedModels.has("__current__") ? selectedEndpointModel.value : "", delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
     activeRunId.value = result.run_ids[0];
     await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
@@ -1451,11 +1763,24 @@ async function init() {
     config.value = await api("/api/config");
     vllmTargets.value = config.value.vllm_targets || {};
     vllmTargetId.value = config.value.default_vllm_target_id || Object.keys(vllmTargets.value)[0] || "";
-    sentrixUrl.value = config.value.default_sentrix_url; judgeUrl.value = config.value.default_judge_url; rejudgePrompt.value = config.value.custom_judge_prompt || config.value.judge_prompt || "";
+    const runtimeConfig = config.value.runtime_config || {};
+    vllmManagerUrl.value = runtimeConfig.vllm_manager_url || vllmTargets.value[vllmTargetId.value]?.manager_url || config.value.default_vllm_api_url || "";
+    modelEndpoint.value = runtimeConfig.model_base_url || config.value.default_vllm_model_base_url || vllmTargets.value[vllmTargetId.value]?.model_base_url || "";
+    modelEndpointUserEdited.value = Boolean(runtimeConfig.model_base_url);
+    selectedEndpointModel.value = runtimeConfig.endpoint_model || "";
+    sentrixUrl.value = runtimeConfig.sentrix_url || config.value.default_sentrix_url;
+    judgeUrl.value = runtimeConfig.judge_url || config.value.default_judge_url;
+    judgeModel.value = runtimeConfig.judge_model || config.value.judge_model || "";
+    judgeApiKey.value = "";
+    judgeApiKeyDirty.value = false;
+    rejudgePrompt.value = config.value.custom_judge_prompt || config.value.judge_prompt || "";
     await loadJudgePrompts();
-    judgeProviderId.value = config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
+    judgeProviderId.value = runtimeConfig.judge_provider_id || config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
+    connectionConfigState.value = "saved";
+    connectionConfigMessage.value = "已读取配置文件";
     manifests.value = (await api("/api/manifests")).manifests || [];
-    await loadRuns(); await loadProfiles();
+    await loadRuns(); if (vllmManagerUrl.value.trim()) await loadProfiles();
+    if (modelEndpoint.value.trim()) await loadCurrentModel({ openPopover: false });
     const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
     if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
@@ -1463,13 +1788,24 @@ async function init() {
   arbiterTimer = setInterval(loadArbiterStatus, 3000);
 }
 const qaBrowserOptions = computed(() => manifests.value.find((m) => m.album_id === qaBrowserAlbum.value)?.qa_sets || []);
+const qaBrowserTags = computed(() => [...new Set(qaBrowserItems.value.flatMap(item => Array.isArray(item.tags) ? item.tags : []))].sort());
+const visibleQaBrowserItems = computed(() => {
+  const query = qaBrowserSearch.value.trim().toLocaleLowerCase();
+  return qaBrowserItems.value.filter(item => {
+    if (qaBrowserTag.value && !(item.tags || []).includes(qaBrowserTag.value)) return false;
+    if (!query) return true;
+    return [item.qa_id, item.question, item.answer, ...(item.tags || [])]
+      .some(value => String(value || "").toLocaleLowerCase().includes(query));
+  });
+});
 async function loadQaBrowser() {
   qaBrowserLoading.value = true;
   qaBrowserError.value = "";
   try {
-    const data = await api(`/api/qa-dataset?album_id=${encodeURIComponent(qaBrowserAlbum.value)}&qa_set=${encodeURIComponent(qaBrowserSet.value)}`);
+    const data = await api(`/api/qa-dataset?album_id=${encodeURIComponent(qaBrowserAlbum.value)}&qa_set=${encodeURIComponent(qaBrowserSet.value)}&sentrix_url=${encodeURIComponent(sentrixUrl.value.trim())}`);
     qaBrowserItems.value = data.items || [];
-  } catch (e) { qaBrowserError.value = e.message; qaBrowserItems.value = []; }
+    qaBrowserMediaResolution.value = data.media_resolution || null;
+  } catch (e) { qaBrowserError.value = e.message; qaBrowserItems.value = []; qaBrowserMediaResolution.value = null; }
   finally { qaBrowserLoading.value = false; }
 }
 function qaTypeLabel(t) {
@@ -1481,9 +1817,25 @@ function qaActionBadge(a) {
 function qaAnswerabilityLabel(v) {
   return ({answerable:"可回答",unanswerable:"不可回答",ambiguous:"有歧义",unsafe_request:"不安全请求",answerable_after_clarification:"澄清后可回答",mixed:"混合"}[v]) || v || "-";
 }
-function qaPhotoUrl(albumId, relPath) {
-  const fileName = relPath.split("/").pop();
-  return `/api/albums/${encodeURIComponent(albumId)}/photos/${encodeURIComponent(fileName)}`;
+function qaEvidenceRefs(item) {
+  return mediaRefs(item, "retrieval");
+}
+function qaIsVideoEvidence(item, media) {
+  const mediaId = typeof media === "string" ? media : media?.media_id;
+  return item.video_id === mediaId || inferMediaType(mediaId, media?.media_type) === "video";
+}
+function qaHasVideoEvidence(item) {
+  return qaEvidenceRefs(item).some((ref) => ref.media_type === "video");
+}
+function qaMediaUrl(albumId, item, media) {
+  if (typeof media !== "string" && media?.media_url) return media.media_url;
+  const assetId = typeof media === "string" ? "" : media?.asset_id;
+  return assetId && sentrixUrl.value
+    ? `${sentrixUrl.value.replace(/\/$/, "")}/api/assets/${encodeURIComponent(assetId)}/file`
+    : "";
+}
+function qaClaimMediaRefs(claim) {
+  return mediaRefs(claim, "evidence");
 }
 function qaConversationTurns(item) {
   const conv = item.conversation;
@@ -1523,18 +1875,25 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
     <section class="section config-section">
       <div class="section-head">
 <h2>评测配置</h2>
+<div class="section-head-actions">
 <span v-if="hasRunning" class="live-badge">实时更新中</span>
+<button class="btn ghost compact" type="button" :disabled="connectionConfigState === 'saving'" @click="saveConnectionConfig">{{ connectionConfigState === 'saving' ? '保存中…' : '保存测评配置' }}</button>
+<span class="config-save-status" :class="`state-${connectionConfigState}`">{{ connectionConfigMessage }}</span>
 </div>
-      <div class="config-grid">
+</div>
+      <div class="config-groups">
+        <div class="config-group">
+          <div class="config-group-head"><div><strong>任务范围</strong><span>选择本次要构建或测评的数据范围</span></div></div>
+          <div class="config-grid config-grid-scope">
         <label>工作模式<select v-model="runMode" :disabled="suiteRunning || hasRunning" @change="onModeChange">
 <option v-for="mode in RUN_MODES_UI" :key="mode.id" :value="mode.id">{{ mode.label }}</option>
 </select>
 <span class="config-help mode-hint">{{ runModeMeta.hint }}</span>
 </label>
         <label v-if="runMode !== 'reuse'">照片<select v-model="selectedAlbum">
-<option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} ({{ manifest.face_count }}人 / {{ manifest.photo_count }}图)</option>
+<option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} ({{ albumCountLabel(manifest) }})</option>
 </select>
-<span v-if="runMode === 'build'" class="config-help">图片与身份来源，处理后相册保留</span>
+<span v-if="runMode === 'build'" class="config-help">图片、视频与身份来源，处理后相册保留</span>
 </label>
         <label v-if="runMode === 'reuse'">复用基座<select v-model="selectedReuseBaseId" :disabled="memorySpacesLoading">
 <option value="" disabled>{{ memorySpacesLoading ? '加载中…' : (reuseBases.length ? '请选择相册基座（相册 + 模型）' : '无可复用基座（检查 Sentrix 后端地址）') }}</option>
@@ -1547,32 +1906,89 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </select>
 <span v-if="runMode === 'reuse'" class="config-help">题目与对照随所选现有相册自动匹配</span>
 </label>
-        <label>Sentrix 后端<input v-model="sentrixUrl" type="text" />
+          </div>
+        </div>
+        <div class="config-group">
+          <div class="config-group-head"><div><strong>评测服务</strong><span>配置 Sentrix 后端、Judge 评分服务及认证信息</span></div></div>
+          <div class="config-grid config-grid-judge">
+        <label>Sentrix 后端<input v-model="sentrixUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.0.153:8091" />
 </label>
-       <label>Judge 服务<input v-model="judgeUrl" type="text" />
+       <label>Judge 服务<input v-model="judgeUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.1.65:1234/v1" />
 </label>
-        <label v-if="runMode !== 'build'">Judge 模型<select v-model="judgeProviderId">
-<option v-for="provider in (config?.judge_providers || [])" :key="provider.id" :value="provider.id">{{ provider.label }}</option>
-</select>
-<span class="config-help">{{ (config?.judge_providers || []).find((p) => p.id === judgeProviderId)?.model || '-' }}</span>
+        <label>Judge 模型<input v-model="judgeModel" type="text" @input="markConnectionConfigDirty" placeholder="例如 qwen3.5-4b-mlx" />
+          <span class="config-help">Judge 请求使用此 model 字段。</span>
 </label>
-        <label>vLLM 服务目标<select v-model="vllmTargetId" @change="loadProfiles">
-<option v-for="(target, id) in vllmTargets" :key="id" :value="id">{{ target.label }}</option>
-</select>
-<span class="config-help">{{ vllmTargets[vllmTargetId]?.manager_url }} → {{ vllmTargets[vllmTargetId]?.model_base_url }}</span>
+        <label>Judge API key
+          <input v-model="judgeApiKey" type="password" autocomplete="new-password" @input="judgeApiKeyDirty = true; markConnectionConfigDirty()" placeholder="留空表示不使用或保留已保存值" />
+          <span class="config-help">仅保存到评测编排器本机环境变量；{{ config?.runtime_config?.judge_api_key_set ? `已配置（${config.runtime_config.judge_api_key_hint}）` : '当前未配置' }}。</span>
+</label>
+          </div>
+        </div>
+        <div class="config-group config-group-model">
+          <div class="config-group-head"><div><strong>模型服务</strong><span>模型服务地址必填；模型管理器仅用于扫描注册表和切换模型</span></div></div>
+          <div class="config-model-endpoint">
+        <label>模型服务地址
+          <div class="endpoint-line">
+          <input v-model="modelEndpoint" type="text" @input="onModelEndpointInput" placeholder="例如 192.168.0.153:8100 或 http://192.168.0.153:8100/v1" />
+          <div class="current-model-control">
+            <button class="current-model-trigger" type="button" :class="{ active: currentModelPopoverOpen }" :disabled="currentModelLoading" @click="currentModelInfo ? currentModelPopoverOpen = !currentModelPopoverOpen : loadCurrentModel()">
+              <span class="current-model-icon">{{ currentModelLoading ? '…' : '↗' }}</span>
+              <span>{{ currentModelLoading ? '正在读取' : currentModelInfo ? '可用模型' : '获取模型列表' }}</span>
+              <span class="current-model-chevron">{{ currentModelPopoverOpen ? '⌃' : '⌄' }}</span>
+            </button>
+            <div v-if="currentModelInfo && currentModelPopoverOpen" class="current-model-popover" role="status" aria-live="polite">
+              <span class="popover-arrow"></span>
+              <div class="current-model-popover-head"><span>MODEL ENDPOINT</span><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></div>
+              <strong>{{ currentModelInfo.served_model_name || `${currentModelInfo.served_models.length} 个模型待选择` }}</strong>
+              <div class="current-model-status"><i></i>{{ currentModelInfo.manager_available ? '已读取 Manager 当前运行状态' : '已连接 OpenAI-compatible 端点' }}</div>
+              <dl>
+                <div><dt>模型服务</dt><dd>{{ currentModelInfo.model_base_url }}</dd></div>
+                <div v-if="currentModelInfo.state?.profile"><dt>Profile</dt><dd>{{ currentModelInfo.state.profile }}</dd></div>
+                <div v-if="currentModelInfo.state?.max_model_len"><dt>上下文 / 并发</dt><dd>{{ currentModelInfo.state.max_model_len }} / {{ currentModelInfo.state.max_num_seqs || '-' }}</dd></div>
+                <div v-if="currentModelInfo.state?.dtype"><dt>精度</dt><dd>{{ currentModelInfo.state.dtype }}</dd></div>
+              </dl>
+              <button class="popover-refresh" type="button" @click="loadCurrentModel">重新获取</button>
+            </div>
+          </div>
+          </div>
+          <span class="config-help">填写模型服务的 IP:端口；可带或不带 /v1，实际请求会自动补齐。</span>
+          <span v-if="currentModelError" class="config-help error">{{ currentModelError }}</span>
 </label>
       </div>
-      <div class="model-picker">
-<span class="field-label">选择模型（可多选，串行测试）</span>
+          <div class="config-model-manager">
+            <label>模型管理器地址（可选）
+              <input v-model="vllmManagerUrl" type="text" @input="onModelManagerInput" @change="loadProfiles" placeholder="例如 192.168.0.153:8500；无管理器可留空" />
+              <span class="config-help">填写后从 Manager 的模型注册表自动扫描；留空时不显示普通模型选择。</span>
+            </label>
+            <button class="btn ghost compact model-registry-refresh" type="button" :disabled="!vllmManagerUrl.trim()" @click="loadProfiles">刷新模型注册表</button>
+          </div>
+          <div class="model-current-choice">
+            <label class="endpoint-model-select">可用模型
+              <select v-model="selectedEndpointModel" :disabled="!endpointModels.length" @change="onEndpointModelChange">
+                <option value="">{{ endpointModels.length ? '请选择模型' : '先获取模型列表' }}</option>
+                <option v-for="model in endpointModels" :key="model" :value="model">{{ model }}</option>
+              </select>
+            </label>
+            <button class="btn ghost compact endpoint-test-button" type="button" :disabled="!selectedEndpointModel || modelTestState === 'testing'" @click="testEndpointModel">{{ modelTestState === 'testing' ? '测试中…' : '测试 POST' }}</button>
+            <span v-if="modelTestMessage" class="model-test-feedback" :class="`state-${modelTestState}`">{{ modelTestMessage }}</span>
+            <label class="check endpoint-reuse-check" :class="{ active: selectedModels.has('__current__') }">
+              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ selectedEndpointModel }}，不启停）</span>
+            </label>
+          </div>
+          <div v-if="vllmManagerUrl.trim()" class="model-picker">
+<span class="field-label">模型注册表（可多选，串行测试）</span>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
 <input type="checkbox" :checked="selectedModels.has(profile.id)" :disabled="!profile.available" @change="setModelSelected(profile.id, $event.target.checked)" />{{ profile.id }}<span v-if="profile.source === 'cloud_api'">（云端 API）</span><span v-if="!profile.available">（不可用）</span>
 </label>
-</div>
+<span v-if="!profiles.length" class="config-help">尚未从模型管理器注册表加载模型，请点击“刷新模型注册表”。</span>
+          </div>
+          <div v-else class="model-manager-empty">未配置模型管理器。Ollama、llama.cpp 等端点只会按请求使用上方选中的模型；测评服务不会自动启停或切换模型。</div>
+        </div>
+      </div>
       <div class="actions">
 <label v-if="runMode === 'full'" class="check"><input type="checkbox" v-model="deleteScopeAfterRun" :disabled="suiteRunning || hasRunning" />完成后删除相册</label>
 <button class="btn" :disabled="Boolean(startDisabledReason)" @click="startSuite">{{ hasRunning ? '已有任务运行中' : runModeMeta.button }}</button>
 <button class="btn warn" :disabled="!hasRunning" @click="stopSuite">停止全部</button>
-<button class="btn ghost" @click="loadProfiles">刷新模型列表</button>
 </div>
       <p v-if="error" class="error">{{ error }}</p>
     </section>
@@ -1592,7 +2008,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <th>耗时</th>
 <th>状态</th>
 <th>进度</th>
-<th>图片级召回率</th>
+<th>媒体召回率</th>
 <th>质量均分</th>
 <th>
 </th>
@@ -1611,7 +2027,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
 <td>{{ runProgressLabel(run) }}</td>
-<td>{{ fmtPct(run.summary?.retrieval_recall_micro) }}</td>
+<td>{{ fmtPct(run.summary?.media_retrieval_recall_micro ?? run.summary?.retrieval_recall_micro) }}</td>
 <td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>
@@ -1641,6 +2057,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
         </div>
       </div>
       <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}<template v-if="activeRun.mode === 'reuse'"> · 复用相册 {{ activeRun.scope_name || activeRun.scope_id || activeRun.existing_scope_id }}<span v-if="(activeRun.scope_reused_from_runs || []).length">（源自 run {{ activeRun.scope_reused_from_runs.join('、') }}）</span><span v-else>（外部创建，非编排器产物）</span></template><template v-else-if="activeRun.mode === 'build'"> · 产出相册 {{ activeRun.scope_id || '-' }}（已保留，可在复用测评中使用）</template></p>
+      <div v-if="activeRun.fatal_error" class="run-error-banner"><b>任务终止原因</b><span>{{ activeRun.fatal_error }}</span><small v-if="activeRun.failed_phase">失败阶段：{{ EXECUTION_PHASES.find((item) => item.key === activeRun.failed_phase)?.label || activeRun.failed_phase }}</small></div>
       <section v-if="activeRun.mode !== 'build'" class="rejudge-card">
         <div class="rejudge-head">
 <div>
@@ -1660,7 +2077,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </textarea>
 </label>
         <div class="rejudge-toolbar">
-<span class="muted small">{{ rejudgePrompt.length }} 字符 · Judge {{ config?.judge_model || '-' }}</span>
+<span class="muted small">{{ rejudgePrompt.length }} 字符 · Judge {{ judgeModel || '-' }}</span>
 <div class="rejudge-actions">
 <button class="btn ghost compact" :disabled="activeRejudge?.status === 'running'" @click="saveJudgePrompt">保存提示词</button>
 <button class="btn ghost compact" :disabled="activeRejudge?.status === 'running'" @click="resetJudgePrompt">恢复默认</button>
@@ -1690,6 +2107,15 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="activeRun.phases?.[phaseDef.key]?.status || 'pending'">{{ statusLabel(activeRun.phases?.[phaseDef.key]?.status || 'pending') }}</span>
 </div>
 <p class="phase-summary">{{ phaseSummary(phaseDef.key, activeRun.phases?.[phaseDef.key]) }}</p>
+<details v-if="phaseErrorDetails(activeRun.phases?.[phaseDef.key]).length" class="phase-errors">
+<summary>{{ phaseErrorSummary(activeRun.phases?.[phaseDef.key]) }}</summary>
+<ul>
+<li v-for="(detail, detailIndex) in phaseErrorDetails(activeRun.phases?.[phaseDef.key]).slice(0, 20)" :key="`${detail.sample_id || 'error'}-${detailIndex}`">
+<b>{{ detail.sample_id || '未知样本' }}</b><span>{{ detail.reason || detail.error || '未提供原因' }}</span><small>{{ detail.error_type || detail.status || '错误' }}<template v-if="detail.asset_id"> · {{ detail.asset_id }}</template></small>
+</li>
+</ul>
+<p v-if="phaseErrorDetails(activeRun.phases?.[phaseDef.key]).length > 20">仅展示前 20 条，完整记录已保存在 run.json。</p>
+</details>
 <div v-if="phaseDef.key === 'pipeline_processing' && activeRun.phases?.[phaseDef.key]?.progress" class="phase-bar">
 <div class="phase-bar-fill" :style="{ width: phasePercent(activeRun.phases[phaseDef.key]) + '%' }">
 </div>
@@ -1822,6 +2248,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <input v-model="qaFilters.search" type="search" placeholder="搜索题号或问题" />
           <select v-model="qaFilters.score"><option value="">全部 Judge 分数</option><option value="2">2 分</option><option value="1">1 分</option><option value="0">0 分</option></select>
           <select v-model="qaFilters.task_type"><option value="">全部任务类型</option><option v-for="value in qaPage.facets?.task_types || []" :key="value" :value="value">{{ value }}</option></select>
+          <select v-model="qaFilters.tag"><option value="">全部标签</option><option v-for="value in qaPage.facets?.tags || []" :key="value" :value="value">{{ value }}</option></select>
           <select v-model="qaFilters.angle"><option value="">全部问题角度</option><option v-for="value in qaPage.facets?.angles || []" :key="value" :value="value">{{ value }}</option></select>
           <select v-model="qaFilters.difficulty"><option value="">全部难度</option><option v-for="value in qaPage.facets?.difficulties || []" :key="value" :value="value">{{ value }}</option></select>
           <select v-model="qaFilters.answerability"><option value="">全部可回答性</option><option v-for="value in qaPage.facets?.answerabilities || []" :key="value" :value="value">{{ value }}</option></select>
@@ -1850,6 +2277,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                 <span v-if="itemDetail(summary).angle">{{ itemDetail(summary).angle }}</span>
                 <span v-if="itemDetail(summary).difficulty">{{ itemDetail(summary).difficulty }}</span>
                 <span v-if="itemDetail(summary).answerability">{{ itemDetail(summary).answerability }}</span>
+                <span v-for="tag in itemDetail(summary).tags || []" :key="tag" class="qa-run-tag">{{ tag }}</span>
               </div>
               <section v-if="conversationTurns(itemDetail(summary)).length > 1" class="result-conversation-card">
                 <header class="result-conversation-head">
@@ -1860,11 +2288,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                   <article v-for="(turn, turnIndex) in conversationTurns(itemDetail(summary))" :key="turn.index ?? turnIndex" class="result-conversation-turn">
                     <div class="result-turn-marker"><b>{{ turnIndex + 1 }}</b><span>{{ conversationContextLabel(turn, turnIndex) }}</span></div>
                     <div class="result-message result-user-message"><small>用户 · 第 {{ turnIndex + 1 }} 轮</small><p>{{ turn.message }}</p></div>
-                    <div class="result-message result-assistant-message"><small>模型回答</small><p>{{ turn.answer || "未完成" }}</p></div>
+                    <div class="result-message result-assistant-message"><small>模型回答</small><p>{{ turn.final_answer || turn.answer || "未完成" }}</p></div>
                     <div class="result-turn-scores">
                       <span>任务行为 <b>期望{{ actionLabel(turn.expected_action) }} / 实际{{ actionLabel(turn.task_judge?.actual_action) }}</b><em :class="turn.task_judge?.correct === true ? 'pass' : turn.task_judge?.correct === false ? 'fail' : ''">{{ turn.task_judge?.correct === true ? '一致' : turn.task_judge?.correct === false ? '不一致' : '未记录' }}</em></span>
                       <span>回答质量 <b>{{ turnScore(turn.judge?.score) }}</b></span>
-                      <span>图片证据 <b>{{ evidenceScoreLabel(turn.evidence_judge) }}</b></span>
+                      <span>媒体证据 <b>{{ evidenceScoreLabel(turn.evidence_judge) }}</b></span>
                       <span>轮次结果 <b>{{ turn.turn_outcome || turn.termination_reason || "未记录" }}</b></span>
                     </div>
                     <div class="result-turn-reasons" v-if="judgeReason(turn.judge) || judgeReason(turn.task_judge) || judgeReason(turn.evidence_judge)">
@@ -1877,29 +2305,29 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               </section>
               <div class="item-body">
                 <div>
-                  <h4>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮回答" : "模型回答" }}</h4><p>{{ itemDetail(summary).answer || itemDetail(summary).error || "未完成" }}</p>
+                  <h4>{{ conversationTurns(itemDetail(summary)).length > 1 ? "最终一轮回答" : "模型回答" }}</h4><p>{{ itemDetail(summary).final_answer || itemDetail(summary).answer || itemDetail(summary).error || "未完成" }}</p>
                   <div class="capability-grid">
                     <span><small>任务判断</small><b>{{ taskDecisionLabel(itemDetail(summary)) }}</b></span>
                     <span><small>任务判断结果</small><b>{{ itemDetail(summary).task_judge?.correct === true ? "一致" : itemDetail(summary).task_judge?.correct === false ? "不一致" : "未记录" }}</b></span>
                     <span v-if="itemDetail(summary).task_judges?.length > 1"><small>多轮评分口径</small><b>每轮独立评分，并携带截至该轮的完整对话</b></span>
                     <span><small>证据对应</small><b>{{ evidenceScoreLabel(itemDetail(summary).evidence_judge) }}</b></span>
-                    <span><small>图片检索</small><b>{{ itemRetrievalMetrics(itemDetail(summary)) }}</b></span>
+                    <span><small>媒体检索</small><b>{{ itemRetrievalMetrics(itemDetail(summary)) }}</b></span>
                     <span><small>JSON 解析</small><b>{{ itemParseRate(itemDetail(summary)) }}</b></span>
                     <span><small>步数内完成</small><b>{{ completionLabel(itemDetail(summary)) }}</b></span>
                   </div>
-                  <h4>模型召回图片（{{ itemImages(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="image in itemImages(itemDetail(summary))" :key="image.asset_id || image.file_name" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div><span v-if="!itemImages(itemDetail(summary)).length" class="muted small">模型没有返回可识别的图片</span></div>
-                  <h4>回答来源图片（{{ itemEvidenceImages(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="image in itemEvidenceImages(itemDetail(summary)).slice(0, 3)" :key="`evidence-${image.asset_id || image.file_name}`" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div><span v-if="!itemEvidenceImages(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
-                  <details v-if="itemEvidenceImages(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceImages(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="image in itemEvidenceImages(itemDetail(summary)).slice(3)" :key="`evidence-more-${image.asset_id || image.file_name}`" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}</span></div></div></details>
+                  <h4>模型召回媒体（{{ itemMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemMedia(itemDetail(summary)).length" class="muted small">模型没有返回可识别的媒体</span></div>
+                  <h4>回答来源媒体（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`evidence-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
+                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`evidence-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>
-                  <h4>检索 GT 图片（{{ itemImages(itemDetail(summary), true).length }}）</h4>
-                  <div class="image-grid"><div v-for="image in itemImages(itemDetail(summary), true)" :key="image.asset_id || image.file_name" class="image-tile"><img v-if="imageUrl(image)" :src="imageUrl(image)" :alt="image.file_name" loading="lazy" @click="openImage(image)" /><span v-else class="image-empty">无图</span><span class="image-label">{{ image.file_name || image.image_id }}<em v-if="image.matched === false"> · 未召回</em></span></div></div>
+                  <h4>检索 GT 媒体（{{ itemMedia(itemDetail(summary), true).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary), true)" :key="media.asset_id || `${media.media_type}-${media.media_id}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}<em v-if="media.matched === false"> · 未召回</em></span></div></div>
                   <h4 v-if="judgeReason(itemDetail(summary).judge)">回答质量评分说明</h4><p v-if="judgeReason(itemDetail(summary).judge)" class="muted">{{ judgeReason(itemDetail(summary).judge) }}</p>
                   <h4 v-if="judgeReason(itemDetail(summary).task_judge)">任务判断说明</h4><p v-if="judgeReason(itemDetail(summary).task_judge)" class="muted">{{ judgeReason(itemDetail(summary).task_judge) }}</p>
-                  <h4 v-if="judgeReason(itemDetail(summary).evidence_judge)">图片证据评分说明</h4><p v-if="judgeReason(itemDetail(summary).evidence_judge)" class="muted">{{ judgeReason(itemDetail(summary).evidence_judge) }}</p>
+                  <h4 v-if="judgeReason(itemDetail(summary).evidence_judge)">媒体证据评分说明</h4><p v-if="judgeReason(itemDetail(summary).evidence_judge)" class="muted">{{ judgeReason(itemDetail(summary).evidence_judge) }}</p>
                 </div>
               </div>
               <section class="qa-performance">
@@ -2040,23 +2468,28 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <div>
             <p class="qa-browser-kicker">DATASET REVIEW</p>
             <h1>QA 数据集审阅</h1>
-            <p>按题检查对话设计、参考回答、GT 图片和证据元数据。</p>
+            <p>按题检查对话设计、参考回答、图视频 GT 和证据元数据。</p>
           </div>
-          <div class="qa-browser-count"><strong>{{ qaBrowserItems.length }}</strong><span>道题目</span></div>
+          <div class="qa-browser-count"><strong>{{ visibleQaBrowserItems.length }}</strong><span>{{ visibleQaBrowserItems.length === qaBrowserItems.length ? '道题目' : `/ ${qaBrowserItems.length} 道` }}</span></div>
         </header>
         <div class="qa-browser-toolbar">
           <label><span>相册</span><select v-model="qaBrowserAlbum" @change="qaBrowserSet = (qaBrowserOptions[0] || 'compact-10q'); loadQaBrowser()">
-            <option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} · {{ manifest.face_count }} 人 / {{ manifest.photo_count }} 图</option>
+            <option v-for="manifest in manifests" :key="manifest.album_id" :value="manifest.album_id">{{ manifest.album_name }} · {{ albumCountLabel(manifest) }}</option>
           </select></label>
           <label><span>QA 数据集</span><select v-model="qaBrowserSet" @change="loadQaBrowser">
             <option v-for="qa in qaBrowserOptions" :key="qa" :value="qa">{{ qa }}</option>
           </select></label>
+          <label><span>搜索</span><input v-model="qaBrowserSearch" type="search" placeholder="QA ID、问题或答案"></label>
+          <label><span>标签</span><select v-model="qaBrowserTag"><option value="">全部标签</option><option v-for="tag in qaBrowserTags" :key="tag" :value="tag">{{ tag }}</option></select></label>
           <button class="btn ghost" @click="loadQaBrowser">刷新数据</button>
         </div>
         <p v-if="qaBrowserError" class="error">{{ qaBrowserError }}</p>
+        <p v-else-if="qaBrowserMediaResolution && qaBrowserMediaResolution.status !== 'no_media'" class="muted small qa-media-source-status">
+          媒体来源：Sentrix 后端 · 已解析 {{ qaBrowserMediaResolution.resolved_count || 0 }} · 缺失 {{ qaBrowserMediaResolution.missing_count || 0 }} · 不唯一 {{ qaBrowserMediaResolution.ambiguous_count || 0 }}
+        </p>
         <div v-if="qaBrowserLoading" class="qa-browser-empty">正在加载数据集…</div>
         <div v-else class="qa-browser-list">
-          <article v-for="(item, idx) in qaBrowserItems" :key="item.qa_id || idx" class="qa-review-card">
+          <article v-for="(item, idx) in visibleQaBrowserItems" :key="item.qa_id || idx" class="qa-review-card">
             <header class="qa-review-header">
               <div class="qa-review-index">{{ String(idx + 1).padStart(2, '0') }}</div>
               <div class="qa-review-title">
@@ -2065,12 +2498,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                   <span class="qa-type-tag">{{ qaTypeLabel(item.question_type) }}</span>
                   <span class="qa-answerability-tag">{{ qaAnswerabilityLabel(item.answerability) }}</span>
                   <span v-if="item.difficulty" class="qa-difficulty-tag">{{ item.difficulty }}</span>
+                  <span v-for="tag in item.tags || []" :key="tag" class="qa-data-tag">{{ tag }}</span>
                   <span v-if="qaConversationTurns(item).length > 1" class="multi-turn-badge">{{ qaConversationTurns(item).length }} 轮</span>
                 </div>
                 <span class="qa-review-id">{{ item.qa_id || `qa-${idx + 1}` }}</span>
               </div>
             </header>
-            <div class="qa-review-layout" :class="{ 'no-evidence': !(item.retrieval_image_ids && item.retrieval_image_ids.length) }">
+            <div class="qa-review-layout" :class="{ 'no-evidence': !qaEvidenceRefs(item).length }">
               <div class="qa-dialogue-panel">
                 <div v-for="(turn, ti) in qaConversationTurns(item)" :key="ti" class="qa-turn-row">
                   <div class="qa-turn-side user-side">
@@ -2087,20 +2521,22 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                   </div>
                 </div>
               </div>
-              <aside v-if="item.retrieval_image_ids && item.retrieval_image_ids.length" class="qa-evidence-panel">
-                <div class="qa-evidence-head"><div><span>RETRIEVAL GROUND TRUTH</span><strong>检索 GT 图片</strong><small>同一事件内允许召回的相关图片</small></div><b>{{ item.retrieval_image_ids.length }}</b></div>
-                <div class="gt-gallery">
-                  <button v-for="imgId in item.retrieval_image_ids" :key="imgId" class="gt-thumb-card" :class="{ 'direct-evidence': isDirectEvidence(item, imgId) }" type="button" @click="lightbox = { url: qaPhotoUrl(qaBrowserAlbum, imgId), name: imgId.split('/').pop() }">
-                    <img :src="qaPhotoUrl(qaBrowserAlbum, imgId)" :alt="imgId" loading="lazy" />
-                    <span>{{ imgId.split('/').pop() }}<em>{{ isDirectEvidence(item, imgId) ? '直接证据' : '事件相关' }}</em></span>
-                  </button>
+              <aside v-if="qaEvidenceRefs(item).length" class="qa-evidence-panel">
+                <div class="qa-evidence-head"><div><span>RETRIEVAL GROUND TRUTH</span><strong>检索 GT 媒体</strong><small>问题对应的直接证据</small></div><b>{{ qaEvidenceRefs(item).length }}</b></div>
+                <div class="gt-gallery" :class="{ 'video-gallery': qaHasVideoEvidence(item) }">
+                  <div v-for="media in qaEvidenceRefs(item)" :key="mediaKey(media)" class="gt-thumb-card" :class="{ 'direct-evidence': isDirectEvidence(item, media), 'video-evidence': qaIsVideoEvidence(item, media) }">
+                    <video v-if="qaIsVideoEvidence(item, media) && qaMediaUrl(qaBrowserAlbum, item, media)" :src="qaMediaUrl(qaBrowserAlbum, item, media)" controls playsinline preload="none"></video>
+                    <button v-else-if="qaMediaUrl(qaBrowserAlbum, item, media)" class="gt-image-button" type="button" @click="lightbox = { url: qaMediaUrl(qaBrowserAlbum, item, media), name: media.media_id.split('/').pop() }"><img :src="qaMediaUrl(qaBrowserAlbum, item, media)" :alt="media.media_id" loading="lazy" /></button>
+                    <span v-else class="image-empty">{{ media.mapping_status === 'ambiguous' ? '媒体标识不唯一' : 'Sentrix 后端未找到' }}</span>
+                    <span>{{ media.media_id.split('/').pop() }}<em>{{ qaIsVideoEvidence(item, media) ? '视频证据' : isDirectEvidence(item, media) ? '直接证据' : '事件相关' }}</em></span>
+                  </div>
                 </div>
               </aside>
             </div>
             <div class="qa-review-foot">
               <details v-if="item.answer_claims && item.answer_claims.length" class="qa-detail-block">
                 <summary>证据声明 <b>{{ item.answer_claims.length }}</b></summary>
-                <div v-for="(claim, ci) in item.answer_claims" :key="ci" class="qa-claim"><span class="claim-type">{{ claim.support_type || claim.claim_id }}</span><span class="claim-text">{{ claim.text }}</span><span v-if="claim.evidence_image_ids?.length" class="claim-evidence">{{ claim.evidence_image_ids.map(x => x.split('/').pop()).join(' · ') }}</span></div>
+                <div v-for="(claim, ci) in item.answer_claims" :key="ci" class="qa-claim"><span class="claim-type">{{ claim.support_type || claim.claim_id }}</span><span class="claim-text">{{ claim.text }}</span><span v-if="qaClaimMediaRefs(claim).length" class="claim-evidence">{{ qaClaimMediaRefs(claim).map(ref => `${ref.media_type === 'video' ? '视频' : '图片'}:${ref.media_id.split('/').pop()}`).join(' · ') }}</span></div>
               </details>
               <details v-if="item.person_references && item.person_references.length" class="qa-detail-block">
                 <summary>人物引用 <b>{{ item.person_references.length }}</b></summary>

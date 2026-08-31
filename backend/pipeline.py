@@ -27,6 +27,29 @@ def file_time(path):
     return datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc).isoformat()
 
 
+def _offline_ocr_text(path):
+    """导入阶段离线 OCR：12B VLM 读不出小字/菜单时用 PaddleOCR 补（P2.3 离线优先）。
+
+    结果存进 observations.ocr_text，供 read_photo_text 的 ingestion_ocr 路径优先
+    使用。PaddleOCR 是 CPU 推理、能力优于 VLM 小字读取；任何失败仅返回空串，
+    不影响导入主路径。
+    """
+    try:
+        from .agent_runtime.ocr_tool import (_get_small_engine, _paddle_items,
+                                             _small_ocr_rows, small_ocr_available)
+        if not small_ocr_available():
+            return ""
+        engine = _get_small_engine()
+        result = engine.predict(path)
+        items = _paddle_items(result)
+        if not items:
+            return ""
+        text, _, _ = _small_ocr_rows(items)
+        return str(text or "")[:1600]
+    except Exception:
+        return ""
+
+
 class IngestionPipeline:
     def __init__(self, store, gamma=None, asr=None, face=None, clip=None, geocoder=None):
         self.store = store
@@ -53,6 +76,51 @@ class IngestionPipeline:
                 pass
         return self.clip.embed_text(str(text)), self.clip.model_name
 
+    def _field_desc_text(self, analysis: dict) -> str:
+        """完整描述文本：caption + place + objects + event_type + ocr_text（observations 字段）。
+
+        field_desc 是检索侧的独立语义通道：它和现有 episodic/semantic 向量（caption+
+        activity+place+ocr+object+detail 拼接）不同，只拼任务书指定的五个字段，让
+        查询（planner_goal）与这张完整描述做余弦加分，补上单字段语义漂移。
+        """
+        caption = str(analysis.get("caption") or "")
+        place = str(analysis.get("place") or "")
+        objects = analysis.get("objects") or []
+
+        def _object_text(item):
+            if isinstance(item, str):
+                return item
+            if isinstance(item, dict):
+                parts = [
+                    str(item.get(key, "")).strip()
+                    for key in ("label", "primary", "details")
+                    if str(item.get(key, "")).strip() not in ("", "[]", "{}", "其他或不确定")
+                ]
+                return " ".join(parts)
+            return str(item)
+
+        object_text = " ".join(_object_text(item) for item in objects)
+        event_type = str(analysis.get("event_type") or "")
+        ocr_text = str(analysis.get("ocr_text") or "")
+        return " ".join(filter(None, [caption, place, object_text, event_type, ocr_text]))
+
+    def _field_desc_embed(self, text: str):
+        """用 bge-m3 sidecar 编码完整描述；失败返回 (None, None)，不阻塞语义导入。
+
+        复用带熔断的 BgeM3TextQueryEmbedder（sidecar 死亡时快速返回空向量），
+        生成失败仅跳过 field_desc 通道，绝不让图片导入报错。
+        """
+        try:
+            from .embeddings.bge_text import BgeM3TextQueryEmbedder
+            if getattr(self, "_field_desc_embedder", None) is None:
+                self._field_desc_embedder = BgeM3TextQueryEmbedder()
+            vector = self._field_desc_embedder.embed_query(text)
+            if vector:
+                return vector, self._field_desc_embedder.model_id
+        except Exception:
+            pass
+        return None, None
+
     def prepare_asset(self, path, file_name=None, media_type=None, mime_type=None, metadata=None):
         """Prepare file metadata without mutating SQLite.
 
@@ -67,7 +135,7 @@ class IngestionPipeline:
         metadata.setdefault("content_sha256", self._sha256(path))
         import_timings["sha256_seconds"] = round(time.perf_counter() - step_started, 4)
         step_started = time.perf_counter()
-        metadata.setdefault("exif", self._extract_exif(path) if media_type == "image" else {})
+        metadata.setdefault("exif", self.extract_capture_metadata(path, media_type))
         import_timings["exif_seconds"] = round(time.perf_counter() - step_started, 4)
         existing = self.store.find_asset_by_hash(metadata["content_sha256"], metadata.get("scope_id"))
         if existing:
@@ -76,6 +144,8 @@ class IngestionPipeline:
         for key in ("captured_at", "captured_location", "source_device_id"):
             if metadata.get(key) is None and metadata["exif"].get(key):
                 metadata[key] = metadata["exif"][key]
+        if metadata.get("source_device_id") is None and metadata["exif"].get("device"):
+            metadata["source_device_id"] = metadata["exif"]["device"]
         gps = self._gps_from_metadata(metadata)
         if gps:
             if not metadata.get("captured_location"):
@@ -145,6 +215,35 @@ class IngestionPipeline:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @classmethod
+    def extract_capture_metadata(cls, path, media_type):
+        if media_type == "image":
+            return cls._extract_exif(path)
+        if media_type == "video":
+            return cls._extract_video_capture_metadata(path)
+        return {}
+
+    @staticmethod
+    def _extract_video_capture_metadata(path):
+        try:
+            from .video.metadata import probe_video_metadata
+            meta = probe_video_metadata(path)
+            result = {}
+            if meta.captured_at:
+                result["captured_at"] = meta.captured_at
+            if meta.latitude is not None and meta.longitude is not None:
+                result["gps"] = {"latitude": meta.latitude, "longitude": meta.longitude}
+                result["captured_location"] = meta.captured_location or (
+                    f"{float(meta.latitude):.6f},{float(meta.longitude):.6f}"
+                )
+            if meta.device:
+                result["device"] = meta.device
+            if meta.creation_source:
+                result["creation_source"] = meta.creation_source
+            return {key: value for key, value in result.items() if value not in (None, "", {})}
+        except Exception:
+            return {}
 
     @staticmethod
     def _extract_exif(path):
@@ -412,7 +511,7 @@ class IngestionPipeline:
             "clothing": analysis.get("clothing", []),
             "emotions": analysis.get("emotions", []),
             "spatial_relations": analysis.get("spatial_relations", []),
-            "ocr_text": analysis.get("ocr_text", ""),
+            "ocr_text": analysis.get("ocr_text", "") or _offline_ocr_text(asset["path"]),
             "event_type": analysis.get("event_type", ""),
             "facts": analysis.get("facts", []),
         }
@@ -443,10 +542,15 @@ class IngestionPipeline:
         embedding_started = time.perf_counter()
         embedding, embedding_model = self._text_embed(text)
         embedding_seconds = time.perf_counter() - embedding_started
+        field_desc_text = self._field_desc_text(analysis)
+        field_desc_vector, field_desc_model = self._field_desc_embed(field_desc_text)
         return {
             "analysis": analysis,
             "embedding": embedding,
             "embedding_model": embedding_model,
+            "field_desc_text": field_desc_text,
+            "field_desc_vector": field_desc_vector,
+            "field_desc_model": field_desc_model,
             "timings": {
                 "vlm_image_description_seconds": round(vision_seconds, 4),
                 "text_embedding_seconds": round(embedding_seconds, 4),
@@ -483,6 +587,17 @@ class IngestionPipeline:
         step_started = time.perf_counter()
         self.store.upsert_vector("episodic", "observation", observation_id, embedding, embedding_model, {"asset_id": asset_id, "event_id": event_id})
         self.store.upsert_vector("semantic", "observation", observation_id, embedding, embedding_model, {"asset_id": asset_id, "event_id": event_id})
+        field_desc_vector = prepared.get("field_desc_vector")
+        if field_desc_vector:
+            try:
+                self.store.upsert_vector(
+                    "field_desc", "asset", asset_id, field_desc_vector,
+                    prepared.get("field_desc_model") or "BAAI/bge-m3",
+                    {"observation_id": observation_id, "event_id": event_id,
+                     "text": prepared.get("field_desc_text", "")},
+                )
+            except Exception:
+                pass
         if event_id:
             self.store.upsert_vector("episodic", "event", event_id, embedding, embedding_model, {"observation_id": observation_id})
             # Fast-path events keep placeholder place ("其他或不确定"); sync the

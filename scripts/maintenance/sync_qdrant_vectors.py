@@ -54,11 +54,11 @@ def sync(store, index, scope_id=None):
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)}
 
 
-def reembed_visual_assets(store, embedder):
+def reembed_visual_assets(store, embedder, *, scope_id=None):
     started = time.perf_counter()
     written = 0
     skipped = 0
-    assets = store.list_assets(media_type="image", limit=100_000)
+    assets = store.list_assets(media_type="image", limit=100_000, scope_id=scope_id)
     for asset in assets:
         path = asset.get("path") or ""
         if not Path(path).is_file():
@@ -178,7 +178,9 @@ def main():
                             return clip.embed_image(path)
 
                     embedder = ClipImageEmbedder()
-                result["visual_reembed"] = reembed_visual_assets(store, embedder)
+                result["visual_reembed"] = reembed_visual_assets(
+                    store, embedder, scope_id=args.scope or None
+                )
             result["sync"] = sync(store, index, args.scope or None)
         else:
             result["dry_run"] = True

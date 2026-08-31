@@ -69,7 +69,7 @@ class ToolPolicy:
         "unresolved", "delivered", "blocked", "observation", "certainty",
         "confirms_visual_only", "source", "persisted", "question", "asset_handle",
         "reason", "url", "status", "family_role", "photo_identities",
-        "_model_call_metrics",
+        "call_status", "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
@@ -78,31 +78,28 @@ class ToolPolicy:
             "explicit_foods", "explicit_food_events", "meal_scene_events",
             "possible_events", "time_range", "rows_truncated", "samples", "items",
         },
-        "query_memory_metadata": _DEFAULT_ALLOWED | {
-            "tool", "operation", "metadata_operation", "answer_type", "value",
-            "rows", "samples", "items", "filters_applied", "source_asset_ids",
-            "source_handles", "evidence_asset_ids", "evidence_kind", "evidence_count",
-            "event_count", "asset_count", "time_range", "rows_truncated",
-        },
         "query_photo_people": _DEFAULT_ALLOWED | {
             "result_set_id", "asset_id", "people", "unconfirmed_people",
             "unconfirmed_people_count", "source_asset_ids", "source_handles",
             "evidence_asset_ids", "evidence_kind", "summary",
         },
         "search_memories": _DEFAULT_ALLOWED | {
-            "query", "mode", "gaps", "query_satisfaction", "answerability",
-            "condition_summary", "can_inspect", "inspect_hint",
-            "recommended_resolution",
-            "asset_ids", "evidence_count", "place",
-            "retrieval_timing", "_preview_asset_ids", "_retrieved_asset_ids",
-            "retrieval_channels",
-            "retrieved_asset_ids", "evidence_asset_ids", "source_asset_ids",
-            "reference_resolution", "evidence_status", "validation_status",
+            # 只保留模型决策需要的顶层字段;检索内部/统计/诊断字段留在服务端
+            # 与 debug trace,不进入模型上下文（见 runtime._model_visible_observation）。
+            "query", "query_satisfaction", "recommended_handle", "place",
             "group_photo_count", "group_photo_sizes", "group_photo_rows",
         },
-        "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
-        "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
-        "inspect_photo": _DEFAULT_ALLOWED | {"_source_asset_id"},
+        "get_original_photos": _DEFAULT_ALLOWED | {"scope_id", "media_type",
+                                                  "source_timestamp_sec", "source_video_asset_id"},
+        "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query",
+                                               "asset_ids", "evidence_asset_ids",
+                                               "retrieved_asset_ids", "source_asset_ids",
+                                               "requires_new_search"},
+        "inspect_photo": _DEFAULT_ALLOWED | {"_source_asset_id", "face_candidates",
+                                             "selected_face_id", "target_bbox",
+                                             "target_face_id", "target_face_status",
+                                             "target_person", "unconfirmed_people",
+                                             "unconfirmed_people_count"},
         "read_photo_text": _DEFAULT_ALLOWED | {
             "full_text", "text_regions", "confidence", "exact_values", "fallback_used",
             "provider", "cache_hit", "tiles", "vlm_calls",
@@ -112,12 +109,6 @@ class ToolPolicy:
         },
         "get_core_memory": _DEFAULT_ALLOWED | {
             "subject", "topic", "cards", "note",
-        },
-        "get_person_memory": _DEFAULT_ALLOWED | {
-            "person", "operation", "readiness", "asset_count", "observation_count",
-            "event_count", "entity_binding_coverage", "first_occurrence",
-            "last_occurrence", "common_places", "co_occurrence", "events",
-            "representative_events", "insufficient_evidence", "note",
         },
         "get_person_profile": _DEFAULT_ALLOWED | {
             "person", "readiness", "insufficient_evidence", "note",

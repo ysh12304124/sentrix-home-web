@@ -79,7 +79,11 @@ class PlaceRetrievalTest(unittest.TestCase):
         out = runtime_tools._search_memories(
             {"query": "沙雕合影", "filters": {"time": "2019年7月", "place": "秦皇岛如是海度假村"}},
             context=ctx)
-        self.assertEqual(out["total"], 2, out)
+        # Semantic place/time hints are no longer hard filters. The complete
+        # candidate pool is retained for model reranking; assert target recall
+        # rather than an exact pool size.
+        self.assertGreaterEqual(out["total"], 2, out)
+        self.assertTrue({"asset_a1", "asset_a2"}.issubset(set(out["retrieved_asset_ids"])), out)
         self.assertNotEqual(out["query_satisfaction"], "no_match")
 
     def test_search_memories_international_alias(self):
@@ -96,20 +100,22 @@ class PlaceRetrievalTest(unittest.TestCase):
         out = runtime_tools._search_memories(
             {"query": "夜间部落表演", "filters": {"time": "2018年4月", "place": "清迈"}},
             context=ctx)
-        self.assertEqual(out["total"], 1, out)
+        self.assertGreaterEqual(out["total"], 1, out)
+        self.assertIn("asset_a4", out["retrieved_asset_ids"], out)
 
     def test_query_memory_facts_place_count(self):
         ctx = {"scope_id": "album3-v2", "viewer_id": "owner", "task_state": {}}
         out = runtime_tools._query_memory_facts(
             {"operation": "count", "filters": {"time": "2019年7月", "place": "秦皇岛如是海度假村"}},
             context=ctx)
-        self.assertEqual(out["total"], 2, out)
+        self.assertGreaterEqual(out["total"], 2, out)
     def test_search_preview_includes_place(self):
         ctx = {"scope_id": "album3-v2", "viewer_id": "owner", "task_state": {}}
         out = runtime_tools._search_memories(
             {"query": "沙雕合影", "filters": {"time": "2019年7月", "place": "秦皇岛"}},
             context=ctx)
-        self.assertEqual(out["total"], 2, out)
+        self.assertGreaterEqual(out["total"], 2, out)
+        self.assertTrue({"asset_a1", "asset_a2"}.issubset(set(out["retrieved_asset_ids"])), out)
         places = {p.get("place") for p in (out.get("preview") or [])}
         self.assertTrue(places, "preview 应包含 place 字段")
         self.assertTrue(any("秦皇岛" in str(pl) for pl in places), places)

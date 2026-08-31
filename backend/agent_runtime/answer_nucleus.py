@@ -162,8 +162,8 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                         unit="元" if kind == "price" else "",
                         certainty="confirmed", source="ocr",
                         label=label, display=display))
-            elif (tr.get("ocr_text") or "").strip():
-                ocr = str(tr["ocr_text"])
+            elif (tr.get("full_text") or tr.get("ocr_text") or "").strip():
+                ocr = str(tr.get("full_text") or tr.get("ocr_text"))
                 for m in _PRICE_RE.finditer(ocr):
                     nucleus.values.append(NucleusValue(
                         kind="price", value=m.group(1), unit="元",

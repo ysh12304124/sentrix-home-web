@@ -4,6 +4,11 @@
   if (root) root.sentrixImageMetadata = api;
 })(typeof window !== "undefined" ? window : globalThis, function () {
   const MAX_METADATA_BYTES = 4 * 1024 * 1024;
+  const ALBUM_FILE_RE = /\.(jpe?g|png|webp|heic|heif|bmp|gif|mp4|mov|m4v|avi|mkv)$/i;
+
+  function isAlbumMediaFile(file) {
+    return ALBUM_FILE_RE.test(String((file && file.name) || ""));
+  }
 
   function ascii(view, offset, length) {
     let value = "";
@@ -131,5 +136,5 @@
     }
   }
 
-  return { extract, parseJpeg, parsePng, parseTiff };
+  return { extract, parseJpeg, parsePng, parseTiff, isAlbumMediaFile, ALBUM_FILE_RE };
 });

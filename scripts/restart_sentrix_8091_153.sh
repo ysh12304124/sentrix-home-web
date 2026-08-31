@@ -26,6 +26,7 @@ LOG_FILE="logs/sentrix-api-8091.log"
 PROBE_SCRIPT="scripts/probe_sentrix_retrieval.py"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
+cd "$PROJECT_DIR"
 
 echo "== 步骤 1/5: 检查活跃 run =="
 ACTIVE=$(curl -s -m 5 http://127.0.0.1:8771/api/runs | python3 -c 'import json,sys; runs=json.load(sys.stdin); items=runs if isinstance(runs,list) else runs.get("runs",[]); print(len([r for r in items if r.get("status") in ("running","pending","queued")]))' 2>/dev/null || echo -1)
@@ -51,8 +52,19 @@ if [[ -n "$REMAIN" ]]; then
 else
   echo "旧进程已全灭（无残留）"
 fi
-OTHERS=$(pgrep -af 'uvicorn [b]ackend.app' | grep -v -- '--port 8091' | wc -l)
+OTHERS=$(pgrep -af 'uvicorn [b]ackend.app' | grep -v -- '--port 8091' | wc -l) || OTHERS=0
 echo "其他 backend.app 实例保留: $OTHERS 个（8099/9598/11001/11011 等，分属不同项目）"
+
+echo "== 步骤 3.5/5: 确保常用测试集视觉向量一致（chinese_clip 补齐 + 同步 Qdrant）=="
+# 停机窗口 qdrant 锁已释放，是唯一安全的补齐时机。只保证最近最常用的测试集
+# scope 按当前生产 embedder（chinese-clip）编码；其余历史一次性评测 scope 不补
+# （避免每次重启全量重嵌 3057 张）。缺向量时 visual_ann 会静默 no_candidates。
+ACTIVE_SCOPES="album_ca0cc0ddda3a,album_cba01be9502b,album3"
+if "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/maintenance/ensure_visual_vectors.py" --apply --scope "$ACTIVE_SCOPES"; then
+  echo "视觉向量一致性检查通过（常用测试集无缺失或已补齐）"
+else
+  echo "!! 视觉向量补齐失败（非致命，但常用测试集检索可能退化）——查 chinese_clip 模型/磁盘；health.memory.vectorIndex 会暴露状态"
+fi
 
 echo "== 步骤 4/5: 启动脚本拉起 =="
 cd "$PROJECT_DIR"

@@ -35,10 +35,11 @@ class SidecarClientCircuitBreakerTests(unittest.TestCase):
             embedder = bge_module.BgeM3TextQueryEmbedder(base_url="http://sidecar:8101")
             self.assertEqual(embedder.embed_query("厨房"), [1.0, 0.0, 2.0])
 
-    def test_circuit_breaker_trips_after_three_failures(self):
+    def test_circuit_breaker_trips_after_five_failures(self):
+        # 熔断阈值迭代放宽：3→5（连续 5 次失败才熔断，降低 sidecar 偶发慢响应的误熔断）
         with mock.patch.object(bge_module.httpx, "post", side_effect=RuntimeError("down")):
             embedder = bge_module.BgeM3TextQueryEmbedder(base_url="http://sidecar:8101")
-            for _ in range(3):
+            for _ in range(5):
                 self.assertEqual(embedder.embed_query("x"), [])
             # tripped -> further calls short-circuit to [] without HTTP.
             with mock.patch.object(bge_module.httpx, "post") as post:

@@ -13,6 +13,7 @@ Chinese-CLIP checkpoint (``~/.cache/clip/clip_cn_vit-l-14.pt`` on 153).
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 _DEFAULT_CHECKPOINT = os.getenv(
@@ -22,6 +23,28 @@ _DEFAULT_CHECKPOINT = os.getenv(
 
 
 class ChineseClipVisualEmbedder:
+    _shared_lock = threading.Lock()
+    _shared_instances = {}
+
+    @classmethod
+    def shared(
+        cls, checkpoint: str | None = None,
+        model_name: str = "ViT-L-14", device: str | None = None,
+    ):
+        resolved_checkpoint = str(Path(checkpoint or _DEFAULT_CHECKPOINT).expanduser().resolve())
+        resolved_device = device or os.getenv("CLIP_DEVICE", "cpu")
+        key = (resolved_checkpoint, model_name, resolved_device)
+        with cls._shared_lock:
+            instance = cls._shared_instances.get(key)
+            if instance is None:
+                instance = cls(
+                    checkpoint=resolved_checkpoint,
+                    model_name=model_name,
+                    device=resolved_device,
+                )
+                cls._shared_instances[key] = instance
+            return instance
+
     def __init__(self, checkpoint: str | None = None, model_name: str = "ViT-L-14", device: str | None = None):
         self.checkpoint = checkpoint or _DEFAULT_CHECKPOINT
         self.model_name = model_name
@@ -29,6 +52,8 @@ class ChineseClipVisualEmbedder:
         self._preprocess = None
         self._device = device or os.getenv("CLIP_DEVICE", "cpu")
         self._error = None
+        self._load_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
 
     @property
     def model_id(self):
@@ -48,27 +73,31 @@ class ChineseClipVisualEmbedder:
     def _load(self):
         if self._model is not None:
             return self._model
-        if not Path(self.checkpoint).is_file():
-            self._error = f"checkpoint missing: {self.checkpoint}"
-            return None
-        try:
-            from cn_clip.clip import load_from_name
+        with self._load_lock:
+            if self._model is not None:
+                return self._model
+            if not Path(self.checkpoint).is_file():
+                self._error = f"checkpoint missing: {self.checkpoint}"
+                return None
+            try:
+                from cn_clip.clip import load_from_name
 
-            # cn_clip resolves ``model_name`` relative to ``download_root``.
-            # Point it at the configured checkpoint directory so an existing
-            # local weight is loaded without attempting a Hugging Face download.
-            model, preprocess = load_from_name(
-                self.model_name,
-                device=self._device,
-                download_root=str(Path(self.checkpoint).parent),
-            )
-            model.eval()
-            self._model = model
-            self._preprocess = preprocess
-            return model
-        except Exception as error:
-            self._error = str(error)
-            return None
+                # cn_clip resolves ``model_name`` relative to ``download_root``.
+                # Point it at the configured checkpoint directory so an existing
+                # local weight is loaded without attempting a Hugging Face download.
+                model, preprocess = load_from_name(
+                    self.model_name,
+                    device=self._device,
+                    download_root=str(Path(self.checkpoint).parent),
+                )
+                model.eval()
+                self._model = model
+                self._preprocess = preprocess
+                self._error = None
+                return model
+            except Exception as error:
+                self._error = str(error)
+                return None
 
     def embed_query(self, text: str) -> list[float]:
         model = self._load()
@@ -77,7 +106,7 @@ class ChineseClipVisualEmbedder:
         try:
             import torch
             from cn_clip.clip import tokenize
-            with torch.no_grad():
+            with self._inference_lock, torch.no_grad():
                 vector = model.encode_text(tokenize([str(text)]).to(self._device))
             return [float(value) for value in vector[0].cpu().tolist()]
         except Exception:
@@ -94,7 +123,7 @@ class ChineseClipVisualEmbedder:
 
             ensure_heif_support()
             image = self._preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(self._device)
-            with torch.no_grad():
+            with self._inference_lock, torch.no_grad():
                 vector = model.encode_image(image)
             return [float(value) for value in vector[0].cpu().tolist()]
         except Exception:

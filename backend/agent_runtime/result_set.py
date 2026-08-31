@@ -17,6 +17,23 @@ RESULT_SET_TTL_S = 24 * 60 * 60  # D7：ResultSet TTL 延长到 24h（多轮/跨
 RESULT_SET_PAGE_SIZE = 6
 
 
+@dataclass(frozen=True)
+class ResultSetPublicView:
+    """A bounded public handle map that never leaks ResultSet global rank."""
+
+    asset_ids: tuple[str, ...]
+
+    def handles(self) -> dict[str, str]:
+        return {f"photo_{index + 1}": asset_id
+                for index, asset_id in enumerate(self.asset_ids)}
+
+    def preview(self, limit: int = RESULT_SET_PAGE_SIZE) -> list[dict]:
+        return [
+            {"handle": f"photo_{index + 1}", "asset_id": asset_id}
+            for index, asset_id in enumerate(self.asset_ids[:limit])
+        ]
+
+
 def debug_asset_projection(result_set: "ResultSet", preview: list[dict] | None) -> dict:
     """Project full and model-visible evidence IDs for benchmark-only diagnostics.
 
@@ -32,7 +49,9 @@ def debug_asset_projection(result_set: "ResultSet", preview: list[dict] | None) 
             continue
         handle = str(item.get("handle") or "")
         asset_id = ""
-        if handle.startswith("photo_"):
+        if item.get("asset_id"):
+            asset_id = str(item["asset_id"])
+        elif handle.startswith("photo_"):
             try:
                 index = int(handle.removeprefix("photo_")) - 1
             except ValueError:
@@ -57,6 +76,7 @@ class ResultSet:
     scope_id: str
     query: str
     asset_ids: list
+    public_asset_ids: list | None = None
     total: int = 0
     ordering: list = field(default_factory=list)
     unresolved: list = field(default_factory=list)
@@ -68,13 +88,29 @@ class ResultSet:
     shown: int = 0
 
     def handles(self) -> dict[str, str]:
-        """全量稳定 handle 映射（photo_N 跨页一致，N 为结果集中全局序号）。"""
-        return {f"photo_{i + 1}": aid for i, aid in enumerate(self.asset_ids)}
+        """Return only the current model-visible handle map."""
+        return {f"photo_{i + 1}": aid
+                for i, aid in enumerate(self.visible_asset_ids())}
+
+    def visible_asset_ids(self) -> list:
+        """Public subset; full retrieval stays in the private asset_ids list."""
+        return list(self.public_asset_ids if self.public_asset_ids is not None
+                    else self.asset_ids)
+
+    def public_view(self, asset_ids: list[str] | tuple[str, ...]) -> ResultSetPublicView:
+        """Return a contiguous public handle map for an ordered subset."""
+        allowed = set(self.asset_ids)
+        visible = tuple(str(asset_id) for asset_id in asset_ids
+                        if asset_id and str(asset_id) in allowed)
+        return ResultSetPublicView(visible)
+
+    def set_public_view(self, asset_ids: list[str] | tuple[str, ...]) -> None:
+        self.public_asset_ids = list(self.public_view(asset_ids).asset_ids)
 
     def preview(self, limit: int = 6) -> list[dict]:
         return [
             {"handle": f"photo_{i + 1}", "asset_id": aid}
-            for i, aid in enumerate(self.asset_ids[:limit])
+            for i, aid in enumerate(self.visible_asset_ids()[:limit])
         ]
 
     def page(self, page_no: int, page_size: int | None = None) -> list[dict]:
@@ -82,9 +118,10 @@ class ResultSet:
         size = min(RESULT_SET_PAGE_SIZE, max(1, int(page_size or self.page_size)))
         start = max(0, (int(page_no) - 1) * size)
         end = start + size
+        visible = self.visible_asset_ids()
         return [
             {"handle": f"photo_{start + i + 1}", "asset_id": aid}
-            for i, aid in enumerate(self.asset_ids[start:end])
+            for i, aid in enumerate(visible[start:end])
         ]
 
 
@@ -103,11 +140,20 @@ class ResultSetStore:
                     scope_id TEXT NOT NULL,
                     query TEXT NOT NULL DEFAULT '',
                     asset_ids_json TEXT NOT NULL DEFAULT '[]',
+                    public_asset_ids_json TEXT,
                     total INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     expires_at REAL NOT NULL DEFAULT 0
                 );""")
             self.store.connection.commit()
+            columns = {
+                row["name"] for row in self.store.connection.execute(
+                    "PRAGMA table_info(agent_result_sets)").fetchall()
+            }
+            if "public_asset_ids_json" not in columns:
+                self.store.connection.execute(
+                    "ALTER TABLE agent_result_sets ADD COLUMN public_asset_ids_json TEXT")
+                self.store.connection.commit()
         except Exception:
             pass
 
@@ -124,10 +170,13 @@ class ResultSetStore:
             import json as _json
             self.store.connection.execute(
                 """INSERT OR REPLACE INTO agent_result_sets
-                   (result_set_id, scope_id, query, asset_ids_json, total, created_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (result_set_id, scope_id, query, asset_ids_json, public_asset_ids_json,
+                    total, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (rs.result_set_id, rs.scope_id, rs.query or "",
                  _json.dumps(rs.asset_ids or [], ensure_ascii=False),
+                 _json.dumps(rs.public_asset_ids, ensure_ascii=False)
+                 if rs.public_asset_ids is not None else None,
                  rs.total, rs.created_at or "", rs.expires_at))
             self.store.connection.commit()
         except Exception:
@@ -145,9 +194,12 @@ class ResultSetStore:
             if row["expires_at"] and time.time() > row["expires_at"]:
                 return None
             asset_ids = _json.loads(row["asset_ids_json"] or "[]")
+            public_raw = row["public_asset_ids_json"] if "public_asset_ids_json" in row.keys() else None
+            public_asset_ids = _json.loads(public_raw) if public_raw else None
             rs = ResultSet(
                 result_set_id=row["result_set_id"], scope_id=row["scope_id"],
                 query=row["query"], asset_ids=list(asset_ids), total=row["total"],
+                public_asset_ids=list(public_asset_ids) if public_asset_ids is not None else None,
                 created_at=row["created_at"], expires_at=row["expires_at"],
                 shown=min(6, len(asset_ids)),
             )

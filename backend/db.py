@@ -316,6 +316,10 @@ class MemoryStore:
     def __init__(self, path):
         self.path = str(path)
         self._last_vector_search = {"backend": "sqlite", "error": None}
+        # FastAPI dispatches sync handlers through a thread pool. sqlite3's
+        # Row metadata can be corrupted when one shared connection executes
+        # overlapping cursors, even with check_same_thread disabled.
+        self._connection_lock = threading.RLock()
         self.connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
@@ -1287,19 +1291,21 @@ class MemoryStore:
     def count(self, table):
         if table not in {"memory_spaces", "assets", "observations", "events", "event_observations", "event_participants", "persons", "entities", "entity_revisions", "entity_merge_candidates", "face_clusters", "face_instances", "face_prototypes", "person_appearance_evidence", "entity_mentions", "relationships", "memory_vectors", "facts", "semantic_profiles", "semantic_claims", "person_event_memory", "person_patterns", "query_gaps", "memory_feedback", "dialogue_states", "rebuild_runs", "stories", "invites", "trips"}:
             raise ValueError("unsupported table")
-        return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchall()[0][0]
+        with self._connection_lock:
+            return self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchall()[0][0]
 
     def create_memory_space(self, scope_id, name, kind="household", source_path=None, include_in_people=True):
-        timestamp = now_iso()
-        for attempt in range(5):
-            try:
-                self._insert_memory_space(scope_id, name, kind, source_path, include_in_people, timestamp)
-                break
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == 4:
-                    raise
-                time.sleep(0.2 * (attempt + 1))
-        return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
+        with self._connection_lock:
+            timestamp = now_iso()
+            for attempt in range(5):
+                try:
+                    self._insert_memory_space(scope_id, name, kind, source_path, include_in_people, timestamp)
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 4:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
+            return self._row("SELECT * FROM memory_spaces WHERE id = ?", (scope_id,))
 
     def _insert_memory_space(self, scope_id, name, kind, source_path, include_in_people, timestamp):
         self.connection.execute(
@@ -1325,11 +1331,13 @@ class MemoryStore:
         return self._rows("SELECT * FROM memory_spaces ORDER BY created_at")
 
     def _row(self, query, params=()):
-        rows = self.connection.execute(query, params).fetchall()
-        return dict(rows[0]) if rows else None
+        with self._connection_lock:
+            rows = self.connection.execute(query, params).fetchall()
+            return dict(rows[0]) if rows else None
 
     def _rows(self, query, params=()):
-        return [dict(row) for row in self.connection.execute(query, params).fetchall()]
+        with self._connection_lock:
+            return [dict(row) for row in self.connection.execute(query, params).fetchall()]
 
     def _commit(self):
         if not getattr(self, "_defer_entity_maintenance_commits", False) and not getattr(self, "_transaction_depth", 0):

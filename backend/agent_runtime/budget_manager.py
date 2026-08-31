@@ -36,7 +36,12 @@ class BudgetState:
         return self.wall_remaining() > self.final_reserve_s
 
     def can_model_step(self) -> bool:
-        return self.model_steps < self.max_model_steps and self.has_final_reserve()
+        # The final-reserve window belongs to writing the answer, not to more
+        # tool calls.  Once the tool budget is spent a turn must still be able
+        # to run a model step to compose a final answer from evidence already
+        # gathered; otherwise budget exhaustion produces empty replies
+        # (measured: 25/100 QA ended as tool_call_limit with a blank answer).
+        return self.model_steps < self.max_model_steps and self.wall_remaining() > 0
 
     def can_tool_call(self, *, inspection: bool = False) -> bool:
         if self.tool_calls >= self.max_tool_calls:

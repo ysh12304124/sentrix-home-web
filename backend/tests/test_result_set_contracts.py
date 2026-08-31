@@ -159,7 +159,7 @@ class ResultSetContractTests(unittest.TestCase):
             {"image_id": "rs_private", "query": "照片里有几个人"},
             ["photo_3", "photo_4"],
         )
-        self.assertEqual(normalized["asset_handle"], "rs_private")
+        self.assertEqual(normalized["asset_handle"], "photo_3")
         self.assertEqual(normalized["question"], "照片里有几个人")
         self.assertEqual(requested, "rs_private")
 

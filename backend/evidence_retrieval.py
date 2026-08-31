@@ -167,29 +167,30 @@ class EvidenceRetrievalKernel:
         filters = HardFilterContext.from_spec(spec)
         query = RetrievalQuery.from_spec(spec, embedding_router=self.embedding_router)
         query_build_ms = round((time.monotonic() - query_started) * 1000, 1)
-        recall_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
-        # Anchored searches (place/time) need a larger recall budget than a
-        # generic visual top-20.  The metadata channel may contain an entire
-        # event/day whose exact asset sits just past the visual head; truncating
-        # before fusion made valid source photos disappear (e.g. the 15:27
-        # 三峡坝址基石 photo while four nearby 15:00 photos survived).
-        if filters.place:
-            # A city/district can contain hundreds of assets. Keep the full
-            # anchored candidate universe large enough for the semantic query
-            # to recover a specific scene (for example a three-person photo)
-            # instead of truncating at an arbitrary top-100 head. The user
-            # preview remains bounded; this only changes retrieved_candidates.
-            recall_limit = max(recall_limit, 500)
-        elif filters.time_bounds:
-            recall_limit = max(recall_limit, 200)
-        else:
-            # Pure semantic queries also need a recoverable candidate window;
-            # top-20 was too shallow for paraphrases such as “大型水利工程”
-            # whose exact photos may rank below generic scene captions. The
-            # model/UI still see only the bounded preview.
-            recall_limit = max(recall_limit, 500)
+        requested_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
+        # Candidate recall is threshold-based, not Top-K based. Ask each
+        # enabled channel for the complete authorized scope so a relevant
+        # asset cannot disappear merely because another channel ranked it
+        # below an arbitrary head. Later reranking decides ordering; scope and
+        # explicit media type remain the only hard boundaries.
+        scope_for_count = None if spec.scope_mode == "all_authorized" else (spec.scope_id or (spec.scope_ids[0] if spec.scope_ids else None))
+        try:
+            authorized_count = len(self.store.list_assets(scope_id=scope_for_count))
+        except Exception:
+            authorized_count = 0
+        recall_limit = max(requested_limit, authorized_count, 1)
+        # The fused ranking is the single post-recall reducer.  Keep every
+        # channel's complete authorized recall for ranking, then hand the
+        # model/Agent a bounded candidate head.  A fixed score cut is
+        # deliberately avoided here: absolute thresholds cannot adapt to
+        # per-query score distributions and silently drop recalled GT
+        # (measured on album3-max 100QA: threshold prefilter dropped
+        # asset recall from 0.971 to 0.893, while rank top-50 kept 0.971).
+        import os
+        candidate_limit = max(1, int(os.getenv("SENTRIX_SEARCH_CANDIDATE_TOP_K", "30")))
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
+        min_retrieval_score = 0.0
 
         channel_hits = {}
         channel_trace = {}
@@ -238,7 +239,7 @@ class EvidenceRetrievalKernel:
 
         primary_fusion_started = time.monotonic()
         primary_items = self._evaluate_fused(
-            rank(channel_hits, strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+            rank(channel_hits, strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
             spec, packet, filters, all_authorized, scope_id, skip_assets=set())
         primary_fusion_ms = round((time.monotonic() - primary_fusion_started) * 1000, 1)
 
@@ -267,7 +268,7 @@ class EvidenceRetrievalKernel:
             adjacency_fusion_started = time.monotonic()
             adjacency_items = self._evaluate_fused(
                 rank({expander.name: channel_hits[expander.name] for expander in expanders},
-                     strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+                     strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
                 spec, packet, filters, all_authorized, scope_id, skip_assets=already)
             adjacency_fusion_ms = round((time.monotonic() - adjacency_fusion_started) * 1000, 1)
         else:
@@ -275,25 +276,6 @@ class EvidenceRetrievalKernel:
 
         postprocess_started = time.monotonic()
         packet.assets = primary_items + [item for item in adjacency_items if item["asset_id"] not in already]
-        # An explicit place is an identity anchor for the user-visible search.
-        # Missing geocode must not turn a face-ID/uncertain asset into a
-        # plausible-looking result.  Keep only candidates with direct place
-        # support when such candidates exist; if none exists, return no match
-        # rather than displaying unrelated approximate photos.  The open-world
-        # behavior remains available to the lower-level condition evaluator and
-        # evidence tests, but it is not safe for a delivered place search.
-        place_constraints = [c for c in spec.constraints if c.dimension == "place" and not c.negated]
-        if place_constraints:
-            matched_place = [
-                item for item in packet.assets
-                if any(item.get("condition_results", {}).get(c.key, {}).get("status") == "matched"
-                       for c in place_constraints)
-            ]
-            if matched_place:
-                packet.assets = matched_place
-            else:
-                packet.gaps.append({"condition": "place", "reason": "no_direct_support"})
-                packet.assets = []
         for item in packet.assets:
             if item["level"] == "exact":
                 packet.exact_results.append(item)
@@ -303,11 +285,28 @@ class EvidenceRetrievalKernel:
                 packet.approximate_results.append(item)
 
         packet.assets.sort(key=lambda item: ({"exact": 0, "strong": 1, "approximate": 2}[item["level"]], -item["score"]))
+        # Optional confidence gate. It is disabled by default because score
+        # scales differ by retriever. When calibrated, this threshold is the
+        # only reduction mechanism; there is no fixed candidate Top-K.
+        import os
+        try:
+            min_retrieval_score = float(os.getenv("SENTRIX_SEARCH_MIN_RETRIEVAL_SCORE", "0") or 0)
+        except (TypeError, ValueError):
+            min_retrieval_score = 0.0
+        if min_retrieval_score > 0:
+            packet.assets = [item for item in packet.assets
+                             if float(item.get("retrieval_score") or 0) >= min_retrieval_score]
+            packet.exact_results = [item for item in packet.exact_results if item in packet.assets]
+            packet.strong_results = [item for item in packet.strong_results if item in packet.assets]
+            packet.approximate_results = [item for item in packet.approximate_results if item in packet.assets]
         for constraint in spec.constraints:
             if constraint.strictness == SEMANTIC and not any(item["condition_results"].get(constraint.key, {}).get("status") == "matched" for item in packet.assets):
                 packet.gaps.append({"condition": constraint.key, "reason": "no_direct_support"})
-        if spec.result_requirement.get("mode") != "all_relevant":
-            packet.assets = packet.assets[:recall_limit]
+        # Multi-channel recall is confidence/threshold based.  ``recall_limit``
+        # is only the per-channel request size (expanded to the authorized
+        # scope above); never truncate the fused candidate universe by a
+        # presentation-oriented Top-K here.  Delivery and evidence selection
+        # happen in the Agent tool layer.
         packet.exact_results = [item for item in packet.exact_results if item in packet.assets]
         packet.strong_results = [item for item in packet.strong_results if item in packet.assets]
         packet.approximate_results = [item for item in packet.approximate_results if item in packet.assets]
@@ -317,6 +316,7 @@ class EvidenceRetrievalKernel:
             "channels": channel_trace,
             "fusion_ms": round(primary_fusion_ms + adjacency_fusion_ms, 1),
             "postprocess_ms": round((time.monotonic() - postprocess_started) * 1000, 1),
+            "min_retrieval_score": min_retrieval_score,
         }
         if self.embedding_router and hasattr(self.embedding_router, "status"):
             packet.retrieval_timing["embedding_status"] = self.embedding_router.status()
@@ -349,6 +349,13 @@ class EvidenceRetrievalKernel:
                 for hit in candidate.retriever_hits
             ]
             item["fusion_score"] = round(candidate.rrf, 4)
+            # Preserve the strongest channel score separately from RRF.  RRF
+            # is only an ordering signal; an optional confidence threshold can
+            # be calibrated against this raw score without reintroducing a
+            # fixed candidate count.
+            item["retrieval_score"] = round(max(
+                (float(hit.raw_score) for hit in candidate.retriever_hits
+                 if hit.raw_score is not None), default=0.0), 6)
             items.append(item)
         return items
 

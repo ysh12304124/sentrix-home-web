@@ -1,36 +1,5 @@
 (function () {
   const app = document.getElementById("app");
-  const benchmarkModelProfiles = [
-    { id: "gemma4-12b-it", label: "Gemma-4-12B (默认)" },
-    { id: "gemma4-e2b-it", label: "Gemma-4-E2B 蒸馏前" },
-    { id: "gemma4-e2b-it-lora-v2", label: "Gemma-4-E2B 蒸馏后+LoRA" },
-    { id: "qwen3.5-0.8b-it", label: "Qwen-3.5-0.8B" },
-    { id: "qwen3-instruct", label: "Qwen-3-4B Instruct" },
-    { id: "qwen3-8b", label: "Qwen-3-8B" },
-  ];
-
-  function modelProfileOptions(payload) {
-    const profiles = new Map((payload?.profiles || []).map((profile) => [profile.id, profile]));
-    const current = payload?.current || {};
-    const candidate = String(current.profile || "");
-    const active = current.status === "running" && benchmarkModelProfiles.some((profile) => profile.id === candidate) ? candidate : "";
-    const models = Object.fromEntries(benchmarkModelProfiles.map(({ id, label }) => {
-      const profile = profiles.get(id);
-      return [id, {
-        available: Boolean(profile?.available),
-        loaded: id === active,
-        model: label,
-        url: id === active ? current.base_url : "vLLM profile",
-      }];
-    }));
-    return {
-      backend: active,
-      status: current.status || "unmanaged",
-      error: current.error || "",
-      available_backends: benchmarkModelProfiles.map((profile) => profile.id),
-      models,
-    };
-  }
 
   const state = {
     view: "overview",
@@ -67,7 +36,6 @@
     stories: [],
     trips: [],
     health: null,
-    vlmBackendOptions: null,
     ocrSettings: null,
     modal: null,
     modalHistory: [],
@@ -286,11 +254,12 @@
     return `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">${escapeHtml(title)}</p><h3>${values.length} 项</h3></div></div><div class="evidence-list">${values.slice(0, 12).map(evidenceCard).join("")}</div></section>`;
   }
 
-  function imageResults(result) {
-    const images = result?.image_results || [];
-    if (!images.length) return "";
-    const rows = images.map((item) => {
-      const label = item.display_handle || "原始图片";
+  function mediaResults(result) {
+    const media = result?.media_results || result?.mediaResults || result?.image_results || [];
+    if (!media.length) return "";
+    const rows = media.map((item) => {
+      const mediaType = item.media_type === "video" ? "video" : "image";
+      const label = item.display_handle || (mediaType === "video" ? "原始视频" : "原始图片");
       const aspects = [
         ...(item.supported_aspects || []).map((aspect) => `对上了：${aspect}`),
         ...(item.uncertain_aspects || []).map((aspect) => `还不能确认：${aspect}`),
@@ -299,9 +268,12 @@
         ? aspects.map(escapeHtml).join(" · ")
         : (item.captured_at || item.caption || "可回看的原始证据");
       const dup = item.near_duplicate_size > 1 ? `<small class="image-dup">另有 ${item.near_duplicate_size - 1} 张相似照片</small>` : "";
+      if (mediaType === "video") {
+        return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
+      }
       return `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
     }).join("");
-    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关图片</p><h3>${images.length} 张</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
+    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关媒体</p><h3>${media.length} 项</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
   }
 
   function traceLabel(item) {
@@ -489,13 +461,14 @@
     const ordered = result.evidence_order || [];
     const order = ordered.length && isAdmin ? `<details class="algorithm-evidence admin-only"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
     const directEvidence = Boolean(result.original_evidence_requested || presentation.direct_original_evidence);
-    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
-    const optionalImages = directEvidence ? "" : imageResults(result);
+    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${mediaResults(result) || evidence || gapContent}</section>` : "";
+    const optionalMedia = directEvidence ? "" : mediaResults(result);
     const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
     const toolSamples = toolLoopEvidence(result);
     const toolEvidence = toolSamples.length ? `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">本次依据（工具结果）</p><h3>${toolSamples.length} 项</h3></div></div><div class="evidence-list">${toolSamples.map(evidenceCard).join("")}</div></section>` : "";
+    const resultMedia = result.media_results || result.mediaResults || result.image_results || [];
     const evidenceCount = grounding.evidence_count != null ? grounding.evidence_count
-      : (primary.length + (result.image_results || []).length + toolSamples.length);
+      : (primary.length + resultMedia.length + toolSamples.length);
     const hasToolEvidence = toolSamples.length > 0;
     const hasResultSet = Boolean((result.task_state || {}).current_result_set && (result.task_state || {}).result_total > 0);
     // RX-6: a chat turn (memory_used === false) never shows an evidence entry; tool-loop turns use task_state evidence.
@@ -503,7 +476,7 @@
     const hasGap = result.evidence_status === "gap" || (!evidenceCount && result.tool_loop_status === "complete");
     const resultSetBlock = displayMode === "collapsed" ? resultSetCard(result) : "";
     const basisOpen = displayMode === "result_grid" || hasGap || (displayMode !== "collapsed" && evidenceCount > 0);
-    const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalImages}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalMedia}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     if (displayMode === "none") return `${followups}${gapContent}`;
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
@@ -725,7 +698,7 @@
       ["场景图片语义理解", `${state.assets.filter((a) => a.derived_kind === "video_keyframe" && a.status === "processed").length} 张关键帧`, activeVideo ? "active" : "done"],
       ["事件记忆构建", `${stats().events} 个事件 · ${stats().facts} 条事实`, "done"],
     ];
-    return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "视频会在后台读取拍摄信息、提取关键画面并整理进家庭时间线。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或点击选择文件</strong><small>视频支持 MOV / MP4，并在后台构建场景记忆</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
+    return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "选择相册文件夹后，图片和视频会一起上传，并自动读取拍摄时间与地点。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择相册文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,video/*,.mp4,.mov,.m4v,.avi,.mkv" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.bmp,.gif,.mp4,.mov,.m4v,.avi,.mkv,image/*,video/*" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或选择整个相册文件夹</strong><small>支持 JPG / HEIC / PNG / MP4 / MOV，自动解析拍摄时间和地点</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
   }
 
   function ocrSettingsCard() {
@@ -739,12 +712,10 @@
   function settingsView() {
     const facts = state.dashboard?.facts || [];
     const pending = facts.filter((fact) => fact.status === "pending");
-    const router = state.vlmBackendOptions || {};
-    const activeModel = router.models?.[router.backend];
-    const routerReady = router.status === "running" && Boolean(router.backend);
-    const routerStatus = modelSwitchInFlight ? "SWITCHING" : routerReady ? "RUNNING" : "UNMANAGED";
-    const routerStatusClass = routerReady || modelSwitchInFlight ? "" : "warn";
-    const unmanagedOption = router.backend ? "" : `<option value="" selected disabled>未托管模型</option>`;
+    const llm = state.health?.models?.llm || {};
+    const routerReady = llm.status === "running";
+    const routerStatus = routerReady ? "RUNNING" : "UNAVAILABLE";
+    const routerStatusClass = routerReady ? "" : "warn";
     const face = state.health.models?.face || {};
     const faceStatusText = face.identityFallback
       ? `人物检测已启用 · AdaFace 未加载，身份向量已回退为 ${escapeHtml(face.identityFallbackModel || "InsightFace buffalo_l")}`
@@ -753,7 +724,7 @@
         : face.detectionReady
           ? "人物检测已启用 · AdaFace 未加载，身份向量暂不可用"
           : "人物识别不可用";
-    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label ${routerStatusClass}">${routerStatus}</span></div><label class="model-switcher"><span>主推理</span><select data-action="switch-vlm" ${modelSwitchInFlight ? 'disabled' : ''}>${unmanagedOption}${(router.available_backends || []).map(id => { const info = router.models?.[id] || {}; return `<option value="${escapeHtml(id)}" ${id === router.backend ? 'selected' : ''} ${!info.available ? 'disabled' : ''}>${escapeHtml(info.model || id)}${info.available ? '' : ' · 离线'}${info.loaded ? ' · 当前运行' : ''}</option>` }).join('')}</select><small>${escapeHtml(modelSwitchInFlight ? `正在切换到 ${requestedModelProfile}` : activeModel?.url || router.error || '未托管模型')}</small></label><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${faceStatusText}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频场景记忆 <b>WorldMM</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}${ocrSettingsCard()}${`<section class="content-section fact-review">`}<div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频场景</span><b>本地 WorldMM 已启用</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div><div><button class="button small ghost" data-action="open-qa-dashboard">查看 QA 测评 Dashboard ${icon("▤")}</button><small>Agent 基准测评与历史 run 对比</small></div></div></div></section>`;
+    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label ${routerStatusClass}">${routerStatus}</span></div><div class="model-row primary-model-row"><span>主推理</span><strong>${escapeHtml(llm.model || llm.profile || "未连接")}</strong><small>${escapeHtml(llm.base_url || "由部署配置提供，不在产品页面切换")}</small></div><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${faceStatusText}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频场景记忆 <b>WorldMM</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}${ocrSettingsCard()}${`<section class="content-section fact-review">`}<div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频场景</span><b>本地 WorldMM 已启用</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div><div><button class="button small ghost" data-action="open-qa-dashboard">查看 QA 测评 Dashboard ${icon("▤")}</button><small>Agent 基准测评与历史 run 对比</small></div></div></div></section>`;
   }
 
   function semanticDetails(group) {
@@ -1077,7 +1048,7 @@
       const form = nodes.length >= 2 ? `<form id="modal-form" class="relation-form"><label>人物A<select name="person_a" required>${personOptions}</select></label><label>家庭关系<select name="relation">${relationSelect}</select><input name="relation_custom" placeholder="或自定义关系，如：养父" value="${editing && !relationOptions.includes(editing.predicate) ? escapeHtml(editing.predicate) : ""}" /></label><label>人物B<select name="person_b" required>${personOptions}</select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="clear-relation-edit">取消</button><button type="submit" class="button primary">${editing ? "保存修改" : "添加关系"}</button></div></form>` : "";
       body = `<div class="modal-kicker">FAMILY GRAPH</div><h2>家庭关系图</h2><p class="modal-lead">这里只显示你已确认的人物与家庭关系。关系写入后会进入本地记忆，家庭助手也能回忆这些关系。</p>${graphBody}<div class="family-graph-toolbar"><div class="section-head"><div><p class="section-kicker">维护家庭关系</p><h3>${editing ? "编辑关系" : "添加关系"}</h3></div></div>${form}<div class="section-head" style="margin-top:18px"><div><p class="section-kicker">已建立的关系</p><h3>${(graph.relationships || []).filter((item) => item.status !== "retracted").length} 条</h3></div></div><div class="fact-review-list">${relationRows || emptyState("还没有家庭关系", "从上方选择两个人并填写家庭角色，关系会出现在这张图上。")}</div></div>`;
     } else if (modal.type === "import-picker") {
-      body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
+      body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器不能在同一个窗口同时选文件和文件夹。选择整个相册文件夹时，会导入其中的图片和视频。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个相册文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
       const spaceRows = (state.spaces || []).map((sp) => {
         const isDefault = sp.id === "home-default";
@@ -1131,42 +1102,6 @@
   }
 
   let refreshInFlight = false;
-  let modelSwitchInFlight = false;
-  let requestedModelProfile = "";
-
-  async function handleModelProfileChange(select) {
-    if (modelSwitchInFlight) return;
-    const target = String(select.value || "");
-    if (!target) return;
-    modelSwitchInFlight = true;
-    requestedModelProfile = target;
-    select.disabled = true;
-    const selectedOption = select.selectedOptions[0];
-    if (selectedOption) selectedOption.textContent = `${selectedOption.textContent.replace(/ · 切换中$/, "")} · 切换中`;
-    try {
-      await window.sentrixApi.switchModelProfile(target);
-      const payload = await window.sentrixApi.getModelProfiles();
-      const current = payload.current || {};
-      if (current.profile !== target || current.status !== "running") {
-        throw new Error(`后端未确认目标模型运行，当前状态: ${current.status || "unknown"}`);
-      }
-      state.vlmBackendOptions = modelProfileOptions(payload);
-      state.backendError = "";
-      state.toast = `主模型已切换为 ${state.vlmBackendOptions.models?.[target]?.model || target}`;
-    } catch (error) {
-      state.backendError = `模型切换失败：${error.message || error}`;
-      try {
-        state.vlmBackendOptions = modelProfileOptions(await window.sentrixApi.getModelProfiles());
-      } catch (_) {
-        state.vlmBackendOptions = null;
-      }
-    } finally {
-      modelSwitchInFlight = false;
-      requestedModelProfile = "";
-      renderShellNavigation();
-    }
-  }
-
   async function refreshData(options = {}) {
     if (refreshInFlight) return;
     refreshInFlight = true;
@@ -1200,12 +1135,6 @@
     state.stories = calls[4].status === "fulfilled" ? calls[4].value.stories || [] : [];
     state.health = calls[5].status === "fulfilled" ? calls[5].value : null;
     loadConversations().catch(() => {});
-    try {
-      const profilePayload = await window.sentrixApi.getModelProfiles();
-      if (!modelSwitchInFlight) state.vlmBackendOptions = modelProfileOptions(profilePayload);
-    } catch (err) {
-      state.vlmBackendOptions = null;
-    }
     try {
       state.ocrSettings = await window.sentrixApi.getOcrSettings();
     } catch (err) {
@@ -1287,7 +1216,7 @@
     const dropzone = fileInput?.closest(".dropzone");
     if (dropzone) {
       const hint = dropzone.querySelector("small");
-      if (hint) hint.textContent = "选择文件或文件夹，系统会自动导入其中的 JPG/JPEG/PNG 图片";
+      if (hint) hint.textContent = "选择文件或整个相册文件夹，系统会自动导入图片和视频，并读取拍摄时间与地点";
       const chooseButton = dropzone.querySelector(".button.primary");
       if (chooseButton && chooseButton.tagName !== "BUTTON") {
         const unifiedButton = document.createElement("button");
@@ -1468,11 +1397,11 @@
 
   async function handleFiles(event) {
     let files = Array.from(event.target.files || []);
-    if (event.target.id === "folder-input") files = files.filter((file) => /\.(jpe?g|png)$/i.test(file.name || ""));
-    if (!files.length) { state.toast = "所选目录中没有 JPG/JPEG/PNG 图片"; renderShellNavigation(); return; }
+    files = files.filter((file) => window.sentrixImageMetadata?.isAlbumMediaFile(file));
+    if (!files.length) { state.toast = "所选内容中没有可导入的图片或视频"; renderShellNavigation(); return; }
     const queueEntries = files.map((file) => ({ fileName: file.name, status: "reading-metadata" }));
     state.queue.unshift(...queueEntries);
-    state.toast = `已读取 ${files.length} 张图片，正在解析元数据...`;
+    state.toast = `已读取 ${files.length} 个文件，正在解析元数据...`;
     renderShellNavigation();
     const items = [];
     for (let index = 0; index < files.length; index += 1) {
@@ -1487,7 +1416,7 @@
         queueEntries[index].error = error.message || String(error);
       }
       if ((index + 1) % 10 === 0 || index === files.length - 1) {
-        state.toast = `正在解析图片元数据：${index + 1}/${files.length}`;
+        state.toast = `正在解析拍摄信息：${index + 1}/${files.length}`;
         renderShellNavigation();
       }
     }
@@ -1505,7 +1434,7 @@
           entry.error = item.error || "";
           if (item.accepted) accepted += 1;
         });
-        state.toast = `正在上传图片：${Math.min(offset + chunk.length, items.length)}/${items.length}`;
+        state.toast = `正在上传相册文件：${Math.min(offset + chunk.length, items.length)}/${items.length}`;
         renderShellNavigation();
       }
     } catch (error) {
@@ -1513,7 +1442,7 @@
       state.toast = `上传失败：${error.message || error}`;
       renderShellNavigation();
     }
-    state.toast = `上传完成：${accepted}/${files.length} 张进入本地处理队列`;
+    state.toast = `上传完成：${accepted}/${files.length} 个文件进入本地处理队列`;
     await refreshData();
     state.view = "imports";
     renderShellNavigation();
@@ -2074,10 +2003,6 @@
     state.view = initialHash;
   }
   shell();
-  document.addEventListener("change", (event) => {
-    const select = event.target?.closest?.('[data-action="switch-vlm"]');
-    if (select) handleModelProfileChange(select);
-  });
   refreshData();
   window.addEventListener("hashchange", () => {
     const hashView = window.location.hash.replace(/^#\/?/, "");
