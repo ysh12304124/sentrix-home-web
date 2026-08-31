@@ -1,0 +1,1592 @@
+diff --git a/backend/agent_runtime/completion.py b/backend/agent_runtime/completion.py
+index 08338ef9..5e4cd2b3 100644
+--- a/backend/agent_runtime/completion.py
++++ b/backend/agent_runtime/completion.py
+@@ -28,6 +28,20 @@ _RETRIEVAL_TOOLS = {
+     "get_core_memory", "get_person_memory",
+ }
+ 
++# Agent 2 planner requirements are authoritative when they contain a type that
++# this legacy completion gate can map.  Unknown types deliberately fall back
++# to the existing intent heuristics so a planner extension cannot disable the
++# legacy safety net.
++_AGENT2_ACTIVE_STATUSES = frozenset({"open", "running", "partially_supported"})
++_AGENT2_EVIDENCE_CODES = {
++    RETRIEVE_EVIDENCE: frozenset({
++        "memory_asset", "memory_reference", "structured_fact",
++        "location_metadata", "temporal_metadata", "confirmed_identity",
++    }),
++    RESOLVE_VISUAL: frozenset({"visual_observation"}),
++    RESOLVE_OCR: frozenset({"visible_text"}),
++}
++
+ @dataclass
+ class Requirement:
+     code: str
+@@ -64,34 +78,50 @@ class CompletionState:
+         self.requirements[code] = Requirement(
+             code=code, label=label, tool=tool, reason=reason, satisfied=satisfied)
+ 
+-    def update(self, task_state: dict | None) -> None:
++    def update(self, task_state: dict | None, agent2_task_state=None) -> None:
+         """根据当前 TaskState 动态增补/刷新需求（在每次工具结果后调用，幂等）。"""
+         task_state = task_state or {}
+         tool_results = task_state.get("tool_results") or []
+         tools_called = {str(tr.get("tool") or "") for tr in tool_results}
+ 
+         # 1) retrieve_evidence：涉及家庭记忆的问题必须先完成一次检索
+-        if self._wants_evidence(self.message):
++        model_retrieve = self._agent2_pending(agent2_task_state, RETRIEVE_EVIDENCE)
++        wants_retrieve = (model_retrieve if model_retrieve is not None
++                          else self._wants_evidence(self.message))
++        if model_retrieve is False and RETRIEVE_EVIDENCE in self.requirements:
++            self.requirements[RETRIEVE_EVIDENCE].satisfied = True
++        if wants_retrieve:
+             self._add(RETRIEVE_EVIDENCE, "检索家庭记忆", None,
+                       "回答这个问题需要先查看家庭记忆/照片记录，请先调用检索工具。",
+-                      satisfied=bool(tools_called & _RETRIEVAL_TOOLS))
++                      satisfied=(not model_retrieve) if model_retrieve is not None
++                      else bool(tools_called & _RETRIEVAL_TOOLS))
+ 
+         # 2) resolve_visual：检索返回候选 + 视觉意图 + 未 inspect
+         has_preview = any(
+             tr.get("tool") == "search_memories" and (tr.get("preview") or [])
+             for tr in tool_results)
+-        if has_preview and visual_intent(self.message):
++        model_visual = self._agent2_pending(agent2_task_state, RESOLVE_VISUAL)
++        wants_visual = (model_visual if model_visual is not None
++                        else visual_intent(self.message))
++        if model_visual is False and RESOLVE_VISUAL in self.requirements:
++            self.requirements[RESOLVE_VISUAL].satisfied = True
++        if has_preview and wants_visual:
+             self._add(RESOLVE_VISUAL, "复核照片细节", "inspect_photo",
+                       "需要调用 inspect_photo 复核预览照片后才能回答视觉细节。",
+-                      satisfied="inspect_photo" in tools_called)
++                      satisfied=(not model_visual) if model_visual is not None
++                      else "inspect_photo" in tools_called)
+ 
+         # 3) resolve_ocr：OCR 意图 或 search 明确推荐 read_photo_text，且尚未调用
+-        wants_ocr = ocr_intent(self.message)
++        model_ocr = self._agent2_pending(agent2_task_state, RESOLVE_OCR)
++        wants_ocr = (model_ocr if model_ocr is not None else ocr_intent(self.message))
++        if model_ocr is False and RESOLVE_OCR in self.requirements:
++            self.requirements[RESOLVE_OCR].satisfied = True
+         recommended_ocr = self._search_recommends(tool_results, "read_photo_text")
+         if wants_ocr or recommended_ocr:
+             self._add(RESOLVE_OCR, "读取照片文字", "read_photo_text",
+                       "需要调用 read_photo_text 读取照片中的文字后，才能回答文字/数字类问题。",
+-                      satisfied="read_photo_text" in tools_called)
++                      satisfied=(not model_ocr) if model_ocr is not None
++                      else "read_photo_text" in tools_called)
+ 
+         # 4) deliver_media：用户明确要求查看照片，且尚未交付原图
+         if image_delivery_intent(self.message):
+@@ -113,11 +143,35 @@ class CompletionState:
+         for tr in tool_results or []:
+             if tr.get("tool") != "search_memories":
+                 continue
+-            rec = (tr.get("observation") or {}).get("recommended_resolution") or {}
++            # New result contracts expose this at the tool-result top level;
++            # retain the nested form for older traces/replays.
++            rec = (tr.get("recommended_resolution") or
++                   (tr.get("observation") or {}).get("recommended_resolution") or {})
+             if rec.get("needed") and rec.get("tool") == tool:
+                 return True
+         return False
+ 
++    @staticmethod
++    def _agent2_pending(agent2_task_state, code: str) -> bool | None:
++        """Return model-derived pending state, or ``None`` for regex fallback.
++
++        A non-empty mapped planner requirement suppresses the corresponding
++        regex signal.  Terminal planner states are therefore treated as no
++        longer pending, while unknown/unmapped evidence types preserve legacy
++        behavior.
++        """
++        requirements = getattr(agent2_task_state, "requirements", None)
++        if not requirements:
++            return None
++        evidence_types = _AGENT2_EVIDENCE_CODES.get(code, frozenset())
++        relevant = [state for state in requirements.values()
++                    if getattr(getattr(state, "requirement", None), "evidence_type", None)
++                    in evidence_types]
++        if not relevant:
++            return None
++        return any(getattr(state, "status", "open") in _AGENT2_ACTIVE_STATUSES
++                   for state in relevant)
++
+     # ---- 查询 ----
+     def blocking(self) -> list[Requirement]:
+         """未完成且仍 pending 的需求，按优先级排序（OCR > 视觉 > 交付 > 检索）。"""
+diff --git a/backend/agent_runtime/final_writer.py b/backend/agent_runtime/final_writer.py
+index a2fa54ab..6f200758 100644
+--- a/backend/agent_runtime/final_writer.py
++++ b/backend/agent_runtime/final_writer.py
+@@ -27,6 +27,38 @@ _HEDGE_WHEN_CONFIRMED_RE = re.compile(r"还不能完全确认|无法完全确认
+ _PROMISE_RE = re.compile(r"我(?:可以|能|会)?(?:继续)?(?:帮你|为您)?(?:再)?(?:核对|确认|查看|找)")
+ _DENIES_FOUND_RE = re.compile(r"没有找到|没找到|未找到|没有获取到|找不到|不存在相关|没有相关")
+ 
++_INTERNAL_ID_RE = re.compile(
++    r"\b(?:asset_|obs_|entity_|mention_|claim_|turn_|conversation_|result_|evt_)[a-f0-9]{6,}\b",
++    re.I,
++)
++_INTERNAL_TABLE_RE = re.compile(
++    r"\b(?:assets|observations|entity_mentions|semantic_claims|agent_result_sets)\b",
++    re.I,
++)
++_PHOTO_HANDLE_PARENS_RE = re.compile(
++    r"[ \t]*[（(]\s*photo_\d+(?:\s*(?:[、,，/]|和|与)\s*photo_\d+)*\s*[)）]",
++    re.I,
++)
++_PHOTO_HANDLE_SERIES_RE = re.compile(
++    r"(?<![A-Za-z0-9_])photo_\d+(?:\s*(?:[、,，/]|和|与)\s*photo_\d+)+(?![A-Za-z0-9_])",
++    re.I,
++)
++_PHOTO_HANDLE_RE = re.compile(
++    r"(?<![A-Za-z0-9_])photo_\d+(?![A-Za-z0-9_])",
++    re.I,
++)
++
++
++def sanitize_internal_refs(text: str) -> str:
++    """Remove internal identifiers and table names from user-visible text."""
++    text = str(text or "")
++    text = _PHOTO_HANDLE_PARENS_RE.sub("", text)
++    text = _PHOTO_HANDLE_SERIES_RE.sub("这些照片", text)
++    text = _PHOTO_HANDLE_RE.sub("这张照片", text)
++    text = _INTERNAL_ID_RE.sub("[内部记录]", text)
++    text = _INTERNAL_TABLE_RE.sub("[内部记录]", text)
++    return text
++
+ # Phase G G7：空壳收尾/套话（自然化时删除，不引入新事实）
+ _BOILERPLATE_TAIL_RE = re.compile(
+     r"[。；]?(?:以上是我目前能确认的部分信息|以上是目前能确认的部分|以上是我能确认的内容|"
+@@ -247,7 +279,7 @@ def clean_writer_output(raw: str) -> str:
+             text = str(parsed["answer"]).strip()
+     except Exception:
+         pass
+-    return naturalize_answer(text.strip().strip('"'))
++    return naturalize_answer(sanitize_internal_refs(text.strip().strip('"')))
+ 
+ 
+ def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = None,
+@@ -288,4 +320,4 @@ def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = N
+     text = text.strip().strip('"').strip()
+     if not text:
+         return None
+-    return text[:1600]
++    return sanitize_internal_refs(text)[:1600]
+diff --git a/backend/agent_runtime/intent.py b/backend/agent_runtime/intent.py
+index f9a88c91..0112cf43 100644
+--- a/backend/agent_runtime/intent.py
++++ b/backend/agent_runtime/intent.py
+@@ -24,7 +24,9 @@ _EVIDENCE_INTENT_RE = re.compile(
+ _VISUAL_RE = re.compile(
+     r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|"
+     r"在做什么|有没有|是什么|放着|写了|内容|细节|长什么样|什么颜色|什么动物|"
+-    r"拿着|道具|植物|场景|拍的什么|什么造型|什么样子|哪[一123]?张")
++    r"拿着|道具|植物|场景|拍的什么|什么造型|什么样子|哪[一123]?张|"
++    r"雕塑|石雕|景观|建筑|广场|公园|喷泉|河流|湖泊|桥|设施|装置|"
++    r"物体|物品|标志|牌子|雕像|纪念碑|布置|装饰|婚房|婚庆|床品|窗帘|花艺|展架|广告牌|展板")
+ 
+ # OCR 文字读取意图
+ _OCR_RE = re.compile(
+diff --git a/backend/agent_runtime/ocr_tool.py b/backend/agent_runtime/ocr_tool.py
+index b1a5289c..894c5978 100644
+--- a/backend/agent_runtime/ocr_tool.py
++++ b/backend/agent_runtime/ocr_tool.py
+@@ -24,10 +24,6 @@ def bind_ocr_runtime(runtime: dict) -> None:
+     _RUNTIME = runtime
+ 
+ 
+-def _handle_to_asset_id(handle: str) -> str | None:
+-    return (_RUNTIME.get("last_handles") or {}).get(handle)
+-
+-
+ # ---- Tool 4b: read_photo_text（Phase E：OCR 专用 Tool）----
+ _OCR_PROMPT = """请读出这张照片中的全部文字（招牌/菜单/价格/数字/电话/年份/小字）。只输出文字内容本身，不要描述图片、不要评价。如果完全看不清就输出空字符串。"""
+ _OCR_PROMPT_FULL = """观察这张照片，墙面上有哪些招牌、牌子或文字？请逐条列出文字内容本身（店名、电话、价格、年份、标语等），不要描述人物和场景。看不清的部分不要编造。"""
+@@ -480,7 +476,7 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None)
+     if result_set_id and rs_store is not None:
+         asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
+     if not asset_id:
+-        asset_id = _handle_to_asset_id(asset_handle)
++        return None
+     store = _RUNTIME.get("store")
+     if not asset_id or store is None:
+         return None
+diff --git a/backend/agent_runtime/result_set.py b/backend/agent_runtime/result_set.py
+index a4046f90..43faa72d 100644
+--- a/backend/agent_runtime/result_set.py
++++ b/backend/agent_runtime/result_set.py
+@@ -14,6 +14,41 @@ import uuid
+ from dataclasses import dataclass, field
+ 
+ RESULT_SET_TTL_S = 24 * 60 * 60  # D7：ResultSet TTL 延长到 24h（多轮/跨会话稳定）
++RESULT_SET_PAGE_SIZE = 6
++
++
++def debug_asset_projection(result_set: "ResultSet", preview: list[dict] | None) -> dict:
++    """Project full and model-visible evidence IDs for benchmark-only diagnostics.
++
++    The full ResultSet remains server-owned.  This projection is emitted only by
++    an include_debug response so offline evaluation can compare candidate recall
++    with the bounded preview without exposing IDs to the model.
++    """
++    full_ids = list(getattr(result_set, "asset_ids", None) or [])
++    preview_handles = []
++    preview_ids = []
++    for item in preview or []:
++        if not isinstance(item, dict):
++            continue
++        handle = str(item.get("handle") or "")
++        asset_id = ""
++        if handle.startswith("photo_"):
++            try:
++                index = int(handle.removeprefix("photo_")) - 1
++            except ValueError:
++                index = -1
++            if 0 <= index < len(full_ids):
++                asset_id = str(full_ids[index])
++        if handle and handle not in preview_handles:
++            preview_handles.append(handle)
++        if asset_id and asset_id not in preview_ids:
++            preview_ids.append(asset_id)
++    return {
++        "debug_asset_ids": full_ids,
++        "debug_preview_asset_ids": preview_ids,
++        "debug_preview_handles": preview_handles,
++        "debug_result_total": len(full_ids),
++    }
+ 
+ 
+ @dataclass
+@@ -29,7 +64,7 @@ class ResultSet:
+     owner: str = ""
+     expires_at: float = 0.0
+     revision: str = ""
+-    page_size: int = 6
++    page_size: int = RESULT_SET_PAGE_SIZE
+     shown: int = 0
+ 
+     def handles(self) -> dict[str, str]:
+@@ -44,7 +79,7 @@ class ResultSet:
+ 
+     def page(self, page_no: int, page_size: int | None = None) -> list[dict]:
+         """返回第 page_no 页（1-based）的 handle 列表；handle 序号为全局序号。"""
+-        size = page_size or self.page_size
++        size = min(RESULT_SET_PAGE_SIZE, max(1, int(page_size or self.page_size)))
+         start = max(0, (int(page_no) - 1) * size)
+         end = start + size
+         return [
+diff --git a/backend/agent_runtime/runtime.py b/backend/agent_runtime/runtime.py
+index 92aac718..7915e752 100644
+--- a/backend/agent_runtime/runtime.py
++++ b/backend/agent_runtime/runtime.py
+@@ -7,6 +7,7 @@ model -> tool -> observation -> model -> ... -> final
+ from __future__ import annotations
+ 
+ import json
++import inspect
+ import os
+ import re
+ import time
+@@ -66,12 +67,28 @@ def _model_visible_observation(observation: dict | None) -> dict:
+     preview = compact.get("preview")
+     if isinstance(preview, list):
+         compact["preview"] = preview[:5]
+-    asset_ids = compact.get("asset_ids")
+-    if isinstance(asset_ids, list):
+-        compact["asset_ids"] = asset_ids[:20]
++        if compact["preview"] and isinstance(compact["preview"][0], dict):
++            compact["recommended_handle"] = compact["preview"][0].get("handle")
++    # ResultSet keeps the full internal mapping server-side. The model only
++    # needs stable handles from the bounded preview; exposing asset IDs turns
++    # the whole candidate set into model-visible evidence and encourages
++    # paging/inspection of unrelated images.
++    compact.pop("asset_ids", None)
+     return compact
+ 
+ 
++def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None) -> tuple[dict, str | None]:
++    """Keep visual/OCR inspection inside the handles actually shown to the model."""
++    if not isinstance(arguments, dict) or not preview_handles:
++        return arguments, None
++    requested = str(arguments.get("asset_handle") or "")
++    if not requested or requested in preview_handles:
++        return arguments, None
++    normalized = dict(arguments)
++    normalized["asset_handle"] = preview_handles[0]
++    return normalized, requested
++
++
+ def _model_visible_action(action: dict) -> str:
+     """Feed the parsed action back without model reasoning or prose."""
+     return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+@@ -94,6 +111,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协
+ - 不要重复调用相同的工具和参数：同一轮里相同 tool+arguments 只允许一次，重复会被拒绝。
+ - inspect_photo 的 asset_handle 必须原样使用 search_memories 返回 preview 里的 handle（如 photo_1、photo_2）。
+   不要编造 preview 之外的 handle。
++- search_memories 若返回 recommended_handle，inspect_photo / read_photo_text 默认优先使用该 handle；
++  不要因为示例中的 photo_1 文本而改选其它照片。
+ - 当用户询问照片里的视觉细节（桌上物品、衣服颜色、人数、文字/招牌、天气、穿什么、有没有某物）时，
+   如果 search_memories 返回了 preview 候选（有 photo_1 等 handle），你必须调用 inspect_photo 复核 preview 里的照片，
+   不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
+@@ -206,7 +225,8 @@ def _pending_resolution(task) -> dict | None:
+     for tr in reversed(task.tool_results or []):
+         if tr.get("tool") == "search_memories":
+             obs = tr.get("observation") or {}
+-            rec = obs.get("recommended_resolution") or {}
++            rec = (tr.get("recommended_resolution") or
++                   obs.get("recommended_resolution") or {})
+             if rec.get("needed") and rec.get("tool"):
+                 called = any((x.get("tool") or "") == rec["tool"]
+                              for x in (task.tool_results or []))
+@@ -811,13 +831,23 @@ class AgentRuntime:
+         # Bucket every model call by call_type; restore the original chat_fn at the end.
+         _stage_timing_ms: dict[str, float] = {}
+         _orig_chat_fn = self.chat_fn
++        _orig_chat_signature = inspect.signature(_orig_chat_fn)
++        _accepts_chat_kwargs = any(
++            parameter.kind == inspect.Parameter.VAR_KEYWORD
++            for parameter in _orig_chat_signature.parameters.values()
++        )
++
+         def _timed_chat(messages, *, call_type=None, step_id=None, **kwargs):
+             _t0 = time.perf_counter()
+             try:
+                 _kw = {}
+-                if call_type is not None:
++                if call_type is not None and (
++                    _accepts_chat_kwargs or "call_type" in _orig_chat_signature.parameters
++                ):
+                     _kw["call_type"] = call_type
+-                if step_id is not None:
++                if step_id is not None and (
++                    _accepts_chat_kwargs or "step_id" in _orig_chat_signature.parameters
++                ):
+                     _kw["step_id"] = step_id
+                 return _orig_chat_fn(messages, **_kw, **kwargs)
+             finally:
+@@ -936,6 +966,13 @@ class AgentRuntime:
+         max_unknown_tool_retries = 1
+         forced_final_attempted = False
+         wants_visual = visual_intent(message)
++
++        def visual_gate_requested() -> bool:
++            """Use Agent 2's visual requirement when available; otherwise regex fallback."""
++            model_visual = CompletionState._agent2_pending(
++                agent2_task_state, RESOLVE_VISUAL)
++            return wants_visual if model_visual is None else model_visual
++
+         # Phase E：Adaptive Visual Budget——按问题类型放宽视觉复核预算
+         wants_multi = multi_image_intent(message)
+         wants_ocr = ocr_intent(message)
+@@ -980,8 +1017,52 @@ class AgentRuntime:
+                             **({"prompt": answer_writer_messages, "raw_full": raw_writer}
+                                if self.include_debug else {}),
+                         })
+-                        turn.status = "complete" if turn.final_answer else "partial"
+-                        turn.reason = "" if turn.final_answer else "empty_answer_writer"
++                        writer_problems = guard.check(
++                            turn.final_answer,
++                            task_state={
++                                "scope_id": self.scope_id,
++                                "viewer_id": self.viewer_id,
++                                "user_query": message,
++                                "history_text": history,
++                                "result_mode": task.result_mode,
++                                "has_more": task.has_more,
++                                "delivery_state": task.delivery_state,
++                                "fulfillment": task.fulfillment,
++                                "fact_total": task.fact_total,
++                                "fact_value": task.fact_value,
++                                "fact_operation": task.fact_operation,
++                                "fact_rows": task.fact_rows,
++                                "fact_group_by": task.fact_group_by,
++                                "last_tool": task.last_tool,
++                                "search_satisfaction": task.search_satisfaction,
++                                "condition_summary": task.search_condition_summary,
++                                "selected_asset_handle": task.selected_asset_handle or selected_handle,
++                                "tool_results": task.tool_results,
++                                "evidence_refs": [],
++                            },
++                            delivered_count=task.delivered_count,
++                        )
++                        turn.steps.append({
++                            "type": "guard",
++                            "status": "fail" if writer_problems else "pass",
++                            "codes": list(writer_problems) if writer_problems else [],
++                            "attempt": 1,
++                        })
++                        if writer_problems:
++                            severity = writer_problems.severity if hasattr(writer_problems, "severity") else "truth"
++                            if severity == "hard_block":
++                                turn.status = "blocked_by_guard"
++                                turn.reason = "hard_block:" + ";".join(writer_problems)
++                                if task.tool_results:
++                                    turn.final_answer = render_emergency_summary(
++                                        task.as_dict(), reason="回答未通过事实校验")
++                            else:
++                                turn.final_answer = _natural_partial(task.as_dict(), list(writer_problems))
++                                turn.status = "partial"
++                                turn.reason = "writer_guard:" + ";".join(str(p) for p in writer_problems[:2])
++                        else:
++                            turn.status = "complete" if turn.final_answer else "partial"
++                            turn.reason = "" if turn.final_answer else "empty_answer_writer"
+                         break
+                     except Exception as exc:
+                         turn.steps.append({"type": "writer", "status": "failed",
+@@ -1037,7 +1118,6 @@ class AgentRuntime:
+                 debug_step_seq += 1
+                 last_model_step_id = step_id
+             try:
+-                import inspect
+                 sig = inspect.signature(self.chat_fn)
+                 if "call_type" in sig.parameters:
+                     raw = self.chat_fn(messages, call_type="agent", step_id=step_id)
+@@ -1178,7 +1258,7 @@ class AgentRuntime:
+                         )})
+                         continue
+                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
+-                if search_has_preview and not inspect_called and wants_visual \
++                if search_has_preview and not inspect_called and visual_gate_requested() \
+                         and visual_retries < max_visual_retries and turn.budget.can_model_step():
+                     visual_retries += 1
+                     denies_found = bool(__import__("re").search(
+@@ -1223,13 +1303,13 @@ class AgentRuntime:
+                             print(f"[nucleus] kind={kind} no_simple nuc_price={[v.label for v in nuc.all('price')] if nuc else None}", file=__import__("sys").stderr)
+                 except Exception as exc:
+                     print(f"[nucleus] render error: {type(exc).__name__}: {exc}", file=__import__("sys").stderr)
+-                completion.update(task.as_dict())
++                completion.update(task.as_dict(), agent2_task_state=agent2_task_state)
+                 gate_prompted = False
+                 for req in completion.blocking():
+                     if req.code == RESOLVE_OCR and _pending_resolution(task):
+                         continue  # 已由上方 recommended_resolution 流程处理
+                     if req.code == RESOLVE_VISUAL and search_has_preview and not inspect_called \
+-                            and wants_visual and visual_retries < max_visual_retries:
++                            and visual_gate_requested() and visual_retries < max_visual_retries:
+                         continue  # 已由上方视觉流程处理
+                     if completion_retries < max_completion_retries \
+                             and turn.budget.can_model_step():
+@@ -1431,7 +1511,7 @@ class AgentRuntime:
+                     # Recovery v3 第二层：一次工具恢复——仍有证据解析需求未满足且预算允许
+                     recovery_tool = None
+                     if turn.budget.can_tool_call():
+-                        completion.update(task.as_dict())
++                        completion.update(task.as_dict(), agent2_task_state=agent2_task_state)
+                         for req in completion.blocking():
+                             if req.code in (RESOLVE_OCR, RESOLVE_VISUAL) and req.tool:
+                                 recovery_tool = req.tool
+@@ -1458,7 +1538,7 @@ class AgentRuntime:
+                                                        auto_decision.observation or {})
+                                 task.record_tool_result(f"recovery_{recovery_tool}", recovery_tool,
+                                                         auto_decision.observation or {})
+-                                completion.update(task.as_dict())
++                                completion.update(task.as_dict(), agent2_task_state=agent2_task_state)
+                                 if recovery_tool == "read_photo_text" \
+                                         and (auto_decision.observation or {}).get("status") == "partial":
+                                     turn.ocr_partial = True
+@@ -1560,6 +1640,10 @@ class AgentRuntime:
+                 turn.reason = "unknown_tool:" + tool_name
+                 turn.termination_reason = "tool_unavailable"
+                 break
++            corrected_handle = None
++            if tool_name in {"inspect_photo", "read_photo_text"}:
++                arguments, corrected_handle = _normalize_preview_handle(
++                    arguments, task.result_preview)
+             if tool_name == "inspect_photo":
+                 handle_arg = str(arguments.get("asset_handle") or "")
+                 self._emit_progress(
+@@ -1584,6 +1668,8 @@ class AgentRuntime:
+                 "error": result.error, "latency_s": latency,
+                 "parent_step_id": last_model_step_id,
+             })
++            if corrected_handle and self.include_debug:
++                turn.steps[-1]["requested_asset_handle"] = corrected_handle
+             emit_text = public_status
+             if tool_name == "inspect_photo" and result.status == "ok":
+                 handle_arg = str(arguments.get("asset_handle") or "")
+@@ -1620,7 +1706,7 @@ class AgentRuntime:
+                         answer_writer_messages = build_answer_writer_messages(
+                             message, answer_context)
+                         answer_writer_pending = True
+-            completion.update(task.as_dict())
++            completion.update(task.as_dict(), agent2_task_state=agent2_task_state)
+             # G6：OCR 显式 partial（超时/失败）→ 记录到 turn，用于最终 natural partial 语义
+             if tool_name == "read_photo_text" and (result.observation or {}).get("status") == "partial":
+                 turn.ocr_partial = True
+diff --git a/backend/agent_runtime/tools.py b/backend/agent_runtime/tools.py
+index c4a70998..9ac97726 100644
+--- a/backend/agent_runtime/tools.py
++++ b/backend/agent_runtime/tools.py
+@@ -486,6 +486,170 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
+ 
+ 
+ # ---- Tool 2: search_memories ----
++_RESULT_PREVIEW_LIMIT = 6
++_RESULT_PAGE_SIZE = 6
++_RESULT_PREVIEW_RELEVANCE_HEAD = max(
++    0, min(_RESULT_PREVIEW_LIMIT, int(os.getenv("SENTRIX_RESULT_PREVIEW_RELEVANCE_HEAD", "3")))
++)
++_PREVIEW_QUERY_ALIASES = {
++    "布置": ("布置", "装饰", "花艺", "彩带", "气球", "窗帘", "床品", "家具"),
++    "装饰": ("装饰", "花艺", "彩带", "气球", "窗帘", "床品", "家具"),
++    "婚房": ("婚房", "室内", "房间", "床", "家具", "窗帘"),
++    "展架": ("展架", "广告牌", "展板", "婚纱照"),
++    "广告牌": ("广告牌", "展架", "展板", "婚纱照"),
++    "祝福": ("祝福", "幸福", "结婚", "新人"),
++    "文字": ("文字：", "文字", "写着", "标志"),
++    "雕塑": ("雕塑", "石雕", "雕像", "纪念碑"),
++    "石雕": ("石雕", "雕塑", "雕像", "纪念碑"),
++    "桥": ("桥", "桥上"),
++}
++
++
++def _observation_summary(store, asset_id: str) -> str:
++    """Expose bounded evidence text without exposing storage identifiers."""
++    if store is None:
++        return ""
++    try:
++        rows = store.list_observations(asset_id=asset_id, limit=1)
++    except Exception:
++        return ""
++    if not rows:
++        return ""
++    observation = rows[0] or {}
++    parts = []
++    for key in ("caption", "activity", "place"):
++        value = str(observation.get(key) or "").strip()
++        if value and value not in parts:
++            parts.append(value)
++    for key in ("objects", "clothing"):
++        values = observation.get(key) or []
++        labels = []
++        for value in values:
++            if isinstance(value, dict):
++                value = value.get("label") or value.get("primary") or ""
++            value = str(value or "").strip()
++            if value and value not in labels:
++                labels.append(value)
++        if labels:
++            parts.append("、".join(labels[:8]))
++    ocr = str(observation.get("ocr_text") or "").strip()
++    if ocr:
++        parts.append(f"文字：{ocr[:120]}")
++    detail = observation.get("detail") or {}
++    if isinstance(detail, dict):
++        details = []
++        for item in detail.get("visible_details") or []:
++            if isinstance(item, dict):
++                value = item.get("text") or item.get("label") or ""
++            else:
++                value = item
++            value = str(value or "").strip()
++            if value and value not in details:
++                details.append(value)
++        if details:
++            parts.append("；".join(details[:6]))
++    return "；".join(parts)[:300]
++
++
++def _asset_group_key(store, asset_id: str) -> str:
++    """Group video keyframes and event-near-duplicates for the initial preview."""
++    if store is None:
++        return asset_id
++    try:
++        asset = store.get_asset(asset_id) or {}
++        if asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
++            return ":".join(str(asset.get(key) or "") for key in (
++                "parent_asset_id", "source_scene_index")) or asset_id
++        row = store.connection.execute(
++            "SELECT event_id FROM event_observations WHERE observation_id IN "
++            "(SELECT id FROM observations WHERE asset_id = ?) ORDER BY event_id LIMIT 1",
++            (asset_id,),
++        ).fetchone()
++        return str(row["event_id"] if row else asset_id)
++    except Exception:
++        return asset_id
++
++
++def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
++    """Promote candidates whose stored visual detail matches explicit visual cues."""
++    text = str(query or "")
++    cues = [(term, aliases) for term, aliases in _PREVIEW_QUERY_ALIASES.items()
++            if term in text]
++    if not cues:
++        return list(range(len(asset_ids)))
++    scored = []
++    for index, asset_id in enumerate(asset_ids):
++        summary = _observation_summary(store, asset_id)
++        score = sum(1 for _, aliases in cues if any(alias in summary for alias in aliases))
++        scored.append((-score, index))
++    scored.sort()
++    return [index for _, index in scored]
++
++
++def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "") -> list[int]:
++    """Select bounded indices while preserving a relevance head before diversity."""
++    if len(asset_ids) <= _RESULT_PREVIEW_LIMIT:
++        return (_preview_query_order(asset_ids, query, store)
++                if mode != "representative" else list(range(len(asset_ids))))
++    if mode == "representative":
++        candidates = _even_indices(len(asset_ids), _RESULT_PREVIEW_LIMIT)
++    else:
++        candidates = _preview_query_order(asset_ids, query, store)
++    selected = []
++    seen_groups = set()
++    # Retrieval order is the strongest available relevance signal.  Preserve a
++    # small head even when those assets belong to one event; otherwise event
++    # diversity can discard the actual answer image before the model can inspect it.
++    relevance_head = min(_RESULT_PREVIEW_RELEVANCE_HEAD, len(candidates))
++    for index in candidates[:relevance_head]:
++        selected.append(index)
++        seen_groups.add(_asset_group_key(store, asset_ids[index]))
++    if len(selected) >= _RESULT_PREVIEW_LIMIT:
++        return selected[:_RESULT_PREVIEW_LIMIT]
++    for index in candidates[relevance_head:]:
++        group = _asset_group_key(store, asset_ids[index])
++        if group in seen_groups:
++            continue
++        selected.append(index)
++        seen_groups.add(group)
++        if len(selected) >= _RESULT_PREVIEW_LIMIT:
++            return selected
++    for index in range(len(asset_ids)):
++        if index not in selected:
++            selected.append(index)
++        if len(selected) >= _RESULT_PREVIEW_LIMIT:
++            break
++    return selected
++
++
++def _preview_entry(store, asset_id: str, handle: str, *, level="exact", condition_summary=None) -> dict:
++    asset = store.get_asset(asset_id) if store is not None else {}
++    asset = asset or {}
++    media_kind = "original_image"
++    source_video_asset_id = None
++    source_timestamp_sec = None
++    source_scene_index = None
++    source_video_file_name = None
++    if asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
++        media_kind = "video_keyframe"
++        source_video_asset_id = asset.get("parent_asset_id")
++        source_timestamp_sec = asset.get("source_timestamp_sec")
++        source_scene_index = asset.get("source_scene_index")
++        source_video = store.get_asset(source_video_asset_id) if store and source_video_asset_id else None
++        source_video_file_name = (source_video or {}).get("file_name")
++    return {
++        "handle": handle,
++        "captured_at": asset.get("captured_at"),
++        "level": level,
++        "place": _short_place_label(asset) if asset else "",
++        "media_kind": media_kind,
++        "source_video_asset_id": source_video_asset_id,
++        "source_timestamp_sec": source_timestamp_sec,
++        "source_scene_index": source_scene_index,
++        "source_video_file_name": source_video_file_name,
++        "evidence_summary": _observation_summary(store, asset_id),
++        "condition_summary": condition_summary or {},
++    }
+ def _even_indices(total: int, n: int) -> list[int]:
+     """在 [0, total) 内均匀取 n 个下标（representative 预览用，避免只展示最新几张），包含首尾。"""
+     if total <= n:
+@@ -504,52 +668,18 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
+     rs = _RUNTIME["result_sets"].new(
+         scope_id=scope_id, query=query or "(时间/地点筛选)", asset_ids=asset_ids,
+         unresolved=[])
+-    handles = rs.handles()
+-    _RUNTIME["last_handles"] = handles
+-    indices = _even_indices(len(asset_ids), 6) if mode == "representative" \
+-        else list(range(min(6, len(asset_ids))))
+-    preview = []
+     store = _RUNTIME.get("store")
+-    for i, idx in enumerate(indices):
+-        a = assets[idx]
+-        place = ""
+-        media_kind = "original_image"
+-        source_video_asset_id = None
+-        source_timestamp_sec = None
+-        source_scene_index = None
+-        source_video_file_name = None
+-        if store is not None:
+-            try:
+-                asset = store.get_asset(a.get("id")) or {}
+-                place = _short_place_label(asset)
+-                if asset.get("derived_kind") == "video_keyframe":
+-                    media_kind = "video_keyframe"
+-                    source_video_asset_id = asset.get("parent_asset_id")
+-                    source_timestamp_sec = asset.get("source_timestamp_sec")
+-                    source_scene_index = asset.get("source_scene_index")
+-                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+-                    source_video_file_name = (source_video or {}).get("file_name")
+-            except Exception:
+-                place = ""
+-        preview.append({
+-            "handle": f"photo_{idx + 1}",
+-            "captured_at": a.get("captured_at"),
+-            "level": "exact",
+-            "place": place,
+-            "media_kind": media_kind,
+-            "source_video_asset_id": source_video_asset_id,
+-            "source_timestamp_sec": source_timestamp_sec,
+-            "source_scene_index": source_scene_index,
+-            "source_video_file_name": source_video_file_name,
+-            "condition_summary": {},
+-        })
++    indices = _preview_indices(asset_ids, mode, store, query=user_goal or query)
++    preview = [
++        _preview_entry(store, assets[idx].get("id"), f"photo_{idx + 1}")
++        for idx in indices
++    ]
+     total = len(assets)
+     return {
+         "result_set_id": rs.result_set_id,
+         "query": query,
+         "mode": mode,
+         "total": total,
+-        "asset_ids": asset_ids[:50],
+         "evidence_count": len(asset_ids),
+         "preview": preview,
+         "has_more": total > len(preview),
+@@ -587,6 +717,19 @@ def _extract_time_from_query(query: str) -> str | None:
+     return None
+ 
+ 
++def _sanitize_model_filters(filters: dict, *, query: str, user_goal: str) -> dict:
++    """Keep model-generated time filters anchored to explicit user wording."""
++    sanitized = dict(filters or {})
++    explicit_time = _extract_time_from_query(f"{user_goal or ''} {query or ''}")
++    if explicit_time:
++        sanitized["time"] = explicit_time
++    else:
++        # The model sees current_time in its prompt and may hallucinate it as a
++        # photo date.  An unsupported time filter silently destroys recall.
++        sanitized.pop("time", None)
++    return sanitized
++
++
+ def _canonical_search_enabled() -> bool:
+     from .canonical_intent import canonical_enabled
+     return canonical_enabled()
+@@ -750,37 +893,26 @@ def _is_referent_query(query: str) -> bool:
+     return any(m in q for m in _REFERENT_MARKERS)
+ 
+ 
+-def _search_from_prior_result_set(prior_rs, scope_id: str) -> dict | None:
++def _search_from_prior_result_set(prior_rs, scope_id: str, *, query: str = "",
++                                  user_goal: str = "") -> dict | None:
+     """W2.3：基于已有 ResultSet 构建检索响应（不重新全库搜索）。"""
+     if prior_rs is None:
+         return None
+     asset_ids = list(prior_rs.asset_ids or [])
+     store = _RUNTIME.get("store")
+     preview = []
+-    handles = prior_rs.handles() if hasattr(prior_rs, "handles") else {}
+-    for i, aid in enumerate(asset_ids[:6]):
+-        handle = f"photo_{i + 1}"
+-        place = ""
+-        captured_at = None
+-        file_name = ""
+-        if store is not None:
+-            try:
+-                asset = store.get_asset(aid) or {}
+-                captured_at = asset.get("captured_at")
+-                place = _short_place_label(asset)
+-                file_name = asset.get("file_name") or ""
+-            except Exception:
+-                pass
+-        preview.append({"handle": handle, "captured_at": captured_at, "level": "exact",
+-                        "file_name": file_name, "place": place,
+-                        "media_kind": "original_image", "condition_summary": {}})
+-    _RUNTIME["last_handles"] = handles
++    indices = _preview_indices(
++        asset_ids, "best", store, query=query or getattr(prior_rs, "query", "") or user_goal)
++    preview = [
++        _preview_entry(store, asset_ids[index], f"photo_{index + 1}")
++        for index in indices
++    ]
++    display_query = query or getattr(prior_rs, "query", "") or f"(引用已有结果集 {prior_rs.result_set_id})"
+     return {
+         "result_set_id": prior_rs.result_set_id,
+-        "query": f"(引用已有结果集 {prior_rs.result_set_id})",
++        "query": display_query,
+         "mode": "best",
+         "total": len(asset_ids),
+-        "asset_ids": asset_ids[:50],
+         "evidence_count": len(asset_ids),
+         "preview": preview,
+         "has_more": len(asset_ids) > len(preview),
+@@ -792,8 +924,9 @@ def _search_from_prior_result_set(prior_rs, scope_id: str) -> dict | None:
+         "condition_summary": {},
+         "can_inspect": len(preview) > 0,
+         "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
+-        "recommended_resolution": _recommended_resolution("(引用已有结果集)", preview,
+-                                                          "full_support" if asset_ids else "no_match"),
++        "recommended_resolution": _recommended_resolution(
++            display_query, preview, "full_support" if asset_ids else "no_match",
++            user_goal=user_goal),
+         "reference_resolution": True,
+     }
+ 
+@@ -834,11 +967,13 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+         if extracted:
+             filters["time"] = extracted
+     scope_id = (context or {}).get("scope_id") or ""
++    user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
++    filters = _sanitize_model_filters(filters, query=query, user_goal=user_goal)
+     # P2 v2: Canonical Retrieval Intent（fusion candidate）—— 从用户原问题确定性提取结构化
+     # 约束，强信号（时间+地点）时作为 filters 增强 hybrid 检索（保留语义 query），消除 paraphrase 漂移。
+     if _canonical_search_enabled():
+         from .canonical_intent import extract_constraints
+-        user_message = ((context or {}).get("task_state") or {}).get("user_goal") or arguments.get("query") or ""
++        user_message = user_goal or arguments.get("query") or ""
+ 
+         ci = extract_constraints(user_message, _RUNTIME.get("store"), scope_id)
+         # 防御：user_message 提取不到 time/place 时，再从 search query 提取并合并（覆盖边角）。
+@@ -856,7 +991,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+                 _ns = type("RS", (), {})()
+                 _ns.asset_ids = _ev["asset_ids"]
+                 _ns.result_set_id = "event_" + _ev["event_id"]
+-                return _search_from_prior_result_set(_ns, scope_id)
++                rs = _RUNTIME["result_sets"].new(
++                    scope_id=scope_id, query=query, asset_ids=_ev["asset_ids"])
++                return _search_from_prior_result_set(
++                    rs, scope_id, query=query, user_goal=user_message)
+         # canonical 结构化约束始终作为 filters 增强（覆盖 agent 的坏值如"所有时间"），
+         # 保留 hybrid 语义 query，避免 v1 空 query 走纯元数据路径丢失 OCR/关键词召回。
+         if ci.get("time"):
+@@ -878,7 +1016,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+                     prior_rs = rs_store.get(prior_rs_id)
+                 except Exception:
+                     prior_rs = None
+-        anchored = _search_from_prior_result_set(prior_rs, scope_id)
++        anchored = _search_from_prior_result_set(
++            prior_rs, scope_id, query=query, user_goal=_user_msg)
+         if anchored is not None:
+             return anchored
+         # W2.4：turn-0 无结果集时，引用解析到 Event（二级锚）
+@@ -887,7 +1026,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+             _ns = type("RS", (), {})()
+             _ns.asset_ids = ev["asset_ids"]
+             _ns.result_set_id = "event_" + ev["event_id"]
+-            return _search_from_prior_result_set(_ns, scope_id)
++            rs = _RUNTIME["result_sets"].new(
++                scope_id=scope_id, query=query, asset_ids=ev["asset_ids"])
++            return _search_from_prior_result_set(
++                rs, scope_id, query=query, user_goal=_user_msg)
+     viewer_id = (context or {}).get("viewer_id") or "owner"
+     draft = _draft_from_filters({**filters, "query": query}, answer_type="asset_set")
+     draft.result_requirement = {"mode": mode}
+@@ -904,49 +1046,24 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+         unresolved=[g.get("reason") for g in (packet.gaps or [])],
+     )
+     preview = []
+-    handles = rs.handles()
+     store = _RUNTIME.get("store")
+-    for i, item in enumerate(assets[:6]):
+-        handle = f"photo_{i + 1}"
+-        place = ""
+-        media_kind = "original_image"
+-        source_video_asset_id = None
+-        source_timestamp_sec = None
+-        source_scene_index = None
+-        source_video_file_name = None
+-        if store is not None:
+-            try:
+-                asset = store.get_asset(item.get("asset_id")) or {}
+-                place = _short_place_label(asset)
+-                if asset.get("derived_kind") == "video_keyframe":
+-                    media_kind = "video_keyframe"
+-                    source_video_asset_id = asset.get("parent_asset_id")
+-                    source_timestamp_sec = asset.get("source_timestamp_sec")
+-                    source_scene_index = asset.get("source_scene_index")
+-                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+-                    source_video_file_name = (source_video or {}).get("file_name")
+-            except Exception:
+-                place = ""
+-        preview.append({
+-            "handle": handle,
+-            "captured_at": item.get("captured_at"),
+-            "level": item.get("level"),
+-            "place": place,
+-            "media_kind": media_kind,
+-            "source_video_asset_id": source_video_asset_id,
+-            "source_timestamp_sec": source_timestamp_sec,
+-            "source_scene_index": source_scene_index,
+-            "source_video_file_name": source_video_file_name,
+-            "condition_summary": _condition_summary(item),
+-        })
+-    _RUNTIME["last_handles"] = handles
++    preview_indices = _preview_indices(asset_ids, mode, store, query=query)
++    preview = [
++        _preview_entry(
++            store,
++            asset_ids[index],
++            f"photo_{index + 1}",
++            level=(assets[index].get("level") if index < len(assets) else "exact"),
++            condition_summary=_condition_summary(assets[index]),
++        )
++        for index in preview_indices
++    ]
+     cond, satisfaction, answerability = _truth_contract(packet, rs.total)
+     return {
+         "result_set_id": rs.result_set_id,
+         "query": query,
+         "mode": mode,
+         "total": rs.total,
+-        "asset_ids": asset_ids[:50],
+         "evidence_count": len(asset_ids),
+         "preview": preview,
+         "has_more": len(asset_ids) > len(preview),
+@@ -1151,8 +1268,15 @@ def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
+         page_no = max(1, int(arguments.get("page") or 1))
+     except (TypeError, ValueError):
+         page_no = 1
++    if arguments.get("query") or arguments.get("filters"):
++        return {
++            "summary": "新的查询条件不能翻旧结果集，请重新调用 search_memories。",
++            "total": 0,
++            "requires_new_search": True,
++            "blocked": ["new_query_requires_search"],
++        }
+     try:
+-        page_size = min(20, max(1, int(arguments.get("page_size") or 6)))
++        page_size = min(_RESULT_PAGE_SIZE, max(1, int(arguments.get("page_size") or _RESULT_PAGE_SIZE)))
+     except (TypeError, ValueError):
+         page_size = 6
+     rs_store = _RUNTIME.get("result_sets")
+@@ -1193,10 +1317,14 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
+     asset_id = None
+     result_set_id = task_state.get("current_result_set")
+     rs_store = _RUNTIME.get("result_sets")
++    used_result_set = False
+     if result_set_id and rs_store is not None:
+         asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
+-    if not asset_id:
+-        asset_id = _handle_to_asset_id(asset_handle)
++        used_result_set = True
++    if not asset_id and not used_result_set:
++        return {"summary": "请先通过 search_memories 建立当前结果集。",
++                "certainty": "uncertain", "persisted": False,
++                "blocked": ["no_current_result_set"]}
+     store = _RUNTIME.get("store")
+     if not asset_id or store is None:
+         return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False,
+@@ -1680,7 +1808,7 @@ def register_tools():
+     ))
+     register(ToolSpec(
+         name="get_result_page",
+-        description="查看 search_memories 结果集的下一页/指定页。result_set_id 用 search_memories 返回的，page 从 1 开始。",
++        description="查看 search_memories 结果集的下一页/指定页（每页最多6张）。result_set_id 用 search_memories 返回的，page 从 1 开始。若要改变查询条件，重新调用 search_memories，不要把新条件传给本工具。",
+         input_schema={"result_set_id": "", "page": 1, "page_size": 6},
+         executor=_get_result_page, read_write="read", cost_class="cheap", readiness="ready",
+         produces_evidence=("memory_asset",),
+diff --git a/backend/app.py b/backend/app.py
+index 53642467..6448eacb 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import BaseModel, Field
+ 
+ from .agent_conversation import ConversationStore
++from .agent_runtime.result_set import debug_asset_projection
+ from .db import MemoryStore, make_id
+ from .image_io import (
+     encode_jpeg_preview,
+@@ -2453,13 +2454,26 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
+                    "problems": list(s.get("problems") or [])}
+                   for s in turn.steps if s.get("type") == "judge"],
+     }
+-    tool_trace = [
+-        {"tool": s.get("tool", ""), "status": s.get("status", ""),
+-         "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
+-         "error": s.get("error") or "",
+-         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
+-        for s in turn.steps if s.get("type") == "tool"
+-    ]
++    tool_trace = []
++    for step in turn.steps:
++        if step.get("type") != "tool":
++            continue
++        observation = step.get("observation") or {}
++        trace = {
++            "tool": step.get("tool", ""), "status": step.get("status", ""),
++            "latency_s": step.get("latency_s"), "reason": step.get("reason") or "",
++            "error": step.get("error") or "",
++            "retrieval_timing": observation.get("retrieval_timing"),
++        }
++        # Benchmark/debug consumers need to score returned handles, but model-facing
++        # observations must continue to hide internal asset IDs.
++        if include_debug and step.get("tool") in {"search_memories", "get_result_page"}:
++            result_set_id = observation.get("result_set_id")
++            result_sets = getattr(runtime_tools, "_RUNTIME", {}).get("result_sets")
++            result_set = result_sets.get(result_set_id) if result_sets and result_set_id else None
++            if result_set is not None:
++                trace.update(debug_asset_projection(result_set, observation.get("preview")))
++        tool_trace.append(trace)
+     return {
+         "answer": turn.final_answer,
+         "model_call_metrics": ordered_metrics,
+diff --git a/backend/db.py b/backend/db.py
+index 79b31898..5df7d309 100644
+--- a/backend/db.py
++++ b/backend/db.py
+@@ -454,6 +454,7 @@ class MemoryStore:
+                 confidence REAL NOT NULL DEFAULT 0,
+                 raw_json TEXT NOT NULL DEFAULT '{}',
+                 canonical_json TEXT NOT NULL DEFAULT '{}',
++                detail_json TEXT NOT NULL DEFAULT '{}',
+                 source_owner_id TEXT,
+                 inferred_captured_by TEXT,
+                 clothing_json TEXT NOT NULL DEFAULT '[]',
+@@ -1149,6 +1150,7 @@ class MemoryStore:
+         )
+         self.connection.commit()
+         self._ensure_columns("memory_spaces", {"include_in_people": "INTEGER NOT NULL DEFAULT 1"})
++        self._ensure_columns("observations", {"detail_json": "TEXT NOT NULL DEFAULT '{}'"})
+         self._ensure_columns("face_instances", {"validity": "TEXT NOT NULL DEFAULT 'uncertain'"})
+         self._ensure_columns("entities", {
+             "identity_state": "TEXT NOT NULL DEFAULT 'clustered'",
+@@ -1761,8 +1763,8 @@ class MemoryStore:
+             """INSERT INTO observations(
+                 id, scope_id, asset_id, captured_at, source_type, caption, activity, place,
+                 people_json, objects_json, ocr_text, event_type, transcript, confidence, raw_json,
+-                canonical_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at, updated_at
+-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                canonical_json, detail_json, source_owner_id, inferred_captured_by, clothing_json, spatial_relations_json, revision, created_at, updated_at
++            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             (
+                 observation_id,
+                 scope_id,
+@@ -1780,6 +1782,7 @@ class MemoryStore:
+                 float(data.get("confidence", 0) or 0),
+                 json_value(data.get("raw"), {}),
+                 json_value(data.get("canonical"), {}),
++                json_value(data.get("detail"), {}),
+                 data.get("source_owner_id"),
+                 data.get("inferred_captured_by"),
+                 json_value(data.get("clothing"), []),
+@@ -1793,12 +1796,13 @@ class MemoryStore:
+         return self.get_observation(observation_id)
+ 
+     def get_observation(self, observation_id):
+-        result = self._decode(self._row("SELECT * FROM observations WHERE id = ?", (observation_id,)), ["people_json", "objects_json", "raw_json", "canonical_json", "clothing_json", "spatial_relations_json"])
++        result = self._decode(self._row("SELECT * FROM observations WHERE id = ?", (observation_id,)), ["people_json", "objects_json", "raw_json", "canonical_json", "detail_json", "clothing_json", "spatial_relations_json"])
+         if result:
+             result["people"] = result.get("people_json", [])
+             result["objects"] = result.get("objects_json", [])
+             result["raw"] = result.get("raw_json", {})
+             result["canonical"] = result.get("canonical_json", {})
++            result["detail"] = result.get("detail_json", {})
+             result["clothing"] = result.get("clothing_json", [])
+             result["spatial_relations"] = result.get("spatial_relations_json", [])
+         return result
+@@ -1807,9 +1811,10 @@ class MemoryStore:
+         observation = self.get_observation(observation_id)
+         if not observation:
+             return None
+-        canonical = {**(observation.get("canonical") or {}), **{key: value for key, value in details.items() if value not in (None, "", [], {})}}
+-        assignments = ["canonical_json = ?", "revision = revision + 1"]
+-        params = [json_value(canonical, {})]
++        canonical = {**(observation.get("canonical") or {}), **{key: value for key, value in details.items() if key != "detail" and value not in (None, "", [], {})}}
++        detail = {**(observation.get("detail") or {}), **(details.get("detail") or {})}
++        assignments = ["canonical_json = ?", "detail_json = ?", "revision = revision + 1"]
++        params = [json_value(canonical, {}), json_value(detail, {})]
+         for key, column in (("objects", "objects_json"), ("clothing", "clothing_json"), ("spatial_relations", "spatial_relations_json")):
+             if key in details:
+                 assignments.append(f"{column} = ?")
+@@ -1841,11 +1846,12 @@ class MemoryStore:
+             rows = self._rows("SELECT * FROM observations ORDER BY created_at DESC LIMIT ?", (limit,))
+         values = []
+         for row in rows:
+-            value = self._decode(row, ["people_json", "objects_json", "raw_json", "canonical_json", "clothing_json", "spatial_relations_json"])
++            value = self._decode(row, ["people_json", "objects_json", "raw_json", "canonical_json", "detail_json", "clothing_json", "spatial_relations_json"])
+             value["people"] = value.get("people_json", [])
+             value["objects"] = value.get("objects_json", [])
+             value["raw"] = value.get("raw_json", {})
+             value["canonical"] = value.get("canonical_json", {})
++            value["detail"] = value.get("detail_json", {})
+             value["clothing"] = value.get("clothing_json", [])
+             value["spatial_relations"] = value.get("spatial_relations_json", [])
+             values.append(value)
+diff --git a/backend/model_clients.py b/backend/model_clients.py
+index 35d24929..5c42c49a 100644
+--- a/backend/model_clients.py
++++ b/backend/model_clients.py
+@@ -1023,8 +1023,8 @@ class GammaClient:
+         file_path = Path(path)
+         encoded, mime_type = self._encode_core_image(file_path)
+         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
+-严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；确实看不清才用空数组或空字符串。
+-字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
++严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过160字；activity、place、event_type 各不超过40字；people、objects、clothing、emotions、spatial_relations 尽量完整记录（分别最多12、40、12、12、40项），每项可包含不超过80字的可见细节；facts 最多8项；ocr_text 不超过1000字；确实看不清才用空数组或空字符串。
++字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts、detail。detail 用于保存不应被短摘要丢弃的可验证细节，包含 visible_details、regions、text_blocks、uncertainties 四个数组，每项写清可见内容和 confidence，不要猜测。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
+ 地点主类只能从："""
+         prompt += "、".join(PLACE_PRIMARY_TYPES)
+         prompt += "；物品主类只能从："
+@@ -1036,14 +1036,14 @@ class GammaClient:
+         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
+         if not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text")) and not parsed.get("people") and not parsed.get("objects"):
+             recovery_prompt = """首轮图片结果只有分类或为空，请补齐可验证的自然语言观察。只根据图片，不猜测姓名，不输出坐标。
+-严格返回简体中文 JSON：caption（图片中看到什么，20字内）、activity（正在发生什么，10字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，10字内）、event_type（10字内）、people（最多2项）、objects（最多4项）、ocr_text（20字内）。画面确实看不清才留空；不要只返回分类字段。"""
++严格返回简体中文 JSON：caption（图片中看到什么，160字内）、activity（正在发生什么，40字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，40字内）、event_type（40字内）、people（最多12项）、objects（最多40项）、ocr_text（1000字内）、detail（visible_details/regions/text_blocks/uncertainties）。画面确实看不清才留空；不要只返回分类字段。"""
+             recovered = parse_json_response(self.chat(recovery_prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
+             for key in ("caption", "activity", "place", "event_type", "people", "objects", "ocr_text"):
+                 if recovered.get(key) not in (None, "", []):
+                     parsed[key] = recovered[key]
+         scalar_text = " ".join(as_text(parsed.get(key)) for key in ("caption", "activity", "place", "event_type", "ocr_text"))
+         if contains_latin_text(scalar_text):
+-            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："
++            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts、detail。detail 必须保留 visible_details、regions、text_blocks、uncertainties。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："
+             canonical_prompt += "、".join(SCENE_TYPE_OPTIONS)
+             canonical_prompt += "。\n原始观察：" + json.dumps(parsed, ensure_ascii=False)
+             parsed = parse_json_response(self.chat(canonical_prompt))
+@@ -1053,6 +1053,16 @@ class GammaClient:
+         parsed["emotions"] = as_list(parsed.get("emotions"))
+         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
+         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
++        detail = parsed.get("detail") if isinstance(parsed.get("detail"), dict) else {}
++        parsed["detail"] = {
++            "schema_version": 1,
++            "visible_details": as_list(detail.get("visible_details")),
++            "regions": as_list(detail.get("regions")),
++            "text_blocks": as_list(detail.get("text_blocks")),
++            "uncertainties": as_list(detail.get("uncertainties")),
++            **{key: value for key, value in detail.items()
++               if key not in {"visible_details", "regions", "text_blocks", "uncertainties"}},
++        }
+         normalize_analysis_fields(parsed)
+         parsed = normalize_semantic_analysis(parsed)
+         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
+@@ -1070,7 +1080,7 @@ class GammaClient:
+         prompt = """你是家庭视频事件观察器。输入是同一连续事件中按时间顺序排列的3至5张临时证据图。
+ 综合全部图片和YOLO时间序列语义，描述事件期间可验证的人物、物品、环境与活动变化；不能只描述第一张或最后一张，不能猜测姓名或关系。忽略单纯的站立、坐着、抬手等低信息动作，除非它们对事件变化不可缺少。
+ caption 和 activity 必须由选中的证据图片直接支持，不得描述已经离开画面的活动。返回 representative_indices：能够覆盖 caption、activity 和事件中不同阶段的最小图片序号集合，从0开始，最多3张。单一活动或相似画面只能选1张；只有出现不同地点、不同活动阶段且单图无法覆盖时才选2至3张，例如“泳池环境”和“烧烤操作”应各选一张。禁止选择重复画面。
+-严格返回简体中文 JSON：caption（20字内）、activity（15字内）、place（10字内）、scene_type、semantic、people（最多4项）、objects（最多8项）、clothing（最多4项）、emotions（最多4项）、spatial_relations（最多6项）、ocr_text（40字内）、event_type、facts（最多2项）、representative_indices（整数数组，1至3项）。
++严格返回简体中文 JSON：caption（160字内）、activity（60字内）、place（40字内）、scene_type、semantic、people（最多20项）、objects（最多60项）、clothing（最多20项）、emotions（最多20项）、spatial_relations（最多60项）、ocr_text（1000字内）、event_type、facts（最多12项）、detail（visible_details/regions/text_blocks/uncertainties）、representative_indices（整数数组，1至3项）。
+ 图片顺序和事件上下文：""" + json.dumps({
+             "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
+         }, ensure_ascii=False)
+@@ -1081,6 +1091,16 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述
+         parsed["emotions"] = as_list(parsed.get("emotions"))
+         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
+         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
++        detail = parsed.get("detail") if isinstance(parsed.get("detail"), dict) else {}
++        parsed["detail"] = {
++            "schema_version": 1,
++            "visible_details": as_list(detail.get("visible_details")),
++            "regions": as_list(detail.get("regions")),
++            "text_blocks": as_list(detail.get("text_blocks")),
++            "uncertainties": as_list(detail.get("uncertainties")),
++            **{key: value for key, value in detail.items()
++               if key not in {"visible_details", "regions", "text_blocks", "uncertainties"}},
++        }
+         normalize_analysis_fields(parsed)
+         parsed = normalize_semantic_analysis(parsed)
+         raw_indices = parsed.get("representative_indices")
+diff --git a/backend/pipeline.py b/backend/pipeline.py
+index d3549b59..05d52c69 100644
+--- a/backend/pipeline.py
++++ b/backend/pipeline.py
+@@ -231,7 +231,12 @@ class IngestionPipeline:
+             )
+             fact_text = " ".join(f"{item.get('subject', '')} {item.get('predicate', '')} {item.get('object', '')}" for item in result.get("facts", []))
+             clothing_text = " ".join(str(item) for item in (observation.get("clothing") or []))
+-            text_embedding, text_model = self._text_embed(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text])))
++            detail = observation.get("detail") or {}
++            detail_text = " ".join(
++                str(item.get("text") or item.get("label") or item)
++                for item in (detail.get("visible_details") or [])
++            ) if isinstance(detail, dict) else ""
++            text_embedding, text_model = self._text_embed(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text, detail_text])))
+             self.store.upsert_vector("episodic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
+             self.store.upsert_vector("episodic", "event", event["id"], text_embedding, text_model, {"observation_id": observation["id"]})
+             self.store.upsert_vector("semantic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
+@@ -394,6 +399,22 @@ class IngestionPipeline:
+         })
+         vision_seconds = time.perf_counter() - vision_started
+         analysis = normalize_semantic_analysis(analysis)
++        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
++        analysis["detail"] = {
++            "schema_version": 1,
++            **detail,
++            "caption": analysis.get("caption", ""),
++            "activity": analysis.get("activity", ""),
++            "place": analysis.get("place", ""),
++            "people": analysis.get("people", []),
++            "objects": analysis.get("objects", []),
++            "clothing": analysis.get("clothing", []),
++            "emotions": analysis.get("emotions", []),
++            "spatial_relations": analysis.get("spatial_relations", []),
++            "ocr_text": analysis.get("ocr_text", ""),
++            "event_type": analysis.get("event_type", ""),
++            "facts": analysis.get("facts", []),
++        }
+         analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
+         analysis["location_context"] = metadata.get("reverse_geocode") or {}
+         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
+@@ -411,7 +432,12 @@ class IngestionPipeline:
+             return str(item)
+ 
+         object_text = " ".join(object_text(item) for item in objects)
+-        text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text]))
++        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
++        detail_text = " ".join(
++            str(item.get("text") or item.get("label") or item)
++            for item in (detail.get("visible_details") or [])
++        )
++        text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text, detail_text]))
+         embedding_started = time.perf_counter()
+         embedding, embedding_model = self._text_embed(text)
+         embedding_seconds = time.perf_counter() - embedding_started
+@@ -647,6 +673,22 @@ class IngestionPipeline:
+             faces, face_seconds = timed(lambda: self.face.detect(path))
+             clip_embedding, clip_seconds = timed(lambda: self.clip.embed_image(path))
+         analysis = normalize_semantic_analysis(analysis)
++        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
++        analysis["detail"] = {
++            "schema_version": 1,
++            **detail,
++            "caption": analysis.get("caption", ""),
++            "activity": analysis.get("activity", ""),
++            "place": analysis.get("place", ""),
++            "people": analysis.get("people", []),
++            "objects": analysis.get("objects", []),
++            "clothing": analysis.get("clothing", []),
++            "emotions": analysis.get("emotions", []),
++            "spatial_relations": analysis.get("spatial_relations", []),
++            "ocr_text": analysis.get("ocr_text", ""),
++            "event_type": analysis.get("event_type", ""),
++            "facts": analysis.get("facts", []),
++        }
+         analysis["clip_embedding"] = clip_embedding
+         analysis["processing_timings"] = {
+             "vision_seconds": round(vision_seconds, 4),
+diff --git a/backend/retrieval_indexes.py b/backend/retrieval_indexes.py
+index 2f059261..4a49a115 100644
+--- a/backend/retrieval_indexes.py
++++ b/backend/retrieval_indexes.py
+@@ -17,7 +17,7 @@ import uuid
+ from typing import Iterable
+ 
+ 
+-_FIELD_TYPES = ("place", "activity", "object", "clothing", "ocr", "person_bridge", "caption")
++_FIELD_TYPES = ("place", "activity", "object", "clothing", "ocr", "person_bridge", "caption", "detail")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -86,6 +86,21 @@ def _terms_from_field(observation, field_type, source_key):
+             yield field_type, value
+ 
+ 
++def _terms_from_detail(observation):
++    detail = observation.get("detail") or {}
++    if not isinstance(detail, dict):
++        return
++    for key in ("visible_details", "regions", "text_blocks"):
++        for item in detail.get(key) or []:
++            if isinstance(item, dict):
++                value = " ".join(str(item.get(name) or "") for name in ("text", "label", "description"))
++            else:
++                value = str(item or "")
++            value = _normalize(value)
++            if value:
++                yield "detail", value
++
++
+ class RetrievalIndex:
+     """Manage the ``observation_search_terms`` derived table.
+ 
+@@ -170,6 +185,11 @@ class RetrievalIndex:
+                     _make_id(), observation_id, asset_id, scope_id, field_type, value,
+                     confidence, "observation", revision,
+                 ))
++        for _, value in _terms_from_detail(observation):
++            rows.append((
++                _make_id(), observation_id, asset_id, scope_id, "detail", value,
++                confidence, "observation_detail", revision,
++            ))
+         if rows:
+             now = observation.get("updated_at") or observation.get("created_at") or ""
+             for row in rows:
+diff --git a/backend/tests/test_agent2_answer_context.py b/backend/tests/test_agent2_answer_context.py
+index 26efbfd6..1f0eec58 100644
+--- a/backend/tests/test_agent2_answer_context.py
++++ b/backend/tests/test_agent2_answer_context.py
+@@ -1,10 +1,15 @@
+ import json
+ import os
++import re
+ import unittest
+ from unittest.mock import patch
+ 
+ from backend.agent_runtime.evidence_ledger import EvidenceLedger, LedgerEntry
+-from backend.agent_runtime.final_writer import build_answer_writer_messages, clean_writer_output
++from backend.agent_runtime.final_writer import (
++    build_answer_writer_messages,
++    clean_writer_output,
++    rewrite_final,
++)
+ from backend.agent_runtime.task_state import EvidenceRequirement, TaskDeclaration, TaskState
+ 
+ 
+@@ -37,6 +42,48 @@ class Agent2AnswerContextTests(unittest.TestCase):
+         self.assertEqual(clean_writer_output("活动在秦皇岛"), "活动在秦皇岛。")
+         self.assertEqual(clean_writer_output('{"action":"final","answer":"活动在秦皇岛"}'), "活动在秦皇岛。")
+ 
++    def test_clean_writer_output_removes_photo_handle_parenthetical(self):
++        output = clean_writer_output(
++            "我为您找到的这张照片（photo_1）实际上是在河北省邯郸市永年区的室内家居环境中拍摄的..."
++        )
++
++        self.assertEqual(
++            output,
++            "我为您找到的这张照片实际上是在河北省邯郸市永年区的室内家居环境中拍摄的...。",
++        )
++        self.assertNotRegex(output, r"(?i)(?<![A-Za-z0-9_])photo_\d+(?![A-Za-z0-9_])")
++        self.assertNotIn("（）", output)
++
++    def test_clean_writer_output_naturalizes_bare_and_multiple_photo_handles(self):
++        cases = {
++            "photo_2显示的是室内家居环境。": "这张照片显示的是室内家居环境。",
++            "画面来自photo_3，地点在河北。": "画面来自这张照片，地点在河北。",
++            "这是室内照片（photo_4）。": "这是室内照片。",
++            "photo_5和photo_6展示了同一处场景。": "这些照片展示了同一处场景。",
++            "这些画面（photo_7、photo_8）拍摄于河北。": "这些画面拍摄于河北。",
++        }
++
++        for source, expected in cases.items():
++            with self.subTest(source=source):
++                output = clean_writer_output(source)
++                self.assertEqual(output, expected)
++                self.assertIsNone(re.search(r"(?i)(?<![A-Za-z0-9_])photo_\d+(?![A-Za-z0-9_])", output))
++
++    def test_photo_handle_cleanup_does_not_match_embedded_identifier(self):
++        self.assertEqual(
++            clean_writer_output("型号是my_photo_1_variant"),
++            "型号是my_photo_1_variant。",
++        )
++
++    def test_rewrite_final_removes_photo_handle(self):
++        output = rewrite_final(
++            lambda _messages, **_kwargs: "照片（photo_9）是在河北拍的。",
++            {},
++            "draft",
++        )
++
++        self.assertEqual(output, "照片是在河北拍的。")
++
+     def test_answer_context_flag_is_opt_in(self):
+         ledger = EvidenceLedger(scope_id="album1")
+         ledger.append(LedgerEntry(
+diff --git a/backend/tests/test_pipeline.py b/backend/tests/test_pipeline.py
+index c737691f..5dc335ec 100644
+--- a/backend/tests/test_pipeline.py
++++ b/backend/tests/test_pipeline.py
+@@ -99,6 +99,8 @@ class PipelineTests(unittest.TestCase):
+             self.assertEqual(result["status"], "processed")
+             observation = store.list_observations()[0]
+             self.assertEqual(observation["ocr_text"], "生日快乐")
++            self.assertEqual(observation["detail"]["schema_version"], 1)
++            self.assertEqual(observation["detail"]["objects"][0]["label"], "蛋糕")
+             self.assertEqual(store.count("events"), 1)
+             self.assertEqual(store.count("face_clusters"), 1)
+             self.assertEqual({item["entity_type"] for item in store.list_entities()}, {"person", "place", "object", "time"})
+diff --git a/backend/video/hybrid_keyframe.py b/backend/video/hybrid_keyframe.py
+index 2db96f1d..bc6dd594 100755
+--- a/backend/video/hybrid_keyframe.py
++++ b/backend/video/hybrid_keyframe.py
+@@ -262,6 +262,18 @@ def _merge_frames(frames, max_duration=300.0, max_gap=30.0):
+             "objects": objects,
+             "actions": actions,
+             "expressions": expressions,
++            "frame_observations": [
++                {
++                    "source_timestamp_sec": row.get("source_timestamp_sec"),
++                    "event_start_sec": row.get("event_start_sec"),
++                    "event_end_sec": row.get("event_end_sec"),
++                    "objects": row.get("objects") or [],
++                    "actions": row.get("actions") or [],
++                    "expressions": row.get("expressions") or [],
++                    "event_label": row.get("event_label") or "",
++                }
++                for row in group
++            ],
+             "source_frame_count": len(group),
+             "duplicate_frame_count": duplicate_count,
+             "visual_duplicate_count": max(0, len(valid) - len(representatives)),
+diff --git a/backend/video/processor.py b/backend/video/processor.py
+index 1cdd66b9..766d4598 100644
+--- a/backend/video/processor.py
++++ b/backend/video/processor.py
+@@ -352,6 +352,13 @@ class VideoMemoryAdapter:
+                     "memory_duplicate_frame_removal": True, "source_event_ids": item["source_event_ids"],
+                     "source_frame_count": item["source_frame_count"], "duplicate_frame_count": item["duplicate_frame_count"],
+                     "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
++                    "frame_observations": item.get("frame_observations") or [],
++                    "event_detail": {
++                        key: event_analysis.get(key)
++                        for key in ("caption", "activity", "people", "objects", "clothing",
++                                    "spatial_relations", "ocr_text", "facts", "detail")
++                        if event_analysis.get(key) not in (None, "", [], {})
++                    },
+                     "vlm_evidence_count": len(evidence_paths),
+                     "vlm_evidence_persisted": len(representatives),
+                     "vlm_selected_evidence_indices": [
+diff --git a/scripts/maintenance/build_text_ann_space.py b/scripts/maintenance/build_text_ann_space.py
+index 8b1c5f90..bafc342e 100644
+--- a/scripts/maintenance/build_text_ann_space.py
++++ b/scripts/maintenance/build_text_ann_space.py
+@@ -29,9 +29,14 @@ def observation_text(obs) -> str:
+         f"{f.get('subject', '')} {f.get('predicate', '')} {f.get('object', '')}"
+         for f in facts if isinstance(f, dict)
+     )
++    detail = obs.get("detail") or {}
++    detail_text = " ".join(
++        str(item.get("text") or item.get("label") or item)
++        for item in (detail.get("visible_details") or [])
++    ) if isinstance(detail, dict) else ""
+     return " ".join(filter(None, [
+         obs.get("caption"), obs.get("activity"), obs.get("place"),
+-        obs.get("ocr_text"), obs.get("transcript"), clothing, fact_text,
++        obs.get("ocr_text"), obs.get("transcript"), clothing, fact_text, detail_text,
+     ]))
+ 
+ 
+diff --git a/scripts/runtime/start_sentrix_api_8091.sh b/scripts/runtime/start_sentrix_api_8091.sh
+index 18ee3e2a..99b28a20 100755
+--- a/scripts/runtime/start_sentrix_api_8091.sh
++++ b/scripts/runtime/start_sentrix_api_8091.sh
+@@ -17,7 +17,8 @@ unset PYTHONNOUSERSITE
+ NVIDIA_RUNTIME_ROOT=/home/asus/Github/Sentrix-Home-Web/.venv/lib/python3.10/site-packages/nvidia
+ NVIDIA_RUNTIME_LIBS=$(find "$NVIDIA_RUNTIME_ROOT" -mindepth 2 -maxdepth 2 -type d -name lib -printf '%p:')
+ export LD_LIBRARY_PATH="${NVIDIA_RUNTIME_LIBS}${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH}"
+-exec env CUDA_VISIBLE_DEVICES=0 SENTRIX_PIPELINE_MAX_WORKERS=12 SENTRIX_PIPELINE_MAX_RETRIES=1 SENTRIX_EVENT_SUMMARY_MAX_WORKERS=16 SENTRIX_FACE_GPU_SESSION_LIMIT_MIB=1024 SENTRIX_RETINAFACE_GPU_SESSION_LIMIT_MIB=768 SENTRIX_FACE_GPU_MAX_CONCURRENCY=4 SENTRIX_API_PORT=8091 SENTRIX_THIN_AGENT_V1=1 SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1=1 SENTRIX_IMAGE_EMBEDDER=chinese_clip SENTRIX_TEXT_EMBEDDER=bge SENTRIX_MODEL_SPLIT_V1=1 SENTRIX_AGENT_MODEL_PROFILE=quality_12b SENTRIX_AGENT_STAGE_TRACE=1 SENTRIX_CONVERSATION_STORE_V1=1 SENTRIX_EVIDENCE_ANSWER_12B=1 CLIP_DEVICE=cpu \
++# Bound turn workers because each worker can retain visual/embed resources; batch fan-out otherwise causes process-level OOM.
++exec env CUDA_VISIBLE_DEVICES=0 SENTRIX_ASSISTANT_TURN_WORKERS=4 SENTRIX_PIPELINE_MAX_WORKERS=12 SENTRIX_PIPELINE_MAX_RETRIES=1 SENTRIX_EVENT_SUMMARY_MAX_WORKERS=16 SENTRIX_FACE_GPU_SESSION_LIMIT_MIB=1024 SENTRIX_RETINAFACE_GPU_SESSION_LIMIT_MIB=768 SENTRIX_FACE_GPU_MAX_CONCURRENCY=4 SENTRIX_API_PORT=8091 SENTRIX_THIN_AGENT_V1=1 SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1=1 SENTRIX_IMAGE_EMBEDDER=chinese_clip SENTRIX_TEXT_EMBEDDER=bge SENTRIX_MODEL_SPLIT_V1=1 SENTRIX_AGENT_MODEL_PROFILE=quality_12b SENTRIX_AGENT_STAGE_TRACE=1 SENTRIX_CONVERSATION_STORE_V1=1 SENTRIX_EVIDENCE_ANSWER_12B=1 CLIP_DEVICE=cpu \
+   FACE_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider RETINAFACE_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider FACE_EMBEDDING_MODE=adaface ADAFACE_DEVICE=cpu \
+   ADAFACE_MODEL_PATH=/home/asus/models/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt ADAFACE_REPO_ROOT=/home/asus/models/AdaFace \
+   SENTRIX_CANONICAL_SEARCH=1 SENTRIX_RX_V1=1 SENTRIX_AGENT2_ANSWER_CONTEXT=1 SENTRIX_ANSWER_BRIEF_V1=1 SENTRIX_RESPONSE_PLAN_V1=1 SENTRIX_VISIBLE_EVIDENCE_V1=1 \
+diff --git a/services/photobench/tests/test_image_extraction.py b/services/photobench/tests/test_image_extraction.py
+index 42fa02d7..0a62435b 100644
+--- a/services/photobench/tests/test_image_extraction.py
++++ b/services/photobench/tests/test_image_extraction.py
+@@ -48,6 +48,20 @@ class ExtractImageIdsTests(unittest.TestCase):
+ 
+         self.assertEqual(MODULE._extract_image_ids(result), ["asset_1", "asset_2"])
+ 
++    def test_extracts_debug_asset_ids_without_model_facing_asset_ids(self):
++        result = {
++            "tool_trace": [
++                {"tool": "search_memories", "debug_asset_ids": ["asset_1", "asset_2"]}
++            ],
++            "task_state": {
++                "tool_results": [
++                    {"tool": "search_memories", "preview": [{"handle": "photo_1"}]}
++                ]
++            },
++        }
++
++        self.assertEqual(MODULE._extract_image_ids(result), ["asset_1", "asset_2"])
++
+     def test_does_not_scan_unrelated_images_or_ground_truth(self):
+         result = {
+             "gt_images": [{"asset_id": "asset_gt"}],
+diff --git a/services/photobench/tests/test_suite_control.py b/services/photobench/tests/test_suite_control.py
+index b7f474bc..481947ca 100644
+--- a/services/photobench/tests/test_suite_control.py
++++ b/services/photobench/tests/test_suite_control.py
+@@ -63,6 +63,91 @@ class SuiteControlTests(unittest.TestCase):
+ 
+         self.assertEqual(list(repository.runs), [self.run.run_id])
+ 
++    def test_query_current_model_verifies_live_served_name(self):
++        repository = MODULE.OrchestratorRepository(Path(self.results.name) / "current-query")
++
++        def request(url, **_kwargs):
++            if url.endswith("/state"):
++                return {
++                    "profile": "qwen3.5-4b",
++                    "served_model_name": "qwen3.5-4b",
++                    "max_num_seqs": 12,
++                }
++            if url.endswith("/models"):
++                return {"data": [{"id": "qwen3.5-4b"}]}
++            raise AssertionError(url)
++
++        with patch.object(MODULE, "request_json", side_effect=request):
++            snapshot = repository.query_current_model(
++                "http://manager.invalid", "http://model.invalid/v1",
++            )
++
++        self.assertEqual(snapshot["model_id"], "qwen3.5-4b")
++        self.assertEqual(snapshot["served_model_name"], "qwen3.5-4b")
++        self.assertEqual(snapshot["state"]["max_num_seqs"], 12)
++
++    def test_start_suite_pins_current_model_without_switching(self):
++        repository = MODULE.OrchestratorRepository(Path(self.results.name) / "current-suite")
++        requested_urls = []
++
++        def request(url, *_args, **_kwargs):
++            requested_urls.append(url)
++            if url.endswith("/state"):
++                return {
++                    "profile": "qwen3.5-4b",
++                    "served_model_name": "qwen3.5-4b",
++                    "max_num_seqs": 12,
++                }
++            if url.endswith("/models"):
++                return {"data": [{"id": "qwen3.5-4b"}]}
++            if url.endswith("/api/model-profiles/bind-runtime"):
++                return {"status": "ok"}
++            raise AssertionError(url)
++
++        target = {
++            "manager_url": "http://manager.invalid",
++            "model_base_url": "http://model.invalid/v1",
++        }
++        with (
++            patch.object(MODULE, "resolve_vllm_target", return_value=("test", target)),
++            patch.object(MODULE, "request_json", side_effect=request),
++            patch.object(MODULE.threading.Thread, "start"),
++        ):
++            result = repository.start_suite({
++                "album_id": "album3-14",
++                "qa_set": "compact-10q",
++                "models": [MODULE.CURRENT_MODEL_SELECTION],
++                "sentrix_url": "http://sentrix.invalid",
++            })
++
++        run = repository.runs[result["run_ids"][0]]
++        self.assertEqual(result["models"], ["qwen3.5-4b"])
++        self.assertEqual(run.model_profile, "qwen3.5-4b")
++        self.assertTrue(run.use_current_model)
++        self.assertNotIn("model_deploy", run._selected_phase_names())
++        self.assertFalse(any(url.endswith(("/start", "/stop")) for url in requested_urls))
++
++    def test_current_model_run_skips_deploy_and_is_never_reclaimed(self):
++        manifest = json.loads(
++            (MODULE.BENCHMARK_DATA_ROOT / "album3-14" / "manifest.json").read_text(encoding="utf-8")
++        )
++        run = MODULE.BenchmarkRun(
++            run_id="test-current", album_id="album3-14", manifest=manifest,
++            model_profile="qwen3.5-4b", qa_set="compact-10q",
++            sentrix_url="http://sentrix.invalid", judge_url="http://judge.invalid",
++            vllm_api_url="http://manager.invalid", vllm_target_id="test",
++            vllm_model_base_url="http://model.invalid/v1",
++            results_root=Path(self.results.name), use_current_model=True,
++            current_model_snapshot={"state": {"max_num_seqs": 12}},
++        )
++        self.addCleanup(run._stop_persist_writer)
++
++        self.assertNotIn("model_deploy", run._selected_phase_names())
++        self.assertEqual(run._resolve_qa_concurrency(), 12)
++        with patch.object(MODULE, "request_json") as request:
++            run._reclaim_vllm_after_cancel()
++        request.assert_not_called()
++
+     def test_memory_profile_rejects_existing_active_run(self):
+         repository = MODULE.OrchestratorRepository(Path(self.results.name) / "repository")
+         repository.runs[self.run.run_id] = self.run

@@ -1,7 +1,8 @@
-"""Shadow-only declaration planner for Agent 2.
+"""Goal declaration planner for Agent 2.
 
-The model declares evidence needs; this adapter validates the declaration and
-returns an observable fallback instead of granting it authority to execute.
+The model declares evidence needs in a clean, lightweight format; this adapter validates
+the declaration, maps simplified needs to strict EvidenceRequirements if needed, and returns
+the structured TaskDeclaration.
 """
 
 from __future__ import annotations
@@ -12,25 +13,47 @@ import json
 from dataclasses import dataclass
 
 from .planner_contracts import parse_planner_action
-from .task_state import TaskDeclaration
+from .task_state import TaskDeclaration, EvidenceRequirement
+from .evidence_contract import planner_evidence_types
 
 
-_DECLARATION_PROMPT = """你正在规划一项家庭记忆任务。只返回一个 JSON 对象，格式如下：
-{{"action":"declare","declaration":{{"goal":"<用户目标>","scope_id":"{scope_id}","requirements":[{{"id":"req_1","evidence_type":"<证据类型>","description":"<证据描述>"}}]}}}}
-仅声明回答用户请求所必需的最小证据需求。
-可选的证据类型（evidence_type）包括：
-- memory_asset：相册照片/视频等媒体实体资产
-- visible_text：照片/招牌/菜单/账单中直接可见的文字或数字
-- visual_observation：照片中的视觉细节（如衣服颜色、物品、人物动作等）
-- temporal_metadata：拍摄时间或日期元数据
-- location_metadata：拍摄地点、城市或地标元数据
-- confirmed_identity：确认人物身份或家庭成员关系
-- structured_fact：数据库结构化统计事实（如计数、分组、最早/最近等）
-- memory_reference：记忆引用或历史记录
-- user_statement：用户显式声明的信息
-- transcript：音频或视频转录文本
+# 极简 Planning 提示词：小于 120 tokens，不包含庞杂工具描述与冗余参数
+_DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精简的 JSON 对象，格式如下：
+{{"action":"declare","declaration":{{"goal":"<用户目标>","scope_id":"{scope_id}","requirements":[{{"id":"req_1","evidence_type":"<证据类型>","description":"<描述>"}}]}}}}
+证据类型（evidence_type）只能来自系统注册表，不得创造新类型。
+{evidence_types}
 
-不要调用工具，不要编造不存在的资产，不要输出 SQL，不要直接回答用户。"""
+只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据重复声明。规则：
+- goal 必须用简体中文描述用户目标（家庭记忆系统使用中文，英文目标会导致语义检索
+  与中文图片描述失配、召回失败）；描述要保留完整语义，不要压缩成几个词。
+- 数量、是否存在、分组等结构化问题声明 structured_fact；拍摄时间/日期/年份声明 temporal_metadata；只有用户明确要求找出照片时才增加 memory_asset。
+- 用户没有明确要求“历史对话/之前说过什么”时，不要声明 user_statement。
+- 地点问题声明 location_metadata；照片内容/颜色/动作声明 visual_observation；照片文字/数字声明 visible_text。
+- 身份问题只有在需要确认照片中的人名时才声明 photo_identity；不要用 visual_observation 代替身份。
+- 同一种 evidence_type 只声明一次；不要为了同一个答案同时声明多个等价需求。
+每个 requirement 都必须能由注册表中的工具直接或通过 prerequisite 获得。
+
+不要调用工具，不要输出 SQL，不要直接回答用户。"""
+
+_TYPE_MAP = {
+    "photo": "memory_asset",
+    "image": "memory_asset",
+    "video": "memory_asset",
+    "asset": "memory_asset",
+    "location": "location_metadata",
+    "place": "location_metadata",
+    "time": "temporal_metadata",
+    "date": "temporal_metadata",
+    "person": "confirmed_identity",
+    "identity": "confirmed_identity",
+    "visual": "visual_observation",
+    "detail": "visual_observation",
+    "text": "visible_text",
+    "ocr": "visible_text",
+    "price": "visible_text",
+    "fact": "structured_fact",
+    "count": "structured_fact",
+}
 
 
 @dataclass(frozen=True)
@@ -46,17 +69,23 @@ class PlannerDeclarationResult:
 
 
 class GoalPlanner:
-    def __init__(self, *, chat_fn):
+    def __init__(self, *, chat_fn, enable_format_rewrite: bool = True):
         self.chat_fn = chat_fn
+        self.enable_format_rewrite = enable_format_rewrite
 
     def declare(self, message: str, *, scope_id: str, history: str = "",
                 include_debug: bool = False, step_id: str = "planner_step_0") -> PlannerDeclarationResult:
+        evidence_lines = "\n".join(f"- {item}" for item in planner_evidence_types())
+        prompt = _DECLARATION_PROMPT.format(
+            scope_id=scope_id,
+            evidence_types=evidence_lines,
+        )
         messages = [
-            {"role": "system", "content": _DECLARATION_PROMPT.format(scope_id=scope_id)},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": message},
         ]
         if history:
-            messages.insert(1, {"role": "system", "content": "Conversation context:\n" + history})
+            messages[0]["content"] = messages[0]["content"] + "\n\n历史对话背景：\n" + history
         prompt_copy = copy.deepcopy(messages) if include_debug else None
         try:
             sig = inspect.signature(self.chat_fn)
@@ -68,14 +97,81 @@ class GoalPlanner:
             return PlannerDeclarationResult(fallback_reason="planner_call_error", prompt=prompt_copy)
         try:
             payload = self._parse_json(raw)
+            # 兼容小模型可能返回的扁平或近义词结构
+            payload = self._normalize_payload(payload, scope_id=scope_id, default_goal=message)
             action = parse_planner_action(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return PlannerDeclarationResult(fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
-        if action.kind != "declare" or action.declaration is None:
+            rewritten = self._rewrite_json(raw, message=message) if self.enable_format_rewrite else ""
+            if not rewritten:
+                return PlannerDeclarationResult(
+                    fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
+            try:
+                payload = self._parse_json(rewritten)
+                payload = self._normalize_payload(
+                    payload, scope_id=scope_id, default_goal=message)
+                action = parse_planner_action(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return PlannerDeclarationResult(
+                    fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
+        if action.kind not in {"declare", "revise"} or action.declaration is None:
             return PlannerDeclarationResult(fallback_reason="invalid_planner_action", raw=raw, prompt=prompt_copy)
         if action.declaration.scope_id != scope_id:
             return PlannerDeclarationResult(fallback_reason="scope_mismatch", raw=raw, prompt=prompt_copy)
         return PlannerDeclarationResult(declaration=action.declaration, raw=raw, prompt=prompt_copy)
+
+    @classmethod
+    def _normalize_payload(cls, payload: dict, *, scope_id: str, default_goal: str) -> dict:
+        """把小模型可能简化的 declaration 结构归一为严格 TaskDeclaration schema。"""
+        if not isinstance(payload, dict):
+            return payload
+        decl = payload.get("declaration")
+        if not isinstance(decl, dict):
+            if payload.get("action") == "declare" and ("requirements" in payload or "needs" in payload):
+                decl = payload
+                payload = {"action": "declare", "declaration": decl}
+            else:
+                return payload
+        
+        if not decl.get("scope_id"):
+            decl["scope_id"] = scope_id
+        if not decl.get("goal"):
+            decl["goal"] = default_goal
+            
+        reqs = decl.get("requirements") or decl.get("needs") or []
+        normalized_reqs = []
+        seen_types = set()
+        for idx, item in enumerate(reqs):
+            if isinstance(item, str):
+                etype = _TYPE_MAP.get(item.lower(), "memory_asset")
+                if etype in seen_types:
+                    continue
+                seen_types.add(etype)
+                normalized_reqs.append({
+                    "id": f"req_{idx+1}",
+                    "evidence_type": etype,
+                    "description": item,
+                    "required": True,
+                })
+            elif isinstance(item, dict):
+                etype = str(item.get("evidence_type") or item.get("type") or "memory_asset").strip()
+                etype = _TYPE_MAP.get(etype.lower(), etype)
+                if etype in seen_types:
+                    continue
+                seen_types.add(etype)
+                normalized_reqs.append({
+                    "id": str(item.get("id") or f"req_{idx+1}"),
+                    "evidence_type": etype,
+                    "description": str(item.get("description") or item.get("desc") or ""),
+                    "required": bool(item.get("required", True)),
+                })
+        if not normalized_reqs:
+            normalized_reqs.append({
+                "id": "req_1",
+                "evidence_type": "memory_asset",
+                "description": "查找相关记忆照片",
+            })
+        decl["requirements"] = normalized_reqs
+        return payload
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
@@ -85,10 +181,57 @@ class GoalPlanner:
             if text.endswith("```"):
                 text = text[:-3]
         start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end < start:
+        if start < 0:
             raise ValueError("planner did not return JSON")
-        payload = json.loads(text[start:end + 1])
+        candidate = text[start:]
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            if (exc.pos < len(candidate) - 1
+                    or GoalPlanner._root_brace_balance(candidate) != 1):
+                raise
+            payload = json.loads(candidate + "}")
         if not isinstance(payload, dict):
             raise ValueError("planner action must be an object")
         return payload
+
+    @staticmethod
+    def _root_brace_balance(text: str) -> int:
+        """Return unmatched object braces without treating quoted braces as syntax."""
+        balance = 0
+        quoted = False
+        escaped = False
+        for char in text:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+                continue
+            if char == '"':
+                quoted = True
+            elif char == "{":
+                balance += 1
+            elif char == "}":
+                balance -= 1
+        return balance
+
+    def _rewrite_json(self, raw: str, *, message: str) -> str:
+        """One semantic-preserving format rewrite; no autonomous task recovery."""
+        prompt = [
+            {"role": "system", "content":
+             "只把以下规划输出改写为合法 JSON。不得增加、删除或改变任务语义；"
+             "只输出 JSON，不要 Markdown。"},
+            {"role": "user", "content": "用户任务：\n" + message + "\n原始输出：\n" + str(raw or "")},
+        ]
+        try:
+            sig = inspect.signature(self.chat_fn)
+            if "call_type" in sig.parameters:
+                return self.chat_fn(
+                    prompt, call_type="planner_format_rewrite",
+                    step_id="planner_format_rewrite") or ""
+            return self.chat_fn(prompt) or ""
+        except Exception:
+            return ""

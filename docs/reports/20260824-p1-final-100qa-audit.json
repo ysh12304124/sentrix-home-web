@@ -1,0 +1,2241 @@
+{
+  "run": {
+    "run_id": "20260824-203300-album3-max-qwen3.5-0.8-lora-v2-reuse-f2a498",
+    "path": "services/photobench/results/20260824-203300-album3-max-qwen3.5-0.8-lora-v2-reuse-f2a498/run.json",
+    "status": "completed",
+    "run_valid": true,
+    "qa_count": 100,
+    "summary": {
+      "total": 100,
+      "completed": 100,
+      "retrieval_recall_mean": 0.628,
+      "judge_distribution": {
+        "0": 55,
+        "1": 13,
+        "2": 32
+      },
+      "judge_valid_count": 100,
+      "answer_quality_mean": 0.77,
+      "exact_accuracy": 0.32,
+      "core_accuracy": 0.45,
+      "llm_ttft_ms_mean": 40.2,
+      "llm_tokens_per_second_mean": 399.7,
+      "prompt_tokens_total": 405808,
+      "completion_tokens_total": 29825,
+      "llm_prompt_tokens_max": 4666,
+      "llm_prompt_tokens_p95": 1922,
+      "llm_completion_tokens_max": 384,
+      "llm_completion_tokens_p95": 129,
+      "llm_context_tokens_max": 4472,
+      "llm_context_tokens_p95": 1982,
+      "llm_context_samples_count": 519,
+      "retrieval_precision_micro": 0.108,
+      "retrieval_recall_micro": 0.474,
+      "retrieval_f1_micro": 0.176,
+      "retrieval_metric_count": 100,
+      "evidence_distribution": {
+        "0": 0,
+        "1": 0,
+        "2": 0
+      },
+      "evidence_valid_count": 0,
+      "evidence_mean": null,
+      "evidence_fully_supported_rate": null,
+      "evidence_basically_supported_rate": null,
+      "task_decision_labeled_count": 111,
+      "task_decision_valid_count": 111,
+      "task_decision_accuracy": 0.667,
+      "json_parse_total": 14,
+      "json_parse_success": 10,
+      "json_parse_success_rate": 0.714,
+      "qa_completion_valid_count": 100,
+      "qa_completion_within_steps_rate": 0.83,
+      "e2e_latency_mean_ms": 27730.7,
+      "e2e_latency_p50_ms": 23680.7,
+      "e2e_latency_p95_ms": 54383.1,
+      "e2e_latency_max_ms": 60675.2,
+      "agent_task_latency_mean_ms": 6381.6,
+      "judge_llm_latency_mean_ms": 8142.9,
+      "judge_exclusive_wall_ms": 214102.0,
+      "judge_phase_wall_ms": 214102.5,
+      "judge_concurrency": 4,
+      "agent_throughput_latency_ms": 1608.6,
+      "agent_throughput_latency_mode": "measured_agent_phase",
+      "agent_phase_wall_ms": 160857.8,
+      "agent_phase_completed_count": 100,
+      "agent_throughput_qa_per_s": 0.622,
+      "agent_throughput_latency_sample_count": 100,
+      "agent_throughput_latency_total_count": 100,
+      "agent_loop_calls_mean": 3.32,
+      "agent2_trace": {
+        "available": true,
+        "planner_decision_count": 111,
+        "planner_fallback_count": 3,
+        "requirement_status_counts": {
+          "satisfied": 48,
+          "partially_supported": 28,
+          "open": 32
+        },
+        "evidence_coverage": {
+          "entries": 339,
+          "partial_entries": 171
+        },
+        "terminal_reasons": {
+          "candidate_closure": 94,
+          "candidate_partial": 17
+        },
+        "budget_outcomes": [
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.81,
+            "wall_remaining_s": 89.19
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.13,
+            "wall_remaining_s": 233.87
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.98,
+            "wall_remaining_s": 84.02
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.37,
+            "wall_remaining_s": 89.63
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 1.91,
+            "wall_remaining_s": 88.09
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 1.7,
+            "wall_remaining_s": 88.3
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.39,
+            "wall_remaining_s": 85.61
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.61,
+            "wall_remaining_s": 89.39
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 1.08,
+            "wall_remaining_s": 88.92
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.44,
+            "wall_remaining_s": 89.56
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.39,
+            "wall_remaining_s": 89.6
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 2.82,
+            "wall_remaining_s": 87.18
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 8.02,
+            "wall_remaining_s": 81.98
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 12.2,
+            "wall_remaining_s": 77.8
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 3,
+            "inspections": 2,
+            "elapsed_s": 10.22,
+            "wall_remaining_s": 229.78
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 6.44,
+            "wall_remaining_s": 83.56
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 8.82,
+            "wall_remaining_s": 81.18
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 15.11,
+            "wall_remaining_s": 74.89
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.15,
+            "wall_remaining_s": 83.85
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.04,
+            "wall_remaining_s": 235.96
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.92,
+            "wall_remaining_s": 85.08
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.4,
+            "wall_remaining_s": 89.6
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.25,
+            "wall_remaining_s": 89.75
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 3,
+            "inspections": 2,
+            "elapsed_s": 6.9,
+            "wall_remaining_s": 233.1
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 14.86,
+            "wall_remaining_s": 75.14
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.02,
+            "wall_remaining_s": 234.98
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 8.86,
+            "wall_remaining_s": 81.14
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 4,
+            "inspections": 3,
+            "elapsed_s": 8.79,
+            "wall_remaining_s": 231.21
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 12.17,
+            "wall_remaining_s": 77.83
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 8.54,
+            "wall_remaining_s": 81.46
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.32,
+            "wall_remaining_s": 83.68
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 18.49,
+            "wall_remaining_s": 71.51
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 7.31,
+            "wall_remaining_s": 82.69
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 7.56,
+            "wall_remaining_s": 82.44
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 13.87,
+            "wall_remaining_s": 76.13
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.05,
+            "wall_remaining_s": 83.95
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.28,
+            "wall_remaining_s": 89.72
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 3,
+            "inspections": 2,
+            "elapsed_s": 6.52,
+            "wall_remaining_s": 233.48
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 4.96,
+            "wall_remaining_s": 85.04
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.88,
+            "wall_remaining_s": 85.12
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 13.51,
+            "wall_remaining_s": 76.49
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 17.49,
+            "wall_remaining_s": 72.51
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.69,
+            "wall_remaining_s": 84.31
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.37,
+            "wall_remaining_s": 89.63
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 16.2,
+            "wall_remaining_s": 73.8
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 7.45,
+            "wall_remaining_s": 82.55
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.09,
+            "wall_remaining_s": 85.91
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 1.37,
+            "wall_remaining_s": 88.63
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 5.05,
+            "wall_remaining_s": 84.95
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 3.67,
+            "wall_remaining_s": 86.33
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.24,
+            "wall_remaining_s": 89.76
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 3,
+            "inspections": 2,
+            "elapsed_s": 2.83,
+            "wall_remaining_s": 237.17
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 3.59,
+            "wall_remaining_s": 86.41
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.93,
+            "wall_remaining_s": 85.07
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.56,
+            "wall_remaining_s": 84.44
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 4.18,
+            "wall_remaining_s": 85.82
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 1.01,
+            "wall_remaining_s": 88.99
+          },
+          {
+            "model_steps": 7,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 5.2,
+            "wall_remaining_s": 84.8
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 4.79,
+            "wall_remaining_s": 85.21
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.08,
+            "wall_remaining_s": 85.92
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.28,
+            "wall_remaining_s": 89.72
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 14.39,
+            "wall_remaining_s": 225.61
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.76,
+            "wall_remaining_s": 89.24
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.3,
+            "wall_remaining_s": 83.7
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.78,
+            "wall_remaining_s": 239.22
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 15.68,
+            "wall_remaining_s": 74.32
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.27,
+            "wall_remaining_s": 84.73
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.23,
+            "wall_remaining_s": 89.77
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 3,
+            "inspections": 2,
+            "elapsed_s": 3.84,
+            "wall_remaining_s": 236.16
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 14.88,
+            "wall_remaining_s": 75.12
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.4,
+            "wall_remaining_s": 84.6
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 12.51,
+            "wall_remaining_s": 227.49
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 8.44,
+            "wall_remaining_s": 81.56
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.73,
+            "wall_remaining_s": 89.27
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 6.48,
+            "wall_remaining_s": 83.52
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 3.84,
+            "wall_remaining_s": 86.16
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.26,
+            "wall_remaining_s": 89.74
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 14.24,
+            "wall_remaining_s": 75.76
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.86,
+            "wall_remaining_s": 83.14
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.54,
+            "wall_remaining_s": 83.46
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.88,
+            "wall_remaining_s": 85.12
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 1.32,
+            "wall_remaining_s": 88.68
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 15.0,
+            "wall_remaining_s": 75.0
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.99,
+            "wall_remaining_s": 85.01
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.21,
+            "wall_remaining_s": 89.79
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 4,
+            "inspections": 3,
+            "elapsed_s": 2.42,
+            "wall_remaining_s": 237.58
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.37,
+            "wall_remaining_s": 84.63
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 5.09,
+            "wall_remaining_s": 84.91
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 1.68,
+            "wall_remaining_s": 238.32
+          },
+          {
+            "model_steps": 5,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 11.8,
+            "wall_remaining_s": 78.2
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 6.38,
+            "wall_remaining_s": 83.62
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.69,
+            "wall_remaining_s": 85.31
+          },
+          {
+            "model_steps": 1,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 0.25,
+            "wall_remaining_s": 89.75
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 4,
+            "inspections": 3,
+            "elapsed_s": 2.26,
+            "wall_remaining_s": 87.74
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.67,
+            "wall_remaining_s": 89.33
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.76,
+            "wall_remaining_s": 89.24
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.61,
+            "wall_remaining_s": 89.39
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 4.16,
+            "wall_remaining_s": 85.84
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 1.1,
+            "wall_remaining_s": 88.9
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 3,
+            "inspections": 2,
+            "elapsed_s": 2.78,
+            "wall_remaining_s": 237.22
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 2.87,
+            "wall_remaining_s": 87.13
+          },
+          {
+            "model_steps": 7,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 2.04,
+            "wall_remaining_s": 87.96
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 6.77,
+            "wall_remaining_s": 83.23
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.88,
+            "wall_remaining_s": 89.12
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 3,
+            "inspections": 2,
+            "elapsed_s": 3.48,
+            "wall_remaining_s": 236.52
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.54,
+            "wall_remaining_s": 89.46
+          },
+          {
+            "model_steps": 3,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 2.19,
+            "wall_remaining_s": 87.81
+          },
+          {
+            "model_steps": 6,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 5.79,
+            "wall_remaining_s": 84.21
+          },
+          {
+            "model_steps": 2,
+            "tool_calls": 1,
+            "inspections": 0,
+            "elapsed_s": 0.43,
+            "wall_remaining_s": 89.57
+          },
+          {
+            "model_steps": 4,
+            "tool_calls": 2,
+            "inspections": 1,
+            "elapsed_s": 4.31,
+            "wall_remaining_s": 85.69
+          },
+          {
+            "model_steps": 8,
+            "tool_calls": 0,
+            "inspections": 0,
+            "elapsed_s": 1.09,
+            "wall_remaining_s": 88.91
+          }
+        ],
+        "task_declaration": {
+          "goal": "确定聚餐时与明明同行的朋友姓名",
+          "scope_id": "album_cba01be9502b",
+          "constraints": {},
+          "requirements": [
+            {
+              "id": "req_1",
+              "evidence_type": "user_statement",
+              "description": "用户询问聚餐时与明明同行的朋友姓名"
+            }
+          ]
+        },
+        "task_state": {
+          "declaration": {
+            "goal": "确定聚餐时与明明同行的朋友姓名",
+            "scope_id": "album_cba01be9502b",
+            "constraints": {},
+            "requirements": [
+              {
+                "id": "req_1",
+                "evidence_type": "user_statement",
+                "description": "用户询问聚餐时与明明同行的朋友姓名"
+              }
+            ]
+          },
+          "requirements": [
+            {
+              "id": "req_1",
+              "evidence_type": "user_statement",
+              "description": "用户询问聚餐时与明明同行的朋友姓名",
+              "status": "open",
+              "evidence_refs": [],
+              "coverage_status": "candidate"
+            }
+          ]
+        },
+        "evidence_ledger": {
+          "scope_id": "album_cba01be9502b",
+          "entries": []
+        },
+        "planner_decisions": [
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "fallback",
+            "reason": "invalid_planner_action"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "fallback",
+            "reason": "invalid_planner_action"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "fallback",
+            "reason": "invalid_planner_action"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          },
+          {
+            "kind": "declare",
+            "status": "accepted"
+          }
+        ]
+      },
+      "benchmark_e2e_latency_excluding_judge_ms": null
+    }
+  },
+  "validity": {
+    "items": 100,
+    "judge_valid": 100,
+    "judge_missing": 0,
+    "all_agents_completed": false
+  },
+  "retrieval": {
+    "full_recall_scored": 60,
+    "full_recall_aq0": 30,
+    "full_recall_aq0_rate": 0.5,
+    "non_full_recall_scored": 40,
+    "mean_recall_scored": 0.628
+  },
+  "tool_routing": {
+    "counts": {
+      "search_memories": 97,
+      "inspect_photo": 28,
+      "read_photo_text": 10,
+      "search_conversation_history": 1
+    },
+    "search_calls": 97,
+    "page_calls": 0,
+    "inspect_calls": 28,
+    "ocr_calls": 10
+  },
+  "sample_failures": [
+    {
+      "qa_id": "album3v4-004",
+      "question": "这场馆陶的婚礼仪式总共收了多少礼金？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-09-27 113615.jpg",
+          "file_name": "2017-09-27 113615.jpg",
+          "asset_id": "asset_ca4b4b44427d",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-09-27 113629.jpg",
+          "file_name": "2017-09-27 113629.jpg",
+          "asset_id": "asset_b38fcb8e7e02",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "根据检索到的照片证据，馆陶婚礼仪式的礼金总额确认为 12,000 元。"
+    },
+    {
+      "qa_id": "album3v4-006",
+      "question": "我记得有次晚上在河北户外的婚礼仪式舞台前拍了留影，帮我找到这张照片对应的那次经历？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-08-18 112054.jpg",
+        "2019-01-01 112710.jpg",
+        "2019-01-01 165606.jpg",
+        "IMG_20221005_155759.jpg",
+        "IMG_20221005_155940.jpg",
+        "IMG_3589.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223147.jpg",
+          "file_name": "2017-10-04 223147.jpg",
+          "asset_id": "asset_6a5b158f6f6f",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "现有照片里看不出来/不知道。"
+    },
+    {
+      "qa_id": "album3v4-008",
+      "question": "我在易县沙岭的婚礼仪式舞台前拍留影是哪一天的事？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223147.jpg",
+          "file_name": "2017-10-04 223147.jpg",
+          "asset_id": "asset_6a5b158f6f6f",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "照片中三位男士在装饰有紫色纱幔和心形挂饰的室内合影，中间男士穿白色 T 恤，两侧男士分别穿黑色夹克和黑色连帽衫，背景有红色床品和白色家具。"
+    },
+    {
+      "qa_id": "album3v4-012",
+      "question": "国庆节参加亲戚婚礼，我和几个兄弟在婚房拍了合影，这场婚礼是在哪里办的呀？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-10-29 151201.jpg",
+        "2017-11-05 152200.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-08-18 112054.jpg",
+        "IMG_20221005_155759.jpg",
+        "IMG_3589.JPG",
+        "IMG_6868.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223521.jpg",
+          "file_name": "2017-10-04 223521.jpg",
+          "asset_id": "asset_ee629829836c",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223534.jpg",
+          "file_name": "2017-10-04 223534.jpg",
+          "asset_id": "asset_5278007499a7",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "婚礼在邯郸市永年区举办。"
+    },
+    {
+      "qa_id": "album3v4-013",
+      "question": "我去河北易县沙岭参加亲戚的婚礼，那是哪一年国庆节的事？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223521.jpg",
+          "file_name": "2017-10-04 223521.jpg",
+          "asset_id": "asset_ee629829836c",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223534.jpg",
+          "file_name": "2017-10-04 223534.jpg",
+          "asset_id": "asset_5278007499a7",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "read_photo_text"
+      ],
+      "answer": "找到 4 张接近的照片。；部分信息能对上，还有细节不能完全确认。这些是目前能确认的内容。"
+    },
+    {
+      "qa_id": "album3v4-014",
+      "question": "那次在亲戚婚房和兄弟们合影，一共拍了几张不同人数的合影？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-11-15 180614.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-08-18 112054.jpg",
+        "2018-10-16 204309.jpg",
+        "2018-11-11 191300.jpg",
+        "2018-11-11 191353.jpg",
+        "2018-11-11 191519.jpg",
+        "IMG_7541.JPG",
+        "IMG_9107.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223521.jpg",
+          "file_name": "2017-10-04 223521.jpg",
+          "asset_id": "asset_ee629829836c",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223534.jpg",
+          "file_name": "2017-10-04 223534.jpg",
+          "asset_id": "asset_5278007499a7",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "根据观察，那次合影一共拍了 4 张不同人数的合影。"
+    },
+    {
+      "qa_id": "album3v4-016",
+      "question": "这次亲戚的婚礼一共摆了多少桌酒席呀？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-08-18 112054.jpg",
+        "2018-10-15 125003.jpg",
+        "2018-10-16 204309.jpg",
+        "2019-03-16 202603.jpg",
+        "IMG_20230730_192239.jpg",
+        "IMG_3589.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223521.jpg",
+          "file_name": "2017-10-04 223521.jpg",
+          "asset_id": "asset_ee629829836c",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223534.jpg",
+          "file_name": "2017-10-04 223534.jpg",
+          "asset_id": "asset_5278007499a7",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "婚礼现场一共摆了 3 桌酒席。"
+    },
+    {
+      "qa_id": "album3v4-018",
+      "question": "我回保定参加亲友婚礼还和兄弟们拍了好多留影，具体是哪一年国庆节的事？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223147.jpg",
+          "file_name": "2017-10-04 223147.jpg",
+          "asset_id": "asset_6a5b158f6f6f",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223228.jpg",
+          "file_name": "2017-10-04 223228.jpg",
+          "asset_id": "asset_bcf30a50f216",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223521.jpg",
+          "file_name": "2017-10-04 223521.jpg",
+          "asset_id": "asset_ee629829836c",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223534.jpg",
+          "file_name": "2017-10-04 223534.jpg",
+          "asset_id": "asset_5278007499a7",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "找到 5 张接近的照片。这些信息还不足以确认你要的答案。"
+    },
+    {
+      "qa_id": "album3v4-019",
+      "question": "那次参加亲友婚礼，我一共在哪些不同的场地拍了留影和合影？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-10-29 151201.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-04-03 105352.jpg",
+        "2018-04-03 173254.jpg",
+        "2018-08-18 112054.jpg",
+        "2019-01-01 165606.jpg",
+        "IMG_3589.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223147.jpg",
+          "file_name": "2017-10-04 223147.jpg",
+          "asset_id": "asset_6a5b158f6f6f",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223228.jpg",
+          "file_name": "2017-10-04 223228.jpg",
+          "asset_id": "asset_bcf30a50f216",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223521.jpg",
+          "file_name": "2017-10-04 223521.jpg",
+          "asset_id": "asset_ee629829836c",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223534.jpg",
+          "file_name": "2017-10-04 223534.jpg",
+          "asset_id": "asset_5278007499a7",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "您一共在保定市易县、邯郸市永年区、石家庄市正定县、邯郸市馆陶县和邯郸市永年区拍了留影和合影。"
+    },
+    {
+      "qa_id": "album3v4-022",
+      "question": "我记得参加亲友婚礼时，在天台给同行亲友拍了留影，那次婚礼是在哪里办的？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-04-03 105352.jpg",
+        "2018-08-18 112054.jpg",
+        "IMG_3589.JPG",
+        "IMG_4791.JPG",
+        "IMG_6868.JPG",
+        "IMG_6872.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "参加亲友婚礼时，在天台给同行亲友拍了留影，那次婚礼是在邯郸市永年区办的。"
+    },
+    {
+      "qa_id": "album3v4-024",
+      "question": "我去易县沙岭参加亲友婚礼，那次我在天台给人拍了照，具体是什么情况？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "照片中显示一对新人站在婚礼横幅前合影，横幅上印有新人婚纱照，背景为深色墙面和金属支架。"
+    },
+    {
+      "qa_id": "album3v4-025",
+      "question": "那次易县沙岭婚礼天台的迎宾展架上，写了什么祝福新人的文字？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "read_photo_text",
+        "inspect_photo"
+      ],
+      "answer": "照片展示了一对新人站在一个婚礼横幅前，横幅上印有新人婚纱照和文字信息。"
+    },
+    {
+      "qa_id": "album3v4-026",
+      "question": "帮我找那次在乡村婚礼天台，站在新人婚纱照展架旁拍的留影，是哪次经历？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-11-05 152200.jpg",
+        "2017-11-05 161103.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-08-18 112054.jpg",
+        "2019-01-01 165606.jpg",
+        "IMG_20221005_155759.jpg",
+        "IMG_20221005_155940.jpg",
+        "IMG_3589.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "那是一次在乡村婚礼天台，站在新人婚纱照展架旁拍的留影。"
+    },
+    {
+      "qa_id": "album3v4-029",
+      "question": "我和家人回乡参加亲友婚礼，晚上在天台婚礼展架旁留影，这大概是什么时候的事？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-04-03 105352.jpg",
+        "2018-08-18 112054.jpg",
+        "IMG_3589.JPG",
+        "IMG_4791.JPG",
+        "IMG_6868.JPG",
+        "IMG_6872.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223228.jpg",
+          "file_name": "2017-10-04 223228.jpg",
+          "asset_id": "asset_bcf30a50f216",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "根据对照片 photo_1 的视觉复核，婚礼现场确实是在婚礼当天（2026年8月24日）在天台婚礼展架旁留影，新郎新娘手持花束和麦克风，周围宾客围观，现场布置有紫色地毯和蓝色灯光装饰。因此，这大概是在2026年8月24日左右的事。"
+    },
+    {
+      "qa_id": "album3v4-032",
+      "question": "我记得那次参加家乡亲友婚礼，我们是在哪里找到这个婚礼迎宾展架留影的？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-04-03 105352.jpg",
+        "2018-08-18 112054.jpg",
+        "2019-03-16 202336.jpg",
+        "IMG_3589.JPG",
+        "IMG_6112.JPG",
+        "IMG_6868.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223228.jpg",
+          "file_name": "2017-10-04 223228.jpg",
+          "asset_id": "asset_bcf30a50f216",
+          "matched": true,
+          "mapping_status": "ok"
+        },
+        {
+          "image_id": "album3/2017-10-04 223242.jpg",
+          "file_name": "2017-10-04 223242.jpg",
+          "asset_id": "asset_f1fb5d896800",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "在保定市易县和邯郸市永年区找到了这个婚礼迎宾展架留影的照片。"
+    },
+    {
+      "qa_id": "album3v4-037",
+      "question": "那次我在婚礼迎宾展架旁留影，是白天还是晚上拍的？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-09-27 113615.jpg",
+        "2017-09-27 113629.jpg",
+        "2017-10-04 223147.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-10-04 223242.jpg",
+        "2017-10-04 223521.jpg",
+        "2017-10-04 223534.jpg",
+        "2017-12-16 100650.jpg",
+        "2017-12-16 100719.jpg",
+        "2017-12-16 102414.jpg",
+        "2017-12-16 140213.jpg",
+        "2018-02-01 120812.jpg",
+        "2018-02-01 120842.jpg",
+        "2018-04-03 105352.jpg",
+        "2018-08-18 112054.jpg",
+        "2019-03-16 202336.jpg",
+        "IMG_3589.JPG",
+        "IMG_6868.JPG",
+        "IMG_6872.JPG",
+        "IMG_7541.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-04 223228.jpg",
+          "file_name": "2017-10-04 223228.jpg",
+          "asset_id": "asset_bcf30a50f216",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "那次留影是白天拍的。"
+    },
+    {
+      "qa_id": "album3v4-044",
+      "question": "那次在宿州餐厅拍黄包车合影的经历大概是怎么回事？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-17 210236.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-17 210236.jpg",
+          "file_name": "2017-10-17 210236.jpg",
+          "asset_id": "asset_64fcef3ab610",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "照片中显示一个人坐在轮椅上，旁边站着另一个人，背景是室内装饰和灯光。"
+    },
+    {
+      "qa_id": "album3v4-048",
+      "question": "我带我爸妈出去游玩拍合影的那次，是在河北哪个著名景点啊？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-29 151201.jpg",
+        "2018-02-18 153257.jpg",
+        "2018-02-18 210738.jpg",
+        "2018-12-30 134508.jpg",
+        "2018-12-30 135456.jpg",
+        "2018-12-30 135510.jpg",
+        "2018-12-30 135513.jpg",
+        "2018-12-30 143406.jpg",
+        "2018-12-30 143413.jpg",
+        "2018-12-30 151233.jpg",
+        "2018-12-30 151236.jpg",
+        "2019-01-01 112710.jpg",
+        "2019-01-01 165555.jpg",
+        "2019-01-01 165606.jpg",
+        "2019-01-03 150017.jpg",
+        "2019-01-03 160506.jpg",
+        "IMG_20230429_152646.jpg",
+        "IMG_20230429_152658.jpg",
+        "IMG_20230429_152729.jpg",
+        "IMG_9289.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-29 151201.jpg",
+          "file_name": "2017-10-29 151201.jpg",
+          "asset_id": "asset_169164779696",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "找到 20 张接近的照片。；部分信息能对上，还有细节不能完全确认。这些信息还不足以确认你要的答案。"
+    },
+    {
+      "qa_id": "album3v4-050",
+      "question": "我帮爸爸妈妈拍的那张都戴红围巾的景点合影是在哪座桥上拍的？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-29 151201.jpg",
+        "2018-12-30 134508.jpg",
+        "2018-12-30 134633.jpg",
+        "2018-12-30 134902.jpg",
+        "2018-12-30 135510.jpg",
+        "2018-12-30 150444.jpg",
+        "2018-12-30 150544.jpg",
+        "2018-12-30 150610.jpg",
+        "2018-12-31 131954.jpg",
+        "2019-01-01 112710.jpg",
+        "2019-01-01 165434.jpg",
+        "2019-01-01 165445.jpg",
+        "2019-01-01 165525.jpg",
+        "2019-01-01 165606.jpg",
+        "2019-01-01 165643.jpg",
+        "2019-01-03 150017.jpg",
+        "2019-03-17 122941.jpg",
+        "IMG_6114.JPG",
+        "IMG_6120.JPG",
+        "IMG_6137.JPG"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-29 151201.jpg",
+          "file_name": "2017-10-29 151201.jpg",
+          "asset_id": "asset_169164779696",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories",
+        "inspect_photo"
+      ],
+      "answer": "照片里可见一座传统风格的石桥，桥上有行人和车辆，背景是绿树和传统建筑。"
+    },
+    {
+      "qa_id": "album3v4-051",
+      "question": "那次我带爸妈去赵县的出游，主要是做什么呀？",
+      "score": 0,
+      "retrieval_recall": 1.0,
+      "predicted_file_names": [
+        "2017-10-29 151201.jpg"
+      ],
+      "gt_images": [
+        {
+          "image_id": "album3/2017-10-29 151201.jpg",
+          "file_name": "2017-10-29 151201.jpg",
+          "asset_id": "asset_169164779696",
+          "matched": true,
+          "mapping_status": "ok"
+        }
+      ],
+      "tools": [
+        "search_memories"
+      ],
+      "answer": "根据检索到的照片证据，那次带爸妈去赵县出游的主要活动是去赵县游玩。"
+    }
+  ],
+  "source": {
+    "head": "a34c8b2506e4aef18a7180e217f590aaf9778d17",
+    "status": [
+      " M backend/agent_runtime/completion.py",
+      " M backend/agent_runtime/final_writer.py",
+      " M backend/agent_runtime/intent.py",
+      " M backend/agent_runtime/ocr_tool.py",
+      " M backend/agent_runtime/result_set.py",
+      " M backend/agent_runtime/runtime.py",
+      " M backend/agent_runtime/task_state.py",
+      " M backend/agent_runtime/tools.py",
+      " M backend/app.py",
+      " M backend/db.py",
+      " M backend/model_clients.py",
+      " M backend/pipeline.py",
+      " M backend/qdrant_memory.py",
+      " M backend/retrieval_indexes.py",
+      " M backend/tests/test_agent2_answer_context.py",
+      " M backend/tests/test_agent2_evidence_recording.py",
+      " M backend/tests/test_agent2_shadow_runtime.py",
+      " M backend/tests/test_agent_task_state.py",
+      " M backend/tests/test_pipeline.py",
+      " M backend/video/hybrid_keyframe.py",
+      " M backend/video/processor.py",
+      " M scripts/maintenance/build_text_ann_space.py",
+      " M scripts/maintenance/sync_qdrant_vectors.py",
+      " M scripts/runtime/start_sentrix_api_8091.sh",
+      " M services/photobench/tests/test_image_extraction.py",
+      " M services/photobench/tests/test_suite_control.py",
+      "?? backend/agent_runtime/sync_qdrant_vectors.py",
+      "?? backend/agent_runtime/test_agent2_evidence_recording.py",
+      "?? backend/agent_runtime/test_agent2_shadow_runtime.py",
+      "?? backend/agent_runtime/test_agent_task_state.py",
+      "?? backend/agent_runtime/test_result_set_contracts.py",
+      "?? backend/ocr_tool.py",
+      "?? backend/runtime.py",
+      "?? backend/task_state.py",
+      "?? backend/tests/test_result_set_contracts.py",
+      "?? db.py",
+      "?? docs/reports/",
+      "?? ocr_tool.py",
+      "?? qdrant_memory.py",
+      "?? runtime.py",
+      "?? scripts/benchmarks/audit_100qa_root_causes.py",
+      "?? scripts/benchmarks/diagnose_retrieval_diff.py",
+      "?? scripts/maintenance/backfill_observation_details.py",
+      "?? sync_qdrant_vectors.py",
+      "?? task_state.py"
+    ]
+  }
+}

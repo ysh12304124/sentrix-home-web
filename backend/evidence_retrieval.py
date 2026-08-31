@@ -157,7 +157,7 @@ class EvidenceRetrievalKernel:
         evaluated, which is the semantic-difference this phase introduces.
         """
         total_started = time.monotonic()
-        from .retrieval import HardFilterContext, RetrievalQuery, fuse
+        from .retrieval import HardFilterContext, RetrievalQuery
         from .retrieval.config import RetrievalConfig
         from .retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS
         from .retrieval.ranking import VISUAL_ONLY, rank
@@ -167,9 +167,30 @@ class EvidenceRetrievalKernel:
         filters = HardFilterContext.from_spec(spec)
         query = RetrievalQuery.from_spec(spec, embedding_router=self.embedding_router)
         query_build_ms = round((time.monotonic() - query_started) * 1000, 1)
-        recall_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
+        requested_limit = int(spec.result_requirement.get("top_k", config.top_k) or config.top_k)
+        # Candidate recall is threshold-based, not Top-K based. Ask each
+        # enabled channel for the complete authorized scope so a relevant
+        # asset cannot disappear merely because another channel ranked it
+        # below an arbitrary head. Later reranking decides ordering; scope and
+        # explicit media type remain the only hard boundaries.
+        scope_for_count = None if spec.scope_mode == "all_authorized" else (spec.scope_id or (spec.scope_ids[0] if spec.scope_ids else None))
+        try:
+            authorized_count = len(self.store.list_assets(scope_id=scope_for_count))
+        except Exception:
+            authorized_count = 0
+        recall_limit = max(requested_limit, authorized_count, 1)
+        # The fused ranking is the single post-recall reducer.  Keep every
+        # channel's complete authorized recall for ranking, then hand the
+        # model/Agent a bounded candidate head.  A fixed score cut is
+        # deliberately avoided here: absolute thresholds cannot adapt to
+        # per-query score distributions and silently drop recalled GT
+        # (measured on album3-max 100QA: threshold prefilter dropped
+        # asset recall from 0.971 to 0.893, while rank top-50 kept 0.971).
+        import os
+        candidate_limit = max(1, int(os.getenv("SENTRIX_SEARCH_CANDIDATE_TOP_K", "30")))
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
+        min_retrieval_score = 0.0
 
         channel_hits = {}
         channel_trace = {}
@@ -202,6 +223,8 @@ class EvidenceRetrievalKernel:
                 "embedding_ms": round(sum(event.get("latency_ms", 0) for event in embedding_events), 1),
                 "embedding_events": embedding_events,
             }
+            if self.embedding_router and hasattr(self.embedding_router, "status"):
+                trace["embedding_status"] = self.embedding_router.status()
             if channel_reason:
                 trace["reason"] = channel_reason
             channel_trace[retriever.name] = trace
@@ -216,7 +239,7 @@ class EvidenceRetrievalKernel:
 
         primary_fusion_started = time.monotonic()
         primary_items = self._evaluate_fused(
-            rank(channel_hits, strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+            rank(channel_hits, strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
             spec, packet, filters, all_authorized, scope_id, skip_assets=set())
         primary_fusion_ms = round((time.monotonic() - primary_fusion_started) * 1000, 1)
 
@@ -245,7 +268,7 @@ class EvidenceRetrievalKernel:
             adjacency_fusion_started = time.monotonic()
             adjacency_items = self._evaluate_fused(
                 rank({expander.name: channel_hits[expander.name] for expander in expanders},
-                     strategy, recall_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+                     strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
                 spec, packet, filters, all_authorized, scope_id, skip_assets=already)
             adjacency_fusion_ms = round((time.monotonic() - adjacency_fusion_started) * 1000, 1)
         else:
@@ -262,11 +285,28 @@ class EvidenceRetrievalKernel:
                 packet.approximate_results.append(item)
 
         packet.assets.sort(key=lambda item: ({"exact": 0, "strong": 1, "approximate": 2}[item["level"]], -item["score"]))
+        # Optional confidence gate. It is disabled by default because score
+        # scales differ by retriever. When calibrated, this threshold is the
+        # only reduction mechanism; there is no fixed candidate Top-K.
+        import os
+        try:
+            min_retrieval_score = float(os.getenv("SENTRIX_SEARCH_MIN_RETRIEVAL_SCORE", "0") or 0)
+        except (TypeError, ValueError):
+            min_retrieval_score = 0.0
+        if min_retrieval_score > 0:
+            packet.assets = [item for item in packet.assets
+                             if float(item.get("retrieval_score") or 0) >= min_retrieval_score]
+            packet.exact_results = [item for item in packet.exact_results if item in packet.assets]
+            packet.strong_results = [item for item in packet.strong_results if item in packet.assets]
+            packet.approximate_results = [item for item in packet.approximate_results if item in packet.assets]
         for constraint in spec.constraints:
             if constraint.strictness == SEMANTIC and not any(item["condition_results"].get(constraint.key, {}).get("status") == "matched" for item in packet.assets):
                 packet.gaps.append({"condition": constraint.key, "reason": "no_direct_support"})
-        if spec.result_requirement.get("mode") != "all_relevant":
-            packet.assets = packet.assets[:recall_limit]
+        # Multi-channel recall is confidence/threshold based.  ``recall_limit``
+        # is only the per-channel request size (expanded to the authorized
+        # scope above); never truncate the fused candidate universe by a
+        # presentation-oriented Top-K here.  Delivery and evidence selection
+        # happen in the Agent tool layer.
         packet.exact_results = [item for item in packet.exact_results if item in packet.assets]
         packet.strong_results = [item for item in packet.strong_results if item in packet.assets]
         packet.approximate_results = [item for item in packet.approximate_results if item in packet.assets]
@@ -276,7 +316,10 @@ class EvidenceRetrievalKernel:
             "channels": channel_trace,
             "fusion_ms": round(primary_fusion_ms + adjacency_fusion_ms, 1),
             "postprocess_ms": round((time.monotonic() - postprocess_started) * 1000, 1),
+            "min_retrieval_score": min_retrieval_score,
         }
+        if self.embedding_router and hasattr(self.embedding_router, "status"):
+            packet.retrieval_timing["embedding_status"] = self.embedding_router.status()
         return packet
 
     def _evaluate_fused(self, fused, spec, packet, filters, all_authorized, scope_id, *, skip_assets):
@@ -306,11 +349,20 @@ class EvidenceRetrievalKernel:
                 for hit in candidate.retriever_hits
             ]
             item["fusion_score"] = round(candidate.rrf, 4)
+            # Preserve the strongest channel score separately from RRF.  RRF
+            # is only an ordering signal; an optional confidence threshold can
+            # be calibrated against this raw score without reintroducing a
+            # fixed candidate count.
+            item["retrieval_score"] = round(max(
+                (float(hit.raw_score) for hit in candidate.retriever_hits
+                 if hit.raw_score is not None), default=0.0), 6)
             items.append(item)
         return items
 
     def _observations_for_asset(self, asset_id):
-        return [item for item in self.store.list_observations(limit=100_000) if item.get("asset_id") == asset_id]
+        # Indexed lookup: the old full-scan-and-filter decoded every observation
+        # JSON (~11k rows) once per fusion candidate (~100x per search).
+        return self.store.list_observations(asset_id=asset_id, limit=1000)
 
     def probe(self, raw_text: str, scope_id: str | None, viewer_id: str = "owner",
               *, focus=None, media_hint=None):
@@ -519,6 +571,13 @@ class EvidenceRetrievalKernel:
         if geocode and place_text_matches(value, geocode):
             return ("matched", "asset_metadata", asset.get("id"),
                     float(geocode.get("confidence") or 0.9))
+        # A normalized observation.place value is a direct field fact when it
+        # exactly names the requested place.  Keep broader captions/scene
+        # prose weak, but do not downgrade this precise field to possible.
+        observation_place = str(observation.get("place") or "").strip()
+        if observation_place and observation_place == value:
+            return ("matched", "observation_field_exact", observation.get("id"),
+                    float(observation.get("confidence") or 0))
         pool = " ".join(filter(None, [observation.get("place"), observation.get("caption")]))
         if _contains(pool, value):
             return ("possible", "observation", observation.get("id"),

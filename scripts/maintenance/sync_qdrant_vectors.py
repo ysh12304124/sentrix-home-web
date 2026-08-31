@@ -12,11 +12,15 @@ import time
 from pathlib import Path
 
 
-def _rows(store):
-    return store.connection.execute(
+def _rows(store, scope_id=None):
+    query = (
         "SELECT id,scope_id,space,source_type,source_id,vector_json,model_name,"
         "metadata_json,created_at,updated_at FROM memory_vectors ORDER BY updated_at"
-    ).fetchall()
+    )
+    if scope_id:
+        query = query.replace(" ORDER BY", " WHERE scope_id = ? ORDER BY")
+        return store.connection.execute(query, (scope_id,)).fetchall()
+    return store.connection.execute(query).fetchall()
 
 
 def _decode(value, fallback):
@@ -26,33 +30,35 @@ def _decode(value, fallback):
         return fallback
 
 
-def sync(store, index):
-    written = 0
+def sync(store, index, scope_id=None):
+    payloads = []
     skipped = 0
     started = time.perf_counter()
-    for raw in _rows(store):
+    cleared_collections = (index.drop_scope(scope_id) if scope_id else index.clear())
+    for raw in _rows(store, scope_id):
         row = dict(raw)
         vector = _decode(row["vector_json"], [])
         if not vector:
             skipped += 1
             continue
-        index.upsert(
-            row_id=row["id"], scope_id=row["scope_id"], space=row["space"],
-            source_type=row["source_type"], source_id=row["source_id"],
-            vector=vector, model_name=row["model_name"],
-            metadata=_decode(row["metadata_json"], {}),
-            created_at=row["created_at"], updated_at=row["updated_at"],
-        )
-        written += 1
+        payloads.append({
+            "row_id": row["id"], "scope_id": row["scope_id"], "space": row["space"],
+            "source_type": row["source_type"], "source_id": row["source_id"],
+            "vector": vector, "model_name": row["model_name"],
+            "metadata": _decode(row["metadata_json"], {}),
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        })
+    written = index.upsert_many(payloads) if hasattr(index, "upsert_many") else 0
     return {"written": written, "skipped": skipped,
+            "cleared_collections": cleared_collections,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)}
 
 
-def reembed_visual_assets(store, embedder):
+def reembed_visual_assets(store, embedder, *, scope_id=None):
     started = time.perf_counter()
     written = 0
     skipped = 0
-    assets = store.list_assets(media_type="image", limit=100_000)
+    assets = store.list_assets(media_type="image", limit=100_000, scope_id=scope_id)
     for asset in assets:
         path = asset.get("path") or ""
         if not Path(path).is_file():
@@ -80,8 +86,8 @@ def reembed_visual_assets(store, embedder):
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)}
 
 
-def benchmark(store, index, sample_count=20, limit=10):
-    rows = [dict(row) for row in _rows(store)]
+def benchmark(store, index, sample_count=20, limit=10, scope_id=None):
+    rows = [dict(row) for row in _rows(store, scope_id)]
     if not rows:
         return {"queries": 0}
     step = max(1, len(rows) // max(1, sample_count))
@@ -128,6 +134,8 @@ def main():
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--reembed-visual", choices=["none", "clip", "chinese_clip"], default="none",
                         help="Rebuild image vectors in the deployed query model before Qdrant sync.")
+    parser.add_argument("--scope", default="",
+                        help="Only rebuild one scope; preserves all other derived collections.")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     os.environ["SENTRIX_VECTOR_BACKEND"] = "qdrant"
@@ -139,8 +147,20 @@ def main():
     store = MemoryStore(args.db)
     index = get_qdrant_index(args.db)
     try:
-        rows = _rows(store)
-        result = {"sqlite_vectors": len(rows), "qdrant_path": str(Path(args.qdrant_path).resolve())}
+        rows = _rows(store, args.scope or None)
+        result = {"sqlite_vectors": len(rows), "scope": args.scope or None,
+                  "qdrant_path": str(Path(args.qdrant_path).resolve())}
+        if index is None:
+            result["qdrant"] = {
+                "available": False,
+                "reason": "qdrant_unavailable_or_locked",
+            }
+            if args.apply:
+                raise RuntimeError(
+                    "Qdrant unavailable or locked; stop the owning service before --apply"
+                )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
         if args.apply:
             if args.reembed_visual != "none":
                 if args.reembed_visual == "chinese_clip":
@@ -158,13 +178,16 @@ def main():
                             return clip.embed_image(path)
 
                     embedder = ClipImageEmbedder()
-                result["visual_reembed"] = reembed_visual_assets(store, embedder)
-            result["sync"] = sync(store, index)
+                result["visual_reembed"] = reembed_visual_assets(
+                    store, embedder, scope_id=args.scope or None
+                )
+            result["sync"] = sync(store, index, args.scope or None)
         else:
             result["dry_run"] = True
         result["qdrant"] = index.collection_stats()
         if args.benchmark:
-            result["benchmark"] = benchmark(store, index, sample_count=args.samples)
+            result["benchmark"] = benchmark(store, index, sample_count=args.samples,
+                                             scope_id=args.scope or None)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     finally:
         store.close()

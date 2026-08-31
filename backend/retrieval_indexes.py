@@ -17,7 +17,7 @@ import uuid
 from typing import Iterable
 
 
-_FIELD_TYPES = ("place", "activity", "object", "clothing", "ocr", "person_bridge", "caption")
+_FIELD_TYPES = ("place", "activity", "object", "clothing", "ocr", "person_bridge", "caption", "detail")
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,21 @@ def _terms_from_field(observation, field_type, source_key):
         value = _normalize(raw)
         if value:
             yield field_type, value
+
+
+def _terms_from_detail(observation):
+    detail = observation.get("detail") or {}
+    if not isinstance(detail, dict):
+        return
+    for key in ("visible_details", "regions", "text_blocks"):
+        for item in detail.get(key) or []:
+            if isinstance(item, dict):
+                value = " ".join(str(item.get(name) or "") for name in ("text", "label", "description"))
+            else:
+                value = str(item or "")
+            value = _normalize(value)
+            if value:
+                yield "detail", value
 
 
 class RetrievalIndex:
@@ -170,6 +185,11 @@ class RetrievalIndex:
                     _make_id(), observation_id, asset_id, scope_id, field_type, value,
                     confidence, "observation", revision,
                 ))
+        for _, value in _terms_from_detail(observation):
+            rows.append((
+                _make_id(), observation_id, asset_id, scope_id, "detail", value,
+                confidence, "observation_detail", revision,
+            ))
         if rows:
             now = observation.get("updated_at") or observation.get("created_at") or ""
             for row in rows:
@@ -198,7 +218,15 @@ class RetrievalIndex:
             () if scope_id is None else (scope_id,),
         )
         try:
-            self.connection.execute("DELETE FROM observation_search_fts")
+            # Keep the FTS projection scoped exactly like
+            # ``observation_search_terms``.  A scoped rebuild previously
+            # erased every album's FTS rows, then restored only one album,
+            # leaving all other lexical retrieval channels silently empty.
+            self.connection.execute(
+                "DELETE FROM observation_search_fts" if scope_id is None
+                else "DELETE FROM observation_search_fts WHERE scope_id = ?",
+                () if scope_id is None else (scope_id,),
+            )
         except Exception:
             pass
         self.connection.commit()

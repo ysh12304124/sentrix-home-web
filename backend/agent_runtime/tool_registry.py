@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .task_state import EVIDENCE_TYPES
+from .evidence_contract import PUBLIC_EVIDENCE_TYPES
 
 
 @dataclass(frozen=True)
@@ -27,12 +27,16 @@ class ToolSpec:
     readiness_reason: str = ""
     produces_evidence: tuple[str, ...] = ()
     cannot_establish: tuple[str, ...] = ()
+    required_inputs: tuple[str, ...] = ()
+    preconditions: tuple[str, ...] = ()
+    prerequisite_evidence_types: tuple[str, ...] = ()
     budget_unit: str = "call"
 
     def __post_init__(self):
         produced = tuple(self.produces_evidence)
         prohibited = tuple(self.cannot_establish)
-        unknown = (set(produced) | set(prohibited)) - EVIDENCE_TYPES
+        unknown = (set(produced) | set(prohibited) |
+                   set(self.prerequisite_evidence_types)) - PUBLIC_EVIDENCE_TYPES
         if unknown:
             raise ValueError(f"unsupported evidence type: {sorted(unknown)[0]}")
         overlap = set(produced) & set(prohibited)
@@ -44,6 +48,11 @@ class ToolSpec:
     def can_satisfy(self, evidence_type: str) -> bool:
         return evidence_type in self.produces_evidence
 
+    @property
+    def produces_evidence_types(self) -> tuple[str, ...]:
+        """Canonical contract name; ``produces_evidence`` remains replay-compatible."""
+        return self.produces_evidence
+
     def as_contract(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -54,7 +63,11 @@ class ToolSpec:
             "budget_unit": self.budget_unit,
             "readiness": self.readiness,
             "produces_evidence": list(self.produces_evidence),
+            "produces_evidence_types": list(self.produces_evidence),
             "cannot_establish": list(self.cannot_establish),
+            "required_inputs": list(self.required_inputs),
+            "preconditions": list(self.preconditions),
+            "prerequisite_evidence_types": list(self.prerequisite_evidence_types),
         }
 
 
@@ -84,6 +97,10 @@ def tool_readiness_matrix() -> dict[str, dict]:
             "cost_class": t.cost_class,
             "read_write": t.read_write,
             "timeout_s": t.timeout_s,
+            "produces_evidence": list(t.produces_evidence),
+            "required_inputs": list(t.required_inputs),
+            "preconditions": list(t.preconditions),
+            "prerequisite_evidence_types": list(t.prerequisite_evidence_types),
         }
         for t in _TOOL_SPECS.values()
     }

@@ -199,7 +199,11 @@ class RecoverySuccessMetricsTests(unittest.TestCase):
         def chat_fn(messages):
             return pool.pop(0)
 
-        return AgentRuntime(chat_fn=chat_fn, scope_id="home", viewer_id="owner").run(question)
+        # This regression targets the legacy L1/L2 guard sequence; exercise it
+        # explicitly without the production planner/writer pipeline consuming
+        # the scripted responses.
+        return AgentRuntime(chat_fn=chat_fn, profile_name="tool_loop",
+                            scope_id="home", viewer_id="owner").run(question)
 
     def test_l2_blocked_recoverable_failure_recovers(self):
         cases = [

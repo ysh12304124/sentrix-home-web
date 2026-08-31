@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .agent_conversation import ConversationStore
+from .agent_runtime.result_set import debug_asset_projection
 from .db import MemoryStore, make_id
 from .image_io import (
     encode_jpeg_preview,
@@ -31,9 +32,12 @@ from .image_io import (
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
-from .worldmm_memory import WorldMMMemory, worldmm_artifact_path
-from .video.event_aggregator import EVENTAGG_METHOD_VERSION
-from .video.mtsw import MTSW_METHOD_VERSION
+from .person_insights import rank_core_people
+from .runtime_providers import (
+    create_runtime_providers,
+    normalize_openai_base_url,
+    normalize_service_url,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,13 +68,19 @@ VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
 RUNTIME_VLLM_API_URL = None
 RUNTIME_VLLM_BASE_URL = None
+RUNTIME_MODEL_SOURCE = "managed"
+RUNTIME_MODEL_PROFILE = None
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mp3", ".wav", ".m4a",
     ".txt", ".md", ".json",
 }
 MAX_REMOTE_IMPORT_FILES = int(os.getenv("SENTRIX_MAX_REMOTE_IMPORT_FILES", "500"))
-KEYFRAME_PACKAGE_SIDECARS = {"frame_map.json", "semantic.json"}
+IMPORT_DB_CHUNK_SIZE = max(1, int(os.getenv("SENTRIX_IMPORT_DB_CHUNK_SIZE", "32")))
+PIPELINE_MAX_RETRIES = max(0, int(os.getenv("SENTRIX_PIPELINE_MAX_RETRIES", "1")))
+PIPELINE_MAX_ATTEMPTS = PIPELINE_MAX_RETRIES + 1
+PIPELINE_WORK_STATUSES = ("queued", "failed", "video-queued", "video-processing-failed")
+PIPELINE_STALE_STATUSES = ("processing", "semantic_enriching")
 
 
 @contextlib.contextmanager
@@ -214,135 +224,13 @@ def _batch_status(batch_id: str):
     }
 
 
-def _performance_number(metadata, keys):
-    """Return the first finite timing value recorded by a video pipeline."""
-    for key in keys:
-        value = (metadata or {}).get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return round(float(value), 4)
-    return None
-
-
-def _video_performance(scope_id=None):
-    """Read-only performance summary for the frontend performance dashboard.
-
-    Older WorldMM publishers did not persist every stage separately.  The
-    response therefore marks the source of each number and leaves unavailable
-    values null instead of presenting a misleading zero.
-    """
-    all_assets = store.list_assets(limit=100000, scope_id=scope_id or None)
-    videos = [item for item in all_assets if item.get("media_type") == "video"]
-    children_by_parent = {}
-    for item in all_assets:
-        parent_id = item.get("parent_asset_id")
-        derived_kind = item.get("derived_kind")
-        if parent_id and derived_kind in {"video_keyframe", "video_keyframe_webp"}:
-            children_by_parent.setdefault(parent_id, []).append(item)
-
-    def safe_int(value, default=0):
-        try:
-            return int(value or default)
-        except (TypeError, ValueError):
-            return default
-
-    records = []
-    total_original = 0
-    total_keyframe = 0
-    known_extraction = []
-    known_memory = []
-    for video in videos:
-        metadata = video.get("metadata_json") or {}
-        children = children_by_parent.get(video.get("id"), [])
-        keyframe_bytes = sum(max(0, safe_int(item.get("size_bytes"))) for item in children)
-        original_bytes = max(0, safe_int(video.get("size_bytes") or metadata.get("source_video_size_bytes")))
-        retained_ratio = (keyframe_bytes / original_bytes) if original_bytes else None
-        extraction = _performance_number(metadata, [
-            "keyframe_extraction_seconds", "worldmm_keyframe_seconds",
-            "video_keyframe_seconds", "video_processing_seconds",
-        ])
-        extraction_source = "关键帧提取" if any(
-            isinstance(metadata.get(key), (int, float)) and not isinstance(metadata.get(key), bool)
-            for key in ["keyframe_extraction_seconds", "worldmm_keyframe_seconds", "video_keyframe_seconds"]
-        ) else ("视频处理总耗时（未拆分）" if extraction is not None else None)
-        memory_build = _performance_number(metadata, [
-            "memory_build_seconds", "video_memory_build_seconds",
-            "event_summary_wall_seconds",
-        ])
-        batch_id = video.get("batch_id") or metadata.get("batch_id")
-        if memory_build is None and batch_id:
-            batch = store.get_ingest_batch(batch_id)
-            metrics = (batch or {}).get("metadata_json", {}).get("pipeline_metrics", {})
-            candidate = metrics.get("total_wall_seconds")
-            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
-                memory_build = round(float(candidate), 4)
-        if extraction is not None:
-            known_extraction.append(extraction)
-        if memory_build is not None:
-            known_memory.append(memory_build)
-        total_original += original_bytes
-        total_keyframe += keyframe_bytes
-        records.append({
-            "id": video.get("id"),
-            "file_name": video.get("file_name") or video.get("id"),
-            "scope_id": video.get("scope_id"),
-            "status": video.get("status"),
-            "format": metadata.get("keyframe_video_memory_format") or (
-                "webp" if any(item.get("derived_kind") == "video_keyframe_webp" for item in children) else "未知"
-            ),
-            "original_bytes": original_bytes,
-            "keyframe_bytes": keyframe_bytes,
-            "retained_ratio": round(retained_ratio, 6) if retained_ratio is not None else None,
-            "compression_ratio": round(1 - retained_ratio, 6) if retained_ratio is not None else None,
-            "keyframe_count": safe_int(metadata.get("worldmm_selected_keyframe_count") or metadata.get("keyframe_video_memory_frame_count") or len(children)),
-            "scene_count": safe_int(metadata.get("worldmm_scene_count") or len(metadata.get("video_scene_event_ids") or [])),
-            "extraction_seconds": extraction,
-            "extraction_source": extraction_source,
-            "memory_build_seconds": memory_build,
-            "batch_id": batch_id,
-        })
-
-    batches = []
-    try:
-        rows = store._rows("SELECT id FROM ingest_batches " + ("WHERE scope_id = ? " if scope_id else "") + "ORDER BY updated_at DESC LIMIT 10", (scope_id,) if scope_id else ())
-        for row in rows:
-            batch = store.get_ingest_batch(row["id"])
-            if batch:
-                metrics = (batch.get("metadata_json") or {}).get("pipeline_metrics") or {}
-                batches.append({"id": batch.get("id"), "scope_id": batch.get("scope_id"), "status": batch.get("status"), "updated_at": batch.get("updated_at"), "pipeline_metrics": metrics})
-    except Exception:
-        batches = []
-    latest_batch = batches[0] if batches else None
-    return {
-        "scope_id": scope_id or "",
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "summary": {
-            "video_count": len(records),
-            "keyframe_count": sum(item["keyframe_count"] for item in records),
-            "scene_count": sum(item["scene_count"] for item in records),
-            "original_bytes": total_original,
-            "keyframe_bytes": total_keyframe,
-            "retained_ratio": round(total_keyframe / total_original, 6) if total_original else None,
-            "compression_ratio": round(1 - total_keyframe / total_original, 6) if total_original else None,
-            "extraction_seconds": round(sum(known_extraction), 4) if known_extraction else None,
-            "memory_build_seconds": round(sum(known_memory), 4) if known_memory else None,
-        },
-        "videos": records,
-        "latest_batch": latest_batch,
-        "notes": {
-            "compression": "关键帧证据文件总大小 / 原视频大小；未保存原视频时显示可测到的资产大小。",
-            "extraction": "旧批次只保存视频处理总耗时时，会明确标注为未拆分。",
-            "qa": "问答响应、检索、模型、图片加载和通道耗时由浏览器在每次问答后记录。",
-        },
-    }
-
-
 def process_asset(asset_id):
     # BackgroundTasks may process uploads concurrently. Each task must own its
     # SQLite connection; sharing the request-store connection interleaves its
     # transactions and raises "cannot start a transaction within a transaction".
     task_store = MemoryStore(store.path)
     task_pipeline = IngestionPipeline(
-        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        task_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     try:
         asset = task_store.get_asset(asset_id) or {}
@@ -371,10 +259,56 @@ def _pipeline_worker_limits():
     }
 
 
+def _pipeline_attempt_count(asset):
+    metadata = (asset or {}).get("metadata_json") or {}
+    try:
+        return max(0, int(metadata.get("pipeline_attempts") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _batch_work_asset_ids(task_store, batch_id, *, include_stale=False):
+    statuses = list(PIPELINE_WORK_STATUSES)
+    if include_stale:
+        statuses.extend(PIPELINE_STALE_STATUSES)
+    placeholders = ",".join("?" for _ in statuses)
+    rows = task_store._rows(
+        f"SELECT id FROM assets WHERE batch_id = ? AND status IN ({placeholders}) ORDER BY created_at, id",
+        (batch_id, *statuses),
+    )
+    selected = []
+    for row in rows:
+        asset = task_store.get_asset(row["id"]) or {}
+        if asset.get("status") == "failed" and _pipeline_attempt_count(asset) >= PIPELINE_MAX_ATTEMPTS:
+            continue
+        selected.append(row["id"])
+    return selected
+
+
+def _recover_stale_batch_assets(task_store, batch_id):
+    """Requeue assets left active when a worker process was interrupted."""
+    rows = task_store._rows(
+        "SELECT id, status FROM assets WHERE batch_id = ? AND status IN (?, ?) ORDER BY created_at, id",
+        (batch_id, *PIPELINE_STALE_STATUSES),
+    )
+    recovered = []
+    for row in rows:
+        task_store.cleanup_asset_derivatives(row["id"])
+        task_store.update_asset(row["id"], "queued", {
+            "error": None,
+            "failed_stage": None,
+            "pipeline_attempts": 0,
+            "pipeline_retry_count": 0,
+            "pipeline_recovered_from_status": row["status"],
+        })
+        recovered.append(row["id"])
+    return recovered
+
+
 def _prepare_asset_stage(asset_id, stage):
     worker_store = MemoryStore(store.path)
     worker_pipeline = IngestionPipeline(
-        worker_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        worker_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     try:
         if stage == "fast":
@@ -386,10 +320,101 @@ def _prepare_asset_stage(asset_id, stage):
         worker_store.close()
 
 
+def _process_image_stages(image_ids, task_store, task_pipeline, limits):
+    """Run fast and semantic model work as a bounded two-stage pipeline.
+
+    Fast commits stay in upload order because they establish face/event
+    clustering state. Semantic inference can start as soon as its fast commit
+    exists; semantic commits remain ordered and are bounded so a slow VLM does
+    not leave an unbounded list of prepared results in memory.
+    """
+    image_ids = list(image_ids or [])
+    if not image_ids:
+        return
+
+    worker_count = max(1, int(limits["effective_workers"]))
+    semantic_window = max(worker_count, worker_count * 2)
+    fast_pending = {}
+    semantic_pending = {}
+    semantic_order = []
+    next_fast_submit = 0
+    next_fast_commit = 0
+    next_semantic_commit = 0
+
+    def mark_fast_failed(asset_id, error):
+        asset = task_store.get_asset(asset_id) or {}
+        attempts = _pipeline_attempt_count(asset)
+        with db_write_guard("ingest-commit-fast-error"):
+            task_store.cleanup_asset_derivatives(asset_id)
+            task_store.update_asset(asset_id, "failed", {
+                "error": str(error), "failed_stage": "fast",
+                "pipeline_failure_terminal": attempts >= PIPELINE_MAX_ATTEMPTS,
+            })
+
+    def mark_semantic_failed(asset_id, error):
+        asset = task_store.get_asset(asset_id) or {}
+        attempts = _pipeline_attempt_count(asset)
+        with db_write_guard("ingest-commit-semantic-error"):
+            if attempts >= PIPELINE_MAX_ATTEMPTS:
+                task_store.cleanup_asset_derivatives(asset_id)
+            task_store.update_asset(asset_id, "failed", {
+                "error": str(error), "failed_stage": "semantic",
+                "pipeline_failure_terminal": attempts >= PIPELINE_MAX_ATTEMPTS,
+            })
+
+    def commit_semantic(asset_id):
+        future = semantic_pending.pop(asset_id)
+        try:
+            prepared = future.result()
+            with db_write_guard("ingest-commit-semantic"):
+                task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
+        except Exception as error:
+            mark_semantic_failed(asset_id, error)
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="sentrix-batch-fast") as fast_executor, \
+            ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="sentrix-batch-semantic") as semantic_executor:
+        while next_fast_submit < len(image_ids) and len(fast_pending) < worker_count:
+            asset_id = image_ids[next_fast_submit]
+            fast_pending[asset_id] = fast_executor.submit(_prepare_asset_stage, asset_id, "fast")
+            next_fast_submit += 1
+
+        while next_fast_commit < len(image_ids):
+            asset_id = image_ids[next_fast_commit]
+            future = fast_pending.pop(asset_id)
+            try:
+                prepared = future.result()
+                with db_write_guard("ingest-commit-fast"):
+                    task_pipeline.commit_fast_image(asset_id, prepared)
+                semantic_pending[asset_id] = semantic_executor.submit(
+                    _prepare_asset_stage, asset_id, "semantic"
+                )
+                semantic_order.append(asset_id)
+            except Exception as error:
+                mark_fast_failed(asset_id, error)
+
+            next_fast_commit += 1
+            while next_fast_submit < len(image_ids) and len(fast_pending) < worker_count:
+                next_asset_id = image_ids[next_fast_submit]
+                fast_pending[next_asset_id] = fast_executor.submit(
+                    _prepare_asset_stage, next_asset_id, "fast"
+                )
+                next_fast_submit += 1
+
+            # Apply backpressure after two worker windows. This preserves
+            # semantic commit order without retaining every VLM result.
+            while len(semantic_pending) >= semantic_window:
+                commit_semantic(semantic_order[next_semantic_commit])
+                next_semantic_commit += 1
+
+        while next_semantic_commit < len(semantic_order):
+            commit_semantic(semantic_order[next_semantic_commit])
+            next_semantic_commit += 1
+
+
 def _summarize_event_worker(event_id):
     worker_store = MemoryStore(store.path)
     worker_pipeline = IngestionPipeline(
-        worker_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        worker_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     started_at = time.perf_counter()
     try:
@@ -439,7 +464,7 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
     asset_ids = list(dict.fromkeys(asset_ids or []))
     task_store = MemoryStore(store.path)
     task_pipeline = IngestionPipeline(
-        task_store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
+        task_store, gamma=pipeline.gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip,
     )
     limits = _pipeline_worker_limits()
     started_at = time.perf_counter()
@@ -451,41 +476,36 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
         image_ids = []
         for asset_id in asset_ids:
             asset = task_store.get_asset(asset_id) or {}
-            if asset.get("media_type") == "image" and asset.get("status") in {"queued", "failed"}:
+            if asset.get("status") not in PIPELINE_WORK_STATUSES:
+                continue
+            attempts = _pipeline_attempt_count(asset) + 1
+            attempt_metadata = {
+                "pipeline_attempts": attempts,
+                "pipeline_retry_count": max(0, attempts - 1),
+                "pipeline_max_retries": PIPELINE_MAX_RETRIES,
+                "error": None,
+                "failed_stage": None,
+                "pipeline_failure_terminal": False,
+            }
+            if attempts > 1 and asset.get("media_type") == "image":
+                with db_write_guard("ingest-retry-cleanup"):
+                    task_store.cleanup_asset_derivatives(asset_id)
+            if asset.get("media_type") == "image":
                 with db_write_guard("ingest-group-mark-processing"):
                     task_store.update_asset(asset_id, "processing", {
-                        "processing_timings": {"queue_wait_seconds": round(time.perf_counter() - started_at, 4)}
+                        **attempt_metadata,
+                        "processing_timings": {
+                            **((asset.get("metadata_json") or {}).get("processing_timings") or {}),
+                            "queue_wait_seconds": round(time.perf_counter() - started_at, 4),
+                        },
                     })
                 image_ids.append(asset_id)
-            elif asset.get("status") in {"queued", "failed", "video-queued"}:
+            else:
+                with db_write_guard("ingest-group-mark-processing"):
+                    task_store.update_asset(asset_id, "processing", attempt_metadata)
                 process_asset(asset_id)
 
-        with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-fast") as executor:
-            futures = {asset_id: executor.submit(_prepare_asset_stage, asset_id, "fast") for asset_id in image_ids}
-            for asset_id in image_ids:
-                try:
-                    prepared = futures[asset_id].result()
-                    with db_write_guard("ingest-commit-fast"):
-                        task_pipeline.commit_fast_image(asset_id, prepared)
-                except Exception as error:
-                    with db_write_guard("ingest-commit-fast-error"):
-                        task_store.cleanup_asset_derivatives(asset_id)
-                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "fast"})
-
-        semantic_ids = [
-            asset_id for asset_id in image_ids
-            if (task_store.get_asset(asset_id) or {}).get("status") == "semantic_enriching"
-        ]
-        with ThreadPoolExecutor(max_workers=limits["effective_workers"], thread_name_prefix="sentrix-batch-semantic") as executor:
-            futures = {asset_id: executor.submit(_prepare_asset_stage, asset_id, "semantic") for asset_id in semantic_ids}
-            for asset_id in semantic_ids:
-                try:
-                    prepared = futures[asset_id].result()
-                    with db_write_guard("ingest-commit-semantic"):
-                        task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
-                except Exception as error:
-                    with db_write_guard("ingest-commit-semantic-error"):
-                        task_store.update_asset(asset_id, "failed", {"error": str(error), "failed_stage": "semantic"})
+        _process_image_stages(image_ids, task_store, task_pipeline, limits)
 
         if finalize_batch:
             task_store.complete_ingest_batch(batch_id)
@@ -538,24 +558,21 @@ def process_ingest_batch(asset_ids, batch_id):
     all_asset_ids = list(dict.fromkeys(asset_ids or []))
     pipeline_started_at = time.perf_counter()
     try:
-        first = True
+        with db_write_guard("ingest-recover-stale"):
+            recovered_ids = _recover_stale_batch_assets(task_store, batch_id)
+        all_asset_ids.extend(item for item in recovered_ids if item not in all_asset_ids)
         while True:
-            rows = task_store._rows(
-                "SELECT id FROM assets WHERE batch_id = ? AND status IN ('queued', 'failed', 'video-queued') ORDER BY created_at, id",
-                (batch_id,),
-            )
-            queued_ids = [row["id"] for row in rows]
+            queued_ids = _batch_work_asset_ids(task_store, batch_id)
             if queued_ids:
                 all_asset_ids.extend(item for item in queued_ids if item not in all_asset_ids)
                 _process_ingest_asset_group(queued_ids, batch_id, finalize_batch=False)
-                first = False
                 continue
             batch = task_store.get_ingest_batch(batch_id) or {}
             pending_row = task_store._row(
                 "SELECT COUNT(*) AS count FROM assets WHERE batch_id = ? AND status IN ('queued', 'processing', 'semantic_enriching')",
                 (batch_id,),
             )
-            if batch.get("status") == "complete" and not (pending_row and pending_row["count"]):
+            if batch.get("status") in {"complete", "completed"} and not (pending_row and pending_row["count"]):
                 break
             time.sleep(0.5)
 
@@ -578,6 +595,13 @@ def process_ingest_batch(asset_ids, batch_id):
                 "event_summary_call_count": len(event_results),
                 "event_summary_wall_seconds": summary_wall_seconds,
                 "event_summaries": event_results,
+                "failed_count": len(task_store._rows(
+                    "SELECT id FROM assets WHERE batch_id = ? AND status = 'failed'", (batch_id,)
+                )),
+                "failed_asset_ids": [row["id"] for row in task_store._rows(
+                    "SELECT id FROM assets WHERE batch_id = ? AND status = 'failed' ORDER BY created_at, id", (batch_id,)
+                )],
+                "pipeline_max_retries": PIPELINE_MAX_RETRIES,
                 "stage_timings": _pipeline_timing_summary(task_store, all_asset_ids),
                 "total_wall_seconds": round(time.perf_counter() - pipeline_started_at, 4),
             }
@@ -689,6 +713,17 @@ def _profile_summary(profile_id, profile):
 
 
 def _current_model_runtime():
+    if RUNTIME_MODEL_SOURCE in {"cloud_api", "external"}:
+        return {
+            "backend": getattr(gamma, "backend", "unknown"),
+            "base_url": gamma.base_url, "model": gamma.model,
+            "profile": RUNTIME_MODEL_PROFILE,
+            "source": RUNTIME_MODEL_SOURCE,
+            "status": "running",
+            "state": None,
+            "capabilities": gamma.inference_provider.capabilities()
+                if getattr(gamma, "inference_provider", None) else {},
+        }
     registry = _load_vllm_registry()
     state = _load_vllm_state(registry)
     running = bool(state and state.get("pid"))
@@ -702,7 +737,7 @@ def _current_model_runtime():
 
 
 def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
-    global gamma, pipeline
+    global gamma, pipeline, RUNTIME_MODEL_SOURCE, RUNTIME_MODEL_PROFILE
     registry = _load_vllm_registry()
     profile = profile or (registry.get("profiles") or {}).get(profile_id) or {}
     state = state or _load_vllm_state(registry) or {}
@@ -713,6 +748,8 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
         new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai", manager_url=RUNTIME_VLLM_API_URL or VLLM_API_URL)
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
+        RUNTIME_MODEL_SOURCE = "managed"
+        RUNTIME_MODEL_PROFILE = profile_id
     return _current_model_runtime()
 
 
@@ -772,11 +809,34 @@ def _sync_vllm_state_on_startup():
     except Exception:
         pass
 
+def _video_extraction_status():
+    algorithm = os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm").strip().lower()
+    if algorithm == "hybrid_webp":
+        return {
+            "adapter": "hybrid_webp_memory", "algorithm": algorithm, "status": "available",
+            "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
+            "sampleFps": os.getenv("SENTRIX_VIDEO_SAMPLE_FPS", "10"),
+            "yoloBatch": os.getenv("SENTRIX_VIDEO_YOLO_BATCH_SIZE", "16"),
+            "targetDecode": "NVDEC", "memoryMerge": True, "duplicateFrameRemoval": True,
+        }
+    return {
+        "adapter": "worldmm_keyframe_memory", "algorithm": "worldmm", "status": "available",
+        "package": "tools/video_keyframe/worldmm_keyframe_pipeline.py",
+    }
+
+
+def _vector_index_status_safe():
+    try:
+        return store.vector_search_status()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.get("/api/health")
 def health():
     # Phase C C12：profile manifest 作为运维真实来源
     agent = {
-        "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow").strip().lower(),
+        "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate").strip().lower(),
         "runtime": "tool_loop",
     }
     try:
@@ -831,9 +891,9 @@ def health():
                 "identityModel": pipeline.face.identity_model,
                 "identityConfigured": pipeline.face.identity_configured,
                 "identityReady": pipeline.face.identity_ready,
-                "identityFallback": getattr(pipeline.face, "identity_fallback", False),
-                "identityFallbackModel": getattr(pipeline.face, "identity_fallback_model", None),
-                "identityFallbackError": getattr(pipeline.face, "identity_fallback_error", None),
+                "identityFallback": pipeline.face.identity_fallback,
+                "identityFallbackModel": pipeline.face.identity_fallback_model,
+                "identityFallbackError": pipeline.face.identity_fallback_error,
                 "error": pipeline.face.error,
                 "identityError": pipeline.face.identity_runtime_error or pipeline.face.identity_error,
             },
@@ -842,46 +902,11 @@ def health():
         "memory": {
             "mode": "sentrix-native",
             "vectorSpaces": ["episodic", "semantic", "visual"],
-            "vectorIndex": store.vector_search_status(),
+            "vectorIndex": _vector_index_status_safe(),
         },
-        "videoExtraction": {
-            "adapter": "hybrid_v2_yolo_katna_nvdec_webp", "status": "available",
-            "method_version": "sentrix-keyframe-hybrid-v2.0.0",
-            "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
-            "sampleFps": 10, "yoloBatch": 16, "targetDecode": "NVDEC",
-            "memoryMerge": True, "duplicateFrameRemoval": True,
-        },
+        "videoExtraction": _video_extraction_status(),
         "database": store.path,
     }
-
-
-@app.get("/api/performance")
-def performance(scope_id: str | None = None, method: str = "baseline"):
-    """Video and browser-side QA performance data for the local dashboard."""
-    try:
-        scope = (scope_id or "").strip() or None
-        payload = _video_performance(scope)
-        runs = store.list_method_runs(scope_id=scope)
-        if runs:
-            media_ids = {run.get("media_id") for run in runs if run.get("media_id")}
-            runs = [item for media_id in media_ids for item in store.list_method_runs(media_id=media_id)]
-        payload["method_comparison"] = {
-            "baseline_method": "keyframe-hybrid-v2.0.0",
-            "eventagg_method": EVENTAGG_METHOD_VERSION,
-            "mtsw_method": MTSW_METHOD_VERSION,
-            "references": [{
-                "method_version": "keyframe-hybrid-v2.0.0",
-                "label": "Baseline v2.0",
-                "status": "frozen_reference",
-                "metrics_json": {"keyframes": 180, "events": 180, "total_wall_seconds": 293.26, "extraction_seconds": 77.827},
-            }],
-            "runs": runs,
-            "selected_method": "mtsw" if str(method).lower() in {"mtsw", "mtsw_v23", MTSW_METHOD_VERSION.lower()} else "eventagg" if str(method).lower() in {"eventagg", "eventagg_v21"} else "baseline",
-        }
-        return payload
-    except Exception as error:
-        # Keep this observability endpoint non-fatal for the rest of the app.
-        raise HTTPException(status_code=500, detail=f"performance summary failed: {error}") from error
 
 @app.get("/api/hardware")
 def hardware():
@@ -939,17 +964,33 @@ def delete_memory_space(scope_id: str):
         raise HTTPException(status_code=403, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"删除失败: {exc}")
+    dropped_collections = 0
+    try:
+        from .qdrant_memory import get_qdrant_index
+        index = get_qdrant_index(store.path)
+        if index is not None:
+            dropped_collections = index.drop_scope(scope_id)
+    except Exception as exc:
+        stats["qdrant_drop_error"] = str(exc)[:300]
+    if dropped_collections:
+        stats["qdrant_collections_dropped"] = dropped_collections
     return {"ok": True, "scope_id": scope_id, "removed": stats}
 
 
 
 _OCR_SETTING_KEY = "ocr.small_enabled"
+_OCR_SETTING_EXPLICIT_KEY = "ocr.small_enabled.explicit"
 
 
 def _ocr_settings():
     from .agent_runtime.tools import small_ocr_available
-    enabled = store.get_setting(_OCR_SETTING_KEY, "false").lower() in {"1", "true", "on"}
+    from .agent_runtime.ocr_tool import resolve_small_ocr_enabled
     available = small_ocr_available()
+    enabled = resolve_small_ocr_enabled(
+        store.get_setting(_OCR_SETTING_KEY),
+        store.get_setting(_OCR_SETTING_EXPLICIT_KEY),
+        available=available,
+    )
     return {
         "small_ocr_enabled": enabled,
         "small_ocr_available": available,
@@ -970,6 +1011,7 @@ def get_ocr_settings():
 @app.put("/api/settings/ocr")
 def put_ocr_settings(payload: OCRSettingsPayload):
     store.set_setting(_OCR_SETTING_KEY, "true" if payload.small_ocr_enabled else "false")
+    store.set_setting(_OCR_SETTING_EXPLICIT_KEY, "true")
     return _ocr_settings()
 
 
@@ -999,6 +1041,39 @@ def current_model_profile():
     return _current_model_runtime()
 
 
+@app.get("/api/runtime-providers")
+def runtime_providers():
+    """Expose runtime capabilities without requiring lifecycle management."""
+    runtime = _current_model_runtime()
+    manager_url = RUNTIME_VLLM_API_URL or VLLM_API_URL
+    providers = create_runtime_providers(
+        gamma.base_url,
+        manager_url=manager_url,
+        api_key=getattr(gamma, "api_key", ""),
+        api_mode=getattr(gamma, "api_mode", "generic"),
+        timeout=min(30, getattr(gamma, "timeout", 30)),
+    )
+    try:
+        lifecycle = providers.lifecycle.state()
+    except Exception as exc:
+        lifecycle = {"status": "unavailable", "error": str(exc)}
+    telemetry = providers.telemetry.gpu_stats()
+    try:
+        inference_health = providers.inference.health()
+    except Exception as exc:
+        inference_health = {"status": "unavailable", "error": str(exc)}
+    return {
+        "runtime": runtime,
+        "inference": {
+            "status": inference_health.get("status", "unavailable"),
+            "health": inference_health,
+            "capabilities": providers.inference.capabilities(),
+        },
+        "lifecycle": lifecycle,
+        "telemetry": telemetry,
+    }
+
+
 @app.post("/api/model-profiles/switch")
 def switch_model_profile(request: ModelSwitchRequest):
     return _run_vllm_switch(request)
@@ -1012,20 +1087,153 @@ class RuntimeBindRequest(BaseModel):
 def bind_model_runtime(request: RuntimeBindRequest):
     """Bind Agent runtime to one fixed Manager/model-service pair for this process."""
     global RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL
-    if not request.manager_url.startswith(("http://", "https://")):
+    manager_url = normalize_service_url(request.manager_url)
+    model_base_url = normalize_openai_base_url(request.model_base_url)
+    if not manager_url:
         raise HTTPException(status_code=400, detail="invalid vLLM manager URL")
-    if request.model_base_url and not request.model_base_url.startswith(("http://", "https://")):
+    if request.model_base_url and not model_base_url:
         raise HTTPException(status_code=400, detail="invalid vLLM model URL")
     previous = (RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL)
-    RUNTIME_VLLM_API_URL = request.manager_url.rstrip("/")
-    RUNTIME_VLLM_BASE_URL = request.model_base_url.rstrip("/") if request.model_base_url else None
-    state = _load_vllm_state()
+    RUNTIME_VLLM_API_URL = manager_url
+    RUNTIME_VLLM_BASE_URL = model_base_url or None
+    providers = create_runtime_providers(
+        RUNTIME_VLLM_BASE_URL or gamma.base_url,
+        manager_url=RUNTIME_VLLM_API_URL,
+        api_key=getattr(gamma, "api_key", ""),
+        api_mode="vllm",
+    )
+    try:
+        state = providers.lifecycle.state()
+    except Exception:
+        state = None
     if not state or not state.get("pid"):
         RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL = previous
         raise HTTPException(status_code=502, detail="selected vLLM Manager has no active model")
     runtime = _apply_vllm_profile_to_runtime_from_state()
     return {"accepted": True, "manager_url": RUNTIME_VLLM_API_URL,
             "model_base_url": RUNTIME_VLLM_BASE_URL, "runtime": runtime}
+
+class CloudRuntimeBindRequest(BaseModel):
+    profile: str = "big_model"
+
+@app.post("/api/model-profiles/bind-cloud-runtime")
+def bind_cloud_runtime(request: CloudRuntimeBindRequest):
+    """Bind Agent runtime to the configured external OpenAI-compatible API."""
+    if request.profile != "big_model":
+        raise HTTPException(status_code=400, detail="unsupported cloud model profile")
+    base_url = os.getenv(
+        "SENTRIX_BIG_MODEL_BASE_URL",
+        "https://ark.cn-beijing.volces.com/api/plan/v3",
+    ).strip().rstrip("/")
+    model = os.getenv("SENTRIX_BIG_MODEL_MODEL", "doubao-seed-2.0-lite").strip()
+    api_key = os.getenv("SENTRIX_BIG_MODEL_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="SENTRIX_BIG_MODEL_API_KEY is not configured")
+    if not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="invalid cloud model base URL")
+    if not model:
+        raise HTTPException(status_code=400, detail="cloud model name is empty")
+
+    global gamma, pipeline, RUNTIME_MODEL_SOURCE, RUNTIME_MODEL_PROFILE
+    new_gamma = GammaClient(
+        base_url=base_url,
+        model=model,
+        backend="openai",
+        api_key=api_key,
+        manager_url="",
+        runtime_source="cloud_api",
+        api_mode="generic",
+    )
+    new_gamma.bind_store(store)
+    with runtime_lock:
+        previous_pipeline = pipeline
+        # The configured Doubao profile is vision-capable. Bind the same
+        # cloud client to Agent and ingestion so this run has no local LLM.
+        gamma = new_gamma
+        pipeline = IngestionPipeline(
+            store,
+            gamma=new_gamma,
+            asr=previous_pipeline.asr,
+            face=previous_pipeline.face,
+            clip=previous_pipeline.clip,
+        )
+        RUNTIME_MODEL_SOURCE = "cloud_api"
+        RUNTIME_MODEL_PROFILE = request.profile
+    runtime = _current_model_runtime()
+    return {
+        "accepted": True,
+        "profile": request.profile,
+        "source": "cloud_api",
+        "backend": "openai",
+        "base_url": base_url,
+        "model": model,
+        "runtime": runtime,
+    }
+
+
+class ExternalRuntimeBindRequest(BaseModel):
+    base_url: str
+    model: str
+    api_mode: str = "generic"
+
+
+@app.post("/api/model-profiles/bind-external-runtime")
+def bind_external_runtime(request: ExternalRuntimeBindRequest):
+    """Bind Agent and ingestion to a pre-started OpenAI-compatible endpoint."""
+    base_url = normalize_openai_base_url(request.base_url)
+    model = str(request.model or "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="invalid external model base URL")
+    if not model:
+        raise HTTPException(status_code=400, detail="external model name is empty")
+    api_key = (
+        os.getenv("SENTRIX_EXTERNAL_API_KEY")
+        or os.getenv("SENTRIX_VLLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    ).strip()
+    api_mode = str(request.api_mode or "generic").strip().lower()
+    if api_mode not in {"generic", "vllm"}:
+        raise HTTPException(status_code=400, detail="api_mode must be generic or vllm")
+    new_gamma = GammaClient(
+        base_url=base_url,
+        model=model,
+        backend="openai",
+        api_key=api_key,
+        manager_url="",
+        runtime_source="external",
+        api_mode=api_mode,
+    )
+    try:
+        probe = new_gamma.inference_provider.list_models()
+        if model not in probe.get("models", []):
+            raise ValueError(f"model {model!r} is not served by endpoint")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"external model endpoint unavailable: {exc}") from exc
+    new_gamma.bind_store(store)
+    global gamma, pipeline, RUNTIME_MODEL_SOURCE, RUNTIME_MODEL_PROFILE
+    with runtime_lock:
+        previous_pipeline = pipeline
+        gamma = new_gamma
+        pipeline = IngestionPipeline(
+            store,
+            gamma=new_gamma,
+            asr=previous_pipeline.asr,
+            face=previous_pipeline.face,
+            clip=previous_pipeline.clip,
+        )
+        RUNTIME_MODEL_SOURCE = "external"
+        RUNTIME_MODEL_PROFILE = model
+    return {
+        "accepted": True,
+        "source": "external",
+        "backend": "openai",
+        "base_url": new_gamma.base_url,
+        "model": model,
+        "api_mode": api_mode,
+        "capabilities": new_gamma.inference_provider.capabilities(),
+        "runtime": _current_model_runtime(),
+    }
 
 @app.post("/api/model-profiles/sync-runtime")
 def sync_model_runtime():
@@ -1110,34 +1318,12 @@ def dashboard(scope_id: str | None = None):
 
 
 @app.get("/api/events")
-def events(scope_id: str | None = None, limit: int = 1000, method: str = "baseline", run_id: str | None = None):
+def events(scope_id: str | None = None, limit: int = 1000):
     # The timeline needs older events when the user selects a historical date.
     # Keep a server-side ceiling while avoiding the previous silent 100-event
     # truncation that hid older video scenes.
     limit = min(max(int(limit or 1000), 1), 5000)
-    method_name = str(method or "baseline").lower()
-    if method_name in {"mtsw", "mtsw_v23", MTSW_METHOD_VERSION.lower()}:
-        method_version = MTSW_METHOD_VERSION
-        if not run_id:
-            runs = store.list_method_runs(scope_id=scope_id, method_version=method_version)
-            run_id = runs[0]["run_id"] if runs else None
-        return {"events": store.list_eventagg_events(run_id=run_id, scope_id=scope_id, method_version=method_version)[:limit], "method": method_version, "run_id": run_id}
-    if method_name in {"eventagg", "eventagg_v21", EVENTAGG_METHOD_VERSION.lower()}:
-        if not run_id:
-            runs = store.list_method_runs(scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
-            preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
-            run_id = (preferred or (runs[0] if runs else {})).get("run_id")
-        if not run_id:
-            return {"events": [], "method": EVENTAGG_METHOD_VERSION, "run_id": None}
-        events = store.list_eventagg_events(run_id=run_id, scope_id=scope_id, method_version=EVENTAGG_METHOD_VERSION)
-        return {"events": events[:limit], "method": EVENTAGG_METHOD_VERSION, "run_id": run_id}
-    baseline_events = store.list_events(limit, scope_id=scope_id)
-    return {"events": baseline_events, "method": "baseline"}
-
-
-@app.get("/api/method-runs")
-def method_runs(scope_id: str | None = None, media_id: str | None = None, method_version: str | None = None):
-    return {"runs": store.list_method_runs(media_id=media_id, scope_id=scope_id, method_version=method_version)}
+    return {"events": store.list_events(limit, scope_id=scope_id)}
 
 
 @app.get("/api/trips")
@@ -1177,8 +1363,6 @@ def reject_trip(trip_id: str):
 def event_detail(event_id: str):
     value = store.get_event_detail(event_id)
     if not value:
-        value = store.get_eventagg_event_detail(event_id)
-    if not value:
         raise HTTPException(status_code=404, detail="event not found")
     return value
 
@@ -1197,27 +1381,6 @@ def video_scenes(asset_id: str):
     if not value or value.get("media_type") != "video":
         raise HTTPException(status_code=404, detail="video asset not found")
     return {"video_asset_id": asset_id, "scenes": store.list_video_scene_events(asset_id)}
-
-
-@app.get("/api/videos/{asset_id}/eventagg")
-def video_eventagg(asset_id: str, run_id: str | None = None):
-    if not store.get_asset(asset_id):
-        raise HTTPException(status_code=404, detail="video asset not found")
-    if not run_id:
-        runs = store.list_method_runs(media_id=asset_id, method_version=EVENTAGG_METHOD_VERSION)
-        preferred = next((run for run in runs if abs(float((run.get("config_json") or {}).get("merge_threshold", -1)) - 0.68) < 1e-6), None)
-        run_id = (preferred or (runs[0] if runs else {})).get("run_id")
-    return {"video_asset_id": asset_id, "method": EVENTAGG_METHOD_VERSION, "run_id": run_id, "events": store.list_eventagg_events(run_id=run_id, media_id=asset_id)}
-
-
-@app.get("/api/videos/{asset_id}/mtsw")
-def video_mtsw(asset_id: str, run_id: str | None = None):
-    if not store.get_asset(asset_id):
-        raise HTTPException(status_code=404, detail="video asset not found")
-    if not run_id:
-        runs = store.list_method_runs(media_id=asset_id, method_version=MTSW_METHOD_VERSION)
-        run_id = runs[0]["run_id"] if runs else None
-    return {"video_asset_id": asset_id, "method": MTSW_METHOD_VERSION, "run_id": run_id, "events": store.list_eventagg_events(run_id=run_id, media_id=asset_id, method_version=MTSW_METHOD_VERSION)}
 
 
 @app.get("/api/video-scenes/{scene_id}")
@@ -1322,6 +1485,196 @@ def person_evidence(person_id: str, scope_id: str | None = None):
         entity["family_role"] = None
         entity["summary"] = "由人脸聚类生成，等待用户确认"
     return value
+
+
+@app.get("/api/person-insights")
+def person_insights(scope_id: str | None = None):
+    scope_id = scope_id or "home-default"
+    run = store.latest_person_insight_run(scope_id)
+    features = store.person_candidate_features(scope_id)
+    ranked = rank_core_people(features, limit=10)
+    tiers = {"core": [], "common": [], "incidental": []}
+    for item in ranked:
+        person = store.get_entity(item["person_id"]) or {}
+        role_candidates = store.list_role_hypotheses(
+            person_id=item["person_id"], status="suggested"
+        )
+        portrait = store.get_active_portrait(item["person_id"])
+        tiers[item["tier"]].append({
+            **item,
+            "identity_state": person.get("identity_state") or "clustered",
+            "role_state": person.get("role_state") or "unknown",
+            "name_state": person.get("name_state") or "anonymous",
+            "display_name": person.get("canonical_name") or "未命名成员",
+            "family_role": person.get("family_role"),
+            "role_candidates": role_candidates[:3],
+            "portrait": portrait,
+        })
+    owner_candidates = [
+        hypothesis for hypothesis in store.list_role_hypotheses(scope_id=scope_id, status="suggested")
+        if hypothesis.get("role") == "本人"
+    ]
+    return {
+        "scope_id": scope_id,
+        "run": run,
+        "tiers": tiers,
+        "album_owner_candidates": owner_candidates,
+        "relationship_hypotheses": store.list_relationship_hypotheses(scope_id, status="suggested"),
+    }
+
+
+@app.post("/api/people/{person_id}/role-decision")
+def role_decision(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    decision = str((payload or {}).get("decision") or "").strip()
+    if decision == "confirm":
+        updated = store.confirm_role_hypothesis(
+            (payload or {}).get("hypothesis_id"),
+            role=(payload or {}).get("role"),
+            is_self=bool((payload or {}).get("is_self")),
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        affected = store.supersede_conflicting_hypotheses(person_id)
+        store.rebuild_person_memory(person_id)
+        store.mark_portraits_stale([person_id, *affected])
+        return {"ok": True, "person": updated, "affected": affected}
+    if decision == "reject":
+        rejected = store.reject_role_hypothesis((payload or {}).get("hypothesis_id"))
+        if rejected is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        return {"ok": True, "rejected": rejected["id"]}
+    raise HTTPException(status_code=400, detail="unsupported decision")
+
+
+@app.patch("/api/people/{person_id}/name")
+def rename_person_api(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    name = str((payload or {}).get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    updated = store.rename_person(person_id, name)
+    return {"ok": True, "name": updated["entity"]["canonical_name"]}
+
+
+@app.post("/api/relationship-hypotheses/{hypothesis_id}/decision")
+def relationship_hypothesis_decision(hypothesis_id: str, payload: dict):
+    decision = str((payload or {}).get("decision") or "").strip()
+    if decision == "confirm":
+        hypothesis = store.confirm_relationship_hypothesis(hypothesis_id)
+        if hypothesis is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        affected = store.supersede_conflicting_hypotheses(hypothesis["subject_person_id"])
+        store.rebuild_person_memory(hypothesis["subject_person_id"])
+        store.rebuild_person_memory(hypothesis["object_person_id"])
+        store.mark_portraits_stale([
+            hypothesis["subject_person_id"], hypothesis["object_person_id"], *affected,
+        ])
+        return {"ok": True, "hypothesis": hypothesis}
+    if decision == "reject":
+        rejected = store.reject_relationship_hypothesis(hypothesis_id)
+        if rejected is None:
+            raise HTTPException(status_code=404, detail="hypothesis not found")
+        return {"ok": True, "rejected": rejected["id"]}
+    raise HTTPException(status_code=400, detail="unsupported decision")
+
+
+@app.get("/api/people/{person_id}/portrait")
+def person_portrait(person_id: str):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    return {
+        "person_id": person_id,
+        "active": store.get_active_portrait(person_id),
+        "revisions": store.list_portrait_revisions(person_id),
+    }
+
+
+@app.post("/api/people/{person_id}/portrait-feedback")
+def portrait_feedback(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    revision_id = (payload or {}).get("revision_id")
+    verdict = str((payload or {}).get("verdict") or "").strip()
+    note = str((payload or {}).get("note") or "").strip()
+    feedback = verdict + (f"：{note}" if note else "")
+    updated = store.set_portrait_feedback(revision_id, feedback)
+    if not updated:
+        raise HTTPException(status_code=404, detail="revision not found")
+    return {"ok": True, "revision": updated}
+
+
+@app.patch("/api/people/{person_id}/portrait")
+def update_portrait(person_id: str, payload: dict):
+    person = store.get_entity(person_id)
+    if not person or person.get("entity_type") != "person":
+        raise HTTPException(status_code=404, detail="person not found")
+    text = str((payload or {}).get("portrait_text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="portrait_text is required")
+    revision_id = (payload or {}).get("revision_id")
+    existing = store.get_portrait_revision(revision_id) if revision_id else None
+    revision = store.create_portrait_revision(person_id, {
+        "portrait_text": text,
+        "themes": (existing or {}).get("themes") or [],
+        "evidence_refs": (existing or {}).get("evidence_refs") or [],
+        "trigger_type": "user_edit",
+        "model_name": "user",
+        "prompt_version": "user-edit",
+    })
+    if bool((payload or {}).get("locked")):
+        revision = store.set_portrait_lock(revision["id"], True)
+    return {"ok": True, "revision": revision}
+
+
+def _execute_person_insight_run(run_id: str, scope_id: str, config: dict):
+    from .person_insights import PersonInsightService
+
+    PersonInsightService(store, gamma).run(run_id, scope_id, config or {})
+
+
+@app.post("/api/person-insight-runs")
+def start_person_insight_run(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    latest = store.latest_person_insight_run(scope_id)
+    if latest and latest.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail="person insight run already in progress")
+    config = dict(payload or {})
+    run = store.create_person_insight_run(scope_id, config)
+    threading.Thread(
+        target=_execute_person_insight_run, args=(run["id"], scope_id, config), daemon=True
+    ).start()
+    return {"status": 202, "run": run}
+
+
+@app.get("/api/person-insight-runs/{run_id}")
+def get_person_insight_run(run_id: str):
+    run = store.get_person_insight_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+@app.post("/api/person-insight-runs/{run_id}/retry")
+def retry_person_insight_run(run_id: str):
+    run = store.get_person_insight_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.get("status") == "running":
+        raise HTTPException(status_code=409, detail="run already running")
+    config = dict(run.get("config") or {})
+    threading.Thread(
+        target=_execute_person_insight_run, args=(run_id, run["scope_id"], config), daemon=True
+    ).start()
+    return {"status": 202, "run": store.get_person_insight_run(run_id)}
 
 
 @app.get("/api/entities")
@@ -1504,9 +1857,9 @@ def _analyze_confirmed_person_appearance(person_id: str):
         if not instance or not Path(instance["asset_path"]).is_file():
             continue
         try:
-            from PIL import Image
+            from PIL import Image, ImageOps
 
-            image = Image.open(instance["asset_path"]).convert("RGB")
+            image = ImageOps.exif_transpose(Image.open(instance["asset_path"])).convert("RGB")
             crop, crop_bbox = expanded_person_crop(image, instance.get("bbox_json") or [])
             with tempfile.NamedTemporaryFile(suffix=".jpg", dir=DATA_DIR, delete=False) as temporary:
                 crop.save(temporary, format="JPEG", quality=90)
@@ -1669,6 +2022,38 @@ def confirm_person(person_id: str, payload: dict | None = None):
     if not value:
         raise HTTPException(status_code=404, detail="person not found")
     return value
+
+
+@app.post("/api/people/batch-confirm")
+def batch_confirm_people(payload: dict | None = None):
+    """Confirm several person candidates at once, skipping the heavy per-person
+    appearance/LLM refresh (confirm_person_entity already rebuilds DB-level memory)."""
+    items = (payload or {}).get("items") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="items is required")
+    confirmed, failed = [], []
+    for item in items:
+        person_id = str(item.get("person_id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        family_role = str(item.get("family_role") or "").strip() or None
+        if not person_id or not name:
+            failed.append({"person_id": person_id, "name": name, "error": "person_id and name are required"})
+            continue
+        try:
+            native = store.confirm_person_entity(person_id, name, family_role)
+            if not native or not native.get("entity"):
+                failed.append({"person_id": person_id, "name": name, "error": "person not found"})
+                continue
+            confirmed.append({
+                "person_id": person_id,
+                "entity_id": native["entity"]["id"],
+                "name": name,
+                "family_role": family_role,
+                "merged": bool(native.get("merged_into")),
+            })
+        except Exception as error:
+            failed.append({"person_id": person_id, "name": name, "error": str(error)[:200]})
+    return {"confirmed": confirmed, "failed": failed, "count": len(confirmed)}
 
 
 @app.post("/api/people/{person_id}/rename")
@@ -1949,11 +2334,13 @@ def face_instance_crop(face_instance_id: str):
     if not instance or not asset_path or not Path(asset_path).is_file():
         raise HTTPException(status_code=404, detail="face instance not found")
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         ensure_heif_support()
         with Image.open(asset_path) as source:
-            image = source.convert("RGB")
+            # cv2.imread (used by detection) applies EXIF orientation, so bbox is
+            # stored in oriented coordinates; transpose here to keep crops aligned.
+            image = ImageOps.exif_transpose(source).convert("RGB")
         bbox = instance.get("bbox_json") or []
         if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
             raise ValueError("invalid face bounding box")
@@ -2035,12 +2422,6 @@ class AssistantTurnRequest(BaseModel):
     viewer_id: str = "owner"
 
 
-class WorldMMQARequest(BaseModel):
-    question: str
-    options: dict[str, str] = Field(default_factory=dict)
-    scope_id: str = "home-default"
-
-
 _TOOL_LOOP_TASK_STATE: dict[str, dict] = {}  # conversation_id -> task_state（B3.1 跨 turn 结果集续接）
 _TURN_JOBS: dict[str, dict] = {}  # turn_id -> job（B3.4 异步轮询）
 _TURN_EXECUTOR = None  # 惰性初始化 ThreadPoolExecutor
@@ -2050,7 +2431,12 @@ def _turn_executor():
     global _TURN_EXECUTOR
     if _TURN_EXECUTOR is None:
         from concurrent.futures import ThreadPoolExecutor
-        _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+        # Benchmark orchestrators now run QA evaluation with high question-level
+        # concurrency (aligned with the serving model's max_num_seqs, e.g. 16);
+        # the old fixed 2 workers serialized those turns and silently throttled
+        # concurrent runs. Env-overridable, default 16.
+        workers = max(2, int(os.getenv("SENTRIX_ASSISTANT_TURN_WORKERS", "16")))
+        _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=workers)
     return _TURN_EXECUTOR
 
 
@@ -2071,14 +2457,23 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         # Qdrant query and hides the actual sub-millisecond index latency.
         embedding_router = EmbeddingRouter.from_clip(pipeline.clip)
         retrieval_config = RetrievalConfig()
-    except Exception:
+    except Exception as exc:
+        # Retrieval must never silently fall back to the legacy full-table
+        # scan. Keep the failure visible in the service log so a missing
+        # embedder/index cannot masquerade as a normal search result.
+        import logging
+        logging.getLogger(__name__).exception("embedding_router_init_failed: %s", exc)
         embedding_router = None
-        retrieval_config = None
+        try:
+            from .retrieval import RetrievalConfig
+            retrieval_config = RetrievalConfig()
+        except Exception:
+            retrieval_config = None
     runtime_tools.bind_runtime(store, gamma=gamma, embedding_router=embedding_router,
                                retrieval_config=retrieval_config)
     runtime_tools.set_conversation_id(conversation_id)
     runtime_tools.register_tools()
-    profile_name = (profile_name or os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow")).strip().lower()
+    profile_name = (profile_name or os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate")).strip().lower()
     model_call_metrics = []
     gamma.get_and_clear_call_metrics()
 
@@ -2101,15 +2496,22 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         return int(zh * 0.7 + (total - zh) * 0.25) + 400
 
     def chat_fn(messages, *, call_type="agent", step_id=None):
-        max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
-        # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
-        # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
-        try:
-            room = 4400 - _estimate_prompt_tokens(messages)
-            if room < max_tokens:
-                max_tokens = max(64, room)
-        except Exception:
-            pass
+        is_cloud_model = getattr(gamma, "runtime_source", "") == "cloud_api"
+        if is_cloud_model:
+            max_tokens = max(1, int(os.getenv(
+                "SENTRIX_BIG_MODEL_MAX_OUTPUT_TOKENS",
+                os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"),
+            )))
+        else:
+            max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
+            # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
+            # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
+            try:
+                room = 4400 - _estimate_prompt_tokens(messages)
+                if room < max_tokens:
+                    max_tokens = max(64, room)
+            except Exception:
+                pass
         try:
             text = gamma.chat_messages(
                 messages, role="tool_loop", temperature=0.0, max_tokens=max_tokens)
@@ -2121,7 +2523,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             model_call_metrics.extend(metrics)
         return text
 
-    _ocr_setting = store.get_setting("ocr.small_enabled", "false").lower() in {"1", "true", "on"}
+    _ocr_setting = _ocr_settings()["small_ocr_enabled"]
     runtime = AgentRuntime(chat_fn=chat_fn, profile_name=profile_name,
                            ocr_settings={"small_ocr_enabled": _ocr_setting},
                            scope_id=scope_id, viewer_id=viewer_id,
@@ -2259,15 +2661,41 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                    "problems": list(s.get("problems") or [])}
                   for s in turn.steps if s.get("type") == "judge"],
     }
-    tool_trace = [
-        {"tool": s.get("tool", ""), "status": s.get("status", ""),
-         "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
-         "error": s.get("error") or "",
-         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
-        for s in turn.steps if s.get("type") == "tool"
-    ]
+    tool_trace = []
+    for step in turn.steps:
+        if step.get("type") != "tool":
+            continue
+        observation = step.get("observation") or {}
+        tool_record = {
+            "tool": step.get("tool", ""), "status": step.get("status", ""),
+            "tool_call_id": step.get("tool_call_id") or "",
+            "step_id": step.get("step_id") or "",
+            "parent_step_id": step.get("parent_step_id") or "",
+            "arguments": step.get("arguments") or {},
+            # 8771 needs the actual tool observation, not just a performance
+            # summary; this is still server-side debug data and never enters
+            # the model-visible observation path.
+            "observation": observation,
+            "latency_s": step.get("latency_s"),
+            "reason": step.get("reason") or step.get("error") or "",
+            "error": step.get("error") or "",
+            "retrieval_timing": observation.get("retrieval_timing"),
+        }
+        # Benchmark/debug consumers need to score returned handles, but model-facing
+        # observations must continue to hide internal asset IDs.
+        if include_debug and step.get("tool") in {"search_memories", "get_result_page"}:
+            result_set_id = observation.get("result_set_id")
+            result_sets = getattr(runtime_tools, "_RUNTIME", {}).get("result_sets")
+            result_set = result_sets.get(result_set_id) if result_sets and result_set_id else None
+            if result_set is not None:
+                tool_record.update(debug_asset_projection(result_set, observation.get("preview")))
+        tool_trace.append(tool_record)
     return {
         "answer": turn.final_answer,
+        "final_answer": turn.final_answer,
+        "answer_source": turn.answer_source,
+        "writer_call_id": turn.writer_call_id,
+        "writer_status": turn.writer_status,
         "model_call_metrics": ordered_metrics,
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
@@ -2281,6 +2709,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "agent2_trace": turn.agent2_trace if include_debug else public_agent2_trace(turn.agent2_trace),
         "guard_debug": guard_debug,
         "answer_grounding": turn.answer_grounding,
+        "selected_image_handles": list(getattr(turn, "selected_image_handles", []) or []),
+        "selected_image_ids": list(getattr(turn, "selected_image_ids", []) or []),
         "termination_reason": turn.termination_reason,
         "debug_trace": turn.steps if include_debug else None,
     }
@@ -2324,48 +2754,6 @@ def assistant_turn(request: AssistantTurnRequest):
         "conversation_id": conversation_id or f"conversation_{uuid.uuid4().hex[:12]}",
         "intent": "tool_loop",
     }
-
-
-def _load_worldmm_memory(scope_id):
-    """Return a rebuilt WorldMM artifact when this scope has one."""
-    path = worldmm_artifact_path(DATA_DIR, scope_id)
-    if not path.is_file():
-        return None
-    try:
-        return WorldMMMemory(path)
-    except Exception as error:
-        print(f"[worldmm] unable to load {path}: {error}", flush=True)
-        return None
-
-
-def _worldmm_turn(message, scope_id, *, options=None, progress_callback=None):
-    memory = _load_worldmm_memory(scope_id)
-    if memory is None:
-        raise HTTPException(status_code=404, detail=f"WorldMM memory is not built for scope {scope_id}")
-    if progress_callback:
-        progress_callback({"stage": "retrieval", "status": "running", "text": "正在检索 Caption、Episodic、Semantic、Visual 四类记忆。"})
-    result = memory.answer(gamma, message, options=options or {})
-    if progress_callback:
-        progress_callback({"stage": "answer", "status": "complete", "text": "已完成 WorldMM 多路记忆融合回答。"})
-    result.update({
-        "conversation_id": f"worldmm_{uuid.uuid4().hex[:12]}",
-        "intent": "worldmm_memory_qa",
-        "memory_used": True,
-        "evidence_status": "worldmm_fused",
-        "worldmm": {"scope_id": scope_id, "manifest": memory.manifest},
-        "retrieval_trace": [{"stage": "worldmm_fusion", "status": "complete", "detail": result.get("retrieval") or {}, "retrieval_timing": result.get("retrieval_timing") or {}}],
-        "tool_trace": [],
-        "public_progress": [],
-        "segments": [{"type": "text", "text": result.get("answer", "")}],
-    })
-    return result
-
-
-@app.post("/api/worldmm/qa")
-def worldmm_qa(request: WorldMMQARequest):
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="question is required")
-    return assistant_response(_worldmm_turn(request.question.strip(), request.scope_id, options=request.options))
 
 
 @app.get("/api/assistant/turn/{turn_id}")
@@ -2464,7 +2852,7 @@ def _record_turn_conversation(message, request, result, turn_id=""):
             for s in steps if _public_progress_text(s)
         ]
         conversation_store.save_trajectory(
-            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow"),
+            turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate"),
             steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent"),
                                  "telemetry": result.get("telemetry") or {}},
             public_progress=public_progress, scope_id=scope_id,
@@ -2693,6 +3081,63 @@ def assistant_response(result):
     result["evidenceStatus"] = result.get("evidence_status", "not_applicable")
     result["originalEvidenceRequested"] = result.get("original_evidence_requested", False)
     result["answerGrounding"] = result.get("answer_grounding", {})
+    # The production client renders representative source images from this
+    # stable projection.  Keep it separate from the full retrieval trace and
+    # never promote raw candidates; selected assets win, otherwise expose only
+    # the first three evidence sources.
+    grounding = result.get("answer_grounding") or {}
+    if isinstance(grounding, dict):
+        evidence_media = [
+            dict(item) for item in (
+                grounding.get("evidence_media") or grounding.get("evidence_images") or [])
+            if isinstance(item, dict) and item.get("asset_id")
+        ]
+        known_ids = {str(item.get("asset_id")) for item in evidence_media}
+        evidence_ids = grounding.get("evidence_asset_ids") or grounding.get("evidence_sources") or []
+        for asset_id in evidence_ids[:12]:
+            asset_id = str(asset_id)
+            if asset_id in known_ids:
+                continue
+            try:
+                asset = store.get_asset(asset_id)
+            except Exception:
+                asset = None
+            if asset:
+                evidence_media.append({
+                    "asset_id": asset_id,
+                    "file_name": asset.get("file_name") or "",
+                    "captured_at": asset.get("captured_at") or "",
+                    "media_type": asset.get("media_type") or "image",
+                    "media_url": f"/api/assets/{asset_id}/file",
+                })
+                known_ids.add(asset_id)
+        selected_ids = {str(value) for value in (grounding.get("selected_asset_ids") or []) if value}
+        if selected_ids:
+            selected = [item for item in evidence_media if str(item.get("asset_id")) in selected_ids]
+            evidence_media = selected or evidence_media
+        projected = []
+        for item in evidence_media[:3]:
+            asset_id = str(item.get("asset_id"))
+            asset = None
+            if not item.get("media_type"):
+                try:
+                    asset = store.get_asset(asset_id)
+                except Exception:
+                    pass
+            media_type = str(item.get("media_type") or (asset or {}).get("media_type") or "image")
+            projected.append({
+                "asset_id": asset_id,
+                "file_name": item.get("file_name") or (asset or {}).get("file_name") or "",
+                "media_type": media_type,
+                "media_url": item.get("media_url") or f"/api/assets/{asset_id}/file",
+                "display_handle": item.get("handle") or ("原始视频" if media_type == "video" else "原始图片"),
+                "captured_at": item.get("captured_at") or (asset or {}).get("captured_at") or "",
+            })
+        if not result.get("media_results"):
+            result["media_results"] = projected
+        if not result.get("image_results"):
+            result["image_results"] = [item for item in projected if item["media_type"] == "image"]
+        result["mediaResults"] = result.get("media_results") or []
     result["terminationReason"] = result.get("termination_reason", "")
     result["claimVerifications"] = result["claim_verifications"]
     result["claimVerificationStatus"] = result["claim_verification_status"]
@@ -2728,21 +3173,6 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
                 job["public_progress"] = job.get("progress_events")
 
         started = time.time()
-        # A rebuilt WorldMM scope owns its QA path.  The existing tool-loop
-        # remains unchanged for ordinary household scopes.
-        if _load_worldmm_memory(scope_id) is not None:
-            result = _worldmm_turn(message, scope_id, progress_callback=on_progress)
-            result["telemetry"] = {
-                "profile": "worldmm_memory",
-                "status": "complete",
-                "latency_s": round(time.time() - started, 2),
-                "fallback": False,
-            }
-            result = assistant_response(result)
-            if job is not None:
-                job.update({"status": "complete", "result": result,
-                            "public_progress": result.get("public_progress") or job.get("public_progress") or []})
-            return
         result = _tool_loop_turn(message, conversation_id, scope_id, viewer_id,
                                  recent_turns=recent_turns, progress_callback=on_progress,
                                  selected_asset_handle=selected_asset_handle,
@@ -2753,7 +3183,7 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
         try:
             trace = result.get("retrieval_trace") or []
             result["telemetry"] = {
-                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_shadow"),
+                "profile": os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate"),
                 "status": result.get("tool_loop_status"),
                 "reason": result.get("tool_loop_reason"),
                 "termination_reason": result.get("termination_reason"),
@@ -2914,7 +3344,7 @@ async def ingest(
 
 
 @app.post("/api/import", status_code=202)
-async def import_remote_files(
+def import_remote_files(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     metadata: str | None = Form(None),
@@ -2944,28 +3374,11 @@ async def import_remote_files(
     with db_write_guard("import-remote-init"):
         store.create_memory_space(scope, scope, kind="benchmark")
         store.create_ingest_batch(batch, scope)
-    upload_names = {Path(upload.filename or "").name.lower() for upload in files}
-    package_video_upload = next((upload for upload in files if Path(upload.filename or "").suffix.lower() in {".mp4", ".m4v", ".mov"}
-                                and ("selected_frames" in Path(upload.filename or "").stem.lower()
-                                     or "frame_map.json" in upload_names and "semantic.json" in upload_names)), None)
-    is_keyframe_package = bool(package_video_upload and KEYFRAME_PACKAGE_SIDECARS <= upload_names)
-    package_sidecar_paths = {}
-    package_video_asset = None
     items = []
     queued_asset_ids = []
+    prepared_records = []
     for index, upload in enumerate(files):
         safe_name = Path(upload.filename or f"upload-{index}").name
-        if is_keyframe_package and safe_name.lower() in KEYFRAME_PACKAGE_SIDECARS:
-            sidecar_path = MEDIA_DIR / f"{make_id('keyframe-package')}_{safe_name}"
-            try:
-                with sidecar_path.open("wb") as output:
-                    shutil.copyfileobj(upload.file, output)
-                package_sidecar_paths[safe_name.lower()] = sidecar_path
-                items.append({"accepted": True, "fileName": safe_name, "status": "attached", "package_sidecar": True, "scope_id": scope, "batch_id": batch})
-            except Exception as error:
-                sidecar_path.unlink(missing_ok=True)
-                items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
-            continue
         media_type = (upload.content_type or "application/octet-stream").split("/", 1)[0]
         if media_type not in {"image", "audio", "video", "text"}:
             media_type = media_type_from_upload(upload.content_type, safe_name)
@@ -2976,56 +3389,68 @@ async def import_remote_files(
                 shutil.copyfileobj(upload.file, output)
             file_save_seconds = round(time.perf_counter() - save_started, 4)
             capture = _normalized_capture_metadata(per_file[index])
-            with db_write_guard("import-remote-file"):
-                created = pipeline.create_asset(destination, file_name=safe_name, media_type=media_type, mime_type=upload.content_type, metadata={
-                    "scope_id": scope, "batch_id": batch, "source_owner_id": sourceOwnerId,
-                    "source_owner_label": sourceOwnerLabel, "source_device_id": sourceDeviceId,
-                    "source_album_id": sourceAlbumId, "source_confidence": 1.0 if sourceOwnerId else 0.0,
-                    **capture,
-                })
-                if media_type == "video" and created.get("path") == str(destination):
-                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
-                    if is_keyframe_package and upload is package_video_upload:
-                        package_video_asset = created
-                created = store.update_asset(created["id"], created.get("status") or "queued", {
-                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": file_save_seconds}
-                })
-            deduplicated = created.get("path") != str(destination)
-            if deduplicated:
-                destination.unlink(missing_ok=True)
-            elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
-                queued_asset_ids.append(created["id"])
-            items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"], "fileName": created["file_name"], "status": created["status"], "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"), "deduplicated": deduplicated})
+            prepared = pipeline.prepare_asset(destination, file_name=safe_name,
+                                              media_type=media_type,
+                                              mime_type=upload.content_type,
+                                              metadata={
+                                                  "scope_id": scope, "batch_id": batch,
+                                                  "source_owner_id": sourceOwnerId,
+                                                  "source_owner_label": sourceOwnerLabel,
+                                                  "source_device_id": sourceDeviceId,
+                                                  "source_album_id": sourceAlbumId,
+                                                  "source_confidence": 1.0 if sourceOwnerId else 0.0,
+                                                  **capture,
+                                              })
+            prepared["metadata"]["import_timings"] = {
+                **(prepared["metadata"].get("import_timings") or {}),
+                "file_save_seconds": file_save_seconds,
+            }
+            prepared_records.append({"file_name": safe_name, "media_type": media_type,
+                                     "destination": destination, "prepared": prepared})
         except ValueError as error:
             destination.unlink(missing_ok=True)
             items.append({"accepted": False, "fileName": safe_name, "status": "rejected", "error": str(error)})
         except Exception as error:
             destination.unlink(missing_ok=True)
             items.append({"accepted": False, "fileName": safe_name, "status": "failed", "error": str(error)})
-    if is_keyframe_package and package_video_asset and len(package_sidecar_paths) == len(KEYFRAME_PACKAGE_SIDECARS):
-        package_dir = Path(package_video_asset["path"]).parent
-        moved = {}
-        for name, source in package_sidecar_paths.items():
-            target = package_dir / name
-            shutil.move(str(source), str(target))
-            moved[name] = str(target)
+
+    for offset in range(0, len(prepared_records), IMPORT_DB_CHUNK_SIZE):
+        chunk = prepared_records[offset:offset + IMPORT_DB_CHUNK_SIZE]
         try:
-            frame_map = json.loads(Path(moved["frame_map.json"]).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            frame_map = {}
-        package_descriptor = {
-            "frame_map_path": moved["frame_map.json"],
-            "semantic_path": moved["semantic.json"],
-            "encoded_fps": frame_map.get("encoded_fps", 25) if isinstance(frame_map, dict) else 25,
-            "source_fps": frame_map.get("source_fps", 0) if isinstance(frame_map, dict) else 0,
-            "source_width": frame_map.get("source_width", 0) if isinstance(frame_map, dict) else 0,
-            "source_height": frame_map.get("source_height", 0) if isinstance(frame_map, dict) else 0,
-        }
-        with db_write_guard("import-keyframe-package"):
-            package_video_asset = store.update_asset(package_video_asset["id"], "video-queued", {
-                "video_stage": "video-queued", "keyframe_video": True,
-                "keyframe_video_package": package_descriptor,
-            })
+            chunk_items = []
+            chunk_queued_asset_ids = []
+            cleanup_paths = []
+            with db_write_guard("import-remote-chunk"):
+                with store.transaction():
+                    created_batch = pipeline.create_assets([item["prepared"] for item in chunk])
+                    for item, created in zip(chunk, created_batch):
+                        destination = item["destination"]
+                        if item["media_type"] == "video" and created.get("path") == str(destination):
+                            created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                        created = store.update_asset(created["id"], created.get("status") or "queued", {
+                            "import_timings": {
+                                **((created.get("metadata_json") or {}).get("import_timings") or {}),
+                                "file_save_seconds": (item["prepared"].get("metadata") or {}).get("import_timings", {}).get("file_save_seconds", 0.0),
+                            }
+                        })
+                        deduplicated = created.get("path") != str(destination)
+                        if deduplicated:
+                            cleanup_paths.append(destination)
+                        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
+                            chunk_queued_asset_ids.append(created["id"])
+                        chunk_items.append({"accepted": True, "assetId": created["id"], "asset_id": created["id"],
+                                      "fileName": created["file_name"], "status": created["status"],
+                                      "scope_id": created.get("scope_id"), "batch_id": created.get("batch_id"),
+                                      "deduplicated": deduplicated})
+            queued_asset_ids.extend(chunk_queued_asset_ids)
+            items.extend(chunk_items)
+            for destination in cleanup_paths:
+                destination.unlink(missing_ok=True)
+        except Exception as error:
+            for item in chunk:
+                item["destination"].unlink(missing_ok=True)
+                items.append({"accepted": False, "fileName": item["file_name"], "status": "failed", "error": str(error)})
+
     if queued_asset_ids:
         if not deferBatchComplete:
             store.complete_ingest_batch(batch)
@@ -3058,6 +3483,7 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
     imported = []
     skipped = []
     queued_asset_ids = []
+    prepared_records = []
     for path in candidates:
         metadata = {
             "scope_id": scope,
@@ -3071,36 +3497,66 @@ def import_assets(request: ImportRequest, background_tasks: BackgroundTasks):
             "captured_location": request.captured_location,
         }
         target = path
-        if request.copy_file:
-            target = MEDIA_DIR / f"{make_id('import')}_{path.name}"
-            shutil.copy2(path, target)
+        copy_started = time.perf_counter()
         try:
-            copy_started = time.perf_counter()
-            with db_write_guard("import-directory-file"):
-                created = pipeline.create_asset(target, file_name=path.name, metadata=metadata)
-                if created.get("media_type") == "video" and created.get("path") == str(target):
-                    created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
-                created = store.update_asset(created["id"], created.get("status") or "queued", {
-                    "import_timings": {**((created.get("metadata_json") or {}).get("import_timings") or {}), "file_save_seconds": round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0}
-                })
+            if request.copy_file:
+                target = MEDIA_DIR / f"{make_id('import')}_{path.name}"
+                shutil.copy2(path, target)
+            file_save_seconds = round(time.perf_counter() - copy_started, 4) if request.copy_file else 0.0
+            prepared = pipeline.prepare_asset(target, file_name=path.name, metadata=metadata)
+            prepared["metadata"]["import_timings"] = {
+                **(prepared["metadata"].get("import_timings") or {}),
+                "file_save_seconds": file_save_seconds,
+            }
+            prepared_records.append({"source_path": path, "target": target, "prepared": prepared})
         except Exception as error:
             if request.copy_file:
                 target.unlink(missing_ok=True)
             skipped.append({"path": str(path), "reason": str(error)})
-            continue
-        deduplicated = created.get("path") != str(target)
-        if request.copy_file and deduplicated:
-            target.unlink(missing_ok=True)
-        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
-            queued_asset_ids.append(created["id"])
-        imported.append({
-            "asset_id": created["id"],
-            "file_name": created["file_name"],
-            "media_type": created["media_type"],
-            "status": created["status"],
-            "deduplicated": deduplicated,
-            "source_path": str(path),
-        })
+
+    for offset in range(0, len(prepared_records), IMPORT_DB_CHUNK_SIZE):
+        chunk = prepared_records[offset:offset + IMPORT_DB_CHUNK_SIZE]
+        chunk_imported = []
+        chunk_queued_asset_ids = []
+        cleanup_paths = []
+        try:
+            with db_write_guard("import-directory-chunk"):
+                with store.transaction():
+                    created_batch = pipeline.create_assets([item["prepared"] for item in chunk])
+                    for item, created in zip(chunk, created_batch):
+                        target = item["target"]
+                        if created.get("media_type") == "video" and created.get("path") == str(target):
+                            created = store.update_asset(created["id"], "video-queued", {"video_stage": "video-queued"})
+                        created = store.update_asset(created["id"], created.get("status") or "queued", {
+                            "import_timings": {
+                                **((created.get("metadata_json") or {}).get("import_timings") or {}),
+                                "file_save_seconds": (item["prepared"].get("metadata") or {}).get("import_timings", {}).get("file_save_seconds", 0.0),
+                            }
+                        })
+                        deduplicated = created.get("path") != str(target)
+                        if deduplicated:
+                            cleanup_paths.append(target)
+                        elif created.get("status") in {"queued", "failed", "video-queued", "video-processing-failed"}:
+                            chunk_queued_asset_ids.append(created["id"])
+                        chunk_imported.append({
+                            "asset_id": created["id"],
+                            "file_name": created["file_name"],
+                            "media_type": created["media_type"],
+                            "status": created["status"],
+                            "deduplicated": deduplicated,
+                            "source_path": str(item["source_path"]),
+                        })
+            imported.extend(chunk_imported)
+            queued_asset_ids.extend(chunk_queued_asset_ids)
+            for target in cleanup_paths:
+                if request.copy_file:
+                    target.unlink(missing_ok=True)
+        except Exception as error:
+            for item in chunk:
+                if request.copy_file:
+                    item["target"].unlink(missing_ok=True)
+                skipped.append({"path": str(item["source_path"]), "reason": str(error)})
+
     if queued_asset_ids:
         store.complete_ingest_batch(batch_id)
         background_tasks.add_task(process_ingest_batch, queued_asset_ids, batch_id)
@@ -3144,16 +3600,46 @@ def complete_ingest_batch(batch_id: str, background_tasks: BackgroundTasks):
     with batch_worker_lock:
         worker_active = batch_id in active_batch_workers
     if not worker_active:
-        background_tasks.add_task(pipeline.finalize_ingest_batch, batch_id)
+        pending_ids = _batch_work_asset_ids(store, batch_id, include_stale=True)
+        if pending_ids:
+            if (store.get_ingest_batch(batch_id) or {}).get("status") == "completed":
+                with db_write_guard("ingest-batch-reopen-recovery"):
+                    store.reopen_ingest_batch(batch_id)
+            background_tasks.add_task(process_ingest_batch, pending_ids, batch_id)
+        else:
+            all_batch_ids = [row["id"] for row in store._rows(
+                "SELECT id FROM assets WHERE batch_id = ? ORDER BY created_at, id",
+                (batch_id,),
+            )]
+            background_tasks.add_task(process_ingest_batch, all_batch_ids, batch_id)
     return _batch_status(batch_id)
 
 
 @app.post("/api/maintenance/recheck")
-def recheck(background_tasks: BackgroundTasks):
-    assets = [store.get_asset(row["id"]) for row in store._rows("SELECT id FROM assets WHERE status IN ('queued', 'failed', 'semantic_enriching', 'video-queued', 'video-processing-failed') ORDER BY created_at")]
+def recheck(background_tasks: BackgroundTasks, scope_id: str | None = None):
+    # processing/semantic_enriching 是处理中断遗留的中间状态（SQLite 写锁竞争 /
+    # worker 重启时遗留），recheck 必须覆盖并先重置为 queued 再重新处理；
+    # 否则这些资产永久卡住，scope 永不 complete（实测 album3-kling 导入卡死）。
+    clauses = ["status IN ('queued', 'failed', 'processing', 'semantic_enriching', 'video-queued', 'video-processing-failed')"]
+    params = []
+    if scope_id:
+        clauses.append("scope_id = ?")
+        params.append(scope_id)
+    assets = [store.get_asset(row["id"]) for row in store._rows(
+        "SELECT id FROM assets WHERE " + " AND ".join(clauses) + " ORDER BY created_at", params)]
+    recovered = 0
+    for item in assets:
+        if item["status"] in PIPELINE_STALE_STATUSES:
+            store.cleanup_asset_derivatives(item["id"])
+            store.update_asset(item["id"], "queued", {
+                "error": None, "failed_stage": None,
+                "pipeline_attempts": 0, "pipeline_retry_count": 0,
+                "pipeline_recovered_from_status": item["status"],
+            })
+            recovered += 1
     for item in assets:
         background_tasks.add_task(process_asset, item["id"])
-    return {"accepted": len(assets), "status": "recheck-queued"}
+    return {"accepted": len(assets), "status": "recheck-queued", "recovered_from_stale": recovered}
 
 
 @app.post("/api/maintenance/summarize-events")

@@ -35,10 +35,11 @@ class SidecarClientCircuitBreakerTests(unittest.TestCase):
             embedder = bge_module.BgeM3TextQueryEmbedder(base_url="http://sidecar:8101")
             self.assertEqual(embedder.embed_query("厨房"), [1.0, 0.0, 2.0])
 
-    def test_circuit_breaker_trips_after_three_failures(self):
+    def test_circuit_breaker_trips_after_five_failures(self):
+        # 熔断阈值迭代放宽：3→5（连续 5 次失败才熔断，降低 sidecar 偶发慢响应的误熔断）
         with mock.patch.object(bge_module.httpx, "post", side_effect=RuntimeError("down")):
             embedder = bge_module.BgeM3TextQueryEmbedder(base_url="http://sidecar:8101")
-            for _ in range(3):
+            for _ in range(5):
                 self.assertEqual(embedder.embed_query("x"), [])
             # tripped -> further calls short-circuit to [] without HTTP.
             with mock.patch.object(bge_module.httpx, "post") as post:
@@ -55,6 +56,18 @@ class SidecarClientCircuitBreakerTests(unittest.TestCase):
             post.return_value.raise_for_status.return_value = None
             post.return_value.json.return_value = {"vector": [1.0]}
             self.assertEqual(embedder.embed_query("ok"), [1.0])
+
+    def test_health_probe_is_cached_during_batched_queries(self):
+        with mock.patch.object(bge_module.httpx, "get") as get, \
+                mock.patch.object(bge_module.httpx, "post") as post:
+            get.return_value = mock.Mock(status_code=200)
+            post.return_value = mock.Mock()
+            post.return_value.raise_for_status.return_value = None
+            post.return_value.json.return_value = {"vector": [1.0]}
+            embedder = bge_module.BgeM3TextQueryEmbedder(base_url="http://sidecar:8101")
+            self.assertTrue(embedder.available)
+            self.assertTrue(embedder.available)
+            self.assertEqual(get.call_count, 1)
 
 
 class TextAnnShadowRankingTests(unittest.TestCase):

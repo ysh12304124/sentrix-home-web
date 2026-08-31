@@ -25,7 +25,7 @@ test("Phase C: agent-style work trace auto-collapses after final and stays open 
 
 test("Phase C: original evidence fold defaults open with item count", () => {
   assert.match(app, /<summary>原始证据\$\{evidenceCount/);
-  assert.match(app, /hasGap \|\| evidenceCount > 0 \? " open" : ""/);
+  assert.match(app, /const basisOpen = displayMode === "result_grid" \|\| hasGap \|\| \(displayMode !== "collapsed" && evidenceCount > 0\)/);
 });
 
 test("Phase C/UX: tool-loop evidence samples feed the original-evidence fold", () => {

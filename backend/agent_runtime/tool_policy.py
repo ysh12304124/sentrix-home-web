@@ -43,8 +43,19 @@ class ToolPolicy:
         decision = self.authorize(spec, spec.name, arguments)
         if not decision.allowed:
             return decision
+        context = context or {}
+        if "asset_handle_in_current_preview" in getattr(spec, "preconditions", ()):
+            task_state = context.get("task_state") or {}
+            preview = task_state.get("result_preview") or []
+            handles = {
+                item.get("handle") if isinstance(item, dict) else str(item)
+                for item in preview
+            }
+            handle = str(arguments.get("asset_handle") or "")
+            if not handle or handle not in handles:
+                return ToolDecision(False, "asset_handle_not_in_current_preview")
         try:
-            payload = spec.executor(arguments, context=context or {})
+            payload = spec.executor(arguments, context=context)
         except Exception as exc:
             return ToolDecision(False, "tool_execution_error", error=str(exc))
         if self.budget is not None:
@@ -57,7 +68,8 @@ class ToolPolicy:
         "remaining", "counts", "coverage", "facts", "items", "completeness",
         "unresolved", "delivered", "blocked", "observation", "certainty",
         "confirms_visual_only", "source", "persisted", "question", "asset_handle",
-        "reason", "url", "status", "_model_call_metrics",
+        "reason", "url", "status", "family_role", "photo_identities",
+        "call_status", "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
         "query_memory_facts": _DEFAULT_ALLOWED | {
@@ -66,16 +78,28 @@ class ToolPolicy:
             "explicit_foods", "explicit_food_events", "meal_scene_events",
             "possible_events", "time_range", "rows_truncated", "samples", "items",
         },
-        "search_memories": _DEFAULT_ALLOWED | {
-            "query", "mode", "gaps", "query_satisfaction", "answerability",
-            "condition_summary", "can_inspect", "inspect_hint",
-            "recommended_resolution",
-            "asset_ids", "evidence_count", "place",
-            "retrieval_timing",
+        "query_photo_people": _DEFAULT_ALLOWED | {
+            "result_set_id", "asset_id", "people", "unconfirmed_people",
+            "unconfirmed_people_count", "source_asset_ids", "source_handles",
+            "evidence_asset_ids", "evidence_kind", "summary",
         },
-        "get_original_photos": _DEFAULT_ALLOWED | {"scope_id"},
-        "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query"}, 
-        "inspect_photo": _DEFAULT_ALLOWED,
+        "search_memories": _DEFAULT_ALLOWED | {
+            # 只保留模型决策需要的顶层字段;检索内部/统计/诊断字段留在服务端
+            # 与 debug trace,不进入模型上下文（见 runtime._model_visible_observation）。
+            "query", "query_satisfaction", "recommended_handle", "place",
+            "group_photo_count", "group_photo_sizes", "group_photo_rows",
+        },
+        "get_original_photos": _DEFAULT_ALLOWED | {"scope_id", "media_type",
+                                                  "source_timestamp_sec", "source_video_asset_id"},
+        "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query",
+                                               "asset_ids", "evidence_asset_ids",
+                                               "retrieved_asset_ids", "source_asset_ids",
+                                               "requires_new_search"},
+        "inspect_photo": _DEFAULT_ALLOWED | {"_source_asset_id", "face_candidates",
+                                             "selected_face_id", "target_bbox",
+                                             "target_face_id", "target_face_status",
+                                             "target_person", "unconfirmed_people",
+                                             "unconfirmed_people_count"},
         "read_photo_text": _DEFAULT_ALLOWED | {
             "full_text", "text_regions", "confidence", "exact_values", "fallback_used",
             "provider", "cache_hit", "tiles", "vlm_calls",
@@ -86,11 +110,10 @@ class ToolPolicy:
         "get_core_memory": _DEFAULT_ALLOWED | {
             "subject", "topic", "cards", "note",
         },
-        "get_person_memory": _DEFAULT_ALLOWED | {
-            "person", "operation", "readiness", "asset_count", "observation_count",
-            "event_count", "entity_binding_coverage", "first_occurrence",
-            "last_occurrence", "common_places", "co_occurrence", "events",
-            "representative_events", "insufficient_evidence", "note",
+        "get_person_profile": _DEFAULT_ALLOWED | {
+            "person", "readiness", "insufficient_evidence", "note",
+            "preference_summary", "relationships", "patterns",
+            "recent_events", "claims", "profile_text",
         },
     }
 

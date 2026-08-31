@@ -1,0 +1,217 @@
+[
+ {
+  "qa": "validation-album3-012-q01",
+  "score": null,
+  "applicable": false,
+  "reason": "模型仅陈述了活动地点，图片中不存在可核验该地点的相关视觉信息，也无其他可核验的具体视觉陈述"
+ },
+ {
+  "qa": "validation-album3-012-q02",
+  "score": 1,
+  "applicable": true,
+  "reason": "两张图片中均存在大头儿子小头爸爸主题的沙雕，且有儿童在该沙雕前合影；仅无法从图片确认这些儿童是否为明明和乐乐，模型称无法确认是否包含该主题沙雕内容与图片可见事实矛盾，但该矛盾属于次要问题，关于人物身份无法确认的表述符合图片情况。"
+ },
+ {
+  "qa": "validation-album3-012-q06",
+  "score": null,
+  "applicable": false,
+  "reason": "回答仅表示无法确定该男孩的身份，未包含其他可核验的视觉事实陈述，符合applicable=false的条件"
+ },
+ {
+  "qa": "validation-album3-012-q08",
+  "score": null,
+  "applicable": false,
+  "reason": "回答仅说明无法确认明明的身份及对应的上衣颜色，未陈述具体视觉事实，属于非视觉结论，因此不适用评分"
+ },
+ {
+  "qa": "validation-album3-012-q03",
+  "score": 0,
+  "applicable": true,
+  "reason": "结合两张图片可以看到该主题沙雕上存在可辨认的文字内容，能够识别出主题名称相关的文字信息，模型称现有照片看不出来文字内容无法确认，与图片可见事实矛盾"
+ },
+ {
+  "qa": "validation-album3-024-q01",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "validation-album3-024-q04",
+  "score": 2,
+  "applicable": true,
+  "reason": "本轮实际召回了3张店铺相关照片，符合回答中提到的3张照片的描述；照片无法确认是否包含提问者本人和其工友，回答该表述也符合图片信息，所有可核验的视觉陈述均得到图片支持。"
+ },
+ {
+  "qa": "validation-album3-024-q08",
+  "score": null,
+  "applicable": false,
+  "reason": "模型仅表示无法从照片看出工友名字，未作出其他具体视觉陈述，名字属于非视觉元数据，符合applicable=false条件"
+ },
+ {
+  "qa": "validation-album3-024-q05",
+  "score": 1,
+  "applicable": true,
+  "reason": "在合影图中可以确认你（提问者）穿着白色背心，下身是黑色短裤，这两项描述符合图片可见内容；但腰间系着的是蓝白相间的布料衣物，并非回答中所说的毛巾，存在次要视觉陈述的矛盾。"
+ },
+ {
+  "qa": "validation-album3-024-q02",
+  "score": 0,
+  "applicable": true,
+  "reason": "在第一张图片里，该单人留影身后墙面的招牌文字为“大圣 葱油拌面”，与模型回答的“大兴 烧烤串儿”不符，回答的视觉事实与图片存在明显矛盾。"
+ },
+ {
+  "qa": "validation-album3-024-q07",
+  "score": 0,
+  "applicable": true,
+  "reason": "第一张图片中，单人留影身后墙面上的蓝色标牌清晰显示出报警电话为22048084和22048085，模型回答称现有照片里看不出来，与图片可见事实矛盾。"
+ },
+ {
+  "qa": "validation-album3-026-q01",
+  "score": 0,
+  "applicable": true,
+  "reason": "本轮召回的两张顶呱呱炸鸡店菜单图片上都清晰标注了“創始于1974年”，现有图片可以明确看出品牌创始年份，和回答中“现有照片里看不出来”的陈述矛盾。"
+ },
+ {
+  "qa": "validation-album3-026-q02",
+  "score": 1,
+  "applicable": true,
+  "reason": "模型列出的多数菜单品类和对应价格可由两张图片支持，但存在多处与图片不符的描述：将黑松芭乐汁错写为黑松花生汁，错误描述汉堡双人套餐配料份量，错误称经典单人餐价格未完全显示，错误描述超值炸鸡桶套餐内容、108元套餐内容，错将呱呱包写为吼吼花，因"
+ },
+ {
+  "qa": "validation-album3-026-q08",
+  "score": null,
+  "applicable": false,
+  "reason": "模型仅给出无法判断的结论，未包含具体视觉陈述，符合applicable=false的条件。"
+ },
+ {
+  "qa": "validation-album3-026-q03",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "validation-album3-026-q06",
+  "score": 2,
+  "applicable": true,
+  "reason": "在提供的顶呱呱炸鸡店菜单饮品区域中，清晰标注台式奶茶的售价为¥10，和回答的视觉陈述一致，没有矛盾。"
+ },
+ {
+  "qa": "validation-album3-026-q07",
+  "score": 2,
+  "applicable": true,
+  "reason": "第一张菜单图片底部清晰标注了“可乐加\"¥8\"可换玉米浓汤/美式咖啡”，与模型回答的内容完全一致，所有视觉陈述均得到图片支持，不存在矛盾。"
+ },
+ {
+  "qa": "validation-album3-040-q01",
+  "score": 2,
+  "applicable": true,
+  "reason": "图片中可见存在三个彩色的兔子雕塑，多张照片都显示人物和兔子雕塑互动合影，回答陈述的所有视觉事实都得到图片支持，不存在矛盾。"
+ },
+ {
+  "qa": "validation-album3-040-q02",
+  "score": 2,
+  "applicable": true,
+  "reason": "本轮提供的5张图片均为夜晚户外公园场景，每张图都存在卡通兔子雕塑，且都有人物和兔子雕塑合影，符合回答中‘有几张在户外草坪上与卡通兔子雕塑合影的照片’的陈述；回答声明无法确认照片中的人是否为提问者家人，符合图片无法核验人物身份的情况，所有已陈"
+ },
+ {
+  "qa": "validation-album3-040-q04",
+  "score": 2,
+  "applicable": true,
+  "reason": "图片均为夜晚的公园场景，可见多名人员在此和兔子造型雕塑互动游玩，符合夜晚在公园游玩的描述；图片仅能看到人员样貌，无法确认这些人员具体的家庭成员身份关系，也无法确认更多额外活动内容，模型的相关陈述均符合图片情况，没有与图片矛盾的视觉陈述。"
+ },
+ {
+  "qa": "validation-album3-047-q01",
+  "score": null,
+  "applicable": false,
+  "reason": "模型仅说明现有照片无法看出举办地点，未给出其他具体视觉陈述，因此不进行评分"
+ },
+ {
+  "qa": "validation-album3-047-q02",
+  "score": 2,
+  "applicable": true,
+  "reason": "本轮实际召回了4张夜间户外表演场景的照片，回答中4张照片的计数符合图片事实；且图片仅能确认是夜间户外表演，无法确认是否为夜间部落表演，回答中无法确认的结论也与图片情况一致。日期地点属于不可核验元数据，不影响评分。所有可核验视觉陈述均得到图片"
+ },
+ {
+  "qa": "validation-album3-047-q04",
+  "score": 0,
+  "applicable": true,
+  "reason": "提供的四张图片中，都可以清晰看到这场夜间表演的场地周边种植有多棵棕榈树，能够辨认出周边的植物种类，模型称现有照片里看不出来，与图片可见事实矛盾。"
+ },
+ {
+  "qa": "validation-album3-047-q08",
+  "score": null,
+  "applicable": false,
+  "reason": "回答仅说明无法从照片确认朋友名字，未包含其他具体视觉陈述"
+ },
+ {
+  "qa": "validation-album3-047-q03",
+  "score": 0,
+  "applicable": true,
+  "reason": "在第四张召回图片中，可以清晰看到表演者使用了火把以及圆形装饰类道具，模型称现有照片看不出来，该结论与图片可见事实矛盾"
+ },
+ {
+  "qa": "validation-album3-047-q07",
+  "score": 0,
+  "applicable": true,
+  "reason": "第四张图片中清晰拍到了表演现场有表演者手持点燃的火把进行表演，模型回答称现有照片里看不出来，与图片可见事实矛盾。"
+ },
+ {
+  "qa": "behavior-v2-01",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-02",
+  "score": null,
+  "reason": "skipped_clarify"
+ },
+ {
+  "qa": "behavior-v2-03",
+  "score": null,
+  "reason": "skipped_clarify"
+ },
+ {
+  "qa": "behavior-v2-04",
+  "score": 2,
+  "applicable": true,
+  "reason": "三张提供的图片中，均未出现这两位工友的手机号码和身份证号相关信息，回答的陈述与图片信息一致，不存在矛盾。"
+ },
+ {
+  "qa": "behavior-v2-05",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-06",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-07",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-08",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-09",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-10",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-11",
+  "score": null,
+  "reason": "no_predicted_images"
+ },
+ {
+  "qa": "behavior-v2-12",
+  "score": null,
+  "reason": "no_predicted_images"
+ }
+]

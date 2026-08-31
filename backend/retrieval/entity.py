@@ -40,7 +40,9 @@ class EntityRetriever:
                     + (" AND scope_id = ?" if scope_id else ""),
                     (person.lower(), scope_id) if scope_id else (person.lower(),),
                 ).fetchall()
-                return {row[0] for row in rows}
+                asset_ids = {row[0] for row in rows}
+                if asset_ids:
+                    return asset_ids
         except Exception:
             pass
         assets = set()
@@ -48,7 +50,12 @@ class EntityRetriever:
             if scope_id and (observation.get("scope_id") or "home-default") != scope_id:
                 continue
             people = observation.get("people") or []
-            if person in people:
+            names = {
+                str(item.get("name") or item.get("canonical_name") or "")
+                if isinstance(item, dict) else str(item)
+                for item in people
+            }
+            if person in names:
                 assets.add(observation.get("asset_id"))
         return assets
 

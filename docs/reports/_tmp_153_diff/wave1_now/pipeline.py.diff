@@ -1,0 +1,78 @@
+diff --git a/backend/pipeline.py b/backend/pipeline.py
+index d3549b59..05d52c69 100644
+--- a/backend/pipeline.py
++++ b/backend/pipeline.py
+@@ -231,7 +231,12 @@ class IngestionPipeline:
+             )
+             fact_text = " ".join(f"{item.get('subject', '')} {item.get('predicate', '')} {item.get('object', '')}" for item in result.get("facts", []))
+             clothing_text = " ".join(str(item) for item in (observation.get("clothing") or []))
+-            text_embedding, text_model = self._text_embed(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text])))
++            detail = observation.get("detail") or {}
++            detail_text = " ".join(
++                str(item.get("text") or item.get("label") or item)
++                for item in (detail.get("visible_details") or [])
++            ) if isinstance(detail, dict) else ""
++            text_embedding, text_model = self._text_embed(" ".join(filter(None, [observation.get("caption"), observation.get("activity"), observation.get("place"), observation.get("ocr_text"), observation.get("transcript"), clothing_text, fact_text, detail_text])))
+             self.store.upsert_vector("episodic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
+             self.store.upsert_vector("episodic", "event", event["id"], text_embedding, text_model, {"observation_id": observation["id"]})
+             self.store.upsert_vector("semantic", "observation", observation["id"], text_embedding, text_model, {"asset_id": asset_id, "event_id": event["id"]})
+@@ -394,6 +399,22 @@ class IngestionPipeline:
+         })
+         vision_seconds = time.perf_counter() - vision_started
+         analysis = normalize_semantic_analysis(analysis)
++        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
++        analysis["detail"] = {
++            "schema_version": 1,
++            **detail,
++            "caption": analysis.get("caption", ""),
++            "activity": analysis.get("activity", ""),
++            "place": analysis.get("place", ""),
++            "people": analysis.get("people", []),
++            "objects": analysis.get("objects", []),
++            "clothing": analysis.get("clothing", []),
++            "emotions": analysis.get("emotions", []),
++            "spatial_relations": analysis.get("spatial_relations", []),
++            "ocr_text": analysis.get("ocr_text", ""),
++            "event_type": analysis.get("event_type", ""),
++            "facts": analysis.get("facts", []),
++        }
+         analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
+         analysis["location_context"] = metadata.get("reverse_geocode") or {}
+         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
+@@ -411,7 +432,12 @@ class IngestionPipeline:
+             return str(item)
+ 
+         object_text = " ".join(object_text(item) for item in objects)
+-        text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text]))
++        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
++        detail_text = " ".join(
++            str(item.get("text") or item.get("label") or item)
++            for item in (detail.get("visible_details") or [])
++        )
++        text = " ".join(filter(None, [analysis.get("caption"), analysis.get("activity"), analysis.get("place"), analysis.get("ocr_text"), object_text, detail_text]))
+         embedding_started = time.perf_counter()
+         embedding, embedding_model = self._text_embed(text)
+         embedding_seconds = time.perf_counter() - embedding_started
+@@ -647,6 +673,22 @@ class IngestionPipeline:
+             faces, face_seconds = timed(lambda: self.face.detect(path))
+             clip_embedding, clip_seconds = timed(lambda: self.clip.embed_image(path))
+         analysis = normalize_semantic_analysis(analysis)
++        detail = analysis.get("detail") if isinstance(analysis.get("detail"), dict) else {}
++        analysis["detail"] = {
++            "schema_version": 1,
++            **detail,
++            "caption": analysis.get("caption", ""),
++            "activity": analysis.get("activity", ""),
++            "place": analysis.get("place", ""),
++            "people": analysis.get("people", []),
++            "objects": analysis.get("objects", []),
++            "clothing": analysis.get("clothing", []),
++            "emotions": analysis.get("emotions", []),
++            "spatial_relations": analysis.get("spatial_relations", []),
++            "ocr_text": analysis.get("ocr_text", ""),
++            "event_type": analysis.get("event_type", ""),
++            "facts": analysis.get("facts", []),
++        }
+         analysis["clip_embedding"] = clip_embedding
+         analysis["processing_timings"] = {
+             "vision_seconds": round(vision_seconds, 4),

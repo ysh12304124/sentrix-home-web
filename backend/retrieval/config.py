@@ -49,7 +49,12 @@ class RetrievalConfig:
 
     @property
     def multi_retriever(self) -> bool:
-        return _flag("SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1", False)
+        # The committed retrieval profile is authoritative unless deployment
+        # explicitly overrides it.  Previously the default was hard-coded
+        # false here, so every production request silently used the legacy
+        # first-200 full-table scan even though defaults.json enabled fusion.
+        return _flag("SENTRIX_EVIDENCE_MULTI_RETRIEVER_V1",
+                     bool(self._data.get("multi_retriever", False)))
 
     @property
     def fusion(self) -> str:

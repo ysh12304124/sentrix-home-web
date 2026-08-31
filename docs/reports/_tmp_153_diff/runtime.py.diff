@@ -1,0 +1,172 @@
+diff --git a/backend/agent_runtime/runtime.py b/backend/agent_runtime/runtime.py
+index 92aac718..58492ace 100644
+--- a/backend/agent_runtime/runtime.py
++++ b/backend/agent_runtime/runtime.py
+@@ -7,6 +7,7 @@ model -> tool -> observation -> model -> ... -> final
+ from __future__ import annotations
+ 
+ import json
++import inspect
+ import os
+ import re
+ import time
+@@ -66,12 +67,28 @@ def _model_visible_observation(observation: dict | None) -> dict:
+     preview = compact.get("preview")
+     if isinstance(preview, list):
+         compact["preview"] = preview[:5]
+-    asset_ids = compact.get("asset_ids")
+-    if isinstance(asset_ids, list):
+-        compact["asset_ids"] = asset_ids[:20]
++        if compact["preview"] and isinstance(compact["preview"][0], dict):
++            compact["recommended_handle"] = compact["preview"][0].get("handle")
++    # ResultSet keeps the full internal mapping server-side. The model only
++    # needs stable handles from the bounded preview; exposing asset IDs turns
++    # the whole candidate set into model-visible evidence and encourages
++    # paging/inspection of unrelated images.
++    compact.pop("asset_ids", None)
+     return compact
+ 
+ 
++def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None) -> tuple[dict, str | None]:
++    """Keep visual/OCR inspection inside the handles actually shown to the model."""
++    if not isinstance(arguments, dict) or not preview_handles:
++        return arguments, None
++    requested = str(arguments.get("asset_handle") or "")
++    if not requested or requested in preview_handles:
++        return arguments, None
++    normalized = dict(arguments)
++    normalized["asset_handle"] = preview_handles[0]
++    return normalized, requested
++
++
+ def _model_visible_action(action: dict) -> str:
+     """Feed the parsed action back without model reasoning or prose."""
+     return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+@@ -94,6 +111,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协
+ - 不要重复调用相同的工具和参数：同一轮里相同 tool+arguments 只允许一次，重复会被拒绝。
+ - inspect_photo 的 asset_handle 必须原样使用 search_memories 返回 preview 里的 handle（如 photo_1、photo_2）。
+   不要编造 preview 之外的 handle。
++- search_memories 若返回 recommended_handle，inspect_photo / read_photo_text 默认优先使用该 handle；
++  不要因为示例中的 photo_1 文本而改选其它照片。
+ - 当用户询问照片里的视觉细节（桌上物品、衣服颜色、人数、文字/招牌、天气、穿什么、有没有某物）时，
+   如果 search_memories 返回了 preview 候选（有 photo_1 等 handle），你必须调用 inspect_photo 复核 preview 里的照片，
+   不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
+@@ -206,7 +225,8 @@ def _pending_resolution(task) -> dict | None:
+     for tr in reversed(task.tool_results or []):
+         if tr.get("tool") == "search_memories":
+             obs = tr.get("observation") or {}
+-            rec = obs.get("recommended_resolution") or {}
++            rec = (tr.get("recommended_resolution") or
++                   obs.get("recommended_resolution") or {})
+             if rec.get("needed") and rec.get("tool"):
+                 called = any((x.get("tool") or "") == rec["tool"]
+                              for x in (task.tool_results or []))
+@@ -811,13 +831,23 @@ class AgentRuntime:
+         # Bucket every model call by call_type; restore the original chat_fn at the end.
+         _stage_timing_ms: dict[str, float] = {}
+         _orig_chat_fn = self.chat_fn
++        _orig_chat_signature = inspect.signature(_orig_chat_fn)
++        _accepts_chat_kwargs = any(
++            parameter.kind == inspect.Parameter.VAR_KEYWORD
++            for parameter in _orig_chat_signature.parameters.values()
++        )
++
+         def _timed_chat(messages, *, call_type=None, step_id=None, **kwargs):
+             _t0 = time.perf_counter()
+             try:
+                 _kw = {}
+-                if call_type is not None:
++                if call_type is not None and (
++                    _accepts_chat_kwargs or "call_type" in _orig_chat_signature.parameters
++                ):
+                     _kw["call_type"] = call_type
+-                if step_id is not None:
++                if step_id is not None and (
++                    _accepts_chat_kwargs or "step_id" in _orig_chat_signature.parameters
++                ):
+                     _kw["step_id"] = step_id
+                 return _orig_chat_fn(messages, **_kw, **kwargs)
+             finally:
+@@ -980,8 +1010,52 @@ class AgentRuntime:
+                             **({"prompt": answer_writer_messages, "raw_full": raw_writer}
+                                if self.include_debug else {}),
+                         })
+-                        turn.status = "complete" if turn.final_answer else "partial"
+-                        turn.reason = "" if turn.final_answer else "empty_answer_writer"
++                        writer_problems = guard.check(
++                            turn.final_answer,
++                            task_state={
++                                "scope_id": self.scope_id,
++                                "viewer_id": self.viewer_id,
++                                "user_query": message,
++                                "history_text": history,
++                                "result_mode": task.result_mode,
++                                "has_more": task.has_more,
++                                "delivery_state": task.delivery_state,
++                                "fulfillment": task.fulfillment,
++                                "fact_total": task.fact_total,
++                                "fact_value": task.fact_value,
++                                "fact_operation": task.fact_operation,
++                                "fact_rows": task.fact_rows,
++                                "fact_group_by": task.fact_group_by,
++                                "last_tool": task.last_tool,
++                                "search_satisfaction": task.search_satisfaction,
++                                "condition_summary": task.search_condition_summary,
++                                "selected_asset_handle": task.selected_asset_handle or selected_handle,
++                                "tool_results": task.tool_results,
++                                "evidence_refs": [],
++                            },
++                            delivered_count=task.delivered_count,
++                        )
++                        turn.steps.append({
++                            "type": "guard",
++                            "status": "fail" if writer_problems else "pass",
++                            "codes": list(writer_problems) if writer_problems else [],
++                            "attempt": 1,
++                        })
++                        if writer_problems:
++                            severity = writer_problems.severity if hasattr(writer_problems, "severity") else "truth"
++                            if severity == "hard_block":
++                                turn.status = "blocked_by_guard"
++                                turn.reason = "hard_block:" + ";".join(writer_problems)
++                                if task.tool_results:
++                                    turn.final_answer = render_emergency_summary(
++                                        task.as_dict(), reason="回答未通过事实校验")
++                            else:
++                                turn.final_answer = _natural_partial(task.as_dict(), list(writer_problems))
++                                turn.status = "partial"
++                                turn.reason = "writer_guard:" + ";".join(str(p) for p in writer_problems[:2])
++                        else:
++                            turn.status = "complete" if turn.final_answer else "partial"
++                            turn.reason = "" if turn.final_answer else "empty_answer_writer"
+                         break
+                     except Exception as exc:
+                         turn.steps.append({"type": "writer", "status": "failed",
+@@ -1037,7 +1111,6 @@ class AgentRuntime:
+                 debug_step_seq += 1
+                 last_model_step_id = step_id
+             try:
+-                import inspect
+                 sig = inspect.signature(self.chat_fn)
+                 if "call_type" in sig.parameters:
+                     raw = self.chat_fn(messages, call_type="agent", step_id=step_id)
+@@ -1560,6 +1633,10 @@ class AgentRuntime:
+                 turn.reason = "unknown_tool:" + tool_name
+                 turn.termination_reason = "tool_unavailable"
+                 break
++            corrected_handle = None
++            if tool_name in {"inspect_photo", "read_photo_text"}:
++                arguments, corrected_handle = _normalize_preview_handle(
++                    arguments, task.result_preview)
+             if tool_name == "inspect_photo":
+                 handle_arg = str(arguments.get("asset_handle") or "")
+                 self._emit_progress(
+@@ -1584,6 +1661,8 @@ class AgentRuntime:
+                 "error": result.error, "latency_s": latency,
+                 "parent_step_id": last_model_step_id,
+             })
++            if corrected_handle and self.include_debug:
++                turn.steps[-1]["requested_asset_handle"] = corrected_handle
+             emit_text = public_status
+             if tool_name == "inspect_photo" and result.status == "ok":
+                 handle_arg = str(arguments.get("asset_handle") or "")

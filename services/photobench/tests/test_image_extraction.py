@@ -15,6 +15,7 @@ SPEC.loader.exec_module(MODULE)
 class ExtractImageIdsTests(unittest.TestCase):
     def test_extracts_current_tool_result_asset_id_strings(self):
         result = {
+            "answer_grounding": {"selected_asset_ids": ["asset_1", "asset_2"]},
             "task_state": {
                 "tool_results": [
                     {
@@ -33,6 +34,12 @@ class ExtractImageIdsTests(unittest.TestCase):
 
     def test_extracts_current_tool_result_preview_asset_ids(self):
         result = {
+            "answer_grounding": {"selected_image_handles": ["photo_1", "photo_2"]},
+            "tool_trace": [{
+                "tool": "search_memories",
+                "debug_preview_handles": ["photo_1", "photo_2"],
+                "debug_preview_asset_ids": ["asset_1", "asset_2"],
+            }],
             "task_state": {
                 "tool_results": [
                     {
@@ -47,6 +54,33 @@ class ExtractImageIdsTests(unittest.TestCase):
         }
 
         self.assertEqual(MODULE._extract_image_ids(result), ["asset_1", "asset_2"])
+
+    def test_extracts_debug_asset_ids_without_model_facing_asset_ids(self):
+        result = {
+            "answer_grounding": {"selected_asset_ids": ["asset_1", "asset_2"]},
+            "tool_trace": [
+                {"tool": "search_memories", "debug_asset_ids": ["asset_noise"]}
+            ],
+            "task_state": {
+                "tool_results": [
+                    {"tool": "search_memories", "preview": [{"handle": "photo_1"}]}
+                ]
+            },
+        }
+
+        self.assertEqual(MODULE._extract_image_ids(result), ["asset_1", "asset_2"])
+
+    def test_does_not_promote_all_search_candidates_to_selected_images(self):
+        result = {
+            "tool_trace": [{
+                "tool": "search_memories",
+                "debug_asset_ids": ["asset_1", "asset_2", "asset_3"],
+                "debug_preview_handles": ["photo_1", "photo_2"],
+                "debug_preview_asset_ids": ["asset_1", "asset_2"],
+            }],
+            "task_state": {"tool_results": [{"tool": "search_memories", "asset_ids": ["asset_1", "asset_2", "asset_3"]}]},
+        }
+        self.assertEqual(MODULE._extract_image_ids(result), [])
 
     def test_does_not_scan_unrelated_images_or_ground_truth(self):
         result = {

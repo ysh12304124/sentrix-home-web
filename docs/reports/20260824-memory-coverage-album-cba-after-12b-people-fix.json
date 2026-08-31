@@ -1,0 +1,55 @@
+{
+  "scope_id": "album_cba01be9502b",
+  "assets": 363,
+  "observations": 363,
+  "media_types": {
+    "image": 363
+  },
+  "field_coverage": {
+    "caption": {
+      "count": 363,
+      "rate": 1.0
+    },
+    "activity": {
+      "count": 363,
+      "rate": 1.0
+    },
+    "place": {
+      "count": 363,
+      "rate": 1.0
+    },
+    "people": {
+      "count": 279,
+      "rate": 0.7686
+    },
+    "objects": {
+      "count": 361,
+      "rate": 0.9945
+    },
+    "clothing": {
+      "count": 171,
+      "rate": 0.4711
+    },
+    "spatial_relations": {
+      "count": 229,
+      "rate": 0.6309
+    },
+    "ocr_text": {
+      "count": 154,
+      "rate": 0.4242
+    },
+    "transcript": {
+      "count": 0,
+      "rate": 0.0
+    },
+    "detail": {
+      "count": 363,
+      "rate": 1.0
+    }
+  },
+  "detail_schema_versions": {
+    "1": 363
+  },
+  "observation_search_terms": 363,
+  "index_coverage_rate": 1.0
+}

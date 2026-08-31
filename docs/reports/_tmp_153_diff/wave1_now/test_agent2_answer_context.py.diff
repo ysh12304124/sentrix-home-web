@@ -1,0 +1,70 @@
+diff --git a/backend/tests/test_agent2_answer_context.py b/backend/tests/test_agent2_answer_context.py
+index 26efbfd6..1f0eec58 100644
+--- a/backend/tests/test_agent2_answer_context.py
++++ b/backend/tests/test_agent2_answer_context.py
+@@ -1,10 +1,15 @@
+ import json
+ import os
++import re
+ import unittest
+ from unittest.mock import patch
+ 
+ from backend.agent_runtime.evidence_ledger import EvidenceLedger, LedgerEntry
+-from backend.agent_runtime.final_writer import build_answer_writer_messages, clean_writer_output
++from backend.agent_runtime.final_writer import (
++    build_answer_writer_messages,
++    clean_writer_output,
++    rewrite_final,
++)
+ from backend.agent_runtime.task_state import EvidenceRequirement, TaskDeclaration, TaskState
+ 
+ 
+@@ -37,6 +42,48 @@ class Agent2AnswerContextTests(unittest.TestCase):
+         self.assertEqual(clean_writer_output("活动在秦皇岛"), "活动在秦皇岛。")
+         self.assertEqual(clean_writer_output('{"action":"final","answer":"活动在秦皇岛"}'), "活动在秦皇岛。")
+ 
++    def test_clean_writer_output_removes_photo_handle_parenthetical(self):
++        output = clean_writer_output(
++            "我为您找到的这张照片（photo_1）实际上是在河北省邯郸市永年区的室内家居环境中拍摄的..."
++        )
++
++        self.assertEqual(
++            output,
++            "我为您找到的这张照片实际上是在河北省邯郸市永年区的室内家居环境中拍摄的...。",
++        )
++        self.assertNotRegex(output, r"(?i)(?<![A-Za-z0-9_])photo_\d+(?![A-Za-z0-9_])")
++        self.assertNotIn("（）", output)
++
++    def test_clean_writer_output_naturalizes_bare_and_multiple_photo_handles(self):
++        cases = {
++            "photo_2显示的是室内家居环境。": "这张照片显示的是室内家居环境。",
++            "画面来自photo_3，地点在河北。": "画面来自这张照片，地点在河北。",
++            "这是室内照片（photo_4）。": "这是室内照片。",
++            "photo_5和photo_6展示了同一处场景。": "这些照片展示了同一处场景。",
++            "这些画面（photo_7、photo_8）拍摄于河北。": "这些画面拍摄于河北。",
++        }
++
++        for source, expected in cases.items():
++            with self.subTest(source=source):
++                output = clean_writer_output(source)
++                self.assertEqual(output, expected)
++                self.assertIsNone(re.search(r"(?i)(?<![A-Za-z0-9_])photo_\d+(?![A-Za-z0-9_])", output))
++
++    def test_photo_handle_cleanup_does_not_match_embedded_identifier(self):
++        self.assertEqual(
++            clean_writer_output("型号是my_photo_1_variant"),
++            "型号是my_photo_1_variant。",
++        )
++
++    def test_rewrite_final_removes_photo_handle(self):
++        output = rewrite_final(
++            lambda _messages, **_kwargs: "照片（photo_9）是在河北拍的。",
++            {},
++            "draft",
++        )
++
++        self.assertEqual(output, "照片是在河北拍的。")
++
+     def test_answer_context_flag_is_opt_in(self):
+         ledger = EvidenceLedger(scope_id="album1")
+         ledger.append(LedgerEntry(

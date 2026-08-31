@@ -143,7 +143,7 @@ class VisualAnnRetriever:
                 continue
             rows = self.store.search_vectors(
                 self.space, vector, limit=max(limit * 4, limit),
-                scope_id=scope, model_name=model_id,
+                scope_id=scope, model_name=model_id, route="visual_ann",
             )
             rows = [row for row in rows if row.get("source_type") == "asset"]
             if not rows:

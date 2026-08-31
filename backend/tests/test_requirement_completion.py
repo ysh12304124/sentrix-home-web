@@ -59,6 +59,7 @@ class RequirementCompletionTests(unittest.TestCase):
             provenance_refs=("asset_1",),
             asset_id="photo_1",
             subject="steak_price",
+            requirement_refs=("price",),
         ))
         completion = RequirementCompletion(state, ledger)
         state.mark_running("price")
@@ -91,6 +92,7 @@ class RequirementCompletionTests(unittest.TestCase):
             input_refs=("steak",),
             provenance_refs=("photo_1",),
             asset_id="photo_1",
+            requirement_refs=("photo_req",),
         ))
         ledger.append(LedgerEntry(
             tool_call_id="call_ocr",
@@ -100,6 +102,7 @@ class RequirementCompletionTests(unittest.TestCase):
             provenance_refs=("photo_1",),
             coverage=Coverage(requested=2, processed=1, skipped_budget=1),
             asset_id="photo_1",
+            requirement_refs=("price_req",),
         ))
 
         completion = RequirementCompletion(state, ledger)

@@ -262,6 +262,18 @@ def _merge_frames(frames, max_duration=300.0, max_gap=30.0):
             "objects": objects,
             "actions": actions,
             "expressions": expressions,
+            "frame_observations": [
+                {
+                    "source_timestamp_sec": row.get("source_timestamp_sec"),
+                    "event_start_sec": row.get("event_start_sec"),
+                    "event_end_sec": row.get("event_end_sec"),
+                    "objects": row.get("objects") or [],
+                    "actions": row.get("actions") or [],
+                    "expressions": row.get("expressions") or [],
+                    "event_label": row.get("event_label") or "",
+                }
+                for row in group
+            ],
             "source_frame_count": len(group),
             "duplicate_frame_count": duplicate_count,
             "visual_duplicate_count": max(0, len(valid) - len(representatives)),
@@ -270,7 +282,43 @@ def _merge_frames(frames, max_duration=300.0, max_gap=30.0):
     return result
 
 
+def _gpu_free_memory_mib(device="0"):
+    """Return free GPU memory in MiB for the configured device, or None if unknown."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        index = int(device) if str(device).lstrip("-").isdigit() else 0
+        free, _total = torch.cuda.mem_get_info(index)
+        return int(free // (1024 * 1024))
+    except Exception:
+        return None
+
+
+def check_video_gpu_capacity():
+    """Refuse to start GPU YOLO/NVDEC work when the GPU is already saturated.
+
+    The vLLM model server shares the same GPU; launching another heavy GPU
+    consumer without a capacity check can OOM the production inference.
+    Returns None when the device is CPU-only or capacity cannot be measured.
+    """
+    device = str(os.getenv("SENTRIX_VIDEO_DEVICE", "cpu")).strip().lower()
+    if device in ("", "cpu", "auto"):
+        return None
+    min_free_mib = int(os.getenv("SENTRIX_VIDEO_GPU_MIN_FREE_MIB", "4096"))
+    free_mib = _gpu_free_memory_mib(device)
+    if free_mib is None:
+        return None
+    if free_mib < min_free_mib:
+        raise RuntimeError(
+            f"insufficient GPU memory for video keyframe extraction: "
+            f"{free_mib} MiB free < {min_free_mib} MiB required (SENTRIX_VIDEO_GPU_MIN_FREE_MIB)"
+        )
+    return free_mib
+
+
 def run(video_path, output_dir, video_id):
+    check_video_gpu_capacity()
     root = Path(__file__).resolve().parents[2] / "tools" / "video_keyframe"
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -286,6 +334,7 @@ def run(video_path, output_dir, video_id):
         "--yolo-batch-size", os.getenv("SENTRIX_VIDEO_YOLO_BATCH_SIZE", "16"),
         "--target-decode-workers", os.getenv("SENTRIX_VIDEO_TARGET_DECODE_WORKERS", "4"),
         "--merge-max-sec", os.getenv("SENTRIX_VIDEO_PREFILTER_MERGE_MAX_SEC", "12"),
+        "--webp-quality", os.getenv("SENTRIX_VIDEO_WEBP_QUALITY", "80"),
         "--device", os.getenv("SENTRIX_VIDEO_DEVICE", "0"),
     ]
     process = subprocess.run(command, check=False, capture_output=True, text=True,

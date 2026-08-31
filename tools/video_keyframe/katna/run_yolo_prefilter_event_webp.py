@@ -328,7 +328,7 @@ def select_unstable_segments(segments, percentile=75.0):
 def _decode_one_target(video, frame_index, fps, width, height):
     timestamp = max(0.0, float(frame_index) / max(float(fps), 0.1))
     frame_bytes = int(width) * int(height) * 3
-    command = [
+    gpu_command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", f"{timestamp:.6f}",
         "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
@@ -336,12 +336,29 @@ def _decode_one_target(video, frame_index, fps, width, height):
         "-vf", "hwdownload,format=nv12,format=bgr24",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]
-    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    if completed.returncode != 0 or len(completed.stdout) < frame_bytes:
-        error = completed.stderr.decode("utf-8", errors="replace")[-800:]
-        raise RuntimeError(f"NVDEC target frame {frame_index} failed: {error}")
-    frame = np.frombuffer(completed.stdout[:frame_bytes], dtype=np.uint8).reshape((height, width, 3)).copy()
-    return int(frame_index), frame
+    gpu_result = subprocess.run(gpu_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if gpu_result.returncode == 0 and len(gpu_result.stdout) >= frame_bytes:
+        frame = np.frombuffer(gpu_result.stdout[:frame_bytes], dtype=np.uint8).reshape((height, width, 3)).copy()
+        return int(frame_index), frame, "nvdec"
+
+    # vLLM can leave too little VRAM for a new NVDEC CUDA context even though
+    # the coarse video analysis already succeeded. Preserve the GPU fast path,
+    # but decode this target frame on CPU instead of failing the whole video.
+    gpu_error = gpu_result.stderr.decode("utf-8", errors="replace")[-800:]
+    cpu_command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{timestamp:.6f}", "-i", str(video), "-an", "-frames:v", "1",
+        "-vf", "format=bgr24", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
+    ]
+    cpu_result = subprocess.run(cpu_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if cpu_result.returncode != 0 or len(cpu_result.stdout) < frame_bytes:
+        cpu_error = cpu_result.stderr.decode("utf-8", errors="replace")[-800:]
+        raise RuntimeError(
+            f"target frame {frame_index} failed with NVDEC ({gpu_error}) "
+            f"and CPU fallback ({cpu_error})"
+        )
+    frame = np.frombuffer(cpu_result.stdout[:frame_bytes], dtype=np.uint8).reshape((height, width, 3)).copy()
+    return int(frame_index), frame, "cpu"
 
 
 def _gpu_decode_target_frames(video, target_frames, width, height, fps, workers=4):
@@ -357,6 +374,10 @@ def _gpu_decode_target_frames(video, target_frames, width, height, fps, workers=
 
 def _frame_index(candidate):
     return int(candidate.frame_index) if hasattr(candidate, "frame_index") else int(candidate["frame_index"])
+
+
+def _clamp_target_index(frame_index, frame_count):
+    return max(0, min(int(frame_index), max(0, int(frame_count) - 1)))
 
 
 def _timestamp(candidate):
@@ -553,18 +574,30 @@ def main():
     for stale in evidence_dir.glob("*.webp"):
         stale.unlink()
     wanted = {}
+    clamped_target_count = 0
     for record in frame_records:
         for evidence_index, evidence in enumerate(record["vlm_evidence"]):
-            wanted.setdefault(evidence["source_frame_index"], []).append((record, evidence, evidence_index))
+            original_index = int(evidence["source_frame_index"])
+            target_index = _clamp_target_index(original_index, frame_count)
+            if target_index != original_index:
+                clamped_target_count += 1
+                evidence["source_frame_index"] = target_index
+                evidence["source_timestamp_sec"] = target_index / max(fps, 0.1)
+                if original_index == int(record["source_frame_index"]):
+                    record["source_frame_index"] = target_index
+                    record["source_timestamp_sec"] = evidence["source_timestamp_sec"]
+            wanted.setdefault(target_index, []).append((record, evidence, evidence_index))
     target_decode_started = time.perf_counter()
     decoded_targets = 0
-    for index, frame in _gpu_decode_target_frames(
+    target_decode_backends = Counter()
+    for index, frame, decode_backend in _gpu_decode_target_frames(
         args.video, wanted.keys(), source_width, source_height, fps, args.target_decode_workers,
     ):
         targets = wanted.pop(index, None)
         if targets is None:
             continue
         decoded_targets += len(targets)
+        target_decode_backends[decode_backend] += len(targets)
         final_semantic = analyzer.analyze(frame)
         encoded, buffer = cv2.imencode(".webp", frame, [cv2.IMWRITE_WEBP_QUALITY, args.webp_quality])
         if not encoded:
@@ -618,9 +651,13 @@ def main():
         "timings_sec": {"yolo_prefilter": round(coarse_seconds, 3), "katna_targeted": round(katna_seconds, 3), "package_write": round(time.perf_counter() - katna_started - katna_seconds, 3)},
         "gpu_target_decode_sec": round(target_decode_seconds, 3),
         "gpu_target_decode_frames": decoded_targets,
+        "target_decode_sec": round(target_decode_seconds, 3),
+        "target_decode_frames": decoded_targets,
+        "target_decode_backend_counts": dict(target_decode_backends),
+        "target_decode_clamped_frames": clamped_target_count,
         "full_resolution_refinement": "removed; KATNA quality gate selects non-motion representatives",
         "katna_selection": katna_detail,
-        "implementation": "yolo_prefilter_premerge_nvdec_single_event_webp_v3",
+        "implementation": "yolo_prefilter_premerge_nvdec_cpu_fallback_event_webp_v4",
         "total_sec": round(time.perf_counter() - started, 3),
     }
     (args.output / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
