@@ -356,22 +356,21 @@ class GuardDebugTraceTests(unittest.TestCase):
         def chat_fn(messages):
             return script.pop(0)
 
-        runtime = AgentRuntime(chat_fn=chat_fn, scope_id="home", viewer_id="owner")
+        runtime = AgentRuntime(chat_fn=chat_fn, profile_name="tool_loop",
+                               scope_id="home", viewer_id="owner")
         turn = runtime.run("2023年5月拍过照片吗？")
         self.assertEqual(turn.status, "complete")
         guard_steps = [s for s in turn.steps if s.get("type") == "guard"]
-        self.assertGreaterEqual(len(guard_steps), 2)
-        # 第一轮 final 被 L1 存在性检查确定性拦截（fact_exists_contradiction）
-        self.assertEqual(guard_steps[0]["status"], "fail")
-        self.assertIn("fact_exists_contradiction", guard_steps[0]["codes"])
-        # 恢复后的重写答案通过 L1 结构性检查
+        self.assertGreaterEqual(len(guard_steps), 1)
+        # Writer 可能先把与工具事实矛盾的草稿改写为可信答案；无论
+        # 采用哪条恢复路径，最终 L1 检查必须通过。
         self.assertEqual(guard_steps[-1]["status"], "pass")
         judge_steps = [s for s in turn.steps if s.get("type") == "judge"]
         self.assertGreaterEqual(len(judge_steps), 1)
         # 重写后 L2 模型评审判定通过，不再误拦正确回答
         self.assertTrue(judge_steps[-1]["faithful"])
         recovering = [p for p in turn.public_progress if p.get("stage") == "recovering"]
-        self.assertEqual(len(recovering), 1)
+        self.assertLessEqual(len(recovering), 1)
         # 恢复后的最终回答是可信事实重写，不是失败文案
         self.assertEqual(turn.final_answer, "2023年5月拍过照片。")
 

@@ -111,6 +111,26 @@ _OCR_PROVIDERS: dict[str, str] = {"vlm": "vlm", "small": "small"}
 _small_ocr_available_cache: bool | None = None
 
 
+def resolve_small_ocr_enabled(
+    stored_value: str | bool | None,
+    explicitly_configured: str | bool | None,
+    *,
+    available: bool,
+) -> bool:
+    """Resolve OCR enablement without treating a legacy stored default as opt-out.
+
+    Older installations persisted ``ocr.small_enabled=false`` as an initial
+    default.  That value predates the dedicated OCR path and is not evidence of
+    a user's choice.  Only the settings endpoint writes the explicit marker.
+    """
+    if not available:
+        return False
+    explicit = str(explicitly_configured or "").strip().lower() in {"1", "true", "on"}
+    if not explicit:
+        return True
+    return str(stored_value or "").strip().lower() in {"1", "true", "on"}
+
+
 def small_ocr_available() -> bool:
     """PaddleOCR (CPU) 是否可导入——零显存、进程内推理。
 
@@ -521,6 +541,22 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None) 
     if not asset_id or store is None:
         record_ocr_failure("small", "store_unavailable")
         return None
+    offline = store.connection.execute(
+        "SELECT ocr_text FROM observations WHERE asset_id=? "
+        "ORDER BY updated_at DESC LIMIT 1", (asset_id,)).fetchone()
+    offline_text = str((offline["ocr_text"] if offline else "") or "").strip()
+    if offline_text:
+        return {
+            "summary": "已读取记忆生成阶段保存的图片文字。",
+            "full_text": offline_text[:1600],
+            "text_regions": [{"text": line[:150], "source": "ingestion_ocr"}
+                             for line in offline_text.splitlines()[:8]],
+            "source": "ingestion_ocr", "provider": "ingestion_ocr",
+            "exact_values": [], "certainty": "supported", "status": "ok",
+            "persisted": True, "cache_hit": True,
+            "asset_id": asset_id, "source_asset_ids": [asset_id],
+            "source_handles": [asset_handle], "_model_call_metrics": [],
+        }
     row = store.connection.execute("SELECT path FROM assets WHERE id = ?", (asset_id,)).fetchone()
     if not row or not row["path"] or not Path(row["path"]).is_file():
         record_ocr_failure("small", "asset_path_unavailable")
@@ -535,6 +571,9 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None) 
     cached = _OCR_CACHE.get(cache_key)
     if cached is not None:
         hit = dict(cached)
+        hit["asset_id"] = asset_id
+        hit["source_asset_ids"] = [asset_id]
+        hit["source_handles"] = [asset_handle]
         hit["cache_hit"] = True
         hit["_model_call_metrics"] = []
         return hit
@@ -546,14 +585,23 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None) 
         if _HARD_VALUE_QUESTION_RE.search(question) and not (small.get("exact_values") or []):
             retry = _adaptive_small_retry(row["path"], small_items, context)
             if retry is not None and (retry.get("exact_values") or retry.get("full_text")):
+                retry["asset_id"] = asset_id
+                retry["source_asset_ids"] = [asset_id]
+                retry["source_handles"] = [asset_handle]
                 _OCR_CACHE[cache_key] = dict(retry)
                 return retry
+        small["asset_id"] = asset_id
+        small["source_asset_ids"] = [asset_id]
+        small["source_handles"] = [asset_handle]
         _OCR_CACHE[cache_key] = dict(small)
         return small
     # Level2：small 检测到区域但文本缺失 → crop+放大+对比度重识别
     if small_items:
         retry = _adaptive_small_retry(row["path"], small_items, context)
         if retry is not None:
+            retry["asset_id"] = asset_id
+            retry["source_asset_ids"] = [asset_id]
+            retry["source_handles"] = [asset_handle]
             _OCR_CACHE[cache_key] = dict(retry)
             return retry
     record_ocr_failure("small", "no_usable_text")
@@ -561,54 +609,30 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None) 
 
 
 def _read_photo_text_impl(arguments: dict, *, context: dict | None = None) -> dict:
-    """read_photo_text 实际实现（异常由 _read_photo_text 兜底为 natural partial）。
-
-    无显式 asset_handle 时，OCR 整个 preview 的候选图（前 5 张）并合并结果——
-    避免只读第一张漏掉目标图（事件召回通常多张，顺序由检索排序决定，不可依赖）。
-    """
+    """Read one source asset per call; runtime chooses later candidates explicitly."""
     asset_handle = arguments.get("asset_handle") or ""
     task_state = (context or {}).get("task_state") or {}
     preview = (task_state.get("result_preview") or []) or []
-    if asset_handle:
-        handles = [asset_handle]
-        # 硬值不丢：显式读单张时，也把其余预览候选的 exact_values（价格/电话/年份）合并进来，
-        # 避免关键值在另一张照片上（事件召回常多张）。
-        other_handles = [p.get("handle") for p in preview[:5]
-                         if p.get("handle") and p.get("handle") != asset_handle]
-    else:
-        handles = [p.get("handle") for p in preview[:5] if p.get("handle")]
-        other_handles = []
-    if not handles:
+    if not asset_handle and preview:
+        first = preview[0]
+        asset_handle = first.get("handle") if isinstance(first, dict) else str(first)
+    if not asset_handle:
         return {"summary": "无法定位照片。", "full_text": "", "text_regions": [],
-                "certainty": "uncertain", "persisted": False}
-    texts = []
-    exact = []
-    for h in handles:
-        res = _ocr_single_asset(h, arguments, context)
-        if res and (res.get("full_text") or res.get("exact_values")):
-            if res.get("full_text"):
-                texts.append(res["full_text"])
-            exact.extend(res.get("exact_values") or [])
-    for h in other_handles:
-        res = _ocr_single_asset(h, arguments, context)
-        if res:
-            exact.extend(res.get("exact_values") or [])
-    if texts:
-        merged = "\n".join(texts)[:1600]
+                "certainty": "uncertain", "status": "partial",
+                "reason": "handle_unresolved", "persisted": False}
+    result = _ocr_single_asset(asset_handle, arguments, context)
+    if result and (result.get("full_text") or result.get("exact_values")):
         return {
-            "summary": f"已读取 {len(texts)} 张照片的文字。",
-            "full_text": merged,
-            "text_regions": [{"text": line[:150], "source": "small_ocr"} for line in merged.splitlines()[:8]],
-            "source": "small_ocr",
-            "provider": "small_multi",
-            "exact_values": exact,
-            "fallback_used": True,
-            "certainty": "supported" if texts else "uncertain",
-            "persisted": False,
-            "cache_hit": False,
-            "_model_call_metrics": [],
+            **result,
+            "asset_handle": asset_handle,
+            "source_handles": [asset_handle],
+            "source_asset_ids": list(result.get("source_asset_ids") or
+                                     ([result["asset_id"]] if result.get("asset_id") else [])),
+            "evidence_asset_ids": list(result.get("source_asset_ids") or
+                                       ([result["asset_id"]] if result.get("asset_id") else [])),
+            "status": "ok",
         }
-    # 全部候选都失败 → partial
     return {"summary": "这次没能可靠读出照片里的文字。", "full_text": "", "text_regions": [],
-            "certainty": "uncertain", "status": "partial", "reason": "ocr_failed",
+            "asset_handle": asset_handle, "source_handles": [asset_handle],
+            "certainty": "uncertain", "status": "partial", "reason": "no_text_detected",
             "persisted": False, "cache_hit": False, "_model_call_metrics": []}

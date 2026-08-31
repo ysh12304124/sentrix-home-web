@@ -170,10 +170,12 @@ button { cursor: pointer; }
 .image-result { border: 1px solid var(--line); border-radius: 9px; padding: 0; overflow: hidden; background: #fff; text-align: left; }
 .image-result:hover { border-color: var(--lime); box-shadow: var(--shadow); }
 .image-result img { display: block; width: 100%; aspect-ratio: 1.2; object-fit: cover; background: var(--soft); }
+.image-result video { display: block; width: 100%; aspect-ratio: 1.2; object-fit: contain; background: #111; }
 .image-result span { display: block; padding: 8px 9px; }
 .image-result strong, .image-result small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .image-result strong { font-size: 10px; }
 .image-result small { margin-top: 4px; color: var(--muted); font-size: 9px; }
+.media-result-info { display: block; width: 100%; padding: 8px 9px; border: 0; background: #fff; text-align: left; cursor: pointer; }
 .evidence-card { border: 1px solid var(--line); background: #ffffff; padding: 12px; }
 
 .evidence-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; color: var(--muted); font-size: 9px; }

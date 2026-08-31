@@ -58,6 +58,50 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
         self.assertEqual(task.requirement("text").coverage_status, "failed")
         self.assertEqual(ledger.entries[0].failure_reason, "ocr_failed")
 
+    def test_metadata_place_operation_does_not_consume_temporal_attempt(self):
+        task = TaskState.from_declaration(TaskDeclaration(
+            goal="where and when", scope_id="album1",
+            requirements=(
+                EvidenceRequirement(id="date", evidence_type="temporal_metadata"),
+                EvidenceRequirement(id="place", evidence_type="location_metadata"),
+            ),
+        ))
+        ledger = EvidenceLedger(scope_id="album1")
+        spec = ToolSpec(name="query_memory_metadata", description="metadata", input_schema={},
+                        executor=_execute,
+                        produces_evidence=("structured_fact", "temporal_metadata", "location_metadata"))
+
+        self.assertTrue(record_agent2_tool_evidence(
+            task, ledger, spec, tool_call_id="metadata_place",
+            observation={"metadata_operation": "place", "value": "上海",
+                         "source_asset_ids": ["asset_1"]}))
+
+        self.assertEqual(task.requirement("place").status, "satisfied")
+        self.assertEqual(task.requirement("date").status, "open")
+        self.assertEqual(task.requirement("date").attempt_count, 0)
+
+    def test_negative_visual_observation_is_asset_bound_contradiction(self):
+        task = TaskState.from_declaration(TaskDeclaration(
+            goal="find a boat", scope_id="album1",
+            requirements=(EvidenceRequirement(
+                id="scene", evidence_type="visual_observation", description="是否有船"),),
+        ))
+        ledger = EvidenceLedger(scope_id="album1")
+        spec = ToolSpec(name="inspect_photo", description="visual", input_schema={},
+                        executor=_execute, produces_evidence=("visual_observation",))
+
+        self.assertTrue(record_agent2_tool_evidence(
+            task, ledger, spec, tool_call_id="inspect_1", input_refs=("photo_1",),
+            observation={"observation": "这张照片中没有船。",
+                         "_source_asset_id": "asset_1", "certainty": "supported"}))
+        # 单张图的否定只构成负向证据（P3.1）：需求进入 failed 终态（已尝试
+        # 未确认，不放大为全局 contradicted），ledger 仍记录该 asset 的
+        # contradicted 证据。
+        self.assertEqual(task.requirement("scene").status, "failed")
+        self.assertEqual(task.requirement("scene").attempt_count, 1)
+        self.assertEqual(ledger.entries[0].certainty, "contradicted")
+        self.assertEqual(ledger.entries[0].asset_id, "asset_1")
+
     def test_observation_can_bind_multiple_requirements_from_one_search(self):
         task = TaskState.from_declaration(TaskDeclaration(
             goal="查找有日期和地点的照片", scope_id="album1",
@@ -113,6 +157,26 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
         identity = next(entry for entry in ledger.entries if entry.evidence_type == "photo_identity")
         self.assertEqual(identity.extracted_value["person_name"], "明明")
         self.assertEqual(identity.asset_id, "asset_1")
+
+    def test_search_summary_never_satisfies_visible_text(self):
+        task = TaskState.from_declaration(TaskDeclaration(
+            goal="read full menu", scope_id="album1",
+            requirements=(EvidenceRequirement(id="text", evidence_type="visible_text"),),
+        ))
+        ledger = EvidenceLedger(scope_id="album1")
+        spec = ToolSpec(name="search_memories", description="search", input_schema={},
+                        executor=_execute,
+                        produces_evidence=("memory_asset", "location_metadata", "temporal_metadata"))
+
+        self.assertTrue(record_agent2_tool_evidence(
+            task, ledger, spec, tool_call_id="search_1",
+            observation={"result_set_id": "result_1", "total": 1,
+                         "asset_ids": ["asset_1"],
+                         "preview": [{"handle": "photo_1", "evidence_summary": "文字：菜单价格"}],
+                         "evidence_status": "validated", "evidence_asset_ids": ["asset_1"]}))
+        self.assertEqual(task.requirement("text").status, "open")
+        self.assertEqual(task.requirement("text").attempt_count, 0)
+        self.assertFalse(any(e.evidence_type == "visible_text" for e in ledger.entries))
 
 
 if __name__ == "__main__":

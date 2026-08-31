@@ -75,6 +75,11 @@ class RequirementCompletion:
         if matching_entry is None:
             return False
 
+        if matching_entry.certainty == "contradicted":
+            self.task_state.mark_contradicted(
+                requirement_id, evidence_refs=(matching_entry.tool_call_id,))
+            return True
+
         # Check coverage
         if matching_entry.coverage.is_partial:
             if allow_partial:
@@ -103,6 +108,11 @@ class RequirementCompletion:
                 ]
                 if matching_entries:
                     refs = tuple(e.tool_call_id for e in matching_entries)
+                    if any(entry.certainty == "contradicted"
+                           for entry in matching_entries):
+                        self.task_state.mark_contradicted(req_id, evidence_refs=refs)
+                        satisfied_count += 1
+                        continue
                     has_partial = any(e.coverage.is_partial for e in matching_entries)
                     if has_partial and req_state.status == "open":
                         self.task_state.mark_partially_supported(req_id, evidence_refs=refs)

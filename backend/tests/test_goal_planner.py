@@ -43,6 +43,29 @@ class GoalPlannerTests(unittest.TestCase):
         self.assertFalse(scope_result.ok)
         self.assertEqual(scope_result.fallback_reason, "scope_mismatch")
 
+    def test_recovers_only_a_missing_outer_object_brace(self):
+        planner = GoalPlanner(chat_fn=lambda messages: (
+            '{"action":"declare","declaration":{"goal":"读招牌","scope_id":"album1",'
+            '"requirements":[{"id":"text","evidence_type":"visible_text"}]}'
+        ))
+        result = planner.declare("读招牌", scope_id="album1")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.declaration.requirements[0].id, "text")
+
+    def test_invalid_json_gets_one_format_rewrite_before_blocking(self):
+        calls = []
+
+        def chat(messages, call_type=None, **kwargs):
+            calls.append(call_type)
+            if len(calls) == 1:
+                return "not-json"
+            return ('{"action":"declare","declaration":{"goal":"读招牌","scope_id":"album1",'
+                    '"requirements":[{"id":"text","evidence_type":"visible_text"}]}}')
+
+        result = GoalPlanner(chat_fn=chat).declare("读招牌", scope_id="album1")
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, ["planner", "planner_format_rewrite"])
+
 
 if __name__ == "__main__":
     unittest.main()

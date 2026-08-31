@@ -44,7 +44,7 @@ class BgeM3TextQueryEmbedder:
 
     @property
     def circuit_open(self):
-        return bool(self._tripped_at and time.monotonic() - self._tripped_at < 30.0)
+        return bool(self._tripped_at and time.monotonic() - self._tripped_at < 10.0)
 
     def status(self) -> dict:
         """Expose sidecar health and breaker state for retrieval diagnostics."""
@@ -62,13 +62,13 @@ class BgeM3TextQueryEmbedder:
     def available(self):
         if httpx is None:
             return False
-        if self._tripped_at and time.monotonic() - self._tripped_at < 30.0:
+        if self._tripped_at and time.monotonic() - self._tripped_at < 10.0:
             return False
         now = time.monotonic()
         if now - self._health_checked_at < self._health_ttl:
             return self._health_value
         try:
-            response = httpx.get(f"{self._base_url}/health", timeout=1.5)
+            response = httpx.get(f"{self._base_url}/health", timeout=5)
             self._health_checked_at = now
             self._health_value = response.status_code == 200
             return self._health_value
@@ -81,7 +81,7 @@ class BgeM3TextQueryEmbedder:
         self._failures += 1
         self._health_value = False
         self._health_checked_at = 0.0
-        if self._failures >= 3:
+        if self._failures >= 5:
             self._tripped_at = time.monotonic()
             self._failures = 0
 
@@ -94,7 +94,7 @@ class BgeM3TextQueryEmbedder:
     def embed_query(self, text: str) -> list[float]:
         if httpx is None:
             return []
-        if self._tripped_at and time.monotonic() - self._tripped_at < 30.0:
+        if self._tripped_at and time.monotonic() - self._tripped_at < 10.0:
             return []
         try:
             response = httpx.post(f"{self._base_url}/embed",

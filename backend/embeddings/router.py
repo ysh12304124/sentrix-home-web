@@ -32,7 +32,7 @@ class EmbeddingRouter:
         visual = None
         if image_kind == "chinese_clip":
             from .chinese_clip_visual import ChineseClipVisualEmbedder
-            visual = ChineseClipVisualEmbedder()
+            visual = ChineseClipVisualEmbedder.shared()
         elif clip is not None:
             from .clip_visual import ClipVisualQueryEmbedder
             visual = ClipVisualQueryEmbedder(clip)

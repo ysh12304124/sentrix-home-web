@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { parseTiff, parsePng } = require("../src/image-metadata.js");
+const { parseTiff, parsePng, isAlbumMediaFile } = require("../src/image-metadata.js");
 
 function tiffFixture() {
   const buffer = new ArrayBuffer(320);
@@ -30,4 +30,12 @@ test("reads EXIF capture time and GPS from TIFF payload", () => {
 test("PNG without eXIf returns empty metadata", () => {
   const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
   assert.deepEqual(parsePng(png.buffer), {});
+});
+
+test("album folder import accepts photos and videos and skips other files", () => {
+  assert.equal(isAlbumMediaFile({ name: "trip/IMG_001.jpg" }), true);
+  assert.equal(isAlbumMediaFile({ name: "clip.MP4" }), true);
+  assert.equal(isAlbumMediaFile({ name: "live.MOV" }), true);
+  assert.equal(isAlbumMediaFile({ name: "notes.txt" }), false);
+  assert.equal(isAlbumMediaFile({ name: ".DS_Store" }), false);
 });
