@@ -247,13 +247,26 @@ class EvidenceRetrievalKernel:
         # not visual_only, and only for all_relevant or reliable seeds.
         already = {item["asset_id"] for item in primary_items}
         adjacency_items = []
-        if expanders and (strategy != VISUAL_ONLY or all_relevant):
-            seeds = [item["asset_id"] for item in primary_items if item.get("level") in {"exact", "strong"}]
+        graph_expanders = [expander for expander in expanders
+                           if getattr(expander, "name", "") == "graph"]
+        if expanders and ((strategy != VISUAL_ONLY or all_relevant) or graph_expanders):
+            reliable_seeds = [item["asset_id"] for item in primary_items
+                              if item.get("level") in {"exact", "strong"}]
             adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "no_seeds"}
             for expander in expanders:
+                # Graph late-fusion intentionally starts from the wider
+                # baseline head; adjacency keeps its stricter reliable-seed
+                # gate to avoid changing existing photo retrieval semantics.
+                seeds = ([item["asset_id"] for item in primary_items[:30]
+                          if item.get("asset_id")] if getattr(expander, "name", "") == "graph"
+                         else reliable_seeds)
                 channel_started = time.monotonic()
                 try:
-                    adjacency_hits = expander.expand(seeds, filters, limit=recall_limit)
+                    try:
+                        adjacency_hits = expander.expand(
+                            seeds, filters, limit=recall_limit, query=query)
+                    except TypeError:
+                        adjacency_hits = expander.expand(seeds, filters, limit=recall_limit)
                     adjacency_trace = {"invoked": True, "candidate_count": len(adjacency_hits),
                                        "status": "ok", "seeds": len(seeds)}
                 except Exception as error:

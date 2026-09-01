@@ -49,7 +49,8 @@ class AdjacencyRetriever:
         # retrieve has no seeds and therefore nothing to expand.
         return []
 
-    def expand(self, seed_asset_ids: list[str], filters: HardFilterContext, limit: int) -> list[CandidateHit]:
+    def expand(self, seed_asset_ids: list[str], filters: HardFilterContext,
+               limit: int, query=None) -> list[CandidateHit]:
         if not seed_asset_ids:
             return []
         seeds = list(dict.fromkeys(seed_asset_ids))[: self._budgets["max_seeds"]]

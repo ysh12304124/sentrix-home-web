@@ -62,6 +62,12 @@ def _adjacency(store, **kwargs):
     return AdjacencyRetriever(store, config=kwargs.get("config"))
 
 
+@_register("graph")
+def _graph(store, **kwargs):
+    from .graph_expander import GraphExpander
+    return GraphExpander(store, config=kwargs.get("config"))
+
+
 def build_default_retrievers(store, *, embedding_router=None, config=None, ann_dir=None):
     """Instantiate the enabled retriever set for a Kernel.
 
@@ -82,6 +88,10 @@ def build_default_retrievers(store, *, embedding_router=None, config=None, ann_d
         factory = _RETRIEVER_FACTORIES[name]
         retrievers.append(factory(store, embedding_router=embedding_router,
                                   config=config, ann_dir=ann_dir))
+    from .graph_expander import graph_retriever_enabled
+    if graph_retriever_enabled():
+        retrievers.append(_RETRIEVER_FACTORIES["graph"](
+            store, embedding_router=embedding_router, config=config, ann_dir=ann_dir))
     return retrievers
 
 
