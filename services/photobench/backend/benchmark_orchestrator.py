@@ -1871,6 +1871,7 @@ class BenchmarkRun:
             ("identity_seed", self._phase_identity_seed),
             ("photo_import", self._phase_photo_import),
             ("pipeline_processing", self._phase_processing),
+            ("graph_memory", self._phase_graph_memory),
             ("qa_eval", self._phase_qa_eval),
             ("gpu_metrics", self._phase_gpu_metrics),
             ("aggregate", self._phase_aggregate),
@@ -1927,15 +1928,68 @@ class BenchmarkRun:
         # 工作模式决定阶段编排；当前模型模式不拥有模型生命周期，因此没有部署阶段。
         phase_names_by_mode = {
             "full": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
-                     "pipeline_processing", "qa_eval", "gpu_metrics", "aggregate"],
+                     "pipeline_processing", "graph_memory", "qa_eval", "gpu_metrics", "aggregate"],
             "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
-                      "pipeline_processing", "gpu_metrics", "aggregate"],
+                      "pipeline_processing", "graph_memory", "gpu_metrics", "aggregate"],
             "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
         }
         selected = phase_names_by_mode[self.mode]
         if self.use_current_model:
             selected = [name for name in selected if name != "model_deploy"]
         return selected
+
+    def _phase_graph_memory(self):
+        """Build the graph projection from the same processed Sentrix scope.
+
+        This is an internal pipeline stage, not a separate benchmark input or
+        an extra evaluator.  QA starts only after the graph build request has
+        completed (or records a partial optional stage and continues with the
+        normal memory retriever fallback).
+        """
+        self._phase_start("graph_memory")
+        started = time.perf_counter()
+        try:
+            before_status = request_json(
+                f"{self.sentrix_url}/api/graph-memory/status", timeout=30)
+            before_built_at = str(before_status.get("built_at") or "")
+            request_json(
+                f"{self.sentrix_url}/api/graph-memory/build",
+                {"include_images": False, "causal": False},
+                "POST", 30,
+            )
+            timeout_seconds = max(5, int(os.getenv(
+                "PHOTOBENCH_GRAPH_BUILD_TIMEOUT_SECONDS", "600")))
+            deadline = time.monotonic() + timeout_seconds
+            last_status = {}
+            while time.monotonic() < deadline:
+                last_status = request_json(
+                    f"{self.sentrix_url}/api/graph-memory/status", timeout=30)
+                metadata = last_status.get("last_build") or {}
+                stats = metadata.get("stats") or {}
+                built_at = str(last_status.get("built_at") or "")
+                if (int(stats.get("frames") or 0) > 0
+                        and built_at and built_at != before_built_at):
+                    self._phase_done("graph_memory", {
+                        "total_seconds": round(time.perf_counter() - started, 3),
+                        "graph_path": last_status.get("path"),
+                        "nodes": last_status.get("nodes", 0),
+                        "edges": last_status.get("edges", 0),
+                        "frames": stats.get("frames", 0),
+                        "scope_id": self.state.get("scope_id"),
+                    })
+                    return
+                self._cancel.wait(1)
+            raise TimeoutError(
+                f"graph memory build did not become ready within {timeout_seconds}s")
+        except Exception as error:
+            # Graph is an enhancement over the existing memory path.  A graph
+            # failure must be visible in the run report but must not invalidate
+            # the benchmark or prevent QA from using the normal retriever.
+            self._phase_partial("graph_memory", {
+                "total_seconds": round(time.perf_counter() - started, 3),
+                "error": str(error),
+                "fallback": "normal_memory_retriever",
+            })
 
     def _cleanup_scope(self):
         """Delete the PhotoBench-created memory space after the run finishes."""
@@ -5598,7 +5652,7 @@ class OrchestratorRepository:
         return result
 
     def start_suite(self, payload: dict) -> dict:
-        album_id = payload.get("album_id", "album3-14")
+        album_id = payload.get("album_id", "album3-max-video10")
         mode = str(payload.get("mode") or "full").strip().lower()
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
