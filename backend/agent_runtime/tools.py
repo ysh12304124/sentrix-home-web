@@ -2259,7 +2259,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     _relax_level = 0
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
     rs = _RUNTIME["result_sets"].new(
-        scope_id=scope_id, query=query, asset_ids=asset_ids,
+        # Keep source-video IDs in the private ResultSet projection so
+        # include_debug/benchmark provenance can resolve a keyframe hit back
+        # to the uploaded video.  The public view below remains frame-only.
+        scope_id=scope_id, query=query, asset_ids=retrieved_asset_ids,
         unresolved=[g.get("reason") for g in (packet.gaps or [])],
     )
     preview_indices = _preview_indices(asset_ids, mode, store, query=query)
