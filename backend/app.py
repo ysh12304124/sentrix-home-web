@@ -31,6 +31,7 @@ from .image_io import (
 )
 from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
 from .pipeline import IngestionPipeline
+from .graph_memory import GraphMemoryService
 from .person_appearance import expanded_person_crop
 from .person_insights import rank_core_people
 from .runtime_providers import (
@@ -54,6 +55,8 @@ gamma = GammaClient()
 gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
 conversation_store = ConversationStore(store)
+graph_memory_service = GraphMemoryService()
+graph_memory_build_lock = threading.Lock()
 CONVERSATION_STORE_ENABLED = os.getenv("SENTRIX_CONVERSATION_STORE_V1", "0").lower() in {"1", "true", "on"}
 
 app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
@@ -3650,6 +3653,65 @@ def summarize_pending_events(background_tasks: BackgroundTasks, scope_id: str | 
     ])
     background_tasks.add_task(pipeline.summarize_pending_events, scope_id, max(1, limit))
     return {"accepted": accepted, "status": "event-summary-queued"}
+
+
+@app.get("/api/graph-memory/status")
+def graph_memory_status():
+    return graph_memory_service.status()
+
+
+@app.post("/api/graph-memory/build")
+def build_graph_memory(background_tasks: BackgroundTasks, payload: dict | None = None):
+    payload = payload or {}
+    if not graph_memory_build_lock.acquire(False):
+        return {"accepted": False, "status": "already-running"}
+    try:
+        scope_id = str(payload.get("scope_id") or "").strip() or None
+        include_images = bool(payload.get("include_images", False))
+        causal = bool(payload.get("causal", False))
+
+        def _build_graph_memory():
+            try:
+                graph_memory_service.build(
+                    scope_id=scope_id,
+                    include_images=include_images,
+                    enable_causal_edges=causal,
+                )
+            finally:
+                graph_memory_build_lock.release()
+
+        background_tasks.add_task(_build_graph_memory)
+        return {
+            "accepted": True,
+            "status": "graph-build-queued",
+            "scope_id": scope_id,
+            "include_images": include_images,
+            "causal": causal,
+            "graph_path": graph_memory_service.graph_path,
+        }
+    except Exception:
+        graph_memory_build_lock.release()
+        raise
+
+
+@app.post("/api/graph-memory/rebuild")
+def rebuild_graph_memory(background_tasks: BackgroundTasks, payload: dict | None = None):
+    return build_graph_memory(background_tasks, payload)
+
+
+@app.post("/api/graph-memory/search")
+def search_graph_memory(payload: dict):
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    result = graph_memory_service.search(
+        query,
+        top_k=int(payload.get("top_k") or 10),
+        scope_id=str(payload.get("scope_id") or "").strip() or None,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error") or "graph memory unavailable")
+    return result
 
 
 @app.get("/api/query-gaps")

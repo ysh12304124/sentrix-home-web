@@ -8,7 +8,7 @@ const root = __dirname;
 const port = Number(process.env.PORT || 11000);
 // The web portal uses the Agent-capable API as its single authority.
 // Default API is the project-local backend that reads ./data/sentrix.db.
-const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:9598").replace(/\/$/, "");
+const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || `http://127.0.0.1:${process.env.SENTRIX_API_PORT || 11001}`).replace(/\/$/, "");
 const photobenchPort = Number(process.env.PHOTOBENCH_PORT || 8771);
 const photobenchDir = path.join(root, "services", "photobench");
 const photobenchPython = process.env.PHOTOBENCH_PYTHON || "python3";

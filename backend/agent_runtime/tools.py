@@ -2249,6 +2249,82 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     }
 
 
+
+def _search_graph_memory(arguments: dict, *, context: dict | None = None) -> dict:
+    """MAGMA-style graph retrieval for temporal/causal/multi-hop video questions."""
+    from ..graph_memory import GraphMemoryService
+
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return {"readiness": "blocked", "error": "query is required"}
+    top_k = max(1, min(int(arguments.get("top_k") or 10), 50))
+    scope_id = str((context or {}).get("scope_id") or "").strip() or None
+
+    service = GraphMemoryService()
+    result = service.search(query, top_k=top_k, scope_id=scope_id)
+    if not result.get("ok"):
+        return {
+            "readiness": "limited",
+            "error": result.get("error") or "graph memory unavailable",
+            "graph_path": result.get("path"),
+            "hint": "先调用 POST /api/graph-memory/build 或 scripts/maintenance/build_graph_memory.py",
+        }
+
+    nodes = result.get("nodes") or []
+    event_nodes = [node for node in nodes if node.get("node_type") == "EVENT"]
+    asset_ids = list(dict.fromkeys(
+        str((node.get("attributes") or {}).get("source_asset_id") or node.get("id") or "")
+        for node in event_nodes
+        if (node.get("attributes") or {}).get("source_asset_id") or node.get("id")
+    ))
+
+    result_set_id = None
+    preview = []
+    handles = []
+    store = _RUNTIME.get("store")
+    if store is not None and asset_ids:
+        rs = _RUNTIME["result_sets"].new(
+            scope_id=scope_id or "home-default",
+            query=query,
+            asset_ids=asset_ids,
+            unresolved=[],
+        )
+        result_set_id = rs.result_set_id
+        handles = rs.handles()
+        _RUNTIME["last_handles"] = handles
+        for index, node in enumerate(event_nodes[:6]):
+            attrs = node.get("attributes") or {}
+            handle = f"photo_{index + 1}"
+            preview.append({
+                "handle": handle,
+                "asset_id": attrs.get("source_asset_id") or node.get("id"),
+                "time_sec": node.get("time_sec"),
+                "event_id": node.get("event_id"),
+                "video_asset_id": node.get("video_uid"),
+                "scene_id": node.get("clip_uid"),
+                "caption": node.get("caption"),
+                "person_ids": node.get("person_ids") or [],
+                "objects": node.get("objects") or [],
+                "relations": node.get("relations") or [],
+                "causal_context": node.get("causal_context") or [],
+            })
+
+    return {
+        "result_set_id": result_set_id,
+        "query": query,
+        "query_type": result.get("query_type"),
+        "total": len(event_nodes),
+        "asset_ids": asset_ids[:50],
+        "preview": preview,
+        "graph_context": result.get("context"),
+        "graph_paths": result.get("graph_paths") or [],
+        "needs_visual": result.get("needs_visual", False),
+        "stats": result.get("stats") or {},
+        "can_inspect": bool(preview),
+        "inspect_hint": "preview 里的 handle（photo_1…）可用于 inspect_photo 复核关键帧视觉细节" if preview else "",
+    }
+
+
 def _short_place_label(asset: dict) -> str:
     """从资产反地理编码取短地点标签（城市/区县名），供 preview 证据展示。"""
     import json as _json
@@ -3137,6 +3213,15 @@ def register_tools():
         required_inputs=("asset_handle",),
         preconditions=("asset_handle_in_current_preview",),
         prerequisite_evidence_types=("memory_asset",),
+    ))
+    register(ToolSpec(
+        name="search_graph_memory",
+        description=("检索视频关键帧图记忆，适合时序/因果/多跳/人物一致性问题："
+                     "“之后发生了什么”“之前谁在场”“为什么/导致了什么”“第一次出现”“同一个人前后做了什么”。"
+                     "返回关键帧、时间点、事件、人物ID和图路径；图未构建时会返回 limited。"),
+        input_schema={"query": "", "top_k": 10},
+        executor=_search_graph_memory, read_write="read", cost_class="medium", readiness="ready",
+        produces_evidence=("memory_asset", "memory_reference", "temporal_metadata", "confirmed_identity"),
     ))
     register(ToolSpec(
         name="get_original_photos",

@@ -1954,7 +1954,15 @@ class BenchmarkRun:
             before_built_at = str(before_status.get("built_at") or "")
             request_json(
                 f"{self.sentrix_url}/api/graph-memory/build",
-                {"include_images": False, "causal": False},
+                {
+                    # Build only the scope created/attached by this run.  The
+                    # graph service is otherwise asked to project every scope
+                    # in sentrix.db, which can leave old benchmark albums in
+                    # the graph and make the run's retrieval hard to verify.
+                    "scope_id": self.state.get("scope_id"),
+                    "include_images": False,
+                    "causal": False,
+                },
                 "POST", 30,
             )
             timeout_seconds = max(5, int(os.getenv(
