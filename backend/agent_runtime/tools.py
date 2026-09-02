@@ -2025,13 +2025,18 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # Semantic conditions are soft hints for the reranker, never hard
     # retrieval filters. Keep only an explicit media boundary here; scope
     # authorization remains enforced by the runtime context.
-    raw_filters = dict(arguments.get("filters") or {})
+    scope_id = (context or {}).get("scope_id") or ""
+    user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
+    # The planner is instructed to emit relative time only when the user said
+    # it.  Enforce that contract before any deterministic filter path so a
+    # hallucinated ``filters.time=去年`` cannot narrow an otherwise unbounded
+    # query.  Media remains the only raw filter accepted here.
+    raw_filters = _sanitize_model_filters(
+        arguments.get("filters"), query=query, user_goal=user_goal)
     filters = {}
     media = str(raw_filters.get("media") or "").strip().lower()
     if media in {"image", "video"}:
         filters["media"] = media
-    scope_id = (context or {}).get("scope_id") or ""
-    user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
     # Event summaries are intentionally not an early-return retrieval path.
     # They may be used later as an additional ranking signal, but must never
     # replace the multi-channel candidate universe.
