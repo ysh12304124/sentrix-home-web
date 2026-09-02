@@ -5691,7 +5691,11 @@ class OrchestratorRepository:
                             or not state.get("scope_id")
                             or state.get("scope_source") != "created"
                             or state.get("mode") not in {"full", "build"}
-                            or state.get("status") not in {"completed", "completed_with_errors"}):
+                            or state.get("status") not in {
+                                "completed", "completed_with_errors", "cancelled", "interrupted",
+                            }
+                            or (state.get("phases", {}).get("pipeline_processing", {}).get("status")
+                                not in {"done", "partial"})):
                         continue
                     historical.append((str(state.get("finished_at") or state.get("started_at") or ""),
                                        str(rid), state))
