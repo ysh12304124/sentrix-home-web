@@ -5674,8 +5674,67 @@ class OrchestratorRepository:
         if not qa_set:
             raise ValueError(f"album {album_id} has no qa_sets in manifest")
         existing_scope_id = str(payload.get("existing_scope_id") or "").strip()
+        auto_reused_scope = False
         if mode == "reuse" and not existing_scope_id:
-            raise ValueError("existing_scope_id is required when mode=reuse")
+            # The UI may not have a reusable-base selection when it is opened
+            # against a freshly restarted orchestrator.  Reuse is still safe
+            # to run without another import: resolve the newest *completed*
+            # build for this album and attach to its existing scope.  Do not
+            # guess from a scope name alone; an interrupted import can leave an
+            # active scope with only a fraction of the media.
+            sentrix_for_reuse = str(payload.get("sentrix_url") or DEFAULT_SENTRIX_URL).rstrip("/")
+            with self.lock:
+                historical = []
+                for rid, run in self.runs.items():
+                    state = run.state if isinstance(run, BenchmarkRun) else run
+                    if (str(state.get("album_id") or "") != str(album_id)
+                            or not state.get("scope_id")
+                            or state.get("scope_source") != "created"
+                            or state.get("mode") not in {"full", "build"}
+                            or state.get("status") not in {"completed", "completed_with_errors"}):
+                        continue
+                    historical.append((str(state.get("finished_at") or state.get("started_at") or ""),
+                                       str(rid), state))
+            historical.sort(reverse=True)
+            spaces = request_json(f"{sentrix_for_reuse}/api/memory-spaces", timeout=30)
+            if isinstance(spaces, dict):
+                spaces = spaces.get("spaces") or spaces.get("items") or []
+            active_spaces = {
+                str(space.get("id")): space for space in (spaces or [])
+                if space.get("id") and str(space.get("status") or "active") == "active"
+            }
+            expected_media = len(album_media_entries(manifest_early))
+            rejected = []
+            for _, rid, state in historical:
+                candidate = str(state.get("scope_id"))
+                if candidate not in active_spaces:
+                    continue
+                try:
+                    asset_payload = request_json(
+                        f"{sentrix_for_reuse}/api/assets?scope_id={quote(candidate)}&limit=2000",
+                        timeout=60,
+                    )
+                    assets = asset_payload.get("assets", []) if isinstance(asset_payload, dict) else []
+                    statuses = [str(asset.get("status") or "") for asset in assets]
+                    # A processed scope may contain derived keyframes, so use
+                    # the manifest media count as the minimum rather than an
+                    # exact asset count.
+                    complete = (len(assets) >= expected_media
+                                and bool(assets)
+                                and not any(status in PIPELINE_PENDING_STATUSES for status in statuses))
+                except Exception as exc:
+                    complete = False
+                    rejected.append(f"{candidate}: {exc}")
+                if complete:
+                    existing_scope_id = candidate
+                    auto_reused_scope = True
+                    break
+            if not existing_scope_id:
+                detail = f"; checked: {', '.join(rejected[:2])}" if rejected else ""
+                raise ValueError(
+                    f"no completed reusable memory found for album {album_id}{detail}; "
+                    "run a build/full evaluation once before using mode=reuse"
+                )
         models = payload.get("models", [])
         if not isinstance(models, list) or not models:
             raise ValueError("models must contain at least one model")
@@ -5798,6 +5857,12 @@ class OrchestratorRepository:
                     current_model_snapshot=current_model_snapshot,
                     use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
                 )
+                if auto_reused_scope:
+                    run.state["scope_reuse_resolution"] = {
+                        "mode": "auto_latest_completed",
+                        "scope_id": existing_scope_id,
+                        "reason": "existing_scope_id was omitted; attached to the newest completed build with a complete asset set",
+                    }
                 self.runs[run_id] = run
                 created_runs.append(run_id)
             self.active_suite_run_ids = created_runs
