@@ -2162,6 +2162,22 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "visual_ann": 2.5, "lexical": 1.0, "text_ann": 0.5,
         "metadata": 1.0, "entity": 1.0, "adjacency": 0.5, "graph": 1.0,
     }
+    # Event/place/time/person questions are text and metadata retrieval tasks.
+    # The global visual-heavy ablation weights are useful for "what color /
+    # what is visible" questions, but otherwise let visually similar clutter
+    # outrank an exact caption/keyword hit.  Detect only explicit visual
+    # predicates; the default profile favours lexical/text evidence.
+    _visual_query = bool(re.search(
+        r"颜色|穿着|衣服|长什么样|看起来|画面|外观|姿势|表情|手里拿|照片中|图中|可见|什么样",
+        str(query_for_retrieval or ""), re.I))
+    if not _visual_query:
+        _channel_weights.update({
+            "visual_ann": 0.75,
+            "lexical": 3.0,
+            "text_ann": 1.5,
+            "metadata": 2.0,
+            "entity": 2.0,
+        })
     scores: dict[str, float] = {}
     for _aid in (set(per_asset_ranks) | event_member_ids):
         _ranks = per_asset_ranks.get(_aid) or []
