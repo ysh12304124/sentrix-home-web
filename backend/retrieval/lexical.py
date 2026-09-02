@@ -25,7 +25,10 @@ class LexicalRetriever:
     def __init__(self, store):
         self.store = store
         self.index = RetrievalIndex(store)
-        self._populated = False
+        # A benchmark creates a fresh scope for every run.  Keep health state
+        # per scope instead of globally, otherwise the first scope searched in
+        # a process suppresses the self-heal for every later album.
+        self._populated_scopes: set[str | None] = set()
 
     def _scope(self, filters: HardFilterContext) -> str | None:
         if filters.all_authorized or not filters.scope_ids:
@@ -41,14 +44,16 @@ class LexicalRetriever:
         whole album.  Compare distinct indexed observations with the current
         scope and rebuild that scope when the projection is materially behind.
         """
-        if self._populated:
+        scope_key = str(scope_id or "") or None
+        if scope_key in self._populated_scopes:
             return
         try:
             conn = self.store.connection
-            where = "WHERE scope_id = ?" if scope_id else ""
+            where = "WHERE a.scope_id = ?" if scope_id else ""
             params = (scope_id,) if scope_id else ()
             expected = int(conn.execute(
-                f"SELECT COUNT(DISTINCT id) FROM observations {where}", params
+                "SELECT COUNT(DISTINCT o.id) FROM observations o "
+                "JOIN assets a ON a.id = o.asset_id " + where, params
             ).fetchone()[0] or 0)
             indexed = int(conn.execute(
                 "SELECT COUNT(DISTINCT observation_id) FROM observation_search_fts "
@@ -61,7 +66,7 @@ class LexicalRetriever:
                 self.index.rebuild_all(scope_id=scope_id)
         except Exception:
             pass
-        self._populated = True
+        self._populated_scopes.add(scope_key)
 
     def retrieve(self, query: RetrievalQuery, filters: HardFilterContext, limit: int) -> list[CandidateHit]:
         scope = self._scope(filters)
