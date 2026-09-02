@@ -881,6 +881,32 @@ def _observation_summary(store, asset_id: str) -> str:
     return "；".join(parts)[:300]
 
 
+def _semantic_text_overlap(query: str, text: str) -> float:
+    """Score source-text overlap for candidate ordering.
+
+    Metadata anchors (date/place) are useful hard evidence, but a location can
+    match many unrelated photos in the same album.  This small deterministic
+    score keeps an asset whose caption/event/activity actually describes the
+    query in front of a metadata-only candidate.  It is not an answer lookup:
+    it reads only the candidate's persisted observation text.
+    """
+    q = re.sub(r"\s+", "", str(query or "").lower())
+    hay = str(text or "").lower()
+    if not q or not hay:
+        return 0.0
+    if q in hay:
+        return min(2.5, 1.0 + len(q) / 8.0)
+    terms = []
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", q):
+        if len(run) <= 8:
+            terms.append(run)
+        terms.extend(run[i:i + 2] for i in range(len(run) - 1))
+    terms.extend(re.findall(r"[a-z0-9]{2,}", q))
+    terms = list(dict.fromkeys(terms))
+    hits = sum(1 for term in terms if term in hay)
+    return min(1.5, hits * 0.18) if hits else 0.0
+
+
 def _asset_group_key(store, asset_id: str) -> str:
     """Group video keyframes and event-near-duplicates for the initial preview."""
     if store is None:
@@ -916,12 +942,18 @@ def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
                 requested_count = int(raw)
             except ValueError:
                 requested_count = None
-    if not cues and requested_count is None:
-        return list(range(len(asset_ids)))
     scored = []
     for index, asset_id in enumerate(asset_ids):
         summary = _observation_summary(store, asset_id)
+        # Keep the explicit visual aliases, but also score ordinary event and
+        # activity words from the query against the persisted observation.  A
+        # query such as “婚礼仪式” has no entry in the alias table; previously
+        # that caused the preview to fall back to raw rank even when the right
+        # keyframe was already in the candidate set.
         score = sum(1 for _, aliases in cues if any(alias in summary for alias in aliases))
+        overlap = _semantic_text_overlap(text, summary)
+        if overlap:
+            score += max(1, int(round(overlap * 2)))
         if requested_count is not None and store is not None:
             try:
                 face_count = int(store.connection.execute(
@@ -2203,11 +2235,17 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             _slots = None
         if _slots:
             bounds = _slots["time"].get("bounds") or []
-            if len(bounds) == 2:
+            # Explicit tool filters are planner/user facts.  The optional
+            # slot parser is allowed to add a missing constraint, but must not
+            # overwrite an already supplied place/person/time with a model
+            # paraphrase or hallucinated normalization (that used to turn a
+            # 馆陶县 query into an unrelated district and remove the target
+            # video keyframe during hard evaluation).
+            if len(bounds) == 2 and not filters.get("time"):
                 filters["time"] = _bounds_to_time_expr(bounds[0], bounds[1])
-            if _slots["place"].get("name"):
+            if _slots["place"].get("name") and not filters.get("place"):
                 filters["place"] = _slots["place"].get("hint") or _slots["place"]["name"]
-            if _slots.get("person"):
+            if _slots.get("person") and not filters.get("person"):
                 filters["person"] = "、".join(p["name"] for p in _slots["person"])
             _slot_event = _slots["event"].get("name") or ""
             _slot_objects = [str(o) for o in (_slots.get("object") or [])]
@@ -2308,6 +2346,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         })
     scores: dict[str, float] = {}
     place_scores: dict[str, float] = {}
+    semantic_scores: dict[str, float] = {}
     for _aid in (set(per_asset_ranks) | event_member_ids):
         _ranks = per_asset_ranks.get(_aid) or []
         _channels = per_asset_channels.get(_aid) or {}
@@ -2316,6 +2355,20 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                      for name, rank in _channels.items())
         else:
             _s = sum(1.0 / (_slot_rrf_k + r) for r in _ranks)
+        # A semantic hit in the persisted observation/event text should beat a
+        # candidate admitted only because its GPS/place anchor matched.  This
+        # is especially important when one album contains several events at
+        # the same city or district and the answer depends on the event itself.
+        try:
+            _asset = store.get_asset(_aid) or {}
+            _semantic_overlap = _semantic_text_overlap(
+                query_for_retrieval,
+                _media_list_search_text(store, _aid, _asset),
+            )
+            semantic_scores[_aid] = _semantic_overlap
+            _s += _semantic_overlap
+        except Exception:
+            pass
         if _aid in event_member_ids:
             _s += _slot_ev_w
         if place_q := str(filters.get("place") or "").strip():
@@ -2352,7 +2405,15 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         for _aid in scores:
             if time_bounds and not _in_time_bounds(_asset_captured(_aid), time_bounds):
                 continue
-            if place_q and place_scores.get(_aid, 0.0) <= 0:
+            # A frame can be the only reliable source of the event caption
+            # while its uploaded parent has GPS but no reverse-geocode label.
+            # Do not discard that frame solely because the explicit place
+            # filter is absent on the observation: retain a strong persisted
+            # event/text hit and let the place evidence remain a ranking signal.
+            # This fixes video keyframes such as “婚礼仪式” whose parent GPS
+            # is present but whose derived observation has no district string.
+            if (place_q and place_scores.get(_aid, 0.0) <= 0
+                    and semantic_scores.get(_aid, 0.0) < 0.35):
                 continue
             kept.append(_aid)
         if not kept and time_bounds:
@@ -2424,7 +2485,13 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     validated_ids = list(asset_ids)
     candidate_only_ids = []
     ranked_ids = list(asset_ids)
-    public_ids = list(asset_ids)
+    # The bounded preview is what the model actually sees.  Keep its handles
+    # aligned with the ResultSet order so ``photo_1`` always resolves to the
+    # first displayed evidence item, while ``ranked_asset_ids`` below retains
+    # the full fused ranking for diagnostics/benchmark provenance.
+    preview_order = list(preview_indices or range(len(asset_ids)))
+    preview_order.extend(index for index in range(len(asset_ids)) if index not in preview_order)
+    public_ids = [asset_ids[index] for index in preview_order]
     public_status = "candidate_only" if public_ids else "none"
     rs.set_public_view(public_ids)
     _RUNTIME["result_sets"].save(rs)

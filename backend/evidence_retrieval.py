@@ -434,7 +434,15 @@ class EvidenceRetrievalKernel:
                 status = "possible"
             results[constraint.key] = {"status": status, "source_type": source_type, "source_id": source_id, "confidence": confidence}
             if constraint.strictness == HARD and (status != "matched" if not constraint.negated else status == "matched"):
-                excluded = True
+                # Place metadata is open-world: a derived video keyframe often
+                # has no reverse-geocode of its own even though the uploaded
+                # parent carries GPS.  An unknown place must not erase a
+                # semantically matched event from the candidate set; only an
+                # authoritative, conflicting geocode is a hard contradiction.
+                # The slot reranker applies the explicit place score when it
+                # is available and the event-text score when it is not.
+                if not (constraint.dimension == "place" and status == "unknown"):
+                    excluded = True
             if constraint.strictness == SEMANTIC and status == "contradicted":
                 excluded = True
         semantic = [item["status"] for item in results.values() if item["status"] in {"possible", "unknown", "contradicted"}]
