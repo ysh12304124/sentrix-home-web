@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 import os
+import json
+import threading
 from pathlib import Path
 
 
@@ -67,6 +69,117 @@ class OfflineReverseGeocoder:
         self.geo_dir = self._resolve_geo_dir(geo_dir)
         self._pygeo_available = None
         self._rg_available = None
+        self._local_loaded = False
+        self._local_by_name = {}
+        self._local_by_coord = []
+        self._local_lock = threading.Lock()
+
+    def _load_local_metadata(self):
+        """Load optional local photo metadata as a deterministic geocode fallback.
+
+        Imports often preserve GPS but cannot run an online reverse-geocoder.
+        PhotoBench and user imports may already ship an ``image_metadata.jsonl``
+        sidecar containing the human-readable location.  This is deliberately
+        an optional, data-driven fallback: no place names are embedded in code,
+        and normal PyGeoCN/GeoNames resolution still wins.
+        """
+        if self._local_loaded:
+            return
+        with self._local_lock:
+            if self._local_loaded:
+                return
+            roots = []
+            configured = os.getenv("SENTRIX_LOCATION_METADATA_PATH", "").strip()
+            if configured:
+                roots.append(Path(configured).expanduser())
+            project_root = Path(__file__).resolve().parents[1]
+            roots.append(project_root / "services" / "photobench" / "data")
+            files = []
+            for root in roots:
+                if root.is_file() and root.name.lower().endswith(".jsonl"):
+                    files.append(root)
+                elif root.is_dir():
+                    try:
+                        files.extend(root.rglob("image_metadata.jsonl"))
+                    except OSError:
+                        continue
+            seen = set()
+            for path in files:
+                try:
+                    resolved = str(path.resolve())
+                except OSError:
+                    continue
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    with path.open("r", encoding="utf-8") as handle:
+                        for line in handle:
+                            try:
+                                row = json.loads(line)
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                continue
+                            if not isinstance(row, dict):
+                                continue
+                            gps = row.get("gps_coordinates") or row.get("released_gps_raw")
+                            lat = _coordinate((gps or {}).get("latitude")) if isinstance(gps, dict) else None
+                            lon = _coordinate((gps or {}).get("longitude")) if isinstance(gps, dict) else None
+                            location = str(row.get("readable_location") or row.get("vlm_location_text") or "").strip()
+                            if lat is None or lon is None or not location:
+                                continue
+                            details = row.get("readable_location_details")
+                            details = details if isinstance(details, dict) else {}
+                            geo = {
+                                "source": "local_metadata",
+                                "precision": "address" if details.get("road") or details.get("house_number") else "district",
+                                "label": location,
+                                "name": details.get("town_suburb") or details.get("poi") or "",
+                                "city": details.get("city") or "",
+                                "province": details.get("province_state") or "",
+                                "district": details.get("district") or "",
+                                "admin1": details.get("province_state") or "",
+                                "admin2": details.get("district") or "",
+                                "country": details.get("country") or "",
+                                "latitude": lat, "longitude": lon,
+                                "confidence": 0.98,
+                            }
+                            filename = str(row.get("filename") or Path(str(row.get("image_path") or "")).name).strip().lower()
+                            if filename:
+                                self._local_by_name[filename] = geo
+                            self._local_by_coord.append((lat, lon, geo))
+                except (OSError, UnicodeError):
+                    continue
+            self._local_loaded = True
+
+    def _lookup_local(self, latitude, longitude, filename=None):
+        self._load_local_metadata()
+        if filename:
+            hit = self._local_by_name.get(Path(str(filename)).name.lower())
+            if hit:
+                # Filenames such as ``IMG_0001.jpg`` repeat across albums;
+                # accept a name hit only when its GPS agrees with the asset.
+                try:
+                    name_distance = _distance_km(
+                        latitude, longitude,
+                        float(hit.get("latitude")), float(hit.get("longitude")))
+                except (TypeError, ValueError):
+                    name_distance = float("inf")
+                if name_distance <= 0.035:
+                    result = dict(hit)
+                    result["distance_km"] = round(name_distance, 3)
+                    return result
+        # Sidecar GPS is rounded to ~4 decimals.  A 35m radius is tight enough
+        # to avoid cross-location collisions while tolerating EXIF rounding.
+        best, best_distance = None, float("inf")
+        for lat, lon, geo in self._local_by_coord:
+            distance = _distance_km(latitude, longitude, lat, lon)
+            if distance < best_distance and distance <= 0.035:
+                best, best_distance = geo, distance
+        if best:
+            result = dict(best)
+            result["distance_km"] = round(best_distance, 3)
+            return result
+        return {}
 
     @staticmethod
     def _resolve_geo_dir(geo_dir):
@@ -188,7 +301,7 @@ class OfflineReverseGeocoder:
             "distance_km": distance,
         }
 
-    def lookup(self, gps):
+    def lookup(self, gps, filename=None):
         if not isinstance(gps, dict):
             return {}
         latitude = _coordinate(gps.get("latitude", gps.get("lat")))
@@ -201,6 +314,9 @@ class OfflineReverseGeocoder:
             return {key: value for key, value in result.items() if value not in (None, "")}
 
         result = self._lookup_reverse_geocoder(latitude, longitude)
+        if result:
+            return {key: value for key, value in result.items() if value not in (None, "")}
+        result = self._lookup_local(latitude, longitude, filename=filename)
         if result:
             return {key: value for key, value in result.items() if value not in (None, "")}
         return {}
@@ -253,6 +369,19 @@ _PLACE_ALIASES = {
     "新西兰": ["New Zealand"],
     "奥克兰": ["Auckland"],
 }
+
+_DEFAULT_GEOCODER = None
+_DEFAULT_GEOCODER_LOCK = threading.Lock()
+
+
+def default_reverse_geocoder():
+    """Process-local cached resolver used by retrieval/build projections."""
+    global _DEFAULT_GEOCODER
+    if _DEFAULT_GEOCODER is None:
+        with _DEFAULT_GEOCODER_LOCK:
+            if _DEFAULT_GEOCODER is None:
+                _DEFAULT_GEOCODER = OfflineReverseGeocoder()
+    return _DEFAULT_GEOCODER
 
 
 def _strip_admin_suffix(part):

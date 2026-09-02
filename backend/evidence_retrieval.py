@@ -1,6 +1,7 @@
 """Correctness-first Asset-level Evidence Retrieval Kernel."""
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 import time
@@ -567,7 +568,23 @@ class EvidenceRetrievalKernel:
                 geocode = json.loads(geocode)
             except (TypeError, ValueError):
                 geocode = {}
-        return geocode if isinstance(geocode, dict) else {}
+        if isinstance(geocode, dict) and geocode:
+            return geocode
+        # Keep GPS-only imports searchable without changing the hard-filter
+        # contract: resolve through the optional offline metadata/geocoder
+        # fallback and let the normal place evaluator consume the result.
+        location = str(asset.get("captured_location") or "")
+        match = re.search(r"(-?\d+(?:\.\d+)?)\s*[,; ]\s*(-?\d+(?:\.\d+)?)", location)
+        if match:
+            try:
+                from .geocoding import default_reverse_geocoder
+                return default_reverse_geocoder().lookup(
+                    {"latitude": match.group(1), "longitude": match.group(2)},
+                    filename=asset.get("file_name"),
+                ) or {}
+            except Exception:
+                pass
+        return {}
 
     def _evaluate_place(self, asset, observation, constraint):
         """地理地点条件（D12）。

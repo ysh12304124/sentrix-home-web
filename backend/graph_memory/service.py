@@ -46,6 +46,13 @@ class GraphMemoryService:
         include_images: bool = False,
         enable_causal_edges: bool | None = None,
     ) -> dict:
+        # Ordinary uploaded photos are first-class memories too.  The previous
+        # default only projected video keyframes, so the graph expander could
+        # never recover an image that lexical/ANN recall missed.  Keep an
+        # explicit opt-out for large deployments/tests while enabling the
+        # complete memory projection by default.
+        include_images = bool(include_images or _truthy(
+            os.getenv("SENTRIX_GRAPH_INCLUDE_IMAGES"), True))
         provider = SentrixFrameProvider(self.db_path)
         frames = provider.fetch_frames(scope_id=scope_id, include_images=include_images)
         if not frames:
@@ -58,7 +65,14 @@ class GraphMemoryService:
             }
 
         if enable_causal_edges is None:
-            enable_causal_edges = _truthy(os.getenv("GRAPH_CAUSAL_ENABLED"), False)
+            enable_causal_edges = _truthy(os.getenv("GRAPH_CAUSAL_ENABLED"), True)
+        elif not enable_causal_edges and _truthy(os.getenv("GRAPH_CAUSAL_ENABLED"), True):
+            # The API/benchmark payload historically sent ``causal: false``
+            # because causal construction was an optional enhancement.  That
+            # left every graph snapshot without causal edges.  Treat the
+            # default as enabled while retaining an explicit environment opt-
+            # out (GRAPH_CAUSAL_ENABLED=0) for constrained deployments.
+            enable_causal_edges = True
 
         builder = KeyframeMemoryBuilder(enable_causal_edges=enable_causal_edges)
         stats = builder.build_from_frames(frames)
@@ -252,15 +266,20 @@ class GraphMemoryService:
                 self._builder = None
 
     def _refresh_if_stale(self, scope_id: str | None = None) -> None:
+        include_images = _truthy(os.getenv("SENTRIX_GRAPH_INCLUDE_IMAGES"), True)
+        causal_enabled = _truthy(os.getenv("GRAPH_CAUSAL_ENABLED"), True)
         if not self.graph_exists:
-            self.build(scope_id=scope_id, include_images=False)
+            self.build(scope_id=scope_id, include_images=include_images)
             return
         try:
             graph_mtime = Path(self.graph_path).stat().st_mtime
             conn = sqlite3.connect(self.db_path)
             try:
                 params = []
-                where = "WHERE media_type = 'image' AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')"
+                where = "WHERE media_type = 'image' AND (derived_kind IN ('video_keyframe', 'video_keyframe_webp')"
+                if include_images:
+                    where += " OR derived_kind IS NULL"
+                where += ")"
                 row = conn.execute(f"SELECT COUNT(*), MAX(COALESCE(updated_at, created_at)) FROM assets {where}", params).fetchone()
             finally:
                 conn.close()
@@ -276,11 +295,25 @@ class GraphMemoryService:
                     built_count = int(((metadata.get("stats") or {}).get("frames") or 0))
             except Exception:
                 built_count = 0
-            if current_count and current_count != built_count:
+            built_include_images = False
+            built_causal = False
+            try:
+                gconn = sqlite3.connect(self.graph_path)
+                metadata_row = gconn.execute("SELECT value FROM metadata WHERE key = 'sentrix_build'").fetchone()
+                gconn.close()
+                if metadata_row:
+                    metadata = json.loads(metadata_row[0])
+                    built_include_images = bool(metadata.get("include_images"))
+                    built_causal = bool(metadata.get("causal_enabled"))
+            except Exception:
+                built_include_images = False
+            if current_count and (current_count != built_count
+                                  or (include_images and not built_include_images)
+                                  or (causal_enabled and not built_causal)):
                 # Keep one complete derived graph and apply scope filtering at
                 # traversal time; rebuilding a scope-specific graph here
                 # would overwrite memories from other albums.
-                self.build(scope_id=None, include_images=False)
+                self.build(scope_id=None, include_images=include_images)
                 return
             if latest:
                 try:
@@ -288,7 +321,7 @@ class GraphMemoryService:
                 except (TypeError, ValueError, OSError):
                     latest_ts = 0.0
                 if latest_ts > graph_mtime + 1.0:
-                    self.build(scope_id=None, include_images=False)
+                    self.build(scope_id=None, include_images=include_images)
         except Exception:
             # A stale-check failure must never take down retrieval; the
             # existing graph remains a safe fallback.

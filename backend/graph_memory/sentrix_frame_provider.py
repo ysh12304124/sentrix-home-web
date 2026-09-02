@@ -8,6 +8,7 @@ Sentrix SQLite schema.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
@@ -115,6 +116,24 @@ class SentrixFrameProvider:
         place = place_entity.get("canonical_name") if place_entity else (
             observation.get("place") or (event or {}).get("place") or ""
         )
+        # GPS is often retained while reverse-geocoding is unavailable at
+        # ingest time.  Resolve it lazily and append it to (rather than
+        # replacing) the model's scene label: both "室内空间" and the real
+        # administrative/landmark location remain searchable.
+        location = str(asset["captured_location"] or asset["parent_captured_location"] or "")
+        match = re.search(r"(-?\d+(?:\.\d+)?)\s*[,; ]\s*(-?\d+(?:\.\d+)?)", location)
+        if match:
+            try:
+                from ..geocoding import default_reverse_geocoder
+                geo = default_reverse_geocoder().lookup(
+                    {"latitude": match.group(1), "longitude": match.group(2)},
+                    filename=asset["file_name"],
+                )
+                geo_place = str(geo.get("label") or geo.get("name") or "").strip()
+                if geo_place and geo_place not in str(place):
+                    place = (str(place).strip() + " " + geo_place).strip()
+            except Exception:
+                pass
 
         payload = {
             "video_uid": str(parent_id),

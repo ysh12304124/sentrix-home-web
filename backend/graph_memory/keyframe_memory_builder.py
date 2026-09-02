@@ -212,11 +212,28 @@ class KeyframeMemoryBuilder:
             obj_str = ", ".join("%s x%d" % (k, v) for k, v in list(obj_counts.items())[:8])
             parts.append("Objects: " + obj_str)
 
+        event_title = str(payload.get("event_title") or "").strip()
+        event_summary = str(payload.get("event_summary") or "").strip()
+        if event_title:
+            parts.append("Event: " + event_title)
+        if event_summary:
+            parts.append("Event summary: " + event_summary)
+
         clip_t = payload.get("clip_time_sec")
         vid_t = payload.get("video_time_sec")
         clip = (payload.get("clip_uid") or "")[:8]
         loc = "Location: clip %s @ %ss / video @ %ss" % (clip, clip_t, vid_t)
         parts.append(loc)
+        # Wall-clock capture time and human-readable place are separate from
+        # in-video timestamps.  Put both on the searchable narrative so graph
+        # anchors can answer date/location questions instead of relying only on
+        # the generic clip location string.
+        captured = str(payload.get("captured_at") or "").strip()
+        place = str(payload.get("place") or "").strip()
+        if captured:
+            parts.append("Captured: " + captured)
+        if place:
+            parts.append("Place: " + place)
         return "\n".join(parts)
 
     def create_frame_node(self, point: dict) -> EventNode:
@@ -259,6 +276,8 @@ class KeyframeMemoryBuilder:
                 "video_uid": payload.get("video_uid"),
                 "frame_uid": payload.get("frame_uid"),
                 "event_id": payload.get("event_id"),
+                "event_summary": payload.get("event_summary") or "",
+                "event_title": payload.get("event_title") or "",
                 "source_asset_id": payload.get("source_asset_id") or str(point_id),
                 "source_scene_index": payload.get("source_scene_index"),
                 "frame_path": frame_path,
@@ -448,8 +467,17 @@ class KeyframeMemoryBuilder:
     # ------------------------------------------------------------------ #
 
     def index_frame(self, event_id, content, attributes):
-        """Build a keyword index (object_labels + relation_labels + tokens)."""
-        for text in [content]:
+        """Build a keyword index (narrative + identity/context fields).
+
+        ``tokenize_text`` caps long narratives at 128 tokens; dates/places are
+        appended near the end of the narrative and were therefore frequently
+        truncated.  Index the compact context fields separately so a location
+        or capture-date anchor is never lost to the token budget.
+        """
+        for text in [content, attributes.get("place"), attributes.get("captured_at"),
+                     attributes.get("event_title"), attributes.get("event_summary")]:
+            if not text:
+                continue
             for tok in tokenize_text(text):
                 tok = tok.strip(".,!?;:\"\x27")
                 if len(tok) >= 2 or contains_cjk(tok):

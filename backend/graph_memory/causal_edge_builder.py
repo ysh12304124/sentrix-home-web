@@ -105,9 +105,15 @@ class CausalEdgeBuilder:
         if configured_api:
             self.api = configured_api.rstrip("/")
         else:
+            base_url = (
+                ollama_url
+                or os.getenv("OLLAMA_BASE_URL", "").strip()
+                or os.getenv("OPENAI_BASE_URL", "").strip()
+                or "http://127.0.0.1:11434"
+            )
             self.api = (
-                ollama_url or os.getenv("OPENAI_BASE_URL", "")
-            ).replace("/v1", "").rstrip("/") + "/api/chat"
+                base_url.replace("/v1", "").rstrip("/") + "/api/chat"
+            )
 
         configured_backend = os.getenv("CAUSAL_BACKEND", "auto").strip().lower()
         path = self.api.lower()
@@ -506,6 +512,36 @@ class CausalEdgeBuilder:
 
         # Scene stability across ALL objects (background included)
         scene = self._compute_scene_iou(raw_a, raw_b)
+        # Many imported observations contain labels/relations but no bounding
+        # boxes.  Treating those pairs as an unstable scene discarded every
+        # possible causal transition before rules/VLM could judge it.  Use a
+        # conservative label-only fallback: at least two shared specific
+        # objects anchor the scene and no more than four objects change.
+        has_bbox = any(obj.get("bbox") for obj in (raw_a + raw_b)
+                       if isinstance(obj, dict))
+        if scene["total_shared"] < 2 and not has_bbox:
+            labels_a = {
+                str(obj.get("label") or obj).strip().lower()
+                for obj in raw_a
+            } or {str(value).strip().lower()
+                  for value in (pair.get("objects_a") or [])}
+            labels_b = {
+                str(obj.get("label") or obj).strip().lower()
+                for obj in raw_b
+            } or {str(value).strip().lower()
+                  for value in (pair.get("objects_b") or [])}
+            labels_a -= GENERIC_OBJECT_LABELS
+            labels_b -= GENERIC_OBJECT_LABELS
+            shared_count = len(labels_a & labels_b)
+            changed_count = len(labels_a.symmetric_difference(labels_b))
+            scene = {
+                "total_shared": shared_count,
+                "stable": shared_count,
+                "displaced": 0,
+                "displacement_ratio": 0.0 if shared_count >= 2 and changed_count <= 4 else 1.0,
+                "stable_ratio": 1.0 if shared_count >= 2 else 0.0,
+                "per_object": {},
+            }
         scene_is_stable = (
             scene["displacement_ratio"] <= 0.4 and scene["stable"] >= 2
         )
@@ -957,7 +993,7 @@ class CausalEdgeBuilder:
             return False
 
         object_low = values["object_involved"].lower()
-        object_tokens = set(re.findall(r"[a-z0-9]+", object_low))
+        object_tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", object_low))
         if not object_tokens or not (object_tokens - NON_SPECIFIC_OBJECT_LABELS):
             return False
 
@@ -968,8 +1004,8 @@ class CausalEdgeBuilder:
 
         data_a = " ".join(objects_a + relations_a).lower()
         data_b = " ".join(objects_b + relations_b).lower()
-        tokens_a = set(re.findall(r"[a-z0-9]+", data_a))
-        tokens_b = set(re.findall(r"[a-z0-9]+", data_b))
+        tokens_a = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", data_a))
+        tokens_b = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", data_b))
         return bool(object_tokens & tokens_a and object_tokens & tokens_b)
 
     def build_causal_edges(self, frame_pairs: List[dict], graph_db,

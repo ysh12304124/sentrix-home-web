@@ -496,6 +496,76 @@ class KeyframeQueryEngine:
         scored.sort(key=lambda x: (-x[0], x[1].node_id))
         return [n for _, n in scored[:top_k]]
 
+    @staticmethod
+    def _metadata_query_anchors(question: str) -> tuple[list[str], list[str]]:
+        """Return generic calendar and place anchors from a user query.
+
+        This deliberately does not use benchmark answers or a fixed place
+        vocabulary.  Calendar expressions are normalized and CJK runs are
+        matched against the persisted ``place`` field at query time.
+        """
+        text = str(question or "").lower()
+        dates = []
+        for match in re.finditer(
+                r"(\d{4})\s*(?:[-/.年]\s*)(\d{1,2})\s*(?:[-/.月]\s*)(\d{1,2})\s*(?:日)?",
+                text):
+            dates.append("%04d-%02d-%02d" % tuple(map(int, match.groups())))
+        # Keep meaningful CJK runs; generic interrogative/time words cannot
+        # identify a place and would otherwise match most nodes.
+        stop = {
+            "什么", "哪个", "哪里", "地点", "场景", "时间", "时候", "发生",
+            "拍摄", "视频", "照片", "画面", "事情", "事件", "内容", "当时",
+            "之后", "之前", "然后", "现在", "那里", "这里", "有没有",
+        }
+        places = []
+        for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+            if run in stop:
+                continue
+            # Long natural-language runs contain verbs and question words;
+            # retain their useful n-grams and let node metadata validate them.
+            if len(run) <= 12:
+                places.append(run)
+            else:
+                places.extend(run[i:i + 2] for i in range(len(run) - 1))
+                places.extend(run[i:i + 3] for i in range(len(run) - 2))
+        return dates, list(dict.fromkeys(places))
+
+    def _metadata_recall(self, question: str, top_k: int = 20,
+                         scope: Optional[Dict] = None) -> List:
+        """Recall nodes by exact persisted date/place context.
+
+        Vector/semantic channels are intentionally fuzzy.  This channel is
+        deterministic and only adds candidates when the query contains an
+        explicit date or a phrase that occurs in a node's stored location.
+        It is therefore useful for dates and GPS-derived locations without
+        changing ordinary visual retrieval behavior.
+        """
+        dates, place_terms = self._metadata_query_anchors(question)
+        if not dates and not place_terms:
+            return []
+        scored = []
+        for node in self.graph_db.nodes.values():
+            if node.node_type.value != "EVENT" or not self._scope_match(node, scope):
+                continue
+            attrs = getattr(node, "attributes", {}) or {}
+            captured = str(attrs.get("captured_at") or "").lower()
+            place = str(attrs.get("place") or "").lower()
+            event_text = " ".join(str(attrs.get(k) or "").lower()
+                                  for k in ("event_title", "event_summary"))
+            score = 0.0
+            if any(date in captured[:10].replace("/", "-") for date in dates):
+                score += 100.0
+            for term in place_terms:
+                if len(term) >= 2 and term in place:
+                    score += 120.0 if len(term) >= 3 else 70.0
+                elif len(term) >= 3 and term in event_text:
+                    score += 12.0
+            if score > 0:
+                node.metadata_score = score
+                scored.append((score, node))
+        scored.sort(key=lambda item: (-item[0], item[1].node_id))
+        return [node for _, node in scored[:top_k]]
+
     # ------------------------------------------------------------------ #
     #  RRF fusion (reused verbatim from MAGMA)
     # ------------------------------------------------------------------ #
@@ -1274,6 +1344,21 @@ class KeyframeQueryEngine:
                 diff = abs(node_t - target_t)
                 time_score = max(0, 30.0 - diff)  # closer = higher
 
+            # Real-world location/date anchors are identity evidence, not
+            # fuzzy visual concepts.  Semantic label matching can mistake a
+            # place token (e.g. 沙岭) for a visually similar object (沙发);
+            # exact hits in the node's persisted context fields must win.
+            place_text = str(attrs.get("place") or "").lower()
+            captured_text = str(attrs.get("captured_at") or "").lower()
+            context_anchor_score = 0.0
+            anchor_dates, anchor_places = self._metadata_query_anchors(question)
+            for term in set(terms) | set(anchor_places):
+                if len(term) >= 2 and term in place_text:
+                    context_anchor_score += 120.0
+            for date in anchor_dates:
+                if date in captured_text[:10].replace("/", "-"):
+                    context_anchor_score += 100.0
+
             sim = getattr(node, "similarity_score", 0)
             try:
                 quality = float(attrs.get("worldmm_information_gain") or 0.0)
@@ -1315,6 +1400,7 @@ class KeyframeQueryEngine:
                      + causal_score * weights.get("causal", 0.0)
                      + subtype_score
                      + graph_path_score
+                     + context_anchor_score
                      + quality * weights.get("quality", 0.5)
                      + sim * 10.0)
             node.ranking_score = total
@@ -1477,6 +1563,16 @@ class KeyframeQueryEngine:
         recall_timings["structured_ms"] = round((time.perf_counter() - t_channel) * 1000, 1)
         if struct_nodes:
             ranked_lists.append(struct_nodes)
+
+        # Exact date/GPS-derived place context is a separate recall signal.
+        # Keeping it independent from semantic labels prevents a place name
+        # from being confused with a visually similar object (e.g. 沙岭/沙发).
+        t_channel = time.perf_counter()
+        metadata_nodes = self._metadata_recall(
+            question, top_k=recall_budget, scope=scope)
+        recall_timings["metadata_ms"] = round((time.perf_counter() - t_channel) * 1000, 1)
+        if metadata_nodes:
+            ranked_lists.append(metadata_nodes)
 
         t_channel = time.perf_counter()
         vec_nodes = self._vector_channel(
@@ -1652,6 +1748,7 @@ class KeyframeQueryEngine:
                     "qdrant": len(vec_nodes),
                     "keyword": len(kw_nodes),
                     "structured": len(struct_nodes),
+                    "metadata": len(metadata_nodes),
                     "scan": len(scan_nodes),
                     "temporal": len(t_nodes),
                     "timings": recall_timings,

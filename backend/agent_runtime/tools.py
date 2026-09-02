@@ -122,6 +122,12 @@ def _resolve_time_expression(value: str) -> str | None:
         return f"{y - 2}年"
     if re.fullmatch(r"20\d{2}", v):
         return f"{v}年"
+    # Absolute day expressions are already deterministic; preserve the day
+    # instead of downgrading to a whole month/year (or dropping the filter).
+    if re.fullmatch(r"20\d{2}\s*年\s*[0-9一二三四五六七八九十]{1,3}\s*月\s*[0-9一二三四五六七八九十]{1,3}\s*[日号]?", v):
+        return re.sub(r"\s+", "", v)
+    if re.fullmatch(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", v):
+        return v.replace("/", "-").replace(".", "-")
     if re.fullmatch(r"20\d{2}年(?:\d{1,2}月(?:\d{1,2}[日号]?)?)?", v):
         return v
     # Unknown relative phrases must not be passed to the strict time parser as
@@ -1169,7 +1175,11 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
     }
 
 
-_TIME_TOKEN_RE = re.compile(r"20\d{2}\s*年(?:\s*[01]?\d|\s*十[一二]?)?\s*月?")
+_TIME_TOKEN_RE = re.compile(
+    r"20\d{2}\s*年\s*(?:[0-9一二三四五六七八九十]{1,3}\s*月"
+    r"(?:\s*[0-9一二三四五六七八九十]{1,3}\s*[日号])?|"
+    r"[0-9一二三四五六七八九十]{1,3}\s*[日号])?"
+    r"|20\d{2}\s*[-/.]\s*\d{1,2}(?:\s*[-/.]\s*\d{1,2})?")
 _RELATIVE_TIMES = ("这两年", "近两年", "最近两年", "最近一年", "今年", "去年", "前年",
                    "上上个月", "上个月", "去年春天", "去年夏天", "去年秋天", "去年冬天")
 
@@ -1981,23 +1991,123 @@ def _in_time_bounds(captured_at, bounds) -> bool:
         return False
 
 
-def _place_matches(item, place_q: str, store) -> bool:
-    """候选是否满足地点硬指标：reverse_geocode 匹配查询地点。"""
-    if not store or not place_q:
-        return False
+def _asset_location_evidence(asset_id: str, store) -> tuple[str, dict]:
+    """Return all location text available for an asset plus normalized geo.
+
+    Imports commonly retain GPS while reverse-geocoding is unavailable.  The
+    old retrieval path treated that as no location at all, even when the
+    observation/event text or a local metadata sidecar named the place.  Keep
+    this helper retrieval-only and source-bound: it never invents a location.
+    """
+    if not store or not asset_id:
+        return "", {}
     try:
-        asset = store.get_asset(item.get("asset_id")) or {}
-        metadata = asset.get("metadata_json") or {}
-        if isinstance(metadata, str):
-            import json
-            metadata = json.loads(metadata)
-        geo = (metadata or {}).get("reverse_geocode")
-        if not geo:
-            return False
-        from ..geocoding import place_text_matches
-        return place_text_matches(place_q, geo)
+        asset = store.get_asset(asset_id) or {}
     except Exception:
-        return False
+        asset = {}
+    metadata = asset.get("metadata_json") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    geo = metadata.get("reverse_geocode") or {}
+    if isinstance(geo, str):
+        try:
+            geo = json.loads(geo)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            geo = {}
+    geo = geo if isinstance(geo, dict) else {}
+    # Fill missing reverse-geocode data from the optional offline sidecar/GPS
+    # resolver.  This is cached by the geocoder and is a no-op in deployments
+    # without such a sidecar or geocoder database.
+    if not geo:
+        location = str(asset.get("captured_location") or "")
+        match = re.search(r"(-?\d+(?:\.\d+)?)\s*[,; ]\s*(-?\d+(?:\.\d+)?)", location)
+        if match:
+            try:
+                from ..geocoding import default_reverse_geocoder
+                geo = default_reverse_geocoder().lookup(
+                    {"latitude": match.group(1), "longitude": match.group(2)},
+                    filename=asset.get("file_name"),
+                ) or {}
+            except Exception:
+                geo = {}
+    chunks = []
+    for key in ("label", "name", "city", "province", "district", "admin1", "admin2", "country"):
+        if geo.get(key):
+            chunks.append(str(geo[key]))
+    for key in ("readable_location", "vlm_location_text", "location", "place", "description"):
+        value = metadata.get(key)
+        if value:
+            chunks.append(str(value))
+    if isinstance(metadata.get("readable_location_details"), dict):
+        chunks.extend(str(value) for value in metadata["readable_location_details"].values() if value)
+    raw_location = str(asset.get("captured_location") or "").strip()
+    if raw_location and not re.fullmatch(r"-?\d+(?:\.\d+)?\s*[,; ]\s*-?\d+(?:\.\d+)?", raw_location):
+        chunks.append(raw_location)
+    try:
+        observations = store.list_observations(asset_id=asset_id, limit=1000) or []
+    except Exception:
+        observations = []
+    for observation in observations:
+        for key in ("place", "caption", "activity", "ocr_text"):
+            value = observation.get(key)
+            if isinstance(value, list):
+                chunks.extend(str(item) for item in value if item)
+            elif value:
+                chunks.append(str(value))
+    # Event title/place/summary often carries a more useful location than the
+    # short per-frame observation, especially for video-derived memories.
+    event_ids = set()
+    event_id = metadata.get("event_id")
+    if event_id:
+        event_ids.add(str(event_id))
+    try:
+        rows = store.connection.execute(
+            "SELECT event_id FROM event_observations WHERE observation_id IN "
+            "(SELECT id FROM observations WHERE asset_id = ?)", (asset_id,)).fetchall()
+        event_ids.update(str(row[0]) for row in rows if row[0])
+        for eid in event_ids:
+            row = store.connection.execute(
+                "SELECT title, place, activity, summary FROM events WHERE id = ?", (eid,)
+            ).fetchone()
+            if row:
+                chunks.extend(str(value) for value in row if value)
+    except Exception:
+        pass
+    return " ".join(chunks).lower(), geo
+
+
+def _place_match_score(item, place_q: str, store) -> float:
+    """Score a candidate against a place using all source-bound location text."""
+    place_q = str(place_q or "").strip().lower()
+    if not place_q:
+        return 0.0
+    text, geo = _asset_location_evidence(str(item.get("asset_id") or ""), store)
+    if not text and not geo:
+        return 0.0
+    try:
+        from ..geocoding import place_text_matches
+        if geo and place_text_matches(place_q, geo):
+            return 1.0
+    except Exception:
+        pass
+    if place_q in text:
+        return 0.92
+    # Keep Chinese/Latin multi-word place components useful without allowing a
+    # one-character overlap to become a location match.
+    terms = [term for term in re.split(r"[\s,，、。/\\|]+", place_q) if len(term) >= 2]
+    if len(place_q) >= 2 and not terms:
+        terms = [place_q]
+    hits = sum(1 for term in terms if term in text)
+    return min(0.85, 0.30 + 0.18 * hits) if hits else 0.0
+
+
+def _place_matches(item, place_q: str, store) -> bool:
+    """候选是否满足地点条件（GPS 反编码、sidecar、观察/事件文本）。"""
+    return _place_match_score(item, place_q, store) > 0.0
 
 
 # 拆槽多路召回：每路语义召回最多看前 30 名（排名>30 的 RRF 贡献≈0）；
@@ -2037,6 +2147,14 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     media = str(raw_filters.get("media") or "").strip().lower()
     if media in {"image", "video"}:
         filters["media"] = media
+    # Keep explicit semantic slots emitted by the planner.  Only ``media`` was
+    # copied here previously; time/place/person therefore vanished whenever
+    # the optional semantic-slot model was unavailable (the common local QA
+    # path), making every route an unbounded semantic search.
+    for key in ("time", "place", "person"):
+        value = raw_filters.get(key)
+        if value not in (None, "", [], {}):
+            filters[key] = value
     # Event summaries are intentionally not an early-return retrieval path.
     # They may be used later as an additional ranking signal, but must never
     # replace the multi-channel candidate universe.
@@ -2128,7 +2246,12 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     retrieval_timing: dict[str, object] = {}
     for _sq in semantic_routes:
         try:
-            _pk, _ = _relaxed_retrieve(_sq, {}, scope_id, viewer_id, mode)
+            # Keep the deterministic time/place/person/media slots on every
+            # semantic route.  Passing ``{}`` here used to silently discard
+            # the parsed constraints, leaving metadata/entity retrievers with
+            # an unbounded query and making the later manual filter the only
+            # (and lossy) chance to recover the target frame.
+            _pk, _ = _relaxed_retrieve(_sq, filters, scope_id, viewer_id, mode)
             for _channel, _trace in (getattr(_pk, "channel_trace", {}) or {}).items():
                 retrieval_channels[_channel] = _trace
             if getattr(_pk, "retrieval_timing", None):
@@ -2184,6 +2307,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "entity": 2.0,
         })
     scores: dict[str, float] = {}
+    place_scores: dict[str, float] = {}
     for _aid in (set(per_asset_ranks) | event_member_ids):
         _ranks = per_asset_ranks.get(_aid) or []
         _channels = per_asset_channels.get(_aid) or {}
@@ -2194,6 +2318,14 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             _s = sum(1.0 / (_slot_rrf_k + r) for r in _ranks)
         if _aid in event_member_ids:
             _s += _slot_ev_w
+        if place_q := str(filters.get("place") or "").strip():
+            _place_score = _place_match_score({"asset_id": _aid}, place_q, store)
+            place_scores[_aid] = _place_score
+            # Location evidence is an identity anchor.  Give exact metadata or
+            # observation/event text a visible lift without overriding a strong
+            # visual match for queries that contain no place condition.
+            if _place_score:
+                _s += 0.35 + 0.85 * _place_score
         scores[_aid] = _s
 
     # 确定性筛子：时间/地点由模型拆槽判断（bounds/place），不符合直接筛出；
@@ -2220,7 +2352,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         for _aid in scores:
             if time_bounds and not _in_time_bounds(_asset_captured(_aid), time_bounds):
                 continue
-            if place_q and not _place_matches({"asset_id": _aid}, place_q, store):
+            if place_q and place_scores.get(_aid, 0.0) <= 0:
                 continue
             kept.append(_aid)
         if not kept and time_bounds:
