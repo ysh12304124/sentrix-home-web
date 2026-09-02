@@ -1074,6 +1074,41 @@ def _preview_entry(store, asset_id: str, handle: str, *, level="exact", conditio
         "priority_rank": priority_rank,
         "selection_reason": selection_reason or ("相关性排序靠前" if priority_rank == 1 else "候选补充" if priority_rank else ""),
     }
+
+
+def _retrieval_ids_with_source_media(asset_ids: list[str], store) -> list[str]:
+    """Expose source-media IDs alongside derived keyframe IDs.
+
+    Video memories are indexed through their persisted keyframe assets.  The
+    keyframe is the right object for visual inspection, but the benchmark and
+    API provenance contract identify the media by the uploaded parent video
+    (for example ``video-001``).  Returning only the derived keyframe ID makes
+    a correctly recalled video look like a miss because the evaluator cannot
+    resolve the private derived filename.  Keep the original order and append
+    each parent exactly once; callers can still use the keyframe IDs for
+    previews/evidence while media-level recall sees the source video.
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in asset_ids or []:
+        asset_id = str(value or "").strip()
+        if not asset_id or asset_id in seen:
+            continue
+        seen.add(asset_id)
+        result.append(asset_id)
+        if store is None:
+            continue
+        try:
+            asset = store.get_asset(asset_id) or {}
+        except Exception:
+            asset = {}
+        if asset.get("derived_kind") not in {"video_keyframe", "video_keyframe_webp"}:
+            continue
+        parent_id = str(asset.get("parent_asset_id") or "").strip()
+        if parent_id and parent_id not in seen:
+            seen.add(parent_id)
+            result.append(parent_id)
+    return result
 def _even_indices(total: int, n: int) -> list[int]:
     """在 [0, total) 内均匀取 n 个下标（representative 预览用，避免只展示最新几张），包含首尾。"""
     if total <= n:
@@ -1102,6 +1137,7 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
     total = len(assets)
     visible_total = _visible_candidate_total(total)
     preview_asset_ids = [asset_ids[idx] for idx in indices if idx < len(asset_ids)]
+    retrieved_asset_ids = _retrieval_ids_with_source_media(asset_ids, store)
     return {
         "result_set_id": rs.result_set_id,
         "query": query,
@@ -1122,12 +1158,12 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
         "recommended_resolution": _recommended_resolution(query, preview,
                                                        "full_support" if total else "no_match",
                                                        user_goal=user_goal),
-        "_retrieved_asset_ids": list(asset_ids),
+        "_retrieved_asset_ids": retrieved_asset_ids,
         # Public trace contract: keep the complete candidate set distinct from
         # the bounded preview.  Runtime may still redact private underscore
         # fields, so expose stable asset IDs explicitly for benchmark/user
         # provenance accounting.
-        "retrieved_asset_ids": list(asset_ids),
+        "retrieved_asset_ids": retrieved_asset_ids,
         "_preview_asset_ids": preview_asset_ids,
         "evidence_asset_ids": [],
     }
@@ -1151,6 +1187,24 @@ def _extract_time_from_query(query: str) -> str | None:
         if expr in (query or ""):
             return expr
     return None
+
+
+def _sanitize_model_filters(filters: dict | None, *, query: str = "",
+                            user_goal: str = "") -> dict:
+    """Keep model filters, but only accept time constraints stated by the user."""
+    sanitized = {
+        str(key): value for key, value in dict(filters or {}).items()
+        if value not in (None, "", [], {})
+    }
+    # The tool query is model-authored and may invent today's date.  When the
+    # original goal is available it is the sole authority for a time filter.
+    source = user_goal if str(user_goal or "").strip() else query
+    explicit_time = _extract_time_from_query(str(source or ""))
+    if explicit_time:
+        sanitized["time"] = explicit_time
+    else:
+        sanitized.pop("time", None)
+    return sanitized
 
 
 def _event_resolution(question: str, store, scope_id: str) -> dict | None:
@@ -1585,6 +1639,7 @@ def _search_from_prior_result_set(prior_rs, scope_id: str, *, query: str = "",
         + "、".join(str(x) for x in group_sizes) + "人。"
         if group_photo_rows and group_sizes else ""
     )
+    retrieved_asset_ids = _retrieval_ids_with_source_media(asset_ids, store)
     return {
         "result_set_id": prior_rs.result_set_id,
         "query": display_query,
@@ -1615,8 +1670,8 @@ def _search_from_prior_result_set(prior_rs, scope_id: str, *, query: str = "",
         "validation_batches": validation.get("validation_batches", 0),
         "validation_rows": validation.get("validation_rows") or [],
         "evidence_status": "validated" if reference_evidence else ("candidate_only" if asset_ids else "none"),
-        "_retrieved_asset_ids": list(asset_ids),
-        "retrieved_asset_ids": list(asset_ids),
+        "_retrieved_asset_ids": retrieved_asset_ids,
+        "retrieved_asset_ids": retrieved_asset_ids,
         "_preview_asset_ids": preview_asset_ids,
         "evidence_asset_ids": reference_evidence,
         "source_asset_ids": reference_evidence,
@@ -2058,13 +2113,31 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     if query_for_retrieval.strip():
         semantic_routes.append(query_for_retrieval)
     per_asset_ranks: dict[str, list[int]] = {}
+    # Preserve the channel identity from the shared EvidenceRetrievalKernel.
+    # The previous slot wrapper flattened every channel into one unweighted
+    # rank list, so a weak visual hit could outweigh a lexical/metadata hit and
+    # the graph channel was effectively invisible in the final ordering.
+    per_asset_channels: dict[str, dict[str, int]] = {}
+    packet_items: dict[str, dict] = {}
+    retrieval_channels: dict[str, dict] = {}
+    retrieval_timing: dict[str, object] = {}
     for _sq in semantic_routes:
         try:
             _pk, _ = _relaxed_retrieve(_sq, {}, scope_id, viewer_id, mode)
+            for _channel, _trace in (getattr(_pk, "channel_trace", {}) or {}).items():
+                retrieval_channels[_channel] = _trace
+            if getattr(_pk, "retrieval_timing", None):
+                retrieval_timing = _pk.retrieval_timing
             for _rank, _item in enumerate((_pk.assets or [])[:_SLOT_ROUTE_HEAD], 1):
                 _aid = _item.get("asset_id")
                 if _aid:
                     per_asset_ranks.setdefault(_aid, []).append(_rank)
+                    packet_items.setdefault(_aid, _item)
+            for _channel, _ids in getattr(_pk, "channel_hits", {}).items():
+                for _rank, _aid in enumerate(_ids[:_SLOT_ROUTE_HEAD], 1):
+                    if _aid:
+                        channels = per_asset_channels.setdefault(_aid, {})
+                        channels[_channel] = min(_rank, channels.get(_channel, _rank))
         except Exception:
             continue
 
@@ -2080,15 +2153,24 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         except Exception:
             event_member_ids = set()
 
-    # 综合分：RRF 排名累加 —— score = Σ 1/(k+rank) + 事件重合权重。
-    # 图在各语义召回的排名越靠前、被越多路召回，分越高。k/gap 对召回鲁棒
-    # （扫描：k=10/20/30、gap=0.5-0.8 持平），候选上限是主导参数。
-    _slot_rrf_k = float(os.getenv("SENTRIX_SLOT_RRF_K", "10"))
+    # 综合分：沿用共享检索器的 weighted-RRF，而不是 slot 层重新做平权
+    # RRF。这样 lexical/metadata/entity 的确定性命中不会被视觉 ANN 稀释，
+    # graph 的路径命中也能在最终候选排序中保留。
+    _slot_rrf_k = float(os.getenv("SENTRIX_SLOT_RRF_K", "60"))
     _slot_ev_w = float(os.getenv("SENTRIX_SLOT_EV_WEIGHT", "0.1"))
+    _channel_weights = {
+        "visual_ann": 2.5, "lexical": 1.0, "text_ann": 0.5,
+        "metadata": 1.0, "entity": 1.0, "adjacency": 0.5, "graph": 1.0,
+    }
     scores: dict[str, float] = {}
     for _aid in (set(per_asset_ranks) | event_member_ids):
         _ranks = per_asset_ranks.get(_aid) or []
-        _s = sum(1.0 / (_slot_rrf_k + r) for r in _ranks)
+        _channels = per_asset_channels.get(_aid) or {}
+        if _channels:
+            _s = sum(_channel_weights.get(name, 1.0) / (_slot_rrf_k + rank)
+                     for name, rank in _channels.items())
+        else:
+            _s = sum(1.0 / (_slot_rrf_k + r) for r in _ranks)
         if _aid in event_member_ids:
             _s += _slot_ev_w
         scores[_aid] = _s
@@ -2160,14 +2242,20 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "level": "strong" if _aid in event_member_ids else "approximate",
             "score": scores.get(_aid, 0),
             "fusion_score": scores.get(_aid, 0),
-            "retrieval_score": 0.0,
+            "retrieval_score": float((packet_items.get(_aid) or {}).get("retrieval_score") or 0.0),
             "observation_fields": {"place": _o.get("place"), "activity": _o.get("activity"),
                                    "subject_clothing": _o.get("subject_clothing") or []},
             "attributions": [{"retriever": "slot_route", "rank": 0,
                               "score": scores.get(_aid, 0), "score_kind": "structured"}],
         })
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
-    packet = _SlotRetrievalPacket(assets, gaps=[], retrieval_timing={}, channel_trace={})
+    # Keep frame IDs for the result set/preview, but also expose the uploaded
+    # source video IDs for media-level provenance and benchmark accounting.
+    retrieved_asset_ids = _retrieval_ids_with_source_media(asset_ids, store)
+    packet = _SlotRetrievalPacket(
+        assets, gaps=[], retrieval_timing=retrieval_timing,
+        channel_trace=retrieval_channels,
+    )
     _relax_level = 0
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
     rs = _RUNTIME["result_sets"].new(
@@ -2225,7 +2313,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "retrieval_timing": packet.retrieval_timing,
         "retrieval_channels": packet.channel_trace,
         "relaxation_level": _relax_level,
-        "raw_candidate_count": len(asset_ids),
+        "raw_candidate_count": len(retrieved_asset_ids),
         "validation_candidate_count": 0,
         "validation_batches": 0,
         "validation_status": "skipped",
@@ -2240,8 +2328,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         # （实测候选含 GT 仍拒答的识别类题，多因 inspect 了错误的图）。
         "recommended_handle": _recommended_handle(
             query_for_retrieval, preview),
-        "_retrieved_asset_ids": list(asset_ids),
-        "retrieved_asset_ids": list(asset_ids),
+        "_retrieved_asset_ids": retrieved_asset_ids,
+        "retrieved_asset_ids": retrieved_asset_ids,
         "_preview_asset_ids": preview_asset_ids,
         "evidence_asset_ids": list(asset_ids),
         "selected_asset_ids": list(preview_asset_ids),
@@ -3221,7 +3309,8 @@ def register_tools():
                      "返回关键帧、时间点、事件、人物ID和图路径；图未构建时会返回 limited。"),
         input_schema={"query": "", "top_k": 10},
         executor=_search_graph_memory, read_write="read", cost_class="medium", readiness="ready",
-        produces_evidence=("memory_asset", "memory_reference", "temporal_metadata", "confirmed_identity"),
+        produces_evidence=("memory_asset", "temporal_metadata", "confirmed_identity"),
+        required_inputs=("query",),
     ))
     register(ToolSpec(
         name="get_original_photos",
