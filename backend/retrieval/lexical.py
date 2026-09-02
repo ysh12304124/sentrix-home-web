@@ -32,25 +32,40 @@ class LexicalRetriever:
             return None
         return filters.scope_ids[0]
 
-    def _ensure_populated(self):
-        """Self-heal the derived projection when the maintenance script has not
-        run yet (e.g. a fresh local fixture or an old DB).  Built once per
-        process; the maintenance script remains the canonical bulk builder."""
+    def _ensure_populated(self, scope_id=None):
+        """Self-heal an empty *or partial* lexical projection.
+
+        Checking only ``COUNT(*) == 0`` left a partially written FTS table
+        (five rows after an interrupted/old scoped rebuild) permanently
+        enabled.  That made lexical recall silently disappear for almost the
+        whole album.  Compare distinct indexed observations with the current
+        scope and rebuild that scope when the projection is materially behind.
+        """
         if self._populated:
             return
         try:
-            count = self.store.connection.execute(
-                "SELECT COUNT(*) FROM observation_search_fts"
-            ).fetchone()[0]
-            if count == 0:
-                self.index.rebuild_all()
+            conn = self.store.connection
+            where = "WHERE scope_id = ?" if scope_id else ""
+            params = (scope_id,) if scope_id else ()
+            expected = int(conn.execute(
+                f"SELECT COUNT(DISTINCT id) FROM observations {where}", params
+            ).fetchone()[0] or 0)
+            indexed = int(conn.execute(
+                "SELECT COUNT(DISTINCT observation_id) FROM observation_search_fts "
+                + ("WHERE scope_id = ?" if scope_id else ""), params
+            ).fetchone()[0] or 0)
+            # Some observations legitimately have no textual fields.  A 50%
+            # floor still catches truncated projections while avoiding a
+            # rebuild for tiny/mostly-empty fixtures.
+            if expected and indexed < max(1, expected // 2):
+                self.index.rebuild_all(scope_id=scope_id)
         except Exception:
             pass
         self._populated = True
 
     def retrieve(self, query: RetrievalQuery, filters: HardFilterContext, limit: int) -> list[CandidateHit]:
-        self._ensure_populated()
         scope = self._scope(filters)
+        self._ensure_populated(scope)
         queries = [query.whole_query] if query.whole_query else []
         queries.extend(facet.surface_text for facet in query.facets if facet.surface_text)
         queries = list(dict.fromkeys(item for item in queries if item))
