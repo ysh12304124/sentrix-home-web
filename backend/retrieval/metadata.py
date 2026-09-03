@@ -30,7 +30,8 @@ class MetadataRetriever:
         # structured condition (time window / media type) to match.  Without
         # one it returns nothing, so a pure-semantic query does not get polluted
         # by "every asset in scope" becoming an anchor.
-        if not filters.time_bounds and not filters.media_types and not filters.place:
+        if (not filters.time_bounds and not filters.annual_time_window
+                and not filters.media_types and not filters.place):
             return []
         from ..geocoding import place_text_matches
         import json as _json
@@ -50,6 +51,10 @@ class MetadataRetriever:
             if filters.time_bounds:
                 captured = _parse_datetime(asset.get("captured_at"))
                 if captured is not None and not (filters.time_bounds[0] <= captured < filters.time_bounds[1]):
+                    continue
+            if filters.annual_time_window:
+                captured = _parse_datetime(asset.get("captured_at"))
+                if captured is not None and not _in_annual_window(captured, filters.annual_time_window):
                     continue
             # place 预筛（镜像 kernel 判定：geocode 匹配或缺失保留，不匹配剔除）
             if filters.place:
@@ -83,6 +88,16 @@ class MetadataRetriever:
             if len(hits) >= internal_limit:
                 break
         return hits
+
+
+def _in_annual_window(captured, window):
+    start_month, start_day, end_month, end_day = window
+    current = (captured.month, captured.day)
+    start = (start_month, start_day)
+    end = (end_month, end_day)
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
 
 
 def _parse_datetime(value):

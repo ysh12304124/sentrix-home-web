@@ -90,6 +90,14 @@ def _contains(haystack, needle):
     return needle in haystack
 
 
+def _in_annual_window(captured, window):
+    start_month, start_day, end_month, end_day = window
+    current = (captured.month, captured.day)
+    start = (start_month, start_day)
+    end = (end_month, end_day)
+    return start <= current < end if start < end else current >= start or current < end
+
+
 class EvidenceRetrievalKernel:
     def __init__(self, store, *, retrievers=None, embedding_router=None, config=None, trace=None):
         self.store = store
@@ -113,8 +121,14 @@ class EvidenceRetrievalKernel:
         all_authorized = spec.scope_mode == "all_authorized"
         scope_id = spec.scope_id or (spec.scope_ids[0] if spec.scope_ids else "all_authorized")
         query_scope = None if all_authorized else scope_id
-        assets = {item["id"]: item for item in self.store.list_assets(scope_id=query_scope)}
-        observations = [item for item in self.store.list_observations(scope_id=query_scope) if item.get("asset_id") in assets]
+        # ``MemoryStore.list_assets`` defaults to 200 rows.  Using that default
+        # here silently removed older media from the fallback/single-retriever
+        # path, which is especially damaging for benchmark albums where the
+        # answer image is near the end of the import order.
+        assets = {item["id"]: item for item in self.store.list_assets(
+            scope_id=query_scope, limit=100_000)}
+        observations = [item for item in self.store.list_observations(
+            scope_id=query_scope, limit=100_000) if item.get("asset_id") in assets]
         by_asset = {}
         for observation in observations:
             by_asset.setdefault(observation["asset_id"], []).append(observation)
@@ -176,7 +190,10 @@ class EvidenceRetrievalKernel:
         # explicit media type remain the only hard boundaries.
         scope_for_count = None if spec.scope_mode == "all_authorized" else (spec.scope_id or (spec.scope_ids[0] if spec.scope_ids else None))
         try:
-            authorized_count = len(self.store.list_assets(scope_id=scope_for_count))
+            # Ask for the complete authorized scope; the store's default
+            # limit=200 is a presentation limit, not a retrieval boundary.
+            authorized_count = len(self.store.list_assets(
+                scope_id=scope_for_count, limit=100_000))
         except Exception:
             authorized_count = 0
         recall_limit = max(requested_limit, authorized_count, 1)
@@ -189,6 +206,14 @@ class EvidenceRetrievalKernel:
         # asset recall from 0.971 to 0.893, while rank top-50 kept 0.971).
         import os
         candidate_limit = max(1, int(os.getenv("SENTRIX_SEARCH_CANDIDATE_TOP_K", "30")))
+        # Structured anchors (calendar/place/media) are cheap, deterministic
+        # recall channels.  Let their complete scope reach the condition pass;
+        # otherwise a valid metadata hit at rank 200+ is discarded before it
+        # can be fused with visual/text evidence.  Pure semantic searches keep
+        # the bounded head for latency.
+        if (filters.time_bounds or filters.annual_time_window
+                or filters.place or filters.media_types):
+            candidate_limit = max(candidate_limit, min(authorized_count, 1000))
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
         min_retrieval_score = 0.0
@@ -479,7 +504,13 @@ class EvidenceRetrievalKernel:
         if constraint.dimension == "time":
             bounds = parse_time_expression(value)
             captured = _parse_datetime(asset.get("captured_at") or observation.get("captured_at"))
-            return ("matched", "asset_metadata", asset.get("id"), 1.0) if bounds and captured and bounds[0] <= captured < bounds[1] else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
+            if bounds:
+                matched = bool(captured and bounds[0] <= captured < bounds[1])
+            else:
+                from .query_contracts import parse_annual_time_expression
+                window = parse_annual_time_expression(value)
+                matched = bool(captured and window and _in_annual_window(captured, window))
+            return ("matched", "asset_metadata", asset.get("id"), 1.0) if matched else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
         if constraint.dimension == "media":
             return ("matched", "asset_metadata", asset.get("id"), 1.0) if asset.get("media_type") == value else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
         if constraint.dimension == "person":

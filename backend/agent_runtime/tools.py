@@ -134,6 +134,9 @@ def _resolve_time_expression(value: str) -> str | None:
     # if they were absolute expressions.  Dropping the unsupported constraint
     # preserves semantic recall; the caller can surface the raw filter in
     # diagnostics instead of silently forcing a contradicted time range.
+    from ..query_contracts import parse_annual_time_expression
+    if parse_annual_time_expression(v):
+        return v
     return None
 
 
@@ -1214,6 +1217,7 @@ _TIME_TOKEN_RE = re.compile(
     r"|20\d{2}\s*[-/.]\s*\d{1,2}(?:\s*[-/.]\s*\d{1,2})?")
 _RELATIVE_TIMES = ("这两年", "近两年", "最近两年", "最近一年", "今年", "去年", "前年",
                    "上上个月", "上个月", "去年春天", "去年夏天", "去年秋天", "去年冬天")
+_ANNUAL_TIMES = ("国庆黄金周", "国庆节", "十一假期")
 
 
 def _extract_time_from_query(query: str) -> str | None:
@@ -1226,6 +1230,9 @@ def _extract_time_from_query(query: str) -> str | None:
     if m:
         return m.group(0)
     for expr in _RELATIVE_TIMES:
+        if expr in (query or ""):
+            return expr
+    for expr in _ANNUAL_TIMES:
         if expr in (query or ""):
             return expr
     return None
@@ -2023,6 +2030,19 @@ def _in_time_bounds(captured_at, bounds) -> bool:
         return False
 
 
+def _in_annual_time_window(captured_at, window) -> bool:
+    if not captured_at:
+        return False
+    try:
+        from datetime import datetime
+        cap = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00")).replace(tzinfo=None)
+        start_month, start_day, end_month, end_day = window
+        current, start, end = (cap.month, cap.day), (start_month, start_day), (end_month, end_day)
+        return start <= current < end if start < end else current >= start or current < end
+    except Exception:
+        return False
+
+
 def _asset_location_evidence(asset_id: str, store) -> tuple[str, dict]:
     """Return all location text available for an asset plus normalized geo.
 
@@ -2241,7 +2261,19 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             # paraphrase or hallucinated normalization (that used to turn a
             # 馆陶县 query into an unrelated district and remove the target
             # video keyframe during hard evaluation).
-            if len(bounds) == 2 and not filters.get("time"):
+            # Never accept a model-invented calendar year for an underspecified
+            # holiday/month.  The source question must itself contain a
+            # supported temporal expression; otherwise the parser's guessed
+            # bounds can silently turn “国庆节” into one arbitrary year and
+            # eliminate every valid album item.  Explicit/relative time is
+            # still handled deterministically by _sanitize_model_filters and
+            # _resolve_time_expression.
+            source_time = _extract_time_from_query(_slot_input)
+            from ..query_contracts import parse_annual_time_expression
+            source_time_resolved = _resolve_time_expression(source_time or "") if source_time else None
+            if (len(bounds) == 2 and not filters.get("time") and source_time
+                    and source_time_resolved
+                    and not parse_annual_time_expression(source_time_resolved)):
                 filters["time"] = _bounds_to_time_expr(bounds[0], bounds[1])
             if _slots["place"].get("name") and not filters.get("place"):
                 filters["place"] = _slots["place"].get("hint") or _slots["place"]["name"]
@@ -2294,13 +2326,22 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                 retrieval_channels[_channel] = _trace
             if getattr(_pk, "retrieval_timing", None):
                 retrieval_timing = _pk.retrieval_timing
-            for _rank, _item in enumerate((_pk.assets or [])[:_SLOT_ROUTE_HEAD], 1):
+            _route_head = _SLOT_ROUTE_HEAD
+            if (filters.get("time") or filters.get("place") or filters.get("media")
+                    or filters.get("person")):
+                # Structured routes carry exact metadata/entity anchors; keep
+                # their complete bounded packet instead of dropping older
+                # assets at an arbitrary 30-row presentation head.
+                _route_head = min(len(_pk.assets or []), 1000)
+            for _rank, _item in enumerate((_pk.assets or [])[:_route_head], 1):
                 _aid = _item.get("asset_id")
                 if _aid:
                     per_asset_ranks.setdefault(_aid, []).append(_rank)
                     packet_items.setdefault(_aid, _item)
             for _channel, _ids in getattr(_pk, "channel_hits", {}).items():
-                for _rank, _aid in enumerate(_ids[:_SLOT_ROUTE_HEAD], 1):
+                _channel_head = _route_head if (filters.get("time") or filters.get("place")
+                                                or filters.get("media") or filters.get("person")) else _SLOT_ROUTE_HEAD
+                for _rank, _aid in enumerate(_ids[:_channel_head], 1):
                     if _aid:
                         channels = per_asset_channels.setdefault(_aid, {})
                         channels[_channel] = min(_rank, channels.get(_channel, _rank))
@@ -2384,12 +2425,16 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # 确定性筛子：时间/地点由模型拆槽判断（bounds/place），不符合直接筛出；
     # 模型判断无时间信息（bounds 空）则不筛。
     time_bounds = None
+    annual_time_window = None
     if filters.get("time"):
         try:
-            from ..query_contracts import parse_time_expression
+            from ..query_contracts import parse_time_expression, parse_annual_time_expression
             time_bounds = parse_time_expression(str(filters["time"]))
+            if not time_bounds:
+                annual_time_window = parse_annual_time_expression(str(filters["time"]))
         except Exception:
             time_bounds = None
+            annual_time_window = None
     place_q = filters.get("place") or ""
 
     def _asset_captured(aid):
@@ -2401,9 +2446,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             return None
 
     kept = []
-    if time_bounds or place_q:
+    if time_bounds or annual_time_window or place_q:
         for _aid in scores:
             if time_bounds and not _in_time_bounds(_asset_captured(_aid), time_bounds):
+                continue
+            if annual_time_window and not _in_annual_time_window(_asset_captured(_aid), annual_time_window):
                 continue
             # A frame can be the only reliable source of the event caption
             # while its uploaded parent has GPS but no reverse-geocode label.
@@ -2418,6 +2465,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             kept.append(_aid)
         if not kept and time_bounds:
             kept = [a for a in scores if _in_time_bounds(_asset_captured(a), time_bounds)]
+        elif not kept and annual_time_window:
+            kept = [a for a in scores if _in_annual_time_window(_asset_captured(a), annual_time_window)]
         elif not kept:
             kept = list(scores)  # 地点全删（非标准地名）→ 保留靠语义排序
     else:

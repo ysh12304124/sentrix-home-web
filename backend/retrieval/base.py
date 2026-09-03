@@ -25,6 +25,7 @@ class HardFilterContext:
     viewer_id: str = "owner"
     media_types: tuple[str, ...] | None = None      # hard media filter (e.g. image only)
     time_bounds: tuple[datetime, datetime] | None = None
+    annual_time_window: tuple[int, int, int, int] | None = None
     negated_media: frozenset[str] = frozenset()      # must_not media (video etc.)
     negated_dimensions: frozenset[str] = frozenset()
     all_authorized: bool = False
@@ -36,6 +37,7 @@ class HardFilterContext:
         from ..query_contracts import HARD
         media_types, negated_media = [], set()
         time_bounds = None
+        annual_time_window = None
         negated_dimensions = set()
         place = None
         for constraint in spec.constraints:
@@ -53,6 +55,8 @@ class HardFilterContext:
                 bounds = _parse_time_bounds(constraint.value)
                 if bounds:
                     time_bounds = bounds
+                else:
+                    annual_time_window = _parse_annual_time_window(constraint.value)
             elif constraint.negated:
                 negated_dimensions.add(constraint.dimension)
         return cls(
@@ -60,6 +64,7 @@ class HardFilterContext:
             viewer_id=spec.viewer_id,
             media_types=tuple(media_types) or None,
             time_bounds=time_bounds,
+            annual_time_window=annual_time_window,
             negated_media=frozenset(negated_media),
             negated_dimensions=frozenset(negated_dimensions),
             all_authorized=spec.scope_mode == "all_authorized",
@@ -71,6 +76,14 @@ def _parse_time_bounds(value: str):
     from ..query_contracts import parse_time_expression
     try:
         return parse_time_expression(value)
+    except Exception:
+        return None
+
+
+def _parse_annual_time_window(value: str):
+    from ..query_contracts import parse_annual_time_expression
+    try:
+        return parse_annual_time_expression(value)
     except Exception:
         return None
 
