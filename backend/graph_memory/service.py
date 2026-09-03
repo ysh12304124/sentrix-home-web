@@ -166,6 +166,139 @@ class GraphMemoryService:
                 pass
         return result
 
+    def quality(self, scope_id: str | None = None) -> dict:
+        """Compute read-only, full-graph structural quality metrics.
+
+        This endpoint deliberately does not mutate the graph or participate in
+        QA execution.  It audits every stored node and edge in the current
+        graph snapshot; ``scope_id`` optionally limits the audit to nodes from
+        one memory space and their incident edges.
+        """
+        path = Path(self.graph_path)
+        if not path.is_file():
+            return {"available": False, "reason": "graph memory has not been built", "scope_id": scope_id}
+        conn = sqlite3.connect(self.graph_path)
+        try:
+            node_rows = conn.execute("SELECT id, data FROM graph_nodes").fetchall()
+            edge_rows = conn.execute("SELECT id, source_id, target_id, data FROM graph_edges").fetchall()
+        finally:
+            conn.close()
+        nodes = {}
+        for node_id, raw in node_rows:
+            try:
+                nodes[str(node_id)] = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                nodes[str(node_id)] = {}
+        if scope_id:
+            scoped = {
+                node_id for node_id, data in nodes.items()
+                if (data.get("attributes") or {}).get("scope_id") == scope_id
+            }
+            selected_edges = [row for row in edge_rows if row[1] in scoped or row[2] in scoped]
+            selected_ids = scoped | {row[1] for row in selected_edges} | {row[2] for row in selected_edges}
+            nodes = {node_id: data for node_id, data in nodes.items() if node_id in selected_ids}
+        else:
+            selected_edges = edge_rows
+
+        def timestamp(data):
+            attrs = data.get("attributes") or {}
+            value = attrs.get("captured_at") or data.get("timestamp")
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+            except (TypeError, ValueError):
+                return None
+
+        def confidence(properties):
+            raw = properties.get("confidence_score", properties.get("confidence"))
+            try:
+                return float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        deterministic_subtypes = {
+            "TIME_PRECEDES", "SCENE_NEXT", "CLIP_CONTAINS", "VIDEO_CONTAINS",
+            "OCCURRED_AT", "CAPTURED_ON", "MENTIONS_PERSON", "MENTIONS_OBJECT",
+            "SAME_ENTITY", "BELONGS_TO_SESSION", "PART_OF_CLIP",
+        }
+        valid_edges = supported_edges = consistent_edges = 0
+        duplicate_keys = set()
+        duplicate_count = 0
+        type_counts = {}
+        invalid_by_type = {}
+        degree = {node_id: 0 for node_id in nodes}
+        for edge_id, source, target, raw in selected_edges:
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                data = {}
+            link_type = str(data.get("link_type") or "UNKNOWN")
+            props = data.get("properties") or {}
+            subtype = str(props.get("sub_type") or "")
+            type_counts[link_type] = type_counts.get(link_type, 0) + 1
+            # A pair may legitimately share more than one object/relation;
+            # include that discriminator so those edges are not misreported as
+            # duplicates merely because their subtype is the same.
+            discriminator = props.get("entity") or props.get("relation") or props.get("object") or ""
+            key = (str(source), str(target), link_type, subtype, str(discriminator))
+            if key in duplicate_keys:
+                duplicate_count += 1
+            duplicate_keys.add(key)
+            endpoints_ok = source in nodes and target in nodes and source != target
+            if endpoints_ok:
+                valid_edges += 1
+                degree[source] = degree.get(source, 0) + 1
+                degree[target] = degree.get(target, 0) + 1
+            confidence_value = confidence(props)
+            evidence_ok = subtype in deterministic_subtypes or (confidence_value is not None and confidence_value >= 0.5)
+            if link_type == "SEMANTIC" and subtype == "VISUAL_SIMILAR":
+                try:
+                    evidence_ok = float(props.get("similarity")) >= 0.75
+                except (TypeError, ValueError):
+                    evidence_ok = False
+            if endpoints_ok and evidence_ok:
+                supported_edges += 1
+            structurally_ok = endpoints_ok
+            if structurally_ok and link_type == "TEMPORAL":
+                left, right = timestamp(nodes[source]), timestamp(nodes[target])
+                if subtype == "TIME_PRECEDES" and props.get("sequence_index") is not None:
+                    # The builder creates this edge from ordered frame
+                    # sequence; EXIF capture times are not reliable for video
+                    # frames and may be reordered by the source device.
+                    structurally_ok = True
+                elif left and right and subtype in {"TIME_PRECEDES", "SCENE_NEXT"}:
+                    structurally_ok = left <= right
+            if structurally_ok and link_type == "CAUSAL":
+                left, right = timestamp(nodes[source]), timestamp(nodes[target])
+                if left and right:
+                    structurally_ok = left <= right
+                structurally_ok = structurally_ok and evidence_ok
+            if structurally_ok:
+                consistent_edges += 1
+            else:
+                invalid_by_type[link_type] = invalid_by_type.get(link_type, 0) + 1
+
+        total_nodes = len(nodes)
+        total_edges = len(selected_edges)
+        connected_nodes = sum(1 for value in degree.values() if value > 0)
+        return {
+            "available": True,
+            "scope_id": scope_id,
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "node_connected_rate": connected_nodes / total_nodes if total_nodes else None,
+            "edge_evidence_support_rate": supported_edges / total_edges if total_edges else None,
+            "edge_consistency_rate": consistent_edges / total_edges if total_edges else None,
+            "duplicate_edge_rate": duplicate_count / total_edges if total_edges else None,
+            "valid_edge_rate": valid_edges / total_edges if total_edges else None,
+            "connected_nodes": connected_nodes,
+            "supported_edges": supported_edges,
+            "consistent_edges": consistent_edges,
+            "duplicate_edges": duplicate_count,
+            "edge_type_counts": type_counts,
+            "invalid_edges_by_type": invalid_by_type,
+            "computed_at": datetime.now().isoformat(),
+        }
+
     def search(self, query: str, top_k: int = 10, scope_id: str | None = None) -> dict:
         if not self.graph_exists:
             return {"ok": False, "error": "graph memory has not been built", "path": self.graph_path}

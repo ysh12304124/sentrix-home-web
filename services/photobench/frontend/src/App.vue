@@ -17,6 +17,8 @@ const vllmTargets = ref({});
 const runs = ref([]);
 const activeRunId = ref(null);
 const activeRun = ref(null);
+const graphQuality = ref(null);
+const graphQualityLoading = ref(false);
 const qaPage = ref({ items: [], page: 1, page_size: 20, total: 0, pages: 1 });
 const qaDetails = reactive({});
 const openQaItems = reactive(new Set());
@@ -24,13 +26,13 @@ const loadingQaItems = reactive(new Set());
 const qaPageSize = ref(20);
 const qaFilters = reactive({ search: "", score: "", task_type: "", tag: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
 const reviewDrafts = reactive({});
-const selectedAlbum = ref("album3-14");
+const selectedAlbum = ref("album3-max-video10");
 const albumCountLabel = (manifest) => {
   const videos = Number(manifest?.video_count || 0);
   const base = `${manifest.face_count}人 / ${manifest.photo_count}图`;
   return videos ? `${base} / ${videos}视频` : base;
 };
-const selectedQa = ref("compact-10q");
+const selectedQa = ref("mixed-image-video-487q");
 const selectedModels = reactive(new Set());
 const sentrixUrl = ref("");
 const judgeUrl = ref("");
@@ -70,8 +72,8 @@ const rejudgeSubmitting = ref(false);
 const reviewSaving = ref(false);
 const loading = ref(true);
 const activeView = ref("runs");
-const qaBrowserAlbum = ref("album3");
-const qaBrowserSet = ref("full-album3-38q");
+const qaBrowserAlbum = ref("album3-max-video10");
+const qaBrowserSet = ref("mixed-image-video-487q");
 const qaBrowserItems = ref([]);
 const qaBrowserSearch = ref("");
 const qaBrowserTag = ref("");
@@ -678,6 +680,35 @@ function tokenDistributionRows() {
 }
 function tokenDistributionCount() {
   return effectiveRunSummary(activeRun.value).llm_context_samples_count ?? 0;
+}
+function graphQualityRows() {
+  const quality = graphQuality.value;
+  if (!quality?.available) return [];
+  return [
+    ["边证据支持率", fmtPct(quality.edge_evidence_support_rate), `${quality.supported_edges ?? 0}/${quality.total_edges ?? 0} 条边有可验证依据`, true],
+    ["边结构一致性率", fmtPct(quality.edge_consistency_rate), `${quality.consistent_edges ?? 0}/${quality.total_edges ?? 0} 条边通过方向、类型和端点校验`, true],
+    ["节点有效连接率", fmtPct(quality.node_connected_rate), `${quality.connected_nodes ?? 0}/${quality.total_nodes ?? 0} 个节点至少连接一条边`, true],
+    ["重复边占比", fmtPct(quality.duplicate_edge_rate), `${quality.duplicate_edges ?? 0}/${quality.total_edges ?? 0} 条重复关系`, false],
+  ];
+}
+async function loadGraphQuality() {
+  const runId = activeRunId.value;
+  const base = String(sentrixUrl.value || "").trim().replace(/\/$/, "");
+  if (!runId || !base) { graphQuality.value = null; return; }
+  const run = activeRun.value;
+  const scopeId = run?.scope_id || run?.existing_scope_id || "";
+  graphQualityLoading.value = true;
+  try {
+    const query = scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : "";
+    const response = await fetch(`${base}/api/graph-memory/quality${query}`, { headers: { "content-type": "application/json" } });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    if (activeRunId.value === runId) graphQuality.value = payload;
+  } catch (error) {
+    if (activeRunId.value === runId) graphQuality.value = { available: false, reason: error.message };
+  } finally {
+    if (activeRunId.value === runId) graphQualityLoading.value = false;
+  }
 }
 function itemCallMetrics(item) {
   return Array.isArray(item?.model_call_metrics)
@@ -1385,6 +1416,7 @@ async function loadActiveRun({ resetPage = false } = {}) {
     Object.assign(reviewDrafts, reviewPayload.reviews || {});
   }
   await loadQaPage(resetPage ? 1 : qaPage.value.page);
+  loadGraphQuality();
 }
 function reviewFor(summary) {
   const qaId = String(summary?.qa_id || "");
@@ -2186,6 +2218,22 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <small>{{ row[2] }}</small>
 </div>
 </div>
+</div>
+<div class="token-distribution-section graph-quality-section">
+<div class="phase-title">
+<b>图结构质量（全量审计）</b>
+<span class="muted small" v-if="graphQuality?.available">{{ graphQuality.total_nodes }} 节点 · {{ graphQuality.total_edges }} 条边</span>
+<span class="muted small" v-else>{{ graphQualityLoading ? '计算中…' : '未生成图结构' }}</span>
+</div>
+<p class="metric-calc-time">逐条检查当前图快照中的全部节点和边；只读审计，不参与 QA 测评执行。</p>
+<div v-if="graphQuality?.available" class="token-distribution-grid">
+<div v-for="row in graphQualityRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<span>{{ row[0] }}</span>
+<strong>{{ row[1] }}</strong>
+<small>{{ row[2] }}</small>
+</div>
+</div>
+<p v-else class="qa-performance-empty">{{ graphQuality?.reason || '该运行暂无可用图结构快照。' }}</p>
 </div>
 </article>
         <article v-if="deliveryBreakdown()" class="phase-card result-phase-card">

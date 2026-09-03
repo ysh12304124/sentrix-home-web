@@ -71,7 +71,7 @@ VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
 RUNTIME_VLLM_API_URL = None
 RUNTIME_VLLM_BASE_URL = None
-RUNTIME_MODEL_SOURCE = "managed"
+RUNTIME_MODEL_SOURCE = os.getenv("SENTRIX_RUNTIME_SOURCE", "managed").strip().lower()
 RUNTIME_MODEL_PROFILE = None
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
@@ -282,7 +282,11 @@ def _batch_work_asset_ids(task_store, batch_id, *, include_stale=False):
     selected = []
     for row in rows:
         asset = task_store.get_asset(row["id"]) or {}
-        if asset.get("status") == "failed" and _pipeline_attempt_count(asset) >= PIPELINE_MAX_ATTEMPTS:
+        # ``video-processing-failed`` is also terminal after the configured
+        # retry budget.  Previously only image ``failed`` assets were filtered,
+        # so one broken video was selected again on every loop iteration and
+        # remained visible as ``processing`` forever.
+        if _pipeline_attempt_count(asset) >= PIPELINE_MAX_ATTEMPTS:
             continue
         selected.append(row["id"])
     return selected
@@ -805,6 +809,8 @@ def _run_vllm_switch(request: ModelSwitchRequest):
 @app.on_event("startup")
 def _sync_vllm_state_on_startup():
     """Sync gamma client with remote vLLM state on startup."""
+    if RUNTIME_MODEL_SOURCE in {"cloud_api", "external"} or getattr(gamma, "backend", "") != "openai":
+        return
     try:
         state = _load_vllm_state()
         if state and state.get("pid"):
@@ -1402,6 +1408,8 @@ def reprocess_video(asset_id: str, background_tasks: BackgroundTasks):
     store.cleanup_video_derivatives(asset_id)
     store.update_asset(asset_id, "video-queued", {
         "video_stage": "video-queued", "error": None, "error_stage": None,
+        "pipeline_attempts": 0, "pipeline_retry_count": 0,
+        "pipeline_failure_terminal": False,
     })
     background_tasks.add_task(process_asset, asset_id)
     return {"accepted": True, "asset_id": asset_id, "status": "video-queued"}
@@ -2724,13 +2732,14 @@ def assistant_turn(request: AssistantTurnRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
     message = request.message.strip()
+    scope_id = request.scope_id.strip() or "home-default"
     conversation_id = request.conversation_id
     recent_turns = ""
     conversation_summary = ""
     if CONVERSATION_STORE_ENABLED:
         # D2：无会话时自动创建；恢复旧会话时按 active 校验
         if not conversation_id:
-            conversation_id = conversation_store.create_conversation(scope_id=request.scope_id)
+            conversation_id = conversation_store.create_conversation(scope_id=scope_id)
         try:
             if conversation_store.get_conversation(conversation_id):
                 history = conversation_store.last_messages(conversation_id, limit=8)
@@ -2748,7 +2757,7 @@ def assistant_turn(request: AssistantTurnRequest):
                            "created_at": time.time()}
     _turn_executor().submit(
         _execute_turn_job, turn_id, message, conversation_id,
-        request.scope_id, request.viewer_id, recent_turns,
+        scope_id, request.viewer_id, recent_turns,
         request.selected_asset_handle, request.selected_result_set_id,
         conversation_summary, request.include_debug)
     return {
@@ -3658,6 +3667,12 @@ def summarize_pending_events(background_tasks: BackgroundTasks, scope_id: str | 
 @app.get("/api/graph-memory/status")
 def graph_memory_status():
     return graph_memory_service.status()
+
+
+@app.get("/api/graph-memory/quality")
+def graph_memory_quality(scope_id: str | None = None):
+    """Read-only full graph quality audit; never called by the QA runner."""
+    return graph_memory_service.quality(scope_id=scope_id)
 
 
 @app.post("/api/graph-memory/build")
