@@ -685,10 +685,10 @@ function graphQualityRows() {
   const quality = graphQuality.value;
   if (!quality?.available) return [];
   return [
-    ["边证据支持率", fmtPct(quality.edge_evidence_support_rate), `${quality.supported_edges ?? 0}/${quality.total_edges ?? 0} 条边有可验证依据`, true],
-    ["边结构一致性率", fmtPct(quality.edge_consistency_rate), `${quality.consistent_edges ?? 0}/${quality.total_edges ?? 0} 条边通过方向、类型和端点校验`, true],
-    ["节点有效连接率", fmtPct(quality.node_connected_rate), `${quality.connected_nodes ?? 0}/${quality.total_nodes ?? 0} 个节点至少连接一条边`, true],
-    ["重复边占比", fmtPct(quality.duplicate_edge_rate), `${quality.duplicate_edges ?? 0}/${quality.total_edges ?? 0} 条重复关系`, false],
+    ["可验证边准确率", fmtPct(quality.reference_edge_precision), `${quality.reference_edge_true_positive_count ?? 0}/${quality.evaluable_predicted_edge_count ?? 0} 条边与参考关系一致`, true],
+    ["可验证边召回率", fmtPct(quality.reference_edge_recall), `${quality.reference_edge_true_positive_count ?? 0}/${quality.reference_edge_count ?? 0} 条参考关系被构建`, true],
+    ["可验证边 F1", fmtPct(quality.reference_edge_f1), "参考关系 Precision 与 Recall 的综合结果", true],
+    ["节点来源可追溯率", fmtPct(quality.node_source_traceability_rate), `${quality.total_nodes ?? 0} 个节点逐条检查来源字段`, true],
   ];
 }
 async function loadGraphQuality() {
@@ -2221,11 +2221,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 <div class="token-distribution-section graph-quality-section">
 <div class="phase-title">
-<b>图结构质量（全量审计）</b>
+<b>图结构真实性（全量参考一致性）</b>
 <span class="muted small" v-if="graphQuality?.available">{{ graphQuality.total_nodes }} 节点 · {{ graphQuality.total_edges }} 条边</span>
 <span class="muted small" v-else>{{ graphQualityLoading ? '计算中…' : '未生成图结构' }}</span>
 </div>
-<p class="metric-calc-time">逐条检查当前图快照中的全部节点和边；只读审计，不参与 QA 测评执行。</p>
+<p class="metric-calc-time">逐条比较全部可验证边与独立参考关系；语义相似、因果等暂无独立真值的边单独排除，不参与真实性分数。</p>
 <div v-if="graphQuality?.available" class="token-distribution-grid">
 <div v-for="row in graphQualityRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
@@ -2233,6 +2233,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <small>{{ row[2] }}</small>
 </div>
 </div>
+<p v-if="graphQuality?.available" class="metric-calc-time">参考关系 {{ graphQuality.reference_edge_count ?? 0 }} 条 · 可验证构建边 {{ graphQuality.evaluable_predicted_edge_count ?? 0 }} 条 · 暂无独立真值 {{ graphQuality.unverifiable_edge_count ?? 0 }} 条</p>
 <p v-else class="qa-performance-empty">{{ graphQuality?.reason || '该运行暂无可用图结构快照。' }}</p>
 </div>
 </article>

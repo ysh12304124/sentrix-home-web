@@ -220,6 +220,69 @@ class GraphMemoryService:
             "OCCURRED_AT", "CAPTURED_ON", "MENTIONS_PERSON", "MENTIONS_OBJECT",
             "SAME_ENTITY", "BELONGS_TO_SESSION", "PART_OF_CLIP",
         }
+        # Build a deterministic reference relation set from independent
+        # source fields carried by the graph projection.  Only these relation
+        # types have an objective reference in the local data; semantic
+        # similarity and causal edges are reported as unverifiable instead of
+        # being counted as if the builder's own confidence were ground truth.
+        reference = set()
+        events_by_clip = {}
+        sessions_by_clip = {}
+        episodes = []
+        person_entities = {}
+        object_entities = {}
+        for node_id, data in nodes.items():
+            attrs = data.get("attributes") or {}
+            node_type = str(data.get("node_type") or "")
+            if node_type == "EVENT" and attrs.get("clip_uid"):
+                events_by_clip.setdefault(str(attrs["clip_uid"]), []).append((node_id, attrs))
+            elif node_type == "SESSION" and attrs.get("clip_uid"):
+                sessions_by_clip[str(attrs["clip_uid"])] = node_id
+            elif node_type == "EPISODE" and attrs.get("clip_ids"):
+                episodes.append((node_id, attrs))
+            elif node_type == "ENTITY":
+                if attrs.get("sentrix_entity_id"):
+                    person_entities[str(attrs["sentrix_entity_id"])] = node_id
+                if attrs.get("entity_type") == "object" and attrs.get("label"):
+                    object_entities.setdefault(str(attrs["label"]), node_id)
+        for clip_uid, rows in events_by_clip.items():
+            rows.sort(key=lambda item: (
+                item[1].get("frame_seq") is None,
+                item[1].get("frame_seq") if item[1].get("frame_seq") is not None else item[1].get("video_time_sec") or 0,
+                item[0]))
+            for (source, _), (target, _) in zip(rows, rows[1:]):
+                reference.add((source, target, "TEMPORAL", "TIME_PRECEDES", ""))
+            session = sessions_by_clip.get(clip_uid)
+            if session:
+                for event, _ in rows:
+                    reference.add((session, event, "SEMANTIC", "CLIP_CONTAINS", ""))
+        for episode, attrs in episodes:
+            for clip_uid in attrs.get("clip_ids") or []:
+                session = sessions_by_clip.get(str(clip_uid))
+                if session:
+                    reference.add((episode, session, "SEMANTIC", "VIDEO_CONTAINS", ""))
+        for event, data in nodes.items():
+            if str(data.get("node_type") or "") != "EVENT":
+                continue
+            attrs = data.get("attributes") or {}
+            for entity in attrs.get("entity_refs") or []:
+                if not isinstance(entity, dict) or not entity.get("id"):
+                    continue
+                target = person_entities.get(str(entity["id"]))
+                kind = str(entity.get("entity_type") or "")
+                subtype = "MENTIONS_PERSON" if kind == "person" else "OCCURRED_AT" if kind == "place" else "CAPTURED_ON" if kind == "time" else ""
+                if target and subtype:
+                    reference.add((event, target, "ENTITY", subtype, ""))
+            for label in attrs.get("object_labels") or []:
+                target = object_entities.get(str(label))
+                if target:
+                    reference.add((event, target, "ENTITY", "MENTIONS_OBJECT", ""))
+
+        evaluable_types = {"TEMPORAL", "SEMANTIC", "ENTITY"}
+        evaluable_subtypes = {"TIME_PRECEDES", "CLIP_CONTAINS", "VIDEO_CONTAINS",
+                              "MENTIONS_PERSON", "OCCURRED_AT", "CAPTURED_ON",
+                              "MENTIONS_OBJECT"}
+        predicted_reference = set()
         valid_edges = supported_edges = consistent_edges = 0
         duplicate_keys = set()
         duplicate_count = 0
@@ -240,6 +303,8 @@ class GraphMemoryService:
             # duplicates merely because their subtype is the same.
             discriminator = props.get("entity") or props.get("relation") or props.get("object") or ""
             key = (str(source), str(target), link_type, subtype, str(discriminator))
+            if link_type in evaluable_types and subtype in evaluable_subtypes:
+                predicted_reference.add(key)
             if key in duplicate_keys:
                 duplicate_count += 1
             duplicate_keys.add(key)
@@ -279,6 +344,23 @@ class GraphMemoryService:
 
         total_nodes = len(nodes)
         total_edges = len(selected_edges)
+        true_positive = len(predicted_reference & reference)
+        reference_precision = true_positive / len(predicted_reference) if predicted_reference else None
+        reference_recall = true_positive / len(reference) if reference else None
+        reference_f1 = (2 * reference_precision * reference_recall / (reference_precision + reference_recall)
+                        if reference_precision is not None and reference_recall is not None
+                        and reference_precision + reference_recall else None)
+        traceable_nodes = 0
+        for data in nodes.values():
+            attrs = data.get("attributes") or {}
+            node_type = str(data.get("node_type") or "")
+            is_traceable = (
+                (node_type == "EVENT" and attrs.get("source_asset_id") and attrs.get("scope_id"))
+                or (node_type == "SESSION" and attrs.get("clip_uid"))
+                or (node_type == "EPISODE" and attrs.get("video_uid"))
+                or (node_type == "ENTITY" and (attrs.get("label") or attrs.get("sentrix_entity_id")))
+            )
+            traceable_nodes += int(bool(is_traceable))
         connected_nodes = sum(1 for value in degree.values() if value > 0)
         return {
             "available": True,
@@ -286,6 +368,7 @@ class GraphMemoryService:
             "total_nodes": total_nodes,
             "total_edges": total_edges,
             "node_connected_rate": connected_nodes / total_nodes if total_nodes else None,
+            "node_source_traceability_rate": traceable_nodes / total_nodes if total_nodes else None,
             "edge_evidence_support_rate": supported_edges / total_edges if total_edges else None,
             "edge_consistency_rate": consistent_edges / total_edges if total_edges else None,
             "duplicate_edge_rate": duplicate_count / total_edges if total_edges else None,
@@ -294,6 +377,13 @@ class GraphMemoryService:
             "supported_edges": supported_edges,
             "consistent_edges": consistent_edges,
             "duplicate_edges": duplicate_count,
+            "reference_edge_count": len(reference),
+            "evaluable_predicted_edge_count": len(predicted_reference),
+            "reference_edge_true_positive_count": true_positive,
+            "reference_edge_precision": reference_precision,
+            "reference_edge_recall": reference_recall,
+            "reference_edge_f1": reference_f1,
+            "unverifiable_edge_count": max(0, total_edges - len(predicted_reference)),
             "edge_type_counts": type_counts,
             "invalid_edges_by_type": invalid_by_type,
             "computed_at": datetime.now().isoformat(),
