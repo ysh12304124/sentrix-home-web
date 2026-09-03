@@ -169,7 +169,10 @@ $photobenchReady = $false
 if (Test-Path $photobenchScript) {
   try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $photobenchScript | Out-Host
-    $photobenchReady = $true
+    $photobenchReady = Test-Port 8771
+    if (-not $photobenchReady) {
+      Write-Warning "PhotoBench start command returned, but port 8771 is not listening"
+    }
   } catch {
     Write-Warning "PhotoBench evaluator did not start: $($_.Exception.Message)"
   }
