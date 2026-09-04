@@ -460,3 +460,12 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
   .endpoint-test-button,.model-test-feedback,.endpoint-reuse-check { grid-column:1; }
   .endpoint-test-button { justify-self:start; }
 }
+
+.cpu-bench-table { width:100%; border-collapse:collapse; margin-top:12px; }
+.cpu-bench-table th, .cpu-bench-table td { padding:8px 10px; text-align:left; border-bottom:1px solid #e8ecf4; }
+.cpu-bench-table th { background:#f4f6fb; font-weight:600; font-size:0.85rem; color:#556; }
+.cpu-bench-table td { font-size:0.9rem; }
+.cpu-bench-table tbody tr:hover { background:#f8f9ff; }
+.status-complete { color:#2a7a3a; }
+.status-failed { color:#c0392b; }
+.status-running { color:#c9a200; }

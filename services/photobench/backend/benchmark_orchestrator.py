@@ -5939,6 +5939,15 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/runs/"):
                 self._json(self.repo.get_run(unquote(parsed.path.removeprefix("/api/runs/"))))
                 return
+            # CPU bench results
+            if parsed.path == "/api/cpu-bench-results":
+                cpu_path = Path(__file__).parent / "cpu_bench_results.json"
+                if cpu_path.exists():
+                    with open(cpu_path) as f:
+                        self._json(json.load(f))
+                else:
+                    self._json({"error": "No CPU bench results found"}, 404)
+                return
             # Serve frontend
             relative = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
             path = (self.web_root / relative).resolve()

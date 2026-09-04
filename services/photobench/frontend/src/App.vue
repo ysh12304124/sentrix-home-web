@@ -78,6 +78,9 @@ const qaBrowserTag = ref("");
 const qaBrowserLoading = ref(false);
 const qaBrowserError = ref("");
 const qaBrowserMediaResolution = ref(null);
+const cpuResults = ref(null);
+const cpuLoading = ref(false);
+const cpuError = ref("");
 const error = ref("");
 const lightbox = ref(null);
 const judgeModal = ref(null);
@@ -91,11 +94,28 @@ const api = async (path, options = {}) => {
   return data;
 };
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
+const loadCpuResults = async () => {
+  cpuLoading.value = true;
+  cpuError.value = "";
+  try {
+    cpuResults.value = await api("/api/cpu-bench-results");
+  } catch (e) {
+    cpuError.value = e.message;
+  } finally {
+    cpuLoading.value = false;
+  }
+};
 const esc = (value) => String(value ?? "");
 const modelName = (run) => run?.model_profile || run?.model_name || run?.profile || "unknown";
 const albumName = (run) => run?.scope_name || run?.album_id || run?.qa_name || "album";
 const qaName = (run) => run?.qa_set || run?.qa_name || "qa";
 const fmtDate = (value) => value ? new Date(value).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-";
+const formatRound = (round) => {
+  if (!round) return "-";
+  if (typeof round === "string") return round;
+  if (round.pass !== undefined) return `${round.pass}/${round.total}`;
+  return "-";
+};
 const duration = (run) => {
   if (!run?.started_at) return "-";
   const end = run.finished_at ? new Date(run.finished_at) : new Date();
@@ -1854,6 +1874,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
     <nav class="view-tabs">
       <button :class="['view-tab', { active: activeView === 'runs' }]" @click="activeView = 'runs'">评测运行</button>
       <button :class="['view-tab', { active: activeView === 'qa-browser' }]" @click="activeView = 'qa-browser'; loadQaBrowser()">QA 数据集浏览</button>
+      <button :class="['view-tab', { active: activeView === 'cpu-bench' }]" @click="activeView = 'cpu-bench'; loadCpuResults()">CPU本地测试</button>
     </nav>
     <template v-if="activeView === 'runs'">
     <section v-if="arbiterStatus" class="section arbiter-section">
@@ -2550,6 +2571,31 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           </article>
         </div>
       </section>
+    </template>
+    <template v-if="activeView === 'cpu-bench'">
+    <section class="section">
+      <h2>CPU本地模型测试</h2>
+      <p class="muted">设备: 0.200 (RTX 3090) · 推理: transformers CPU · 测试集: 5题 × 3轮</p>
+      <div v-if="cpuLoading" class="loading">加载CPU测试结果…</div>
+      <div v-else-if="cpuError" class="error">加载失败: {{ cpuError }}</div>
+      <div v-else-if="cpuResults">
+        <table class="cpu-bench-table">
+          <thead><tr><th>模型</th><th>第1轮</th><th>第2轮</th><th>第3轮</th><th>平均分</th><th>状态</th><th>备注</th></tr></thead>
+          <tbody>
+            <tr v-for="r in cpuResults.results" :key="r.model">
+              <td><b>{{ r.model }}</b></td>
+              <td>{{ formatRound(r.round1) }}</td>
+              <td>{{ formatRound(r.round2) }}</td>
+              <td>{{ formatRound(r.round3) }}</td>
+              <td>{{ r.avg_score ? (r.avg_score * 100).toFixed(0) + '%' : '-' }}</td>
+              <td :class="'status-' + r.status">{{ r.status === 'complete' ? '✅完成' : r.status === 'failed' ? '❌失败' : r.status }}</td>
+              <td class="muted">{{ r.error || '-' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="muted" style="margin-top:12px">更新于: {{ cpuResults.updated_at }}</p>
+      </div>
+    </section>
     </template>
   </main>
   <div v-else class="loading">加载评测数据…</div>
