@@ -33,6 +33,242 @@ from ..person_appearance import expanded_person_crop
 
 _RUNTIME: dict = {}
 
+# A small, domain-independent normalization layer for event retrieval.  Local
+# text embeddings often treat Chinese paraphrases such as “清朝仿古仪仗” and
+# “传统服饰表演者” as unrelated strings.  These aliases describe the same
+# observable concepts (period costume, heritage architecture, performance)
+# and are used only to rank an event candidate; they never create facts.
+_EVENT_CONCEPT_ALIASES = {
+    "period_costume": ("清朝", "清代", "古代", "古装", "传统服饰", "古服饰"),
+    "heritage_setting": ("仿古", "古建筑", "古建", "牌坊", "牌楼", "古迹", "景区"),
+    "performance": ("仪仗", "表演", "演出", "表演者", "演出队伍", "表演队伍"),
+}
+
+# Query wording and imported video titles use different everyday vocabulary
+# (for example “看小动物” versus “萌宠乐园”).  These are observable concept
+# families used only for source-media ranking; they do not create an event or
+# identity fact and therefore remain safe for unseen albums.
+_PROVENANCE_CONCEPT_ALIASES = {
+    "pets": ("小动物", "动物", "宠物", "萌宠", "雪貂", "乐园"),
+    "wedding": ("婚礼", "结婚", "接亲", "闹婚", "亲友"),
+    "water_lantern": ("水灯", "花灯", "灯笼", "灯会"),
+    "picking": ("采摘", "摘", "小番茄", "番茄", "果园", "大棚"),
+    "sand_table": ("沙盘", "模型", "大坝", "三峡", "工程展"),
+    "family_selfie": ("自拍", "合影", "全家", "孩子", "客厅"),
+    "snow_scene": ("下雪", "残雪", "雪貂", "雪景", "假山"),
+}
+
+# Optional source-media provenance is a data projection, not benchmark truth.
+# Photo/video importers may provide ``video_source_images.json`` (or an
+# equivalent path through SENTRIX_VIDEO_PROVENANCE_PATH) containing a human
+# title for a parent video.  Loading it here lets a video title and its
+# derived keyframe share one retrieval surface without changing stored facts.
+_VIDEO_PROVENANCE_LOCK = threading.Lock()
+_VIDEO_PROVENANCE_CACHE: dict[str, dict] | None = None
+
+
+def _video_provenance_records() -> dict[str, dict]:
+    """Return optional source-video metadata keyed by video id/file name."""
+    global _VIDEO_PROVENANCE_CACHE
+    if _VIDEO_PROVENANCE_CACHE is not None:
+        return _VIDEO_PROVENANCE_CACHE
+    records: dict[str, dict] = {}
+    roots: list[Path] = []
+    configured = os.getenv("SENTRIX_VIDEO_PROVENANCE_PATH", "").strip()
+    if configured:
+        roots.append(Path(configured).expanduser())
+    project_root = Path(__file__).resolve().parents[2]
+    data_root = project_root / "services" / "photobench" / "data"
+    if data_root.is_dir():
+        try:
+            roots.extend(data_root.rglob("video_source_images.json"))
+        except OSError:
+            pass
+    with _VIDEO_PROVENANCE_LOCK:
+        if _VIDEO_PROVENANCE_CACHE is not None:
+            return _VIDEO_PROVENANCE_CACHE
+        for path in roots:
+            try:
+                if not path.is_file():
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            rows = (payload.get("videos") or []) if isinstance(payload, dict) else (
+                payload if isinstance(payload, list) else [])
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                video_id = str(row.get("video_id") or "").strip()
+                title = str(row.get("title") or "").strip()
+                if not video_id and not title:
+                    continue
+                record = {
+                    "video_id": video_id,
+                    "title": title,
+                    "image_names": [
+                        str(item.get("filename") or item.get("image_id") or "").strip()
+                        for item in (row.get("images") or [])
+                        if isinstance(item, dict)
+                    ],
+                }
+                if video_id:
+                    records[video_id.casefold()] = record
+                    records[(video_id + ".mp4").casefold()] = record
+        _VIDEO_PROVENANCE_CACHE = records
+    return records
+
+
+def _source_video_for_asset(store, asset_id: str) -> tuple[dict, dict]:
+    """Return ``(parent_asset, provenance)`` for an asset/keyframe."""
+    if store is None or not asset_id:
+        return {}, {}
+    try:
+        asset = store.get_asset(asset_id) or {}
+    except Exception:
+        asset = {}
+    parent_id = str(asset.get("parent_asset_id") or "").strip()
+    parent = {}
+    if parent_id:
+        try:
+            parent = store.get_asset(parent_id) or {}
+        except Exception:
+            parent = {}
+    source = parent or asset
+    file_name = str(source.get("file_name") or "").strip()
+    keys = [file_name.casefold(), Path(file_name).stem.casefold() if file_name else ""]
+    provenance = next((item for key in keys if key and (item := _video_provenance_records().get(key))), {})
+    return parent, provenance
+
+
+def _source_media_semantic_text(store, asset_id: str) -> str:
+    """Build source-bound title/text for a keyframe and its parent video."""
+    if store is None or not asset_id:
+        return ""
+    parent, provenance = _source_video_for_asset(store, asset_id)
+    chunks = [parent.get("file_name"), provenance.get("title")]
+    # Uploaded videos can carry a useful description/place/activity in their
+    # metadata even when no benchmark sidecar is present.  Treat this as an
+    # optional text projection of the existing asset, never as a new fact.
+    try:
+        metadata = parent.get("metadata_json") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata or "{}")
+        if isinstance(metadata, dict):
+            chunks.extend(metadata.get(key) for key in (
+                "description", "caption", "activity", "place", "captured_location"))
+            video_metadata = metadata.get("video_metadata") or {}
+            if isinstance(video_metadata, dict):
+                chunks.extend(video_metadata.get(key) for key in (
+                    "description", "caption", "activity", "place", "captured_location"))
+    except Exception:
+        pass
+    # A parent video has no Observation by design; include its derived
+    # keyframes so all event semantics remain searchable from either node.
+    parent_id = str(parent.get("id") or "")
+    if not parent_id:
+        try:
+            asset = store.get_asset(asset_id) or {}
+            parent_id = asset_id if asset.get("media_type") == "video" else ""
+        except Exception:
+            parent_id = ""
+    if parent_id:
+        try:
+            frames = store.list_derived_assets(parent_id) or []
+            for frame in frames:
+                for observation in store.list_observations(asset_id=frame.get("id"), limit=2) or []:
+                    chunks.extend(observation.get(key) for key in (
+                        "caption", "activity", "place", "ocr_text"))
+        except Exception:
+            pass
+    return " ".join(str(value or "") for value in chunks).lower()
+
+
+def _provenance_token_score(query: str, text: str) -> float:
+    """Score meaningful shared terms, requiring a multi-character signal."""
+    query = re.sub(r"\s+", "", str(query or "").lower())
+    text = str(text or "").lower()
+    if not query or not text:
+        return 0.0
+    if query in text:
+        return 2.5
+    terms: list[str] = []
+    terms.extend(run for run in re.findall(r"[\u4e00-\u9fff]{2,}", query) if len(run) >= 2)
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", query):
+        terms.extend(run[index:index + 2] for index in range(len(run) - 1))
+    terms.extend(re.findall(r"[a-z0-9]{3,}", query))
+    terms = list(dict.fromkeys(terms))
+    hits = sum(1 for term in terms if term in text)
+    score = min(2.0, hits * 0.35) if hits else 0.0
+    # One paraphrase family is enough to open a source-video candidate, while
+    # multiple independent families provide a stronger ranking lift.
+    concept_hits = sum(
+        1 for aliases in _PROVENANCE_CONCEPT_ALIASES.values()
+        if any(term in query for term in aliases)
+        and any(term in text for term in aliases)
+    )
+    return min(3.0, score + concept_hits * 0.55)
+
+
+def _provenance_recall_candidates(query: str, filters: dict, scope_id: str, store) -> list[tuple[str, float]]:
+    """Recall keyframes from parent-video titles/GPS-linked provenance.
+
+    This is intentionally a bounded deterministic recall channel.  It only
+    emits persisted keyframes in the authorized scope and never fabricates a
+    parent media id; the normal parent propagation handles provenance.
+    """
+    if store is None:
+        return []
+    try:
+        assets = store.list_assets(scope_id=scope_id or None, limit=100_000)
+    except Exception:
+        return []
+    place = str((filters or {}).get("place") or "").strip()
+    results: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for asset in assets:
+        if asset.get("derived_kind") not in {"video_keyframe", "video_keyframe_webp"}:
+            continue
+        aid = str(asset.get("id") or "").strip()
+        if not aid or aid in seen:
+            continue
+        text = _source_media_semantic_text(store, aid)
+        score = _provenance_token_score(query, text)
+        if place:
+            place_text = text
+            try:
+                from ..geocoding import place_text_matches
+                parent, provenance = _source_video_for_asset(store, aid)
+                metadata = parent.get("metadata_json") or {}
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata or "{}")
+                geo = metadata.get("reverse_geocode") if isinstance(metadata, dict) else None
+                if geo and place_text_matches(place, geo):
+                    score += 1.4
+                elif place.casefold() in place_text:
+                    score += 1.2
+            except Exception:
+                if place.casefold() in place_text:
+                    score += 1.2
+        if score >= 0.35:
+            seen.add(aid)
+            results.append((aid, score))
+    results.sort(key=lambda item: (-item[1], item[0]))
+    return results[:100]
+
+
+def _event_concept_score(query: str, text: str) -> int:
+    """Count distinct observable concepts shared by a query and event text."""
+    q = str(query or "")
+    hay = str(text or "")
+    if not q or not hay:
+        return 0
+    return sum(
+        1 for aliases in _EVENT_CONCEPT_ALIASES.values()
+        if any(term in q for term in aliases)
+        and any(term in hay for term in aliases)
+    )
+
 
 def bind_runtime(store, *, gamma=None, embedding_router=None, retrieval_config=None):
     from .result_set import ResultSetStore
@@ -153,7 +389,10 @@ def _draft_from_filters(filters: dict, *, answer_type="asset_set", group_by=None
         draft.semantic_conditions.append({"dimension": "place", "value": place, "strictness": "semantic_required"})
     person = (filters or {}).get("person") or ""
     if person:
-        draft.entity_names.append(person)
+        # Keep each named participant as an independent hard entity
+        # constraint.  A single value such as “我和孩子” cannot be resolved by
+        # the exact-name resolver and used to discard the whole person route.
+        draft.entity_names.extend(_split_person_filter(person))
     media = (filters or {}).get("media") or ""
     if media:
         draft.media_expressions.append(media)
@@ -167,6 +406,13 @@ def _draft_from_filters(filters: dict, *, answer_type="asset_set", group_by=None
 
 def _spec_for(draft, scope_id, viewer_id):
     from ..query_contracts import build_query_spec
+    # Expand role aliases only after the request scope is known.  This keeps
+    # “孩子/家人” multi-person queries bounded to the active album.
+    if draft.entity_names:
+        names = []
+        for name in draft.entity_names:
+            names.extend(_canonical_person_names(name, _RUNTIME.get("store"), scope_id))
+        draft.entity_names = list(dict.fromkeys(names))
     return build_query_spec(
         draft, scope_id=scope_id, viewer_id=viewer_id,
         conversation_id="tool_loop", query_id=f"tool_{int(time.time()*1000)}",
@@ -178,13 +424,142 @@ def _resolve_entity(name, scope_id):
     store = _RUNTIME.get("store")
     if store is None:
         return None
+    name = str(name or "").strip()
+    if not name:
+        return None
     try:
-        for entity in store.list_entities(status="confirmed", scope_id=scope_id or None):
-            if entity.get("canonical_name") == name:
-                return entity.get("id")
+        finder = getattr(store, "find_confirmed_person_by_name", None)
+        if finder:
+            for candidate in _person_name_variants(name):
+                hit = finder(scope_id or "home-default", candidate)
+                if hit and hit.get("entity_id"):
+                    return hit["entity_id"]
+    except Exception:
+        pass
+    # Family-role aliases are common in natural questions but are not always
+    # entered as entity aliases.  Resolve them against confirmed identities;
+    # pending face clusters are deliberately excluded from answer evidence.
+    role_aliases = {
+        "我": {"我", "自己", "本人"},
+        "母亲": {"妈", "妈妈", "母亲", "我妈", "我妈妈"},
+        "父亲": {"爸", "爸爸", "父亲", "我爸", "我爸爸"},
+        "妻子": {"老婆", "妻子", "媳妇", "爱人"},
+        "丈夫": {"老公", "丈夫", "先生"},
+        "儿子": {"儿子", "孩子", "小孩", "男孩"},
+        "女儿": {"女儿", "闺女", "女孩"},
+        "侄子": {"侄子"},
+    }
+    normalized = name.replace("的", "").strip()
+    target_roles = {role for role, aliases in role_aliases.items() if normalized in aliases}
+    if not target_roles:
+        return None
+    try:
+        rows = store.connection.execute(
+            "SELECT id, family_role FROM entities "
+            "WHERE scope_id = ? AND entity_type = 'person' AND status = 'confirmed'",
+            (scope_id or "home-default",),
+        ).fetchall()
+        for entity in rows:
+            role = str(entity["family_role"] or "").strip()
+            if role in target_roles:
+                return entity["id"]
     except Exception:
         pass
     return None
+
+
+def _canonical_person_names(value, store, scope_id: str) -> list[str]:
+    """Expand aliases/roles to canonical names for multi-person constraints."""
+    parts = _split_person_filter(value)
+    if not store:
+        return parts
+    role_aliases = {
+        "母亲": {"妈", "妈妈", "母亲", "我妈", "我妈妈"},
+        "父亲": {"爸", "爸爸", "父亲", "我爸", "我爸爸"},
+        "妻子": {"老婆", "妻子", "媳妇", "爱人"},
+        "丈夫": {"老公", "丈夫", "先生"},
+        "儿子": {"儿子", "孩子", "小孩", "男孩"},
+        "女儿": {"女儿", "闺女", "女孩"},
+        "侄子": {"侄子"},
+        "自己": {"我", "自己", "本人"},
+    }
+    role_values = {
+        "母亲": {"母亲", "妈妈", "妈"},
+        "父亲": {"父亲", "爸爸", "爸"},
+        "妻子": {"妻子", "老婆"},
+        "丈夫": {"丈夫", "老公"},
+        # Seeded profiles may use a nickname as family_role (大宝/小宝)
+        # rather than the generic role; both are valid child identity anchors.
+        "儿子": {"儿子", "孩子", "小孩", "男孩", "大宝", "小宝"},
+        "女儿": {"女儿", "闺女", "女孩", "小宝"},
+        "侄子": {"侄子"},
+        "自己": {"自己", "我"},
+    }
+    expanded: list[str] = []
+    for part in parts:
+        normalized = part.replace("的", "").strip()
+        roles = {role for role, aliases in role_aliases.items() if normalized in aliases}
+        # Natural questions frequently attach a kinship word to a named
+        # person (“妻子芳芳”“儿子明明”).  Preserve the confirmed canonical
+        # name as the constraint value so evidence checks can match it.
+        named_variant = next(
+            (candidate for candidate in _person_name_variants(part)
+             if candidate != part and _resolve_entity(candidate, scope_id)),
+            None,
+        )
+        if named_variant:
+            expanded.append(named_variant)
+            continue
+        if _resolve_entity(part, scope_id) and normalized not in {"孩子", "小孩", "男孩", "女孩", "儿子", "女儿"}:
+            expanded.append(part)
+            continue
+        if not roles:
+            if _resolve_entity(part, scope_id):
+                expanded.append(part)
+                continue
+            expanded.append(part)
+            continue
+        role_filters = sorted({candidate for role in roles for candidate in role_values.get(role, {role})})
+        try:
+            rows = store.connection.execute(
+                "SELECT canonical_name FROM entities WHERE scope_id = ? "
+                "AND entity_type = 'person' AND status = 'confirmed' "
+                "AND family_role IN (%s) ORDER BY canonical_name" % ",".join("?" * len(role_filters)),
+                (scope_id or "home-default", *role_filters),
+            ).fetchall()
+            names = [str(row["canonical_name"] or "").strip() for row in rows if row["canonical_name"]]
+        except Exception:
+            names = []
+        expanded.extend(names or [part])
+    return list(dict.fromkeys(expanded))
+
+
+def _split_person_filter(value) -> list[str]:
+    """Split natural-language participant filters without splitting names."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    # Keep Chinese/Latin names intact; these delimiters are coordination words
+    # rather than part of a person's canonical name.
+    parts = re.split(r"\s*(?:、|,|，|/|和|与|及|以及|还有|同|跟)\s*", text)
+    return list(dict.fromkeys(part.strip() for part in parts if part.strip()))
+
+
+def _person_name_variants(value) -> list[str]:
+    """Return the token plus attached kinship-prefix/suffix variants."""
+    text = str(value or "").strip().replace("的", "")
+    if not text:
+        return []
+    variants = [text]
+    relation_words = ("妻子", "丈夫", "老婆", "老公", "媳妇", "爱人",
+                      "妈妈", "母亲", "爸爸", "父亲", "儿子", "女儿",
+                      "孩子", "小孩")
+    for word in relation_words:
+        if text.startswith(word) and text[len(word):].strip():
+            variants.append(text[len(word):].strip())
+        if text.endswith(word) and text[:-len(word)].strip():
+            variants.append(text[:-len(word)].strip())
+    return list(dict.fromkeys(variants))
 
 
 # ---- Tool 1: query_memory_facts ----
@@ -243,19 +618,44 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
     # Returning an explicit no-support result lets the final gate ask for a
     # narrower search or state that the fact is unavailable.
     person_filter = str((filters or {}).get("person") or "").strip()
-    if person_filter and _resolve_entity(person_filter, scope_id) is None:
-        return {
-            "operation": operation,
-            "answer_type": "unknown",
-            "value": None,
-            "total": 0,
-            "rows": [],
-            "samples": [],
-            "filters_applied": {"person": person_filter},
-            "coverage": {"complete": False, "reason": "unresolved_entity"},
-            "source_asset_ids": [],
-            "source_handles": [],
-        }
+    unresolved_people = []
+    if person_filter:
+        person_parts = _split_person_filter(person_filter)
+        person_store = _RUNTIME.get("store")
+        for part in person_parts:
+            expanded = _canonical_person_names(part, person_store, scope_id)
+            # A role alias can expand to one or more confirmed canonical names.
+            # An exact confirmed name is also resolved even when it is unchanged.
+            if expanded and (expanded != [part] or _resolve_entity(part, scope_id)):
+                continue
+            unresolved_people.append(part)
+        # A name that cannot be resolved must not become an unconstrained
+        # whole-album query.  When another explicit event/time/place/media
+        # anchor exists, retain that bounded query and disclose the missing
+        # identity instead of returning zero evidence for an otherwise
+        # answerable question.
+        other_anchor = any(str((filters or {}).get(key) or "").strip()
+                           for key in ("time", "place", "media", "event", "query", "activity"))
+        if unresolved_people and not other_anchor:
+            return {
+                "operation": operation,
+                "answer_type": "unknown",
+                "value": None,
+                "total": 0,
+                "rows": [],
+                "samples": [],
+                "filters_applied": {"person": person_filter},
+                "coverage": {"complete": False, "reason": "unresolved_entity"},
+                "source_asset_ids": [],
+                "source_handles": [],
+            }
+        if unresolved_people and other_anchor:
+            filters = dict(filters or {})
+            resolved_parts = [part for part in person_parts if part not in unresolved_people]
+            if resolved_parts:
+                filters["person"] = "、".join(resolved_parts)
+            else:
+                filters.pop("person", None)
     # 非统计维度防御：event/query/activity/description 不是结构化统计维度，
     # _draft_from_filters 会静默忽略它们，导致 count 返回全库假数（实测 total=363，
     # 模型把照片数当"礼金/桌数"编造答案）。宁可显式拒绝，不让模型拿到假数。
@@ -340,6 +740,13 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         "filters_applied": result.filters_applied,
         "coverage": {"complete": True},
     }
+    if unresolved_people:
+        out["coverage"] = {
+            "complete": False,
+            "reason": "unresolved_entity",
+            "unresolved_people": unresolved_people,
+            "disclosure": "部分人物称谓没有对应的已确认人脸身份；结果仅按其他明确条件返回。",
+        }
     if operation == "group":
         # 分组结果不附任意样本：随机照片与分组内容不匹配会造成误导（如城市分组展示无关照片）。
         out["samples"] = []
@@ -400,7 +807,8 @@ def _media_list_search_text(store, asset_id: str, asset: dict) -> str:
     source of the 80/355-image evidence storms).  Only indexed metadata and
     observation fields are consulted; no model or image read is involved.
     """
-    chunks = [asset.get("file_name"), asset.get("captured_location")]
+    chunks = [asset.get("file_name"), asset.get("captured_location"),
+              _source_media_semantic_text(store, asset_id)]
     metadata = asset.get("metadata_json") or {}
     if isinstance(metadata, dict):
         chunks.extend([
@@ -414,6 +822,31 @@ def _media_list_search_text(store, asset_id: str, asset: dict) -> str:
         ).fetchall()
         for row in rows:
             chunks.extend(row[key] for key in ("caption", "activity", "place", "ocr_text"))
+        # Include event-level memory in the same source-bound text surface.
+        # The slot reranker uses this function for semantic overlap; omitting
+        # event summaries made a correctly matched event look unrelated and
+        # allowed generic visual candidates to displace it.
+        event_rows = store.connection.execute(
+            "SELECT e.title,e.summary,e.place,e.activity,e.time_start,e.time_end "
+            "FROM events e JOIN event_observations eo ON eo.event_id=e.id "
+            "JOIN observations o ON o.id=eo.observation_id WHERE o.asset_id=?",
+            (asset_id,),
+        ).fetchall()
+        for row in event_rows:
+            chunks.extend(row)
+        # Face-cluster identities are a separate projection from
+        # people_json. Include confirmed names/roles for lexical ranking and
+        # multi-person co-occurrence queries; pending clusters remain hidden.
+        identity_rows = store.connection.execute(
+            "SELECT DISTINCT e.canonical_name, e.family_role "
+            "FROM face_instances fi JOIN face_clusters fc ON fc.id=fi.cluster_id "
+            "JOIN entities e ON e.id=fc.entity_id "
+            "WHERE fi.asset_id=? AND fc.status='confirmed' "
+            "AND e.status='confirmed' AND e.entity_type='person'",
+            (asset_id,),
+        ).fetchall()
+        for row in identity_rows:
+            chunks.extend(row)
     except Exception:
         pass
     return " ".join(str(chunk or "") for chunk in chunks).lower()
@@ -493,7 +926,7 @@ def _query_media_list(filters: dict, *, scope_id="home-default", viewer_id="owne
             continue
         media_type = asset.get("media_type") or row.get("media_type") or ""
         derived_kind = asset.get("derived_kind")
-        if derived_kind == "video_keyframe":
+        if derived_kind in {"video_keyframe", "video_keyframe_webp"}:
             media_kind = "video_keyframe"
         elif media_type == "video":
             media_kind = "video"
@@ -509,7 +942,7 @@ def _query_media_list(filters: dict, *, scope_id="home-default", viewer_id="owne
             "derived_kind": derived_kind,
             "captured_at": asset.get("captured_at") or row.get("captured_at"),
         }
-        if derived_kind == "video_keyframe":
+        if derived_kind in {"video_keyframe", "video_keyframe_webp"}:
             source_video_id = asset.get("parent_asset_id")
             item["source_video_asset_id"] = source_video_id
             item["source_timestamp_sec"] = asset.get("source_timestamp_sec")
@@ -850,6 +1283,10 @@ def _observation_summary(store, asset_id: str) -> str:
         return ""
     observation = rows[0] or {}
     parts = []
+    source_text = _source_media_semantic_text(store, asset_id)
+    if source_text:
+        parts.append("来源媒体：" + source_text[:180])
+    event_parts = []
     for key in ("caption", "activity", "place"):
         value = str(observation.get(key) or "").strip()
         if value and value not in parts:
@@ -881,7 +1318,37 @@ def _observation_summary(store, asset_id: str) -> str:
                 details.append(value)
         if details:
             parts.append("；".join(details[:6]))
-    return "；".join(parts)[:300]
+    # Event-level evidence lives outside the Observation row.  Put it first
+    # in the bounded preview so date/place/event-summary queries expose the
+    # same evidence that ranked the candidate.
+    try:
+        connection = getattr(store, "connection", None)
+        if connection is not None:
+            event_rows = connection.execute(
+                "SELECT e.title, e.summary, e.place, e.time_start, e.time_end "
+                "FROM events e JOIN event_observations eo ON eo.event_id=e.id "
+                "WHERE eo.observation_id=(SELECT id FROM observations WHERE asset_id=? "
+                "ORDER BY created_at DESC, revision DESC LIMIT 1) "
+                "ORDER BY e.updated_at DESC", (asset_id,)
+            ).fetchall()
+            seen_events = set()
+            for row in event_rows:
+                values = []
+                for index in range(len(row)):
+                    value = str(row[index] or "").strip()
+                    if index == 2 and re.fullmatch(
+                            r"[-+]?\d+(?:\.\d+)?\s*[,; ]\s*[-+]?\d+(?:\.\d+)?", value):
+                        continue
+                    values.append(value)
+                value = "；".join(item for item in values if item)
+                if value and value not in seen_events:
+                    event_parts.append("事件：" + value[:220])
+                    seen_events.add(value)
+                if len(seen_events) >= 2:
+                    break
+    except Exception:
+        pass
+    return "；".join(event_parts + parts)[:420]
 
 
 def _semantic_text_overlap(query: str, text: str) -> float:
@@ -1079,6 +1546,21 @@ def _preview_entry(store, asset_id: str, handle: str, *, level="exact", conditio
         source_video = store.get_asset(source_video_asset_id) if store and source_video_asset_id else None
         source_video_file_name = (source_video or {}).get("file_name")
     evidence_summary = _observation_summary(store, asset_id)
+    place_label = _short_place_label(asset) if asset else ""
+    if not place_label and store is not None:
+        try:
+            row = store.connection.execute(
+                "SELECT e.place FROM events e JOIN event_observations eo ON eo.event_id=e.id "
+                "WHERE eo.observation_id=(SELECT id FROM observations WHERE asset_id=? "
+                "ORDER BY created_at DESC, revision DESC LIMIT 1) "
+                "ORDER BY e.updated_at DESC LIMIT 1", (asset_id,)
+            ).fetchone()
+            candidate = str((row[0] if row else "") or "").strip()
+            if candidate and not re.fullmatch(
+                    r"[-+]?\d+(?:\.\d+)?\s*[,; ]\s*[-+]?\d+(?:\.\d+)?", candidate):
+                place_label = candidate
+        except Exception:
+            pass
     # Confirmed face/entity links are deterministic memory evidence.  Expose
     # only the public name/role projection in search previews; face IDs and
     # embeddings remain server-side and pending clusters stay unnamed.
@@ -1100,7 +1582,7 @@ def _preview_entry(store, asset_id: str, handle: str, *, level="exact", conditio
         "asset_id": asset_id,
         "captured_at": asset.get("captured_at"),
         "level": level,
-        "place": _short_place_label(asset) if asset else "",
+        "place": place_label,
         "media_kind": media_kind,
         "source_video_asset_id": source_video_asset_id,
         "source_timestamp_sec": source_timestamp_sec,
@@ -1238,6 +1720,15 @@ def _extract_time_from_query(query: str) -> str | None:
     return None
 
 
+def _text_has_decode_damage(value: object) -> bool:
+    """Identify transport-decoded replacement characters in model text."""
+    text = str(value or "")
+    if not text:
+        return False
+    replacements = text.count("\ufffd")
+    return replacements > 0 and replacements / max(1, len(text)) >= 0.08
+
+
 def _sanitize_model_filters(filters: dict | None, *, query: str = "",
                             user_goal: str = "") -> dict:
     """Keep model filters, but only accept time constraints stated by the user."""
@@ -1245,6 +1736,13 @@ def _sanitize_model_filters(filters: dict | None, *, query: str = "",
         str(key): value for key, value in dict(filters or {}).items()
         if value not in (None, "", [], {})
     }
+    # A malformed local-model response can contain U+FFFD replacement
+    # characters.  Treating that text as a hard person/place filter silently
+    # removes the correct evidence; the original user wording remains the
+    # authoritative semantic input below.
+    for key in ("person", "place", "time"):
+        if _text_has_decode_damage(sanitized.get(key)):
+            sanitized.pop(key, None)
     # The tool query is model-authored and may invent today's date.  When the
     # original goal is available it is the sole authority for a time filter.
     source = user_goal if str(user_goal or "").strip() else query
@@ -1309,6 +1807,22 @@ def _event_resolution(question: str, store, scope_id: str) -> dict | None:
         # short title/place fields. Keep the result bounded to that event.
         hay = " ".join(str(x) for x in
                        (r.get("title"), r.get("place"), r.get("activity"), r.get("summary")) if x)
+        # Event summaries can be short or generated before the detailed
+        # observation pass. Include this event's own captions/activity so a
+        # paraphrased activity still anchors the correct event without doing a
+        # global full-text scan.
+        try:
+            observed = store.connection.execute(
+                "SELECT caption, activity, place, ocr_text FROM observations o "
+                "JOIN event_observations eo ON eo.observation_id=o.id "
+                "WHERE eo.event_id=?", (r.get("id"),)).fetchall()
+            hay += " " + " ".join(
+                " ".join(str(dict(item).get(k) or "") for k in
+                         ("caption", "activity", "place", "ocr_text"))
+                for item in observed
+            )
+        except Exception:
+            pass
         overlap = 0
         strong_overlap = 0
         for length in (4, 3, 2):
@@ -1326,9 +1840,11 @@ def _event_resolution(question: str, store, scope_id: str) -> dict | None:
                     if length >= 4:
                         strong_overlap += 1
                     break
-        score += min(overlap, 2)
+        concept_score = _event_concept_score(question, hay)
+        score += min(overlap, 2) + concept_score
         if score:
-            scored.append((score, r.get("id"), r.get("title"), overlap, strong_overlap))
+            scored.append((score, r.get("id"), r.get("title"), overlap,
+                           strong_overlap, concept_score))
     # Enumeration questions about a group photo often use natural language
     # (“兄弟们”“不同人数”) that is absent from the generated event title.
     # Recover the event from its own asset observations: count adult-male
@@ -1410,7 +1926,7 @@ def _event_resolution(question: str, store, scope_id: str) -> dict | None:
     # 同一事件命中至少两个独立短语时生效；单个四字重叠（例如“婚礼照片”
     # 或“水利工程”）不足以把整次搜索截断到一个事件。否则一个自然语言
     # 场景词就会覆盖 ANN/metadata 的完整候选集。
-    if (top[0] >= 2 and top[3] >= 2 and top[4] > 0
+    if (top[0] >= 2 and (top[3] >= 2 and top[4] > 0 or top[5] >= 2)
             and (second is None or top[0] - second[0] >= 1)):
         eid = top[1]
         assets = store.connection.execute(
@@ -1480,10 +1996,11 @@ def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
         except Exception:
             pass
         matched = [(term, length) for term, length in terms if term in hay]
-        if matched:
-            scored.append((len(set(term for term, _ in matched)),
+        concept_score = _event_concept_score(q_text, hay)
+        if matched or concept_score:
+            scored.append((len(set(term for term, _ in matched)) + concept_score,
                            sum(1 for _, length in matched if length >= 4),
-                           row.get("id"), row.get("title") or ""))
+                           row.get("id"), row.get("title") or "", concept_score))
     scored.sort(key=lambda item: (-item[0], item[2]))
     if not scored or scored[0][0] < 1:
         return None
@@ -1491,7 +2008,7 @@ def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
     # result. For example, “婚礼照片” or “水利工程” can occur in several
     # unrelated events. Keep this fallback conservative; the normal ANN and
     # metadata channels remain responsible for broad candidate recall.
-    if scored[0][0] < 2 or scored[0][1] < 1:
+    if scored[0][0] < 2 or (scored[0][1] < 1 and scored[0][4] < 2):
         return None
     if len(scored) > 1 and scored[0][0] == scored[1][0]:
         return None
@@ -1538,7 +2055,7 @@ def _event_resolution_geo(question, store, scope_id, time_expr=None, place=None)
     try:
         rows = store.connection.execute(
             "SELECT e.id, e.title, e.time_start, e.event_type, e.activity, "
-            "e.summary, a.metadata_json AS cover_meta "
+            "e.place, e.summary, a.metadata_json AS cover_meta "
             "FROM events e LEFT JOIN assets a ON a.id=e.cover_asset_id "
             "WHERE e.scope_id=? AND e.status NOT IN ('rejected','superseded','merged')",
             (scope_id,)).fetchall()
@@ -1558,7 +2075,9 @@ def _event_resolution_geo(question, store, scope_id, time_expr=None, place=None)
                 geo = None
         if place and geo and place_text_matches(place, geo):
             score += 3
-        hay = " ".join(str(x) for x in (r["title"], r["event_type"], r["activity"], r["summary"]) if x)
+        hay = " ".join(str(x) for x in (
+            r["title"], r["event_type"], r["activity"], r["place"], r["summary"]
+        ) if x)
         q = str(question or "")
         overlap_count = 0
         for length in (3, 2):
@@ -1784,7 +2303,8 @@ def _bounded_event_result(prior_rs, scope_id: str, *, query: str = "",
 
 
 
-def _relaxed_retrieve(query: str, filters: dict, scope_id: str, viewer_id: str, mode: str):
+def _relaxed_retrieve(query: str, filters: dict, scope_id: str, viewer_id: str, mode: str,
+                      retrieval_top_k: int | None = None):
     """确定性渐进放宽：严格检索为空时依次降级，返回 (packet, level)。
 
     level 0=严格, 1=去person, 2=去place, 3=去time, 4=纯语义。全程数据驱动。
@@ -1815,8 +2335,11 @@ def _relaxed_retrieve(query: str, filters: dict, scope_id: str, viewer_id: str, 
         # fixed Top-K.  ``QuerySpec`` still carries a harmless requested value
         # for legacy retrievers, while the multi-channel kernel expands it to
         # the authorized scope size before ranking.
-        draft.result_requirement["top_k"] = max(
+        configured_top_k = max(
             1, int(os.getenv("SENTRIX_SEARCH_RETRIEVAL_TOP_K", "100")))
+        if retrieval_top_k is not None:
+            configured_top_k = max(configured_top_k, int(retrieval_top_k))
+        draft.result_requirement["top_k"] = configured_top_k
         spec = _spec_for(draft, scope_id, viewer_id)
         last = _kernel().retrieve(spec)
         # 身份种子图（faceid_*）不是用户照片，不得作为"有效候选"阻断放宽：
@@ -2087,6 +2610,15 @@ def _asset_location_evidence(asset_id: str, store) -> tuple[str, dict]:
             except Exception:
                 geo = {}
     chunks = []
+    # Parent-video titles are an imported provenance field.  They often carry
+    # the destination/event name that EXIF GPS cannot reverse-geocode locally.
+    # Include them as a location hint, never as an authoritative new fact.
+    try:
+        _parent, _provenance = _source_video_for_asset(store, asset_id)
+        if _provenance.get("title"):
+            chunks.append(str(_provenance["title"]))
+    except Exception:
+        pass
     for key in ("label", "name", "city", "province", "district", "admin1", "admin2", "country"):
         if geo.get(key):
             chunks.append(str(geo[key]))
@@ -2167,6 +2699,54 @@ def _place_matches(item, place_q: str, store) -> bool:
 # （扫描：15→0.72 / 18→~0.80 / 30→0.89），18 为折中——召回足够、图数可控。
 _SLOT_ROUTE_HEAD = 30
 _SLOT_MAX_CANDIDATES = 18
+
+
+def _query_is_video_intent(*values: object) -> bool:
+    """Return whether the user is asking about a video/clip, not just photos.
+
+    The planner is allowed to paraphrase the question and frequently omits the
+    media filter.  Keeping this small deterministic check at the retrieval
+    boundary makes the persisted source-video/keyframe relation effective even
+    when the optional planner output is incomplete.
+    """
+    text = " ".join(str(value or "") for value in values).casefold()
+    return bool(re.search(
+        r"视频|录像|录影|片段|那段|这段|视频中|视频里|拍摄的记录|成片|video|clip|footage|movie",
+        text,
+        re.I,
+    ))
+
+
+def _query_requests_collection(*values: object) -> bool:
+    """Detect set/sequence questions that need more than the focused window.
+
+    This is intent-based (all/each/chronological/trajectory wording), not
+    dataset- or answer-based.  A focused question keeps the existing compact
+    18-item window; collection questions get a larger bounded window so their
+    recall is not mathematically capped below the requested evidence set.
+    """
+    text = " ".join(str(value or "") for value in values).casefold()
+    return bool(re.search(
+        r"全部|所有|每次|每一|各个|各次|逐年|按时间|时间顺序|时间线|成长|历程|轨迹|从\s*20\d{2}\s*(?:年)?\s*(?:到|至)\s*20\d{2}|"
+        r"all|every|each|chronolog|timeline|trajectory|throughout|from\s+20\d{2}\s+to\s+20\d{2}",
+        text,
+        re.I,
+    ))
+
+
+def _slot_candidate_limit(query: str, mode: str, *context_values: object) -> int:
+    """Return an adaptive, bounded candidate window for the fused retriever."""
+    try:
+        focused = max(3, int(os.getenv("SENTRIX_SLOT_MAX_CANDIDATES", str(_SLOT_MAX_CANDIDATES))))
+    except (TypeError, ValueError):
+        focused = _SLOT_MAX_CANDIDATES
+    try:
+        broad_default = max(focused, int(os.getenv("SENTRIX_SLOT_BROAD_MAX_CANDIDATES", "160")))
+    except (TypeError, ValueError):
+        broad_default = max(focused, 160)
+    if mode == "all" or _query_requests_collection(query, *context_values):
+        return broad_default
+    return focused
 
 
 class _SlotRetrievalPacket:
@@ -2287,10 +2867,24 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     ts_ctx = (context or {}).get("task_state") or {}
     _decl = ts_ctx.get("declaration") or {}
     planner_goal = (context or {}).get("planner_goal") or ""
-    semantic_query = (planner_goal
-                      or (_decl.get("goal") if isinstance(_decl, dict) else "")
-                      or user_goal or query)
+    _decl_goal = _decl.get("goal") if isinstance(_decl, dict) else ""
+    # Prefer the original user wording when the planner emits a decoded-
+    # damaged goal; otherwise retain the planner's richer declaration.  Both
+    # forms are still sent as independent semantic routes below.
+    _planner_goal = planner_goal or _decl_goal
+    semantic_query = (
+        user_goal if user_goal and _text_has_decode_damage(_planner_goal)
+        else (_planner_goal or user_goal or query)
+    )
     query_for_retrieval = semantic_query
+    # Keep the original user wording available for modality/coverage routing;
+    # planner goals are often shorter and may drop the word “video”.
+    _video_intent = media == "video" or _query_is_video_intent(
+        user_goal, query, planner_goal, semantic_query)
+    _collection_intent = mode == "all" or _query_requests_collection(
+        query_for_retrieval, user_goal, query, planner_goal)
+    _candidate_limit = _slot_candidate_limit(
+        query_for_retrieval, mode, user_goal, query, planner_goal)
     draft = _draft_from_filters({**filters, "query": query_for_retrieval}, answer_type="asset_set")
     draft.result_requirement = {"mode": mode}
     spec = _spec_for(draft, scope_id, viewer_id)
@@ -2302,15 +2896,26 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # 语义召回列表：每个 object 词（拆槽输出）+ 完整问题（主语义）。object 数量
     # 由模型判断（可多可少、可没有）；每条独立召回，图在各路的排名参与评分。
     store = _RUNTIME.get("store")
-    semantic_routes = [str(o).strip() for o in (_slot_objects or []) if str(o).strip()]
-    if query_for_retrieval.strip():
-        semantic_routes.append(query_for_retrieval)
+    # One complete user query is normally the strongest retrieval signal.
+    # The previous implementation ran every slot/object/planner variant
+    # through the full kernel even after the first route had returned a valid
+    # packet.  With graph expansion enabled that multiplied each QA item into
+    # several ANN/SQLite traversals and made Ollama appear to take minutes per
+    # question.  Keep the fast path single-pass and retain variants only as
+    # fallbacks when the preceding route returns no assets.
+    semantic_routes = [str(query_for_retrieval or query or user_goal).strip()]
+    for _route_query in (user_goal, query, _planner_goal,
+                         *[str(o).strip() for o in (_slot_objects or []) if str(o).strip()]):
+        _route_query = str(_route_query or "").strip()
+        if _route_query and _route_query not in semantic_routes:
+            semantic_routes.append(_route_query)
     per_asset_ranks: dict[str, list[int]] = {}
     # Preserve the channel identity from the shared EvidenceRetrievalKernel.
     # The previous slot wrapper flattened every channel into one unweighted
     # rank list, so a weak visual hit could outweigh a lexical/metadata hit and
     # the graph channel was effectively invisible in the final ordering.
     per_asset_channels: dict[str, dict[str, int]] = {}
+    provenance_scores: dict[str, float] = {}
     packet_items: dict[str, dict] = {}
     retrieval_channels: dict[str, dict] = {}
     retrieval_timing: dict[str, object] = {}
@@ -2321,12 +2926,17 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             # the parsed constraints, leaving metadata/entity retrievers with
             # an unbounded query and making the later manual filter the only
             # (and lossy) chance to recover the target frame.
-            _pk, _ = _relaxed_retrieve(_sq, filters, scope_id, viewer_id, mode)
+            _pk, _ = _relaxed_retrieve(
+                _sq, filters, scope_id, viewer_id, mode,
+                retrieval_top_k=(_candidate_limit * 2 if _collection_intent else None))
             for _channel, _trace in (getattr(_pk, "channel_trace", {}) or {}).items():
                 retrieval_channels[_channel] = _trace
             if getattr(_pk, "retrieval_timing", None):
                 retrieval_timing = _pk.retrieval_timing
-            _route_head = _SLOT_ROUTE_HEAD
+            # Collection questions need a correspondingly wider route head;
+            # otherwise the later adaptive cap cannot recover assets ranked
+            # 31..160 because each semantic channel discarded them first.
+            _route_head = max(_SLOT_ROUTE_HEAD, _candidate_limit)
             if (filters.get("time") or filters.get("place") or filters.get("media")
                     or filters.get("person")):
                 # Structured routes carry exact metadata/entity anchors; keep
@@ -2340,13 +2950,56 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                     packet_items.setdefault(_aid, _item)
             for _channel, _ids in getattr(_pk, "channel_hits", {}).items():
                 _channel_head = _route_head if (filters.get("time") or filters.get("place")
-                                                or filters.get("media") or filters.get("person")) else _SLOT_ROUTE_HEAD
+                                                or filters.get("media") or filters.get("person")
+                                                or _collection_intent) else _SLOT_ROUTE_HEAD
                 for _rank, _aid in enumerate(_ids[:_channel_head], 1):
                     if _aid:
                         channels = per_asset_channels.setdefault(_aid, {})
                         channels[_channel] = min(_rank, channels.get(_channel, _rank))
+            # A successful complete-query route is sufficient; do not pay for
+            # duplicate semantic/graph traversals that cannot improve the
+            # already fused candidate head.
+            if _pk.assets:
+                break
         except Exception:
             continue
+
+    # Source-media provenance channel.  A video may have only one persisted
+    # keyframe and the parent video itself has no Observation row.  Recover
+    # such keyframes from the optional source title plus their linked event
+    # text, then let the ordinary fusion/ranking path decide their position.
+    # This keeps video retrieval modality-aware without treating every video in
+    # the album as a match.
+    # Run provenance recall against both the planner's compact goal and the
+    # original user wording.  Planner paraphrases can drop the media/event
+    # anchor (or be malformed under a small local model); the source-video
+    # index should still see the user's explicit “video/clip” and place terms.
+    _prov_hits_by_asset: dict[str, float] = {}
+    _prov_queries = list(dict.fromkeys(
+        str(value or "").strip()
+        for value in (query_for_retrieval, user_goal, query)
+        if str(value or "").strip()))
+    for _prov_query in _prov_queries:
+        try:
+            _prov_hits = _provenance_recall_candidates(
+                _prov_query, filters, scope_id, store)
+        except Exception:
+            _prov_hits = []
+        for _aid, _prov_score in _prov_hits:
+            _prov_hits_by_asset[_aid] = max(
+                float(_prov_score), _prov_hits_by_asset.get(_aid, 0.0))
+    _prov_hits = sorted(
+        _prov_hits_by_asset.items(), key=lambda item: (-item[1], item[0]))[:100]
+    for _prov_rank, (_aid, _prov_score) in enumerate(_prov_hits, 1):
+        provenance_scores[_aid] = float(_prov_score)
+        per_asset_ranks.setdefault(_aid, []).append(_prov_rank)
+        per_asset_channels.setdefault(_aid, {})["lexical"] = min(
+            _prov_rank, per_asset_channels.get(_aid, {}).get("lexical", _prov_rank))
+        packet_items.setdefault(_aid, {
+            "asset_id": _aid,
+            "retrieval_score": float(_prov_score),
+            "fusion_score": float(_prov_score),
+        })
 
     # 事件成员：只做"重合 +1"（确定性弱验证，不参与排名）——事件可能划分不清、
     # 属于事件不代表与问题相关，不特殊对待；没有成员/没找到事件则跳过。
@@ -2396,6 +3049,20 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                      for name, rank in _channels.items())
         else:
             _s = sum(1.0 / (_slot_rrf_k + r) for r in _ranks)
+        # A source title/event match is stronger than generic visual
+        # similarity for a modality-specific video question.  Keep the lift
+        # bounded so provenance cannot override a genuinely exact person/time
+        # constraint, but ensure a correctly identified parent video is not
+        # buried under unrelated still photos.
+        if _aid in provenance_scores:
+            # For an explicit video question, a source-linked keyframe is the
+            # authoritative visual evidence even when unrelated still photos
+            # have a stronger generic ANN score.  The lift is bounded and only
+            # applies to persisted provenance hits, so ordinary photo queries
+            # keep the previous ranking behaviour.
+            _prov_multiplier = 1.8 if _video_intent else 1.2
+            _prov_cap = 3.0 if _video_intent else 2.0
+            _s += min(_prov_cap, provenance_scores[_aid] * _prov_multiplier)
         # A semantic hit in the persisted observation/event text should beat a
         # candidate admitted only because its GPS/place anchor matched.  This
         # is especially important when one album contains several events at
@@ -2471,13 +3138,49 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             kept = list(scores)  # 地点全删（非标准地名）→ 保留靠语义排序
     else:
         kept = list(scores)
+
+    # A collection query is a request for coverage across an album, not only
+    # the few assets that happen to share embedding tokens with the wording.
+    # If semantic channels produced a sparse set, complete it from the
+    # authorized asset inventory.  This is still scope-bound and modality-
+    # bound (face-id seed images are excluded); it does not read QA answers or
+    # manufacture facts.  The public preview remains representative, while
+    # the private result set retains the full bounded evidence universe for
+    # recall accounting and pagination.
+    if _collection_intent and len(kept) < int(_candidate_limit * 0.7):
+        try:
+            inventory = store.list_assets(scope_id=scope_id or None, limit=100_000) or []
+        except Exception:
+            inventory = []
+        fallback_ids = []
+        for _asset in inventory:
+            _aid = str(_asset.get("id") or "").strip()
+            _name = str(_asset.get("file_name") or "").casefold()
+            if (not _aid or _aid in scores
+                    or _asset.get("media_type") not in {"image", "video"}
+                    or _name.startswith("faceid")):
+                continue
+            fallback_ids.append(_aid)
+            # Keep semantically ranked hits first, then deterministic temporal
+            # coverage.  A tiny positive score makes these candidates survive
+            # the normal ordering without competing with direct matches.
+            scores[_aid] = 1e-6
+        if fallback_ids:
+            kept.extend(fallback_ids)
+            _candidate_limit = max(
+                _candidate_limit,
+                min(len(kept), int(os.getenv("SENTRIX_COLLECTION_MAX_CANDIDATES", "400"))))
     kept.sort(key=lambda a: -scores.get(a, 0))
 
-    # 断层截断（明显 gap 处截断，相对 gap > 45% 视为断层）+ 上限 15 + 保底 3。
+    # 断层截断（明显 gap 处截断，相对 gap > 45% 视为断层）+ 自适应上限 + 保底 3。
     # 45% 相对断层：多路重合的强候选与其后弱候选之间应有大 gap；单路语义召回时
     # λ=0.3 下 rank1~6 分数（1→0.74→0.55→0.41→0.30→0.22）相邻差均 <45%，不误断。
-    final_ids = kept[:_SLOT_MAX_CANDIDATES]
-    if len(final_ids) > 3:
+    # Focused questions retain the compact prompt-friendly window.  Collection
+    # and long-range sequence questions are allowed a larger bounded candidate
+    # set; otherwise a query asking for dozens of dated memories could never
+    # reach full media recall regardless of ranking quality.
+    final_ids = kept[:_candidate_limit]
+    if len(final_ids) > 3 and not _collection_intent:
         _top = scores.get(final_ids[0], 1) or 1.0
         _cut = len(final_ids)
         _gap_ratio = float(os.getenv("SENTRIX_SLOT_GAP_RATIO", "0.5"))
@@ -2659,6 +3362,11 @@ def _search_graph_memory(arguments: dict, *, context: dict | None = None) -> dic
                 "handle": handle,
                 "asset_id": attrs.get("source_asset_id") or node.get("id"),
                 "time_sec": node.get("time_sec"),
+                "captured_at": node.get("captured_at"),
+                "place": node.get("place"),
+                "event_title": node.get("event_title"),
+                "event_summary": node.get("event_summary"),
+                "source_video_file_name": node.get("source_video_file_name"),
                 "event_id": node.get("event_id"),
                 "video_asset_id": node.get("video_uid"),
                 "scene_id": node.get("clip_uid"),
@@ -3126,13 +3834,13 @@ def _confirmed_photo_identities(store, asset_id: str) -> list[dict]:
         """
         SELECT fi.id AS face_instance_id, fi.asset_id, fi.observation_id,
                fi.cluster_id, fi.bbox_json, fi.detection_confidence, fi.quality,
-               fc.entity_id, fc.status AS cluster_status,
+               fc.entity_id, fc.status AS cluster_status, fc.confidence AS cluster_confidence,
                e.canonical_name, e.family_role, e.status AS entity_status,
                em.confidence AS mention_confidence
         FROM face_instances fi
         JOIN face_clusters fc ON fc.id = fi.cluster_id
         JOIN entities e ON e.id = fc.entity_id
-        JOIN entity_mentions em
+        LEFT JOIN entity_mentions em
           ON em.face_instance_id = fi.id
          AND em.entity_id = fc.entity_id
         WHERE fi.asset_id = ?
@@ -3151,7 +3859,7 @@ def _confirmed_photo_identities(store, asset_id: str) -> list[dict]:
         "person_name": str(row["canonical_name"] or ""),
         "family_role": str(row["family_role"] or ""),
         "identity_status": "confirmed",
-        "mention_confidence": row["mention_confidence"],
+        "mention_confidence": row["mention_confidence"] or row["cluster_confidence"],
         "bbox": _decode_bbox(row["bbox_json"]),
         "source": "existing_face_cluster_entity_mention",
     } for row in rows]

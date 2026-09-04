@@ -1175,6 +1175,8 @@ class CausalEdgeBuilder:
                         properties={
                             "sub_type": edge_type,
                             "confidence": confidence,
+                            "confidence_score": confidence,
+                            "evidence_tier": "inferred",
                             "reason": v.get("reason", ""),
                         },
                     ))
@@ -1254,6 +1256,8 @@ class CausalEdgeBuilder:
                         properties={
                             "sub_type": edge_type,
                             "confidence": confidence,
+                            "confidence_score": confidence,
+                            "evidence_tier": "inferred",
                             "reason": v.get("reason", ""),
                         },
                     ))
@@ -1288,6 +1292,8 @@ class CausalEdgeBuilder:
                 properties={
                     "sub_type": edge_type,
                     "confidence": 0.8,
+                    "confidence_score": 0.8,
+                    "evidence_tier": "supported",
                     "reason": reason,
                 },
             ))

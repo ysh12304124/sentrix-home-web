@@ -284,6 +284,7 @@ class KeyframeMemoryBuilder:
                 "source_frame_path": payload.get("frame_path"),
                 "clip_path": clip_path,
                 "source_clip_path": payload.get("clip_path"),
+                "source_video_file_name": payload.get("source_video_file_name") or "",
                 "point_id": payload.get("point_id") or str(point_id),
                 "frame_idx": payload.get("frame_idx"),
                 "frame_seq": payload.get("frame_seq"),
@@ -291,6 +292,7 @@ class KeyframeMemoryBuilder:
                 "video_time_sec": payload.get("video_time_sec"),
                 "captured_at": payload.get("captured_at") or "",
                 "place": payload.get("place") or "",
+                "captured_location": payload.get("captured_location") or "",
                 "person_ids": list(payload.get("person_ids") or []),
                 "person_labels": list(payload.get("person_labels") or []),
                 "entity_refs": list(payload.get("entity_refs") or []),
@@ -550,14 +552,16 @@ class KeyframeMemoryBuilder:
             self.graph_db.add_link(Link(
                 source_node_id=src, target_node_id=tgt,
                 link_type=LinkType.TEMPORAL,
-                properties={"sub_type": "TIME_PRECEDES", "sequence_index": i},
+                properties={"sub_type": "TIME_PRECEDES", "sequence_index": i,
+                            "confidence": 1.0, "evidence_tier": "confirmed"},
             ))
             created += 1
             if bidirectional:
                 self.graph_db.add_link(Link(
                     source_node_id=tgt, target_node_id=src,
                     link_type=LinkType.TEMPORAL,
-                    properties={"sub_type": "TIME_SUCCEEDS", "sequence_index": i},
+                    properties={"sub_type": "TIME_SUCCEEDS", "sequence_index": i,
+                                "confidence": 1.0, "evidence_tier": "confirmed"},
                 ))
                 created += 1
         return created
@@ -597,6 +601,7 @@ class KeyframeMemoryBuilder:
                     source_node_id=left[3], target_node_id=right[3],
                     link_type=LinkType.TEMPORAL,
                     properties={"sub_type": "SCENE_NEXT", "confidence": 1.0,
+                                "confidence_score": 1.0, "evidence_tier": "confirmed",
                                 "video_uid": left[0]},
                 ))
                 created += 1
@@ -615,14 +620,16 @@ class KeyframeMemoryBuilder:
             self.graph_db.add_link(Link(
                 source_node_id=clip_node.node_id, target_node_id=fid,
                 link_type=LinkType.SEMANTIC,
-                properties={"sub_type": "CLIP_CONTAINS", "confidence": 1.0},
+                properties={"sub_type": "CLIP_CONTAINS", "confidence": 1.0,
+                            "confidence_score": 1.0, "evidence_tier": "confirmed"},
             ))
             created += 1
             if bidirectional:
                 self.graph_db.add_link(Link(
                     source_node_id=fid, target_node_id=clip_node.node_id,
                     link_type=LinkType.SEMANTIC,
-                    properties={"sub_type": "PART_OF_CLIP", "confidence": 1.0},
+                    properties={"sub_type": "PART_OF_CLIP", "confidence": 1.0,
+                                "confidence_score": 1.0, "evidence_tier": "confirmed"},
                 ))
                 created += 1
         return created
@@ -640,7 +647,8 @@ class KeyframeMemoryBuilder:
                     self.graph_db.add_link(Link(
                         source_node_id=video_node.node_id, target_node_id=clip_node_id,
                         link_type=LinkType.SEMANTIC,
-                        properties={"sub_type": "VIDEO_CONTAINS", "confidence": 1.0},
+                        properties={"sub_type": "VIDEO_CONTAINS", "confidence": 1.0,
+                                    "confidence_score": 1.0, "evidence_tier": "confirmed"},
                     ))
                     created += 1
         return created
@@ -672,14 +680,18 @@ class KeyframeMemoryBuilder:
                     self.graph_db.add_link(Link(
                         source_node_id=fid, target_node_id=hub_id,
                         link_type=LinkType.ENTITY,
-                        properties={"sub_type": "MENTIONS_OBJECT", "entity": obj},
+                        properties={"sub_type": "MENTIONS_OBJECT", "entity": obj,
+                                    "confidence": 0.9, "confidence_score": 0.9,
+                                    "evidence_tier": "supported"},
                     ))
                     created += 1
                     if bidirectional:
                         self.graph_db.add_link(Link(
                             source_node_id=hub_id, target_node_id=fid,
                             link_type=LinkType.ENTITY,
-                            properties={"sub_type": "MENTIONED_IN", "entity": obj},
+                            properties={"sub_type": "MENTIONED_IN", "entity": obj,
+                                        "confidence": 0.9, "confidence_score": 0.9,
+                                        "evidence_tier": "supported"},
                         ))
                         created += 1
             else:
@@ -689,7 +701,8 @@ class KeyframeMemoryBuilder:
                         self.graph_db.add_link(Link(
                             source_node_id=fids[i], target_node_id=fids[j],
                             link_type=LinkType.ENTITY,
-                            properties={"sub_type": "SAME_ENTITY", "entity": obj, "confidence": 0.9},
+                            properties={"sub_type": "SAME_ENTITY", "entity": obj, "confidence": 0.9,
+                                        "confidence_score": 0.9, "evidence_tier": "supported"},
                         ))
                         created += 1
         return created
@@ -721,7 +734,8 @@ class KeyframeMemoryBuilder:
                         source_node_id=fid, target_node_id=hub_id,
                         link_type=LinkType.SEMANTIC,
                         properties={"sub_type": "SHARES_RELATION",
-                                    "relation": rel, "confidence": 0.7},
+                                    "relation": rel, "confidence": 0.7,
+                                    "confidence_score": 0.7, "evidence_tier": "supported"},
                     ))
                     created += 1
                 continue
@@ -740,7 +754,8 @@ class KeyframeMemoryBuilder:
                     self.graph_db.add_link(Link(
                         source_node_id=fi, target_node_id=fj,
                         link_type=LinkType.SEMANTIC,
-                        properties={"sub_type": "SHARES_RELATION", "relation": rel, "confidence": 0.7},
+                        properties={"sub_type": "SHARES_RELATION", "relation": rel, "confidence": 0.7,
+                                    "confidence_score": 0.7, "evidence_tier": "supported"},
                     ))
                     created += 1
         return created
@@ -815,7 +830,8 @@ class KeyframeMemoryBuilder:
                     source_node_id=src, target_node_id=tgt,
                     link_type=LinkType.SEMANTIC,
                     properties={"sub_type": "VISUAL_SIMILAR",
-                                "similarity": score},
+                                "similarity": score, "confidence": score,
+                                "confidence_score": score, "evidence_tier": "inferred"},
                 ))
                 created += 1
         return created

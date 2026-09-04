@@ -89,6 +89,21 @@ class KeyframeQueryEngine:
     STRONG_CROSS_VIDEO_SUBTYPES = (
         "VISUAL_SIMILAR", "SHARES_RELATION", "SAME_ENTITY")
     MAX_HUB_EXPANSION = 160
+    # Graph edges are not equally reliable.  Deterministic timeline and
+    # containment links may always be traversed; similarity/LLM-derived links
+    # must carry a minimum score or they turn common objects into noisy hubs.
+    GRAPH_EDGE_MIN_CONFIDENCE = {
+        "VISUAL_SIMILAR": 0.80,
+        "SHARES_RELATION": 0.65,
+        "SAME_ENTITY": 0.80,
+        "LEADS_TO": 0.60,
+        "ENABLES": 0.60,
+    }
+    GRAPH_DETERMINISTIC_EDGES = {
+        "TIME_PRECEDES", "TIME_SUCCEEDS", "SCENE_NEXT", "CLIP_CONTAINS",
+        "PART_OF_CLIP", "VIDEO_CONTAINS", "PART_OF_VIDEO", "OCCURRED_AT",
+        "CAPTURED_ON", "MENTIONS_PERSON", "PERSON_IN_FRAME",
+    }
 
     def __init__(
         self,
@@ -551,7 +566,9 @@ class KeyframeQueryEngine:
             captured = str(attrs.get("captured_at") or "").lower()
             place = str(attrs.get("place") or "").lower()
             event_text = " ".join(str(attrs.get(k) or "").lower()
-                                  for k in ("event_title", "event_summary"))
+                                  for k in ("event_title", "event_summary",
+                                            "sentrix_event_title", "sentrix_event_summary",
+                                            "sentrix_event_place", "event_text"))
             score = 0.0
             if any(date in captured[:10].replace("/", "-") for date in dates):
                 score += 100.0
@@ -559,7 +576,10 @@ class KeyframeQueryEngine:
                 if len(term) >= 2 and term in place:
                     score += 120.0 if len(term) >= 3 else 70.0
                 elif len(term) >= 3 and term in event_text:
-                    score += 12.0
+                    # Event summaries are identity-bearing evidence, not a
+                    # weak visual hint.  Let them compete with exact place
+                    # fields while still requiring the term to be present.
+                    score += 90.0 if len(term) >= 4 else 55.0
             if score > 0:
                 node.metadata_score = score
                 scored.append((score, node))
@@ -665,6 +685,34 @@ class KeyframeQueryEngine:
 
         return True
 
+    @classmethod
+    def _trusted_graph_edge(cls, link) -> bool:
+        """Reject weak/inferred edges before they contaminate graph recall.
+
+        Older graph files only stored ``confidence`` while newer files also
+        store ``confidence_score``.  Read both formats so this remains
+        backwards compatible and does not require changing the database.
+        """
+        props = link.properties or {}
+        subtype = str(props.get("sub_type") or "").upper()
+        if subtype in cls.GRAPH_DETERMINISTIC_EDGES:
+            return True
+        minimum = cls.GRAPH_EDGE_MIN_CONFIDENCE.get(subtype)
+        if minimum is None:
+            # Unknown semantic edges are useful only when explicitly marked
+            # as confirmed/supported; inferred edges are not safe expansion
+            # bridges for unrelated frames.
+            return str(props.get("evidence_tier") or "").lower() in {
+                "confirmed", "supported"
+            }
+        raw = props.get("confidence_score", props.get("confidence",
+                       props.get("similarity", 0.0)))
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            return False
+        return score >= minimum
+
     def _get_neighbor_links(self, node, follow_link_types=None,
                             direction: str = None,
                             max_links: Optional[int] = None) -> List[Tuple]:
@@ -705,6 +753,8 @@ class KeyframeQueryEngine:
                 continue
             if link is None:
                 continue
+            if not self._trusted_graph_edge(link):
+                continue
             if not self._link_allowed(link, True, follow_link_types, direction):
                 continue
             t = self.graph_db.get_node(target_id)
@@ -715,6 +765,8 @@ class KeyframeQueryEngine:
             if source_id == node.node_id or source_id in seen:
                 continue
             if link is None:
+                continue
+            if not self._trusted_graph_edge(link):
                 continue
             if not self._link_allowed(link, False, follow_link_types, direction):
                 continue
@@ -1350,14 +1402,22 @@ class KeyframeQueryEngine:
             # exact hits in the node's persisted context fields must win.
             place_text = str(attrs.get("place") or "").lower()
             captured_text = str(attrs.get("captured_at") or "").lower()
+            event_context = " ".join(str(attrs.get(key) or "").lower() for key in (
+                "event_title", "event_summary", "sentrix_event_title",
+                "sentrix_event_summary", "sentrix_event_place",
+                "sentrix_event_time_start", "sentrix_event_time_end"))
             context_anchor_score = 0.0
             anchor_dates, anchor_places = self._metadata_query_anchors(question)
             for term in set(terms) | set(anchor_places):
                 if len(term) >= 2 and term in place_text:
                     context_anchor_score += 120.0
+                elif len(term) >= 3 and term in event_context:
+                    context_anchor_score += 65.0
             for date in anchor_dates:
                 if date in captured_text[:10].replace("/", "-"):
                     context_anchor_score += 100.0
+                elif date in event_context:
+                    context_anchor_score += 90.0
 
             sim = getattr(node, "similarity_score", 0)
             try:
@@ -1422,10 +1482,31 @@ class KeyframeQueryEngine:
             objs = attrs.get("object_labels") or []
             rels = attrs.get("relation_labels") or []
             t = attrs.get("clip_time_sec", "?")
-            video = (attrs.get("video_uid") or "")[:8]
-            clip = (attrs.get("clip_uid") or "")[:8]
-            parts.append("[%d] t=%ss video=%s clip=%s | objects=%s | relations=%s" % (
-                i + 1, t, video, clip, objs[:6], rels[:4]))
+            video = (attrs.get("video_uid") or "")[:12]
+            clip = (attrs.get("clip_uid") or "")[:12]
+            captured = str(attrs.get("captured_at") or "").strip()
+            place = str(attrs.get("place") or "").strip()
+            title = str(attrs.get("event_title") or attrs.get("sentrix_event_title") or "").strip()
+            summary = str(attrs.get("event_summary") or attrs.get("sentrix_event_summary") or "").strip()
+            narration = str(attrs.get("narration_text") or "").strip()
+            action = str(attrs.get("action_text") or "").strip()
+            source = str(attrs.get("source_video_file_name") or attrs.get("clip_path") or "").strip()
+            metadata = " | ".join(item for item in (
+                f"captured={captured}" if captured else "",
+                f"place={place}" if place else "",
+                f"event={title}" if title else "",
+                f"summary={summary[:240]}" if summary else "",
+                f"source={source}" if source else "",
+            ) if item)
+            visual = " | ".join(item for item in (
+                f"objects={objs[:8]}" if objs else "",
+                f"relations={rels[:6]}" if rels else "",
+                f"narration={narration[:160]}" if narration else "",
+                f"action={action[:120]}" if action else "",
+            ) if item)
+            parts.append("[%d] t=%ss video=%s clip=%s | %s%s" % (
+                i + 1, t, video, clip, metadata,
+                (" | " + visual) if visual else ""))
         return "\n".join(parts)
 
     # ------------------------------------------------------------------ #

@@ -27,6 +27,11 @@ def _truthy(value: str | None, default: bool = False) -> bool:
 class GraphMemoryService:
     """Facade used by scripts and FastAPI routes."""
 
+    # Bump when the persisted projection fields or event-to-frame links
+    # change.  The next query then rebuilds the derived graph automatically
+    # instead of silently serving an older snapshot.
+    GRAPH_SCHEMA_VERSION = 2
+
     def __init__(self, db_path: str | Path | None = None, graph_path: str | Path | None = None):
         root = Path(__file__).resolve().parents[2]
         data_dir = Path(os.getenv("SENTRIX_DATA_DIR", root / "data"))
@@ -96,6 +101,7 @@ class GraphMemoryService:
                 "scope_id": scope_id or "all",
                 "include_images": bool(include_images),
                 "causal_enabled": bool(enable_causal_edges),
+                "graph_schema_version": self.GRAPH_SCHEMA_VERSION,
                 "stats": stats,
             })
         finally:
@@ -374,6 +380,7 @@ class GraphMemoryService:
             "duplicate_edge_rate": duplicate_count / total_edges if total_edges else None,
             "valid_edge_rate": valid_edges / total_edges if total_edges else None,
             "connected_nodes": connected_nodes,
+            "valid_edges": valid_edges,
             "supported_edges": supported_edges,
             "consistent_edges": consistent_edges,
             "duplicate_edges": duplicate_count,
@@ -520,6 +527,7 @@ class GraphMemoryService:
                 built_count = 0
             built_include_images = False
             built_causal = False
+            built_schema_version = 0
             try:
                 gconn = sqlite3.connect(self.graph_path)
                 metadata_row = gconn.execute("SELECT value FROM metadata WHERE key = 'sentrix_build'").fetchone()
@@ -528,11 +536,13 @@ class GraphMemoryService:
                     metadata = json.loads(metadata_row[0])
                     built_include_images = bool(metadata.get("include_images"))
                     built_causal = bool(metadata.get("causal_enabled"))
+                    built_schema_version = int(metadata.get("graph_schema_version") or 0)
             except Exception:
                 built_include_images = False
             if current_count and (current_count != built_count
                                   or (include_images and not built_include_images)
-                                  or (causal_enabled and not built_causal)):
+                                  or (causal_enabled and not built_causal)
+                                  or built_schema_version < self.GRAPH_SCHEMA_VERSION):
                 # Keep one complete derived graph and apply scope filtering at
                 # traversal time; rebuilding a scope-specific graph here
                 # would overwrite memories from other albums.
@@ -568,6 +578,12 @@ class GraphMemoryService:
             "video_uid": attrs.get("video_uid"),
             "clip_uid": attrs.get("clip_uid"),
             "time_sec": attrs.get("video_time_sec", attrs.get("clip_time_sec")),
+            "captured_at": attrs.get("captured_at"),
+            "place": attrs.get("place") or attrs.get("sentrix_event_place"),
+            "event_title": attrs.get("event_title") or attrs.get("sentrix_event_title"),
+            "event_summary": attrs.get("event_summary") or attrs.get("sentrix_event_summary"),
+            "source_asset_id": attrs.get("source_asset_id") or attrs.get("frame_uid"),
+            "source_video_file_name": attrs.get("source_video_file_name"),
             "event_id": attrs.get("sentrix_event_id") or attrs.get("event_id"),
             "person_ids": attrs.get("person_ids") or [],
             "objects": attrs.get("object_labels") or [],
@@ -635,7 +651,10 @@ class GraphMemoryService:
                     source_node_id=frame_id,
                     target_node_id=node_id,
                     link_type=LinkType.ENTITY,
-                    properties={"sub_type": subtype, "confidence": float(entity.get("confidence") or 1.0)},
+                    properties={"sub_type": subtype,
+                                "confidence": float(entity.get("confidence") or 1.0),
+                                "confidence_score": float(entity.get("confidence") or 1.0),
+                                "evidence_tier": "supported"},
                 ))
                 added_edges += 1
 
@@ -663,6 +682,8 @@ class GraphMemoryService:
                         "sub_type": "SAME_ENTITY",
                         "sentrix_entity_id": entity_id,
                         "confidence": min(1.0, float(entity.get("confidence") or 1.0)),
+                        "confidence_score": min(1.0, float(entity.get("confidence") or 1.0)),
+                        "evidence_tier": "confirmed",
                     },
                 ))
                 same_person_edges += 1
@@ -763,20 +784,31 @@ class GraphMemoryService:
         events = {str(row["id"]): dict(row) for row in rows}
 
         for node in list(builder.graph_db.nodes.values()):
-            if node.node_type.value != "SESSION":
+            attrs = node.attributes or {}
+            if node.node_type.value == "EVENT":
+                event_id = str(attrs.get("event_id") or "")
+            elif node.node_type.value == "SESSION":
+                event_id = str(attrs.get("clip_uid") or "")
+            else:
                 continue
-            event_id = str((node.attributes or {}).get("clip_uid") or "")
             event = events.get(event_id)
             if not event:
                 continue
             title = str(event.get("title") or "").strip()
             summary = str(event.get("summary") or "").strip()
-            if title:
+            if title and node.node_type.value == "SESSION":
                 node.summary = title if not summary else f"{title}\n{summary}"
-            if summary:
-                node.attributes["sentrix_event_summary"] = summary
-            node.attributes["sentrix_event_id"] = event_id
-            node.attributes["sentrix_event_title"] = title
-            node.attributes["sentrix_event_place"] = event.get("place")
-            node.attributes["sentrix_event_time_start"] = event.get("time_start")
-            node.attributes["sentrix_event_time_end"] = event.get("time_end")
+            # EVENT nodes are what the query engine returns.  Project the
+            # session's event evidence onto them as well, so the graph and
+            # ordinary retrieval expose one consistent memory record.
+            if summary and not attrs.get("event_summary"):
+                attrs["event_summary"] = summary
+            if title and not attrs.get("event_title"):
+                attrs["event_title"] = title
+            attrs["sentrix_event_summary"] = summary
+            attrs["sentrix_event_id"] = event_id
+            attrs["sentrix_event_title"] = title
+            attrs["sentrix_event_place"] = event.get("place")
+            attrs["sentrix_event_time_start"] = event.get("time_start")
+            attrs["sentrix_event_time_end"] = event.get("time_end")
+            node.attributes = attrs

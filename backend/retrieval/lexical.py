@@ -12,6 +12,7 @@ Kernel's condition pass — never copied from a matched FTS row directly
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 
 from ..retrieval_indexes import RetrievalIndex
 from .base import CandidateHit, HardFilterContext, RetrievalQuery
@@ -29,6 +30,10 @@ class LexicalRetriever:
         # per scope instead of globally, otherwise the first scope searched in
         # a process suppresses the self-heal for every later album.
         self._populated_scopes: set[str | None] = set()
+        # A fresh benchmark scope can be queried by many QA workers at once.
+        # Serialize the one-time FTS self-heal; concurrent rebuild_all calls
+        # can corrupt SQLite/FTS on Windows and crash the API process.
+        self._populate_lock = threading.Lock()
 
     def _scope(self, filters: HardFilterContext) -> str | None:
         if filters.all_authorized or not filters.scope_ids:
@@ -36,6 +41,10 @@ class LexicalRetriever:
         return filters.scope_ids[0]
 
     def _ensure_populated(self, scope_id=None):
+        with self._populate_lock:
+            return self._ensure_populated_unlocked(scope_id)
+
+    def _ensure_populated_unlocked(self, scope_id=None):
         """Self-heal an empty *or partial* lexical projection.
 
         Checking only ``COUNT(*) == 0`` left a partially written FTS table
@@ -59,10 +68,28 @@ class LexicalRetriever:
                 "SELECT COUNT(DISTINCT observation_id) FROM observation_search_fts "
                 + ("WHERE scope_id = ?" if scope_id else ""), params
             ).fetchone()[0] or 0)
+            # Event-level evidence was added to the derived lexical
+            # projection after older databases had already been built.  A
+            # one-time self-heal is needed even when the observation row count
+            # looks healthy; otherwise date/place/event queries never see the
+            # new terms until a manual maintenance rebuild.
+            event_terms = int(conn.execute(
+                "SELECT COUNT(*) FROM observation_search_terms WHERE field_type='event_summary'"
+                + (" AND scope_id = ?" if scope_id else ""), params
+            ).fetchone()[0] or 0)
             # Some observations legitimately have no textual fields.  A 50%
             # floor still catches truncated projections while avoiding a
             # rebuild for tiny/mostly-empty fixtures.
-            if expected and indexed < max(1, expected // 2):
+            event_exists_sql = (
+                "SELECT 1 FROM events e JOIN event_observations eo ON eo.event_id=e.id "
+                "JOIN observations o ON o.id=eo.observation_id "
+                "JOIN assets a ON a.id=o.asset_id "
+                "WHERE a.scope_id = ? LIMIT 1" if scope_id else
+                "SELECT 1 FROM events LIMIT 1"
+            )
+            event_exists = conn.execute(event_exists_sql, params if scope_id else ()).fetchone()
+            if expected and (indexed < max(1, expected // 2) or
+                             (event_terms == 0 and event_exists)):
                 self.index.rebuild_all(scope_id=scope_id)
         except Exception:
             pass
