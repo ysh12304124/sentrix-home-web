@@ -4,5 +4,6 @@
   "judge_model": "doubao-seed-2.0-lite",
   "vllm_manager_url": "http://192.168.0.153:8500",
   "model_base_url": "http://192.168.0.153:8100/v1",
+  "endpoint_model": "gemma4-12b-it",
   "judge_provider_id": "volcengine-doubao-seed-2.0-lite"
 }
