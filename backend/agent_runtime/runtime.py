@@ -1821,6 +1821,8 @@ class AgentRuntime:
         # 5B：证据需求未满足时，最多给模型一次补证/修正的机会；模型坚持 final 就放行，
         # 代码不再写死"现有证据不足，无法确认。"覆盖模型已给的好答案。
         gate_unattempted_prompted = False
+        # 反编造：零工具调用却给出具体数字断言时，只给一次"检索核实"机会；模型坚持再放行。
+        fabrication_check_prompted = False
         wants_visual = visual_intent(message)
         # 预算 B：同一工具同一失败原因（evidence_incompatible / no_evidence_returned
         # 等）连续 2 次就强制换动作，避免小模型在同一个失败模式上反复消耗预算，
@@ -2400,6 +2402,30 @@ class AgentRuntime:
                             "available_tools": [spec.name for spec in available],
                             "pending_requirements": pending,
                         })
+                # 反编造软门槛：需求为空（模型认为无需证据）不代表可以凭空编数字。
+                # 零工具调用却给出具体数字/金额/年份断言时，只给一次"检索核实"机会，
+                # 检索后没有依据就让模型如实说无法确认；模型坚持原样再放行（不覆盖）。
+                if (self.profile.features.get("agent2_authoritative")
+                        and agent2_task_state is not None
+                        and not fabrication_check_prompted
+                        and not task.tool_results
+                        and turn.budget.can_model_step()
+                        and not _CHAT_ONLY_RE.search(message)
+                        and re.search(
+                            r"\d[\d,，.万]*\s*(?:元|块钱|万|桌|张|人|个|名|年|月|日|号)",
+                            str(action.get("answer") or ""))):
+                    fabrication_check_prompted = True
+                    final_gate = turn.agent2_trace.setdefault("final_gate", {})
+                    final_gate["decision"] = "verify_claim_no_tools"
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                    messages.append({"role": "user", "content": (
+                        "你的回答给出了具体的数字/金额/年份，但本轮还没有检索相册来核实。"
+                        "请先调用 search_memories 检索相关照片（必要时再 read_photo_text / inspect_photo "
+                        "查看照片里的文字或细节）；如果相册里确实没有能确认该数字的依据，"
+                        "请如实说“现有记录无法确认”，不要编造数字。"
+                    )})
+                    continue
+
                 # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
                 if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
                     open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
