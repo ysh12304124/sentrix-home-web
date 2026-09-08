@@ -1339,39 +1339,28 @@ def _build_answer_grounding(*, message: str, task: TaskState,
         display_mode = "inline_images"
     else:
         display_mode = "collapsed"
-    evidence_asset_set = set(evidence_assets)
-    valid_selected_ids = [str(aid) for aid in (selected_image_ids or [])
-                          if aid and str(aid) in evidence_asset_set]
-    if not valid_selected_ids and evidence_assets:
-        valid_selected_ids = evidence_assets[:3]
-    # Model-selected evidence can miss a GT image even though the code
-    # candidate set contains it (measured delivery recall 0.70 vs ~0.95 code
-    # candidate recall).  Backfill delivery from the code candidate order so a
-    # GT image is not dropped purely because the validator under-ranked it.
-    if (len(valid_selected_ids) < 3 and retrieved_assets
-            and display_mode != "none"):
-        # 只在答案有证据支撑、确实需要展示图时从代码候选补齐（保 GT 不丢）。
-        # display_mode=none（闲聊/拒答/无证据）绝不能因补齐而返回无关图——
-        # 无答案的题应返回空图，而不是把代码候选塞进 delivery。
-        for _aid in retrieved_assets:
-            if str(_aid) not in valid_selected_ids:
-                valid_selected_ids.append(str(_aid))
-            if len(valid_selected_ids) >= 3:
-                break
-    valid_selected_handles = list(selected_image_handles or [])
-    if rs is not None:
-        valid_selected_handles = [handle for handle in valid_selected_handles
-                                  if any(str(aid) in evidence_asset_set
-                                         and f"photo_{rs.visible_asset_ids().index(aid) + 1}" == str(handle)
-                                         for aid in rs.visible_asset_ids())]
-    else:
-        # A handle without its originating result set cannot be resolved safely.
-        valid_selected_handles = []
-    if rs is not None and not valid_selected_handles:
-        valid_selected_handles = [
-            f"photo_{rs.visible_asset_ids().index(aid) + 1}"
-            for aid in valid_selected_ids if aid in rs.visible_asset_ids()
-        ]
+    # 交付口径（E）：只展示模型显式选择且出现在当前结果集里的图。
+    # search_memories 返回即"看到"，不需要 inspect/evidence 提升；模型没选 → 空交付合法，
+    # 代码绝不把 evidence/candidate 前几张塞进 delivery（不再 backfill）。
+    visible_ids = list(rs.visible_asset_ids()) if rs is not None else []
+    handle_to_id = ({f"photo_{index + 1}": asset_id
+                     for index, asset_id in enumerate(visible_ids)}
+                    if rs is not None else {})
+    id_to_handle = {asset_id: handle for handle, asset_id in handle_to_id.items()}
+    valid_selected_handles = []
+    for handle in (selected_image_handles or []):
+        handle = str(handle or "").strip()
+        if handle in handle_to_id and handle not in valid_selected_handles:
+            valid_selected_handles.append(handle)
+    valid_selected_ids = [handle_to_id[handle] for handle in valid_selected_handles]
+    # 少数内部调用方直接给 id（无 handle 的老路径）：按可见集回补 handle。
+    if not valid_selected_ids and (selected_image_ids or []):
+        for asset_id in selected_image_ids:
+            asset_id = str(asset_id or "").strip()
+            handle = id_to_handle.get(asset_id)
+            if handle and handle not in valid_selected_handles:
+                valid_selected_handles.append(handle)
+                valid_selected_ids.append(asset_id)
     return {
         "required": used_evidence,
         "display_mode": display_mode,
@@ -3166,45 +3155,9 @@ class AgentRuntime:
                     message=message, task=task, selected_handle=selected_handle,
                     selected_image_handles=turn.selected_image_handles,
                     selected_image_ids=turn.selected_image_ids)
-        # Delivery is a projection of evidence, not a second retrieval path.
-        # If the writer omits selected_image_handles, expose up to three
-        # representative evidence images so both 4174 and 8771 still show the
-        # sources that support the answer.  Never fall back to raw candidates.
-        if not turn.selected_image_handles:
-            fallback_items = [
-                item for item in
-                (turn.answer_grounding.get("evidence_images") or [])
-                if item.get("asset_id")
-            ][:3]
-            fallback_handles = [
-                str(item.get("handle")) for item in fallback_items
-                if item.get("handle")
-            ]
-            fallback_ids = [
-                str(item.get("asset_id")) for item in fallback_items
-                if item.get("asset_id")
-            ]
-            if fallback_handles or fallback_ids:
-                # A structured fact may have a source asset but no current
-                # ResultSet handle.  Keep the asset ID as the delivery key so
-                # both benchmark and production clients can render it.
-                turn.selected_image_handles = fallback_handles
-                turn.selected_image_ids = fallback_ids
-                try:
-                    from . import tools as runtime_tools
-                    resolved = [
-                        asset_id for handle in fallback_handles
-                        if (asset_id := runtime_tools.resolve_handle_asset_id(
-                            handle, task.current_result_set, self.scope_id))
-                    ]
-                    if resolved:
-                        turn.selected_image_ids = list(dict.fromkeys(resolved))
-                except Exception:
-                    pass
-                turn.answer_grounding = _build_answer_grounding(
-                    message=message, task=task, selected_handle=selected_handle,
-                    selected_image_handles=turn.selected_image_handles,
-                    selected_image_ids=turn.selected_image_ids)
+        # 交付口径（E）：不再从 evidence/candidate 兜底补图。模型显式选择（含
+        # group 枚举的来源行）即交付；模型没选、或答案本就没有依据图（拒答/闲聊）
+        # → 交付为空，这是合法状态，前端按"回答依据图片为空"展示。
         turn.termination_reason = _classify_termination(turn)
         if turn.agent2_trace.get("writer_output"):
             turn.answer_source = "writer"

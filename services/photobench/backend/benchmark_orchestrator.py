@@ -2914,9 +2914,11 @@ class BenchmarkRun:
             retrieved_media = _resolve_predicted_media(media_sets["retrieved_asset_ids"], assets_by_name)
             evidence_media = _resolve_predicted_media(media_sets["evidence_asset_ids"], assets_by_name)
 
-            # Match against GT
-            metrics = _modality_metrics(gt_refs, retrieved_media)
-            gt_media = _resolve_gt_media(gt_refs, assets_by_name, retrieved_media)
+            # Match against GT. 交付口径（E）：主要"回答来源/召回"指标对齐到模型的
+            # 显式交付（selected/delivery），与 UI 展示的模型回答图片一致；检索候选集
+            # 只作为检索层诊断单独保留，不再冒充回答来源参与召回指标。
+            metrics = _modality_metrics(gt_refs, selected_media)
+            gt_media = _resolve_gt_media(gt_refs, assets_by_name, selected_media)
             retrieved_keys = {
                 _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
                 for value in retrieved_media
@@ -2930,7 +2932,9 @@ class BenchmarkRun:
                 for value in selected_media
             }
             matched = sorted(entry["file_name"] for entry in gt_media
-                             if _media_key(entry["media_type"], entry["media_id"]) in retrieved_keys)
+                             if _media_key(entry["media_type"], entry["media_id"]) in selected_keys)
+            matched_retrieved = sorted(entry["file_name"] for entry in gt_media
+                                       if _media_key(entry["media_type"], entry["media_id"]) in retrieved_keys)
             evidence_matched = sorted(entry["file_name"] for entry in gt_media
                                       if _media_key(entry["media_type"], entry["media_id"]) in evidence_keys)
             delivery_matched = sorted(entry["file_name"] for entry in gt_media
