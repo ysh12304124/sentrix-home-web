@@ -1,6 +1,11 @@
 # PhotoBench 评测服务
 
-独立维护的 PhotoBench + Sentrix 端到端评测服务，包含本地编排器、Vue 3 前端、引用数据集、历史结果与日志。
+本仓库是三部分系统中的测试平台：负责调用算法服务、执行 QA/Judge 测评并保存结果。完整项目的最新算法、前端主界面和测试平台代码均以 153 机器上的工程为准。
+
+- 最新算法服务：<http://192.168.0.153:8091>
+- 前端主界面：<http://192.168.0.200:4174/#/search>
+- 最新前端主界面：<http://192.168.0.153:4174/#/search>
+- 最新测试平台：<http://192.168.0.153:8771/>
 
 ## 目录
 
@@ -10,6 +15,7 @@ frontend/                Vue 3 源码
 frontend/dist/           前端生产构建
 config/                  vLLM Manager 目标配置
 data/                    评测相册、身份图和 QA（本地数据，不纳入 Git）
+docs/                    项目介绍、面板使用方法和优化调试方法
 results/                 历史评测结果（本地数据，不纳入 Git）
 logs/                    服务日志（不纳入 Git）
 scripts/                 本地启动脚本
@@ -17,7 +23,10 @@ scripts/                 本地启动脚本
 
 ## 默认开发模式
 
+安装 Python 依赖后启动：
+
 ```bash
+python3 -m pip install -r requirements.txt
 ./scripts/start.sh
 ```
 
@@ -43,7 +52,7 @@ npm run build
 
 构建完成后，生产页面由 Python 后端从 `frontend/dist/` 提供，可通过 <http://127.0.0.1:8771/> 访问。
 
-默认依赖：100 服务器 Sentrix 后端、153 服务器 vLLM Manager，以及本机 Judge 服务。Judge 默认使用编排器所在机器自动探测的局域网 IPv4（例如 `http://192.168.1.65:1234`），不使用 `localhost`；具体地址仍可通过 `BENCH_SENTRIX_URL`、`BENCH_JUDGE_URL`、`BENCH_VLLM_API_URL` 等环境变量覆盖。
+默认依赖的算法服务、模型服务和 Judge 地址以面板“运行配置”为准；具体地址可通过 `BENCH_SENTRIX_URL`、`BENCH_JUDGE_URL`、`BENCH_VLLM_API_URL` 等环境变量覆盖。
 
 ## 结果 API
 
@@ -59,6 +68,10 @@ npm run build
 新结果会保存 Sentrix 现有 Agent 响应中的逐轮模型性能、工具调用、Guard/结束原因、Agent 状态和 QA 分类字段。评测 UI 仅展示工具名称、状态、调用关系和耗时，不依赖或呈现具体后端实现。历史结果缺少 QA 分类时，只读关联本地 QA 数据集补充展示；缺少真实运行指标时继续明确标记为未记录，不从服务日志推测或补造。
 
 ## 数据来源与扩展边界
+
+当前项目结构、面板功能、测评操作方式，以及记忆查询架构和图关系建立的优化调试方法，统一见 [PhotoBench 测评项目介绍与系统使用说明](docs/project-introduction-and-evaluation-guide.md)。
+
+Word 版（含当前项目分工、本周工作方向、测试参数和交付物）：[PhotoBench 项目介绍与测评系统使用说明（Word）](docs/PhotoBench_Project_Introduction_and_Evaluation_Guide_Updated.docx)
 
 | 信息 | 当前来源 | 是否需要 Sentrix 新接口 |
 |---|---|---|

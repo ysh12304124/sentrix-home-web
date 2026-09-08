@@ -1,0 +1,9 @@
+{
+  "sentrix_url": "http://127.0.0.1:9598",
+  "judge_url": "http://127.0.0.1:8100/v1",
+  "judge_model": "qwen3-vl-4b",
+  "vllm_manager_url": "",
+  "model_base_url": "http://127.0.0.1:8100/v1",
+  "endpoint_model": "qwen3-vl-4b",
+  "judge_provider_id": "dashscope-qwen3.8-max"
+}

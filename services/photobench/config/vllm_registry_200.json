@@ -1,0 +1,28 @@
+{
+  "service_root": "/home/sscy/deployments/sentrix-home-test/vllm-runtime",
+  "state_file": "/home/sscy/deployments/sentrix-home-test/vllm-runtime/state/current.json",
+  "vllm_binary": "/home/sscy/deployments/sentrix-home-test/.venv-vllm/bin/vllm",
+  "default_host": "0.0.0.0",
+  "default_port": 8100,
+  "profiles": {
+    "qwen3-vl-4b": {
+      "model": "/home/liangjiahua/Video_memory_01/memory_KV/models/Qwen3-VL-4B-Instruct",
+      "served_model_name": "qwen3-vl-4b",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.75,
+      "max_model_len": 4096,
+      "max_num_seqs": 1,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "mm_processor_cache_gb": 0,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "default_max_tokens": 1501,
+      "notes": "Qwen3-VL-4B on 192.168.0.200 via vLLM",
+      "host": "192.168.0.200"
+    }
+  }
+}

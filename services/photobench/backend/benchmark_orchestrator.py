@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import base64
 import hashlib
@@ -19,10 +20,13 @@ import json
 import math
 import mimetypes
 import os
+import random
 import re
 import shutil
+import shlex
 import socket
 import ssl
+import sys
 import threading
 import time
 import traceback
@@ -35,11 +39,40 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from backend.runtime_providers import (
+    ManagerLifecycleProvider,
+    ManagerTelemetryProvider,
+    OpenAICompatibleInferenceProvider,
+    UnavailableLifecycleProvider,
+    UnavailableTelemetryProvider,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "results"
 DEFAULT_WEB_ROOT = PROJECT_ROOT / "frontend/dist"
-DEFAULT_SENTRIX_URL = os.environ.get("BENCH_SENTRIX_URL", "http://192.168.0.153:8091")
+RUNTIME_CONNECTION_CONFIG_PATH = PROJECT_ROOT / "config/runtime_connection.json"
+RUNTIME_CONNECTION_CONFIG_LOCK = threading.RLock()
+
+
+def _load_runtime_connection_config() -> dict:
+    try:
+        value = json.loads(RUNTIME_CONNECTION_CONFIG_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+RUNTIME_CONNECTION_CONFIG = _load_runtime_connection_config()
+DEFAULT_SENTRIX_URL = (
+    os.environ.get("BENCH_SENTRIX_URL")
+    or str(RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or "")
+    or "http://192.168.0.153:8091"
+)
 
 
 def local_lan_ip() -> str:
@@ -60,6 +93,28 @@ CUSTOM_JUDGE_PROMPT_PATH = PROJECT_ROOT / "config/custom_judge_prompt.json"
 TASK_ACTION_POLICY_PATH = PROJECT_ROOT / "config/qa_task_actions.json"
 JUDGE_PROVIDERS_PATH = PROJECT_ROOT / "config/judge_providers.json"
 EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
+# Progress is served from the in-memory run state.  Coalesce frequent snapshots
+# so disk I/O does not become part of the Agent/Judge wall-clock measurements.
+PERSIST_DEBOUNCE_SECONDS = max(
+    0.05, float(os.environ.get("PHOTOBENCH_PERSIST_DEBOUNCE_SECONDS", "0.25"))
+)
+JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "6")))
+JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "5.0")))
+JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
+    JUDGE_RETRY_BACKOFF_SECONDS,
+    float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_MAX_SECONDS", "60.0")),
+)
+JUDGE_REQUEST_INTERVAL_SECONDS = max(
+    0.0, float(os.environ.get("PHOTOBENCH_JUDGE_REQUEST_INTERVAL_SECONDS", "0.5"))
+)
+
+
+def _judge_thinking_kwargs(judge_url: str | None) -> dict:
+    """Disable cloud-provider reasoning while preserving local judge payloads."""
+    endpoint = str(judge_url or "").lower()
+    if "volces.com" in endpoint or "volcengine.com" in endpoint:
+        return {"thinking": {"type": "disabled"}}
+    return {"enable_thinking": False}
 
 
 def _load_judge_providers():
@@ -78,11 +133,19 @@ def _load_judge_providers():
 
 
 def _public_judge_providers(providers: dict[str, dict]) -> list[dict]:
-    return [
-        {"id": pid, "label": p.get("label") or pid, "model": p.get("model") or "",
-         "url": p.get("url") or "", "supports_vision": p.get("supports_vision", False)}
-        for pid, p in sorted(providers.items())
-    ]
+    result = []
+    for pid, provider in sorted(providers.items()):
+        _, url, model, api_key = resolve_judge_provider(pid)
+        result.append({
+            "id": pid,
+            "label": provider.get("label") or pid,
+            "model": model,
+            "url": url,
+            "supports_vision": provider.get("supports_vision", False),
+            "api_key_set": bool(api_key),
+            "api_key_hint": _secret_hint(api_key),
+        })
+    return result
 
 
 def resolve_judge_provider(provider_id: str | None) -> tuple[str, str, str, str]:
@@ -90,16 +153,71 @@ def resolve_judge_provider(provider_id: str | None) -> tuple[str, str, str, str]
     provider = JUDGE_PROVIDERS.get(selected)
     if not provider:
         raise ValueError(f"unknown judge provider: {selected}")
-    return selected, str(provider.get("url") or ""), str(provider.get("model") or ""), str(provider.get("api_key") or "")
+    configured_id = str(RUNTIME_CONNECTION_CONFIG.get("judge_provider_id") or "").strip()
+    use_runtime_override = not configured_id or selected == configured_id
+    url = str(provider.get("url") or "")
+    model = str(provider.get("model") or "")
+    if use_runtime_override:
+        url = str(RUNTIME_CONNECTION_CONFIG.get("judge_url") or url)
+        model = str(RUNTIME_CONNECTION_CONFIG.get("judge_model") or model)
+    api_key = os.getenv("BENCH_JUDGE_API_KEY")
+    if api_key is None:
+        api_key = str(provider.get("api_key") or "")
+    return selected, url, model, api_key
 
 
 DEFAULT_JUDGE_PROVIDER_ID, JUDGE_PROVIDERS = _load_judge_providers()
+_configured_judge_provider_id = str(RUNTIME_CONNECTION_CONFIG.get("judge_provider_id") or "").strip()
+if _configured_judge_provider_id in JUDGE_PROVIDERS:
+    DEFAULT_JUDGE_PROVIDER_ID = _configured_judge_provider_id
 _, _P_URL, _P_MODEL, _P_KEY = resolve_judge_provider(None)
-DEFAULT_JUDGE_URL = os.environ.get("BENCH_JUDGE_URL") or _P_URL
-DEFAULT_VLLM_API_URL = os.environ.get("BENCH_VLLM_API_URL", "http://192.168.0.153:8500")
-DEFAULT_VLLM_BASE_URL = os.environ.get("BENCH_VLLM_BASE_URL", "http://192.168.0.153:8105/v1")
-JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL") or _P_MODEL
-JUDGE_API_KEY = os.environ.get("BENCH_JUDGE_API_KEY") or _P_KEY
+DEFAULT_JUDGE_URL = (
+    os.environ.get("BENCH_JUDGE_URL")
+    or str(RUNTIME_CONNECTION_CONFIG.get("judge_url") or "")
+    or _P_URL
+)
+DEFAULT_VLLM_API_URL = (
+    os.environ.get("BENCH_VLLM_API_URL")
+    or (str(RUNTIME_CONNECTION_CONFIG.get("vllm_manager_url"))
+        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://192.168.0.153:8500")
+)
+DEFAULT_VLLM_BASE_URL = (
+    os.environ.get("BENCH_VLLM_BASE_URL")
+    or (str(RUNTIME_CONNECTION_CONFIG.get("model_base_url"))
+        if "model_base_url" in RUNTIME_CONNECTION_CONFIG else "")
+    or ""
+)
+BIG_MODEL_PROFILE_ID = "big_model"
+BIG_MODEL_BASE_URL = os.environ.get("BENCH_BIG_MODEL_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3")
+BIG_MODEL_MODEL = os.environ.get("BENCH_BIG_MODEL_MODEL", "doubao-seed-2.0-lite")
+BIG_MODEL_ENABLED = os.environ.get("BENCH_BIG_MODEL_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL") or str(RUNTIME_CONNECTION_CONFIG.get("judge_model") or "") or _P_MODEL
+JUDGE_API_KEY = os.environ.get("BENCH_JUDGE_API_KEY") if os.environ.get("BENCH_JUDGE_API_KEY") is not None else _P_KEY
+
+
+def _secret_hint(value: str | None) -> str:
+    secret = str(value or "")
+    if not secret:
+        return ""
+    if len(secret) <= 4:
+        return "*" * len(secret)
+    return f"{secret[:2]}{'*' * min(8, len(secret) - 4)}{secret[-2:]}"
+
+
+def _write_local_env_secret(name: str, value: str) -> None:
+    """Update one secret in the evaluator's localhost dotenv file."""
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{name} must be a single-line value")
+    env_path = PROJECT_ROOT / ".env.local"
+    existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    prefix = f"{name}="
+    lines = [line for line in existing if not line.startswith(prefix)]
+    if value:
+        lines.append(f"{name}={shlex.quote(value)}")
+    temporary = env_path.with_name(f"{env_path.name}.tmp.{os.getpid()}")
+    temporary.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, env_path)
 
 
 def load_vllm_targets() -> tuple[str, dict[str, dict]]:
@@ -115,6 +233,10 @@ def load_vllm_targets() -> tuple[str, dict[str, dict]]:
 
 
 DEFAULT_VLLM_TARGET_ID, VLLM_TARGETS = load_vllm_targets()
+if not DEFAULT_VLLM_BASE_URL and "model_base_url" not in RUNTIME_CONNECTION_CONFIG:
+    DEFAULT_VLLM_BASE_URL = str(
+        VLLM_TARGETS.get(DEFAULT_VLLM_TARGET_ID, {}).get("model_base_url") or ""
+    ).rstrip("/")
 
 
 def resolve_vllm_target(target_id: str | None) -> tuple[str, dict]:
@@ -123,6 +245,94 @@ def resolve_vllm_target(target_id: str | None) -> tuple[str, dict]:
     if not target:
         raise ValueError(f"unknown vLLM target: {selected}")
     return selected, target
+
+
+def normalize_model_base_url(value: str | None) -> str:
+    """Normalize a user-entered model endpoint to an OpenAI /v1 base URL."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "http://" + raw
+    raw = raw.rstrip("/")
+    return raw if re.search(r"/v\d+$", raw, flags=re.IGNORECASE) else f"{raw}/v1"
+
+
+def normalize_service_url(value: str | None) -> str:
+    """Normalize a user-entered HTTP service URL without adding an API path."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "http://" + raw
+    return raw.rstrip("/")
+
+
+def _validated_service_url(value: str | None, label: str, *, optional: bool = False) -> str:
+    normalized = normalize_service_url(value)
+    if not normalized and optional:
+        return ""
+    parsed = urlparse(normalized)
+    if not parsed.netloc:
+        raise ValueError(f"{label} must be a host:port or HTTP(S) URL")
+    return normalized
+
+
+def public_runtime_connection_config() -> dict:
+    return {
+        "sentrix_url": DEFAULT_SENTRIX_URL,
+        "judge_url": DEFAULT_JUDGE_URL,
+        "judge_model": JUDGE_MODEL,
+        "judge_api_key_set": bool(JUDGE_API_KEY),
+        "judge_api_key_hint": _secret_hint(JUDGE_API_KEY),
+        "vllm_manager_url": (
+            str(RUNTIME_CONNECTION_CONFIG["vllm_manager_url"])
+            if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else DEFAULT_VLLM_API_URL
+        ),
+        "model_base_url": (
+            str(RUNTIME_CONNECTION_CONFIG["model_base_url"])
+            if "model_base_url" in RUNTIME_CONNECTION_CONFIG else DEFAULT_VLLM_BASE_URL
+        ),
+        "endpoint_model": str(RUNTIME_CONNECTION_CONFIG.get("endpoint_model") or ""),
+        "judge_provider_id": DEFAULT_JUDGE_PROVIDER_ID,
+    }
+
+
+def persist_runtime_connection_config(payload: dict) -> dict:
+    """Persist only non-secret connection settings and return their effective values."""
+    provider_id = str(payload.get("judge_provider_id") or DEFAULT_JUDGE_PROVIDER_ID).strip()
+    if provider_id not in JUDGE_PROVIDERS:
+        raise ValueError(f"unknown judge provider: {provider_id}")
+    values = {
+        "sentrix_url": _validated_service_url(payload.get("sentrix_url"), "Sentrix URL"),
+        "judge_url": _validated_service_url(payload.get("judge_url"), "Judge URL"),
+        "judge_model": str(payload.get("judge_model") or "").strip(),
+        "vllm_manager_url": _validated_service_url(
+            payload.get("vllm_manager_url"), "vLLM Manager URL", optional=True
+        ),
+        "model_base_url": normalize_model_base_url(payload.get("model_base_url")),
+        "endpoint_model": str(payload.get("endpoint_model") or "").strip(),
+        "judge_provider_id": provider_id,
+    }
+    if not values["judge_model"]:
+        raise ValueError("Judge model is required")
+    temporary = RUNTIME_CONNECTION_CONFIG_PATH.with_name(
+        f"{RUNTIME_CONNECTION_CONFIG_PATH.name}.tmp.{os.getpid()}"
+    )
+    with RUNTIME_CONNECTION_CONFIG_LOCK:
+        RUNTIME_CONNECTION_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, RUNTIME_CONNECTION_CONFIG_PATH)
+        RUNTIME_CONNECTION_CONFIG.clear()
+        RUNTIME_CONNECTION_CONFIG.update(values)
+        global JUDGE_API_KEY, JUDGE_MODEL
+        if "judge_api_key" in payload:
+            secret = str(payload.get("judge_api_key") or "")
+            _write_local_env_secret("BENCH_JUDGE_API_KEY", secret)
+            os.environ["BENCH_JUDGE_API_KEY"] = secret
+            JUDGE_API_KEY = secret
+        JUDGE_MODEL = values["judge_model"]
+    return public_runtime_connection_config()
 
 JUDGE_PROMPT = """你是通用对话任务的回答质量评测员。根据截至当前轮的完整对话、当前问题、预期行为、可回答性、模型回答和参考答案，对“模型是否有效完成用户本轮任务”打 0/1/2 分。
 
@@ -328,16 +538,46 @@ def summarize_agent2_trace(runtime_turns: list[dict]) -> dict:
     return res
 
 
-def load_custom_judge_prompt() -> str | None:
+JUDGE_PROMPT_KINDS: dict[str, str] = {
+    "answer_quality": JUDGE_PROMPT,
+    "task_decision": TASK_JUDGE_PROMPT,
+    "evidence": EVIDENCE_JUDGE_PROMPT,
+}
+
+
+def _read_custom_judge_prompt_file() -> dict:
     if CUSTOM_JUDGE_PROMPT_PATH.exists():
         try:
-            return json.loads(CUSTOM_JUDGE_PROMPT_PATH.read_text(encoding="utf-8")).get("judge_prompt") or None
+            data = json.loads(CUSTOM_JUDGE_PROMPT_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, OSError):
-            return None
-    return None
+            return {}
+    return {}
 
-def save_custom_judge_prompt(prompt: str) -> None:
-    atomic_json(CUSTOM_JUDGE_PROMPT_PATH, {"judge_prompt": prompt})
+
+def load_custom_judge_prompts() -> dict[str, str | None]:
+    data = _read_custom_judge_prompt_file()
+    legacy = data.get("judge_prompt") or None
+    return {
+        "answer_quality": data.get("answer_quality") or legacy,
+        "task_decision": data.get("task_decision") or None,
+        "evidence": data.get("evidence") or None,
+    }
+
+
+def load_custom_judge_prompt() -> str | None:
+    """Legacy helper: answer-quality prompt only."""
+    return load_custom_judge_prompts().get("answer_quality")
+
+
+def save_custom_judge_prompt(prompt: str, kind: str = "answer_quality") -> None:
+    if kind not in JUDGE_PROMPT_KINDS:
+        raise ValueError(f"unknown judge prompt kind: {kind}")
+    data = _read_custom_judge_prompt_file()
+    if "judge_prompt" in data:  # migrate legacy single-prompt key
+        data.setdefault("answer_quality", data.pop("judge_prompt"))
+    data[kind] = prompt.strip() or None  # empty string restores the default
+    atomic_json(CUSTOM_JUDGE_PROMPT_PATH, data)
 
 
 def judge_score_consistency(score: int | None, reason: str) -> bool:
@@ -381,8 +621,24 @@ def request_json(url: str, payload=None, method: str = "GET", timeout: int = 120
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")[:2000]
+        detail = raw.strip()
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                detail = parsed.get("detail") or parsed.get("error") or parsed.get("message") or parsed
+            else:
+                detail = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if isinstance(detail, (dict, list)):
+            detail = json.dumps(detail, ensure_ascii=False)
+        detail = str(detail or exc.reason or "request failed")[:1000]
+        raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {detail}") from exc
 
 
 def request_text(url: str, timeout: int = 120) -> str:
@@ -488,7 +744,20 @@ def upload_files(url: str, fields: dict, files: list[tuple[str, str, bytes]], ti
         return json.loads(resp.read())
 
 
-def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -> dict:
+RUN_MODES = ("full", "reuse", "build", "resume")
+PIPELINE_PENDING_STATUSES = {
+    "queued", "processing", "semantic_enriching",
+    "video-queued", "video-keyframe-extracting", "video-scene-importing",
+}
+PIPELINE_FAILED_STATUSES = {"failed", "video-processing-failed"}
+CURRENT_MODEL_SELECTION = "__current__"
+
+
+class RunCancelledError(RuntimeError):
+    """Raised when the orchestrator cancels while waiting on a remote call."""
+
+
+def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, cancelled=None) -> dict:
     """Resolve the asynchronous Sentrix assistant-turn response when necessary."""
     turn_id = response.get("turn_id")
     if not turn_id or response.get("status") not in {"running", "pending"}:
@@ -497,6 +766,8 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -
     deadline = time.monotonic() + timeout
     poll_url = f"{base_url.rstrip('/')}/api/assistant/turn/{quote(str(turn_id))}"
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            raise RunCancelledError(f"run cancelled while waiting for assistant turn {turn_id}")
         state = request_json(poll_url, timeout=min(30, max(1, int(deadline - time.monotonic()))))
         status = str(state.get("status") or "").lower()
         if status in {"complete", "completed", "done", "success"}:
@@ -510,42 +781,204 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900) -
     raise TimeoutError(f"assistant turn {turn_id} did not complete within {timeout}s")
 
 
-def _extract_image_ids(result: dict) -> list[str]:
-    """Collect images returned by retrieval tools without scanning unrelated payload data."""
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+
+
+def _infer_media_type(value: object, explicit: object = None) -> str:
+    media_type = str(explicit or "").strip().lower()
+    if media_type in {"image", "video"}:
+        return media_type
+    text = str(value or "").strip()
+    suffix = Path(text.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS or re.fullmatch(r"video-\d+", Path(text).name, re.I):
+        return "video"
+    return "image"
+
+
+def _media_key(media_type: object, media_id: object) -> tuple[str, str]:
+    """Return the stable comparison key used by GT and retrieved assets."""
+    kind = _infer_media_type(media_id, media_type)
+    name = Path(str(media_id or "").split("?", 1)[0].split("#", 1)[0]).name
+    canonical = Path(name).stem if kind == "video" else name
+    return kind, canonical.casefold()
+
+
+def _normalize_media_refs(record: dict, prefix: str = "retrieval") -> list[dict[str, str]]:
+    """Read typed refs first, then deterministically upgrade legacy ID fields."""
+    refs = record.get(f"{prefix}_media_refs")
+    candidates: list[tuple[object, object]] = []
+    if isinstance(refs, list):
+        for ref in refs:
+            if isinstance(ref, dict):
+                candidates.append((ref.get("media_type"), ref.get("media_id") or ref.get("id")))
+    else:
+        for value in record.get(f"{prefix}_image_ids") or []:
+            candidates.append((None, value))
+        for value in record.get(f"{prefix}_video_ids") or []:
+            candidates.append(("video", value))
+
+    normalized = []
+    seen = set()
+    for explicit_type, value in candidates:
+        media_id = str(value or "").strip()
+        if not media_id:
+            continue
+        media_type = _infer_media_type(media_id, explicit_type)
+        key = _media_key(media_type, media_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"media_type": media_type, "media_id": media_id})
+    return normalized
+
+
+def _extract_media_sets(result: dict) -> dict[str, list[str]]:
+    """Separate retrieval candidates, evidence sources, and user delivery.
+
+    Debug candidate fields are intentionally used only for retrieval accounting;
+    they must never silently become the user-facing delivery set.
+    """
+    retrieved: list[str] = []
+    evidence: list[str] = []
     ids: list[str] = []
+    selected_handles: list[str] = []
 
-    def visit(value):
-        if isinstance(value, dict):
-            for key in ("asset_ids", "image_ids"):
-                if isinstance(value.get(key), list):
-                    ids.extend(str(x) for x in value[key])
-            for key in ("image_id", "asset_id", "file_name", "path"):
-                if value.get(key):
-                    ids.append(str(value[key]))
-                    break
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
+    def add(values, target):
+        if isinstance(values, list):
+            target.extend(str(value) for value in values if value)
 
-    for key in ("image_results", "evidence", "retrieved_images", "images"):
-        visit(result.get(key))
-    task_state = result.get("task_state") or result.get("taskState") or {}
-    if isinstance(task_state, dict):
-        for tool_result in task_state.get("tool_results") or task_state.get("toolResults") or []:
-            if not isinstance(tool_result, dict):
-                continue
-            for key in ("asset_ids", "image_ids"):
-                values = tool_result.get(key)
-                if isinstance(values, list):
-                    ids.extend(str(value) for value in values if value)
-            visit(tool_result.get("preview"))
-    return list(dict.fromkeys(ids))
+    add(result.get("retrieved_asset_ids"), retrieved)
+    add(result.get("evidence_asset_ids"), evidence)
+    add(result.get("source_asset_ids"), evidence)
+    add(result.get("selected_image_ids"), ids)
+    grounding = result.get("answer_grounding") or result.get("answerGrounding") or {}
+    if isinstance(grounding, dict):
+        add(grounding.get("retrieved_candidates") or grounding.get("retrieved_asset_ids"), retrieved)
+        add(grounding.get("evidence_sources") or grounding.get("evidence_asset_ids"), evidence)
+        add(grounding.get("selected_delivery") or grounding.get("selected_asset_ids"), ids)
+        values = grounding.get("selected_image_handles") or grounding.get("selectedImageHandles")
+        if isinstance(values, list):
+            selected_handles.extend(str(value) for value in values if value)
+    delivery = result.get("image_delivery") or result.get("imageDelivery") or {}
+    if isinstance(delivery, dict):
+        add(delivery.get("selected_asset_ids") or delivery.get("asset_ids"), ids)
+    # Legacy top-level fields are retained only because they already represent
+    # an explicit user-facing image payload, not an arbitrary nested search trace.
+    for item in result.get("retrieved_images") or []:
+        if isinstance(item, dict) and item.get("asset_id"):
+            ids.append(str(item["asset_id"]))
+
+    # Resolve explicitly selected handles through debug preview projections.
+    # The full debug_asset_ids list is deliberately ignored.
+    for trace in result.get("tool_trace") or []:
+        if not isinstance(trace, dict):
+            continue
+        add(trace.get("debug_asset_ids"), retrieved)
+        # Debug previews are candidate projections, not evidence sources.
+        add(trace.get("debug_preview_asset_ids"), retrieved)
+        # 聚合工具（query_memory_facts）只提供文本统计/枚举清单，绝不产生照片候选。
+        # 检索候选（retrieved）与证据（evidence）只统计 search_memories 等找图工具，
+        # 与"非 search 工具不影响模型可见召回图"的设计一致；否则 operation=list 的
+        # 全库 items 会被误算成候选（实测 82/86 张）。
+        if str(trace.get("tool") or "") == "query_memory_facts":
+            continue
+        # Debug preview is only a candidate projection, not evidence.
+        observation = trace.get("observation") or trace.get("result") or {}
+        if isinstance(observation, dict):
+            add(observation.get("retrieved_asset_ids") or observation.get("asset_ids"), retrieved)
+            add(observation.get("evidence_asset_ids"), evidence)
+            add(observation.get("source_asset_ids"), evidence)
+            for row in (observation.get("items") or observation.get("rows") or []):
+                if isinstance(row, dict) and row.get("asset_id"):
+                    evidence.append(str(row["asset_id"]))
+                    retrieved.append(str(row["asset_id"]))
+        handles = trace.get("debug_preview_handles") or []
+        preview_ids = trace.get("debug_preview_asset_ids") or []
+        if not handles or not preview_ids:
+            continue
+        mapping = {str(handle): str(preview_ids[index])
+                   for index, handle in enumerate(handles)
+                   if index < len(preview_ids) and preview_ids[index]}
+        ids.extend(mapping[handle] for handle in selected_handles if handle in mapping)
+    # Explicit delivery is also evidence, but only after the independent sets
+    # have been collected. This preserves the subset invariant.
+    evidence.extend(ids)
+    retrieved.extend(evidence)
+    return {
+        "retrieved_asset_ids": list(dict.fromkeys(retrieved)),
+        "evidence_asset_ids": list(dict.fromkeys(evidence)),
+        "selected_asset_ids": list(dict.fromkeys(ids)),
+    }
 
 
-def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> list[dict]:
-    """Resolve returned asset IDs into the stable fields required by the UI."""
+def _extract_image_sets(result: dict) -> dict[str, list[str]]:
+    """Backward-compatible alias for callers predating mixed-media support."""
+    return _extract_media_sets(result)
+
+
+def _extract_image_ids(result: dict) -> list[str]:
+    """Backward-compatible delivery-only projection."""
+    return _extract_media_sets(result)["selected_asset_ids"]
+
+
+def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
+    """Build exact reusable album/model bases from persisted run-to-scope links."""
+    runs_by_scope = {}
+    for run in runs or []:
+        if not isinstance(run, dict) or not run.get("scope_id"):
+            continue
+        runs_by_scope.setdefault(str(run["scope_id"]), []).append(run)
+    groups = {}
+    for space in spaces or []:
+        if not isinstance(space, dict) or not space.get("id"):
+            continue
+        scope_id = str(space["id"])
+        linked = sorted(runs_by_scope.get(scope_id, []),
+                        key=lambda item: str(item.get("started_at") or item.get("created_at") or ""),
+                        reverse=True)
+        source = linked[0] if linked else {}
+        album_id = str(source.get("album_id") or "").strip()
+        model_candidates = sorted({str(run.get("model_profile") or "").strip()
+                                   for run in linked if run.get("model_profile")},
+                                  key=len, reverse=True)
+        space_name = str(space.get("name") or "").lower()
+        model_profile = next((model for model in model_candidates
+                              if safe_slug(model).lower() in space_name), "")
+        model_profile = model_profile or str(source.get("model_profile") or "").strip()
+        if not album_id or not model_profile:
+            name = str(space.get("name") or "")
+            match = re.search(r"PhotoBench-\d{8}-\d{6}-(?P<album>.+?)-(?P<model>(?:qwen|gemma|llama|phi|mistral|current|big_model)[^-]*)$", name, re.I)
+            if match:
+                album_id = album_id or match.group("album")
+                model_profile = model_profile or match.group("model")
+        if not album_id or not model_profile:
+            continue
+        key = (album_id, model_profile)
+        matching_runs = [run for run in linked
+                         if str(run.get("album_id") or "") == album_id
+                         and str(run.get("model_profile") or "") == model_profile]
+        group = groups.setdefault(key, {
+            "base_id": f"{album_id}::{model_profile}",
+            "album_id": album_id,
+            "model_profile": model_profile,
+            "scope_id": scope_id,
+            "scope_name": space.get("name") or scope_id,
+            "created_at": space.get("created_at") or "",
+            "source_run_ids": [],
+            "ready": str(space.get("status") or "active") == "active",
+        })
+        if str(space.get("created_at") or "") > str(group.get("created_at") or ""):
+            group.update({"scope_id": scope_id, "scope_name": space.get("name") or scope_id,
+                          "created_at": space.get("created_at") or ""})
+        group["source_run_ids"] = sorted(set(group["source_run_ids"] + [
+            str(run.get("run_id")) for run in matching_runs if run.get("run_id")
+        ]))
+    return sorted(groups.values(), key=lambda item: (
+        str(item.get("album_id") or ""), str(item.get("model_profile") or "")))
+
+
+def _resolve_predicted_media(asset_ids: list[str], assets_by_name: dict) -> list[dict]:
+    """Resolve returned asset IDs into typed records required by metrics and UI."""
     assets_by_id = {
         str(asset["id"]): (file_name, asset)
         for file_name, assets in assets_by_name.items()
@@ -553,16 +986,237 @@ def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> lis
         if asset.get("id")
     }
     resolved = []
-    for image_id in image_ids:
-        match = assets_by_id.get(str(image_id))
+    for asset_id in asset_ids:
+        match = assets_by_id.get(str(asset_id))
         if not match:
             continue
         file_name, asset = match
-        image = {"asset_id": str(image_id), "file_name": file_name}
+        media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
+        media = {
+            "asset_id": str(asset_id),
+            "file_name": file_name,
+            "media_type": media_type,
+            "media_id": Path(file_name).stem if media_type == "video" else file_name,
+        }
         if asset.get("media_url"):
-            image["media_url"] = asset["media_url"]
-        resolved.append(image)
+            media["media_url"] = asset["media_url"]
+        resolved.append(media)
     return resolved
+
+
+def _resolve_predicted_images(image_ids: list[str], assets_by_name: dict) -> list[dict]:
+    """Backward-compatible image-only projection."""
+    return [{key: item[key] for key in ("asset_id", "file_name", "media_url") if key in item}
+            for item in _resolve_predicted_media(image_ids, assets_by_name)
+            if item.get("media_type") == "image"]
+
+
+def _resolve_album_media_file(album_id: str, media_dir: str, file_name: str) -> Path | None:
+    media_root = (BENCHMARK_DATA_ROOT / album_id / media_dir).resolve()
+    media_path = (media_root / file_name).resolve()
+    if not media_path.is_relative_to(media_root) or not media_path.is_file():
+        return None
+    return media_path
+
+
+def _metric_triplet(gt_keys: set[tuple[str, str]], predicted_keys: set[tuple[str, str]]) -> dict:
+    matched = gt_keys & predicted_keys
+    recall = len(matched) / len(gt_keys) if gt_keys else None
+    precision = len(matched) / len(predicted_keys) if predicted_keys else (0.0 if gt_keys else None)
+    f1 = (2 * precision * recall / (precision + recall)) \
+        if precision is not None and recall is not None and precision + recall \
+        else (0.0 if gt_keys else None)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "matched": len(matched),
+        "predicted": len(predicted_keys),
+        "gt": len(gt_keys),
+    }
+
+
+def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict]) -> dict[str, dict]:
+    gt_keys = {_media_key(ref.get("media_type"), ref.get("media_id")) for ref in gt_refs}
+    predicted_keys = {
+        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
+        for item in predicted_media
+    }
+    result = {"media": _metric_triplet(gt_keys, predicted_keys)}
+    for media_type in ("image", "video"):
+        result[media_type] = _metric_triplet(
+            {key for key in gt_keys if key[0] == media_type},
+            {key for key in predicted_keys if key[0] == media_type},
+        )
+    return result
+
+
+def _micro_metrics_from_counts(items: list[dict], field: str) -> dict:
+    rows = [item.get(field) for item in items if isinstance(item.get(field), dict)
+            and int((item.get(field) or {}).get("gt") or 0) > 0]
+    gt = sum(int(row.get("gt") or 0) for row in rows)
+    predicted = sum(int(row.get("predicted") or 0) for row in rows)
+    matched = sum(int(row.get("matched") or 0) for row in rows)
+    precision = matched / predicted if predicted else (0.0 if gt else None)
+    recall = matched / gt if gt else None
+    f1 = 2 * precision * recall / (precision + recall) \
+        if precision is not None and recall is not None and precision + recall \
+        else (0.0 if gt else None)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "metric_count": len(rows),
+        "matched": matched,
+        "predicted": predicted,
+        "gt": gt,
+    }
+
+
+def _macro_metrics_from_counts(items: list[dict], field: str) -> dict:
+    rows = [item.get(field) for item in items if isinstance(item.get(field), dict)
+            and int((item.get(field) or {}).get("gt") or 0) > 0]
+    values = {"precision": [], "recall": [], "f1": []}
+    for row in rows:
+        gt = int(row.get("gt") or 0)
+        predicted = int(row.get("predicted") or 0)
+        matched = int(row.get("matched") or 0)
+        precision = matched / predicted if predicted else 0.0
+        recall = matched / gt
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        values["precision"].append(precision)
+        values["recall"].append(recall)
+        values["f1"].append(f1)
+    return {metric: sum(samples) / len(samples) if samples else None
+            for metric, samples in values.items()} | {"metric_count": len(rows)}
+
+
+def _retrieval_metric_eligible(item: dict) -> bool:
+    return str(item.get("answerability") or "").strip().lower() != "unanswerable"
+
+
+def _resolve_gt_media(gt_refs: list[dict], assets_by_name: dict,
+                      retrieved_media: list[dict]) -> list[dict]:
+    asset_index: dict[tuple[str, str], list[dict]] = {}
+    for file_name, assets in assets_by_name.items():
+        for asset in assets:
+            media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
+            asset_index.setdefault(_media_key(media_type, file_name), []).append(asset)
+    retrieved_keys = {
+        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
+        for item in retrieved_media
+    }
+    result = []
+    for ref in gt_refs:
+        media_type = ref["media_type"]
+        media_id = ref["media_id"]
+        key = _media_key(media_type, media_id)
+        candidates = asset_index.get(key, [])
+        file_name = Path(media_id).name
+        if media_type == "video" and Path(file_name).suffix.lower() not in VIDEO_EXTENSIONS:
+            file_name = f"{file_name}.mp4"
+        result.append({
+            "media_type": media_type,
+            "media_id": media_id,
+            "image_id": media_id if media_type == "image" else None,
+            "video_id": media_id if media_type == "video" else None,
+            "file_name": file_name,
+            "asset_id": candidates[0].get("id") if len(candidates) == 1 else None,
+            "matched": key in retrieved_keys,
+            "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous",
+        })
+    return result
+
+
+def _qa_scope_id_for_album(spaces: list[dict], album_id: str) -> str | None:
+    """Choose the newest Sentrix scope whose name identifies this benchmark album."""
+    target = safe_slug(album_id).casefold()
+    candidates = []
+    for space in spaces or []:
+        if not isinstance(space, dict) or not space.get("id"):
+            continue
+        name = str(space.get("name") or "")
+        slug = safe_slug(name).casefold()
+        if not target or target not in slug:
+            continue
+        exact = 1 if re.search(rf"(?:^|[-_]){re.escape(target)}(?:[-_]|$)", slug) else 0
+        candidates.append((exact, str(space.get("created_at") or ""), str(space["id"])))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][2]
+
+
+def _resolve_qa_media_rows(sentrix_url: str, album_id: str, rows: list[dict]) -> tuple[list[dict], dict]:
+    """Resolve portable QA media refs against the configured Sentrix backend."""
+    refs_by_key = {}
+    for row in rows:
+        for prefix in ("retrieval", "answer_evidence"):
+            for ref in _normalize_media_refs(row, prefix):
+                refs_by_key[_media_key(ref["media_type"], ref["media_id"])] = ref
+        for claim in row.get("answer_claims") or []:
+            if isinstance(claim, dict):
+                for ref in _normalize_media_refs(claim, "evidence"):
+                    refs_by_key[_media_key(ref["media_type"], ref["media_id"])] = ref
+    if not refs_by_key:
+        return rows, {"status": "no_media", "resolved_count": 0, "missing_count": 0, "ambiguous_count": 0}
+    base = normalize_service_url(sentrix_url)
+    if not base:
+        return rows, {"status": "sentrix_url_missing", "resolved_count": 0,
+                      "missing_count": len(refs_by_key), "ambiguous_count": 0}
+    try:
+        spaces_data = request_json(f"{base}/api/memory-spaces?limit=1000", timeout=20)
+        spaces = spaces_data.get("spaces") if isinstance(spaces_data, dict) else spaces_data
+        scope_id = _qa_scope_id_for_album(spaces or [], album_id)
+        query = f"{base}/api/assets?limit=1000"
+        if scope_id:
+            query += f"&scope_id={quote(scope_id)}"
+        assets_data = request_json(query, timeout=30)
+        assets = assets_data.get("assets") if isinstance(assets_data, dict) else assets_data
+    except Exception as exc:
+        return rows, {"status": "sentrix_unavailable", "error": str(exc),
+                      "resolved_count": 0, "missing_count": len(refs_by_key), "ambiguous_count": 0}
+    index = {}
+    for asset in assets or []:
+        if not isinstance(asset, dict) or not asset.get("id"):
+            continue
+        name = str(asset.get("file_name") or "")
+        kind = _infer_media_type(name, asset.get("media_type") or asset.get("asset_type"))
+        index.setdefault(_media_key(kind, name), []).append(asset)
+    resolved = {}
+    counts = {"resolved_count": 0, "missing_count": 0, "ambiguous_count": 0}
+    for key, ref in refs_by_key.items():
+        candidates = index.get(key, [])
+        item = {**ref, "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous"}
+        if len(candidates) == 1:
+            asset = candidates[0]
+            item.update({"asset_id": str(asset["id"]),
+                         "file_name": asset.get("file_name") or ref["media_id"],
+                         "media_url": f"{base}/api/assets/{quote(str(asset['id']))}/file"})
+            counts["resolved_count"] += 1
+        elif candidates:
+            item["candidate_asset_ids"] = [str(asset["id"]) for asset in candidates]
+            counts["ambiguous_count"] += 1
+        else:
+            counts["missing_count"] += 1
+        resolved[key] = item
+
+    def attach(record: dict, prefix: str) -> None:
+        refs = _normalize_media_refs(record, prefix)
+        if refs:
+            record[f"{prefix}_media_refs"] = [resolved[_media_key(ref["media_type"], ref["media_id"])] for ref in refs]
+
+    enriched = []
+    for row in rows:
+        item = copy.deepcopy(row)
+        attach(item, "retrieval")
+        attach(item, "answer_evidence")
+        for claim in item.get("answer_claims") or []:
+            if isinstance(claim, dict):
+                attach(claim, "evidence")
+        enriched.append(item)
+    return enriched, {"status": "resolved", "scope_id": scope_id, **counts,
+                      "total_refs": len(refs_by_key)}
 
 
 def _execution_failure(agent_status: str | None, termination_reason: str | None) -> bool:
@@ -664,6 +1318,19 @@ def safe_slug(value: str, fallback: str = "x") -> str:
     return slug or fallback
 
 
+def album_media_entries(manifest: dict) -> list[str]:
+    """Return photo then video paths from an album manifest, de-duplicated."""
+    entries = []
+    seen = set()
+    for key in ("photos", "videos"):
+        for item in manifest.get(key) or []:
+            relative = str(item).strip()
+            if relative and relative not in seen:
+                seen.add(relative)
+                entries.append(relative)
+    return entries
+
+
 def load_jsonl(path: Path) -> list[dict]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -724,7 +1391,7 @@ def dataset_integrity(album_dir: Path, manifest: dict, qa_set: str) -> dict:
     manifest_path = album_dir / "manifest.json"
     qa_path = album_dir / str((manifest.get("qa_sets") or {})[qa_set])
     entries = ["manifest.json", str(qa_path.relative_to(album_dir))]
-    entries.extend(str(path) for path in manifest.get("photos") or [])
+    entries.extend(album_media_entries(manifest))
     entries.extend(str(face.get("ref_image")) for face in manifest.get("faces") or [] if face.get("ref_image"))
     missing, file_digests = [], []
     for relative in sorted(set(entries)):
@@ -755,8 +1422,8 @@ def dataset_integrity(album_dir: Path, manifest: dict, qa_set: str) -> dict:
 class GpuSampler:
     """Poll device and managed-model memory at intervals."""
 
-    def __init__(self, api_url: str, interval: float = 0.5, on_sample=None):
-        self.api_url = api_url
+    def __init__(self, provider, interval: float = 0.5, on_sample=None):
+        self.provider = provider
         self.interval = interval
         self.on_sample = on_sample
         self.samples: list[dict] = []
@@ -777,11 +1444,16 @@ class GpuSampler:
     def _run(self):
         while not self._stop.is_set():
             try:
-                data = request_json(f"{self.api_url}/gpu-stats", timeout=10)
-                try:
-                    process_memory = request_json(f"{self.api_url}/process-memory", timeout=5)
-                except Exception:
-                    process_memory = {}
+                gpu_result = self.provider.gpu_stats()
+                memory_result = self.provider.process_memory()
+                if gpu_result.get("status") != "available":
+                    self._stop.wait(self.interval)
+                    continue
+                data = gpu_result.get("data") or {}
+                process_memory = (
+                    memory_result.get("data") or {}
+                    if memory_result.get("status") == "available" else {}
+                )
                 ts = time.perf_counter()
                 for gpu in data.get("gpus", []):
                     sample = dict(gpu)
@@ -892,26 +1564,51 @@ class BenchmarkRun:
                  qa_set: str, sentrix_url: str, judge_url: str, vllm_api_url: str,
                  vllm_target_id: str, vllm_model_base_url: str, results_root: Path,
                  judge_system_prompt: str = JUDGE_PROMPT, judge_model: str = JUDGE_MODEL,
-                 judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False):
+                 judge_api_key: str = JUDGE_API_KEY, delete_scope_after_run: bool = False,
+                 task_judge_system_prompt: str = "", evidence_judge_system_prompt: str = "",
+                 mode: str = "full", existing_scope_id: str = "",
+                 scope_reused_from_runs: list | None = None,
+                 use_current_model: bool = False, current_model_snapshot: dict | None = None,
+                 use_cloud_model: bool = False, resume_state: dict | None = None):
+        if mode not in RUN_MODES:
+            raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
+        if mode == "reuse" and not existing_scope_id:
+            raise ValueError("existing_scope_id is required when mode=reuse")
+        self.mode = mode
+        self.existing_scope_id = str(existing_scope_id).strip()
         self.run_id = run_id
         self.album_id = album_id
         self.manifest = manifest
         self.model_profile = model_profile
+        self.use_current_model = bool(use_current_model)
+        self.use_cloud_model = bool(use_cloud_model)
+        self.current_model_snapshot = dict(current_model_snapshot or {})
         self.qa_set = qa_set
         self.sentrix_url = sentrix_url.rstrip("/")
         base = judge_url.rstrip("/")
         # Cloud providers (e.g. DashScope) include /v1 in the base URL;
         # local LM Studio servers do not. Normalize to avoid double /v1.
-        self.judge_url = base.removesuffix("/v1")
+        self.judge_url = base
         self.judge_model = judge_model
         self.judge_api_key = judge_api_key
         self.judge_system_prompt = judge_system_prompt
+        self.task_judge_system_prompt = task_judge_system_prompt
+        self.evidence_judge_system_prompt = evidence_judge_system_prompt
         self.vllm_api_url = vllm_api_url.rstrip("/")
         self.vllm_target_id = vllm_target_id
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
+        if self.vllm_api_url:
+            self.lifecycle_provider = ManagerLifecycleProvider(self.vllm_api_url)
+            self.telemetry_provider = ManagerTelemetryProvider(self.vllm_api_url)
+        else:
+            self.lifecycle_provider = UnavailableLifecycleProvider()
+            self.telemetry_provider = UnavailableTelemetryProvider()
         self.results_root = results_root
         self.lock = threading.RLock()
-        self.delete_scope_after_run = bool(delete_scope_after_run)
+        self._judge_rate_lock = threading.Lock()
+        self._judge_next_request_at = 0.0
+        # 复用/构建模式的产物相册必须保留，绝不允许 delete_scope 清掉。
+        self.delete_scope_after_run = bool(delete_scope_after_run) and mode == "full"
 
         album_base = BENCHMARK_DATA_ROOT / album_id
         self.album_dir = album_base
@@ -922,8 +1619,20 @@ class BenchmarkRun:
 
         self.state: dict = {
             "run_id": run_id,
+            "mode": mode,
+            "scope_source": None,
             "album_id": album_id,
             "model_profile": model_profile,
+            "model_source": "cloud_api" if self.use_cloud_model else (
+                "current" if self.use_current_model else "managed"
+            ),
+            "model_backend": (
+                "openai" if self.use_cloud_model else
+                "openai_compatible" if self.use_current_model else
+                "vllm"
+            ),
+            "model_name": BIG_MODEL_MODEL if self.use_cloud_model else model_profile,
+            "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
             "judge_model": judge_model,
             "judge_url": self.judge_url,
@@ -940,28 +1649,117 @@ class BenchmarkRun:
             "finished_at": None,
            "scope_id": None,
            "scope_name": None,
+           "existing_scope_id": self.existing_scope_id or None,
+           "scope_reused_from_runs": list(scope_reused_from_runs or []),
            "phases": {},
             "items": [],
             "summary": {},
+            "run_valid": False,
             "fatal_error": None,
         }
         self._gpu_sampling_started = False
-        self._gpu_sampler = GpuSampler(vllm_api_url, on_sample=self._persist_gpu_sample)
+        self._gpu_sampler = GpuSampler(self.telemetry_provider, on_sample=self._persist_gpu_sample)
         self._cancel = threading.Event()
         self._phase_started_perf: dict[str, float] = {}
+        self._persist_condition = threading.Condition(self.lock)
+        self._persist_requested = 0
+        self._persist_written = 0
+        self._persist_error: Exception | None = None
+        self._persist_stopping = False
+        self._persist_thread = threading.Thread(
+            target=self._persist_loop,
+            name=f"persist-{run_id}",
+            daemon=True,
+        )
+        self._persist_thread.start()
+        if resume_state:
+            # Restore the checkpoint after constructing the normal runtime
+            # fields. Keep the same run ID so the UI shows one continuous run.
+            restored = copy.deepcopy(resume_state)
+            restored.update({
+                "run_id": run_id,
+                "mode": "resume",
+                "album_id": album_id,
+                "qa_set": qa_set,
+                "model_profile": model_profile,
+                "model_source": self.state["model_source"],
+                "model_backend": self.state["model_backend"],
+                "model_name": self.state["model_name"],
+                "current_model_snapshot": self.current_model_snapshot or restored.get("current_model_snapshot"),
+                "judge_model": judge_model,
+                "judge_url": self.judge_url,
+                "vllm_target_id": vllm_target_id,
+                "vllm_manager_url": vllm_api_url,
+                "vllm_model_base_url": vllm_model_base_url,
+                "status": "pending",
+                "started_at": None,
+                "finished_at": None,
+                "fatal_error": None,
+                "failed_phase": None,
+                "run_valid": False,
+                "resumed_at": now_iso(),
+                "resume_count": int(restored.get("resume_count") or 0) + 1,
+            })
+            self.state = restored
+            self.existing_scope_id = str(restored.get("scope_id") or existing_scope_id or "").strip()
+            self.persist(wait=True)
 
     @property
     def run_dir(self) -> Path:
         return self.results_root / self.run_id
 
-    def persist(self):
-        with self.lock:
-            stored = {k: v for k, v in self.state.items()}
-            atomic_json(self.run_dir / "run.json", stored)
-            items = stored.get("items") or []
-            path = self.run_dir / "results.jsonl"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in items), encoding="utf-8")
+    def _write_persisted_snapshot(self, stored: dict) -> None:
+        atomic_json(self.run_dir / "run.json", stored)
+        items = stored.get("items") or []
+        path = self.run_dir / "results.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in items), encoding="utf-8")
+
+    def _persist_loop(self) -> None:
+        while True:
+            with self._persist_condition:
+                while self._persist_written >= self._persist_requested and not self._persist_stopping:
+                    self._persist_condition.wait()
+                if self._persist_stopping and self._persist_written >= self._persist_requested:
+                    return
+                # Coalesce progress updates arriving in the same short interval.
+                target = self._persist_requested
+                self._persist_condition.wait(timeout=PERSIST_DEBOUNCE_SECONDS)
+                target = self._persist_requested
+                stored = copy.deepcopy(self.state)
+            try:
+                self._write_persisted_snapshot(stored)
+            except Exception as exc:
+                with self._persist_condition:
+                    self._persist_error = exc
+                    self._persist_written = max(self._persist_written, target)
+                    self._persist_condition.notify_all()
+                continue
+            with self._persist_condition:
+                self._persist_written = max(self._persist_written, target)
+                self._persist_condition.notify_all()
+
+    def persist(self, wait: bool = False) -> None:
+        """Schedule a snapshot; optionally wait until this request reaches disk."""
+        with self._persist_condition:
+            if self._persist_error is not None and wait:
+                raise RuntimeError(f"benchmark state persistence failed: {self._persist_error}")
+            self._persist_requested += 1
+            target = self._persist_requested
+            self._persist_condition.notify()
+            if not wait:
+                return
+            while self._persist_written < target:
+                self._persist_condition.wait()
+            if self._persist_error is not None:
+                raise RuntimeError(f"benchmark state persistence failed: {self._persist_error}")
+
+    def _stop_persist_writer(self) -> None:
+        self.persist(wait=True)
+        with self._persist_condition:
+            self._persist_stopping = True
+            self._persist_condition.notify_all()
+        self._persist_thread.join(timeout=10)
 
     def _gpu_samples_path(self) -> Path:
         return self.run_dir / "gpu_samples.jsonl"
@@ -987,8 +1785,28 @@ class BenchmarkRun:
         else:
             self.state["status"] = "cancelling"
         self._cancel_remote_batch(source)
-        with self.lock:
-            self.persist()
+        self._reclaim_vllm_after_cancel()
+        self.persist(wait=True)
+
+    def _reclaim_vllm_after_cancel(self) -> None:
+        """Best-effort: terminate a vLLM instance this run started (loading or serving).
+
+        Without this, cancelling during model_deploy leaves the load running on the
+        GPU and the manager keeps serving a model nobody asked for.
+        """
+        if self.use_current_model or self.use_cloud_model:
+            return
+        try:
+            state = self.lifecycle_provider.state() or {}
+        except Exception:
+            return
+        run_scope_models = state.get("profile")
+        if run_scope_models and run_scope_models == self.model_profile:
+            try:
+                self.lifecycle_provider.stop({"timeout": 60}, timeout=90)
+                self.state["cancel_vllm_stopped"] = now_iso()
+            except Exception as exc:
+                self.state["cancel_vllm_stop_error"] = str(exc)[:300]
 
     def _cancel_remote_batch(self, source: str) -> None:
         batch_id = self.state.get("batch_id")
@@ -1024,19 +1842,43 @@ class BenchmarkRun:
             for k, v in extra.items():
                 self._record_phase(phase, k, v)
 
+    def _phase_partial(self, phase: str, extra: dict | None = None):
+        self._phase_done(phase, extra)
+        self._record_phase(phase, "status", "partial")
+
     def _hardware_snapshot(self) -> dict:
         """Use existing Manager endpoints; absence is recorded, never inferred from logs."""
+        if self.use_cloud_model:
+            return {
+                "captured_at": now_iso(),
+                "source": "cloud_api",
+                "status": "not_applicable",
+                "reason": "cloud_api_has_no_local_gpu_metrics",
+            }
+        if not self.vllm_api_url:
+            return {
+                "captured_at": now_iso(),
+                "source": "external",
+                "status": "not_applicable",
+                "reason": "external model endpoint has no manager metrics",
+            }
         snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
         try:
-            snapshot["manager"] = request_json(f"{self.vllm_api_url}/state", timeout=10)
+            snapshot["manager"] = self.lifecycle_provider.state()
         except Exception as exc:
             snapshot["manager_error"] = str(exc)
         try:
-            snapshot["gpu"] = request_json(f"{self.vllm_api_url}/gpu-stats", timeout=10).get("gpus") or []
+            gpu = self.telemetry_provider.gpu_stats()
+            snapshot["gpu"] = (gpu.get("data") or {}).get("gpus") or []
+            if gpu.get("status") != "available":
+                snapshot["gpu_status"] = gpu
         except Exception as exc:
             snapshot["gpu_error"] = str(exc)
         try:
-            snapshot["process_memory"] = request_json(f"{self.vllm_api_url}/process-memory", timeout=10)
+            memory = self.telemetry_provider.process_memory()
+            snapshot["process_memory"] = memory.get("data") if memory.get("status") == "available" else None
+            if memory.get("status") != "available":
+                snapshot["process_memory_status"] = memory
         except Exception as exc:
             snapshot["process_memory_error"] = str(exc)
         return snapshot
@@ -1045,16 +1887,18 @@ class BenchmarkRun:
         if self._cancel.is_set():
             self.state["status"] = "cancelled"
             self.state["finished_at"] = self.state.get("finished_at") or now_iso()
-            self.persist()
+            self.persist(wait=True)
+            self._stop_persist_writer()
             return
         self.state["started_at"] = now_iso()
         self.state["status"] = "running"
         self.state["hardware_snapshots"]["start"] = self._hardware_snapshot()
         self._current_phase = None
         self.persist()
-        phases = [
+        all_phases = [
             ("model_deploy", self._phase_model_deploy),
             ("scope_setup", self._phase_scope_setup),
+            ("scope_attach", self._phase_scope_attach),
             ("identity_seed", self._phase_identity_seed),
             ("photo_import", self._phase_photo_import),
             ("pipeline_processing", self._phase_processing),
@@ -1062,6 +1906,8 @@ class BenchmarkRun:
             ("gpu_metrics", self._phase_gpu_metrics),
             ("aggregate", self._phase_aggregate),
         ]
+        selected_phase_names = self._selected_phase_names()
+        phases = [(name, fn) for name, fn in all_phases if name in selected_phase_names]
         try:
             for name, fn in phases:
                 if self._cancel.is_set():
@@ -1073,10 +1919,20 @@ class BenchmarkRun:
                     self._record_phase(self._current_phase, "status", "cancelled")
                 self.state["status"] = "cancelled"
             else:
-                self.state["status"] = "completed"
+                has_partial_phase = any(
+                    phase.get("status") == "partial"
+                    for phase in (self.state.get("phases") or {}).values()
+                )
+                self.state["status"] = "completed_with_errors" if has_partial_phase else "completed"
+        except RunCancelledError:
+            if self._current_phase:
+                self._record_phase(self._current_phase, "status", "cancelled")
+            self.state["status"] = "cancelled"
         except Exception as e:
             if self._current_phase:
-                self._record_phase(self._current_phase, "status", "failed")
+                phase_state = self.state["phases"].get(self._current_phase) or {}
+                if phase_state.get("status") != "stalled":
+                    self._record_phase(self._current_phase, "status", "failed")
                 self._record_phase(self._current_phase, "error", str(e))
                 self._record_phase(self._current_phase, "finished_at", now_iso())
             self.state["status"] = "failed"
@@ -1084,7 +1940,8 @@ class BenchmarkRun:
             self.state["fatal_error"] = str(e)
             traceback.print_exc()
         finally:
-            self._gpu_sampler.stop()
+            if not self.use_cloud_model and self.vllm_api_url:
+                self._gpu_sampler.stop()
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
             if self._gpu_sampling_started and gpu_phase.get("status") != "done":
@@ -1092,10 +1949,33 @@ class BenchmarkRun:
                 partial.update({"status": "partial", "partial": True, "finished_at": now_iso()})
                 self.state["phases"]["gpu_metrics"] = partial
             self.state["finished_at"] = now_iso()
-            with self.lock:
-                self.persist()
+            self.persist(wait=True)
             if self.delete_scope_after_run:
                 self._cleanup_scope()
+            self._stop_persist_writer()
+
+    def _selected_phase_names(self) -> list[str]:
+        # 工作模式决定阶段编排；当前模型模式不拥有模型生命周期，因此没有部署阶段。
+        phase_names_by_mode = {
+            "full": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                     "pipeline_processing", "qa_eval", "gpu_metrics", "aggregate"],
+            "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
+                      "pipeline_processing", "gpu_metrics", "aggregate"],
+            "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
+        }
+        if self.mode == "resume":
+            old_phases = self.state.get("phases") or {}
+            selected = []
+            if (old_phases.get("pipeline_processing") or {}).get("status") != "done":
+                selected.append("pipeline_processing")
+            if (old_phases.get("qa_eval") or {}).get("status") != "done":
+                selected.append("qa_eval")
+            selected.extend(["gpu_metrics", "aggregate"])
+        else:
+            selected = phase_names_by_mode[self.mode]
+        if self.use_current_model:
+            selected = [name for name in selected if name != "model_deploy"]
+        return selected
 
     def _cleanup_scope(self):
         """Delete the PhotoBench-created memory space after the run finishes."""
@@ -1116,24 +1996,93 @@ class BenchmarkRun:
             self.state["scope_cleanup"] = {
                 "status": "failed", "scope_id": scope_id, "error": str(exc),
             }
-        with self.lock:
-            self.persist()
+        self.persist(wait=True)
 
     # ---- Phase implementations ----
 
+    def _wait_model_ready(self, ready_timeout: int = 600, health_timeout: int = 180):
+        """Poll manager state + model endpoint until ready; cancel stops the load."""
+        deadline = time.monotonic() + ready_timeout
+        while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                self._stop_managed_vllm()
+                return RunCancelledError("cancelled while loading model")
+            try:
+                state = self.lifecycle_provider.state() or {}
+            except Exception as exc:
+                state = {}
+                if time.monotonic() >= deadline:
+                    return exc
+            served_names = {state.get("profile"), state.get("served_model_name")}
+            if self.model_profile in served_names:
+                base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
+                root = base.rstrip("/").removesuffix("/v1")
+                probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
+                if probe is None:
+                    return None
+            if self._cancel.wait(2):
+                self._stop_managed_vllm()
+                return RunCancelledError("cancelled while loading model")
+        return TimeoutError(f"model not ready within {ready_timeout}s")
+
+    def _probe_model_endpoint(self, state: dict, model_api_root: str, timeout: int = 180, once: bool = False):
+        """Return None when the model endpoint answers; keep retrying until deadline."""
+        deadline = time.monotonic() + timeout
+        health_error = None
+        while True:
+            if self._cancel.is_set():
+                return RunCancelledError("cancelled during model health check")
+            try:
+                request_json(f"{model_api_root}/v1/chat/completions",
+                              {"model": state.get("served_model_name", self.model_profile),
+                               "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                              "POST", 30)
+                return None
+            except Exception as exc:
+                health_error = exc
+                if once or time.monotonic() >= deadline:
+                    if once:
+                        return health_error
+                    raise RuntimeError(
+                        f"vLLM model endpoint did not become ready within {timeout}s: {health_error}"
+                    ) from exc
+                if self._cancel.wait(2):
+                    return RunCancelledError("cancelled during model health check")
+
+    def _stop_managed_vllm(self):
+        try:
+            self.lifecycle_provider.stop({"timeout": 60}, timeout=90)
+        except Exception:
+            pass
+
     def _phase_model_deploy(self):
         self._phase_start("model_deploy")
+        if self.use_cloud_model:
+            runtime = request_json(
+                f"{self.sentrix_url}/api/model-profiles/bind-cloud-runtime",
+                {"profile": BIG_MODEL_PROFILE_ID}, "POST", 30,
+            )
+            self._phase_done("model_deploy", {
+                "source": "cloud_api",
+                "deployment_mode": "remote_api",
+                "manager_status": "not_applicable",
+                "health_check": "skipped",
+                "model_probe": "skipped",
+                "runtime": runtime,
+            })
+            return
         t0 = time.perf_counter()
         # 1. Stop (unload)
         t_stop0 = time.perf_counter()
         try:
-            request_json(f"{self.vllm_api_url}/stop", {"timeout": 60}, "POST", 90)
+            self.lifecycle_provider.stop({"timeout": 60}, timeout=90)
         except Exception:
             pass
         t_stop = time.perf_counter() - t_stop0
 
         # 1b. Cooldown — give 153 GPU time to free VRAM before next load
-        time.sleep(5)
+        if self._cancel.wait(5):
+            raise RunCancelledError("cancelled during cooldown")
 
         # 2. Start (load to VRAM) — exponential backoff retry on transient 502/timeout
         backoff_schedule = [10, 30, 60, 180]  # seconds between attempts
@@ -1141,45 +2090,41 @@ class BenchmarkRun:
         t_load0 = time.perf_counter()
         start_error = None
         for attempt in range(max_attempts):
+            if self._cancel.is_set():
+                raise RunCancelledError("cancelled before model start")
             try:
-                request_json(f"{self.vllm_api_url}/start",
-                              {"profile": self.model_profile, "wait_ready": True, "ready_timeout": 600},
-                              "POST", 700)
-                start_error = None
-                break
+                # Fire-and-poll: wait_ready=false returns immediately after spawn;
+                # readiness is tracked below with cancel-aware polling so a stop
+                # request can terminate a half-loaded model instead of blocking.
+                self.lifecycle_provider.start(
+                    {"profile": self.model_profile, "wait_ready": False}, timeout=120,
+                )
+                start_error = self._wait_model_ready()
+                if start_error is None:
+                    break
+            except RunCancelledError:
+                raise
             except Exception as exc:
                 start_error = exc
-                if attempt < max_attempts - 1:
-                    wait = backoff_schedule[attempt]
-                    time.sleep(wait)
+            if attempt < max_attempts - 1:
+                wait = backoff_schedule[attempt]
+                if self._cancel.wait(wait):
+                    raise RunCancelledError("cancelled during start backoff")
         if start_error is not None:
             raise RuntimeError(
                 f"vLLM /start failed after {max_attempts} attempts: {start_error}"
             ) from start_error
         t_load = time.perf_counter() - t_load0
 
-        # 3. Health check
-        state = request_json(f"{self.vllm_api_url}/state", timeout=10)
+        # 3. Health check (cancel-aware)
+        state = self.lifecycle_provider.state()
         port = state.get("port", 8105)
         base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
         t_health0 = time.perf_counter()
-        health_deadline = time.monotonic() + 180
-        health_error = None
-        while True:
-            try:
-                request_json(f"{model_api_root}/v1/chat/completions",
-                              {"model": state.get("served_model_name", self.model_profile),
-                               "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-                              "POST", 30)
-                break
-            except Exception as exc:
-                health_error = exc
-                if time.monotonic() >= health_deadline:
-                    raise RuntimeError(
-                        f"vLLM model endpoint did not become ready within 180s: {health_error}"
-                    ) from exc
-                time.sleep(2)
+        health_error = self._probe_model_endpoint(state, model_api_root)
+        if health_error is not None:
+            raise health_error
         t_health = time.perf_counter() - t_health0
 
         # 4. Sync .100 Sentrix gamma client to the new model (no restart)
@@ -1237,9 +2182,35 @@ class BenchmarkRun:
                               {"name": scope_name}, "POST", 30)
         scope_id = result.get("id") or result.get("scope_id")
         self.state["scope_id"] = scope_id
-        self.state["scope_name"] = result.get("name") or scope_name
+        self.state["scope_name"] = result.get("name") or scope_id
+        self.state["scope_source"] = "created"
         t1 = time.perf_counter()
         self._phase_done("scope_setup", {"scope_id": scope_id, "scope_name": self.state["scope_name"], "create_seconds": round(t1 - t0, 3)})
+
+    def _phase_scope_attach(self):
+        """reuse 模式：绑定一个已存在的相册 scope，不创建、不删除。"""
+        self._phase_start("scope_attach")
+        t0 = time.perf_counter()
+        scope_id = self.existing_scope_id
+        # 后端没有 GET /api/memory-spaces/{id} 单查（405），从列表中定位。
+        spaces = request_json(f"{self.sentrix_url}/api/memory-spaces", timeout=30)
+        if isinstance(spaces, dict):
+            spaces = spaces.get("spaces") or spaces.get("items") or []
+        result = next((s for s in (spaces or []) if s.get("id") == scope_id), None)
+        if not result:
+            raise ValueError(f"memory space not found on backend: {scope_id}")
+        self.state["scope_id"] = scope_id
+        self.state["scope_name"] = result.get("name") or scope_id
+        self.state["scope_source"] = "reused"
+        t1 = time.perf_counter()
+        self._phase_done("scope_attach", {
+            "scope_id": scope_id,
+            "scope_name": self.state["scope_name"],
+            "scope_kind": result.get("kind"),
+            "scope_created_at": result.get("created_at"),
+            "attach_seconds": round(t1 - t0, 3),
+            "reused_from_runs": self.state.get("scope_reused_from_runs") or [],
+        })
 
     def _phase_identity_seed(self):
         self._phase_start("identity_seed")
@@ -1293,71 +2264,224 @@ class BenchmarkRun:
     def _phase_photo_import(self):
         self._phase_start("photo_import")
         t0 = time.perf_counter()
-        photo_paths = [self.album_dir / p for p in self.manifest["photos"]]
+        media_relpaths = album_media_entries(self.manifest)
+        total_media_count = len(media_relpaths)
+        media_paths = [self.album_dir / p for p in media_relpaths]
+        missing = [rel for rel, path in zip(media_relpaths, media_paths) if not path.is_file()]
+        media_paths = [path for path in media_paths if path.is_file()]
+        photo_count = len(self.manifest.get("photos") or [])
+        video_count = len(self.manifest.get("videos") or [])
         chunk_size = max(1, int(os.getenv("PHOTOBENCH_IMPORT_CHUNK_SIZE", "8")))
+        upload_workers = max(1, int(os.getenv("PHOTOBENCH_IMPORT_UPLOAD_WORKERS", "2")))
+        max_upload_attempts = max(1, int(os.getenv("PHOTOBENCH_IMPORT_MAX_ATTEMPTS", "3")))
         batch_id = f"batch_{uuid.uuid4().hex[:12]}"
         self.state["batch_id"] = batch_id
         self.persist()
-        items = []
-        for offset in range(0, len(photo_paths), chunk_size):
-            if self._cancel.is_set():
-                break
-            chunk = photo_paths[offset:offset + chunk_size]
-            files = [("files", p.name, p.read_bytes()) for p in chunk]
-            result = upload_files(
-                f"{self.sentrix_url}/api/import",
-                {"scope_id": self.state["scope_id"], "batch_id": batch_id,
-                 "deferBatchComplete": "true"},
-                files, 600,
-            )
-            items.extend(result.get("items", []))
-            if self._cancel.is_set():
-                self._cancel_remote_batch(self.state.get("cancel_source") or "api")
-                self.persist()
-                break
+        items = [{
+            "accepted": False,
+            "fileName": rel,
+            "status": "missing",
+            "error_type": "FileNotFoundError",
+            "error": "Media file listed in manifest does not exist",
+        } for rel in missing]
+
+        def upload_chunk(chunk_index, chunk):
+            # Read bytes inside the bounded worker. Queued chunks retain only
+            # paths, so a large album does not become a second in-memory copy.
+            pending_paths = list(chunk)
+            results_by_name = {}
+            for attempt in range(1, max_upload_attempts + 1):
+                try:
+                    files = [("files", path.name, path.read_bytes()) for path in pending_paths]
+                    result = upload_files(
+                        f"{self.sentrix_url}/api/import",
+                        {"scope_id": self.state["scope_id"], "batch_id": batch_id,
+                         "deferBatchComplete": "true"},
+                        files, 600,
+                    )
+                    returned = {
+                        str(item.get("fileName") or item.get("file_name") or ""): item
+                        for item in (result.get("items") or []) if isinstance(item, dict)
+                    }
+                except Exception as exc:
+                    returned = {
+                        path.name: {
+                            "accepted": False,
+                            "fileName": path.name,
+                            "status": "failed",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                        for path in pending_paths
+                    }
+
+                retry_paths = []
+                for path in pending_paths:
+                    item = dict(returned.get(path.name) or {
+                        "accepted": False,
+                        "fileName": path.name,
+                        "status": "failed",
+                        "error_type": "missing_response_item",
+                        "error": "Sentrix import response omitted this media file",
+                    })
+                    item["upload_attempts"] = attempt
+                    if item.get("accepted") or item.get("status") == "rejected" or attempt == max_upload_attempts:
+                        results_by_name[path.name] = item
+                    else:
+                        retry_paths.append(path)
+                if not retry_paths:
+                    break
+                time.sleep(min(2 ** (attempt - 1), 4))
+                pending_paths = retry_paths
+            return chunk_index, {"items": [results_by_name[path.name] for path in chunk]}
+
+        chunks = [
+            (index, media_paths[offset:offset + chunk_size])
+            for index, offset in enumerate(range(0, len(media_paths), chunk_size))
+        ]
+        results_by_chunk = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=upload_workers, thread_name_prefix="photobench-upload"
+        ) as executor:
+            pending = {
+                executor.submit(upload_chunk, chunk_index, chunk): (chunk_index, chunk)
+                for chunk_index, chunk in chunks
+            }
+            for future in concurrent.futures.as_completed(tuple(pending)):
+                chunk_index, chunk = pending.pop(future)
+                try:
+                    _, result = future.result()
+                except Exception as exc:
+                    result = {"items": [{
+                        "accepted": False,
+                        "fileName": path.name,
+                        "status": "failed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    } for path in chunk]}
+                results_by_chunk[chunk_index] = result
+                completed_items = [
+                    item for index in sorted(results_by_chunk)
+                    for item in results_by_chunk[index].get("items", [])
+                ]
+                self._record_phase("photo_import", "total_photos", photo_count)
+                self._record_phase("photo_import", "total_videos", video_count)
+                self._record_phase("photo_import", "total_media", total_media_count)
+                self._record_phase(
+                    "photo_import", "accepted_count",
+                    sum(1 for item in completed_items if item.get("accepted")),
+                )
+                if self._cancel.is_set():
+                    for remaining in pending:
+                        remaining.cancel()
+                    break
+
+        if self._cancel.is_set():
+            self._cancel_remote_batch(self.state.get("cancel_source") or "api")
+            self.persist()
+            return
+
+        for chunk_index in sorted(results_by_chunk):
+            items.extend(results_by_chunk[chunk_index].get("items", []))
         if self._cancel.is_set():
             return
-        request_json(
-            f"{self.sentrix_url}/api/ingest-batches/{quote(batch_id)}/complete",
-            method="POST", timeout=60,
-        )
-        t1 = time.perf_counter()
         accepted = sum(1 for i in items if i.get("accepted"))
-        self._phase_done("photo_import", {
+        self.state["import_accepted_count"] = accepted
+        if accepted:
+            request_json(
+                f"{self.sentrix_url}/api/ingest-batches/{quote(batch_id)}/complete",
+                method="POST", timeout=60,
+            )
+        t1 = time.perf_counter()
+        rejected = [item for item in items if not item.get("accepted")]
+        phase_result = {
             "upload_seconds": round(t1 - t0, 1),
-            "total_photos": len(photo_paths),
+            "total_photos": photo_count,
+            "total_videos": video_count,
+            "total_media": total_media_count,
             "accepted_count": accepted,
+            "failed_count": len(rejected),
+            "error": f"{len(rejected)} media file(s) could not be imported" if rejected else None,
+            "error_details": [{
+                "sample_id": item.get("fileName") or item.get("file_name") or "unknown",
+                "status": item.get("status") or "failed",
+                "error_type": item.get("error_type") or "import_error",
+                "reason": str(item.get("error") or "Sentrix rejected the media file"),
+            } for item in rejected],
             "batch_id": batch_id,
             "chunk_size": chunk_size,
-            "chunk_count": (len(photo_paths) + chunk_size - 1) // chunk_size,
-        })
+            "chunk_count": len(chunks),
+            "upload_workers": upload_workers,
+            "max_upload_attempts": max_upload_attempts,
+            "retried_file_count": sum(
+                1 for item in items if int(item.get("upload_attempts") or 1) > 1
+            ),
+        }
+        if rejected:
+            self._phase_partial("photo_import", phase_result)
+        else:
+            self._phase_done("photo_import", phase_result)
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        self._reset_gpu_samples_file()
-        self._gpu_sampling_started = True
-        self._gpu_sampler.start()
+        if not self.use_cloud_model and self.vllm_api_url:
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         t0 = time.perf_counter()
         scope_id = self.state["scope_id"]
         poll_count = 0
         batch_data = {}
         total = 0
         processed = 0
+        failed = 0
+        terminal_pipeline_error = None
+        assets = []
+        pending = []
+        if self.mode == "resume" and self.state.get("batch_id"):
+            # A restart can leave the saved ingest batch open. Reopen/complete
+            # only an unfinished batch: calling this endpoint on a completed
+            # batch intentionally reprocesses all of its assets.
+            batch_url = f"{self.sentrix_url}/api/ingest-batches/{quote(str(self.state['batch_id']))}"
+            saved_batch = request_json(batch_url, timeout=60)
+            saved_status = str((saved_batch.get("batch") or {}).get("status") or "")
+            if saved_status not in {"completed", "cancelled"}:
+                request_json(f"{batch_url}/complete", method="POST", timeout=60)
+        if self.state.get("import_accepted_count") == 0:
+            self._phase_partial("pipeline_processing", {
+                "total_seconds": 0.0,
+                "poll_iterations": 0,
+                "processed_photo_count": 0,
+                "failed_asset_count": 0,
+                "skipped_asset_count": 0,
+                "error": "No imported media assets were available for processing",
+                "error_details": [{
+                    "sample_id": "media_batch",
+                    "status": "skipped",
+                    "error_type": "empty_import",
+                    "reason": "All media files failed during the import stage",
+                }],
+                "progress": {"total": 0, "processed": 0, "pending": 0, "failed": 0, "skipped": 0},
+                "average_seconds_per_photo": None,
+                "pipeline_metrics": {},
+            })
+            return
+        try:
+            stall_timeout_seconds = max(0, int(os.getenv(
+                "PHOTOBENCH_PIPELINE_STALL_TIMEOUT_SECONDS", "1200"
+            )))
+        except ValueError:
+            stall_timeout_seconds = 1200
         while True:
             if self._cancel.is_set():
                 break
             poll_count += 1
             data = request_json(f"{self.sentrix_url}/api/assets?scope_id={scope_id}&limit=2000", timeout=60)
             assets = data.get("assets", [])
-            pending = [a for a in assets if a.get("status") in ("queued", "processing", "semantic_enriching")]
+            pending = [a for a in assets if a.get("status") in PIPELINE_PENDING_STATUSES]
             total = len(assets)
             processed = len([a for a in assets if a.get("status") == "processed"])
-            failed = len([a for a in assets if a.get("status") == "failed"])
-            self._record_phase("pipeline_processing", "status", "running")
-            self._record_phase("pipeline_processing", "progress", {
-                "total": total, "processed": processed, "pending": len(pending), "failed": failed,
-                "poll_count": poll_count,
-            })
+            failed = len([a for a in assets if a.get("status") in PIPELINE_FAILED_STATUSES])
             batch_data = {}
             batch_id = self.state.get("batch_id")
             if batch_id:
@@ -1369,24 +2493,143 @@ class BenchmarkRun:
                         self._record_phase("pipeline_processing", "pipeline_metrics", batch_metrics)
                 except Exception:
                     batch_data = {}
-            self.persist()
             batch_status = (batch_data.get("batch") or {}).get("status")
-            if (not pending and batch_status in {"completed", "complete", "failed"}) or poll_count > 600:
+            pipeline_metrics = batch_data.get("pipeline_metrics") or {}
+            status_counts = {}
+            for asset in assets:
+                status = str(asset.get("status") or "unknown")
+                status_counts[status] = status_counts.get(status, 0) + 1
+            # Compare each asset's state instead of only aggregate counts. Two assets
+            # can transition in opposite directions during one poll and leave the
+            # counts unchanged even though the pipeline is making progress.
+            asset_status_signature = tuple(sorted(
+                (str(asset.get("id") or asset.get("asset_id") or asset.get("path") or index),
+                 str(asset.get("status") or "unknown"))
+                for index, asset in enumerate(assets)
+            ))
+            progress_signature = (asset_status_signature, batch_status)
+            now = time.monotonic()
+            if getattr(self, "_pipeline_progress_signature", None) != progress_signature:
+                self._pipeline_progress_signature = progress_signature
+                self._pipeline_last_progress_at = now
+                self._pipeline_last_progress_wall = now_iso()
+            last_progress_at = getattr(self, "_pipeline_last_progress_at", now)
+            no_progress_seconds = max(0.0, now - last_progress_at)
+            self._record_phase("pipeline_processing", "status", "running")
+            self._record_phase("pipeline_processing", "progress", {
+                "total": total, "processed": processed, "pending": len(pending), "failed": failed,
+                "poll_count": poll_count,
+                "status_counts": status_counts,
+                "last_progress_at": getattr(self, "_pipeline_last_progress_wall", now_iso()),
+                "no_progress_seconds": round(no_progress_seconds, 1),
+            })
+            self.persist()
+            if batch_status == "failed" or pipeline_metrics.get("status") == "failed":
+                terminal_pipeline_error = str(
+                    pipeline_metrics.get("error")
+                    or f"Sentrix ingest batch entered status {batch_status}"
+                )
+                break
+            if not pending and batch_status in {"completed", "complete"}:
+                stable_polls = getattr(self, "_pipeline_stable_polls", 0) + 1
+                self._pipeline_stable_polls = stable_polls
+                # Confirm a stable zero-pending snapshot twice: asset status rows can
+                # land after the batch flips to completed (upload/pipeline overlap).
+                if stable_polls >= 2:
+                    break
+                self._cancel.wait(3)
+                continue
+            self._pipeline_stable_polls = 0
+            batch_still_open_without_assets = (
+                total == 0 and batch_status not in {"completed", "complete", "failed"}
+            )
+            if (
+                stall_timeout_seconds > 0
+                and not batch_still_open_without_assets
+                and no_progress_seconds >= stall_timeout_seconds
+            ):
+                stall_progress = {
+                    "total": total,
+                    "processed": processed,
+                    "pending": len(pending),
+                    "failed": failed,
+                    "poll_count": poll_count,
+                    "status_counts": status_counts,
+                    "batch_status": batch_status,
+                    "last_progress_at": getattr(self, "_pipeline_last_progress_wall", None),
+                    "no_progress_seconds": round(no_progress_seconds, 1),
+                    "stall_timeout_seconds": stall_timeout_seconds,
+                }
+                self._record_phase("pipeline_processing", "status", "stalled")
+                self._record_phase("pipeline_processing", "stalled_at", now_iso())
+                self._record_phase("pipeline_processing", "stalled_progress", stall_progress)
+                self.persist()
+                terminal_pipeline_error = (
+                    f"pipeline processing stalled: no asset status change for "
+                    f"{no_progress_seconds:.0f}s (threshold {stall_timeout_seconds}s); "
+                    f"processed={processed}/{total}, pending={len(pending)}, failed={failed}"
+                )
                 break
             if self._cancel.wait(3):
                 break
         t1 = time.perf_counter()
         total_seconds = round(t1 - t0, 1)
-        self._phase_done("pipeline_processing", {
+        failed_assets = [a for a in assets if a.get("status") in PIPELINE_FAILED_STATUSES]
+        skipped_assets = list(pending) if terminal_pipeline_error else []
+
+        def failure_detail(asset, default_reason):
+            metadata = asset.get("metadata_json") or {}
+            return {
+                "sample_id": asset.get("file_name") or asset.get("id") or "unknown",
+                "asset_id": asset.get("id"),
+                "status": asset.get("status") or "failed",
+                "error_type": metadata.get("failed_stage") or "pipeline_error",
+                "reason": str(metadata.get("error") or default_reason),
+            }
+
+        error_details = [
+            failure_detail(asset, "Asset processing failed") for asset in failed_assets
+        ] + [
+            failure_detail(asset, terminal_pipeline_error or "Batch processing stopped")
+            for asset in skipped_assets
+        ]
+        final_progress = {
+            "total": total,
+            "processed": processed,
+            "pending": 0 if terminal_pipeline_error else len(pending),
+            "failed": len(failed_assets),
+            "skipped": len(skipped_assets),
+            "poll_count": poll_count,
+            "status_counts": {
+                **((self.state.get("phases", {}).get("pipeline_processing", {}).get("progress") or {}).get("status_counts") or {}),
+            },
+        }
+        phase_result = {
             "total_seconds": total_seconds,
             "poll_iterations": poll_count,
             "processed_photo_count": processed,
+            "failed_asset_count": len(failed_assets),
+            "skipped_asset_count": len(skipped_assets),
+            "error": terminal_pipeline_error or (
+                f"{len(failed_assets)} asset(s) failed after retries" if failed_assets else None
+            ),
+            "error_details": error_details,
+            "progress": final_progress,
             "average_seconds_per_photo": round(total_seconds / processed, 3) if processed else None,
             "pipeline_metrics": batch_data.get("pipeline_metrics") or {},
-        })
+        }
+        if error_details or terminal_pipeline_error:
+            self._phase_partial("pipeline_processing", phase_result)
+        else:
+            self._phase_done("pipeline_processing", phase_result)
 
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
+        # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
+        if not self.use_cloud_model and self.vllm_api_url and not self._gpu_sampling_started:
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         scope_id = self.state["scope_id"]
         assets_data = request_json(f"{self.sentrix_url}/api/assets?scope_id={scope_id}&limit=2000", timeout=60)
         assets = assets_data.get("assets", [])
@@ -1396,33 +2639,274 @@ class BenchmarkRun:
             assets_by_name.setdefault(name, []).append(a)
 
         t0 = time.perf_counter()
-        for row in self.qa_rows:
-            item = self._evaluate_one(row, assets_by_name)
+        qa_concurrency = self._resolve_qa_concurrency()
+        judge_concurrency = self._resolve_judge_concurrency(qa_concurrency)
+        agent_phase_started_perf = time.perf_counter()
+        agent_phase_started_epoch = round(time.time(), 3)
+        with self.lock:
+            self.state["qa_concurrency"] = qa_concurrency
+            self.state["judge_concurrency"] = judge_concurrency
+        total_qa = len(self.qa_rows)
+        existing_items = self.state.get("items") or []
+        completed_qa_ids = {
+            str(item.get("qa_id")) for item in existing_items
+            if item.get("qa_id") and item.get("execution_status") not in {"scheduled", "running"}
+        }
+        self._qa_submitted = len(completed_qa_ids)
+        self._qa_agent_completed = len(completed_qa_ids)
+        self._qa_judge_submitted = 0
+        self._qa_judge_completed = len(completed_qa_ids)
+        self._qa_judge_skipped = sum(
+            1 for item in existing_items
+            if str(item.get("qa_id") or "") in completed_qa_ids
+            and item.get("judge_status") == "skipped"
+        )
+        self._record_phase("qa_eval", "agent_phase_started_at", now_iso())
+        self._record_phase("qa_eval", "agent_phase_started_at_epoch", agent_phase_started_epoch)
+        self._record_phase("qa_eval", "agent_total", total_qa)
+        self._record_phase("qa_eval", "judge_total", total_qa)
+
+        def record_qa_progress():
+            agent_done = getattr(self, "_qa_agent_completed", 0)
+            judge_done = getattr(self, "_qa_judge_completed", 0)
+            judge_submitted = getattr(self, "_qa_judge_submitted", 0)
+            self._record_phase("qa_eval", "progress", {
+                "total": total_qa,
+                # User-facing completion means Judge reached a terminal state.
+                "completed": judge_done,
+                "agent_completed": agent_done,
+                "agent_total": total_qa,
+                "agent_in_flight": max(0, total_qa - agent_done),
+                "judge_completed": judge_done,
+                "judge_total": total_qa,
+                "judge_submitted": judge_submitted,
+                "judge_skipped": getattr(self, "_qa_judge_skipped", 0),
+                "judge_in_flight": max(0, judge_submitted - (judge_done - getattr(self, "_qa_judge_skipped", 0))),
+                "qa_concurrency": qa_concurrency,
+                "judge_concurrency": judge_concurrency,
+            })
+
+        pool_rows = [
+            (index, row) for index, row in enumerate(self.qa_rows)
+            if str(row.get("qa_id") or "") not in completed_qa_ids
+        ]
+        agent_futures = {}
+        judge_futures = {}
+        judge_phase_started_perf = None
+        judge_phase_started_epoch = None
+
+        # The Agent pool is deliberately independent from the cloud Judge pool.
+        # A completed Agent future returns immediately, releasing its model slot;
+        # its item is then queued for Judge work in the second pool.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=qa_concurrency, thread_name_prefix="qa-agent"
+        ) as agent_executor, concurrent.futures.ThreadPoolExecutor(
+            max_workers=judge_concurrency, thread_name_prefix="qa-judge"
+        ) as judge_executor:
+            agent_futures = {
+                agent_executor.submit(self._evaluate_one, row, assets_by_name): index
+                for index, row in pool_rows
+            }
+            self._qa_submitted = total_qa
+            record_qa_progress()
+
+            # One completion loop services both pools.  This keeps Agent and
+            # Judge truly pipelined: a finished Judge is merged immediately,
+            # even while other Agent futures are still running.
+            pending = {future: ("agent", index) for future, index in agent_futures.items()}
+            agent_phase_recorded = False
+
+            def record_agent_phase_finished() -> None:
+                nonlocal agent_phase_recorded
+                if agent_phase_recorded:
+                    return
+                agent_phase_recorded = True
+                agent_phase_finished_perf = time.perf_counter()
+                agent_phase_finished_epoch = round(time.time(), 3)
+                agent_phase_wall_ms = round(
+                    (agent_phase_finished_perf - agent_phase_started_perf) * 1000, 1
+                )
+                self._record_phase("qa_eval", "agent_phase_finished_at", now_iso())
+                self._record_phase("qa_eval", "agent_phase_finished_at_epoch", agent_phase_finished_epoch)
+                self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
+                self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
+                self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
+                if not self.use_cloud_model and self.vllm_api_url:
+                    self._gpu_sampler.stop()
+
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    kind, index = pending.pop(future)
+                    if kind == "agent":
+                        try:
+                            item = future.result()
+                            agent_failed = bool(item.get("failed")) or bool(item.get("error"))
+                        except Exception as exc:
+                            item = {"index": index, "error": repr(exc), "failed": True}
+                            agent_failed = True
+                        item["_index"] = index
+                        if agent_failed:
+                            # There is no Agent answer for Judge to score.
+                            item["judge_status"] = "skipped"
+                            self._qa_judge_skipped += 1
+                            self._qa_judge_completed += 1
+                        else:
+                            if judge_phase_started_perf is None:
+                                judge_phase_started_perf = time.perf_counter()
+                                judge_phase_started_epoch = round(time.time(), 3)
+                                self._record_phase("qa_eval", "judge_phase_started_at", now_iso())
+                                self._record_phase("qa_eval", "judge_phase_started_at_epoch", judge_phase_started_epoch)
+                            item.setdefault("timing_breakdown", {}).setdefault("timeline", {})[
+                                "judge_queued_at_epoch"
+                            ] = round(time.time(), 3)
+                            self._qa_judge_submitted += 1
+                            judge_item = copy.deepcopy(item)
+                            judge_future = judge_executor.submit(
+                                self._judge_item, judge_item, self.qa_rows[index], assets_by_name,
+                            )
+                            judge_futures[judge_future] = index
+                            pending[judge_future] = ("judge", index)
+                        with self.lock:
+                            self.state["items"].append(item)
+                            self._qa_agent_completed += 1
+                            record_qa_progress()
+                            self.persist()
+                        if not any(k == "agent" for k, _ in pending.values()):
+                            record_agent_phase_finished()
+                    else:
+                        try:
+                            judged_item = future.result()
+                            with self.lock:
+                                item = next((candidate for candidate in self.state["items"]
+                                             if candidate.get("_index") == index), None)
+                                if item is not None and isinstance(judged_item, dict):
+                                    item.update({
+                                        key: value for key, value in judged_item.items()
+                                        if key != "_index"
+                                    })
+                        except Exception as exc:
+                            with self.lock:
+                                item = next((candidate for candidate in self.state["items"]
+                                             if candidate.get("_index") == index), None)
+                                if item is not None:
+                                    item.update({
+                                        "judge": {"score": None, "reason": f"judge_error: {exc}"},
+                                        "task_judge": {"actual_action": None, "correct": None,
+                                                        "reason": f"judge_error: {exc}"},
+                                        "evidence_judge": {"score": None, "reason": "judge_error"},
+                                        "judge_status": "failed",
+                                    })
+                        self._qa_judge_completed += 1
+                        with self.lock:
+                            record_qa_progress()
+                            self.persist()
+
+            record_agent_phase_finished()
+
+            if judge_phase_started_perf is not None:
+                judge_phase_finished_perf = time.perf_counter()
+                judge_phase_finished_epoch = round(time.time(), 3)
+                judge_phase_wall_ms = round((judge_phase_finished_perf - judge_phase_started_perf) * 1000, 1)
+                self._record_phase("qa_eval", "judge_phase_finished_at", now_iso())
+                self._record_phase("qa_eval", "judge_phase_finished_at_epoch", judge_phase_finished_epoch)
+                self._record_phase("qa_eval", "judge_phase_total_seconds", round(judge_phase_wall_ms / 1000, 3))
+                self._record_phase("qa_eval", "judge_phase_wall_ms", judge_phase_wall_ms)
+
             with self.lock:
-                self.state["items"].append(item)
+                self.state["items"].sort(key=lambda it: it.get("_index", 0))
+                for it in self.state["items"]:
+                    it.pop("_index", None)
+                executed = sum(1 for it in self.state["items"]
+                               if it.get("execution_status") == "completed")
+                self.state["run_valid"] = bool(
+                    len(self.state["items"]) == total_qa and executed == total_qa
+                )
+                record_qa_progress()
                 self.persist()
 
         t1 = time.perf_counter()
-        self._gpu_sampler.stop()
-        self._phase_done("qa_eval", {"total_seconds": round(t1 - t0, 1)})
+        failed_items = [item for item in self.state["items"] if (
+            item.get("execution_status") in {"failed", "timeout"}
+            or item.get("judge_status") == "failed"
+        )]
+        qa_phase_result = {
+            "total_seconds": round(t1 - t0, 1),
+            "qa_concurrency": qa_concurrency,
+            "judge_concurrency": judge_concurrency,
+            "failed_count": len(failed_items),
+            "error": f"{len(failed_items)} QA sample(s) failed or timed out" if failed_items else None,
+            "error_details": [{
+                "sample_id": item.get("qa_id") or item.get("id") or f"QA #{index + 1}",
+                "status": item.get("execution_status") or item.get("judge_status") or "failed",
+                "error_type": "judge_error" if item.get("judge_status") == "failed" else "agent_error",
+                "reason": str(item.get("error") or (item.get("judge") or {}).get("reason") or "QA execution failed"),
+            } for index, item in enumerate(failed_items)],
+        }
+        if failed_items:
+            self._phase_partial("qa_eval", qa_phase_result)
+        else:
+            self._phase_done("qa_eval", qa_phase_result)
+
+    def _resolve_qa_concurrency(self) -> int:
+        """QA-level concurrency: default follows the serving model's max_num_seqs snapshot."""
+        env_value = str(os.getenv("PHOTOBENCH_QA_CONCURRENCY") or "").strip()
+        if env_value:
+            try:
+                return max(1, int(env_value))
+            except ValueError:
+                pass
+        try:
+            snapshot = (self.state.get("phases") or {}).get("model_deploy", {}).get("model_state") or {}
+            if not snapshot:
+                snapshot = (self.state.get("current_model_snapshot") or {}).get("state") or {}
+            return max(1, int(snapshot.get("max_num_seqs") or 1))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _resolve_judge_concurrency(qa_concurrency: int) -> int:
+        """Judge uses a separate cloud-API pool and never consumes Agent slots."""
+        env_value = str(os.getenv("PHOTOBENCH_JUDGE_CONCURRENCY") or "").strip()
+        if env_value:
+            try:
+                return max(1, int(env_value))
+            except ValueError:
+                pass
+        return min(8, max(1, int(qa_concurrency or 1)))
 
     def _evaluate_one(self, row: dict, assets_by_name: dict) -> dict:
         t0 = time.perf_counter()
+        timeline = {"started_at_epoch": round(time.time(), 3)}
         conversation = row.get("conversation") or []
         if conversation and not isinstance(conversation, list):
             raise ValueError("conversation must be a list")
         messages = [str(turn.get("message") or "").strip() for turn in conversation if isinstance(turn, dict)]
         query = messages[-1] if messages else str(row["question"])
         reference = str(row["answer"])
-        gt_ids = [str(v) for v in row.get("retrieval_image_ids", [])]
+        gt_refs = _normalize_media_refs(row, "retrieval")
+        gt_image_ids = [ref["media_id"] for ref in gt_refs if ref["media_type"] == "image"]
+        gt_video_ids = [ref["media_id"] for ref in gt_refs if ref["media_type"] == "video"]
+        answer_refs = _normalize_media_refs(row, "answer_evidence") or gt_refs
+        answer_image_ids = [ref["media_id"] for ref in answer_refs if ref["media_type"] == "image"]
+        answer_video_ids = [ref["media_id"] for ref in answer_refs if ref["media_type"] == "video"]
         item = {"qa_id": row.get("qa_id"), "question": query, "reference_answer": reference,
-                "retrieval_image_ids": gt_ids}
-        for field in ("task_type", "question_type", "angle", "difficulty", "answerability",
+                "retrieval_media_refs": gt_refs,
+                "retrieval_image_ids": gt_image_ids,
+                "retrieval_video_ids": gt_video_ids,
+                "answer_evidence_media_refs": answer_refs,
+                "answer_evidence_image_ids": answer_image_ids,
+                "answer_evidence_video_ids": answer_video_ids,
+                "execution_status": "scheduled"}
+        for field in ("task_type", "question_type", "tags", "angle", "difficulty", "answerability",
                       "scope", "scope_anchor", "required_evidence_sources", "query_anchors",
-                      "expected_action"):
+                      "expected_action", "answer_claims", "alternative_evidence_media_sets"):
             if row.get(field) is not None:
                 item[field] = row[field]
         try:
+            item["execution_status"] = "started"
             t_agent0 = time.perf_counter()
             conversation_id = str(uuid.uuid4())
             turn_records = []
@@ -1434,10 +2918,9 @@ class BenchmarkRun:
                     "message": message, "scope_id": self.state["scope_id"],
                     "conversation_id": conversation_id, "viewer_id": "owner", "include_debug": True,
                 }, "POST", 300)
-                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900)
-                turn_metrics = resp.get("model_call_metrics", [])
-                turn_trace = resp.get("retrieval_trace") or resp.get("retrievalTrace") or []
-                turn_tools = resp.get("tool_trace") or resp.get("toolTrace") or []
+                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900,
+                                               cancelled=self._cancel.is_set)
+                turn_metrics, turn_trace, turn_tools = self._normalize_turn_traces(resp)
                 _, turn_observations = self._extract_tool_perf(resp.get("task_state") or {})
                 for metric in turn_metrics:
                     if isinstance(metric, dict):
@@ -1466,6 +2949,7 @@ class BenchmarkRun:
                     "turn_outcome": resp.get("turn_outcome") or _derive_turn_outcome(resp),
                     "parse_status": _derive_parse_status(resp),
                     "next_step": _derive_next_step(resp),
+                    "predicted_media": _resolve_predicted_media(_extract_image_ids(resp), assets_by_name),
                     "predicted_images": _resolve_predicted_images(_extract_image_ids(resp), assets_by_name),
                 })
             agent_wall_ms = round((time.perf_counter() - t_agent0) * 1000, 1)
@@ -1480,123 +2964,99 @@ class BenchmarkRun:
                 call_metrics,
             )
             tool_trace = self._attach_tool_observations(tool_trace, all_tool_observations)
+            call_metrics, tool_trace = self._annotate_agent_loop_timings(call_metrics, tool_trace)
             answer = str(resp.get("answer") or "")
 
-            # Extract predicted images — recursive walk to catch any nesting
-            predicted_images = _extract_image_ids(resp)
+            # Keep retrieval, evidence, and final delivery independent. The
+            # retrieval metric must not punish the UI for showing only a few
+            # representative sources.
+            media_sets = _extract_media_sets(resp)
+            selected_media = _resolve_predicted_media(media_sets["selected_asset_ids"], assets_by_name)
+            retrieved_media = _resolve_predicted_media(media_sets["retrieved_asset_ids"], assets_by_name)
+            evidence_media = _resolve_predicted_media(media_sets["evidence_asset_ids"], assets_by_name)
 
             # Match against GT
-            gt_names = {Path(v).name for v in gt_ids}
-            predicted_image_records = _resolve_predicted_images(predicted_images, assets_by_name)
-            pred_names = {image["file_name"] for image in predicted_image_records}
-            matched = sorted(gt_names & pred_names)
-            recall = len(matched) / len(gt_names) if gt_names else None
-            precision = len(matched) / len(pred_names) if pred_names else (0.0 if gt_names else None)
-            f1 = (2 * precision * recall / (precision + recall)) if precision is not None and recall is not None and precision + recall else 0.0 if gt_names else None
-            gt_images = []
-            for image_id in gt_ids:
-                file_name = Path(image_id).name
-                candidates = assets_by_name.get(file_name, [])
-                asset_id = candidates[0].get("id") if len(candidates) == 1 else None
-                gt_images.append({
-                    "image_id": image_id,
-                    "file_name": file_name,
-                    "asset_id": asset_id,
-                    "matched": file_name in pred_names,
-                    "mapping_status": "ok" if len(candidates) == 1 else "missing" if not candidates else "ambiguous",
-                })
-
-            # Judges consume distinct evidence: answer quality uses the reference;
-            # evidence grounding uses only this turn's retrieved images.
-            t_judge0 = time.perf_counter()
-            for index, record in enumerate(turn_records):
-                expected = record.get("expected_action")
-                turn_definition = (conversation[index]
-                                   if index < len(conversation) and isinstance(conversation[index], dict)
-                                   else {})
-                turn_reference = str(turn_definition.get("reference_answer") or "")
-                if not turn_reference:
-                    turn_reference = (
-                        "应要求用户提供至少一个具体、可用于后续检索的锚点；询问形式不限。"
-                        if expected == "clarify" else reference
-                    )
-                conv_ctx = turn_records[:index + 1]
-                record["task_judge"] = self._judge_task_action(
-                    record["message"], record["answer"], expected,
-                    record["agent_status"], record["termination_reason"],
-                    task_type=row.get("task_type"),
-                    question_type=row.get("question_type"),
-                    answerability=row.get("answerability"),
-                    reference=turn_reference,
-                    conversation=conv_ctx,
-                )
-                # Run answer-quality and evidence judges concurrently
-                should_judge_evidence = (
-                    EVIDENCE_JUDGE_ENABLED
-                    and record.get("predicted_images") and record.get("answer")
-                    and record["task_judge"].get("actual_action") != "clarify"
-                )
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                    quality_future = pool.submit(
-                        self._judge, record["message"], turn_reference, record["answer"],
-                        expected_action=expected,
-                        task_type=row.get("task_type"),
-                        question_type=row.get("question_type"),
-                        answerability=row.get("answerability"),
-                        conversation=conv_ctx,
-                    ) if expected in ANSWER_QUALITY_RUBRICS else None
-                    evidence_future = pool.submit(
-                        self._judge_evidence,
-                        record["message"], record["answer"],
-                        record.get("predicted_images") or [],
-                        assets_by_name, self.sentrix_url, conversation=conv_ctx,
-                    ) if should_judge_evidence else None
-                record["judge"] = quality_future.result() if quality_future else {"score": None, "reason": "not_labeled"}
-                record["evidence_judge"] = evidence_future.result() if evidence_future else {"score": None, "reason": "not_applicable"}
-            task_judges = [record["task_judge"] for record in turn_records]
-            task_judge = task_judges[-1] if task_judges else {"actual_action": None, "correct": None}
-            judge = turn_records[-1]["judge"] if turn_records else {"score": None, "reason": "not_applicable"}
-            evidence_judge = turn_records[-1]["evidence_judge"] if turn_records else {"score": None, "reason": "not_applicable"}
-            judge_ms = round((time.perf_counter() - t_judge0) * 1000, 1)
-
-            # Aggregate LLM metrics from call_metrics
-            llm_summary = self._summarize_call_metrics(call_metrics)
-            wall_clock_ms = round((time.perf_counter() - t0) * 1000, 1)
-            model_ms = llm_summary.get("total_ms_sum") if llm_summary else None
-            tool_ms = None
-            if tool_trace_present:
-                tool_ms = round(sum(
-                    float(trace.get("latency_s") or 0) * 1000
-                    for trace in tool_trace if isinstance(trace, dict)
-                ), 1)
-            attributed = sum(value for value in (model_ms, tool_ms, judge_ms) if value is not None)
-            timing_breakdown = {
-                "wall_clock_ms": wall_clock_ms,
-                "agent_wall_ms": agent_wall_ms,
-                "model_ms": model_ms,
-                "tool_ms": tool_ms,
-                "judge_ms": judge_ms,
-                "other_ms": round(max(0.0, wall_clock_ms - attributed), 1)
-                    if tool_trace_present else None,
-                "agent_overhead_ms": round(max(0.0, agent_wall_ms - (model_ms or 0) - (tool_ms or 0)), 1)
-                    if tool_trace_present else None,
-                "orchestrator_overhead_ms": round(max(0.0, wall_clock_ms - agent_wall_ms - judge_ms), 1),
-                "tool_trace_recorded": tool_trace_present,
+            metrics = _modality_metrics(gt_refs, retrieved_media)
+            gt_media = _resolve_gt_media(gt_refs, assets_by_name, retrieved_media)
+            retrieved_keys = {
+                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                for value in retrieved_media
             }
+            evidence_keys = {
+                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                for value in evidence_media
+            }
+            selected_keys = {
+                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                for value in selected_media
+            }
+            matched = sorted(entry["file_name"] for entry in gt_media
+                             if _media_key(entry["media_type"], entry["media_id"]) in retrieved_keys)
+            evidence_matched = sorted(entry["file_name"] for entry in gt_media
+                                      if _media_key(entry["media_type"], entry["media_id"]) in evidence_keys)
+            delivery_matched = sorted(entry["file_name"] for entry in gt_media
+                                      if _media_key(entry["media_type"], entry["media_id"]) in selected_keys)
+            pred_names = {value["file_name"] for value in selected_media}
+            retrieved_names = {value["file_name"] for value in retrieved_media}
+            evidence_names = {value["file_name"] for value in evidence_media}
+            gt_images = [value for value in gt_media if value["media_type"] == "image"]
+
+            # Agent phase ends before any Judge request starts.  Judge is queued
+            # by _phase_qa_eval in a separate executor after this item returns.
+            timeline["agent_finished_at_epoch"] = round(time.time(), 3)
+            timeline["agent_finished_at"] = now_iso()
+            llm_summary = self._summarize_call_metrics(call_metrics)
+            wall_clock_ms = agent_wall_ms
+            timing_breakdown = self._build_timing_breakdown(
+                call_metrics, tool_trace, wall_clock_ms, agent_wall_ms, None,
+                timeline, tool_trace_present,
+            )
 
             item.update({
-                "answer": answer, "predicted_images": predicted_image_records,
+                "answer": answer,
+                "predicted_media": selected_media,
+                "retrieved_candidate_media": retrieved_media,
+                "evidence_source_media": evidence_media,
+                "predicted_images": [value for value in selected_media if value["media_type"] == "image"],
+                "retrieved_candidate_images": [value for value in retrieved_media if value["media_type"] == "image"],
+                "evidence_source_images": [value for value in evidence_media if value["media_type"] == "image"],
                 "predicted_file_names": sorted(pred_names),
-                "matched_file_names": matched, "retrieval_recall": recall,
-                "retrieval_precision": precision, "retrieval_f1": f1,
+                "retrieved_file_names": sorted(retrieved_names),
+                "evidence_source_file_names": sorted(evidence_names),
+                "matched_file_names": matched,
+                "retrieved_matched_file_names": matched,
+                "evidence_matched_file_names": evidence_matched,
+                "delivery_matched_file_names": delivery_matched,
+                "selected_delivery_file_names": sorted(pred_names),
+                "retrieved_asset_ids": media_sets["retrieved_asset_ids"],
+                "evidence_asset_ids": media_sets["evidence_asset_ids"],
+                "selected_asset_ids": media_sets["selected_asset_ids"],
+                "media_retrieval_counts": metrics["media"],
+                "image_retrieval_counts": metrics["image"],
+                "video_retrieval_counts": metrics["video"],
+                "media_retrieval_recall": metrics["media"]["recall"],
+                "media_retrieval_precision": metrics["media"]["precision"],
+                "media_retrieval_f1": metrics["media"]["f1"],
+                "image_retrieval_recall": metrics["image"]["recall"],
+                "image_retrieval_precision": metrics["image"]["precision"],
+                "image_retrieval_f1": metrics["image"]["f1"],
+                "video_retrieval_recall": metrics["video"]["recall"],
+                "video_retrieval_precision": metrics["video"]["precision"],
+                "video_retrieval_f1": metrics["video"]["f1"],
+                # Compatibility aliases are total-media metrics for typed runs.
+                "retrieval_recall": metrics["media"]["recall"],
+                "retrieval_precision": metrics["media"]["precision"],
+                "retrieval_f1": metrics["media"]["f1"],
+                "gt_media": gt_media,
                 "gt_images": gt_images,
-                "judge": judge, "task_judge": task_judge,
-                "task_judges": task_judges, "conversation": turn_records if conversation else [],
+                "judge": {"score": None, "reason": "pending_judge"},
+                "task_judge": {"actual_action": None, "correct": None, "reason": "pending_judge"},
+                "task_judges": [], "conversation": turn_records if conversation else [],
                 "runtime_turns": turn_records,
                 "conversation_id": conversation_id if conversation else None,
                 "conversation_turn_count": len(turn_records) if conversation else 1,
                 "conversation_context_mode": "shared_conversation_id" if conversation else "single_turn",
-                "evidence_judge": evidence_judge, "judge_ms": judge_ms,
+                "evidence_judge": {"score": None, "reason": "pending_judge"}, "judge_ms": None,
                 "wall_clock_ms": wall_clock_ms,
                 "model_call_metrics": call_metrics,
                 "execution_trace": execution_trace,
@@ -1612,15 +3072,125 @@ class BenchmarkRun:
                 "answer_grounding": resp.get("answer_grounding") or resp.get("answerGrounding") or {},
                 "agent2_trace": summarize_agent2_trace(turn_records),
                 "timing_breakdown": timing_breakdown,
+                "tool_trace_recorded": tool_trace_present,
+                "judge_status": "pending",
             })
             item["delivery_status"] = resp.get("delivery_status") or {}
             item["agent_stability"] = self._agent_stability(item)
             item["attribution"] = self._derive_attribution(item)
+            item["execution_status"] = "completed"
         except Exception as e:
+            message = str(e).lower()
+            if "timed out" in message or "timeout" in message:
+                item["execution_status"] = "timeout"
+            else:
+                item["execution_status"] = "failed"
             item.update({"error": str(e), "retrieval_recall": 0,
                          "retrieval_precision": None, "retrieval_f1": None,
+                         "media_retrieval_recall": 0 if gt_refs else None,
+                         "media_retrieval_precision": None, "media_retrieval_f1": None,
+                         "image_retrieval_recall": 0 if gt_image_ids else None,
+                         "video_retrieval_recall": 0 if gt_video_ids else None,
                          "judge": {"score": None, "reason": "error"},
                          "wall_clock_ms": round((time.perf_counter() - t0) * 1000, 1)})
+        return item
+
+    def _judge_item(self, item: dict, row: dict, assets_by_name: dict) -> dict:
+        """Score one completed Agent answer in the independent Judge pool."""
+        t_judge0 = time.perf_counter()
+        timing = item.get("timing_breakdown") or {}
+        timeline = dict(timing.get("timeline") or {})
+        judge_started_epoch = round(time.time(), 3)
+        timeline["judge_started_at_epoch"] = judge_started_epoch
+        timeline["judge_started_at"] = now_iso()
+        queued_epoch = timeline.get("judge_queued_at_epoch")
+        if isinstance(queued_epoch, (int, float)):
+            timeline["judge_queue_wait_ms"] = round(max(0.0, judge_started_epoch - queued_epoch) * 1000, 1)
+
+        conversation = row.get("conversation") or []
+        reference = str(item.get("reference_answer") or row.get("answer") or "")
+        turn_records = item.get("runtime_turns") or []
+        for index, record in enumerate(turn_records):
+            expected = record.get("expected_action")
+            turn_definition = (conversation[index]
+                               if index < len(conversation) and isinstance(conversation[index], dict)
+                               else {})
+            turn_reference = str(turn_definition.get("reference_answer") or "")
+            if not turn_reference:
+                turn_reference = (
+                    "应要求用户提供至少一个具体、可用于后续检索的锚点；询问形式不限。"
+                    if expected == "clarify" else reference
+                )
+            conv_ctx = turn_records[:index + 1]
+            record["task_judge"] = self._judge_task_action(
+                record["message"], record["answer"], expected,
+                record.get("agent_status"), record.get("termination_reason"),
+                task_type=row.get("task_type"),
+                question_type=row.get("question_type"),
+                answerability=row.get("answerability"),
+                reference=turn_reference,
+                conversation=conv_ctx,
+            )
+            # Answer quality and evidence calls for the same turn remain parallel.
+            should_judge_evidence = (
+                EVIDENCE_JUDGE_ENABLED
+                and record.get("predicted_images") and record.get("answer")
+                and record["task_judge"].get("actual_action") != "clarify"
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                quality_future = pool.submit(
+                    self._judge, record["message"], turn_reference, record["answer"],
+                    expected_action=expected,
+                    task_type=row.get("task_type"),
+                    question_type=row.get("question_type"),
+                    answerability=row.get("answerability"),
+                    conversation=conv_ctx,
+                ) if expected in ANSWER_QUALITY_RUBRICS else None
+                evidence_future = pool.submit(
+                    self._judge_evidence,
+                    record["message"], record["answer"],
+                    record.get("predicted_images") or [],
+                    assets_by_name, self.sentrix_url, conversation=conv_ctx,
+                ) if should_judge_evidence else None
+            record["judge"] = quality_future.result() if quality_future else {"score": None, "reason": "not_labeled"}
+            record["evidence_judge"] = evidence_future.result() if evidence_future else {"score": None, "reason": "not_applicable"}
+
+        task_judges = [record.get("task_judge") or {} for record in turn_records]
+        task_judge = task_judges[-1] if task_judges else {"actual_action": None, "correct": None}
+        judge = turn_records[-1].get("judge") if turn_records else {"score": None, "reason": "not_applicable"}
+        evidence_judge = turn_records[-1].get("evidence_judge") if turn_records else {"score": None, "reason": "not_applicable"}
+        judge_ms = round((time.perf_counter() - t_judge0) * 1000, 1)
+        judge_finished_epoch = round(time.time(), 3)
+        timeline["judge_finished_at_epoch"] = judge_finished_epoch
+        timeline["judge_finished_at"] = now_iso()
+        queue_wait_ms = timeline.get("judge_queue_wait_ms")
+        if not isinstance(queue_wait_ms, (int, float)):
+            queue_wait_ms = 0.0
+        agent_wall_ms = self._numeric_ms(timing.get("agent_wall_ms")) or 0.0
+        wall_clock_ms = round(agent_wall_ms + queue_wait_ms + judge_ms, 1)
+        call_metrics = item.get("model_call_metrics") or []
+        tool_trace = item.get("tool_trace") or []
+        timing_breakdown = self._build_timing_breakdown(
+            call_metrics, tool_trace, wall_clock_ms, agent_wall_ms, judge_ms,
+            timeline, bool(item.get("tool_trace_recorded")), queue_wait_ms,
+        )
+        all_judge_outputs = [judge, evidence_judge, *task_judges]
+        judge_terminal_status = "failed" if any(
+            isinstance(value, dict) and value.get("judge_status") == "failed"
+            for value in all_judge_outputs
+        ) else "completed"
+        item.update({
+            "judge": judge or {"score": None, "reason": "not_applicable"},
+            "task_judge": task_judge,
+            "task_judges": task_judges,
+            "evidence_judge": evidence_judge or {"score": None, "reason": "not_applicable"},
+            "judge_ms": judge_ms,
+            "wall_clock_ms": wall_clock_ms,
+            "judge_status": judge_terminal_status,
+            "timing_breakdown": timing_breakdown,
+        })
+        item["agent_stability"] = self._agent_stability(item)
+        item["attribution"] = self._derive_attribution(item)
         return item
 
     @staticmethod
@@ -1644,6 +3214,137 @@ class BenchmarkRun:
         }
 
     @staticmethod
+    def _numeric_ms(value) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
+    @classmethod
+    def _annotate_agent_loop_timings(cls, model_calls: list, tool_trace: list) -> tuple[list[dict], list[dict]]:
+        """Record model + child-tool duration without flattening nested work.
+
+        ``total_ms`` remains the raw model request duration.  The new
+        ``agent_loop_total_ms`` is the end-to-end duration for that model round
+        plus directly attached tools.  Tool-internal model calls stay nested in
+        their parent tool and are not added as another top-level loop.
+        """
+        calls = [dict(call) for call in model_calls if isinstance(call, dict)]
+        tools = [dict(trace) for trace in tool_trace if isinstance(trace, dict)]
+        by_call: dict[int, list[dict]] = {}
+        for trace in tools:
+            try:
+                index = int(trace.get("model_call_index"))
+            except (TypeError, ValueError):
+                continue
+            duration_ms = cls._numeric_ms(trace.get("duration_ms"))
+            if duration_ms is None:
+                latency_s = cls._numeric_ms(trace.get("latency_s"))
+                duration_ms = latency_s * 1000 if latency_s is not None else None
+            if duration_ms is not None:
+                trace["duration_ms"] = round(duration_ms, 1)
+            by_call.setdefault(index, []).append(trace)
+
+        for index, call in enumerate(calls):
+            model_ms = cls._numeric_ms(call.get("total_ms"))
+            if model_ms is None:
+                continue
+            ttft_ms = cls._numeric_ms(call.get("ttft_ms"))
+            child_tools = by_call.get(index, [])
+            tool_ms = round(sum(float(tool.get("duration_ms") or 0) for tool in child_tools), 1)
+            generation_ms = round(max(0.0, model_ms - (ttft_ms or 0)), 1) if ttft_ms is not None else model_ms
+            call["agent_loop_total_ms"] = round(model_ms + tool_ms, 1)
+            call["agent_loop_timing"] = {
+                "model_ms": round(model_ms, 1),
+                "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+                "model_generation_ms": generation_ms,
+                "tool_ms": tool_ms if child_tools else 0.0,
+                "tool_count": len(child_tools),
+                "tools": [
+                    {"tool": tool.get("tool") or "未知工具", "duration_ms": tool.get("duration_ms")}
+                    for tool in child_tools
+                ],
+            }
+        return calls, tools
+
+    @classmethod
+    def _build_timing_breakdown(cls, model_calls: list, tool_trace: list,
+                                wall_clock_ms: float, agent_wall_ms: float,
+                                judge_ms: float, timeline: dict,
+                                tool_trace_present: bool,
+                                judge_queue_wait_ms: float = 0.0) -> dict:
+        """Build the two-level latency contract used by the UI.
+
+        QA children are Agent Loops, Judge, and residual overhead.  Each Agent
+        Loop exposes TTFT, model generation, and direct child tools.  A tool's
+        own latency already includes any nested work, so nested model calls are
+        intentionally excluded from the QA-level children.
+        """
+        loops = []
+        total_tool_ms = 0.0
+        for index, call in enumerate(model_calls):
+            call_type = str(call.get("call_type") or "agent")
+            if call_type in {"tool_internal", "faithfulness_judge"}:
+                continue
+            loop_ms = cls._numeric_ms(call.get("agent_loop_total_ms"))
+            model_ms = cls._numeric_ms(call.get("total_ms"))
+            if loop_ms is None or model_ms is None:
+                continue
+            timing = call.get("agent_loop_timing") or {}
+            tool_ms = cls._numeric_ms(timing.get("tool_ms")) or 0.0
+            total_tool_ms += tool_ms
+            observation = call.get("call_observation") or {}
+            label = observation.get("label") or {
+                "planner": "Agent 2.0 目标分解与规划",
+                "agent": "Agent 决策 / 回答",
+                "recovery": "Agent 恢复调用",
+                "writer": "最终回答重写",
+            }.get(call_type, call_type)
+            loops.append({
+                "index": index,
+                "label": label,
+                "call_type": call_type,
+                "step_id": call.get("step_id"),
+                "conversation_turn": call.get("conversation_turn"),
+                "duration_ms": loop_ms,
+                "model_ms": round(model_ms, 1),
+                "ttft_ms": timing.get("ttft_ms"),
+                "model_generation_ms": timing.get("model_generation_ms"),
+                "tool_ms": tool_ms,
+                "tool_count": timing.get("tool_count", 0),
+            })
+        loop_sum_ms = round(sum(float(loop["duration_ms"]) for loop in loops), 1)
+        agent_overhead_ms = round(max(0.0, agent_wall_ms - loop_sum_ms), 1)
+        judge_value = cls._numeric_ms(judge_ms)
+        queue_value = cls._numeric_ms(judge_queue_wait_ms) or 0.0
+        other_ms = round(max(0.0, wall_clock_ms - loop_sum_ms - (judge_value or 0) - queue_value), 1)
+        model_ms = round(sum(float(loop["model_ms"]) for loop in loops), 1) if loops else None
+        tool_ms = round(total_tool_ms, 1) if tool_trace_present else None
+        return {
+            "wall_clock_ms": wall_clock_ms,
+            "timeline": timeline,
+            "agent_wall_ms": agent_wall_ms,
+            "model_ms": model_ms,
+            "tool_ms": tool_ms,
+            "judge_ms": judge_value,
+            "judge_queue_wait_ms": queue_value if queue_value > 0 else None,
+            "other_ms": other_ms if tool_trace_present else None,
+            "agent_overhead_ms": agent_overhead_ms if tool_trace_present else None,
+            "orchestrator_overhead_ms": round(max(0.0, wall_clock_ms - agent_wall_ms - queue_value - (judge_value or 0)), 1),
+            "tool_trace_recorded": tool_trace_present,
+            "agent_loop_timing_recorded": bool(loops),
+            "agent_loops": loops,
+            "agent_loop_sum_ms": loop_sum_ms if loops else None,
+            "qa_components": ([
+                *[{"kind": "agent_loop", **loop} for loop in loops],
+                *([{"kind": "judge", "label": "Judge", "duration_ms": judge_value}] if judge_value else []),
+                *([{"kind": "judge_queue", "label": "Judge 排队 / 编排", "duration_ms": queue_value}] if queue_value > 0 else []),
+                *([{"kind": "other", "label": "其他", "duration_ms": other_ms}] if other_ms > 0 else []),
+            ] if loops else []),
+        }
+
+    @staticmethod
     def _bind_tool_calls_to_model_rounds(tool_trace: list, retrieval_trace: list,
                                          model_calls: list | int | None = None) -> list[dict]:
         """Attach tools by step ID first, with ordered fallback for historical runs."""
@@ -1659,6 +3360,7 @@ class BenchmarkRun:
                 continue
             key = (call.get("conversation_turn"), str(call.get("step_id")))
             call_index_by_step[key] = index
+            call_index_by_step[("any", str(call.get("step_id")))] = index
         for trace in bound:
             parent_step_id = trace.get("parent_step_id")
             key = (trace.get("conversation_turn"), str(parent_step_id))
@@ -1672,18 +3374,37 @@ class BenchmarkRun:
                         trace["model_call_index"] = 0
                         trace["round_binding_source"] = "inferred_single_model_call"
             return bound
-        model_index = -1
+        model_index = None
+        ordered_call_index = 0
         tool_index = 0
         for step in retrieval_trace:
             if not isinstance(step, dict):
                 continue
             stage = step.get("stage") or step.get("type")
-            if stage == "model":
-                model_index += 1
+            step_id = step.get("step_id")
+            step_key = (step.get("conversation_turn"), str(step_id))
+            mapped_index = call_index_by_step.get(step_key)
+            if mapped_index is None:
+                mapped_index = call_index_by_step.get(("any", str(step_id)))
+            if stage in {"planner", "model", "writer", "judge"}:
+                if mapped_index is not None:
+                    model_index = mapped_index
+                    ordered_call_index = max(ordered_call_index, mapped_index + 1)
+                elif ordered_call_index < model_call_count:
+                    model_index = ordered_call_index
+                    ordered_call_index += 1
             elif stage == "tool" and tool_index < len(bound):
-                if model_index >= 0 and bound[tool_index].get("model_call_index") is None:
+                if model_index is not None and model_index >= 0 and bound[tool_index].get("model_call_index") is None:
                     bound[tool_index]["model_call_index"] = model_index
                     bound[tool_index]["round_binding_source"] = "retrieval_trace"
+                    if step.get("parent_step_id") is not None:
+                        bound[tool_index]["parent_step_id"] = step.get("parent_step_id")
+                elif model_index is not None and model_index >= 0 and step.get("parent_step_id") is not None:
+                    # The execution trace is authoritative when older Sentrix
+                    # responses carried a stale positional model_call_index.
+                    bound[tool_index]["model_call_index"] = model_index
+                    bound[tool_index]["round_binding_source"] = "retrieval_trace_parent"
+                    bound[tool_index]["parent_step_id"] = step.get("parent_step_id")
                 tool_index += 1
         if model_call_count == 1:
             for trace in bound:
@@ -1861,6 +3582,49 @@ class BenchmarkRun:
         return calls
 
     @staticmethod
+    def _normalize_turn_traces(response: dict) -> tuple[list, list, list]:
+        """Normalize the response into one authoritative ordered trace.
+
+        ``debug_trace`` is the only response field that contains tool
+        arguments, parent step IDs, and the full observation.  Use it as the
+        fallback when the compact retrieval/tool summaries are absent.
+        """
+        response = response if isinstance(response, dict) else {}
+        metrics = response.get("model_call_metrics") or []
+        debug = response.get("debug_trace") or []
+        execution = response.get("retrieval_trace") or response.get("retrievalTrace") or []
+        if not execution and isinstance(debug, list):
+            execution = debug
+        compact_tools = response.get("tool_trace") or response.get("toolTrace") or []
+        debug_tools = []
+        if isinstance(debug, list):
+            debug_tools = [
+                step for step in debug
+                if isinstance(step, dict)
+                and str(step.get("type") or step.get("stage") or "") == "tool"
+            ]
+        # The compact trace carries timing/summary fields, while debug_trace
+        # carries the authoritative arguments, parent_step_id and full
+        # observation. Merge them by execution order so 8771 shows one
+        # complete, internally consistent tool record.
+        if debug_tools:
+            tools = []
+            for index, debug_tool in enumerate(debug_tools):
+                merged = dict(debug_tool)
+                if isinstance(compact_tools, list) and index < len(compact_tools):
+                    compact = compact_tools[index]
+                    if isinstance(compact, dict):
+                        for key, value in compact.items():
+                            if key not in {"observation", "arguments", "parent_step_id", "step_id", "tool", "tool_name"}:
+                                merged.setdefault(key, value)
+                tools.append(merged)
+        else:
+            tools = compact_tools
+        return list(metrics) if isinstance(metrics, list) else [], \
+            list(execution) if isinstance(execution, list) else [], \
+            list(tools) if isinstance(tools, list) else []
+
+    @staticmethod
     def _extract_tool_perf(task_state: dict) -> tuple[dict, list[dict]]:
         """Extract tool-internal metrics already returned in task_state.tool_results."""
         perf = {}
@@ -1983,12 +3747,12 @@ class BenchmarkRun:
                       '{"score":0|1|2,"reason":"简短中文理由"}')
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 1024,
-            "enable_thinking": False, "messages": [{"role": "system", "content": system_prompt},
+            **_judge_thinking_kwargs(getattr(self, "judge_url", "")),
+            "messages": [{"role": "system", "content": system_prompt},
                          {"role": "user", "content": judge_text}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
-                               self._judge_headers())
+            raw, retry_attempts = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             start, end = text.find("{"), text.rfind("}")
             try:
@@ -2010,8 +3774,7 @@ class BenchmarkRun:
                     "messages": [{"role": "system", "content": retry_system}, payload["messages"][1]],
                 }
                 try:
-                    retry_raw = request_json(f"{self.judge_url}/v1/chat/completions", retry_payload, "POST", 180,
-                                             self._judge_headers())
+                    retry_raw, _ = self._judge_request(retry_payload)
                     retry_text = str(retry_raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
                     retry_parsed = self._parse_judge_json(retry_text)
                     retry_score = retry_parsed.get("score") if retry_parsed.get("score") in {0, 1, 2} else None
@@ -2030,9 +3793,12 @@ class BenchmarkRun:
                 "reason": reason,
                 "input": payload,
                 "raw_text": text,
+                "judge_status": "completed",
+                "judge_retry_attempts": retry_attempts,
             }
         except Exception as e:
-            return {"score": None, "reason": f"judge_error: {e}", "input": payload}
+            return {"score": None, "reason": f"judge_error: {e}", "input": payload,
+                    "judge_status": "failed"}
 
     def _judge_task_action(self, question: str, answer: str, expected_action: str | None,
                            agent_status: str | None, termination_reason: str,
@@ -2066,12 +3832,12 @@ class BenchmarkRun:
                   "结合 GT 能力边界，只判断当前模型回答实际表现为直接回答、拒答还是澄清。只输出 JSON。")
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": TASK_JUDGE_PROMPT},
+            **_judge_thinking_kwargs(getattr(self, "judge_url", "")),
+            "messages": [{"role": "system", "content": getattr(self, "task_judge_system_prompt", None) or TASK_JUDGE_PROMPT},
                          {"role": "user", "content": prompt}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
-                               self._judge_headers())
+            raw, _ = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
             actual = parsed.get("actual_action") if parsed.get("actual_action") in {"answer", "refuse", "clarify", "none"} else None
@@ -2083,10 +3849,12 @@ class BenchmarkRun:
                 "reason": str(parsed.get("reason") or text[:200]),
                 "input": payload,
                 "raw_text": text,
+                "judge_status": "completed",
             }
         except Exception as exc:
             return {"expected_action": expected_action, "actual_action": None, "correct": None,
-                    "reason": f"judge_error: {exc}", "input": payload}
+                    "reason": f"judge_error: {exc}", "input": payload,
+                    "judge_status": "failed"}
 
     def _judge_evidence(self, question: str, answer: str, predicted_images: list[dict],
                         assets_by_name: dict, sentrix_url: str,
@@ -2110,25 +3878,26 @@ class BenchmarkRun:
                     {"score": 0, "reason": "no_image_evidence", "input": None})
         payload = {
             "model": getattr(self, "judge_model", JUDGE_MODEL), "temperature": 0, "max_tokens": 512,
-            "enable_thinking": False, "messages": [{"role": "system", "content": EVIDENCE_JUDGE_PROMPT},
+            **_judge_thinking_kwargs(getattr(self, "judge_url", "")),
+            "messages": [{"role": "system", "content": getattr(self, "evidence_judge_system_prompt", None) or EVIDENCE_JUDGE_PROMPT},
                          {"role": "user", "content": content}],
         }
         try:
-            raw = request_json(f"{self.judge_url}/v1/chat/completions", payload, "POST", 180,
-                               self._judge_headers())
+            raw, _ = self._judge_request(payload)
             text = str(raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
             parsed = self._parse_judge_json(text)
             applicable = parsed.get("applicable") is not False
             if not applicable:
                 return {"score": None, "applicable": False,
                         "reason": str(parsed.get("reason") or "no_visual_claims"),
-                        "input": payload, "raw_text": text}
+                        "input": payload, "raw_text": text, "judge_status": "completed"}
             score = parsed.get("score") if parsed.get("score") in {0, 1, 2} else None
             return {"score": score, "applicable": True,
                     "reason": str(parsed.get("reason") or text[:200]),
-                    "input": payload, "raw_text": text}
+                    "input": payload, "raw_text": text, "judge_status": "completed"}
         except Exception as exc:
-            return {"score": None, "reason": f"judge_error: {exc}", "input": payload}
+            return {"score": None, "reason": f"judge_error: {exc}", "input": payload,
+                    "judge_status": "failed"}
 
     @staticmethod
     def _parse_judge_json(text: str) -> dict:
@@ -2138,6 +3907,75 @@ class BenchmarkRun:
         except json.JSONDecodeError:
             value = {}
         return value if isinstance(value, dict) else {}
+
+    def _judge_chat_url(self) -> str:
+        url = self.judge_url.rstrip("/")
+        if url.endswith("/chat/completions"):
+            return url
+        if url.endswith("/v1") or url.endswith("/v3") or url.endswith("/v2"):
+            return f"{url}/chat/completions"
+        return f"{url}/v1/chat/completions"
+
+    def _judge_request(self, payload: dict, timeout: int = 180) -> tuple[dict, int]:
+        """Call remote Judge with bounded exponential-backoff retries."""
+        last_error = None
+        for attempt in range(1, JUDGE_RETRY_ATTEMPTS + 1):
+            try:
+                self._wait_for_judge_request_slot()
+                response = request_json(
+                    self._judge_chat_url(), payload, "POST", timeout,
+                    self._judge_headers(),
+                )
+                if not isinstance(response, dict):
+                    raise ValueError("judge response is not an object")
+                return response, attempt
+            except Exception as exc:
+                last_error = exc
+                if attempt >= JUDGE_RETRY_ATTEMPTS:
+                    break
+                delay = self._judge_retry_delay(exc, attempt)
+                if self._cancel.wait(delay):
+                    raise RunCancelledError("cancelled while retrying Judge request") from exc
+        raise RuntimeError(
+            f"judge request failed after {JUDGE_RETRY_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
+
+    def _wait_for_judge_request_slot(self) -> None:
+        """Space cloud requests across Judge workers to avoid synchronized bursts."""
+        if JUDGE_REQUEST_INTERVAL_SECONDS <= 0:
+            return
+        rate_lock = getattr(self, "_judge_rate_lock", None)
+        if rate_lock is None:
+            rate_lock = self._judge_rate_lock = threading.Lock()
+            self._judge_next_request_at = 0.0
+        with rate_lock:
+            current = time.monotonic()
+            wait_seconds = max(0.0, getattr(self, "_judge_next_request_at", 0.0) - current)
+            self._judge_next_request_at = max(
+                current, getattr(self, "_judge_next_request_at", 0.0)
+            ) + JUDGE_REQUEST_INTERVAL_SECONDS
+        if wait_seconds and self._cancel.wait(wait_seconds):
+            raise RunCancelledError("cancelled while waiting for Judge rate limit")
+
+    @staticmethod
+    def _judge_retry_delay(error: Exception, attempt: int) -> float:
+        delay = min(
+            JUDGE_RETRY_BACKOFF_MAX_SECONDS,
+            JUDGE_RETRY_BACKOFF_SECONDS * (2 ** max(0, attempt - 1)),
+        )
+        current: BaseException | None = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, urllib.error.HTTPError):
+                raw = str(current.headers.get("Retry-After") or "").strip()
+                try:
+                    delay = max(delay, float(raw))
+                except ValueError:
+                    pass
+                break
+            current = current.__cause__ or current.__context__
+        return delay + random.uniform(0.0, min(2.0, delay * 0.2))
 
     def _judge_headers(self) -> dict[str, str]:
         api_key = getattr(self, "judge_api_key", JUDGE_API_KEY)
@@ -2182,6 +4020,17 @@ class BenchmarkRun:
 
     def _phase_gpu_metrics(self):
         self._phase_start("gpu_metrics")
+        if self.use_cloud_model or not self.vllm_api_url:
+            self._phase_done("gpu_metrics", {
+                "status": "skipped",
+                "source": "cloud_api" if self.use_cloud_model else "external",
+                "reason": (
+                    "cloud_api_has_no_local_gpu_metrics"
+                    if self.use_cloud_model else
+                    "external_model_endpoint_has_no_manager_metrics"
+                ),
+            })
+            return
         agg = self._gpu_sampler.aggregate()
         self._phase_done("gpu_metrics", agg)
 
@@ -2215,8 +4064,9 @@ class BenchmarkRun:
                     context_tokens.append(prompt + completion)
 
         summary = {
-            "total": len(self.qa_rows),
-            "completed": len(items),
+            # build 模式不做 QA；total 置 0 避免前端把未执行的题数渲染成 0/N。
+            "total": len(self.qa_rows) if self.mode != "build" else 0,
+            "completed": sum(1 for item in items if item.get("judge_status") in {"completed", "failed", "skipped"}),
             "retrieval_recall_mean": round(sum(recalls) / len(recalls), 3) if recalls else None,
             "judge_distribution": distribution,
             "judge_valid_count": denom,
@@ -2235,7 +4085,7 @@ class BenchmarkRun:
             "llm_context_tokens_p95": nearest_rank_percentile(context_tokens, 0.95),
             "llm_context_samples_count": len(context_tokens),
         }
-        summary.update(self._capability_summary(items))
+        summary.update(self._capability_summary(items, self.state.get("phases") or {}))
         summary["benchmark_e2e_latency_excluding_judge_ms"] = self._benchmark_e2e_latency_excluding_judge_ms(
             self.state.get("phases") or {}, items,
         )
@@ -2243,29 +4093,56 @@ class BenchmarkRun:
         self._phase_done("aggregate", {"summary": summary})
 
     @classmethod
-    def _capability_summary(cls, items: list[dict]) -> dict:
-        answer_judges = [judge for item in items for judge in (
-            [turn.get("judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else [item.get("judge") or {}]
-        )]
+    def _capability_summary(cls, items: list[dict], phases: dict | None = None) -> dict:
+        # Canonical metric: per-qa_id, take the final (item-level) judge only.
+        # Multi-turn conversation items used to be flattened into one judge per
+        # turn, inflating the denominator beyond the number of questions.
+        answer_judges = [item.get("judge") or {} for item in items]
         answer_scores = [score for judge in answer_judges if (score := judge_score_for_summary(judge)) is not None]
         answer_dist = {str(score): answer_scores.count(score) for score in (0, 1, 2)}
-        retrieval_items = [item for item in items if item.get("retrieval_image_ids")]
-        tp = sum(len(item.get("matched_file_names") or []) for item in retrieval_items)
-        predicted = sum(len(item.get("predicted_file_names") or []) for item in retrieval_items)
-        gt = sum(len(item.get("retrieval_image_ids") or []) for item in retrieval_items)
-        precision = tp / predicted if predicted else (0.0 if gt else None)
-        recall = tp / gt if gt else None
-        f1 = 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else (0.0 if gt else None)
-        evidence_judges = [judge for item in items for judge in (
-            [turn.get("evidence_judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else [item.get("evidence_judge") or {}]
-        )]
+        metric_items = [item for item in items if _retrieval_metric_eligible(item)]
+        excluded_unanswerable_count = len(items) - len(metric_items)
+        typed_retrieval_items = [item for item in metric_items if "retrieval_media_refs" in item]
+        if typed_retrieval_items:
+            media_metrics = _micro_metrics_from_counts(typed_retrieval_items, "media_retrieval_counts")
+            image_metrics = _micro_metrics_from_counts(typed_retrieval_items, "image_retrieval_counts")
+            video_metrics = _micro_metrics_from_counts(typed_retrieval_items, "video_retrieval_counts")
+            media_macro = _macro_metrics_from_counts(typed_retrieval_items, "media_retrieval_counts")
+            image_macro = _macro_metrics_from_counts(typed_retrieval_items, "image_retrieval_counts")
+            video_macro = _macro_metrics_from_counts(typed_retrieval_items, "video_retrieval_counts")
+            precision, recall, f1 = (
+                media_metrics["precision"], media_metrics["recall"], media_metrics["f1"])
+            retrieval_metric_count = media_metrics["metric_count"]
+        else:
+            # Historical results predate typed refs and are strictly image-only.
+            retrieval_items = [item for item in metric_items if item.get("retrieval_image_ids")]
+            tp = sum(len(item.get("retrieved_matched_file_names") or item.get("matched_file_names") or []) for item in retrieval_items)
+            predicted = sum(len(item.get("retrieved_file_names") or item.get("predicted_file_names") or []) for item in retrieval_items)
+            gt = sum(len(item.get("retrieval_image_ids") or []) for item in retrieval_items)
+            precision = tp / predicted if predicted else (0.0 if gt else None)
+            recall = tp / gt if gt else None
+            f1 = 2 * precision * recall / (precision + recall) if precision is not None and recall is not None and precision + recall else (0.0 if gt else None)
+            retrieval_metric_count = len(retrieval_items)
+            media_metrics = None
+            image_metrics = {"precision": precision, "recall": recall, "f1": f1,
+                             "metric_count": retrieval_metric_count}
+            video_metrics = None
+            legacy_values = {
+                metric: [item.get(f"retrieval_{metric}") for item in retrieval_items
+                         if isinstance(item.get(f"retrieval_{metric}"), (int, float))]
+                for metric in ("precision", "recall", "f1")
+            }
+            image_macro = {metric: sum(values) / len(values) if values else None
+                           for metric, values in legacy_values.items()} | {
+                               "metric_count": len(legacy_values["recall"])
+                           }
+            media_macro = image_macro
+            video_macro = None
+        evidence_judges = [item.get("evidence_judge") or {} for item in items]
         evidence_scores = [judge.get("score") for judge in evidence_judges if judge.get("score") in {0, 1, 2}]
         evidence_dist = {str(score): evidence_scores.count(score) for score in (0, 1, 2)}
         action_judges = [judge for item in items for judge in (
-            [turn.get("task_judge") or {} for turn in item.get("conversation") or []]
-            if item.get("conversation") else item.get("task_judges") or [item.get("task_judge") or {}]
+            item.get("task_judges") or [item.get("task_judge") or {}]
         ) if judge.get("expected_action") in {"answer", "refuse", "clarify"}]
         action_valid = [value for value in action_judges if value.get("correct") in {True, False}]
         parse_totals = [item.get("agent_stability", {}).get("json_parse_total") for item in items]
@@ -2276,6 +4153,60 @@ class BenchmarkRun:
         completion_valid = [value for value in completion if isinstance(value, bool)]
         wall_times = [float(item["wall_clock_ms"]) for item in items
                       if isinstance(item.get("wall_clock_ms"), (int, float))]
+        judge_times = [float((item.get("timing_breakdown") or {}).get("judge_ms"))
+                       for item in items
+                       if isinstance((item.get("timing_breakdown") or {}).get("judge_ms"), (int, float))]
+        # New runs record the real Agent-only phase wall clock.  This is the
+        # concurrency throughput metric: Agent phase wall / number of QA items.
+        # It must not be reconstructed by subtracting Judge intervals, because
+        # cloud Judge calls can overlap other Agent requests.
+        judge_exclusive_ms = None
+        agent_throughput_ms = None
+        agent_throughput_mode = "historical_interval_estimate"
+        agent_phase_wall_ms = cls._numeric_ms((phases or {}).get("qa_eval", {}).get("agent_phase_wall_ms"))
+        agent_phase_count = (phases or {}).get("qa_eval", {}).get("agent_completed")
+        if not isinstance(agent_phase_count, int) or agent_phase_count <= 0:
+            agent_phase_count = len(items)
+        timelines = [(item.get("timing_breakdown") or {}).get("timeline") or {} for item in items]
+        spans = [(tl.get("started_at_epoch"), tl.get("judge_started_at_epoch"), tl.get("judge_finished_at_epoch")) for tl in timelines]
+        ends = []
+        for s, item in zip(spans, items):
+            wall_ms = (item.get("timing_breakdown") or {}).get("wall_clock_ms")
+            if isinstance(s[0], (int, float)) and isinstance(wall_ms, (int, float)):
+                ends.append(s[0] + float(wall_ms) / 1000)
+        phase = (phases or {}).get("qa_eval") or {}
+        try:
+            phase_start = datetime.fromisoformat(str(phase.get("started_at"))).timestamp()
+            phase_end = datetime.fromisoformat(str(phase.get("finished_at"))).timestamp()
+        except (TypeError, ValueError, OSError):
+            phase_start = phase_end = None
+        valid_item_spans = [s for s in spans if isinstance(s[0], (int, float))]
+        if phase_end is not None and phase_start is not None and phase_end > phase_start:
+            wall_start, wall_end = phase_start, phase_end
+        elif valid_item_spans and ends:
+            wall_start = min(s[0] for s in valid_item_spans)
+            wall_end = max(e for e in ends if isinstance(e, (int, float)))
+        else:
+            wall_start = wall_end = None
+        judge_spans = sorted((s[1], s[2]) for s in spans
+                             if isinstance(s[1], (int, float)) and isinstance(s[2], (int, float)) and s[2] > s[1])
+        if wall_start is not None and wall_end is not None and judge_spans:
+            merged: list[list[float]] = []
+            for a, b in judge_spans:
+                if merged and a <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            judge_exclusive_ms = round(sum(b - a for a, b in merged) * 1000, 1)
+        if agent_phase_wall_ms is not None and agent_phase_wall_ms > 0 and agent_phase_count > 0:
+            agent_throughput_ms = round(agent_phase_wall_ms / agent_phase_count, 1)
+            agent_throughput_mode = "measured_agent_phase"
+        elif wall_start is not None and wall_end is not None and judge_spans and items:
+            # Compatibility fallback for old runs that had no Agent/Judge
+            # boundary.  Keep it explicitly marked as an estimate.
+            agent_throughput_ms = round(max(0.0, (wall_end - wall_start) * 1000 - (judge_exclusive_ms or 0)) / len(items), 1)
+        judge_phase = (phases or {}).get("qa_eval") or {}
+        judge_phase_wall_ms = cls._numeric_ms(judge_phase.get("judge_phase_wall_ms"))
         agent_wall_times = [float((item.get("timing_breakdown") or {}).get("agent_wall_ms"))
                             for item in items
                             if isinstance((item.get("timing_breakdown") or {}).get("agent_wall_ms"), (int, float))]
@@ -2294,7 +4225,34 @@ class BenchmarkRun:
             "retrieval_precision_micro": round(precision, 3) if precision is not None else None,
             "retrieval_recall_micro": round(recall, 3) if recall is not None else None,
             "retrieval_f1_micro": round(f1, 3) if f1 is not None else None,
-            "retrieval_metric_count": len(retrieval_items),
+            "retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro["precision"] is not None else None,
+            "retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro["recall"] is not None else None,
+            "retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro["f1"] is not None else None,
+            "retrieval_recall_mean": round(media_macro["recall"], 3) if media_macro["recall"] is not None else None,
+            "retrieval_metric_count": retrieval_metric_count,
+            "retrieval_metric_scope": "all_media" if typed_retrieval_items else "legacy_image_only",
+            "retrieval_excluded_unanswerable_count": excluded_unanswerable_count,
+            "media_retrieval_precision_micro": round(media_metrics["precision"], 3) if media_metrics and media_metrics["precision"] is not None else None,
+            "media_retrieval_recall_micro": round(media_metrics["recall"], 3) if media_metrics and media_metrics["recall"] is not None else None,
+            "media_retrieval_f1_micro": round(media_metrics["f1"], 3) if media_metrics and media_metrics["f1"] is not None else None,
+            "media_retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro["precision"] is not None else None,
+            "media_retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro["recall"] is not None else None,
+            "media_retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro["f1"] is not None else None,
+            "media_retrieval_metric_count": media_metrics["metric_count"] if media_metrics else None,
+            "image_retrieval_precision_micro": round(image_metrics["precision"], 3) if image_metrics and image_metrics["precision"] is not None else None,
+            "image_retrieval_recall_micro": round(image_metrics["recall"], 3) if image_metrics and image_metrics["recall"] is not None else None,
+            "image_retrieval_f1_micro": round(image_metrics["f1"], 3) if image_metrics and image_metrics["f1"] is not None else None,
+            "image_retrieval_precision_macro": round(image_macro["precision"], 3) if image_macro["precision"] is not None else None,
+            "image_retrieval_recall_macro": round(image_macro["recall"], 3) if image_macro["recall"] is not None else None,
+            "image_retrieval_f1_macro": round(image_macro["f1"], 3) if image_macro["f1"] is not None else None,
+            "image_retrieval_metric_count": image_metrics["metric_count"] if image_metrics else None,
+            "video_retrieval_precision_micro": round(video_metrics["precision"], 3) if video_metrics and video_metrics["precision"] is not None else None,
+            "video_retrieval_recall_micro": round(video_metrics["recall"], 3) if video_metrics and video_metrics["recall"] is not None else None,
+            "video_retrieval_f1_micro": round(video_metrics["f1"], 3) if video_metrics and video_metrics["f1"] is not None else None,
+            "video_retrieval_precision_macro": round(video_macro["precision"], 3) if video_macro and video_macro["precision"] is not None else None,
+            "video_retrieval_recall_macro": round(video_macro["recall"], 3) if video_macro and video_macro["recall"] is not None else None,
+            "video_retrieval_f1_macro": round(video_macro["f1"], 3) if video_macro and video_macro["f1"] is not None else None,
+            "video_retrieval_metric_count": video_metrics["metric_count"] if video_metrics else None,
             "evidence_distribution": evidence_dist,
             "evidence_valid_count": len(evidence_scores),
             "evidence_mean": round(sum(evidence_scores) / len(evidence_scores), 3) if evidence_scores else None,
@@ -2314,6 +4272,19 @@ class BenchmarkRun:
             "e2e_latency_max_ms": max(wall_times) if wall_times else None,
             "agent_task_latency_mean_ms": round(sum(agent_wall_times) / len(agent_wall_times), 1)
                 if agent_wall_times else None,
+            "judge_llm_latency_mean_ms": round(sum(judge_times) / len(judge_times), 1)
+                if judge_times else None,
+            "judge_exclusive_wall_ms": judge_exclusive_ms,
+            "judge_phase_wall_ms": judge_phase_wall_ms,
+            "judge_concurrency": judge_phase.get("judge_concurrency"),
+            "agent_throughput_latency_ms": agent_throughput_ms,
+            "agent_throughput_latency_mode": agent_throughput_mode,
+            "agent_phase_wall_ms": agent_phase_wall_ms,
+            "agent_phase_completed_count": agent_phase_count if agent_phase_wall_ms is not None else None,
+            "agent_throughput_qa_per_s": round(1000 * agent_phase_count / agent_phase_wall_ms, 3)
+                if agent_phase_wall_ms and agent_phase_count else None,
+            "agent_throughput_latency_sample_count": agent_phase_count if agent_phase_wall_ms is not None else len(judge_spans),
+            "agent_throughput_latency_total_count": len(items),
             "agent_loop_calls_mean": round(sum(agent_loop_counts) / len(agent_loop_counts), 3)
                 if agent_loop_counts else None,
             "agent2_trace": summarize_agent2_trace([
@@ -2323,15 +4294,22 @@ class BenchmarkRun:
 
     @staticmethod
     def _benchmark_e2e_latency_excluding_judge_ms(phases: dict, items: list[dict]) -> float | None:
-        """Wall time from data import through QA completion, excluding Judge calls."""
+        """Wall time from data import through Agent completion, excluding Judge.
+
+        New runs have an explicit Agent phase boundary.  Only historical runs
+        without that boundary use the old per-item subtraction fallback.
+        """
         started_at = (phases.get("identity_seed") or {}).get("started_at")
-        finished_at = (phases.get("qa_eval") or {}).get("finished_at")
+        qa_phase = phases.get("qa_eval") or {}
+        finished_at = qa_phase.get("agent_phase_finished_at") or qa_phase.get("finished_at")
         if not started_at or not finished_at:
             return None
         try:
             wall_ms = (datetime.fromisoformat(str(finished_at)) - datetime.fromisoformat(str(started_at))).total_seconds() * 1000
         except (TypeError, ValueError):
             return None
+        if qa_phase.get("agent_phase_finished_at"):
+            return round(max(0.0, wall_ms), 1)
         judge_values = [(item.get("timing_breakdown") or {}).get("judge_ms") for item in items]
         if items and not all(isinstance(value, (int, float)) for value in judge_values):
             return None
@@ -2357,7 +4335,7 @@ class OrchestratorRepository:
 
     @staticmethod
     def _load_qa_metadata() -> dict[str, dict]:
-        fields = ("task_type", "question_type", "angle", "difficulty", "answerability",
+        fields = ("task_type", "question_type", "tags", "angle", "difficulty", "answerability",
                   "scope", "scope_anchor", "required_evidence_sources", "query_anchors",
                   "expected_action", "answer", "conversation")
         result = {}
@@ -2393,6 +4371,20 @@ class OrchestratorRepository:
     def _hydrate_qa_metadata(self, item: dict) -> dict:
         metadata = self.qa_metadata.get(str(item.get("qa_id") or "")) or {}
         hydrated = {**metadata, **item}
+        tag_fields = {
+            "task_type": "task",
+            "question_type": "question",
+            "angle": "angle",
+            "difficulty": "difficulty",
+            "answerability": "answerability",
+            "expected_action": "action",
+        }
+        tags = [str(tag).strip() for tag in (hydrated.get("tags") or []) if str(tag).strip()]
+        for field, prefix in tag_fields.items():
+            value = str(hydrated.get(field) or "").strip()
+            if value:
+                tags.append(f"{prefix}:{value}")
+        hydrated["tags"] = list(dict.fromkeys(tags))
         judge = hydrated.get("judge") or {}
         consistency_status = judge_consistency_status(judge)
         if consistency_status:
@@ -2515,6 +4507,7 @@ class OrchestratorRepository:
                             "album_id": m["album_id"], "album_name": m["album_name"],
                             "face_count": len(m.get("faces", [])),
                             "photo_count": len(m.get("photos", [])),
+                            "video_count": len(m.get("videos", [])),
                             "qa_sets": list(m.get("qa_sets", {}).keys()),
                         })
                     except (OSError, KeyError, json.JSONDecodeError):
@@ -2528,18 +4521,110 @@ class OrchestratorRepository:
         return None
 
     def query_profiles(self, vllm_api_url: str) -> dict:
+        if not vllm_api_url:
+            return {"profiles": [], "status": "not_applicable", "reason": "model_manager_not_configured"}
         try:
-            profiles = request_json(f"{vllm_api_url.rstrip('/')}/profiles", timeout=15)
-            state = request_json(f"{vllm_api_url.rstrip('/')}/state", timeout=10)
-            return {"profiles": profiles, "current": state}
+            return ManagerLifecycleProvider(vllm_api_url).profiles()
         except Exception as e:
-            return {"profiles": [], "current": {}, "error": str(e)}
+            return {"profiles": [], "status": "unavailable", "error": str(e)}
+
+    def query_current_model(self, vllm_api_url: str, model_base_url: str,
+                            requested_model: str = "") -> dict:
+        manager_error = None
+        state = {}
+        if vllm_api_url:
+            try:
+                state = ManagerLifecycleProvider(
+                    vllm_api_url, request_fn=request_json,
+                ).state() or {}
+            except Exception as exc:
+                manager_error = str(exc)
+        model_base_url = normalize_model_base_url(model_base_url)
+        if not model_base_url:
+            raise ValueError("model endpoint is required; enter host:port or an OpenAI /v1 URL")
+        inference = OpenAICompatibleInferenceProvider(
+            model_base_url, manager_url=vllm_api_url, api_mode="generic", timeout=15,
+            request_fn=request_json,
+        )
+        served_models = inference.list_models().get("models") or []
+        if not served_models:
+            raise ValueError("model endpoint exposes no models")
+        requested_model = str(requested_model or "").strip()
+        if requested_model and requested_model not in served_models:
+            raise ValueError(
+                f"selected model {requested_model!r} is not exposed by the endpoint; "
+                f"available models: {served_models}"
+            )
+        served_name = str(state.get("served_model_name") or "").strip()
+        if served_name and served_name not in served_models:
+            raise ValueError(
+                f"manager state is stale or mismatched: expected {served_name}, "
+                f"live endpoint serves {served_models or 'nothing'}"
+            )
+        if served_name and requested_model and requested_model != served_name:
+            raise ValueError(
+                f"Manager reports {served_name!r} as the active model; "
+                f"cannot reuse requested model {requested_model!r} without switching it through Manager"
+            )
+        if not served_name:
+            served_name = requested_model or (served_models[0] if len(served_models) == 1 else "")
+        profile = str(state.get("profile") or "").strip()
+        model_id = profile or served_name or None
+        return {
+            "model_id": model_id,
+            "served_model_name": served_name or None,
+            "selection_required": not bool(served_name),
+            "verified_at": now_iso(),
+            "served_models": served_models,
+            "state": state,
+            "model_base_url": model_base_url,
+            "manager_available": bool(state),
+            "manager_error": manager_error,
+            "capabilities": inference.capabilities(),
+        }
+
+    def test_model_endpoint(self, model_base_url: str, requested_model: str) -> dict:
+        snapshot = self.query_current_model("", model_base_url, requested_model)
+        served_name = str(snapshot.get("served_model_name") or "").strip()
+        if not served_name:
+            raise ValueError("select a model before testing the endpoint")
+        inference = OpenAICompatibleInferenceProvider(
+            snapshot["model_base_url"], api_mode="generic", timeout=30,
+        )
+        started = time.perf_counter()
+        response = inference.chat({
+            "model": served_name,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 1,
+            "temperature": 0,
+            "stream": False,
+        }, timeout=30)
+        body = response.json()
+        choices = body.get("choices") or [] if isinstance(body, dict) else []
+        if not choices:
+            raise ValueError("model endpoint returned no completion choices")
+        return {
+            "ok": True,
+            "model": served_name,
+            "model_base_url": snapshot["model_base_url"],
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "verified_at": now_iso(),
+        }
 
     def start_memory_profile(self, payload: dict) -> dict:
         """Replay saved questions to measure comparable memory without changing QA results."""
         run_ids = [str(value) for value in payload.get("run_ids") or []]
         if not run_ids:
             raise ValueError("run_ids is required")
+        with self.lock:
+            cloud_runs = []
+            for rid in run_ids:
+                run = self.runs.get(rid)
+                state = run.state if isinstance(run, BenchmarkRun) else run or {}
+                if state.get("model_source") == "cloud_api":
+                    cloud_runs.append(rid)
+        if cloud_runs:
+            raise ValueError("cloud API model does not support local GPU memory profiling")
         target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
         manager_url = str(target["manager_url"]).rstrip("/")
         sentrix_url = str(payload.get("sentrix_url") or DEFAULT_SENTRIX_URL).rstrip("/")
@@ -2582,18 +4667,19 @@ class OrchestratorRepository:
                     record = state["memory_profile"]
                     record.update({"status": "running", "started_at": now_iso()})
                     persist(rid, state)
-                sampler = GpuSampler(manager_url, interval=0.1)
+                lifecycle = ManagerLifecycleProvider(manager_url)
+                sampler = GpuSampler(ManagerTelemetryProvider(manager_url), interval=0.1)
                 completed, failed, request_count = 0, 0, 0
                 try:
                     try:
-                        request_json(f"{manager_url}/stop", {"timeout": 60}, "POST", 90)
+                        lifecycle.stop({"timeout": 60}, timeout=90)
                     except Exception:
                         pass
                     time.sleep(5)
-                    request_json(f"{manager_url}/start", {
+                    lifecycle.start({
                         "profile": profile, "wait_ready": True, "ready_timeout": 600,
-                    }, "POST", 700)
-                    model_state = request_json(f"{manager_url}/state", timeout=10)
+                    }, timeout=700)
+                    model_state = lifecycle.state()
                     request_json(f"{sentrix_url}/api/model-profiles/bind-runtime", {
                         "manager_url": manager_url,
                         "model_base_url": str(target["model_base_url"]),
@@ -2699,45 +4785,868 @@ class OrchestratorRepository:
             result["summary"] = self._effective_summary(state)
             return result
 
-    def export_sft(self, run_id: str, min_score: int | None = None) -> dict:
-        """导出轨迹（每步模型调用的 prompt -> response）用于轨迹训练。
+    def get_keyframe_analysis(self, run_id: str) -> dict:
+        """Analyze whether video keyframes are useful for this complete run.
 
-        min_score: None 导出全部；1 只导出答案评分 >=1 的题目；2 只导出评分 =2 的题目。
+        This is deliberately computed from persisted QA traces plus the live
+        Sentrix asset manifest.  A keyframe is counted as relevant to a video
+        GT when its ``parent_asset_id`` is the GT video, so the metric does not
+        punish a system for returning a frame instead of the source video.
         """
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
                 raise KeyError(run_id)
+            state = copy.deepcopy(run.state if isinstance(run, BenchmarkRun) else run)
+        scope_id = str(state.get("scope_id") or "").strip()
+        if not scope_id:
+            return {"status": "pending", "reason": "scope_id_missing", "run_id": run_id}
+
+        try:
+            payload = request_json(
+                f"{DEFAULT_SENTRIX_URL.rstrip('/')}/api/assets?scope_id={quote(scope_id)}&limit=2000",
+                timeout=60,
+            )
+            assets = payload.get("assets", []) if isinstance(payload, dict) else payload
+        except Exception as exc:
+            return {"status": "unavailable", "run_id": run_id, "scope_id": scope_id,
+                    "error": str(exc)}
+        assets = [item for item in (assets or []) if isinstance(item, dict)]
+        asset_source_note = "Sentrix 资产清单"
+        if not assets:
+            # Reused runs may point to a memory scope that is no longer
+            # exposed by the local Sentrix service. Recover keyframe metadata
+            # from persisted tool previews instead of returning zero metrics.
+            recovered = {}
+            for item in state.get("items") or []:
+                traces = item.get("tool_trace") or [] if isinstance(item, dict) else []
+                for trace in traces:
+                    previews = (trace.get("observation") or {}).get("preview") or [] if isinstance(trace, dict) else []
+                    for preview in previews:
+                        if not isinstance(preview, dict) or preview.get("media_kind") != "video_keyframe":
+                            continue
+                        keyframe_id = str(preview.get("asset_id") or "").strip()
+                        parent_id = str(preview.get("source_video_asset_id") or "").strip()
+                        if not keyframe_id:
+                            continue
+                        recovered[keyframe_id] = {
+                            "id": keyframe_id,
+                            "file_name": preview.get("file_name") or preview.get("asset_id"),
+                            "media_type": "image",
+                            "derived_kind": "video_keyframe",
+                            "parent_asset_id": parent_id,
+                            "metadata_json": {
+                                "derived_kind": "video_keyframe",
+                                "parent_asset_id": parent_id,
+                                "source_timestamp_sec": preview.get("source_timestamp_sec"),
+                                "keyframe_selection_reason": preview.get("selection_reason") or "来自已保存工具预览",
+                            },
+                        }
+                        if parent_id and parent_id not in recovered:
+                            recovered[parent_id] = {
+                                "id": parent_id,
+                                "file_name": preview.get("source_video_file_name") or parent_id,
+                                "media_type": "video",
+                                "metadata_json": {},
+                            }
+            assets = list(recovered.values())
+            asset_source_note = (
+                "当前 run 工具轨迹回退：使用已持久化的关键帧 parent_asset_id 与时间戳；未重新处理视频"
+                if assets else "Sentrix 资产清单为空，且 run 未保存关键帧预览"
+            )
+        by_id = {str(item.get("id")): item for item in assets if item.get("id")}
+        by_name = {}
+        for item in assets:
+            name = str(item.get("file_name") or "").strip().lower()
+            if name:
+                by_name.setdefault(name, []).append(item)
+
+        def metadata(asset):
+            value = asset.get("metadata_json") if isinstance(asset, dict) else {}
+            return value if isinstance(value, dict) else {}
+
+        def resolve_asset(value):
+            if isinstance(value, dict):
+                candidates = [value.get("asset_id"), value.get("id"), value.get("media_id"), value.get("file_name"), value.get("image_id"), value.get("video_id")]
+            else:
+                candidates = [value]
+            for candidate in candidates:
+                text = str(candidate or "").strip()
+                if not text:
+                    continue
+                if text in by_id:
+                    return by_id[text]
+                matches = by_name.get(text.lower()) or []
+                if matches:
+                    return matches[0]
+                stem = Path(text).stem.lower()
+                matches = [item for name, rows in by_name.items() if Path(name).stem.lower() == stem for item in rows]
+                if matches:
+                    return matches[0]
+            return None
+
+        keyframe_assets = [item for item in assets if item.get("derived_kind") == "video_keyframe" or metadata(item).get("derived_kind") == "video_keyframe"]
+        keyframe_ids = {str(item.get("id")) for item in keyframe_assets if item.get("id")}
+        parent_by_keyframe = {str(item.get("id")): str(item.get("parent_asset_id") or metadata(item).get("parent_asset_id") or "") for item in keyframe_assets if item.get("id")}
+        source_videos = [item for item in assets if item.get("media_type") == "video" and str(item.get("id")) not in keyframe_ids]
+        source_video_ids = {str(item.get("id")) for item in source_videos if item.get("id")}
+
+        # Keep processing/selection metrics on the same full scope as the
+        # retrieval metrics.  ``video_processing_seconds`` is recorded by the
+        # Sentrix video pipeline; duration and frame count come from ffprobe's
+        # persisted metadata, so this does not reprocess the media.
+        raw_frame_count = 0
+        source_duration_sec = 0.0
+        processing_seconds = []
+        for video in source_videos:
+            video_meta = metadata(video).get("video_metadata") or {}
+            duration = video_meta.get("duration_sec")
+            if isinstance(duration, (int, float)):
+                source_duration_sec += float(duration)
+            streams = ((video_meta.get("raw") or {}).get("streams") or [])
+            video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+            if isinstance(video_stream, dict):
+                frames = video_stream.get("nb_frames")
+                try:
+                    raw_frame_count += int(frames or 0)
+                except (TypeError, ValueError):
+                    pass
+            elapsed = metadata(video).get("video_processing_seconds")
+            if isinstance(elapsed, (int, float)):
+                processing_seconds.append(float(elapsed))
+
+        def refs(item, field):
+            value = item.get(field) or []
+            return value if isinstance(value, list) else []
+
+        def asset_ids(values):
+            result = set()
+            for value in values:
+                asset = resolve_asset(value)
+                if asset and asset.get("id"):
+                    result.add(str(asset["id"]))
+            return result
+
+        def keyframe_ids_in(values):
+            return asset_ids(values) & keyframe_ids
+
+        def parent_ids(values):
+            result = set()
+            for asset_id in keyframe_ids_in(values):
+                parent = parent_by_keyframe.get(asset_id)
+                if parent:
+                    result.add(parent)
+            return result
+
+        items = state.get("items") or []
+        candidate_total = candidate_relevant = predicted_total = predicted_relevant = 0
+        gt_video_targets = gt_video_hits = 0
+        candidate_items = candidate_hit_items = predicted_items = 0
+        quality_with, quality_without = [], []
+        observed_event_ids = set()
+        observed_scene_ids = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            gt = refs(item, "gt_media")
+            gt_ids = asset_ids(gt)
+            gt_video_ids = {asset_id for asset_id in gt_ids if asset_id in source_video_ids}
+            candidate_values = refs(item, "retrieved_candidate_media")
+            predicted_values = refs(item, "predicted_media")
+            candidate_kf = keyframe_ids_in(candidate_values)
+            predicted_kf = keyframe_ids_in(predicted_values)
+            candidate_parents = parent_ids(candidate_values)
+            predicted_parents = parent_ids(predicted_values)
+            candidate_total += len(candidate_kf)
+            candidate_relevant += sum(1 for asset_id in candidate_kf if parent_by_keyframe.get(asset_id) in gt_video_ids)
+            predicted_total += len(predicted_kf)
+            predicted_relevant += sum(1 for asset_id in predicted_kf if parent_by_keyframe.get(asset_id) in gt_video_ids)
+            if gt_video_ids:
+                gt_video_targets += len(gt_video_ids)
+                gt_video_hits += len(gt_video_ids & candidate_parents)
+            if candidate_kf:
+                candidate_items += 1
+                if gt_video_ids & candidate_parents:
+                    candidate_hit_items += 1
+            if predicted_kf:
+                predicted_items += 1
+            score = (item.get("judge") or {}).get("score")
+            if score in {0, 1, 2}:
+                (quality_with if candidate_kf else quality_without).append(float(score))
+            for trace in item.get("tool_trace") or []:
+                for preview in (trace.get("observation") or {}).get("preview") or []:
+                    if not isinstance(preview, dict):
+                        continue
+                    event_id = (preview.get("event_context") or {}).get("id") or preview.get("event_id")
+                    if event_id:
+                        observed_event_ids.add(str(event_id))
+                    scene_id = preview.get("source_scene_index")
+                    if scene_id is not None:
+                        observed_scene_ids.add(str(scene_id))
+
+        timestamps_by_video = {}
+        selection_reasons = {}
+        worldmm_scores = []
+        for asset in keyframe_assets:
+            parent = parent_by_keyframe.get(str(asset.get("id")))
+            if parent:
+                stamp = metadata(asset).get("source_timestamp_sec", asset.get("source_timestamp_sec"))
+                if isinstance(stamp, (int, float)):
+                    timestamps_by_video.setdefault(parent, []).append(float(stamp))
+            reason = metadata(asset).get("worldmm_selection_reason") or metadata(asset).get("keyframe_selection_reason") or "未记录"
+            selection_reasons[str(reason)] = selection_reasons.get(str(reason), 0) + 1
+            score = metadata(asset).get("worldmm_score")
+            if isinstance(score, (int, float)):
+                worldmm_scores.append(float(score))
+        all_gaps = []
+        spans = []
+        for values in timestamps_by_video.values():
+            values.sort()
+            if len(values) > 1:
+                all_gaps.extend(right - left for left, right in zip(values, values[1:]))
+                spans.append(values[-1] - values[0])
+
+        def mean(values):
+            return round(sum(values) / len(values), 4) if values else None
+
+        def rate(numerator, denominator):
+            return round(numerator / denominator, 4) if denominator else None
+
+        return {
+            "status": "ready",
+            "run_id": run_id,
+            "scope_id": scope_id,
+            "asset_source_note": asset_source_note,
+            "metric_scope": "full_run_items_and_sentrix_scope",
+            "assets": {
+                "total": len(assets),
+                "source_videos": len(source_videos),
+                "keyframes": len(keyframe_assets),
+                "videos_with_keyframes": len({parent for parent in parent_by_keyframe.values() if parent}),
+                "keyframes_per_video_mean": rate(len(keyframe_assets), len(source_videos)),
+            },
+            "processing": {
+                "source_duration_sec": round(source_duration_sec, 4),
+                "raw_frame_count": raw_frame_count,
+                "processing_seconds_total": round(sum(processing_seconds), 4),
+                "processing_seconds_mean": mean(processing_seconds),
+                "realtime_factor": (round(source_duration_sec / sum(processing_seconds), 4) if processing_seconds and source_duration_sec else None),
+                "retained_frame_ratio": rate(len(keyframe_assets), raw_frame_count),
+                "compression_ratio": (round(1 - len(keyframe_assets) / raw_frame_count, 4) if raw_frame_count else None),
+                "timing_source": "Sentrix video_processing_seconds + persisted ffprobe metadata",
+            },
+            "retrieval": {
+                "candidate_keyframes": candidate_total,
+                "candidate_relevant_keyframes": candidate_relevant,
+                "candidate_precision": rate(candidate_relevant, candidate_total),
+                "video_parent_recall": rate(gt_video_hits, gt_video_targets),
+                "video_gt_targets": gt_video_targets,
+                "video_gt_targets_hit_by_keyframe": gt_video_hits,
+                "candidate_items": candidate_items,
+                "candidate_hit_items": candidate_hit_items,
+                "candidate_item_hit_rate": rate(candidate_hit_items, candidate_items),
+                "predicted_keyframes": predicted_total,
+                "predicted_relevant_keyframes": predicted_relevant,
+                "predicted_precision": rate(predicted_relevant, predicted_total),
+                "predicted_items": predicted_items,
+            },
+            "temporal": {
+                "videos_sampled": len(timestamps_by_video),
+                "scene_count": len(observed_scene_ids),
+                "mean_gap_sec": mean(all_gaps),
+                "mean_span_sec": mean(spans),
+                "worldmm_score_mean": mean(worldmm_scores),
+                "selection_reasons": selection_reasons,
+            },
+            "usefulness": {
+                "qa_with_keyframe": len(quality_with),
+                "qa_without_keyframe": len(quality_without),
+                "answer_quality_with_keyframe": mean(quality_with),
+                "answer_quality_without_keyframe": mean(quality_without),
+                "answer_quality_delta": (round(mean(quality_with) - mean(quality_without), 4) if quality_with and quality_without else None),
+                "event_context_count": len(observed_event_ids),
+            },
+            "definitions": {
+                "candidate_precision": "检索候选中的关键帧，其 parent video 与本题 GT 视频一致的比例",
+                "video_parent_recall": "GT 视频被其任一关键帧覆盖的比例，允许返回关键帧而非源视频",
+                "answer_quality_delta": "带关键帧候选题与不带关键帧候选题的 Judge 均分差；不是因果结论",
+                "temporal": "根据关键帧 source_timestamp_sec 统计采样间隔和覆盖跨度",
+            },
+        }
+
+    def get_memory_effectiveness(self, run_id: str) -> dict:
+        """Compare the memory-layer inventory with what the evaluation actually used.
+
+        The comparison is intentionally based on persisted tool traces and the
+        Agent2 evidence ledger.  It does not infer hidden model reasoning:
+        effective means that a memory object appeared in a successful tool
+        result or was carried into the saved evidence/answer chain.
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = copy.deepcopy(run.state if isinstance(run, BenchmarkRun) else run)
+
+        items = [item for item in (state.get("items") or []) if isinstance(item, dict)]
+        integrity = state.get("input_integrity") or {}
+        summary = state.get("summary") or {}
+        agent2 = summary.get("agent2_trace") or {}
+        requirement_counts = agent2.get("requirement_status_counts") or {}
+        tool_counts = {}
+        tool_ok = {}
+        preview_rows = []
+        preview_asset_ids = set()
+        final_evidence_asset_ids = set()
+
+        def value_id(value):
+            if isinstance(value, dict):
+                value = (value.get("asset_id") or value.get("id") or value.get("media_id")
+                         or value.get("file_name") or value.get("image_id") or value.get("video_id"))
+            text = str(value or "").strip()
+            return text or None
+
+        def collect(values, target):
+            if isinstance(values, dict):
+                values = list(values.values())
+            if not isinstance(values, list):
+                return
+            for value in values:
+                item_id = value_id(value)
+                if item_id:
+                    target.add(item_id)
+
+        for item in items:
+            collect(item.get("evidence_asset_ids"), final_evidence_asset_ids)
+            collect(item.get("evidence_source_media"), final_evidence_asset_ids)
+            collect(item.get("answer_evidence_media_refs"), final_evidence_asset_ids)
+            for trace in item.get("tool_trace") or []:
+                if not isinstance(trace, dict):
+                    continue
+                name = str(trace.get("tool") or trace.get("tool_name") or trace.get("name") or "unknown")
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+                if str(trace.get("status") or "").lower() in {"ok", "success", "completed"}:
+                    tool_ok[name] = tool_ok.get(name, 0) + 1
+                observation = trace.get("observation") or {}
+                for preview in observation.get("preview") or []:
+                    if not isinstance(preview, dict):
+                        continue
+                    preview_rows.append(preview)
+                    item_id = value_id(preview)
+                    if item_id:
+                        preview_asset_ids.add(item_id)
+
+        event_ids = set()
+        for preview in preview_rows:
+            event = preview.get("event_context") or {}
+            event_id = event.get("id") or preview.get("event_id")
+            if event_id:
+                event_ids.add(str(event_id))
+
+        visual_total = int(tool_counts.get("inspect_photo", 0))
+        visual_effective = int(tool_ok.get("inspect_photo", 0))
+        ocr_total = int(tool_counts.get("read_photo_text", 0))
+        ocr_effective = int(tool_ok.get("read_photo_text", 0))
+        scene_total = len({str(preview.get("source_scene_index")) for preview in preview_rows
+                           if preview.get("source_scene_index") is not None})
+        event_total = len(event_ids)
+        requirement_total = sum(int(value or 0) for value in requirement_counts.values())
+        requirement_effective = int(requirement_counts.get("satisfied", 0) or 0)
+        answer_total = len(items)
+        answer_effective = sum(1 for item in items if str(item.get("agent_status") or "").lower() == "complete")
+        judge_counts = {"2": 0, "1": 0, "0": 0, "unjudged": 0}
+        for item in items:
+            score = (item.get("judge") or {}).get("score")
+            if score in {0, 1, 2}:
+                judge_counts[str(score)] += 1
+            else:
+                judge_counts["unjudged"] += 1
+
+        def retrieval_hit(item):
+            counts = item.get("media_retrieval_counts") or item.get("image_retrieval_counts") or {}
+            gt = int(counts.get("gt") or len(item.get("gt_media") or []))
+            matched = int(counts.get("matched") or len(item.get("matched_file_names") or []))
+            return gt > 0, matched > 0
+
+        def causal_scope(include_unanswerable):
+            matrix = {
+                "hit_correct": 0, "hit_partial": 0, "hit_incorrect": 0,
+                "miss_correct": 0, "miss_partial": 0, "miss_incorrect": 0,
+                "unjudged": 0,
+            }
+            eligible = 0
+            hit_items = 0
+            for item in items:
+                if not include_unanswerable and str(item.get("answerability") or "").strip().lower() == "unanswerable":
+                    continue
+                has_gt, hit = retrieval_hit(item)
+                if not has_gt:
+                    continue
+                eligible += 1
+                if hit:
+                    hit_items += 1
+                score = (item.get("judge") or {}).get("score")
+                if score not in {0, 1, 2}:
+                    matrix["unjudged"] += 1
+                    continue
+                prefix = "hit" if hit else "miss"
+                suffix = {2: "correct", 1: "partial", 0: "incorrect"}[score]
+                matrix[f"{prefix}_{suffix}"] += 1
+            return {
+                "eligible": eligible,
+                "hit_items": hit_items,
+                "miss_items": max(0, eligible - hit_items),
+                "matrix": matrix,
+            }
+        raw_total = int(integrity.get("files_checked") or 0)
+        if not raw_total:
+            raw_total = len({value_id(ref) for item in items for ref in (item.get("gt_media") or []) if value_id(ref)})
+
+        def row(key, name, total, effective, created_detail, effective_detail, invalid_detail):
+            total = int(total or 0)
+            effective = int(effective or 0)
+            invalid = max(0, total - effective)
+            return {
+                "key": key,
+                "name": name,
+                "created": total,
+                "effective": effective,
+                "ineffective": invalid,
+                "rate": round(effective / total, 4) if total else None,
+                "created_detail": created_detail,
+                "effective_detail": effective_detail,
+                "ineffective_detail": invalid_detail,
+            }
+
+        levels = [
+            row("L0", "原始媒体", raw_total, min(len(preview_asset_ids), raw_total) if raw_total else len(preview_asset_ids),
+                f"输入完整性校验 {raw_total} 个文件",
+                f"成功工具结果实际返回 {len(preview_asset_ids)} 个不同资产；最终证据链 {len(final_evidence_asset_ids)} 个资产",
+                f"未在工具结果中出现 {max(0, raw_total - len(preview_asset_ids))} 个；仅返回但未进入最终证据 {max(0, len(preview_asset_ids) - len(final_evidence_asset_ids))} 个"),
+            row("L1", "场景图 / 解析", visual_total + ocr_total + scene_total, visual_effective + ocr_effective + scene_total,
+                f"视觉观察 {visual_total} + OCR {ocr_total} + 场景节点 {scene_total}",
+                f"成功视觉 {visual_effective} + 成功 OCR {ocr_effective} + 已返回场景节点 {scene_total}",
+                f"工具拒绝/失败：视觉 {visual_total - visual_effective} + OCR {ocr_total - ocr_effective}"),
+            row("L2", "事件 / 记忆", event_total, event_total,
+                f"工具图谱中发现 {event_total} 个事件上下文",
+                f"{event_total} 个事件均在评测工具预览中出现",
+                "当前轨迹未发现未生效事件；若图谱接口未加载则本项不应判定"),
+            row("L3", "目标 / 证据规则", requirement_total, requirement_effective,
+                f"证据账本共 {requirement_total} 项需求",
+                f"满足 {requirement_effective} 项（satisfied）",
+                f"未闭合 {max(0, requirement_total - requirement_effective)} 项（open / running / failed）"),
+            row("L4+", "总结 / 回答", answer_total, answer_effective,
+                f"评测生成 {answer_total} 条回答",
+                f"Agent 状态 complete {answer_effective} 条",
+                f"未完整闭环 {max(0, answer_total - answer_effective)} 条（partial / error / blocked）"),
+        ]
+        levels[0]["ineffective_reasons"] = [
+            {"label": "未被成功工具返回", "count": max(0, raw_total - len(preview_asset_ids)), "meaning": "创建输入中没有在检索预览出现"},
+            {"label": "返回但未进入最终证据", "count": max(0, len(preview_asset_ids) - len(final_evidence_asset_ids)), "meaning": "工具找到，但没有形成回答证据"},
+        ]
+        levels[1]["ineffective_reasons"] = [
+            {"label": "视觉工具拒绝/失败", "count": max(0, visual_total - visual_effective), "meaning": "inspect_photo 没有成功返回"},
+            {"label": "OCR 工具拒绝/失败", "count": max(0, ocr_total - ocr_effective), "meaning": "read_photo_text 没有成功返回"},
+        ]
+        levels[2]["ineffective_reasons"] = [
+            {"label": "未发现未生效事件", "count": 0, "meaning": "当前轨迹中的事件上下文均至少出现过一次"},
+        ]
+        levels[3]["ineffective_reasons"] = [
+            {"label": "open", "count": int(requirement_counts.get("open", 0) or 0), "meaning": "需求没有完成证据闭合"},
+            {"label": "running", "count": int(requirement_counts.get("running", 0) or 0), "meaning": "需求仍停留在处理中"},
+            {"label": "failed", "count": int(requirement_counts.get("failed", 0) or 0), "meaning": "需求证据处理失败"},
+        ]
+        levels[4]["ineffective_reasons"] = [
+            {"label": "partial", "count": sum(1 for item in items if str(item.get("agent_status") or "").lower() == "partial"), "meaning": "只完成部分回答链路"},
+            {"label": "error", "count": sum(1 for item in items if str(item.get("agent_status") or "").lower() == "error"), "meaning": "执行或接口错误"},
+            {"label": "blocked", "count": sum(1 for item in items if str(item.get("agent_status") or "").lower() == "blocked_by_guard"), "meaning": "被安全/状态守卫中断"},
+        ]
+
+        # The layer coverage table above is not a correctness table.  For the
+        # 0-point answers, keep a separate, mutually-exclusive diagnosis so
+        # that a simple "created - effective" number is not mistaken for a
+        # semantic error count.  The first two rows are the primary split;
+        # signal rows below are deliberately cross-cutting and must not be
+        # added to the primary split.
+        wrong_items = [item for item in items if (item.get("judge") or {}).get("score") == 0]
+        wrong_total = len(wrong_items)
+        memory_miss_wrong = 0
+        memory_hit_wrong = 0
+        tool_failure_items = 0
+        evidence_not_closed_items = 0
+        execution_error_items = 0
+        attribution_counts = {}
+        hit_total = 0
+        hit_correct = 0
+        hit_partial = 0
+        hit_incorrect = 0
+
+        def has_failed_tool(item):
+            traces = item.get("tool_trace") or []
+            return any(
+                isinstance(trace, dict)
+                and str(trace.get("status") or "").lower() not in {"ok", "complete", "completed", "success"}
+                for trace in traces
+            )
+
+        def has_open_requirement(item):
+            trace = item.get("agent2_trace") or {}
+            requirements = ((trace.get("task_state") or {}).get("requirements") or [])
+            return any(isinstance(req, dict) and str(req.get("status") or "").lower() != "satisfied" for req in requirements)
+
+        for item in items:
+            has_gt, hit = retrieval_hit(item)
+            score = (item.get("judge") or {}).get("score")
+            if has_gt:
+                hit_total += int(hit)
+                if hit:
+                    if score == 2:
+                        hit_correct += 1
+                    elif score == 1:
+                        hit_partial += 1
+                    elif score == 0:
+                        hit_incorrect += 1
+            if item in wrong_items:
+                if has_gt and hit:
+                    memory_hit_wrong += 1
+                else:
+                    memory_miss_wrong += 1
+                if has_failed_tool(item):
+                    tool_failure_items += 1
+                if has_open_requirement(item):
+                    evidence_not_closed_items += 1
+                if str(item.get("agent_status") or "").lower() in {"error", "blocked", "blocked_by_guard"}:
+                    execution_error_items += 1
+                primary = str((item.get("attribution") or {}).get("primary") or "unknown").upper()
+                attribution_counts[primary] = attribution_counts.get(primary, 0) + 1
+
+        def diagnosis_row(key, name, count, state, improvement):
+            return {
+                "key": key,
+                "name": name,
+                "count": int(count),
+                "rate": round(count / wrong_total, 4) if wrong_total else None,
+                "state": state,
+                "improvement": improvement,
+            }
+
+        error_chain_diagnosis = {
+            "wrong_total": wrong_total,
+            "primary_rows": [
+                diagnosis_row(
+                    "memory_miss_wrong", "记忆未召回 → 回答错误", memory_miss_wrong,
+                    "GT 媒体未进入本题检索结果，299 个 0 分回答中属于记忆到达前的损失",
+                    "优先修复检索候选、时间/地点/人物字段、事件图谱关联与重排",
+                ),
+                diagnosis_row(
+                    "memory_hit_wrong", "记忆已召回 → 回答仍错误", memory_hit_wrong,
+                    "GT 媒体已经命中，但 Judge 仍为 0 分，不能再归因于‘没找到记忆’",
+                    "优先检查证据选择、上下文组织、Agent 推理和最终回答生成",
+                ),
+            ],
+            "signals": [
+                diagnosis_row(
+                    "tool_failure", "工具拒绝 / 执行异常（交叉信号）", tool_failure_items,
+                    "本题至少有一次工具状态不是成功；与主诊断可能重叠，不参与相加",
+                    "保留失败原因、重试结果和输入输出，区分接口失败与检索质量问题",
+                ),
+                diagnosis_row(
+                    "evidence_not_closed", "证据需求未闭合（交叉信号）", evidence_not_closed_items,
+                    "Agent2 仍有 open / running / failed 需求；不等价于回答错误原因",
+                    "补齐需求到 evidence_ref 的闭合链路，再单独观察回答正确率变化",
+                ),
+                diagnosis_row(
+                    "execution_error", "Agent 执行错误 / 守卫中断（交叉信号）", execution_error_items,
+                    "agent_status 为 error 或 blocked；与检索/回答错误可能同时出现",
+                    "先隔离执行异常，避免把基础设施失败误判为记忆或模型能力问题",
+                ),
+            ],
+            "attribution_primary": [
+                {"key": key, "count": count, "rate": round(count / wrong_total, 4) if wrong_total else None}
+                for key, count in sorted(attribution_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+            ],
+            "opportunity": {
+                "retrieval_error_share": round(memory_miss_wrong / wrong_total, 4) if wrong_total else None,
+                "post_retrieval_wrong_rate": round(hit_incorrect / hit_total, 4) if hit_total else None,
+                "hit_correct_rate": round(hit_correct / hit_total, 4) if hit_total else None,
+                "hit_total": hit_total,
+                "hit_correct": hit_correct,
+                "hit_partial": hit_partial,
+                "hit_incorrect": hit_incorrect,
+                "meaning": "前者表示 0 分中应先修检索的比例；后两者表示记忆已经到达后，回答链路仍有多大提升空间",
+            },
+            "note": "primary_rows 互斥且合计 0 分题；signals 与 attribution_primary 是交叉诊断，不能与主表相加。命中依据是本题 GT 媒体是否出现在持久化检索结果中。",
+        }
+
+        # Evidence effectiveness is outcome-based, unlike inventory/coverage.
+        # A returned GT/similar item is useful when the answer is correct or
+        # partially correct; a returned item followed by a 0-point answer is
+        # counted as ineffective evidence.  Misses are kept separate.
+        def evidence_effectiveness_row(key, name, counts_key=None, event_linked=False):
+            candidates = []
+            for item in items:
+                if event_linked:
+                    linked = False
+                    for trace in item.get("tool_trace") or []:
+                        if not isinstance(trace, dict):
+                            continue
+                        for preview in ((trace.get("observation") or {}).get("preview") or []):
+                            event = preview.get("event_context") or {}
+                            if event.get("id") or preview.get("event_id"):
+                                linked = True
+                                break
+                        if linked:
+                            break
+                    if linked:
+                        candidates.append(item)
+                    continue
+                counts = item.get(counts_key) or {}
+                if int(counts.get("gt", 0) or 0) > 0:
+                    candidates.append(item)
+            returned = 0
+            effective = 0
+            ineffective = 0
+            unjudged = 0
+            for item in candidates:
+                if event_linked:
+                    is_returned = True
+                else:
+                    is_returned = int((item.get(counts_key) or {}).get("matched", 0) or 0) > 0
+                if not is_returned:
+                    continue
+                returned += 1
+                score = (item.get("judge") or {}).get("score")
+                if score in {1, 2}:
+                    effective += 1
+                elif score == 0:
+                    ineffective += 1
+                else:
+                    unjudged += 1
+            total = len(candidates)
+            return {
+                "key": key,
+                "name": name,
+                "gt_items": total,
+                "returned_items": returned,
+                "effective_items": effective,
+                "ineffective_items": ineffective,
+                "not_returned_items": max(0, total - returned),
+                "unjudged_items": unjudged,
+                "effective_rate": round(effective / total, 4) if total else None,
+                "effective_rate_on_returned": round(effective / returned, 4) if returned else None,
+                "ineffective_rate_on_returned": round(ineffective / returned, 4) if returned else None,
+                "definition": "返回证据后 Judge=2 或 1 计有效；返回证据后 Judge=0 计无效；未返回单独计为未命中",
+            }
+
+        evidence_effectiveness = {
+            "image": evidence_effectiveness_row("image", "原图片证据", "image_retrieval_counts"),
+            "video_keyframe": evidence_effectiveness_row("video_keyframe", "视频 / 关键帧证据", "video_retrieval_counts"),
+            "event": evidence_effectiveness_row("event", "事件上下文证据", event_linked=True),
+            "note": "有效率以返回证据为分母；Judge=1 的相近/部分正确证据计入有效，Judge=0 的返回证据计为无效。该指标是证据结果有效性，不是记忆库覆盖率。",
+        }
+        total_trace = sum(tool_counts.values())
+        ok_trace = sum(tool_ok.values())
+        graph_ready = bool(total_trace and preview_rows and event_ids)
+        return {
+            "status": "ready",
+            "run_id": run_id,
+            "scope_id": state.get("scope_id"),
+            "metric_scope": "full_run_persisted_tool_traces_and_agent2_ledger",
+            "data_quality": {
+                "graph_ready": graph_ready,
+                "tool_trace_count": total_trace,
+                "tool_success_count": ok_trace,
+                "preview_count": len(preview_rows),
+                "event_context_count": len(event_ids),
+                "note": "仅在工具轨迹、媒体预览和事件上下文均存在时计算有效/无效对比；不使用未保存的模型隐藏思维链",
+            },
+            "levels": levels,
+            "details": {
+                "raw_media_returned_assets": len(preview_asset_ids),
+                "raw_media_final_evidence_assets": len(final_evidence_asset_ids),
+                "visual_calls": {"total": visual_total, "effective": visual_effective},
+                "ocr_calls": {"total": ocr_total, "effective": ocr_effective},
+                "requirement_status_counts": requirement_counts,
+                "answer_status_complete": answer_effective,
+                "answer_correctness": {
+                    "correct": judge_counts["2"],
+                    "partial": judge_counts["1"],
+                    "incorrect": judge_counts["0"],
+                    "unjudged": judge_counts["unjudged"],
+                    "exact_accuracy": round(judge_counts["2"] / answer_total, 4) if answer_total else None,
+                },
+                "memory_answer_attribution": {
+                    "retrievable": causal_scope(False),
+                    "all_with_gt": causal_scope(True),
+                    "definitions": {
+                        "hit_correct": "召回至少一个 GT 媒体，且 Judge 2 分",
+                        "hit_incorrect": "召回至少一个 GT 媒体，但 Judge 0 分：记忆已到达，问题更可能在使用/推理/回答",
+                        "miss_correct": "没有召回 GT 媒体，但 Judge 2 分：不能归因于记忆召回",
+                        "miss_incorrect": "没有召回 GT 媒体，且 Judge 0 分：优先排查记忆检索链路",
+                        "scope": "retrievable 排除 answerability=unanswerable 的题；all_with_gt 仅用于完整对照",
+                    },
+                },
+                "error_chain_diagnosis": error_chain_diagnosis,
+                "evidence_effectiveness": evidence_effectiveness,
+            },
+        }
+
+    def export_sft(self, run_id: str, scores: list[int] | None = None,
+                   min_score: int | None = None) -> dict:
+        """导出完整思考轨迹：每题全部 debug_trace 步（含提示词/工具参数/工具结果/守卫/judge）、
+        agent2_trace（task_state/evidence_ledger/answer_context/stage_timing）与评测元数据。
+
+        scores: 非空时只导出答案评分落在该集合内的题目（勾选过滤，勾选什么导出什么）。
+        min_score: 兼容旧参数；非 None 时只导出评分 >= min_score 的题目。
+        """
+        import ast as _ast
+        def _parse(value):
+            if isinstance(value, dict) or not isinstance(value, str) or not value.strip():
+                return value
+            try:
+                return _ast.literal_eval(value)
+            except Exception:
+                return value
+        decoder = json.JSONDecoder()
+        _SUPPORTED_CERTAINTIES = {"supported", "confirmed", "full_support"}
+
+        def _inject_tool_call_status(messages, tool_steps):
+            """Backfill the uniform call_status into '工具 xx 返回' user turns.
+
+            Live runs already carry it (runtime injects it); old runs recorded
+            before the field existed get it derived from the matching tool step.
+            Tool calls and their result turns are appended in lock-step, so the
+            step order matches the message order.
+            """
+            out = []
+            ti = 0
+            for m in messages:
+                if not isinstance(m, dict):
+                    out.append(m)
+                    continue
+                content = str(m.get("content") or "")
+                if (m.get("role") == "user" and content.startswith("工具 ")
+                        and "返回：" in content):
+                    sep = "返回：\n"
+                    idx = content.find(sep)
+                    if idx >= 0 and ti < len(tool_steps):
+                        obs_part = content[idx + len(sep):]
+                        try:
+                            obs = json.loads(obs_part)
+                            if isinstance(obs, dict) and "call_status" not in obs:
+                                st = tool_steps[ti].get("status") or "ok"
+                                obs["call_status"] = "success" if st == "ok" else "invalid"
+                                if st != "ok" and not obs.get("reason"):
+                                    obs["reason"] = tool_steps[ti].get("error") \
+                                        or "tool call not allowed"
+                                m = dict(m)
+                                m["content"] = content[:idx + len(sep)] + \
+                                    json.dumps(obs, ensure_ascii=False)
+                        except Exception:
+                            pass
+                        ti += 1
+                out.append(m)
+            return out
+
+        def _inject_writer_valid(messages):
+            """Backfill binary valid onto writer facts (old runs lack the field)."""
+            out = []
+            for m in messages:
+                if not isinstance(m, dict):
+                    out.append(m)
+                    continue
+                content = str(m.get("content") or "")
+                if m.get("role") == "user" and "最小答案材料" in content:
+                    jstart = content.find('{"facts"')
+                    if jstart >= 0:
+                        try:
+                            obj, end = decoder.raw_decode(content[jstart:])
+                            if isinstance(obj, dict) and isinstance(obj.get("facts"), list):
+                                changed = False
+                                for fact in obj["facts"]:
+                                    if isinstance(fact, dict) and "valid" not in fact:
+                                        fact["valid"] = str(fact.get("certainty") or "") \
+                                            in _SUPPORTED_CERTAINTIES
+                                        changed = True
+                                if changed:
+                                    m = dict(m)
+                                    m["content"] = content[:jstart] + \
+                                        json.dumps(obj, ensure_ascii=False) + \
+                                        content[jstart + end:]
+                        except Exception:
+                            pass
+                out.append(m)
+            return out
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
             state = run.state if isinstance(run, BenchmarkRun) else run
+            items_out = []
             samples = []
+            include = set(scores) if scores else None
             for item in (state.get("items") or []):
-                if min_score is not None:
+                if include is not None:
+                    item_score = (item.get("judge") or {}).get("score")
+                    if item_score not in include:
+                        continue
+                elif min_score is not None:
                     item_score = (item.get("judge") or {}).get("score")
                     if item_score is None or item_score < min_score:
                         continue
                 qa_id = item.get("qa_id")
-                turns = item.get("runtime_turns") or []
-                for turn in turns:
-                    for step in (turn.get("debug_trace") or []):
-                        if not isinstance(step, dict) or step.get("type") != "model":
+                planner = {"prompt": None, "raw": None, "declaration": None}
+                model_samples = []
+                writer_samples = []
+                for turn in (item.get("runtime_turns") or []):
+                    debug_trace = turn.get("debug_trace") or []
+                    tool_steps = [s for s in debug_trace
+                                  if isinstance(s, dict) and s.get("type") == "tool"]
+                    for step in debug_trace:
+                        if not isinstance(step, dict):
+                            continue
+                        if step.get("type") == "planner":
+                            planner["prompt"] = step.get("prompt")
+                            planner["raw"] = step.get("raw_full") or step.get("raw")
                             continue
                         prompt = step.get("prompt")
                         response = step.get("raw_full") or step.get("raw")
                         if not prompt or not isinstance(response, str) or not response.strip():
                             continue
                         messages = list(prompt) if isinstance(prompt, list) else []
-                        messages.append({"role": "assistant", "content": response})
-                        samples.append({
-                            "qa_id": qa_id,
-                            "turn": turn.get("index"),
-                            "step": step.get("status", "complete"),
-                            "messages": messages,
-                        })
-            return {"run_id": run_id, "count": len(samples), "samples": samples,
-                    "min_score": min_score, "filtered": min_score is not None}
+                        if step.get("type") == "writer":
+                            messages = _inject_writer_valid(messages)
+                            messages.append({"role": "assistant", "content": response})
+                            writer_samples.append({
+                                "step": step.get("step_id") or "answer_writer",
+                                "kind": "writer",
+                                "messages": messages,
+                            })
+                        elif step.get("type") == "model":
+                            messages = _inject_tool_call_status(messages, tool_steps)
+                            messages.append({"role": "assistant", "content": response})
+                            model_samples.append({
+                                "step": step.get("step_id") or "model",
+                                "kind": "model",
+                                "messages": messages,
+                            })
+                planner["declaration"] = (item.get("agent2_trace") or {}).get("task_declaration")
+                samples_out = [*model_samples, *writer_samples]
+                items_out.append({
+                    "qa_id": qa_id,
+                    "question": item.get("question"),
+                    "planner": planner,
+                    "samples": samples_out,
+                })
+            return {"run_id": run_id, "count": sum(len(it["samples"]) for it in items_out),
+                    "item_count": len(items_out),
+                    "items": items_out,
+                    "scores": sorted(include) if include is not None else None,
+                    "min_score": min_score,
+                    "filtered": (include is not None or min_score is not None)}
 
     def get_run_items(self, run_id: str, page: int = 1, page_size: int = 20,
-                      search: str = "", score: str = "", task_type: str = "",
+                      search: str = "", score: str = "", task_type: str = "", tag: str = "",
                       agent_status: str = "", angle: str = "", difficulty: str = "",
                       answerability: str = "", primary: str = "") -> dict:
         with self.lock:
@@ -2750,6 +5659,7 @@ class OrchestratorRepository:
             all_items = [self._hydrate_qa_metadata(item) for item in (state.get("items") or [])]
             search = str(search or "").strip().lower()
             task_type = str(task_type or "").strip()
+            tag = str(tag or "").strip()
             agent_status = str(agent_status or "").strip()
             angle = str(angle or "").strip()
             difficulty = str(difficulty or "").strip()
@@ -2762,6 +5672,7 @@ class OrchestratorRepository:
             source_indexes = []
             facets = {
                 "task_types": sorted({str(item.get("task_type")) for item in all_items if item.get("task_type")}),
+                "tags": sorted({str(tag) for item in all_items for tag in (item.get("tags") or []) if str(tag).strip()}),
                 "agent_statuses": sorted({str(item.get("agent_status")) for item in all_items if item.get("agent_status")}),
                 "angles": sorted({str(item.get("angle")) for item in all_items if item.get("angle")}),
                 "difficulties": sorted({str(item.get("difficulty")) for item in all_items if item.get("difficulty")}),
@@ -2775,6 +5686,8 @@ class OrchestratorRepository:
                 if score_filter is not None and (item.get("judge") or {}).get("score") != score_filter:
                     continue
                 if task_type and item.get("task_type") != task_type:
+                    continue
+                if tag and tag not in (item.get("tags") or []):
                     continue
                 if agent_status and item.get("agent_status") != agent_status:
                     continue
@@ -2809,6 +5722,7 @@ class OrchestratorRepository:
                     "search": search,
                     "score": score_filter,
                     "task_type": task_type,
+                    "tag": tag,
                     "agent_status": agent_status,
                     "angle": angle,
                     "difficulty": difficulty,
@@ -2857,14 +5771,26 @@ class OrchestratorRepository:
             "question": item.get("question"),
             "task_type": item.get("task_type"),
             "question_type": item.get("question_type"),
+            "tags": item.get("tags") or [],
             "angle": item.get("angle"),
             "difficulty": item.get("difficulty"),
             "answerability": item.get("answerability"),
             "retrieval_recall": item.get("retrieval_recall"),
             "retrieval_precision": item.get("retrieval_precision"),
             "retrieval_f1": item.get("retrieval_f1"),
+            "media_retrieval_recall": item.get("media_retrieval_recall"),
+            "media_retrieval_precision": item.get("media_retrieval_precision"),
+            "media_retrieval_f1": item.get("media_retrieval_f1"),
+            "image_retrieval_recall": item.get("image_retrieval_recall"),
+            "image_retrieval_precision": item.get("image_retrieval_precision"),
+            "image_retrieval_f1": item.get("image_retrieval_f1"),
+            "video_retrieval_recall": item.get("video_retrieval_recall"),
+            "video_retrieval_precision": item.get("video_retrieval_precision"),
+            "video_retrieval_f1": item.get("video_retrieval_f1"),
             "matched_count": len(item.get("matched_file_names") or []),
-            "ground_truth_count": len(item.get("retrieval_image_ids") or []),
+            "ground_truth_count": len(item.get("retrieval_media_refs") or item.get("retrieval_image_ids") or []),
+            "ground_truth_image_count": len(item.get("retrieval_image_ids") or []),
+            "ground_truth_video_count": len(item.get("retrieval_video_ids") or []),
             "judge": {
                 "score": judge.get("score"),
                 "status": judge.get("status"),
@@ -2929,7 +5855,7 @@ class OrchestratorRepository:
                     attribution_layers[str(key)] = attribution_layers.get(str(key), 0) + 1
         saved.update({
             "total": saved.get("total", state.get("qa_count") or len(items)),
-            "completed": len(items),
+            "completed": sum(1 for item in items if item.get("judge_status") in {"completed", "failed", "skipped"}),
             "judge_valid_count": len(scores),
             "judge_distribution": distribution,
             "retrieval_recall_mean": saved.get("retrieval_recall_mean", round(sum(recalls) / len(recalls), 3) if recalls else None),
@@ -2951,8 +5877,10 @@ class OrchestratorRepository:
             "attribution": {"primary": attribution_primary, "layer_failures": attribution_layers},
             "delivery_breakdown": saved.get("delivery_breakdown", cls._aggregate_delivery(items)),
         })
-        for key, value in BenchmarkRun._capability_summary(items).items():
-            if saved.get(key) is None:
+        for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
+            if (key == "retrieval_recall_mean"
+                    or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
+                    or saved.get(key) is None):
                 saved[key] = value
         if saved.get("benchmark_e2e_latency_excluding_judge_ms") is None:
             saved["benchmark_e2e_latency_excluding_judge_ms"] = BenchmarkRun._benchmark_e2e_latency_excluding_judge_ms(
@@ -3060,8 +5988,10 @@ class OrchestratorRepository:
                 else (round(sum(recalls) / len(recalls), 3) if recalls else None),
             "answer_quality_mean": round(sum(scores) / len(scores), 3) if scores else None,
         })
-        for key, value in BenchmarkRun._capability_summary(items).items():
-            if saved.get(key) is None:
+        for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
+            if (key == "retrieval_recall_mean"
+                    or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
+                    or saved.get(key) is None):
                 saved[key] = value
         return saved
 
@@ -3105,6 +6035,89 @@ class OrchestratorRepository:
                     return {"cancelled": True, "run_id": run_id}
                 return {"cancelled": False, "run_id": run_id, "reason": f"run status is {run.state.get('status')}"}
             return {"cancelled": False, "run_id": run_id, "reason": "run not active (loaded from disk)"}
+
+    def resume_run(self, run_id: str) -> dict:
+        """Resume an interrupted run from its persisted phase/scope checkpoint."""
+        with self.lock:
+            holder = self.runs.get(run_id)
+            if not holder:
+                raise KeyError(run_id)
+            old_state = holder.state if isinstance(holder, BenchmarkRun) else holder
+            status = str(old_state.get("status") or "")
+            if status not in {"interrupted", "failed", "cancelled", "completed_with_errors"}:
+                raise ValueError(f"run cannot be resumed while status is {status or 'unknown'}")
+            busy = [
+                rid for rid, run in self.runs.items()
+                if (run.state if isinstance(run, BenchmarkRun) else run).get("status")
+                in {"running", "pending", "cancelling"}
+            ]
+            if busy:
+                raise ValueError(f"another benchmark suite is still active: {', '.join(busy)}")
+            album_id = str(old_state.get("album_id") or "")
+            qa_set = str(old_state.get("qa_set") or "")
+            manifest = self.get_manifest(album_id)
+            if not manifest:
+                raise ValueError(f"manifest not found for album: {album_id}")
+            if not qa_set or qa_set not in (manifest.get("qa_sets") or {}):
+                raise ValueError(f"qa set not found for album: {album_id}: {qa_set}")
+            scope_id = str(old_state.get("scope_id") or "").strip()
+            if not scope_id:
+                raise ValueError("the saved run has no memory-space checkpoint")
+
+            model_source = str(old_state.get("model_source") or "")
+            use_current_model = model_source == "current" or bool(old_state.get("current_model_snapshot"))
+            snapshot = dict(old_state.get("current_model_snapshot") or {})
+            # Runtime endpoints are machine-local after migration. Prefer the
+            # active 100-server configuration over URLs persisted on 200.
+            model_base_url = normalize_model_base_url(
+                DEFAULT_VLLM_BASE_URL or snapshot.get("model_base_url")
+                or old_state.get("vllm_model_base_url")
+            )
+            model_name = str(
+                snapshot.get("served_model_name") or old_state.get("model_name")
+                or old_state.get("model_profile") or ""
+            ).strip()
+            sentrix_url = str(DEFAULT_SENTRIX_URL).rstrip("/")
+            judge_url = str(DEFAULT_JUDGE_URL or old_state.get("judge_url") or "").rstrip("/")
+            judge_model = str(old_state.get("judge_model") or JUDGE_MODEL)
+            if use_current_model:
+                if not model_base_url or not model_name:
+                    raise ValueError("saved run has no reusable vLLM endpoint/model")
+                current_snapshot = self.query_current_model("", model_base_url, model_name)
+                request_json(f"{sentrix_url}/api/model-profiles/bind-external-runtime", {
+                    "base_url": current_snapshot["model_base_url"],
+                    "model": current_snapshot["served_model_name"],
+                }, "POST", 30)
+                vllm_api_url = ""
+                vllm_target_id = "external"
+                model_base_url = current_snapshot["model_base_url"]
+                model_name = current_snapshot["served_model_name"]
+            else:
+                vllm_api_url = str(old_state.get("vllm_manager_url") or DEFAULT_VLLM_API_URL).rstrip("/")
+                vllm_target_id = str(old_state.get("vllm_target_id") or DEFAULT_VLLM_TARGET_ID)
+                current_snapshot = snapshot or None
+
+            run = BenchmarkRun(
+                run_id=run_id, album_id=album_id, manifest=manifest,
+                model_profile=str(old_state.get("model_profile") or model_name), qa_set=qa_set,
+                sentrix_url=sentrix_url, judge_url=judge_url,
+                vllm_api_url=vllm_api_url, vllm_target_id=vllm_target_id,
+                vllm_model_base_url=model_base_url, results_root=self.results_root,
+                judge_system_prompt=load_custom_judge_prompt() or JUDGE_PROMPT,
+                task_judge_system_prompt=load_custom_judge_prompts().get("task_decision") or TASK_JUDGE_PROMPT,
+                evidence_judge_system_prompt=load_custom_judge_prompts().get("evidence") or EVIDENCE_JUDGE_PROMPT,
+                judge_model=judge_model, judge_api_key=JUDGE_API_KEY,
+                delete_scope_after_run=False, mode="resume", existing_scope_id=scope_id,
+                scope_reused_from_runs=old_state.get("scope_reused_from_runs") or [],
+                use_current_model=use_current_model, current_model_snapshot=current_snapshot,
+                use_cloud_model=False, resume_state=old_state,
+            )
+            self.runs[run_id] = run
+            self.active_suite_run_ids = [run_id]
+
+        threading.Thread(target=run.execute, name=f"resume-{run_id}", daemon=True).start()
+        return {"run_id": run_id, "status": "running", "resumed": True,
+                "scope_id": scope_id, "mode": "resume"}
 
     def cancel_active_suite(self) -> dict:
         """Cancel all running/pending/cancelling runs — both active suite and orphaned."""
@@ -3186,7 +6199,7 @@ class OrchestratorRepository:
             "exact_accuracy": round(distribution["2"] / denom, 3) if denom else None,
             "core_accuracy": round((distribution["1"] + distribution["2"]) / denom, 3) if denom else None,
         })
-        summary.update(BenchmarkRun._capability_summary(items))
+        summary.update(BenchmarkRun._capability_summary(items, state.get("phases") or {}))
         state["summary"] = summary
         aggregate = (state.get("phases") or {}).get("aggregate")
         if aggregate:
@@ -3199,6 +6212,13 @@ class OrchestratorRepository:
         judge_url = str(payload.get("judge_url") or resolved_judge_url).rstrip("/")
         judge_model = str(payload.get("judge_model") or resolved_judge_model)
         judge_api_key = str(payload.get("judge_api_key") or resolved_judge_api_key)
+        saved_custom = load_custom_judge_prompts()
+        task_system_prompt = payload.get("task_system_prompt")
+        task_system_prompt = (str(task_system_prompt).strip() or saved_custom.get("task_decision")
+                              or TASK_JUDGE_PROMPT)
+        evidence_system_prompt = payload.get("evidence_system_prompt")
+        evidence_system_prompt = (str(evidence_system_prompt).strip() or saved_custom.get("evidence")
+                                  or EVIDENCE_JUDGE_PROMPT)
         if not system_prompt:
             raise ValueError("system_prompt is required")
         if len(system_prompt) > 50000:
@@ -3294,9 +6314,11 @@ class OrchestratorRepository:
                         self._persist_run_state(run_id, current, current_state)
 
                     judge_runner = BenchmarkRun.__new__(BenchmarkRun)
-                    judge_runner.judge_url = judge_url.rstrip("/").removesuffix("/v1")
+                    judge_runner.judge_url = judge_url.rstrip("/")
                     judge_runner.judge_model = judge_model
                     judge_runner.judge_api_key = judge_api_key
+                    judge_runner.task_judge_system_prompt = task_system_prompt
+                    judge_runner.evidence_judge_system_prompt = evidence_system_prompt
                     conversation_context = saved_turns[:turn_index + 1] if turn_index is not None else None
                     agent_status_rj = saved_turn.get("agent_status") or item.get("agent_status")
                     termination_reason_rj = saved_turn.get("termination_reason") or item.get("termination_reason") or ""
@@ -3430,21 +6452,100 @@ class OrchestratorRepository:
 
     def start_suite(self, payload: dict) -> dict:
         album_id = payload.get("album_id", "album3-14")
-        qa_set = payload.get("qa_set", "compact-10q")
+        mode = str(payload.get("mode") or "full").strip().lower()
+        if mode not in RUN_MODES:
+            raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
+        manifest_early = self.get_manifest(album_id)
+        if not manifest_early:
+            raise ValueError(f"manifest not found for album: {album_id}")
+        qa_set = payload.get("qa_set") or (
+            # build 模式不做 QA，允许不选；默认取 manifest 第一个仅用于加载结构。
+            next(iter(manifest_early.get("qa_sets") or {}), "")
+        )
+        if not qa_set:
+            raise ValueError(f"album {album_id} has no qa_sets in manifest")
+        existing_scope_id = str(payload.get("existing_scope_id") or "").strip()
+        if mode == "reuse" and not existing_scope_id:
+            raise ValueError("existing_scope_id is required when mode=reuse")
         models = payload.get("models", [])
+        if not isinstance(models, list) or not models:
+            raise ValueError("models must contain at least one model")
         sentrix_url = payload.get("sentrix_url", DEFAULT_SENTRIX_URL)
         judge_provider_id = str(payload.get("judge_provider_id") or DEFAULT_JUDGE_PROVIDER_ID)
         _, resolved_judge_url, resolved_judge_model, resolved_judge_api_key = resolve_judge_provider(judge_provider_id)
         judge_url = str(payload.get("judge_url") or resolved_judge_url).rstrip("/")
         judge_model = str(payload.get("judge_model") or resolved_judge_model)
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
-        # The benchmark uses the fixed primary Manager target.  Do not allow a
-        # per-request URL to split the orchestrator and Sentrix runtime.
-        target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
-        vllm_api_url = str(target["manager_url"])
-        vllm_model_base_url = str(target["model_base_url"])
-        delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
+        model_base_url = normalize_model_base_url(payload.get("model_base_url"))
+        endpoint_model = str(payload.get("endpoint_model") or "").strip()
+        vllm_manager_url = normalize_service_url(payload.get("vllm_manager_url"))
+        if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
+            raise ValueError("big_model cannot be combined with current model")
+        managed_models = [
+            model for model in models
+            if model not in {BIG_MODEL_PROFILE_ID, CURRENT_MODEL_SELECTION}
+        ]
         dirty_statuses = {"running", "pending", "cancelling"}
+        with self.lock:
+            busy = [
+                rid for rid, run in self.runs.items()
+                if (run.state.get("status") if isinstance(run, BenchmarkRun)
+                    else run.get("status")) in dirty_statuses
+            ]
+        if busy:
+            raise ValueError(f"another benchmark suite is still active: {', '.join(busy)}")
+        if managed_models and not vllm_manager_url:
+            raise ValueError("选择模型注册表中的模型时必须提供模型管理器地址")
+        if managed_models:
+            target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+            vllm_api_url = vllm_manager_url or str(target["manager_url"])
+            vllm_model_base_url = model_base_url or str(target["model_base_url"])
+        else:
+            target_id = ""
+            vllm_api_url = ""
+            vllm_model_base_url = ""
+        use_current_model = CURRENT_MODEL_SELECTION in models
+        if use_current_model and len(models) != 1:
+            raise ValueError("current model cannot be combined with managed model profiles")
+        current_model_snapshot = None
+        if use_current_model:
+            if endpoint_model:
+                target_id = "external"
+                vllm_api_url = ""
+                vllm_model_base_url = model_base_url
+            elif vllm_manager_url:
+                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                vllm_api_url = vllm_manager_url
+                vllm_model_base_url = model_base_url or str(target["model_base_url"])
+            elif not model_base_url:
+                # With no explicit endpoint, use the configured target just as the
+                # /api/current-model endpoint does.
+                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                vllm_api_url = str(target["manager_url"])
+                vllm_model_base_url = str(target["model_base_url"])
+            else:
+                target_id = "external"
+                vllm_api_url = ""
+                vllm_model_base_url = model_base_url
+            current_model_snapshot = self.query_current_model(
+                vllm_api_url, vllm_model_base_url, endpoint_model,
+            )
+            if current_model_snapshot.get("selection_required"):
+                raise ValueError(
+                    "model endpoint exposes multiple models; select one before reusing the endpoint"
+                )
+            models = [current_model_snapshot["model_id"]]
+            if not vllm_api_url:
+                request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-external-runtime", {
+                    "base_url": current_model_snapshot["model_base_url"],
+                    "model": current_model_snapshot["served_model_name"],
+                }, "POST", 30)
+            else:
+                request_json(f"{str(sentrix_url).rstrip('/')}/api/model-profiles/bind-runtime", {
+                    "manager_url": vllm_api_url,
+                    "model_base_url": vllm_model_base_url,
+                }, "POST", 30)
+        delete_scope_after_run = bool(payload.get("delete_scope_after_run"))
         with self.lock:
             busy = [
                 rid
@@ -3458,20 +6559,41 @@ class OrchestratorRepository:
             if not manifest:
                 raise ValueError(f"manifest not found for album: {album_id}")
 
+            # reuse 模式：反查该 scope 由哪些历史 run 创建，写进新 run 做来源关联。
+            scope_reused_from_runs: list = []
+            if mode == "reuse":
+                for rid, run in self.runs.items():
+                    state = run.state if isinstance(run, BenchmarkRun) else run
+                    if (state.get("scope_id") == existing_scope_id
+                            and state.get("scope_source") == "created"
+                            and state.get("mode") in ("full", "build")):
+                        scope_reused_from_runs.append(rid)
+                scope_reused_from_runs.sort()
+
             suite_id = f"suite-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
             created_runs = []
             for model in models:
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                run_id = f"{ts}-{safe_slug(album_id)}-{safe_slug(model)}-{uuid.uuid4().hex[:6]}"
+                mode_tag = "" if mode == "full" else f"-{mode}"
+                run_id = f"{ts}-{safe_slug(album_id)}-{safe_slug(model)}{mode_tag}-{uuid.uuid4().hex[:6]}"
                 run = BenchmarkRun(
                     run_id=run_id, album_id=album_id, manifest=manifest,
                     model_profile=model, qa_set=qa_set,
-                    sentrix_url=sentrix_url, judge_url=judge_url, vllm_api_url=vllm_api_url,
-                    vllm_target_id=target_id, vllm_model_base_url=vllm_model_base_url,
+                    sentrix_url=sentrix_url, judge_url=judge_url,
+                    vllm_api_url=vllm_api_url if model != BIG_MODEL_PROFILE_ID else "",
+                    vllm_target_id=target_id if model != BIG_MODEL_PROFILE_ID else "",
+                    vllm_model_base_url=vllm_model_base_url if model != BIG_MODEL_PROFILE_ID else "",
                     results_root=self.results_root,
                     judge_system_prompt=load_custom_judge_prompt() or JUDGE_PROMPT,
+                    task_judge_system_prompt=load_custom_judge_prompts().get("task_decision") or TASK_JUDGE_PROMPT,
+                    evidence_judge_system_prompt=load_custom_judge_prompts().get("evidence") or EVIDENCE_JUDGE_PROMPT,
                     judge_model=judge_model, judge_api_key=judge_api_key_suite,
                     delete_scope_after_run=delete_scope_after_run,
+                    mode=mode, existing_scope_id=existing_scope_id,
+                    scope_reused_from_runs=scope_reused_from_runs,
+                    use_current_model=use_current_model,
+                    current_model_snapshot=current_model_snapshot,
+                    use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
                 )
                 self.runs[run_id] = run
                 created_runs.append(run_id)
@@ -3489,7 +6611,9 @@ class OrchestratorRepository:
 
         threading.Thread(target=_run_sequentially, name=f"suite-{suite_id}", daemon=True).start()
         return {"suite_id": suite_id, "run_ids": created_runs, "album_id": album_id,
-                "models": models, "qa_set": qa_set}
+                "models": models, "qa_set": qa_set, "mode": mode,
+                "existing_scope_id": existing_scope_id or None,
+                "current_model_snapshot": current_model_snapshot}
 
 
 # ---------------------------------------------------------------------------
@@ -3516,13 +6640,30 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/memory-spaces":
+                # 复用相册测评的相册下拉数据：转发 Sentrix 后端列表（新创建的在前）。
+                params = parse_qs(parsed.query)
+                sentrix_base = (params.get("sentrix_url") or [DEFAULT_SENTRIX_URL])[0].rstrip("/")
+                spaces = request_json(f"{sentrix_base}/api/memory-spaces", timeout=30)
+                if isinstance(spaces, dict):
+                    spaces = spaces.get("spaces") or spaces.get("items") or []
+                spaces = sorted(
+                    spaces or [],
+                    key=lambda s: str(s.get("created_at") or ""), reverse=True,
+                )
+                self._json({"spaces": spaces, "reuse_bases": _build_reuse_bases(
+                    spaces, self.repo.list_runs())})
+                return
             if parsed.path == "/api/config":
                 self._json({
                     "default_sentrix_url": DEFAULT_SENTRIX_URL,
                     "default_judge_url": DEFAULT_JUDGE_URL,
                     "default_vllm_api_url": DEFAULT_VLLM_API_URL,
+                    "default_vllm_model_base_url": DEFAULT_VLLM_BASE_URL,
                     "default_vllm_target_id": DEFAULT_VLLM_TARGET_ID,
                     "vllm_targets": VLLM_TARGETS,
+                    "runtime_config": public_runtime_connection_config(),
+                    "runtime_config_file": str(RUNTIME_CONNECTION_CONFIG_PATH),
                    "judge_model": JUDGE_MODEL,
                    "judge_prompt": JUDGE_PROMPT,
                    "custom_judge_prompt": load_custom_judge_prompt(),
@@ -3566,18 +6707,21 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     self._json({"error": "qa file not found"}, 404)
                     return
                 rows = load_jsonl(qa_path)
-                self._json({"album_id": album_id, "qa_set": qa_set, "items": rows})
+                sentrix_url = (query.get("sentrix_url") or [DEFAULT_SENTRIX_URL])[0]
+                rows, media_resolution = _resolve_qa_media_rows(sentrix_url, album_id, rows)
+                self._json({"album_id": album_id, "qa_set": qa_set, "items": rows,
+                            "media_resolution": media_resolution, "media_source": "sentrix"})
                 return
-            if parsed.path.startswith("/api/albums/") and "/photos/" in parsed.path:
-                parts = parsed.path.removeprefix("/api/albums/").split("/photos/", 1)
-                if len(parts) == 2:
+            if parsed.path.startswith("/api/albums/"):
+                parts = parsed.path.removeprefix("/api/albums/").split("/", 2)
+                if len(parts) == 3 and parts[1] in {"photos", "faces", "videos"}:
                     album_id = unquote(parts[0])
-                    file_name = unquote(parts[1])
-                    photo_path = BENCHMARK_DATA_ROOT / album_id / "photos" / file_name
-                    if photo_path.is_file():
-                        self._serve_file(photo_path)
+                    file_name = unquote(parts[2])
+                    media_path = _resolve_album_media_file(album_id, parts[1], file_name)
+                    if media_path:
+                        self._serve_file(media_path)
                         return
-                self._json({"error": "photo not found"}, 404)
+                self._json({"error": "media not found"}, 404)
                 return
             if parsed.path == "/api/runs":
                 self._json({"runs": self.repo.list_runs()})
@@ -3595,6 +6739,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     search=(query.get("search") or [""])[0],
                     score=(query.get("score") or [""])[0],
                     task_type=(query.get("task_type") or [""])[0],
+                    tag=(query.get("tag") or [""])[0],
                     agent_status=(query.get("agent_status") or [""])[0],
                     angle=(query.get("angle") or [""])[0],
                     difficulty=(query.get("difficulty") or [""])[0],
@@ -3602,12 +6747,22 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     primary=(query.get("primary") or [""])[0],
                 ))
                 return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/keyframe-analysis"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/keyframe-analysis"))
+                self._json(self.repo.get_keyframe_analysis(run_id))
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/memory-effectiveness"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/memory-effectiveness"))
+                self._json(self.repo.get_memory_effectiveness(run_id))
+                return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))
                 _q = parse_qs(parsed.query)
+                _raw_scores = (_q.get("scores") or [""])[0]
+                scores = [int(x) for x in _raw_scores.split(",") if x.strip() in {"0", "1", "2"}]
                 _raw = (_q.get("min_score") or [""])[0]
                 min_score = int(_raw) if _raw in {"1", "2"} else None
-                payload = self.repo.export_sft(run_id, min_score=min_score)
+                payload = self.repo.export_sft(run_id, scores=scores or None, min_score=min_score)
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -3615,6 +6770,25 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if parsed.path == "/api/judge-prompts":
+                custom = load_custom_judge_prompts()
+                self._json({
+                    "kinds": [
+                        {
+                            "kind": kind,
+                            "label": label,
+                            "default": JUDGE_PROMPT_KINDS[kind],
+                            "custom": custom.get(kind),
+                        }
+                        for kind, label in (
+                            ("answer_quality", "回答质量 Judge"),
+                            ("task_decision", "任务判断 Judge"),
+                            ("evidence", "证据核验 Judge"),
+                        )
+                    ],
+                    "storage_path": str(CUSTOM_JUDGE_PROMPT_PATH),
+                })
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/judge-prompt"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/judge-prompt"))
@@ -3649,6 +6823,10 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/cancel-active":
                 self._json(self.repo.cancel_active_suite())
                 return
+            if parsed.path.endswith("/resume") and parsed.path.startswith("/api/runs/"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/resume"))
+                self._json(self.repo.resume_run(run_id), status=202)
+                return
             if parsed.path.endswith("/cancel") and parsed.path.startswith("/api/runs/"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/cancel"))
                 self._json(self.repo.cancel_run(run_id))
@@ -3663,6 +6841,20 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 save_custom_judge_prompt(prompt)
                 self._json({"status": "ok"})
                 return
+            if parsed.path == "/api/judge-prompts":
+                payload = self._payload()
+                kind = str(payload.get("kind") or "").strip()
+                prompt = str(payload.get("system_prompt") or "").strip()
+                if kind not in JUDGE_PROMPT_KINDS:
+                    raise ValueError(f"kind must be one of {sorted(JUDGE_PROMPT_KINDS)}")
+                if not prompt:
+                    raise ValueError("system_prompt is required (empty string to restore default is not allowed here)")
+                if len(prompt) > 50000:
+                    raise ValueError("system_prompt is too long")
+                save_custom_judge_prompt(prompt, kind)
+                self._json({"status": "ok", "kind": kind,
+                            "custom": load_custom_judge_prompts().get(kind)})
+                return
             payload = self._payload()
             if parsed.path.endswith("/rejudge") and parsed.path.startswith("/api/runs/"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/rejudge"))
@@ -3670,11 +6862,58 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             elif parsed.path.endswith("/reviews") and parsed.path.startswith("/api/runs/"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/reviews"))
                 self._json(self.repo.save_reviews(run_id, payload))
+            elif self.path == "/api/config":
+                saved = persist_runtime_connection_config(payload)
+                global DEFAULT_SENTRIX_URL, DEFAULT_JUDGE_URL, DEFAULT_VLLM_API_URL
+                global DEFAULT_VLLM_BASE_URL, DEFAULT_JUDGE_PROVIDER_ID
+                DEFAULT_SENTRIX_URL = saved["sentrix_url"]
+                DEFAULT_JUDGE_URL = saved["judge_url"]
+                DEFAULT_VLLM_API_URL = saved["vllm_manager_url"]
+                DEFAULT_VLLM_BASE_URL = saved["model_base_url"]
+                DEFAULT_JUDGE_PROVIDER_ID = saved["judge_provider_id"]
+                self._json({"saved": True, "runtime_config": saved})
             elif self.path == "/api/profiles":
-                target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                manager_url = normalize_service_url(payload.get("vllm_manager_url"))
+                if manager_url:
+                    target_id = "external"
+                    target = {
+                        "label": "自定义模型 Manager",
+                        "manager_url": manager_url,
+                        "model_base_url": normalize_model_base_url(payload.get("model_base_url")),
+                        "kind": "external",
+                    }
+                else:
+                    target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
                 result = self.repo.query_profiles(str(target["manager_url"]))
                 result.update({"target_id": target_id, "target": target})
                 self._json(result)
+            elif self.path == "/api/current-model":
+                direct_base_url = normalize_model_base_url(payload.get("model_base_url"))
+                if direct_base_url:
+                    manager_url = normalize_service_url(payload.get("vllm_manager_url"))
+                    result = self.repo.query_current_model(
+                        manager_url, direct_base_url, str(payload.get("model") or ""),
+                    )
+                    target_id = "external"
+                    target = {
+                        "label": "自定义模型服务",
+                        "model_base_url": direct_base_url,
+                        "manager_url": manager_url,
+                        "kind": "external",
+                    }
+                else:
+                    target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
+                    result = self.repo.query_current_model(
+                        str(target["manager_url"]), str(target["model_base_url"]),
+                        str(payload.get("model") or ""),
+                    )
+                result.update({"target_id": target_id, "target": target})
+                self._json(result)
+            elif self.path == "/api/test-model":
+                self._json(self.repo.test_model_endpoint(
+                    normalize_model_base_url(payload.get("model_base_url")),
+                    str(payload.get("model") or ""),
+                ))
             elif self.path == "/api/memory-profile":
                 self._json(self.repo.start_memory_profile(payload), status=202)
             elif self.path == "/api/runs":
@@ -3700,10 +6939,54 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def _serve_file(self, path: Path):
         if not path.is_file():
             raise FileNotFoundError(path)
-        body = path.read_bytes()
         ct = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if ct.startswith("text/") or ct == "application/javascript":
             ct += "; charset=utf-8"
+        if ct.startswith("video/"):
+            size = path.stat().st_size
+            start, end = 0, size - 1
+            range_header = self.headers.get("Range", "")
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+                if not match:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+                if match.group(1):
+                    start = int(match.group(1))
+                    end = min(int(match.group(2)) if match.group(2) else size - 1, size - 1)
+                elif match.group(2):
+                    length = min(int(match.group(2)), size)
+                    start = size - length
+                if start > end or start >= size:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+            length = end - start + 1
+            self.send_response(HTTPStatus.PARTIAL_CONTENT if range_header else HTTPStatus.OK)
+            self.send_header("Content-Type", ct)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "private, max-age=3600")
+            if range_header:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(start)
+                    remaining = length
+                    while remaining:
+                        chunk = handle.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        body = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))

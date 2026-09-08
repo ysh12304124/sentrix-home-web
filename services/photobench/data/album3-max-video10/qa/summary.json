@@ -1,0 +1,100 @@
+{
+  "schema_version": "photobench_qa_three_sets_v1",
+  "exported_at": "2026-08-28T18:53:01+08:00",
+  "source": {
+    "base_url": "http://192.168.1.65:8782",
+    "album": "3",
+    "daily_days": 30
+  },
+  "semantics": {
+    "image_related": "8782当日事件前N日期QA与全部跨日事件QA；保留事件当前图片/视频GT引用",
+    "single_video": "8782视频QA审核页有效QA；每条规范化为单个video typed ref",
+    "mixed_image_video": "image_related与single_video两个集合的并集"
+  },
+  "collections": {
+    "image-related-439q.jsonl": {
+      "qa_count": 439,
+      "unique_qa_id_count": 439,
+      "review_status": {
+        "pass": 399,
+        "pending": 2,
+        "reject": 38
+      },
+      "interaction_type": {
+        "clarification_request": 66,
+        "direct_question": 310,
+        "injection_probe": 12,
+        "refusal_question": 51
+      },
+      "task_type": {
+        "T1_retrieve_media": 35,
+        "T2_fact_qa": 212,
+        "T3_enumeration": 38,
+        "T5_event_summary": 25,
+        "behavior": 129
+      },
+      "media_composition": {
+        "image_only": 378,
+        "image_video": 23,
+        "video_only": 38
+      },
+      "sha256": "d9cfe63dc161587972a51e4d55edba17b563a77ac4a0f3ffe368f7a8ff0cb38c"
+    },
+    "single-video-48q.jsonl": {
+      "qa_count": 48,
+      "unique_qa_id_count": 48,
+      "review_status": {
+        "pass": 48
+      },
+      "interaction_type": {
+        "clarification_request": 4,
+        "direct_question": 41,
+        "refusal_question": 3
+      },
+      "task_type": {
+        "T1_media_retrieval": 10,
+        "T2_fact_qa": 32,
+        "T3_enumeration": 1,
+        "T5_event_summary": 5
+      },
+      "media_composition": {
+        "video_only": 48
+      },
+      "sha256": "07d75453ad3013e55676aab8ccdba9b8b5568de769fd6188ffb854176b200c60"
+    },
+    "mixed-image-video-487q.jsonl": {
+      "qa_count": 487,
+      "unique_qa_id_count": 487,
+      "review_status": {
+        "pass": 447,
+        "pending": 2,
+        "reject": 38
+      },
+      "interaction_type": {
+        "clarification_request": 70,
+        "direct_question": 351,
+        "injection_probe": 12,
+        "refusal_question": 54
+      },
+      "task_type": {
+        "T1_media_retrieval": 10,
+        "T1_retrieve_media": 35,
+        "T2_fact_qa": 244,
+        "T3_enumeration": 39,
+        "T5_event_summary": 30,
+        "behavior": 129
+      },
+      "media_composition": {
+        "image_only": 378,
+        "image_video": 23,
+        "video_only": 86
+      },
+      "sha256": "73fa4512dde072fb0df9cf45ff3ebd192192db606f9764054bde002dcbf0be47"
+    }
+  },
+  "normalization": {
+    "reason": "Map source images removed from the 334-image album to their generated benchmark videos",
+    "mapping_source": "album3-max-video10/metadata/video_source_images.json",
+    "fields_changed": "media references only; QA content and review status unchanged"
+  }
+}
