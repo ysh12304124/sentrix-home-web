@@ -95,6 +95,8 @@ def _natural_partial(task_state: dict, problems=None) -> str:
 _RETRIEVAL_TOP_KEEP = (
     "result_set_id", "query", "preview", "can_inspect",
     "recommended_handle", "recommended_resolution", "page", "page_size",
+    # search 计算出的合影枚举事实（不同人数各拍了几张），是模型的直接答案依据，不是遥测。
+    "group_photo_count", "group_photo_sizes", "group_photo_rows",
 )
 _RETRIEVAL_PREVIEW_KEEP = (
     "handle", "captured_at", "place", "media_kind", "level",
