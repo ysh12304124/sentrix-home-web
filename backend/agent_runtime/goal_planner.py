@@ -169,11 +169,9 @@ class GoalPlanner:
                     "required": bool(item.get("required", True)),
                 })
         if not normalized_reqs:
-            normalized_reqs.append({
-                "id": "req_1",
-                "evidence_type": "memory_asset",
-                "description": "查找相关记忆照片",
-            })
+            # 允许零需求：无照片证据可确认的全库统计/拒答题，或纯聊天，不强行凑一个
+            # memory_asset 需求。模型在回答阶段决定是否需要检索。
+            pass
         decl["requirements"] = normalized_reqs
         return payload
 

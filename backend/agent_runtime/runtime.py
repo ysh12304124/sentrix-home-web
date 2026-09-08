@@ -1779,6 +1779,9 @@ class AgentRuntime:
         unknown_tool_retries = 0
         max_unknown_tool_retries = 1
         forced_final_attempted = False
+        # 5B：证据需求未满足时，最多给模型一次补证/修正的机会；模型坚持 final 就放行，
+        # 代码不再写死"现有证据不足，无法确认。"覆盖模型已给的好答案。
+        gate_unattempted_prompted = False
         wants_visual = visual_intent(message)
         # 预算 B：同一工具同一失败原因（evidence_incompatible / no_evidence_returned
         # 等）连续 2 次就强制换动作，避免小模型在同一个失败模式上反复消耗预算，
@@ -2316,37 +2319,30 @@ class AgentRuntime:
                             state.requirement.required and state.status == "satisfied"
                             for state in agent2_task_state.requirements.values()
                         )
-                        if unattempted and available and turn.budget.can_model_step():
-                            pending = [
+                        # 5B 软门槛：需求未满足时只给一次"补证/如实收尾"的机会，不再无限
+                        # continue，也不再写死固定文案。模型在提醒后仍输出 final → 放行，
+                        # 让其自然回答（包括诚实的"无法确认"），不被代码覆盖。
+                        if unattempted and available and turn.budget.can_model_step() \
+                                and not gate_unattempted_prompted:
+                            gate_unattempted_prompted = True
+                            prompt_pending = [
                                 f"{state.requirement.id}:{state.requirement.evidence_type}"
                                 for state in unattempted
                             ]
                             final_gate.update({
-                                "decision": "continue_unattempted",
+                                "decision": "continue_unattempted_once",
                                 "available_tools": [spec.name for spec in available],
-                                "unattempted_requirements": pending,
+                                "unattempted_requirements": prompt_pending,
                             })
                             messages.append({"role": "assistant", "content": _model_visible_action(action)})
                             messages.append({"role": "user", "content": (
-                                "还有声明的证据需求尚未尝试，不能输出 final。"
-                                f"未尝试需求：{', '.join(pending)}。"
+                                "还有声明的证据需求尚未尝试："
+                                + ", ".join(prompt_pending) + "。"
                                 f"当前可用工具：{', '.join(spec.name for spec in available)}。"
-                                "请选择一个兼容工具继续获取实际证据；工具结果失败也要如实记录。"
+                                "请先用兼容工具获取证据；如果确实没有对应的照片或记录可以确认"
+                                "（例如问题本身没有可查的答案），请直接输出 final 如实说明，不要编造。"
                             )})
                             continue
-                        if unattempted:
-                            final_gate.update({
-                                "decision": "block_unattempted",
-                                "available_tools": [spec.name for spec in available],
-                                "unattempted_requirements": [
-                                    state.requirement.id for state in unattempted
-                                ],
-                            })
-                            turn.final_answer = "现有证据不足，无法确认。"
-                            turn.status = "partial"
-                            turn.reason = "agent2_unattempted_evidence"
-                            turn.termination_reason = "evidence_gate_blocked_unattempted"
-                            break
                         grounded_context = answer_context
                         if grounded_context is None:
                             try:
@@ -2354,26 +2350,16 @@ class AgentRuntime:
                                     message, agent2_task_state)
                             except Exception:
                                 grounded_context = {}
-                        if has_partial_answer or grounded_context.get("facts"):
-                            # A required ancillary field (for example venue)
-                            # may remain unresolved while the user-requested
-                            # field (for example confirmed people) is already
-                            # directly supported. Let the writer answer only
-                            # the supported portion and state the missing one.
-                            final_gate.update({
-                                "decision": "partial_answer",
-                                "available_tools": [spec.name for spec in available],
-                            })
-                        else:
-                            final_gate.update({
-                                "decision": "block",
-                                "available_tools": [spec.name for spec in available],
-                            })
-                            turn.final_answer = "现有证据不足，无法确认。"
-                            turn.status = "partial"
-                            turn.reason = "agent2_insufficient_evidence"
-                            turn.termination_reason = "evidence_gate_blocked"
-                            break
+                        # 无论是否有已确认事实，模型已选择 final（或已给过补证机会）→ 放行。
+                        # 有部分确认则如实带过缺口；完全没有事实时保留模型自然的"无法确认"，
+                        # 字段级冲突/纯编造仍由 FinalGuard 与 L2 拦截，代码不写死固定文案。
+                        final_gate.update({
+                            "decision": ("partial_answer" if has_partial_answer
+                                         or grounded_context.get("facts")
+                                         else "accept_with_insufficient_evidence"),
+                            "available_tools": [spec.name for spec in available],
+                            "pending_requirements": pending,
+                        })
                 # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
                 if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
                     open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
@@ -2519,53 +2505,11 @@ class AgentRuntime:
                     turn.status = "complete"
                     turn.termination_reason = "evidence_resolution_exhausted"
                     break
-                # Phase F F1：Final Answer Writer——草稿违反 Answer Policy 时用受控事实重写
-                if turn.final_answer and turn.budget.can_model_step():
-                    try:
-                        from .final_writer import build_final_context, needs_rewrite, rewrite_final
-                        fctx = build_final_context(message, task.as_dict())
-                        if needs_rewrite(turn.final_answer, fctx):
-                            turn.budget.record_model_step()
-                            _wr_debug = {} if self.include_debug else None
-                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer,
-                                                      debug_out=_wr_debug)
-                            if rewritten and rewritten != turn.final_answer:
-                                _wr_step = {"type": "writer", "status": "rewritten",
-                                            "call_type": "writer"}
-                                if _wr_debug:
-                                    _wr_step["prompt"] = _wr_debug.get("messages")
-                                    _wr_step["raw_full"] = rewritten
-                                turn.steps.append(_wr_step)
-                                from .final_writer import clean_writer_output
-                                turn.final_answer = naturalize_answer(
-                                    clean_writer_output(rewritten))
-                    except Exception:
-                        pass
-                try:
-                    from .final_writer import (build_final_context, evidence_answer_problems)
-                    _quality_context = build_final_context(message, task.as_dict())
-                    _quality_problems = evidence_answer_problems(
-                        message, turn.final_answer, _quality_context)
-                    if _quality_problems and answer_quality_retries < 1 and turn.budget.can_model_step():
-                        answer_quality_retries += 1
-                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                        messages.append({"role": "user", "content": (
-                            "已有工具结果包含直接证据，但上一版回答不完整或拒答（问题："
-                            + ", ".join(_quality_problems)
-                            + "）。请严格根据受控事实直接回答；已确认的人物、日期和地点必须写出，"
-                              "无法确认的部分要明确说明，不要把其他人的细节归给目标人物。"
-                        )})
-                        continue
-                    if _quality_problems:
-                        # Do not replace the model's natural answer with a
-                        # code-like deterministic concatenation. Preserve the
-                        # Writer output and expose the unresolved quality
-                        # state in the trace for the next bounded retry.
-                        if turn.agent2_trace:
-                            turn.agent2_trace.setdefault("quality", {})[
-                                "unresolved_problems"] = list(_quality_problems)
-                except Exception:
-                    pass
+                # 5B：停用模型 final 的 needs_rewrite/rewrite_final 语义重写。模型的自然回答
+                # 直接放行（naturalize 已在上方做过确定性清理）；风格类问题不再强制改写文本。
+                # 5B：停用 evidence_answer_problems 语义完整性检查的强制重试（不逼模型补
+                # 人名/日期/拒答改写）。语义真实性交给 L2 judge 与字段冲突硬拦，代码不做
+                # 文本级比对，模型给出的答案按其本来样子处理。
                 problems = guard.check(
                     turn.final_answer,
                     task_state={
@@ -2636,23 +2580,11 @@ class AgentRuntime:
                                 task.as_dict(), reason="回答未通过事实校验")
                         break
                     if severity == "style":
-                        # G4 Style Advisory：只做一次建议性重写；重写失败/未改变 → 放行原答案
-                        # （绝不得把事实正确的答案变成 blocked_by_guard）
-                        if turn.final_answer and turn.budget.can_model_step():
-                            try:
-                                from .final_writer import (build_final_context, needs_rewrite,
-                                                          rewrite_final)
-                                fctx = build_final_context(message, task.as_dict())
-                                if needs_rewrite(turn.final_answer, fctx):
-                                    turn.budget.record_model_step()
-                                    rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
-                                    if rewritten and rewritten != turn.final_answer:
-                                        turn.steps.append({"type": "writer",
-                                                           "status": "rewritten_style"})
-                                        from .final_writer import clean_writer_output
-                                        turn.final_answer = clean_writer_output(rewritten)
-                            except Exception:
-                                pass
+                        # 5B：style 仅作提示，不再强制改写；直接放行原答案（绝不得把事实
+                        # 正确的答案变成 blocked_by_guard，也不因风格做额外的模型改写）。
+                        if turn.agent2_trace:
+                            turn.agent2_trace.setdefault("quality", {})[
+                                "style_problems"] = list(str(p) for p in problems)
                         turn.status = "complete"
                         break
                     # Phase H H4：guard 拦截后若问题可确定性渲染（价格/年份/数量），直接交付硬值
@@ -3060,14 +2992,12 @@ class AgentRuntime:
                     f"{entry.tool_call_id}:{entry.evidence_type}" for entry in new_entries
                 ]
                 if answer_context_enabled:
-                    from .final_writer import build_answer_writer_messages
                     answer_context = agent2_evidence_ledger.build_answer_context(
                         message, agent2_task_state)
                     turn.agent2_trace["answer_context"] = answer_context
-                    if _agent2_answer_context_ready(agent2_task_state, answer_context):
-                        answer_writer_messages = build_answer_writer_messages(
-                            message, answer_context)
-                        answer_writer_pending = True
+                    # 5B：证据就绪只写入 trace 供评审，不再自动强制 writer 接管回答。
+                    # 由模型在"已具备足够事实，请直接 final"的提示下自己输出 final；
+                    # writer 仅在 final 违反 Answer Policy / 事实字段冲突时做受控处理。
                 turn.steps[-1]["task_status_after"] = agent2_task_state.status
                 turn.steps[-1]["requirement_status_after"] = {
                     req_id: state.status
