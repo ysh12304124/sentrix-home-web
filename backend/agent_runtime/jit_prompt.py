@@ -34,10 +34,6 @@ LITE_TOOL_SCHEMAS = {
         "需要更多候选用 get_result_page 翻页；返回 recommended_handle 时优先复核该图。\n"
         '  输入: {"query": "关键词", "filters": {"time": "<问题时间，缺省省略>", "person": "人物", "place": "地点"}}'
     ),
-    "query_memory_facts": (
-        "- query_memory_facts: 全量聚合统计与结构化事实（总数/最早/最近/分组/事件）。\n"
-        '  输入: {"operation": "count|first|last|date|group|meal|list|event", "filters": {"time": "时间", "person": "人物", "media": "video/image"}}'
-    ),
     "query_photo_people": (
         "- query_photo_people: 读取当前预览中一张照片自己的已确认人物和未确认同行者。\n"
         '  输入: {"asset_handle": "photo_1", "result_set_id": "..."}'
@@ -96,7 +92,6 @@ def build_jit_system_prompt(
         # Fallback 到包含所有常用工具的简版
         tool_descriptions = "\n".join([
             LITE_TOOL_SCHEMAS["search_memories"],
-            LITE_TOOL_SCHEMAS["query_memory_facts"],
             LITE_TOOL_SCHEMAS["query_photo_people"],
             LITE_TOOL_SCHEMAS["inspect_photo"],
             LITE_TOOL_SCHEMAS["read_photo_text"],

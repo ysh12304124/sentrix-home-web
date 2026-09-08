@@ -224,7 +224,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 规则：
 - 需要家庭记忆事实时调用工具；不需要时直接 final。
 - 声称"没有找到/找不到/不存在相关记录"之前，必须先至少调用一次检索工具
-  （search_memories / query_memory_facts / search_conversation_history / get_core_memory / get_person_profile）。
+  （search_memories / search_conversation_history / get_core_memory / get_person_profile）。
   未检索就断言"没有找到"会被纠正并要求重新检索。
 - 每次只输出一个 JSON 对象，直接输出，不要用 markdown 代码块（不要 ```）、不要解释、不要多余文字：
   {{"action":"tool_call","tool":"...","arguments":{{...}},"public_status":"..."}}
@@ -250,19 +250,13 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   不要补充 rows 中没有的项目，也不要自行概括出 rows 不支持的维度。
 - search_memories 的 preview 只显示前几张，每张带 place 字段（照片所在地，来自 GPS 反地理编码，
   通常为城市/区县/景区名，如"某市某区"、"某度假村"）；用户要求更多/下一页/还有吗 时，用 get_result_page（result_set_id 用 search_memories 返回的，page 从 1 开始）。
-- 问'在哪里/哪个城市/什么地点/哪举办的'时，用 search_memories 检索并在回答中引用 preview 的 place 字段；
-  query_memory_facts 只返回时间/数量/分组，不能回答照片地点。
+- 问'在哪里/哪个城市/什么地点/哪举办的'时，用 search_memories 检索并在回答中引用 preview 的 place 字段。
 - 工具选择看用户意图，不是看有没有日期：
   · 用户要找照片、看照片内容（颜色/服装/道具/人数/雕塑/文字/哪张照片）、或问照片是在哪里拍的 → 用 search_memories（把日期写进 filters.time，不要省略）；需要照片里的视觉细节时再 inspect_photo / read_photo_text。
-  · 只有纯统计/确定性事实（一共多少张、最早/最近一张、是否存在、按时间/地点分组）才用 query_memory_facts，并把用户问题里的时间写进 filters.time（如 '2023年'、'2025-05'），不要用模型估算。
-- 用户要'给我所有视频/照片/音频/文本'或'列出相册里的视频'时，用 query_memory_facts 的 operation=list，并在 filters.media 填 video/image/audio/text；工具返回 items 是实际媒体，回答要引用 items 里的 file_name、时长、场景/关键帧来源，不能只报数量。如果工具返回 summary，直接使用 summary 里的文件名和描述逐项列出。
-- 按月份/地点统计分布用 query_memory_facts 的 operation=group，并填 group_by（month 或 place）。
-- operation=group 且 group_by=place 时，工具会返回 known_location_assets/unknown_location_assets 覆盖信息：
-  只要 unknown_location_assets>0，回答必须如实说明还有多少张照片没有可靠地点信息，不能把地点说成完整清单。
-- operation=meal 回答'吃过什么/吃饭/火锅'类问题：工具会返回 explicit_foods（明确食物，按事件去重）、
-  meal_scene_events（只能确认在吃饭）、possible_events；回答必须逐项列出 explicit_foods 里的食物
-  （如具体菜名）并说明各出现几次，有 meal_scene_events 时还要说明其中一部分只能确认在用餐、
-  不能确认具体菜品；没有 explicit_foods 时才只说用餐场景。
+  · 单张照片的拍摄时间/日期/年份、地点、人物在 search_memories 的 preview 里直接给出，不要为单张照片的地点时间人物再调用其它工具。
+- 需要全库统计/金额/费用/桌数/总数的问题（如'一共收了多少礼金''花了多少钱''请了几桌''相册一共多少张'）没有可用的照片证据：
+  不要把 search 返回的照片数量或 preview 张数当作该统计值编造，也不要用检索字段（total/has_more/候选数）当答案。
+  只有相册里能找到直接依据（账单、菜单、请柬上的文字/数字）时，才用 read_photo_text 读出来回答；否则如实说明现有记录无法确认。
 - final 回答直接给答案，先回答用户问题本身；需要说明不确定时用自然语言，不要复述检索过程。
 - 回答结构：1) 直接答案 2) 必要的 uncertainty 3) 可选一句补充。不要以"我为您找到 N 张候选照片/检索到…"开头。
 - 内部检索词汇（query_satisfaction、candidate_only、partial_support、full_support、no_match、候选照片、
@@ -470,25 +464,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         """
         if not spec.can_satisfy(evidence_type):
             return False
-        operation = str(
-            observation.get("metadata_operation") or observation.get("operation") or ""
-        ).strip().lower()
-        if spec.name == "query_memory_metadata":
-            operation_types = {
-                "date": {"structured_fact", "temporal_metadata"},
-                "first": {"structured_fact", "temporal_metadata"},
-                "last": {"structured_fact", "temporal_metadata"},
-                "place": {"structured_fact", "location_metadata"},
-                "event": {"structured_fact"},
-                "count": {"structured_fact"},
-            }
-            return evidence_type in operation_types.get(operation, set())
-        if spec.name == "query_memory_facts":
-            if operation in {"date", "first", "last"}:
-                return evidence_type in {"structured_fact", "temporal_metadata"}
-            if operation == "group" and str(observation.get("group_by") or "").lower() == "place":
-                return evidence_type in {"structured_fact", "location_metadata"}
-            return evidence_type == "structured_fact"
+        # query_memory_facts / query_memory_metadata 已删除：没有按 operation
+        # 收窄证据类型的聚合工具，回归统一的 spec.can_satisfy 判定。
         return True
 
     def mark_failure(reason: str) -> bool:
@@ -809,79 +786,6 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "certainty": "confirmed",
                     "subject": "商品价格",
                 })
-    elif spec.name == "query_memory_facts":
-        value = observation.get("value")
-        if value is None:
-            value = observation.get("rows") or observation.get("items") or observation.get("summary")
-        if value not in (None, "", [], {}):
-            evidence_rows.append({"evidence_type": "structured_fact", "value": value,
-                                  "subject": str(observation.get("operation") or "结构化记忆事实")})
-        if (observation.get("operation") in {"date", "first", "last"}
-                and observation.get("value") not in (None, "", [], {})):
-            evidence_rows.append({"evidence_type": "temporal_metadata", "value": observation.get("value"),
-                                  "subject": str(observation.get("operation"))})
-        filters = observation.get("filters_applied") or {}
-        time_range = filters.get("time_range") if isinstance(filters, dict) else None
-        items = observation.get("items") or []
-        if time_range and items:
-            temporal_value = [
-                {"asset": str(row.get("asset_id") or row.get("id") or ""),
-                 "value": row.get("captured_at") or row.get("date") or ""}
-                for row in items if isinstance(row, dict)
-                and (row.get("captured_at") or row.get("date"))
-            ]
-            if temporal_value:
-                evidence_rows.append({"evidence_type": "temporal_metadata",
-                                      "value": temporal_value,
-                                      "subject": "时间过滤后的照片拍摄时间",
-                                      "asset_id": temporal_value[0].get("asset") or ""})
-        if observation.get("group_by") == "place" or observation.get("common_places"):
-            value = observation.get("rows") or observation.get("common_places")
-            if value:
-                evidence_rows.append({"evidence_type": "location_metadata", "value": value,
-                                      "subject": "结构化地点事实"})
-    elif spec.name == "query_memory_metadata":
-        # Dedicated structured metadata must enter the same typed ledger as
-        # search/inspect results; otherwise direct date/place/event evidence is
-        # visible in the tool trace but remains invisible to the final gate.
-        value = observation.get("value")
-        if value is None:
-            value = observation.get("items") or observation.get("rows") or observation.get("summary")
-        source_ids = tuple(str(value) for value in (
-            observation.get("evidence_asset_ids")
-            or observation.get("source_asset_ids")
-            or []
-        ) if value)
-        operation = str(observation.get("metadata_operation")
-                        or observation.get("operation") or "").lower()
-        if value is not None:
-            evidence_rows.append({
-                "evidence_type": "structured_fact",
-                "value": value,
-                "subject": f"结构化元数据:{operation or 'query'}",
-                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
-            })
-        if operation in {"date", "first", "last"} and value not in (None, "", [], {}):
-            evidence_rows.append({
-                "evidence_type": "temporal_metadata", "value": value,
-                "subject": "结构化日期事实",
-                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
-            })
-        filters = observation.get("filters_applied") or {}
-        time_range = filters.get("time_range") if isinstance(filters, dict) else None
-        if time_range and source_ids:
-            evidence_rows.append({
-                "evidence_type": "temporal_metadata",
-                "value": {"time_range": time_range, "source_asset_ids": list(source_ids)},
-                "subject": "时间过滤后的结构化照片来源",
-                "asset_id": source_ids[0],
-            })
-        if operation == "place" and value not in (None, "", [], {}):
-            evidence_rows.append({
-                "evidence_type": "location_metadata", "value": value,
-                "subject": "结构化地点事实",
-                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
-            })
     elif spec.name == "query_photo_people":
         people = observation.get("people") or []
         unknown = observation.get("unconfirmed_people") or []
@@ -2582,7 +2486,7 @@ class AgentRuntime:
                         if req.code == RETRIEVE_EVIDENCE:
                             messages.append({"role": "user", "content": (
                                 f"{req.reason} 这是完成回答的必要步骤：请先调用检索工具"
-                                "（search_memories / query_memory_facts / get_core_memory / get_person_profile），"
+                                "（search_memories / get_core_memory / get_person_profile），"
                                 "拿到工具结果后再输出 final。"
                             )})
                         elif req.code == DELIVER_MEDIA:

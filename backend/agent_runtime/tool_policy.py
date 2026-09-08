@@ -72,12 +72,6 @@ class ToolPolicy:
         "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
-        "query_memory_facts": _DEFAULT_ALLOWED | {
-            "operation", "answer_type", "value", "rows", "filters_applied",
-            "scanned_observations", "total_meal_observations", "event_count",
-            "explicit_foods", "explicit_food_events", "meal_scene_events",
-            "possible_events", "time_range", "rows_truncated", "samples", "items",
-        },
         "query_photo_people": _DEFAULT_ALLOWED | {
             "result_set_id", "asset_id", "people", "unconfirmed_people",
             "unconfirmed_people_count", "source_asset_ids", "source_handles",
