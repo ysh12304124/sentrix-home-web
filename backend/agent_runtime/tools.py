@@ -1323,6 +1323,32 @@ def _in_time_bounds(captured_at, bounds) -> bool:
         return False
 
 
+def _in_time_components(captured_at, comps) -> bool:
+    """分量时间匹配：year/months/days 谁给了就约束谁，没给的不约束。
+
+    无年份的节日/季节只约束月、日，任何年份的相符照片都保留；某一年份若没给出
+    绝不猜年份（那会把正确年份的照片筛成 0）。
+    """
+    if not captured_at:
+        return False
+    try:
+        from datetime import datetime
+        cap = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return False
+    comps = comps or {}
+    year = comps.get("year")
+    months = comps.get("months")
+    days = comps.get("days")
+    if year and int(year) != cap.year:
+        return False
+    if months and cap.month not in months:
+        return False
+    if days and cap.day not in days:
+        return False
+    return True
+
+
 def _place_matches(item, place_q: str, store) -> bool:
     """候选是否满足地点硬指标：reverse_geocode 匹配查询地点。"""
     if not store or not place_q:
@@ -1414,6 +1440,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     _slot_input = str(user_goal or "").strip() or query
     _slot_event = ""
     _slot_objects: list[str] = []
+    # 时间分量（year/months/days）可能由拆槽给出；无年份的节日/季节只约束月日，
+    # 绝不能因模型"猜年份"把正确年份的照片筛成 0（qa012/013/017/018 根因）。
+    _slot_year = None
+    _slot_months: list[int] = []
+    _slot_days: list[int] = []
     if gamma is not None and _slot_input.strip():
         try:
             from .semantic_slots import parse_semantic_slots
@@ -1421,9 +1452,26 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         except Exception:
             _slots = None
         if _slots:
-            bounds = _slots["time"].get("bounds") or []
-            if len(bounds) == 2:
-                filters["time"] = _bounds_to_time_expr(bounds[0], bounds[1])
+            _st = _slots.get("time") or {}
+            _slot_year = _st.get("year")
+            _slot_months = sorted({int(m) for m in (_st.get("months") or [])
+                                   if str(m).isdigit()})
+            _slot_days = sorted({int(d) for d in (_st.get("days") or [])
+                                 if str(d).isdigit()})
+            _slot_expr = str(_st.get("expr") or "")
+            # 相对时间（去年/今年/上个月/这两年…）模型不推年份，只给 expr，
+            # 这里用确定性换算成绝对表达式走原有 bounds 路径。
+            if not (_slot_year or _slot_months or _slot_days) and _slot_expr:
+                _slot_abs = _resolve_time_expression(_slot_expr)
+                if _slot_abs:
+                    filters["time"] = _slot_abs
+            # 有年份+月份才补绝对表达式，供 metadata-only/纯时间检索路径使用；
+            # 只有月/日（节日/季节，年份未知）不给 filters.time，靠分量匹配不过滤年份。
+            if _slot_year and _slot_months and not filters.get("time"):
+                _slot_y = int(_slot_year)
+                _slot_lo, _slot_hi = min(_slot_months), max(_slot_months)
+                filters["time"] = (f"{_slot_y}年{_slot_lo}月-{_slot_hi}月"
+                                   if _slot_lo != _slot_hi else f"{_slot_y}年{_slot_lo}月")
             if _slots["place"].get("name"):
                 filters["place"] = _slots["place"].get("hint") or _slots["place"]["name"]
             if _slots.get("person"):
@@ -1490,10 +1538,18 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             _s += _slot_ev_w
         scores[_aid] = _s
 
-    # 确定性筛子：时间/地点由模型拆槽判断（bounds/place），不符合直接筛出；
-    # 模型判断无时间信息（bounds 空）则不筛。
+    # 确定性筛子：时间由拆槽的时间分量（year/months/days，缺省分量不约束）过滤，
+    # 或由绝对/相对表达式（bounds）过滤；地点只做非标准地名时的语义保底。
+    # 年份未知（节日/季节）时只约束月/日，任何年份的相符照片都保留。
+    time_comps = None
+    if _slot_year or _slot_months or _slot_days:
+        time_comps = {
+            "year": int(_slot_year) if _slot_year else None,
+            "months": set(_slot_months) or None,
+            "days": set(_slot_days) or None,
+        }
     time_bounds = None
-    if filters.get("time"):
+    if filters.get("time") and time_comps is None:
         try:
             from ..query_contracts import parse_time_expression
             time_bounds = parse_time_expression(str(filters["time"]))
@@ -1509,16 +1565,23 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         except Exception:
             return None
 
+    def _time_ok(cap):
+        if time_comps is not None:
+            return _in_time_components(cap, time_comps)
+        if time_bounds is not None:
+            return _in_time_bounds(cap, time_bounds)
+        return True
+
     kept = []
-    if time_bounds or place_q:
+    if time_comps is not None or time_bounds or place_q:
         for _aid in scores:
-            if time_bounds and not _in_time_bounds(_asset_captured(_aid), time_bounds):
+            if (time_comps is not None or time_bounds) and not _time_ok(_asset_captured(_aid)):
                 continue
             if place_q and not _place_matches({"asset_id": _aid}, place_q, store):
                 continue
             kept.append(_aid)
-        if not kept and time_bounds:
-            kept = [a for a in scores if _in_time_bounds(_asset_captured(a), time_bounds)]
+        if not kept and (time_comps is not None or time_bounds):
+            kept = [a for a in scores if _time_ok(_asset_captured(a))]
         elif not kept:
             kept = list(scores)  # 地点全删（非标准地名）→ 保留靠语义排序
     else:
