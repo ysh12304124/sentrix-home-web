@@ -5911,13 +5911,12 @@ class OrchestratorRepository:
         return values[max(0, min(len(values) - 1, math.ceil(len(values) * percentile) - 1))]
 
     def export_traces(self, run_id: str, scores: list[int] | None = None,
-                      min_score: int | None = None) -> dict:
-        """按问题导出，每问只给两项：planner 完整输入/输出 + 完整 debug 轨迹。
+                      min_score: int | None = None) -> list:
+        """每题只导两项：planner 完整输入/输出 + 最终 final 那一次的完整轨迹。
 
-        不做任何重排/合成：
-        - planner：保留该步原始 prompt（输入）与 raw_full（输出/声明），显式标为 planner；
-        - trajectory：其余步按原顺序给出（model 步带该步完整 prompt 与 raw_full，
-          工具返回已包含在后续 prompt 的 user 消息里），供逐题核对"模型看到什么、输出了什么"。
+        每题对象仅含：qa_id / question / planner{prompt,raw_full} /
+        final_trace{step_id,prompt,raw_full}（prompt 为该次模型调用完整 messages，
+        含唯一 system 与到 final 前的全部历史；raw_full 为最终答案输出）。
         scores: 非空时只导出评分落在该集合内的题目；min_score: 导出评分 >= 该值的题目。
         """
         with self.lock:
@@ -5927,57 +5926,35 @@ class OrchestratorRepository:
             state = run.state if isinstance(run, BenchmarkRun) else run
             include = set(scores) if scores else None
             items_out = []
-            for index, item in enumerate(state.get("items") or []):
-                if include is not None:
-                    item_score = (item.get("judge") or {}).get("score")
-                    if item_score not in include:
-                        continue
-                elif min_score is not None:
-                    item_score = (item.get("judge") or {}).get("score")
-                    if item_score is None or item_score < min_score:
-                        continue
+            for item in (state.get("items") or []):
+                item_score = (item.get("judge") or {}).get("score")
+                if include is not None and item_score not in include:
+                    continue
+                if min_score is not None and (item_score is None or item_score < min_score):
+                    continue
                 planner = None
-                trajectory = []
+                model_steps = []
                 for turn in (item.get("runtime_turns") or []):
                     for step in (turn.get("debug_trace") or []):
                         if not isinstance(step, dict):
                             continue
-                        stype = step.get("type")
-                        if stype == "planner":
-                            # planner 单独成块并显式标注，不进 trajectory
-                            planner = {
-                                "type": "planner",
-                                "prompt": step.get("prompt"),
-                                "raw_full": step.get("raw_full") or step.get("raw"),
-                            }
-                            continue
-                        entry = {"type": stype}
-                        for key in ("step_id", "call_type", "status", "tool", "role",
-                                    "codes", "problems", "faithful", "reason",
-                                    "attempt", "tool_candidates"):
-                            if step.get(key) is not None:
-                                entry[key] = step[key]
-                        if step.get("prompt") is not None:
-                            entry["prompt"] = step["prompt"]
-                        content = step.get("raw_full") or step.get("raw")
-                        if content:
-                            entry["raw_full"] = content
-                        trajectory.append(entry)
-                items_out.append({
-                    "index": index,
-                    "qa_id": item.get("qa_id"),
-                    "question": item.get("question"),
-                    "planner": planner or {"type": "planner",
-                                           "note": "该题未产生 planner 步"},
-                    "trajectory": trajectory,
-                })
-            return {
-                "run_id": run_id,
-                "album_id": state.get("album_id"),
-                "qa_set": state.get("qa_set"),
-                "count": len(items_out),
-                "items": items_out,
-            }
+                        if step.get("type") == "planner":
+                            planner = {"type": "planner",
+                                       "prompt": step.get("prompt"),
+                                       "raw_full": step.get("raw_full") or step.get("raw")}
+                        elif step.get("type") == "model":
+                            model_steps.append(step)
+                final_trace = None
+                if model_steps:
+                    last = model_steps[-1]
+                    final_trace = {"step_id": last.get("step_id"),
+                                   "prompt": last.get("prompt"),
+                                   "raw_full": last.get("raw_full") or last.get("raw")}
+                items_out.append({"qa_id": item.get("qa_id"),
+                                  "question": item.get("question"),
+                                  "planner": planner,
+                                  "final_trace": final_trace})
+            return items_out
 
     @classmethod
     def _effective_summary(cls, state: dict) -> dict:
