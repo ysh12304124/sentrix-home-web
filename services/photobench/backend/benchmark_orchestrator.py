@@ -744,7 +744,7 @@ def upload_files(url: str, fields: dict, files: list[tuple[str, str, bytes]], ti
         return json.loads(resp.read())
 
 
-RUN_MODES = ("full", "reuse", "build")
+RUN_MODES = ("full", "reuse", "build", "resume")
 PIPELINE_PENDING_STATUSES = {
     "queued", "processing", "semantic_enriching",
     "video-queued", "video-keyframe-extracting", "video-scene-importing",
@@ -1569,7 +1569,7 @@ class BenchmarkRun:
                  mode: str = "full", existing_scope_id: str = "",
                  scope_reused_from_runs: list | None = None,
                  use_current_model: bool = False, current_model_snapshot: dict | None = None,
-                 use_cloud_model: bool = False):
+                 use_cloud_model: bool = False, resume_state: dict | None = None):
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
         if mode == "reuse" and not existing_scope_id:
@@ -1672,6 +1672,37 @@ class BenchmarkRun:
             daemon=True,
         )
         self._persist_thread.start()
+        if resume_state:
+            # Restore the checkpoint after constructing the normal runtime
+            # fields. Keep the same run ID so the UI shows one continuous run.
+            restored = copy.deepcopy(resume_state)
+            restored.update({
+                "run_id": run_id,
+                "mode": "resume",
+                "album_id": album_id,
+                "qa_set": qa_set,
+                "model_profile": model_profile,
+                "model_source": self.state["model_source"],
+                "model_backend": self.state["model_backend"],
+                "model_name": self.state["model_name"],
+                "current_model_snapshot": self.current_model_snapshot or restored.get("current_model_snapshot"),
+                "judge_model": judge_model,
+                "judge_url": self.judge_url,
+                "vllm_target_id": vllm_target_id,
+                "vllm_manager_url": vllm_api_url,
+                "vllm_model_base_url": vllm_model_base_url,
+                "status": "pending",
+                "started_at": None,
+                "finished_at": None,
+                "fatal_error": None,
+                "failed_phase": None,
+                "run_valid": False,
+                "resumed_at": now_iso(),
+                "resume_count": int(restored.get("resume_count") or 0) + 1,
+            })
+            self.state = restored
+            self.existing_scope_id = str(restored.get("scope_id") or existing_scope_id or "").strip()
+            self.persist(wait=True)
 
     @property
     def run_dir(self) -> Path:
@@ -1936,7 +1967,16 @@ class BenchmarkRun:
                       "pipeline_processing", "gpu_metrics", "aggregate"],
             "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
         }
-        selected = phase_names_by_mode[self.mode]
+        if self.mode == "resume":
+            old_phases = self.state.get("phases") or {}
+            selected = []
+            if (old_phases.get("pipeline_processing") or {}).get("status") != "done":
+                selected.append("pipeline_processing")
+            if (old_phases.get("qa_eval") or {}).get("status") != "done":
+                selected.append("qa_eval")
+            selected.extend(["gpu_metrics", "aggregate"])
+        else:
+            selected = phase_names_by_mode[self.mode]
         if self.use_current_model:
             selected = [name for name in selected if name != "model_deploy"]
         return selected
@@ -2413,6 +2453,15 @@ class BenchmarkRun:
         terminal_pipeline_error = None
         assets = []
         pending = []
+        if self.mode == "resume" and self.state.get("batch_id"):
+            # A restart can leave the saved ingest batch open. Reopen/complete
+            # only an unfinished batch: calling this endpoint on a completed
+            # batch intentionally reprocesses all of its assets.
+            batch_url = f"{self.sentrix_url}/api/ingest-batches/{quote(str(self.state['batch_id']))}"
+            saved_batch = request_json(batch_url, timeout=60)
+            saved_status = str((saved_batch.get("batch") or {}).get("status") or "")
+            if saved_status not in {"completed", "cancelled"}:
+                request_json(f"{batch_url}/complete", method="POST", timeout=60)
         if self.state.get("import_accepted_count") == 0:
             self._phase_partial("pipeline_processing", {
                 "total_seconds": 0.0,
@@ -2613,11 +2662,20 @@ class BenchmarkRun:
             self.state["qa_concurrency"] = qa_concurrency
             self.state["judge_concurrency"] = judge_concurrency
         total_qa = len(self.qa_rows)
-        self._qa_submitted = 0
-        self._qa_agent_completed = 0
+        existing_items = self.state.get("items") or []
+        completed_qa_ids = {
+            str(item.get("qa_id")) for item in existing_items
+            if item.get("qa_id") and item.get("execution_status") not in {"scheduled", "running"}
+        }
+        self._qa_submitted = len(completed_qa_ids)
+        self._qa_agent_completed = len(completed_qa_ids)
         self._qa_judge_submitted = 0
-        self._qa_judge_completed = 0
-        self._qa_judge_skipped = 0
+        self._qa_judge_completed = len(completed_qa_ids)
+        self._qa_judge_skipped = sum(
+            1 for item in existing_items
+            if str(item.get("qa_id") or "") in completed_qa_ids
+            and item.get("judge_status") == "skipped"
+        )
         self._record_phase("qa_eval", "agent_phase_started_at", now_iso())
         self._record_phase("qa_eval", "agent_phase_started_at_epoch", agent_phase_started_epoch)
         self._record_phase("qa_eval", "agent_total", total_qa)
@@ -2643,7 +2701,10 @@ class BenchmarkRun:
                 "judge_concurrency": judge_concurrency,
             })
 
-        pool_rows = list(enumerate(self.qa_rows))
+        pool_rows = [
+            (index, row) for index, row in enumerate(self.qa_rows)
+            if str(row.get("qa_id") or "") not in completed_qa_ids
+        ]
         agent_futures = {}
         judge_futures = {}
         judge_phase_started_perf = None
@@ -2929,9 +2990,11 @@ class BenchmarkRun:
             retrieved_media = _resolve_predicted_media(media_sets["retrieved_asset_ids"], assets_by_name)
             evidence_media = _resolve_predicted_media(media_sets["evidence_asset_ids"], assets_by_name)
 
-            # Match against GT
-            metrics = _modality_metrics(gt_refs, retrieved_media)
-            gt_media = _resolve_gt_media(gt_refs, assets_by_name, retrieved_media)
+            # Match against GT. 交付口径（E）：主要"回答来源/召回"指标对齐到模型的
+            # 显式交付（selected/delivery），与 UI 展示的模型回答图片一致；检索候选集
+            # 只作为检索层诊断单独保留，不再冒充回答来源参与召回指标。
+            metrics = _modality_metrics(gt_refs, selected_media)
+            gt_media = _resolve_gt_media(gt_refs, assets_by_name, selected_media)
             retrieved_keys = {
                 _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
                 for value in retrieved_media
@@ -2945,7 +3008,9 @@ class BenchmarkRun:
                 for value in selected_media
             }
             matched = sorted(entry["file_name"] for entry in gt_media
-                             if _media_key(entry["media_type"], entry["media_id"]) in retrieved_keys)
+                             if _media_key(entry["media_type"], entry["media_id"]) in selected_keys)
+            matched_retrieved = sorted(entry["file_name"] for entry in gt_media
+                                       if _media_key(entry["media_type"], entry["media_id"]) in retrieved_keys)
             evidence_matched = sorted(entry["file_name"] for entry in gt_media
                                       if _media_key(entry["media_type"], entry["media_id"]) in evidence_keys)
             delivery_matched = sorted(entry["file_name"] for entry in gt_media
@@ -2978,7 +3043,7 @@ class BenchmarkRun:
                 "retrieved_file_names": sorted(retrieved_names),
                 "evidence_source_file_names": sorted(evidence_names),
                 "matched_file_names": matched,
-                "retrieved_matched_file_names": matched,
+                "retrieved_matched_file_names": matched_retrieved,
                 "evidence_matched_file_names": evidence_matched,
                 "delivery_matched_file_names": delivery_matched,
                 "selected_delivery_file_names": sorted(pred_names),
@@ -4736,6 +4801,853 @@ class OrchestratorRepository:
             result["summary"] = self._effective_summary(state)
             return result
 
+    def get_keyframe_analysis(self, run_id: str) -> dict:
+        """Analyze whether video keyframes are useful for this complete run.
+
+        This is deliberately computed from persisted QA traces plus the live
+        Sentrix asset manifest.  A keyframe is counted as relevant to a video
+        GT when its ``parent_asset_id`` is the GT video, so the metric does not
+        punish a system for returning a frame instead of the source video.
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = copy.deepcopy(run.state if isinstance(run, BenchmarkRun) else run)
+        scope_id = str(state.get("scope_id") or "").strip()
+        if not scope_id:
+            return {"status": "pending", "reason": "scope_id_missing", "run_id": run_id}
+
+        try:
+            payload = request_json(
+                f"{DEFAULT_SENTRIX_URL.rstrip('/')}/api/assets?scope_id={quote(scope_id)}&limit=2000",
+                timeout=60,
+            )
+            assets = payload.get("assets", []) if isinstance(payload, dict) else payload
+        except Exception as exc:
+            return {"status": "unavailable", "run_id": run_id, "scope_id": scope_id,
+                    "error": str(exc)}
+        assets = [item for item in (assets or []) if isinstance(item, dict)]
+        asset_source_note = "Sentrix 资产清单"
+        if not assets:
+            # Reused runs may point to a memory scope that is no longer
+            # exposed by the local Sentrix service. Recover keyframe metadata
+            # from persisted tool previews instead of returning zero metrics.
+            recovered = {}
+            for item in state.get("items") or []:
+                traces = item.get("tool_trace") or [] if isinstance(item, dict) else []
+                for trace in traces:
+                    previews = (trace.get("observation") or {}).get("preview") or [] if isinstance(trace, dict) else []
+                    for preview in previews:
+                        if not isinstance(preview, dict) or preview.get("media_kind") != "video_keyframe":
+                            continue
+                        keyframe_id = str(preview.get("asset_id") or "").strip()
+                        parent_id = str(preview.get("source_video_asset_id") or "").strip()
+                        if not keyframe_id:
+                            continue
+                        recovered[keyframe_id] = {
+                            "id": keyframe_id,
+                            "file_name": preview.get("file_name") or preview.get("asset_id"),
+                            "media_type": "image",
+                            "derived_kind": "video_keyframe",
+                            "parent_asset_id": parent_id,
+                            "metadata_json": {
+                                "derived_kind": "video_keyframe",
+                                "parent_asset_id": parent_id,
+                                "source_timestamp_sec": preview.get("source_timestamp_sec"),
+                                "keyframe_selection_reason": preview.get("selection_reason") or "来自已保存工具预览",
+                            },
+                        }
+                        if parent_id and parent_id not in recovered:
+                            recovered[parent_id] = {
+                                "id": parent_id,
+                                "file_name": preview.get("source_video_file_name") or parent_id,
+                                "media_type": "video",
+                                "metadata_json": {},
+                            }
+            assets = list(recovered.values())
+            asset_source_note = (
+                "当前 run 工具轨迹回退：使用已持久化的关键帧 parent_asset_id 与时间戳；未重新处理视频"
+                if assets else "Sentrix 资产清单为空，且 run 未保存关键帧预览"
+            )
+        by_id = {str(item.get("id")): item for item in assets if item.get("id")}
+        by_name = {}
+        for item in assets:
+            name = str(item.get("file_name") or "").strip().lower()
+            if name:
+                by_name.setdefault(name, []).append(item)
+
+        def metadata(asset):
+            value = asset.get("metadata_json") if isinstance(asset, dict) else {}
+            return value if isinstance(value, dict) else {}
+
+        def resolve_asset(value):
+            if isinstance(value, dict):
+                candidates = [value.get("asset_id"), value.get("id"), value.get("media_id"), value.get("file_name"), value.get("image_id"), value.get("video_id")]
+            else:
+                candidates = [value]
+            for candidate in candidates:
+                text = str(candidate or "").strip()
+                if not text:
+                    continue
+                if text in by_id:
+                    return by_id[text]
+                matches = by_name.get(text.lower()) or []
+                if matches:
+                    return matches[0]
+                stem = Path(text).stem.lower()
+                matches = [item for name, rows in by_name.items() if Path(name).stem.lower() == stem for item in rows]
+                if matches:
+                    return matches[0]
+            return None
+
+        keyframe_assets = [item for item in assets if item.get("derived_kind") == "video_keyframe" or metadata(item).get("derived_kind") == "video_keyframe"]
+        keyframe_ids = {str(item.get("id")) for item in keyframe_assets if item.get("id")}
+        parent_by_keyframe = {str(item.get("id")): str(item.get("parent_asset_id") or metadata(item).get("parent_asset_id") or "") for item in keyframe_assets if item.get("id")}
+        source_videos = [item for item in assets if item.get("media_type") == "video" and str(item.get("id")) not in keyframe_ids]
+        source_video_ids = {str(item.get("id")) for item in source_videos if item.get("id")}
+
+        # Keep processing/selection metrics on the same full scope as the
+        # retrieval metrics.  ``video_processing_seconds`` is recorded by the
+        # Sentrix video pipeline; duration and frame count come from ffprobe's
+        # persisted metadata, so this does not reprocess the media.
+        raw_frame_count = 0
+        source_duration_sec = 0.0
+        processing_seconds = []
+        for video in source_videos:
+            video_meta = metadata(video).get("video_metadata") or {}
+            duration = video_meta.get("duration_sec")
+            if isinstance(duration, (int, float)):
+                source_duration_sec += float(duration)
+            streams = ((video_meta.get("raw") or {}).get("streams") or [])
+            video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+            if isinstance(video_stream, dict):
+                frames = video_stream.get("nb_frames")
+                try:
+                    raw_frame_count += int(frames or 0)
+                except (TypeError, ValueError):
+                    pass
+            elapsed = metadata(video).get("video_processing_seconds")
+            if isinstance(elapsed, (int, float)):
+                processing_seconds.append(float(elapsed))
+
+        def refs(item, field):
+            value = item.get(field) or []
+            return value if isinstance(value, list) else []
+
+        def asset_ids(values):
+            result = set()
+            for value in values:
+                asset = resolve_asset(value)
+                if asset and asset.get("id"):
+                    result.add(str(asset["id"]))
+            return result
+
+        def keyframe_ids_in(values):
+            return asset_ids(values) & keyframe_ids
+
+        def parent_ids(values):
+            result = set()
+            for asset_id in keyframe_ids_in(values):
+                parent = parent_by_keyframe.get(asset_id)
+                if parent:
+                    result.add(parent)
+            return result
+
+        items = state.get("items") or []
+        candidate_total = candidate_relevant = predicted_total = predicted_relevant = 0
+        gt_video_targets = gt_video_hits = 0
+        candidate_items = candidate_hit_items = predicted_items = 0
+        quality_with, quality_without = [], []
+        observed_event_ids = set()
+        observed_scene_ids = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            gt = refs(item, "gt_media")
+            gt_ids = asset_ids(gt)
+            gt_video_ids = {asset_id for asset_id in gt_ids if asset_id in source_video_ids}
+            candidate_values = refs(item, "retrieved_candidate_media")
+            predicted_values = refs(item, "predicted_media")
+            candidate_kf = keyframe_ids_in(candidate_values)
+            predicted_kf = keyframe_ids_in(predicted_values)
+            candidate_parents = parent_ids(candidate_values)
+            predicted_parents = parent_ids(predicted_values)
+            candidate_total += len(candidate_kf)
+            candidate_relevant += sum(1 for asset_id in candidate_kf if parent_by_keyframe.get(asset_id) in gt_video_ids)
+            predicted_total += len(predicted_kf)
+            predicted_relevant += sum(1 for asset_id in predicted_kf if parent_by_keyframe.get(asset_id) in gt_video_ids)
+            if gt_video_ids:
+                gt_video_targets += len(gt_video_ids)
+                gt_video_hits += len(gt_video_ids & candidate_parents)
+            if candidate_kf:
+                candidate_items += 1
+                if gt_video_ids & candidate_parents:
+                    candidate_hit_items += 1
+            if predicted_kf:
+                predicted_items += 1
+            score = (item.get("judge") or {}).get("score")
+            if score in {0, 1, 2}:
+                (quality_with if candidate_kf else quality_without).append(float(score))
+            for trace in item.get("tool_trace") or []:
+                for preview in (trace.get("observation") or {}).get("preview") or []:
+                    if not isinstance(preview, dict):
+                        continue
+                    event_id = (preview.get("event_context") or {}).get("id") or preview.get("event_id")
+                    if event_id:
+                        observed_event_ids.add(str(event_id))
+                    scene_id = preview.get("source_scene_index")
+                    if scene_id is not None:
+                        observed_scene_ids.add(str(scene_id))
+
+        timestamps_by_video = {}
+        selection_reasons = {}
+        worldmm_scores = []
+        for asset in keyframe_assets:
+            parent = parent_by_keyframe.get(str(asset.get("id")))
+            if parent:
+                stamp = metadata(asset).get("source_timestamp_sec", asset.get("source_timestamp_sec"))
+                if isinstance(stamp, (int, float)):
+                    timestamps_by_video.setdefault(parent, []).append(float(stamp))
+            reason = metadata(asset).get("worldmm_selection_reason") or metadata(asset).get("keyframe_selection_reason") or "未记录"
+            selection_reasons[str(reason)] = selection_reasons.get(str(reason), 0) + 1
+            score = metadata(asset).get("worldmm_score")
+            if isinstance(score, (int, float)):
+                worldmm_scores.append(float(score))
+        all_gaps = []
+        spans = []
+        for values in timestamps_by_video.values():
+            values.sort()
+            if len(values) > 1:
+                all_gaps.extend(right - left for left, right in zip(values, values[1:]))
+                spans.append(values[-1] - values[0])
+
+        def mean(values):
+            return round(sum(values) / len(values), 4) if values else None
+
+        def rate(numerator, denominator):
+            return round(numerator / denominator, 4) if denominator else None
+
+        return {
+            "status": "ready",
+            "run_id": run_id,
+            "scope_id": scope_id,
+            "asset_source_note": asset_source_note,
+            "metric_scope": "full_run_items_and_sentrix_scope",
+            "assets": {
+                "total": len(assets),
+                "source_videos": len(source_videos),
+                "keyframes": len(keyframe_assets),
+                "videos_with_keyframes": len({parent for parent in parent_by_keyframe.values() if parent}),
+                "keyframes_per_video_mean": rate(len(keyframe_assets), len(source_videos)),
+            },
+            "processing": {
+                "source_duration_sec": round(source_duration_sec, 4),
+                "raw_frame_count": raw_frame_count,
+                "processing_seconds_total": round(sum(processing_seconds), 4),
+                "processing_seconds_mean": mean(processing_seconds),
+                "realtime_factor": (round(source_duration_sec / sum(processing_seconds), 4) if processing_seconds and source_duration_sec else None),
+                "retained_frame_ratio": rate(len(keyframe_assets), raw_frame_count),
+                "compression_ratio": (round(1 - len(keyframe_assets) / raw_frame_count, 4) if raw_frame_count else None),
+                "timing_source": "Sentrix video_processing_seconds + persisted ffprobe metadata",
+            },
+            "retrieval": {
+                "candidate_keyframes": candidate_total,
+                "candidate_relevant_keyframes": candidate_relevant,
+                "candidate_precision": rate(candidate_relevant, candidate_total),
+                "video_parent_recall": rate(gt_video_hits, gt_video_targets),
+                "video_gt_targets": gt_video_targets,
+                "video_gt_targets_hit_by_keyframe": gt_video_hits,
+                "candidate_items": candidate_items,
+                "candidate_hit_items": candidate_hit_items,
+                "candidate_item_hit_rate": rate(candidate_hit_items, candidate_items),
+                "predicted_keyframes": predicted_total,
+                "predicted_relevant_keyframes": predicted_relevant,
+                "predicted_precision": rate(predicted_relevant, predicted_total),
+                "predicted_items": predicted_items,
+            },
+            "temporal": {
+                "videos_sampled": len(timestamps_by_video),
+                "scene_count": len(observed_scene_ids),
+                "mean_gap_sec": mean(all_gaps),
+                "mean_span_sec": mean(spans),
+                "worldmm_score_mean": mean(worldmm_scores),
+                "selection_reasons": selection_reasons,
+            },
+            "usefulness": {
+                "qa_with_keyframe": len(quality_with),
+                "qa_without_keyframe": len(quality_without),
+                "answer_quality_with_keyframe": mean(quality_with),
+                "answer_quality_without_keyframe": mean(quality_without),
+                "answer_quality_delta": (round(mean(quality_with) - mean(quality_without), 4) if quality_with and quality_without else None),
+                "event_context_count": len(observed_event_ids),
+            },
+            "definitions": {
+                "candidate_precision": "检索候选中的关键帧，其 parent video 与本题 GT 视频一致的比例",
+                "video_parent_recall": "GT 视频被其任一关键帧覆盖的比例，允许返回关键帧而非源视频",
+                "answer_quality_delta": "带关键帧候选题与不带关键帧候选题的 Judge 均分差；不是因果结论",
+                "temporal": "根据关键帧 source_timestamp_sec 统计采样间隔和覆盖跨度",
+            },
+        }
+
+    def get_memory_effectiveness(self, run_id: str) -> dict:
+        """Compare the memory-layer inventory with what the evaluation actually used.
+
+        The comparison is intentionally based on persisted tool traces and the
+        Agent2 evidence ledger.  It does not infer hidden model reasoning:
+        effective means that a memory object appeared in a successful tool
+        result or was carried into the saved evidence/answer chain.
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = copy.deepcopy(run.state if isinstance(run, BenchmarkRun) else run)
+
+        items = [item for item in (state.get("items") or []) if isinstance(item, dict)]
+        integrity = state.get("input_integrity") or {}
+        summary = state.get("summary") or {}
+        agent2 = summary.get("agent2_trace") or {}
+        requirement_counts = agent2.get("requirement_status_counts") or {}
+        tool_counts = {}
+        tool_ok = {}
+        preview_rows = []
+        preview_asset_ids = set()
+        final_evidence_asset_ids = set()
+
+        def value_id(value):
+            if isinstance(value, dict):
+                value = (value.get("asset_id") or value.get("id") or value.get("media_id")
+                         or value.get("file_name") or value.get("image_id") or value.get("video_id"))
+            text = str(value or "").strip()
+            return text or None
+
+        def collect(values, target):
+            if isinstance(values, dict):
+                values = list(values.values())
+            if not isinstance(values, list):
+                return
+            for value in values:
+                item_id = value_id(value)
+                if item_id:
+                    target.add(item_id)
+
+        for item in items:
+            collect(item.get("evidence_asset_ids"), final_evidence_asset_ids)
+            collect(item.get("evidence_source_media"), final_evidence_asset_ids)
+            collect(item.get("answer_evidence_media_refs"), final_evidence_asset_ids)
+            for trace in item.get("tool_trace") or []:
+                if not isinstance(trace, dict):
+                    continue
+                name = str(trace.get("tool") or trace.get("tool_name") or trace.get("name") or "unknown")
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+                if str(trace.get("status") or "").lower() in {"ok", "success", "completed"}:
+                    tool_ok[name] = tool_ok.get(name, 0) + 1
+                observation = trace.get("observation") or {}
+                for preview in observation.get("preview") or []:
+                    if not isinstance(preview, dict):
+                        continue
+                    preview_rows.append(preview)
+                    item_id = value_id(preview)
+                    if item_id:
+                        preview_asset_ids.add(item_id)
+
+        event_ids = set()
+        for preview in preview_rows:
+            event = preview.get("event_context") or {}
+            event_id = event.get("id") or preview.get("event_id")
+            if event_id:
+                event_ids.add(str(event_id))
+
+        visual_total = int(tool_counts.get("inspect_photo", 0))
+        visual_effective = int(tool_ok.get("inspect_photo", 0))
+        ocr_total = int(tool_counts.get("read_photo_text", 0))
+        ocr_effective = int(tool_ok.get("read_photo_text", 0))
+        scene_total = len({str(preview.get("source_scene_index")) for preview in preview_rows
+                           if preview.get("source_scene_index") is not None})
+        event_total = len(event_ids)
+        requirement_total = sum(int(value or 0) for value in requirement_counts.values())
+        requirement_effective = int(requirement_counts.get("satisfied", 0) or 0)
+        answer_total = len(items)
+        answer_effective = sum(1 for item in items if str(item.get("agent_status") or "").lower() == "complete")
+        judge_counts = {"2": 0, "1": 0, "0": 0, "unjudged": 0}
+        for item in items:
+            score = (item.get("judge") or {}).get("score")
+            if score in {0, 1, 2}:
+                judge_counts[str(score)] += 1
+            else:
+                judge_counts["unjudged"] += 1
+
+        # Two-dimension hit (决策：工具召回命中 / 模型使用命中分开统计).
+        #
+        #  tool  = 该题 GT 媒体进入了"检索/工具返回"集合。对视频 GT 按"关键帧父级覆盖"
+        #          判定：返回了该视频的任一关键帧即视为已把该视频召回（与关键帧分析口径一致）。
+        #  usage = 该题 GT 媒体被模型显式用于回答（严格交付口径，与 psh 逐题指标一致）。
+        # 匹配优先按 scope 资产清单的 asset_id / 关键帧 parent_asset_id；资产清单不可用时
+        # 回退到 media_id/file_name 直接比对与已持久化工具预览中的 parent 关系。
+        scope_id = str(state.get("scope_id") or "").strip()
+        assets = []
+        asset_source_note = ""
+        if scope_id:
+            try:
+                payload = request_json(
+                    f"{DEFAULT_SENTRIX_URL.rstrip('/')}/api/assets?scope_id={quote(scope_id)}&limit=5000",
+                    timeout=60,
+                )
+                assets = [a for a in (payload.get("assets") if isinstance(payload, dict) else payload or [])
+                          if isinstance(a, dict)]
+            except Exception:
+                assets = []
+        parent_of_kf = {}
+        children_of_video = {}
+        asset_id_ok = False
+        if assets:
+            for a in assets:
+                meta = a.get("metadata_json") if isinstance(a.get("metadata_json"), dict) else {}
+                aid = str(a.get("id") or "")
+                if not aid:
+                    continue
+                kind = str(a.get("derived_kind") or meta.get("derived_kind") or "")
+                parent = str(a.get("parent_asset_id") or meta.get("parent_asset_id") or "")
+                if kind == "video_keyframe" and parent:
+                    parent_of_kf[aid] = parent
+                    children_of_video.setdefault(parent, set()).add(aid)
+            asset_source_note = f"使用 scope 资产清单 {len(assets)} 条（含关键帧父级）做命中匹配"
+            asset_id_ok = True
+
+        hit_cache = {}
+
+        def _tokens(values):
+            """拆一条媒体引用为 (asset_ids, name/raw tokens)。"""
+            ids = []
+            tokens = set()
+            for value in values or []:
+                if not isinstance(value, dict):
+                    tokens.add(str(value).strip().lower())
+                    continue
+                aid = str(value.get("asset_id") or value.get("id") or "").strip()
+                if aid:
+                    ids.append(aid)
+                for key in ("media_id", "file_name", "image_id", "video_id", "asset_id", "id"):
+                    raw = value.get(key)
+                    if raw:
+                        tokens.add(str(raw).strip().lower())
+            return ids, tokens
+
+        def _coverage(asset_ids):
+            """asset 及其可覆盖集合：关键帧→其父视频；视频→其全部关键帧。"""
+            out = set()
+            for aid in asset_ids:
+                if not aid:
+                    continue
+                out.add(aid)
+                parent = parent_of_kf.get(aid)
+                if parent:
+                    out.add(parent)
+                out.update(children_of_video.get(aid, ()))
+            return out
+
+        def _matched(gt_ids, gt_tokens, cand_ids, cand_tokens):
+            if _coverage(gt_ids) & _coverage(cand_ids):
+                return True
+            if gt_tokens & cand_tokens:
+                return True
+            return False
+
+        def _preview_refs(item):
+            ids, tokens = [], set()
+            for trace in item.get("tool_trace") or []:
+                if not isinstance(trace, dict):
+                    continue
+                for preview in ((trace.get("observation") or {}).get("preview") or []):
+                    if not isinstance(preview, dict):
+                        continue
+                    aid = str(preview.get("asset_id") or preview.get("id") or "").strip()
+                    if aid:
+                        ids.append(aid)
+                    # 关键帧预览同时携带源视频：让视频 GT 能被"返回了它的任一帧"覆盖。
+                    source = str(preview.get("source_video_asset_id") or "").strip()
+                    if source:
+                        ids.append(source)
+                    for key in ("media_id", "file_name", "asset_id", "id", "source_video_file_name"):
+                        raw = preview.get(key)
+                        if raw:
+                            tokens.add(str(raw).strip().lower())
+            return ids, tokens
+
+        def item_hits(item):
+            cached = hit_cache.get(id(item))
+            if cached is not None:
+                return cached
+            gt_ids, gt_tokens = _tokens(item.get("gt_media"))
+            has_gt = bool(gt_ids or gt_tokens)
+            r_ids, r_tokens = _tokens(item.get("retrieved_candidate_media")
+                                      or item.get("retrieved_candidate_images") or [])
+            p_ids, p_tokens = _tokens(item.get("predicted_media")
+                                      or item.get("predicted_images") or [])
+            if not r_ids and not r_tokens:
+                r_ids, r_tokens = _preview_refs(item)
+            tool_hit = has_gt and _matched(gt_ids, gt_tokens, r_ids, r_tokens)
+            usage_hit = has_gt and _matched(gt_ids, gt_tokens, p_ids, p_tokens)
+            cached = (has_gt, tool_hit, usage_hit, gt_ids, gt_tokens)
+            hit_cache[id(item)] = cached
+            return cached
+
+        def causal_scope(dim, include_unanswerable):
+            matrix = {
+                "hit_correct": 0, "hit_partial": 0, "hit_incorrect": 0,
+                "miss_correct": 0, "miss_partial": 0, "miss_incorrect": 0,
+                "unjudged": 0,
+            }
+            eligible = 0
+            hit_items = 0
+            for item in items:
+                if not include_unanswerable and str(item.get("answerability") or "").strip().lower() == "unanswerable":
+                    continue
+                has_gt, tool_hit, usage_hit, _, _ = item_hits(item)
+                if not has_gt:
+                    continue
+                hit = tool_hit if dim == "tool" else usage_hit
+                eligible += 1
+                if hit:
+                    hit_items += 1
+                score = (item.get("judge") or {}).get("score")
+                if score not in {0, 1, 2}:
+                    matrix["unjudged"] += 1
+                    continue
+                prefix = "hit" if hit else "miss"
+                suffix = {2: "correct", 1: "partial", 0: "incorrect"}[score]
+                matrix[f"{prefix}_{suffix}"] += 1
+            return {
+                "eligible": eligible,
+                "hit_items": hit_items,
+                "miss_items": max(0, eligible - hit_items),
+                "matrix": matrix,
+            }
+        raw_total = int(integrity.get("files_checked") or 0)
+        if not raw_total:
+            raw_total = len({value_id(ref) for item in items for ref in (item.get("gt_media") or []) if value_id(ref)})
+
+        def row(key, name, total, effective, created_detail, effective_detail, invalid_detail):
+            total = int(total or 0)
+            effective = int(effective or 0)
+            invalid = max(0, total - effective)
+            return {
+                "key": key,
+                "name": name,
+                "created": total,
+                "effective": effective,
+                "ineffective": invalid,
+                "rate": round(effective / total, 4) if total else None,
+                "created_detail": created_detail,
+                "effective_detail": effective_detail,
+                "ineffective_detail": invalid_detail,
+            }
+
+        levels = [
+            row("L0", "原始媒体", raw_total, min(len(preview_asset_ids), raw_total) if raw_total else len(preview_asset_ids),
+                f"输入完整性校验 {raw_total} 个文件",
+                f"成功工具结果实际返回 {len(preview_asset_ids)} 个不同资产；最终证据链 {len(final_evidence_asset_ids)} 个资产",
+                f"未在工具结果中出现 {max(0, raw_total - len(preview_asset_ids))} 个；仅返回但未进入最终证据 {max(0, len(preview_asset_ids) - len(final_evidence_asset_ids))} 个"),
+            row("L1", "场景图 / 解析", visual_total + ocr_total + scene_total, visual_effective + ocr_effective + scene_total,
+                f"视觉观察 {visual_total} + OCR {ocr_total} + 场景节点 {scene_total}",
+                f"成功视觉 {visual_effective} + 成功 OCR {ocr_effective} + 已返回场景节点 {scene_total}",
+                f"工具拒绝/失败：视觉 {visual_total - visual_effective} + OCR {ocr_total - ocr_effective}"),
+            row("L2", "事件 / 记忆", event_total, event_total,
+                f"工具图谱中发现 {event_total} 个事件上下文",
+                f"{event_total} 个事件均在评测工具预览中出现",
+                "当前轨迹未发现未生效事件；若图谱接口未加载则本项不应判定"),
+            row("L3", "目标 / 证据规则", requirement_total, requirement_effective,
+                f"证据账本共 {requirement_total} 项需求",
+                f"满足 {requirement_effective} 项（satisfied）",
+                f"未闭合 {max(0, requirement_total - requirement_effective)} 项（open / running / failed）"),
+            row("L4+", "总结 / 回答", answer_total, answer_effective,
+                f"评测生成 {answer_total} 条回答",
+                f"Agent 状态 complete {answer_effective} 条",
+                f"未完整闭环 {max(0, answer_total - answer_effective)} 条（partial / error / blocked）"),
+        ]
+        levels[0]["ineffective_reasons"] = [
+            {"label": "未被成功工具返回", "count": max(0, raw_total - len(preview_asset_ids)), "meaning": "创建输入中没有在检索预览出现"},
+            {"label": "返回但未进入最终证据", "count": max(0, len(preview_asset_ids) - len(final_evidence_asset_ids)), "meaning": "工具找到，但没有形成回答证据"},
+        ]
+        levels[1]["ineffective_reasons"] = [
+            {"label": "视觉工具拒绝/失败", "count": max(0, visual_total - visual_effective), "meaning": "inspect_photo 没有成功返回"},
+            {"label": "OCR 工具拒绝/失败", "count": max(0, ocr_total - ocr_effective), "meaning": "read_photo_text 没有成功返回"},
+        ]
+        levels[2]["ineffective_reasons"] = [
+            {"label": "未发现未生效事件", "count": 0, "meaning": "当前轨迹中的事件上下文均至少出现过一次"},
+        ]
+        levels[3]["ineffective_reasons"] = [
+            {"label": "open", "count": int(requirement_counts.get("open", 0) or 0), "meaning": "需求没有完成证据闭合"},
+            {"label": "running", "count": int(requirement_counts.get("running", 0) or 0), "meaning": "需求仍停留在处理中"},
+            {"label": "failed", "count": int(requirement_counts.get("failed", 0) or 0), "meaning": "需求证据处理失败"},
+        ]
+        levels[4]["ineffective_reasons"] = [
+            {"label": "partial", "count": sum(1 for item in items if str(item.get("agent_status") or "").lower() == "partial"), "meaning": "只完成部分回答链路"},
+            {"label": "error", "count": sum(1 for item in items if str(item.get("agent_status") or "").lower() == "error"), "meaning": "执行或接口错误"},
+            {"label": "blocked", "count": sum(1 for item in items if str(item.get("agent_status") or "").lower() == "blocked_by_guard"), "meaning": "被安全/状态守卫中断"},
+        ]
+
+        # The layer coverage table above is not a correctness table.  For the
+        # 0-point answers, keep a separate, mutually-exclusive diagnosis so
+        # that a simple "created - effective" number is not mistaken for a
+        # semantic error count.  The first two rows are the primary split;
+        # signal rows below are deliberately cross-cutting and must not be
+        # added to the primary split.
+        wrong_items = [item for item in items if (item.get("judge") or {}).get("score") == 0]
+        wrong_total = len(wrong_items)
+        memory_miss_wrong = 0
+        memory_hit_wrong = 0
+        tool_failure_items = 0
+        evidence_not_closed_items = 0
+        execution_error_items = 0
+        attribution_counts = {}
+        # 0 分错误链诊断固定用"工具召回命中"维度：只有检索未到达时才谈得上"先修检索"。
+        tool_scope = causal_scope("tool", False)
+        tool_matrix = tool_scope.get("matrix") or {}
+        hit_total = tool_scope["hit_items"]
+        hit_correct = int(tool_matrix.get("hit_correct") or 0)
+        hit_partial = int(tool_matrix.get("hit_partial") or 0)
+        hit_incorrect = int(tool_matrix.get("hit_incorrect") or 0)
+
+        def has_failed_tool(item):
+            traces = item.get("tool_trace") or []
+            return any(
+                isinstance(trace, dict)
+                and str(trace.get("status") or "").lower() not in {"ok", "complete", "completed", "success"}
+                for trace in traces
+            )
+
+        def has_open_requirement(item):
+            trace = item.get("agent2_trace") or {}
+            requirements = ((trace.get("task_state") or {}).get("requirements") or [])
+            return any(isinstance(req, dict) and str(req.get("status") or "").lower() != "satisfied" for req in requirements)
+
+        for item in items:
+            has_gt, tool_hit, _, _, _ = item_hits(item)
+            if item in wrong_items:
+                if has_gt and tool_hit:
+                    memory_hit_wrong += 1
+                else:
+                    memory_miss_wrong += 1
+                if has_failed_tool(item):
+                    tool_failure_items += 1
+                if has_open_requirement(item):
+                    evidence_not_closed_items += 1
+                if str(item.get("agent_status") or "").lower() in {"error", "blocked", "blocked_by_guard"}:
+                    execution_error_items += 1
+                primary = str((item.get("attribution") or {}).get("primary") or "unknown").upper()
+                attribution_counts[primary] = attribution_counts.get(primary, 0) + 1
+
+        def diagnosis_row(key, name, count, state, improvement):
+            return {
+                "key": key,
+                "name": name,
+                "count": int(count),
+                "rate": round(count / wrong_total, 4) if wrong_total else None,
+                "state": state,
+                "improvement": improvement,
+            }
+
+        error_chain_diagnosis = {
+            "wrong_total": wrong_total,
+            "primary_rows": [
+                diagnosis_row(
+                    "memory_miss_wrong", "工具召回未命中 → 回答错误", memory_miss_wrong,
+                    "GT 媒体未进入本题检索候选（工具召回未命中），属于记忆到达之前的损失",
+                    "优先修复检索候选、时间/地点/人物字段、事件图谱关联与重排",
+                ),
+                diagnosis_row(
+                    "memory_hit_wrong", "工具已召回 → 回答仍错误", memory_hit_wrong,
+                    "GT 媒体已被工具召回，但 Judge 仍为 0 分，不能再归因于‘没找到记忆’",
+                    "优先检查证据选择、上下文组织、Agent 推理和最终回答生成",
+                ),
+            ],
+            "signals": [
+                diagnosis_row(
+                    "tool_failure", "工具拒绝 / 执行异常（交叉信号）", tool_failure_items,
+                    "本题至少有一次工具状态不是成功；与主诊断可能重叠，不参与相加",
+                    "保留失败原因、重试结果和输入输出，区分接口失败与检索质量问题",
+                ),
+                diagnosis_row(
+                    "evidence_not_closed", "证据需求未闭合（交叉信号）", evidence_not_closed_items,
+                    "Agent2 仍有 open / running / failed 需求；不等价于回答错误原因",
+                    "补齐需求到 evidence_ref 的闭合链路，再单独观察回答正确率变化",
+                ),
+                diagnosis_row(
+                    "execution_error", "Agent 执行错误 / 守卫中断（交叉信号）", execution_error_items,
+                    "agent_status 为 error 或 blocked；与检索/回答错误可能同时出现",
+                    "先隔离执行异常，避免把基础设施失败误判为记忆或模型能力问题",
+                ),
+            ],
+            "attribution_primary": [
+                {"key": key, "count": count, "rate": round(count / wrong_total, 4) if wrong_total else None}
+                for key, count in sorted(attribution_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+            ],
+            "opportunity": {
+                "retrieval_error_share": round(memory_miss_wrong / wrong_total, 4) if wrong_total else None,
+                "post_retrieval_wrong_rate": round(hit_incorrect / hit_total, 4) if hit_total else None,
+                "hit_correct_rate": round(hit_correct / hit_total, 4) if hit_total else None,
+                "hit_total": hit_total,
+                "hit_correct": hit_correct,
+                "hit_partial": hit_partial,
+                "hit_incorrect": hit_incorrect,
+                "meaning": "retrieval_error_share=0 分中工具召回未命中的比例，应先修检索；post_retrieval_wrong_rate / hit_correct_rate 表示工具已召回后回答链路仍有多大提升空间",
+            },
+            "note": "primary_rows 互斥合计全部 0 分题；命中依据=工具召回命中（GT 进入检索候选，视频按关键帧父级覆盖）。signals 与 attribution_primary 是交叉诊断，不能与主表相加。",
+        }
+
+        # Evidence effectiveness is outcome-based, unlike inventory/coverage.
+        # A returned GT/similar item is useful when the answer is correct or
+        # partially correct; a returned item followed by a 0-point answer is
+        # counted as ineffective evidence.  Misses are kept separate.
+        # 与命中两维一致：tool 行=该类型 GT 被工具召回后按 Judge 看有效性；usage 行=
+        # 该类型 GT 被模型用于回答后按 Judge 看有效性。
+        def evidence_effectiveness_row(dim, key, name, media_type):
+            candidates = []
+            for item in items:
+                has_gt, tool_hit, usage_hit, _, _ = item_hits(item)
+                if not has_gt:
+                    continue
+                hit = tool_hit if dim == "tool" else usage_hit
+                if not hit:
+                    continue
+                has_type = any(
+                    isinstance(ref, dict) and (
+                        ref.get("media_type") == media_type
+                        or (media_type == "video_keyframe" and ref.get("media_type") == "video")
+                    )
+                    for ref in (item.get("gt_media") or [])
+                )
+                if has_type:
+                    candidates.append(item)
+            returned = len(candidates)
+            effective = 0
+            ineffective = 0
+            unjudged = 0
+            for item in candidates:
+                score = (item.get("judge") or {}).get("score")
+                if score in {1, 2}:
+                    effective += 1
+                elif score == 0:
+                    ineffective += 1
+                else:
+                    unjudged += 1
+            return {
+                "key": key,
+                "name": name,
+                "returned_items": returned,
+                "effective_items": effective,
+                "ineffective_items": ineffective,
+                "unjudged_items": unjudged,
+                "effective_rate_on_returned": round(effective / returned, 4) if returned else None,
+                "ineffective_rate_on_returned": round(ineffective / returned, 4) if returned else None,
+                "definition": "该类型 GT 命中后：Judge=2 或 1 计有效，Judge=0 计无效；未命中不进入本表",
+            }
+
+        def event_effectiveness_row():
+            candidates = []
+            for item in items:
+                linked = any(
+                    ((preview.get("event_context") or {}).get("id") or preview.get("event_id"))
+                    for trace in (item.get("tool_trace") or [])
+                    if isinstance(trace, dict)
+                    for preview in ((trace.get("observation") or {}).get("preview") or [])
+                    if isinstance(preview, dict)
+                )
+                if linked:
+                    candidates.append(item)
+            effective = 0
+            ineffective = 0
+            unjudged = 0
+            for item in candidates:
+                score = (item.get("judge") or {}).get("score")
+                if score in {1, 2}:
+                    effective += 1
+                elif score == 0:
+                    ineffective += 1
+                else:
+                    unjudged += 1
+            return {
+                "key": "event",
+                "name": "事件上下文证据",
+                "returned_items": len(candidates),
+                "effective_items": effective,
+                "ineffective_items": ineffective,
+                "unjudged_items": unjudged,
+                "effective_rate_on_returned": round(effective / len(candidates), 4) if candidates else None,
+                "ineffective_rate_on_returned": round(ineffective / len(candidates), 4) if candidates else None,
+                "definition": "工具预览带回事件上下文的题；Judge=2 或 1 计有效，Judge=0 计无效",
+            }
+
+        evidence_effectiveness = {
+            "tool": {
+                "image": evidence_effectiveness_row("tool", "image", "原图片证据", "image"),
+                "video_keyframe": evidence_effectiveness_row("tool", "video_keyframe", "视频 / 关键帧证据", "video"),
+            },
+            "usage": {
+                "image": evidence_effectiveness_row("usage", "image", "原图片证据", "image"),
+                "video_keyframe": evidence_effectiveness_row("usage", "video_keyframe", "视频 / 关键帧证据", "video"),
+            },
+            "event": event_effectiveness_row(),
+            "note": "tool=工具召回命中（视频按关键帧父级覆盖）后按 Judge 判有效/无效；usage=模型显式用于回答后判有效/无效。Judge=1 计有效。该指标是证据结果有效性，不是记忆库覆盖率。",
+        }
+        total_trace = sum(tool_counts.values())
+        ok_trace = sum(tool_ok.values())
+        graph_ready = bool(total_trace and preview_rows and event_ids)
+        return {
+            "status": "ready",
+            "run_id": run_id,
+            "scope_id": state.get("scope_id"),
+            "metric_scope": "full_run_persisted_tool_traces_and_agent2_ledger",
+            "data_quality": {
+                "graph_ready": graph_ready,
+                "tool_trace_count": total_trace,
+                "tool_success_count": ok_trace,
+                "preview_count": len(preview_rows),
+                "event_context_count": len(event_ids),
+                "note": "仅在工具轨迹、媒体预览和事件上下文均存在时计算有效/无效对比；不使用未保存的模型隐藏思维链",
+                "hit_match_source": asset_source_note or (
+                    f"scope {scope_id!r} 无资产清单：命中匹配回退到 media_id/file_name 直接比对与工具预览"
+                    if scope_id else "run 未记录 scope：命中匹配仅用字段直接比对"
+                ),
+            },
+            "levels": levels,
+            "details": {
+                "raw_media_returned_assets": len(preview_asset_ids),
+                "raw_media_final_evidence_assets": len(final_evidence_asset_ids),
+                "visual_calls": {"total": visual_total, "effective": visual_effective},
+                "ocr_calls": {"total": ocr_total, "effective": ocr_effective},
+                "requirement_status_counts": requirement_counts,
+                "answer_status_complete": answer_effective,
+                "answer_correctness": {
+                    "correct": judge_counts["2"],
+                    "partial": judge_counts["1"],
+                    "incorrect": judge_counts["0"],
+                    "unjudged": judge_counts["unjudged"],
+                    "exact_accuracy": round(judge_counts["2"] / answer_total, 4) if answer_total else None,
+                },
+                "memory_answer_attribution": {
+                    "tool": causal_scope("tool", False),
+                    "usage": causal_scope("usage", False),
+                    "tool_all_with_gt": causal_scope("tool", True),
+                    "usage_all_with_gt": causal_scope("usage", True),
+                    "definitions": {
+                        "tool": "工具召回命中：该题 GT 媒体进入检索 / 工具返回集合（视频按关键帧父级覆盖）",
+                        "usage": "模型使用命中：该题 GT 媒体被模型显式用于回答（严格交付口径，与 psh 逐题指标一致）",
+                        "hit_correct": "命中且 Judge 2 分",
+                        "hit_partial": "命中且 Judge 1 分",
+                        "hit_incorrect": "命中但 Judge 0 分：媒体已到达，问题更可能在使用 / 推理 / 回答",
+                        "miss_correct": "未命中但 Judge 2 分：不能归因于媒体召回 / 使用",
+                        "miss_incorrect": "未命中且 Judge 0 分：优先排查媒体检索 / 使用链路",
+                        "scope": "tool / usage 各维度都排除 answerability=unanswerable 的题；*_all_with_gt 仅用于完整对照",
+                    },
+                },
+                "error_chain_diagnosis": error_chain_diagnosis,
+                "evidence_effectiveness": evidence_effectiveness,
+            },
+        }
+
     def export_sft(self, run_id: str, scores: list[int] | None = None,
                    min_score: int | None = None) -> dict:
         """导出完整思考轨迹：每题全部 debug_trace 步（含提示词/工具参数/工具结果/守卫/judge）、
@@ -4752,76 +5664,6 @@ class OrchestratorRepository:
                 return _ast.literal_eval(value)
             except Exception:
                 return value
-        decoder = json.JSONDecoder()
-        _SUPPORTED_CERTAINTIES = {"supported", "confirmed", "full_support"}
-
-        def _inject_tool_call_status(messages, tool_steps):
-            """Backfill the uniform call_status into '工具 xx 返回' user turns.
-
-            Live runs already carry it (runtime injects it); old runs recorded
-            before the field existed get it derived from the matching tool step.
-            Tool calls and their result turns are appended in lock-step, so the
-            step order matches the message order.
-            """
-            out = []
-            ti = 0
-            for m in messages:
-                if not isinstance(m, dict):
-                    out.append(m)
-                    continue
-                content = str(m.get("content") or "")
-                if (m.get("role") == "user" and content.startswith("工具 ")
-                        and "返回：" in content):
-                    sep = "返回：\n"
-                    idx = content.find(sep)
-                    if idx >= 0 and ti < len(tool_steps):
-                        obs_part = content[idx + len(sep):]
-                        try:
-                            obs = json.loads(obs_part)
-                            if isinstance(obs, dict) and "call_status" not in obs:
-                                st = tool_steps[ti].get("status") or "ok"
-                                obs["call_status"] = "success" if st == "ok" else "invalid"
-                                if st != "ok" and not obs.get("reason"):
-                                    obs["reason"] = tool_steps[ti].get("error") \
-                                        or "tool call not allowed"
-                                m = dict(m)
-                                m["content"] = content[:idx + len(sep)] + \
-                                    json.dumps(obs, ensure_ascii=False)
-                        except Exception:
-                            pass
-                        ti += 1
-                out.append(m)
-            return out
-
-        def _inject_writer_valid(messages):
-            """Backfill binary valid onto writer facts (old runs lack the field)."""
-            out = []
-            for m in messages:
-                if not isinstance(m, dict):
-                    out.append(m)
-                    continue
-                content = str(m.get("content") or "")
-                if m.get("role") == "user" and "最小答案材料" in content:
-                    jstart = content.find('{"facts"')
-                    if jstart >= 0:
-                        try:
-                            obj, end = decoder.raw_decode(content[jstart:])
-                            if isinstance(obj, dict) and isinstance(obj.get("facts"), list):
-                                changed = False
-                                for fact in obj["facts"]:
-                                    if isinstance(fact, dict) and "valid" not in fact:
-                                        fact["valid"] = str(fact.get("certainty") or "") \
-                                            in _SUPPORTED_CERTAINTIES
-                                        changed = True
-                                if changed:
-                                    m = dict(m)
-                                    m["content"] = content[:jstart] + \
-                                        json.dumps(obj, ensure_ascii=False) + \
-                                        content[jstart + end:]
-                        except Exception:
-                            pass
-                out.append(m)
-            return out
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
@@ -4840,52 +5682,71 @@ class OrchestratorRepository:
                     if item_score is None or item_score < min_score:
                         continue
                 qa_id = item.get("qa_id")
-                planner = {"prompt": None, "raw": None, "declaration": None}
-                model_samples = []
-                writer_samples = []
+                turns_out = []
                 for turn in (item.get("runtime_turns") or []):
-                    debug_trace = turn.get("debug_trace") or []
-                    tool_steps = [s for s in debug_trace
-                                  if isinstance(s, dict) and s.get("type") == "tool"]
-                    for step in debug_trace:
+                    steps_out = []
+                    for step in (turn.get("debug_trace") or []):
                         if not isinstance(step, dict):
                             continue
-                        if step.get("type") == "planner":
-                            planner["prompt"] = step.get("prompt")
-                            planner["raw"] = step.get("raw_full") or step.get("raw")
+                        st = dict(step)
+                        if isinstance(st.get("arguments"), str):
+                            st["arguments"] = _parse(st["arguments"])
+                        if isinstance(st.get("observation"), str):
+                            st["observation"] = _parse(st["observation"])
+                        steps_out.append(st)
+                    turns_out.append({
+                        "turn": turn.get("index"),
+                        "message": turn.get("message"),
+                        "expected_action": turn.get("expected_action"),
+                        "answer": turn.get("answer"),
+                        "agent_status": turn.get("agent_status"),
+                        "turn_outcome": turn.get("turn_outcome"),
+                        "steps": steps_out,
+                    })
+                    # SFT prompt->response 样本（兼容旧格式；完整轨迹见 items）
+                    for step in (turn.get("debug_trace") or []):
+                        if not isinstance(step, dict) or step.get("type") != "model":
                             continue
                         prompt = step.get("prompt")
                         response = step.get("raw_full") or step.get("raw")
                         if not prompt or not isinstance(response, str) or not response.strip():
                             continue
                         messages = list(prompt) if isinstance(prompt, list) else []
-                        if step.get("type") == "writer":
-                            messages = _inject_writer_valid(messages)
-                            messages.append({"role": "assistant", "content": response})
-                            writer_samples.append({
-                                "step": step.get("step_id") or "answer_writer",
-                                "kind": "writer",
-                                "messages": messages,
-                            })
-                        elif step.get("type") == "model":
-                            messages = _inject_tool_call_status(messages, tool_steps)
-                            messages.append({"role": "assistant", "content": response})
-                            model_samples.append({
-                                "step": step.get("step_id") or "model",
-                                "kind": "model",
-                                "messages": messages,
-                            })
-                planner["declaration"] = (item.get("agent2_trace") or {}).get("task_declaration")
-                samples_out = [*model_samples, *writer_samples]
+                        messages.append({"role": "assistant", "content": response})
+                        samples.append({
+                            "qa_id": qa_id,
+                            "turn": turn.get("index"),
+                            "step": step.get("step_id") or step.get("status", "complete"),
+                            "messages": messages,
+                        })
                 items_out.append({
                     "qa_id": qa_id,
                     "question": item.get("question"),
-                    "planner": planner,
-                    "samples": samples_out,
+                    "expected_action": item.get("expected_action"),
+                    "answer": item.get("answer"),
+                    "judge": item.get("judge"),
+                    "task_judge": item.get("task_judge"),
+                    "retrieval": {k: item.get(k) for k in (
+                        "retrieval_recall", "retrieval_precision", "retrieval_f1",
+                        "media_retrieval_recall", "media_retrieval_precision", "media_retrieval_f1",
+                        "image_retrieval_recall", "image_retrieval_precision", "image_retrieval_f1",
+                        "video_retrieval_recall", "video_retrieval_precision", "video_retrieval_f1",
+                        "retrieval_media_refs", "answer_evidence_media_refs",
+                        "gt_media", "predicted_media", "retrieved_candidate_media", "evidence_source_media",
+                        "gt_images", "predicted_images", "predicted_file_names",
+                        "matched_file_names")},
+                    "agent_status": item.get("agent_status"),
+                    "termination_reason": item.get("termination_reason"),
+                    "turn_outcome": item.get("turn_outcome"),
+                    "timing_breakdown": item.get("timing_breakdown"),
+                    "agent_stability": item.get("agent_stability"),
+                    "answer_grounding": item.get("answer_grounding"),
+                    "tool_trace": item.get("tool_trace"),
+                    "agent2_trace": item.get("agent2_trace"),
+                    "turns": turns_out,
                 })
-            return {"run_id": run_id, "count": sum(len(it["samples"]) for it in items_out),
-                    "item_count": len(items_out),
-                    "items": items_out,
+            return {"run_id": run_id, "count": len(samples), "item_count": len(items_out),
+                    "items": items_out, "samples": samples,
                     "scores": sorted(include) if include is not None else None,
                     "min_score": min_score,
                     "filtered": (include is not None or min_score is not None)}
@@ -5063,6 +5924,52 @@ class OrchestratorRepository:
         if not values:
             return None
         return values[max(0, min(len(values) - 1, math.ceil(len(values) * percentile) - 1))]
+
+    def export_traces(self, run_id: str, scores: list[int] | None = None,
+                      min_score: int | None = None) -> list:
+        """每题只导两项：planner 完整输入/输出 + 最终 final 那一次的完整轨迹。
+
+        每题对象仅含：qa_id / question / planner{prompt,raw_full} /
+        final_trace{step_id,prompt,raw_full}（prompt 为该次模型调用完整 messages，
+        含唯一 system 与到 final 前的全部历史；raw_full 为最终答案输出）。
+        scores: 非空时只导出评分落在该集合内的题目；min_score: 导出评分 >= 该值的题目。
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = run.state if isinstance(run, BenchmarkRun) else run
+            include = set(scores) if scores else None
+            items_out = []
+            for item in (state.get("items") or []):
+                item_score = (item.get("judge") or {}).get("score")
+                if include is not None and item_score not in include:
+                    continue
+                if min_score is not None and (item_score is None or item_score < min_score):
+                    continue
+                planner = None
+                model_steps = []
+                for turn in (item.get("runtime_turns") or []):
+                    for step in (turn.get("debug_trace") or []):
+                        if not isinstance(step, dict):
+                            continue
+                        if step.get("type") == "planner":
+                            planner = {"type": "planner",
+                                       "prompt": step.get("prompt"),
+                                       "raw_full": step.get("raw_full") or step.get("raw")}
+                        elif step.get("type") == "model":
+                            model_steps.append(step)
+                final_trace = None
+                if model_steps:
+                    last = model_steps[-1]
+                    final_trace = {"step_id": last.get("step_id"),
+                                   "prompt": last.get("prompt"),
+                                   "raw_full": last.get("raw_full") or last.get("raw")}
+                items_out.append({"qa_id": item.get("qa_id"),
+                                  "question": item.get("question"),
+                                  "planner": planner,
+                                  "final_trace": final_trace})
+            return items_out
 
     @classmethod
     def _effective_summary(cls, state: dict) -> dict:
@@ -5280,6 +6187,89 @@ class OrchestratorRepository:
                     return {"cancelled": True, "run_id": run_id}
                 return {"cancelled": False, "run_id": run_id, "reason": f"run status is {run.state.get('status')}"}
             return {"cancelled": False, "run_id": run_id, "reason": "run not active (loaded from disk)"}
+
+    def resume_run(self, run_id: str) -> dict:
+        """Resume an interrupted run from its persisted phase/scope checkpoint."""
+        with self.lock:
+            holder = self.runs.get(run_id)
+            if not holder:
+                raise KeyError(run_id)
+            old_state = holder.state if isinstance(holder, BenchmarkRun) else holder
+            status = str(old_state.get("status") or "")
+            if status not in {"interrupted", "failed", "cancelled", "completed_with_errors"}:
+                raise ValueError(f"run cannot be resumed while status is {status or 'unknown'}")
+            busy = [
+                rid for rid, run in self.runs.items()
+                if (run.state if isinstance(run, BenchmarkRun) else run).get("status")
+                in {"running", "pending", "cancelling"}
+            ]
+            if busy:
+                raise ValueError(f"another benchmark suite is still active: {', '.join(busy)}")
+            album_id = str(old_state.get("album_id") or "")
+            qa_set = str(old_state.get("qa_set") or "")
+            manifest = self.get_manifest(album_id)
+            if not manifest:
+                raise ValueError(f"manifest not found for album: {album_id}")
+            if not qa_set or qa_set not in (manifest.get("qa_sets") or {}):
+                raise ValueError(f"qa set not found for album: {album_id}: {qa_set}")
+            scope_id = str(old_state.get("scope_id") or "").strip()
+            if not scope_id:
+                raise ValueError("the saved run has no memory-space checkpoint")
+
+            model_source = str(old_state.get("model_source") or "")
+            use_current_model = model_source == "current" or bool(old_state.get("current_model_snapshot"))
+            snapshot = dict(old_state.get("current_model_snapshot") or {})
+            # Runtime endpoints are machine-local after migration. Prefer the
+            # active 100-server configuration over URLs persisted on 200.
+            model_base_url = normalize_model_base_url(
+                DEFAULT_VLLM_BASE_URL or snapshot.get("model_base_url")
+                or old_state.get("vllm_model_base_url")
+            )
+            model_name = str(
+                snapshot.get("served_model_name") or old_state.get("model_name")
+                or old_state.get("model_profile") or ""
+            ).strip()
+            sentrix_url = str(DEFAULT_SENTRIX_URL).rstrip("/")
+            judge_url = str(DEFAULT_JUDGE_URL or old_state.get("judge_url") or "").rstrip("/")
+            judge_model = str(old_state.get("judge_model") or JUDGE_MODEL)
+            if use_current_model:
+                if not model_base_url or not model_name:
+                    raise ValueError("saved run has no reusable vLLM endpoint/model")
+                current_snapshot = self.query_current_model("", model_base_url, model_name)
+                request_json(f"{sentrix_url}/api/model-profiles/bind-external-runtime", {
+                    "base_url": current_snapshot["model_base_url"],
+                    "model": current_snapshot["served_model_name"],
+                }, "POST", 30)
+                vllm_api_url = ""
+                vllm_target_id = "external"
+                model_base_url = current_snapshot["model_base_url"]
+                model_name = current_snapshot["served_model_name"]
+            else:
+                vllm_api_url = str(old_state.get("vllm_manager_url") or DEFAULT_VLLM_API_URL).rstrip("/")
+                vllm_target_id = str(old_state.get("vllm_target_id") or DEFAULT_VLLM_TARGET_ID)
+                current_snapshot = snapshot or None
+
+            run = BenchmarkRun(
+                run_id=run_id, album_id=album_id, manifest=manifest,
+                model_profile=str(old_state.get("model_profile") or model_name), qa_set=qa_set,
+                sentrix_url=sentrix_url, judge_url=judge_url,
+                vllm_api_url=vllm_api_url, vllm_target_id=vllm_target_id,
+                vllm_model_base_url=model_base_url, results_root=self.results_root,
+                judge_system_prompt=load_custom_judge_prompt() or JUDGE_PROMPT,
+                task_judge_system_prompt=load_custom_judge_prompts().get("task_decision") or TASK_JUDGE_PROMPT,
+                evidence_judge_system_prompt=load_custom_judge_prompts().get("evidence") or EVIDENCE_JUDGE_PROMPT,
+                judge_model=judge_model, judge_api_key=JUDGE_API_KEY,
+                delete_scope_after_run=False, mode="resume", existing_scope_id=scope_id,
+                scope_reused_from_runs=old_state.get("scope_reused_from_runs") or [],
+                use_current_model=use_current_model, current_model_snapshot=current_snapshot,
+                use_cloud_model=False, resume_state=old_state,
+            )
+            self.runs[run_id] = run
+            self.active_suite_run_ids = [run_id]
+
+        threading.Thread(target=run.execute, name=f"resume-{run_id}", daemon=True).start()
+        return {"run_id": run_id, "status": "running", "resumed": True,
+                "scope_id": scope_id, "mode": "resume"}
 
     def cancel_active_suite(self) -> dict:
         """Cancel all running/pending/cancelling runs — both active suite and orphaned."""
@@ -5910,6 +6900,30 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     primary=(query.get("primary") or [""])[0],
                 ))
                 return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/keyframe-analysis"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/keyframe-analysis"))
+                self._json(self.repo.get_keyframe_analysis(run_id))
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/memory-effectiveness"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/memory-effectiveness"))
+                self._json(self.repo.get_memory_effectiveness(run_id))
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-trace"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-trace"))
+                _q = parse_qs(parsed.query)
+                _raw_scores = (_q.get("scores") or [""])[0]
+                scores = [int(x) for x in _raw_scores.split(",") if x.strip() in {"0", "1", "2"}]
+                _raw = (_q.get("min_score") or [""])[0]
+                min_score = int(_raw) if _raw in {"1", "2"} else None
+                payload = self.repo.export_traces(run_id, scores=scores or None, min_score=min_score)
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{run_id}-trace.json"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))
                 _q = parse_qs(parsed.query)
@@ -5986,6 +7000,10 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             if parsed.path == "/api/cancel-active":
                 self._json(self.repo.cancel_active_suite())
+                return
+            if parsed.path.endswith("/resume") and parsed.path.startswith("/api/runs/"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/resume"))
+                self._json(self.repo.resume_run(run_id), status=202)
                 return
             if parsed.path.endswith("/cancel") and parsed.path.startswith("/api/runs/"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/cancel"))

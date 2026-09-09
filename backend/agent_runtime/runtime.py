@@ -89,10 +89,40 @@ def _natural_partial(task_state: dict, problems=None) -> str:
     return base + "你可以让我继续核对，或换个问法再试。"
 
 
+# 模型可见的检索窗口字段白名单：命中统计、候选规模、验证诊断都属于服务端遥测，
+# 会让模型把"返回了几张候选"当成事实（如 #004 的 363），也撑爆小上下文。
+# preview 每项只保留模型决策需要的最小字段；结果集规模/asset_id 只在 trace 中完整保留。
+_RETRIEVAL_TOP_KEEP = (
+    "result_set_id", "query", "preview", "can_inspect",
+    "recommended_handle", "recommended_resolution", "page", "page_size",
+    # search 计算出的合影枚举事实（不同人数各拍了几张），是模型的直接答案依据，不是遥测。
+    "group_photo_count", "group_photo_sizes", "group_photo_rows",
+)
+_RETRIEVAL_PREVIEW_KEEP = (
+    "handle", "captured_at", "place", "media_kind", "level",
+    "evidence_summary", "people",
+)
+
+
 def _model_visible_observation(observation: dict | None) -> dict:
     """Keep tool evidence for planning while excluding telemetry from LLM context."""
     if not isinstance(observation, dict):
         return {}
+    preview = observation.get("preview")
+    is_retrieval_window = bool(
+        isinstance(preview, list) and preview
+        and isinstance(preview[0], dict) and "handle" in preview[0])
+    if is_retrieval_window:
+        # 检索/分页窗口：只暴露决策所需顶层字段 + 白名单 preview。
+        compact = {key: value for key, value in observation.items()
+                   if key in _RETRIEVAL_TOP_KEEP}
+        compact["preview"] = [
+            {key: item[key] for key in _RETRIEVAL_PREVIEW_KEEP if key in item}
+            for item in preview[:5] if isinstance(item, dict)
+        ]
+        if not compact.get("recommended_handle") and compact["preview"]:
+            compact["recommended_handle"] = compact["preview"][0].get("handle")
+        return compact
     # Retrieval diagnostics describe the server-owned full candidate pool and
     # must not become answer facts.  They remain in the recorded trace for
     # recall auditing, while the model only receives the bounded public
@@ -101,30 +131,18 @@ def _model_visible_observation(observation: dict | None) -> dict:
         "retrieval_timing", "debug", "telemetry", "trace",
         "raw_candidate_count", "validation_candidate_count", "validation_batches",
         "retrieval_channels", "validation_rows",
-        # [契约瘦身] 检索内部/统计/诊断字段——给代码和审计,模型决策用不到。
-        # 保留 group_photo_*（合影人数类问题的直接事实）。
-        "mode", "gaps", "answerability", "condition_summary", "can_inspect",
-        "inspect_hint", "recommended_resolution", "evidence_count",
-        "retrieved_total", "evidence_total", "selected_total",
-        "candidate_window", "relaxation_level", "validation_status",
-        "validation_error", "ranked_asset_ids", "selected_asset_ids",
-        "evidence_status", "reference_resolution",
     }
     compact = {key: value for key, value in observation.items() if key not in hidden}
-    preview = compact.get("preview")
-    if isinstance(preview, list):
-        compact["preview"] = preview[:5]
+    pv = compact.get("preview")
+    if isinstance(pv, list):
+        compact["preview"] = pv[:5]
         if compact["preview"] and isinstance(compact["preview"][0], dict):
             compact["recommended_handle"] = compact["preview"][0].get("handle")
         # Asset IDs are server-side provenance. Handles remain the only stable
         # references visible to the Agent; benchmark/debug projections resolve
-        # the handle mapping outside the model prompt. Candidate-level fields
-        # the model does not need (rank, selection_reason, video source
-        # plumbing, status flags) stay server-side too.
-        _PREVIEW_VISIBLE_KEYS = ("handle", "captured_at", "place", "media_kind",
-                                 "people", "evidence_summary")
+        # the handle mapping outside the model prompt.
         compact["preview"] = [
-            {key: value for key, value in item.items() if key in _PREVIEW_VISIBLE_KEYS}
+            {key: value for key, value in item.items() if key != "asset_id"}
             if isinstance(item, dict) else item
             for item in compact["preview"]
         ]
@@ -138,18 +156,26 @@ def _model_visible_observation(observation: dict | None) -> dict:
     return compact
 
 
-def _visible_observation_with_status(observation, *, status="ok", error=None):
-    """Add the uniform call_status (success/invalid) the Agent sees for a tool result.
+# 工具返回折叠：窗口扩到 8192 后仍是有限预算。单轮工具循环里最多保留最近 N 条完整返回，
+# 更早的完整 observation 折叠成一行说明，避免早期大返回与 Qwen 拆槽文本叠加把输出预算挤没
+# （历史上 qmf/list 之后多次 search 的 6-7k 字符 observation 是 tool_call_limit 的主源）。
+_MAX_TOOL_RETURNS_FULL = 4
+_TOOL_RETURN_RE = re.compile(r"^工具 .*?返回：")
 
-    Tool observations do not share a status vocabulary across tools; the Agent
-    only needs a binary signal of whether the call itself was accepted. denied /
-    error calls additionally surface a reason so the Agent can change strategy.
-    """
-    obs = _model_visible_observation(observation)
-    obs["call_status"] = "success" if status == "ok" else "invalid"
-    if status != "ok":
-        obs.setdefault("reason", error or "tool call not allowed")
-    return obs
+
+def _coalesce_old_tool_returns(messages: list[dict]) -> None:
+    """Keep only the most recent ``_MAX_TOOL_RETURNS_FULL`` tool returns verbatim."""
+    tool_user_indexes = [
+        index for index, message in enumerate(messages or [])
+        if isinstance(message, dict) and message.get("role") == "user"
+        and _TOOL_RETURN_RE.match(str(message.get("content") or ""))
+    ]
+    for index in tool_user_indexes[:-_MAX_TOOL_RETURNS_FULL]:
+        content = str(messages[index].get("content") or "")
+        first_line = content.splitlines()[0][:64]
+        messages[index]["content"] = (
+            first_line + " ……（较早的工具返回已折叠以控制长度，作答请以最近几次工具结果为准）"
+        )
 
 
 def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None) -> tuple[dict, str | None]:
@@ -250,7 +276,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 规则：
 - 需要家庭记忆事实时调用工具；不需要时直接 final。
 - 声称"没有找到/找不到/不存在相关记录"之前，必须先至少调用一次检索工具
-  （search_memories / query_memory_facts / search_conversation_history / get_core_memory / get_person_profile）。
+  （search_memories / search_conversation_history / get_core_memory / get_person_profile）。
   未检索就断言"没有找到"会被纠正并要求重新检索。
 - 每次只输出一个 JSON 对象，直接输出，不要用 markdown 代码块（不要 ```）、不要解释、不要多余文字：
   {{"action":"tool_call","tool":"...","arguments":{{...}},"public_status":"..."}}
@@ -264,7 +290,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - 当用户询问照片里的视觉细节（桌上物品、衣服颜色、人数、文字/招牌、天气、穿什么、有没有某物）时，
   如果 search_memories 返回了 preview 候选（有 photo_1 等 handle），你必须调用 inspect_photo 复核 preview 里的照片，
   不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
-- 只有当 search_memories 返回 total=0 或 preview 为空时，才不能 inspect_photo；
+- 只有当 search_memories 没有返回任何候选照片（preview 为空）时，才不能 inspect_photo；
   此时绝对不要调用 inspect_photo、不要编造 handle、不要声称找到候选照片，直接如实说没有找到符合条件的照片。
 - inspect_photo / read_photo_text 确认不了当前 handle（如 photo_1 不含目标）时，换 preview/翻页里的下一张
   （photo_2、photo_3…）复核，不要反复检查同一张；同一张图最多复核一次。看过几张候选仍无目标时，
@@ -276,19 +302,13 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   不要补充 rows 中没有的项目，也不要自行概括出 rows 不支持的维度。
 - search_memories 的 preview 只显示前几张，每张带 place 字段（照片所在地，来自 GPS 反地理编码，
   通常为城市/区县/景区名，如"某市某区"、"某度假村"）；用户要求更多/下一页/还有吗 时，用 get_result_page（result_set_id 用 search_memories 返回的，page 从 1 开始）。
-- 问'在哪里/哪个城市/什么地点/哪举办的'时，用 search_memories 检索并在回答中引用 preview 的 place 字段；
-  query_memory_facts 只返回时间/数量/分组，不能回答照片地点。
+- 问'在哪里/哪个城市/什么地点/哪举办的'时，用 search_memories 检索并在回答中引用 preview 的 place 字段。
 - 工具选择看用户意图，不是看有没有日期：
   · 用户要找照片、看照片内容（颜色/服装/道具/人数/雕塑/文字/哪张照片）、或问照片是在哪里拍的 → 用 search_memories（把日期写进 filters.time，不要省略）；需要照片里的视觉细节时再 inspect_photo / read_photo_text。
-  · 只有纯统计/确定性事实（一共多少张、最早/最近一张、是否存在、按时间/地点分组）才用 query_memory_facts，并把用户问题里的时间写进 filters.time（如 '2023年'、'2025-05'），不要用模型估算。
-- 用户要'给我所有视频/照片/音频/文本'或'列出相册里的视频'时，用 query_memory_facts 的 operation=list，并在 filters.media 填 video/image/audio/text；工具返回 items 是实际媒体，回答要引用 items 里的 file_name、时长、场景/关键帧来源，不能只报数量。如果工具返回 summary，直接使用 summary 里的文件名和描述逐项列出。
-- 按月份/地点统计分布用 query_memory_facts 的 operation=group，并填 group_by（month 或 place）。
-- operation=group 且 group_by=place 时，工具会返回 known_location_assets/unknown_location_assets 覆盖信息：
-  只要 unknown_location_assets>0，回答必须如实说明还有多少张照片没有可靠地点信息，不能把地点说成完整清单。
-- operation=meal 回答'吃过什么/吃饭/火锅'类问题：工具会返回 explicit_foods（明确食物，按事件去重）、
-  meal_scene_events（只能确认在吃饭）、possible_events；回答必须逐项列出 explicit_foods 里的食物
-  （如具体菜名）并说明各出现几次，有 meal_scene_events 时还要说明其中一部分只能确认在用餐、
-  不能确认具体菜品；没有 explicit_foods 时才只说用餐场景。
+  · 单张照片的拍摄时间/日期/年份、地点、人物在 search_memories 的 preview 里直接给出，不要为单张照片的地点时间人物再调用其它工具。
+- 需要全库统计/金额/费用/桌数/总数的问题（如'一共收了多少礼金''花了多少钱''请了几桌''相册一共多少张'）没有可用的照片证据：
+  不要把 search 返回的照片数量或 preview 张数当作该统计值编造，也不要用检索字段（total/has_more/候选数）当答案。
+  只有相册里能找到直接依据（账单、菜单、请柬上的文字/数字）时，才用 read_photo_text 读出来回答；否则如实说明现有记录无法确认。
 - final 回答直接给答案，先回答用户问题本身；需要说明不确定时用自然语言，不要复述检索过程。
 - 回答结构：1) 直接答案 2) 必要的 uncertainty 3) 可选一句补充。不要以"我为您找到 N 张候选照片/检索到…"开头。
 - 内部检索词汇（query_satisfaction、candidate_only、partial_support、full_support、no_match、候选照片、
@@ -496,25 +516,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         """
         if not spec.can_satisfy(evidence_type):
             return False
-        operation = str(
-            observation.get("metadata_operation") or observation.get("operation") or ""
-        ).strip().lower()
-        if spec.name == "query_memory_metadata":
-            operation_types = {
-                "date": {"structured_fact", "temporal_metadata"},
-                "first": {"structured_fact", "temporal_metadata"},
-                "last": {"structured_fact", "temporal_metadata"},
-                "place": {"structured_fact", "location_metadata"},
-                "event": {"structured_fact"},
-                "count": {"structured_fact"},
-            }
-            return evidence_type in operation_types.get(operation, set())
-        if spec.name == "query_memory_facts":
-            if operation in {"date", "first", "last"}:
-                return evidence_type in {"structured_fact", "temporal_metadata"}
-            if operation == "group" and str(observation.get("group_by") or "").lower() == "place":
-                return evidence_type in {"structured_fact", "location_metadata"}
-            return evidence_type == "structured_fact"
+        # query_memory_facts / query_memory_metadata 已删除：没有按 operation
+        # 收窄证据类型的聚合工具，回归统一的 spec.can_satisfy 判定。
         return True
 
     def mark_failure(reason: str) -> bool:
@@ -707,14 +710,14 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         location_question = (not question_text or bool(re.search(
             r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text)))
         places = [item for item in assets if item.get("place")]
-        # GPS/reverse-geocode is a direct structured field of the photo itself,
-        # not a model guess. "Photo X was taken in P" is a fact regardless of
-        # whether X is the right photo for the question, so it may anchor a
-        # location requirement even before visual validation. Only the
-        # top-ranked candidate is promoted — promoting the whole candidate
-        # pool would surface a many-place "answer" from an unvalidated set.
-        if not preview_evidence_allowed:
+        # GPS/reverse-geocode is a direct structured field.  For a location
+        # question the highest-ranked preview may therefore be used as a
+        # source even before visual validation; do not promote the rest of a
+        # broad candidate pool.
+        if places and not preview_evidence_allowed and location_question:
             places = places[:1]
+        elif not preview_evidence_allowed:
+            places = []
         if places:
             evidence_rows.append({
                 "evidence_type": "location_metadata",
@@ -726,12 +729,10 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         date_question = (not question_text or bool(re.search(
             r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text)))
         dates = [item for item in assets if item.get("captured_at")]
-        # Same reasoning: EXIF captured_at is a deterministic timestamp of the
-        # photo, not a candidate guess, so it anchors temporal_metadata even
-        # when the retrieval was not validated. Keep only the top candidate to
-        # avoid conflicting dates from an unvalidated pool.
-        if not preview_evidence_allowed:
+        if dates and not preview_evidence_allowed and date_question:
             dates = dates[:1]
+        elif not preview_evidence_allowed:
+            dates = []
         if dates:
             evidence_rows.append({
                 "evidence_type": "temporal_metadata",
@@ -837,79 +838,6 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "certainty": "confirmed",
                     "subject": "商品价格",
                 })
-    elif spec.name == "query_memory_facts":
-        value = observation.get("value")
-        if value is None:
-            value = observation.get("rows") or observation.get("items") or observation.get("summary")
-        if value not in (None, "", [], {}):
-            evidence_rows.append({"evidence_type": "structured_fact", "value": value,
-                                  "subject": str(observation.get("operation") or "结构化记忆事实")})
-        if (observation.get("operation") in {"date", "first", "last"}
-                and observation.get("value") not in (None, "", [], {})):
-            evidence_rows.append({"evidence_type": "temporal_metadata", "value": observation.get("value"),
-                                  "subject": str(observation.get("operation"))})
-        filters = observation.get("filters_applied") or {}
-        time_range = filters.get("time_range") if isinstance(filters, dict) else None
-        items = observation.get("items") or []
-        if time_range and items:
-            temporal_value = [
-                {"asset": str(row.get("asset_id") or row.get("id") or ""),
-                 "value": row.get("captured_at") or row.get("date") or ""}
-                for row in items if isinstance(row, dict)
-                and (row.get("captured_at") or row.get("date"))
-            ]
-            if temporal_value:
-                evidence_rows.append({"evidence_type": "temporal_metadata",
-                                      "value": temporal_value,
-                                      "subject": "时间过滤后的照片拍摄时间",
-                                      "asset_id": temporal_value[0].get("asset") or ""})
-        if observation.get("group_by") == "place" or observation.get("common_places"):
-            value = observation.get("rows") or observation.get("common_places")
-            if value:
-                evidence_rows.append({"evidence_type": "location_metadata", "value": value,
-                                      "subject": "结构化地点事实"})
-    elif spec.name == "query_memory_metadata":
-        # Dedicated structured metadata must enter the same typed ledger as
-        # search/inspect results; otherwise direct date/place/event evidence is
-        # visible in the tool trace but remains invisible to the final gate.
-        value = observation.get("value")
-        if value is None:
-            value = observation.get("items") or observation.get("rows") or observation.get("summary")
-        source_ids = tuple(str(value) for value in (
-            observation.get("evidence_asset_ids")
-            or observation.get("source_asset_ids")
-            or []
-        ) if value)
-        operation = str(observation.get("metadata_operation")
-                        or observation.get("operation") or "").lower()
-        if value is not None:
-            evidence_rows.append({
-                "evidence_type": "structured_fact",
-                "value": value,
-                "subject": f"结构化元数据:{operation or 'query'}",
-                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
-            })
-        if operation in {"date", "first", "last"} and value not in (None, "", [], {}):
-            evidence_rows.append({
-                "evidence_type": "temporal_metadata", "value": value,
-                "subject": "结构化日期事实",
-                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
-            })
-        filters = observation.get("filters_applied") or {}
-        time_range = filters.get("time_range") if isinstance(filters, dict) else None
-        if time_range and source_ids:
-            evidence_rows.append({
-                "evidence_type": "temporal_metadata",
-                "value": {"time_range": time_range, "source_asset_ids": list(source_ids)},
-                "subject": "时间过滤后的结构化照片来源",
-                "asset_id": source_ids[0],
-            })
-        if operation == "place" and value not in (None, "", [], {}):
-            evidence_rows.append({
-                "evidence_type": "location_metadata", "value": value,
-                "subject": "结构化地点事实",
-                "asset_id": source_ids[0] if len(source_ids) == 1 else "",
-            })
     elif spec.name == "query_photo_people":
         people = observation.get("people") or []
         unknown = observation.get("unconfirmed_people") or []
@@ -1413,39 +1341,28 @@ def _build_answer_grounding(*, message: str, task: TaskState,
         display_mode = "inline_images"
     else:
         display_mode = "collapsed"
-    evidence_asset_set = set(evidence_assets)
-    valid_selected_ids = [str(aid) for aid in (selected_image_ids or [])
-                          if aid and str(aid) in evidence_asset_set]
-    if not valid_selected_ids and evidence_assets:
-        valid_selected_ids = evidence_assets[:3]
-    # Model-selected evidence can miss a GT image even though the code
-    # candidate set contains it (measured delivery recall 0.70 vs ~0.95 code
-    # candidate recall).  Backfill delivery from the code candidate order so a
-    # GT image is not dropped purely because the validator under-ranked it.
-    if (len(valid_selected_ids) < 3 and retrieved_assets
-            and display_mode != "none"):
-        # 只在答案有证据支撑、确实需要展示图时从代码候选补齐（保 GT 不丢）。
-        # display_mode=none（闲聊/拒答/无证据）绝不能因补齐而返回无关图——
-        # 无答案的题应返回空图，而不是把代码候选塞进 delivery。
-        for _aid in retrieved_assets:
-            if str(_aid) not in valid_selected_ids:
-                valid_selected_ids.append(str(_aid))
-            if len(valid_selected_ids) >= 3:
-                break
-    valid_selected_handles = list(selected_image_handles or [])
-    if rs is not None:
-        valid_selected_handles = [handle for handle in valid_selected_handles
-                                  if any(str(aid) in evidence_asset_set
-                                         and f"photo_{rs.visible_asset_ids().index(aid) + 1}" == str(handle)
-                                         for aid in rs.visible_asset_ids())]
-    else:
-        # A handle without its originating result set cannot be resolved safely.
-        valid_selected_handles = []
-    if rs is not None and not valid_selected_handles:
-        valid_selected_handles = [
-            f"photo_{rs.visible_asset_ids().index(aid) + 1}"
-            for aid in valid_selected_ids if aid in rs.visible_asset_ids()
-        ]
+    # 交付口径（E）：只展示模型显式选择且出现在当前结果集里的图。
+    # search_memories 返回即"看到"，不需要 inspect/evidence 提升；模型没选 → 空交付合法，
+    # 代码绝不把 evidence/candidate 前几张塞进 delivery（不再 backfill）。
+    visible_ids = list(rs.visible_asset_ids()) if rs is not None else []
+    handle_to_id = ({f"photo_{index + 1}": asset_id
+                     for index, asset_id in enumerate(visible_ids)}
+                    if rs is not None else {})
+    id_to_handle = {asset_id: handle for handle, asset_id in handle_to_id.items()}
+    valid_selected_handles = []
+    for handle in (selected_image_handles or []):
+        handle = str(handle or "").strip()
+        if handle in handle_to_id and handle not in valid_selected_handles:
+            valid_selected_handles.append(handle)
+    valid_selected_ids = [handle_to_id[handle] for handle in valid_selected_handles]
+    # 少数内部调用方直接给 id（无 handle 的老路径）：按可见集回补 handle。
+    if not valid_selected_ids and (selected_image_ids or []):
+        for asset_id in selected_image_ids:
+            asset_id = str(asset_id or "").strip()
+            handle = id_to_handle.get(asset_id)
+            if handle and handle not in valid_selected_handles:
+                valid_selected_handles.append(handle)
+                valid_selected_ids.append(asset_id)
     return {
         "required": used_evidence,
         "display_mode": display_mode,
@@ -1828,17 +1745,12 @@ class AgentRuntime:
             system = SYSTEM_TEMPLATE.format(tools=self._tool_descriptions(),
                                             current_time=current_time_line())
         messages = [{"role": "system", "content": system}]
-        # [Qwen 兼容] Qwen3.5/3.8 chat template 严格要求 system 只能出现在第一条
-        # （任何后续 system 直接 raise "System message must be at the beginning"）。
-        # result_set/history/summary/active_lines 全部合并进第一条 system，不追加
-        # 第二条 system。合并内容另存一份，供工具执行后刷新 JIT 时保留。
-        system_extra = []
         if task.current_result_set:
             # B3.1：跨 turn 续接同一结果集，让模型知道当前可分页的结果集
             from .tools import result_set_context
             ctx = result_set_context(task.current_result_set, self.scope_id)
             if ctx:
-                system_extra.append(ctx)
+                messages.append({"role": "system", "content": ctx})
         if selected_handle:
             # Phase C C15：用户点选了结果集里的照片，模型可直接用该 handle 复核/交付原图
             ctx = f"用户当前选中了照片（handle={selected_handle}）"
@@ -1847,11 +1759,11 @@ class AgentRuntime:
             ctx += ("。问'这张/原图/里面有几个人'时，直接用 "
                     f"get_original_photos(handle={selected_handle}) 或 "
                     f"inspect_photo(asset_handle={selected_handle})，不要重新全库搜索。")
-            system_extra.append(ctx)
+            messages.append({"role": "system", "content": ctx})
         if history:
-            system_extra.append(f"最近对话：\n{history}")
+            messages.append({"role": "system", "content": f"最近对话：\n{history}"})
         if conversation_summary:
-            system_extra.append(f"本会话摘要：\n{conversation_summary}")
+            messages.append({"role": "system", "content": f"本会话摘要：\n{conversation_summary}"})
         active_lines = []
         if task.active_person:
             active_lines.append(f"当前关注人物：{task.active_person}")
@@ -1864,10 +1776,7 @@ class AgentRuntime:
         if task.open_questions:
             active_lines.append("未解决问题：" + "、".join(str(q) for q in task.open_questions[:5]))
         if active_lines:
-            system_extra.append("当前上下文：\n" + "\n".join(active_lines))
-        if system_extra:
-            messages[0]["content"] = system + "\n\n" + "\n\n".join(system_extra)
-        self._system_extra_parts = system_extra
+            messages.append({"role": "system", "content": "当前上下文：\n" + "\n".join(active_lines)})
         messages.append({"role": "user", "content": message})
         self._emit_progress(turn, progress_callback, stage="thinking", status="running",
                             text="正在理解你的问题…")
@@ -1911,6 +1820,11 @@ class AgentRuntime:
         unknown_tool_retries = 0
         max_unknown_tool_retries = 1
         forced_final_attempted = False
+        # 5B：证据需求未满足时，最多给模型一次补证/修正的机会；模型坚持 final 就放行，
+        # 代码不再写死"现有证据不足，无法确认。"覆盖模型已给的好答案。
+        gate_unattempted_prompted = False
+        # 反编造：零工具调用却给出具体数字断言时，只给一次"检索核实"机会；模型坚持再放行。
+        fabrication_check_prompted = False
         wants_visual = visual_intent(message)
         # 预算 B：同一工具同一失败原因（evidence_incompatible / no_evidence_returned
         # 等）连续 2 次就强制换动作，避免小模型在同一个失败模式上反复消耗预算，
@@ -2096,8 +2010,9 @@ class AgentRuntime:
             # normal user turn that remains model-visible.
             messages.append({"role": "user", "content": (
                 f"工具 {tool_name}（{call_id}）返回：\n" +
-                json.dumps(_visible_observation_with_status(observation), ensure_ascii=False)
+                json.dumps(_model_visible_observation(observation), ensure_ascii=False)
             )})
+            _coalesce_old_tool_returns(messages)
             return True
 
         # Phase E：Adaptive Visual Budget——按问题类型放宽视觉复核预算
@@ -2126,23 +2041,10 @@ class AgentRuntime:
         answer_context = None
         answer_writer_pending = False
         answer_writer_messages = None
-        writer_soft_reminded = 0
         while True:
             if answer_writer_pending and answer_writer_messages:
                 if not turn.budget.can_model_step():
                     answer_writer_pending = False
-                elif writer_soft_reminded < 2:
-                    # [2.2] 软提醒代替强制 writer 接管:证据已齐备时引导模型
-                    # 基于完整对话自己输出 final,保留模型已掌握的上下文,
-                    # 也避免证据被异常判定时 writer 基于错误材料生成。
-                    # 软提醒后模型仍调工具则继续循环;累计提醒 2 次仍不
-                    # final 才兜底 writer。
-                    writer_soft_reminded += 1
-                    answer_writer_pending = False
-                    messages.append({"role": "user", "content": (
-                        "所需证据已齐备。请直接整理并输出 final 回答，不要再调用新工具。"
-                    )})
-                    continue
                 else:
                     turn.budget.record_model_step()
                     try:
@@ -2461,36 +2363,30 @@ class AgentRuntime:
                             state.requirement.required and state.status == "satisfied"
                             for state in agent2_task_state.requirements.values()
                         )
-                        if unattempted and available and turn.budget.can_model_step():
-                            pending = [
+                        # 5B 软门槛：需求未满足时只给一次"补证/如实收尾"的机会，不再无限
+                        # continue，也不再写死固定文案。模型在提醒后仍输出 final → 放行，
+                        # 让其自然回答（包括诚实的"无法确认"），不被代码覆盖。
+                        if unattempted and available and turn.budget.can_model_step() \
+                                and not gate_unattempted_prompted:
+                            gate_unattempted_prompted = True
+                            prompt_pending = [
                                 f"{state.requirement.id}:{state.requirement.evidence_type}"
                                 for state in unattempted
                             ]
                             final_gate.update({
-                                "decision": "continue_unattempted",
+                                "decision": "continue_unattempted_once",
                                 "available_tools": [spec.name for spec in available],
-                                "unattempted_requirements": pending,
+                                "unattempted_requirements": prompt_pending,
                             })
                             messages.append({"role": "assistant", "content": _model_visible_action(action)})
                             messages.append({"role": "user", "content": (
-                                "还有声明的证据需求尚未尝试，不能输出 final。"
-                                f"未尝试需求：{', '.join(pending)}。"
+                                "还有声明的证据需求尚未尝试："
+                                + ", ".join(prompt_pending) + "。"
                                 f"当前可用工具：{', '.join(spec.name for spec in available)}。"
-                                "请选择一个兼容工具继续获取实际证据；工具结果失败也要如实记录。"
+                                "请先用兼容工具获取证据；如果确实没有对应的照片或记录可以确认"
+                                "（例如问题本身没有可查的答案），请直接输出 final 如实说明，不要编造。"
                             )})
                             continue
-                        if unattempted:
-                            final_gate.update({
-                                "decision": "block_unattempted",
-                                "available_tools": [spec.name for spec in available],
-                                "unattempted_requirements": [
-                                    state.requirement.id for state in unattempted
-                                ],
-                            })
-                            # [2.3] 软放行:不再替换模型答案、不终止循环——保留已产出的
-                            # final_answer,由后续 G3 保存 + guard/judge 质量检查兜底。
-                            # gate 职责收窄为"无依据禁猜",不再否决有理有据的答案。
-                            turn.soft_gate_release = "unattempted_evidence"
                         grounded_context = answer_context
                         if grounded_context is None:
                             try:
@@ -2498,25 +2394,40 @@ class AgentRuntime:
                                     message, agent2_task_state)
                             except Exception:
                                 grounded_context = {}
-                        if has_partial_answer or grounded_context.get("facts"):
-                            # A required ancillary field (for example venue)
-                            # may remain unresolved while the user-requested
-                            # field (for example confirmed people) is already
-                            # directly supported. Let the writer answer only
-                            # the supported portion and state the missing one.
-                            final_gate.update({
-                                "decision": "partial_answer",
-                                "available_tools": [spec.name for spec in available],
-                            })
-                        else:
-                            final_gate.update({
-                                "decision": "block",
-                                "soft_release": True,
-                                "available_tools": [spec.name for spec in available],
-                            })
-                            # [2.3] 软放行:不再替换答案、不 break——模型答案由 G3 保存,
-                            # 真实性由 guard/judge 兜底。
-                            turn.soft_gate_release = "insufficient_evidence"
+                        # 无论是否有已确认事实，模型已选择 final（或已给过补证机会）→ 放行。
+                        # 有部分确认则如实带过缺口；完全没有事实时保留模型自然的"无法确认"，
+                        # 字段级冲突/纯编造仍由 FinalGuard 与 L2 拦截，代码不写死固定文案。
+                        final_gate.update({
+                            "decision": ("partial_answer" if has_partial_answer
+                                         or grounded_context.get("facts")
+                                         else "accept_with_insufficient_evidence"),
+                            "available_tools": [spec.name for spec in available],
+                            "pending_requirements": pending,
+                        })
+                # 反编造软门槛：需求为空（模型认为无需证据）不代表可以凭空编数字。
+                # 零工具调用却给出具体数字/金额/年份断言时，只给一次"检索核实"机会，
+                # 检索后没有依据就让模型如实说无法确认；模型坚持原样再放行（不覆盖）。
+                if (self.profile.features.get("agent2_authoritative")
+                        and agent2_task_state is not None
+                        and not fabrication_check_prompted
+                        and not task.tool_results
+                        and turn.budget.can_model_step()
+                        and not _CHAT_ONLY_RE.search(message)
+                        and re.search(
+                            r"\d[\d,，.万]*\s*(?:元|块钱|万|桌|张|人|个|名|年|月|日|号)",
+                            str(action.get("answer") or ""))):
+                    fabrication_check_prompted = True
+                    final_gate = turn.agent2_trace.setdefault("final_gate", {})
+                    final_gate["decision"] = "verify_claim_no_tools"
+                    messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                    messages.append({"role": "user", "content": (
+                        "你的回答给出了具体的数字/金额/年份，但本轮还没有检索相册来核实。"
+                        "请先调用 search_memories 检索相关照片（必要时再 read_photo_text / inspect_photo "
+                        "查看照片里的文字或细节）；如果相册里确实没有能确认该数字的依据，"
+                        "请如实说“现有记录无法确认”，不要编造数字。"
+                    )})
+                    continue
+
                 # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
                 if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
                     open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
@@ -2629,7 +2540,7 @@ class AgentRuntime:
                         if req.code == RETRIEVE_EVIDENCE:
                             messages.append({"role": "user", "content": (
                                 f"{req.reason} 这是完成回答的必要步骤：请先调用检索工具"
-                                "（search_memories / query_memory_facts / get_core_memory / get_person_profile），"
+                                "（search_memories / get_core_memory / get_person_profile），"
                                 "拿到工具结果后再输出 final。"
                             )})
                         elif req.code == DELIVER_MEDIA:
@@ -2662,53 +2573,11 @@ class AgentRuntime:
                     turn.status = "complete"
                     turn.termination_reason = "evidence_resolution_exhausted"
                     break
-                # Phase F F1：Final Answer Writer——草稿违反 Answer Policy 时用受控事实重写
-                if turn.final_answer and turn.budget.can_model_step():
-                    try:
-                        from .final_writer import build_final_context, needs_rewrite, rewrite_final
-                        fctx = build_final_context(message, task.as_dict())
-                        if needs_rewrite(turn.final_answer, fctx):
-                            turn.budget.record_model_step()
-                            _wr_debug = {} if self.include_debug else None
-                            rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer,
-                                                      debug_out=_wr_debug)
-                            if rewritten and rewritten != turn.final_answer:
-                                _wr_step = {"type": "writer", "status": "rewritten",
-                                            "call_type": "writer"}
-                                if _wr_debug:
-                                    _wr_step["prompt"] = _wr_debug.get("messages")
-                                    _wr_step["raw_full"] = rewritten
-                                turn.steps.append(_wr_step)
-                                from .final_writer import clean_writer_output
-                                turn.final_answer = naturalize_answer(
-                                    clean_writer_output(rewritten))
-                    except Exception:
-                        pass
-                try:
-                    from .final_writer import (build_final_context, evidence_answer_problems)
-                    _quality_context = build_final_context(message, task.as_dict())
-                    _quality_problems = evidence_answer_problems(
-                        message, turn.final_answer, _quality_context)
-                    if _quality_problems and answer_quality_retries < 1 and turn.budget.can_model_step():
-                        answer_quality_retries += 1
-                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                        messages.append({"role": "user", "content": (
-                            "已有工具结果包含直接证据，但上一版回答不完整或拒答（问题："
-                            + ", ".join(_quality_problems)
-                            + "）。请严格根据受控事实直接回答；已确认的人物、日期和地点必须写出，"
-                              "无法确认的部分要明确说明，不要把其他人的细节归给目标人物。"
-                        )})
-                        continue
-                    if _quality_problems:
-                        # Do not replace the model's natural answer with a
-                        # code-like deterministic concatenation. Preserve the
-                        # Writer output and expose the unresolved quality
-                        # state in the trace for the next bounded retry.
-                        if turn.agent2_trace:
-                            turn.agent2_trace.setdefault("quality", {})[
-                                "unresolved_problems"] = list(_quality_problems)
-                except Exception:
-                    pass
+                # 5B：停用模型 final 的 needs_rewrite/rewrite_final 语义重写。模型的自然回答
+                # 直接放行（naturalize 已在上方做过确定性清理）；风格类问题不再强制改写文本。
+                # 5B：停用 evidence_answer_problems 语义完整性检查的强制重试（不逼模型补
+                # 人名/日期/拒答改写）。语义真实性交给 L2 judge 与字段冲突硬拦，代码不做
+                # 文本级比对，模型给出的答案按其本来样子处理。
                 problems = guard.check(
                     turn.final_answer,
                     task_state={
@@ -2741,15 +2610,21 @@ class AgentRuntime:
                     "codes": list(problems) if problems else [],
                     "attempt": guard_retries + 1,
                 })
-                # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性
-                if not problems and task.tool_results and turn.budget.can_model_step():
+                # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性。
+                # 原则（2026-09 重构）：每问只评审一次；评审看完整 agent 轨迹
+                # （含 captured_at 拍摄时间等元数据，见 judge.messages）。首次 final
+                # 未通过时不反复逼审，只加一条软引导、让模型基于完整上下文再输出一次；
+                # 之后不再复评，放行的答案打"possibly_fabricated"标签供分析。
+                if (not problems and task.tool_results and turn.budget.can_model_step()
+                        and not getattr(turn, "l2_faithfulness_checked", False)):
+                    turn.l2_faithfulness_checked = True
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                     try:
                         judge_result = judge_faithfulness(
                             self.chat_fn, query=message, tool_results=task.tool_results,
                             answer=turn.final_answer, trusted_facts=trusted,
-                            include_debug=self.include_debug)
+                            messages=messages, include_debug=self.include_debug)
                         if self.include_debug:
                             faithful, judge_problems, judge_debug = judge_result
                         else:
@@ -2764,7 +2639,27 @@ class AgentRuntime:
                             judge_step["call_type"] = "faithfulness_judge"
                         turn.steps.append(judge_step)
                         if not faithful:
-                            problems = judge_problems
+                            # 只对"事实性"问题做软引导；纯风格(missing_disclosure)当提示放行。
+                            _l2_sev = (judge_problems.severity
+                                       if hasattr(judge_problems, "severity") else "truth")
+                            if _l2_sev == "truth":
+                                turn.l2_unverified = True
+                                turn.l2_unverified_reason = "; ".join(str(p) for p in judge_problems)
+                                if turn.budget.can_model_step():
+                                    self._emit_progress(
+                                        turn, progress_callback, stage="recovering",
+                                        status="running", text="我重新核对一遍信息再回答。")
+                                    messages.append({"role": "assistant",
+                                                     "content": _model_visible_action(action)})
+                                    messages.append({"role": "user", "content": (
+                                        "（复核提醒）系统评审认为你上一条 final 里可能有未被工具观察充分"
+                                        "支持的内容。请基于完整对话里出现的所有工具结果重新核对——包括照片/视频"
+                                        "的拍摄时间（captured_at）、地点元数据与检索命中的照片信息，而不只是"
+                                        "OCR 文字。如果按这些元数据能确认年份/日期/数量就直接如实给出；确实"
+                                        "没有任何工具结果能支撑的内容才如实说明无法确认。不要把有依据的信息删掉。"
+                                        "重新输出一个 final（可直接复用你上一版答案）。"
+                                    )})
+                                    continue
                     except Exception as exc:
                         turn.steps.append({"type": "judge", "status": "skipped",
                                            "reason": f"model_call_error:{exc}"})
@@ -2779,23 +2674,11 @@ class AgentRuntime:
                                 task.as_dict(), reason="回答未通过事实校验")
                         break
                     if severity == "style":
-                        # G4 Style Advisory：只做一次建议性重写；重写失败/未改变 → 放行原答案
-                        # （绝不得把事实正确的答案变成 blocked_by_guard）
-                        if turn.final_answer and turn.budget.can_model_step():
-                            try:
-                                from .final_writer import (build_final_context, needs_rewrite,
-                                                          rewrite_final)
-                                fctx = build_final_context(message, task.as_dict())
-                                if needs_rewrite(turn.final_answer, fctx):
-                                    turn.budget.record_model_step()
-                                    rewritten = rewrite_final(self.chat_fn, fctx, turn.final_answer)
-                                    if rewritten and rewritten != turn.final_answer:
-                                        turn.steps.append({"type": "writer",
-                                                           "status": "rewritten_style"})
-                                        from .final_writer import clean_writer_output
-                                        turn.final_answer = clean_writer_output(rewritten)
-                            except Exception:
-                                pass
+                        # 5B：style 仅作提示，不再强制改写；直接放行原答案（绝不得把事实
+                        # 正确的答案变成 blocked_by_guard，也不因风格做额外的模型改写）。
+                        if turn.agent2_trace:
+                            turn.agent2_trace.setdefault("quality", {})[
+                                "style_problems"] = list(str(p) for p in problems)
                         turn.status = "complete"
                         break
                     # Phase H H4：guard 拦截后若问题可确定性渲染（价格/年份/数量），直接交付硬值
@@ -2822,8 +2705,10 @@ class AgentRuntime:
                             stage="recovering", status="running",
                             text="结果里有一处信息对不上，我正在重新核对。")
                         last_answer = (turn.final_answer or "").strip()[:300]
-                        messages.append({"role": "assistant",
-                                         "content": f"（你上一版 final 回答）{last_answer}"})
+                        # 不要把"（你上一版 final 回答）"这类代码元注释冒充模型自己的话塞给它；
+                        # 只原样回放上一条最终回答，并在下一条 user 里点明"上一条是你的最终回答"。
+                        if last_answer:
+                            messages.append({"role": "assistant", "content": last_answer})
                         inspect_obs = [
                             tr.get("inspect_text") for tr in task.tool_results
                             if tr.get("tool") == "inspect_photo" and tr.get("inspect_text")
@@ -2837,7 +2722,8 @@ class AgentRuntime:
                         issue_lines = problems.natural_messages if hasattr(problems, "natural_messages") \
                             else [str(p) for p in problems]
                         recovery = (
-                            "你的最终回答与工具结果有冲突，需要修正后重新输出 final：\n- "
+                            "上一条（你刚输出的内容）是你的最终回答。你的最终回答与工具结果有冲突，"
+                            "需要修正后重新输出 final：\n- "
                             + "\n- ".join(issue_lines) +
                             "\n\n可信事实（只能基于这些，不要重新调用昂贵工具）：\n- "
                             + "\n- ".join(trusted or ["(无工具结果)"]) +
@@ -2904,10 +2790,8 @@ class AgentRuntime:
                                                  "content": _model_visible_action(action)})
                                 messages.append({"role": "user", "content": (
                                     f"工具 {recovery_tool}（恢复结果）返回：\n" +
-                                    json.dumps(_visible_observation_with_status(
-                                        auto_decision.observation,
-                                        status=("ok" if auto_decision.allowed else "denied"),
-                                        error=auto_decision.error), ensure_ascii=False)
+                                    json.dumps(_model_visible_observation(
+                                        auto_decision.observation), ensure_ascii=False)
                                 )})
                                 messages.append({"role": "user", "content": (
                                     "我重新读取了一次照片，请基于新的工具观察，直接输出一个修正后的 final。"
@@ -2930,6 +2814,18 @@ class AgentRuntime:
                     turn, progress_callback,
                     stage="finalizing", status="complete",
                     text="正在整理回答…")
+                # L2 复核标签：某次 final 曾被语义评审判不实、经软引导后放行 → 打标供分析
+                if getattr(turn, "l2_unverified", False):
+                    turn.steps.append({
+                        "type": "judge", "status": "soft_release",
+                        "call_type": "l2_soft_release",
+                        "possibly_fabricated": True,
+                        "reason": getattr(turn, "l2_unverified_reason", "") or "",
+                    })
+                    if turn.agent2_trace:
+                        turn.agent2_trace.setdefault("quality", {})[
+                            "l2_soft_release"] = True
+
                 # G6：OCR 显式 partial —— 读文字失败且回答如实反映“没读清”时，
                 # 以 natural partial 收尾（status=partial, reason=ocr_timeout），不猜、不暴露工程错误
                 if turn.ocr_partial and re.search(
@@ -3016,7 +2912,7 @@ class AgentRuntime:
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     messages.append({"role": "user", "content": (
                         f"工具 {tool_name}（缓存结果）返回：\n" +
-                        json.dumps(_visible_observation_with_status(cached_observation), ensure_ascii=False)
+                        json.dumps(_model_visible_observation(cached_observation), ensure_ascii=False)
                     )})
                     messages.append({"role": "user", "content": (
                         "这是你刚才相同工具调用的已缓存结果，不需要再次调用。"
@@ -3119,17 +3015,6 @@ class AgentRuntime:
                 stage="tool_result" if result.status == "ok" else "tool_error",
                 status=result.status, text=emit_text)
             if not decision.allowed:
-                # [选B] denied 调用也必须让模型可见（call_status=invalid）——静默吞掉会让
-                # 模型以为自己成功、无法调整策略，SFT 轨迹里也永远学不到"无效调用"。
-                denied_obs = {"call_status": "invalid",
-                              "reason": str(result.error or decision.reason
-                                            or "tool call not allowed")}
-                messages.append({"role": "assistant",
-                                 "content": _model_visible_action(action)})
-                messages.append({"role": "user", "content": (
-                    f"工具 {tool_name} 返回：\n" +
-                    json.dumps(denied_obs, ensure_ascii=False)
-                )})
                 if agent2_task_state is not None:
                     turn.steps[-1]["standardized_evidence"] = []
                     turn.steps[-1]["evidence_ids"] = []
@@ -3216,14 +3101,12 @@ class AgentRuntime:
                     f"{entry.tool_call_id}:{entry.evidence_type}" for entry in new_entries
                 ]
                 if answer_context_enabled:
-                    from .final_writer import build_answer_writer_messages
                     answer_context = agent2_evidence_ledger.build_answer_context(
                         message, agent2_task_state)
                     turn.agent2_trace["answer_context"] = answer_context
-                    if _agent2_answer_context_ready(agent2_task_state, answer_context):
-                        answer_writer_messages = build_answer_writer_messages(
-                            message, answer_context)
-                        answer_writer_pending = True
+                    # 5B：证据就绪只写入 trace 供评审，不再自动强制 writer 接管回答。
+                    # 由模型在"已具备足够事实，请直接 final"的提示下自己输出 final；
+                    # writer 仅在 final 违反 Answer Policy / 事实字段冲突时做受控处理。
                 turn.steps[-1]["task_status_after"] = agent2_task_state.status
                 turn.steps[-1]["requirement_status_after"] = {
                     req_id: state.status
@@ -3245,7 +3128,7 @@ class AgentRuntime:
             # Observation 进入下一步模型上下文
             # Candidate 模式下根据最新 TaskState 动态更新首条 JIT System Prompt
             if is_candidate_mode and agent2_task_state is not None:
-                _new_jit = build_jit_system_prompt(
+                messages[0]["content"] = build_jit_system_prompt(
                     task_state=agent2_task_state,
                     current_time_str=current_time_line(),
                     tool_results=task.tool_results,
@@ -3253,21 +3136,15 @@ class AgentRuntime:
                     is_candidate=True,
                     allowed_tool_names=self.profile.tools,
                 )
-                # 保留已合并的 result_set/history/summary/active_lines——Qwen
-                # 只允许第一条 system,不能把 history 再拆成第二条 system。
-                _extra = list(getattr(self, "_system_extra_parts", None) or [])
-                if _extra:
-                    _new_jit = _new_jit + "\n\n" + "\n\n".join(_extra)
-                messages[0]["content"] = _new_jit
             messages.append({"role": "assistant", "content": _model_visible_action(action)})
             # See the strict-provider compatibility note above: observations
             # use a regular user turn because the assistant action is not a
             # native tool_calls object.
             messages.append({"role": "user", "content": (
                 f"工具 {tool_name} 返回：\n" +
-                json.dumps(_visible_observation_with_status(
-                    result.observation, status=result.status, error=result.error), ensure_ascii=False)
+                json.dumps(_model_visible_observation(result.observation), ensure_ascii=False)
             )})
+            _coalesce_old_tool_returns(messages)
             if self.profile.features.get("agent2_authoritative"):
                 failed_resolution = None
                 obs = result.observation or {}
@@ -3347,45 +3224,9 @@ class AgentRuntime:
                     message=message, task=task, selected_handle=selected_handle,
                     selected_image_handles=turn.selected_image_handles,
                     selected_image_ids=turn.selected_image_ids)
-        # Delivery is a projection of evidence, not a second retrieval path.
-        # If the writer omits selected_image_handles, expose up to three
-        # representative evidence images so both 4174 and 8771 still show the
-        # sources that support the answer.  Never fall back to raw candidates.
-        if not turn.selected_image_handles:
-            fallback_items = [
-                item for item in
-                (turn.answer_grounding.get("evidence_images") or [])
-                if item.get("asset_id")
-            ][:3]
-            fallback_handles = [
-                str(item.get("handle")) for item in fallback_items
-                if item.get("handle")
-            ]
-            fallback_ids = [
-                str(item.get("asset_id")) for item in fallback_items
-                if item.get("asset_id")
-            ]
-            if fallback_handles or fallback_ids:
-                # A structured fact may have a source asset but no current
-                # ResultSet handle.  Keep the asset ID as the delivery key so
-                # both benchmark and production clients can render it.
-                turn.selected_image_handles = fallback_handles
-                turn.selected_image_ids = fallback_ids
-                try:
-                    from . import tools as runtime_tools
-                    resolved = [
-                        asset_id for handle in fallback_handles
-                        if (asset_id := runtime_tools.resolve_handle_asset_id(
-                            handle, task.current_result_set, self.scope_id))
-                    ]
-                    if resolved:
-                        turn.selected_image_ids = list(dict.fromkeys(resolved))
-                except Exception:
-                    pass
-                turn.answer_grounding = _build_answer_grounding(
-                    message=message, task=task, selected_handle=selected_handle,
-                    selected_image_handles=turn.selected_image_handles,
-                    selected_image_ids=turn.selected_image_ids)
+        # 交付口径（E）：不再从 evidence/candidate 兜底补图。模型显式选择（含
+        # group 枚举的来源行）即交付；模型没选、或答案本就没有依据图（拒答/闲聊）
+        # → 交付为空，这是合法状态，前端按"回答依据图片为空"展示。
         turn.termination_reason = _classify_termination(turn)
         if turn.agent2_trace.get("writer_output"):
             turn.answer_source = "writer"

@@ -34,10 +34,6 @@ LITE_TOOL_SCHEMAS = {
         "需要更多候选用 get_result_page 翻页；返回 recommended_handle 时优先复核该图。\n"
         '  输入: {"query": "关键词", "filters": {"time": "<问题时间，缺省省略>", "person": "人物", "place": "地点"}}'
     ),
-    "query_memory_facts": (
-        "- query_memory_facts: 全量聚合统计与结构化事实（总数/最早/最近/分组/事件）。\n"
-        '  输入: {"operation": "count|first|last|date|group|meal|list|event", "filters": {"time": "时间", "person": "人物", "media": "video/image"}}'
-    ),
     "query_photo_people": (
         "- query_photo_people: 读取当前预览中一张照片自己的已确认人物和未确认同行者。\n"
         '  输入: {"asset_handle": "photo_1", "result_set_id": "..."}'
@@ -96,7 +92,6 @@ def build_jit_system_prompt(
         # Fallback 到包含所有常用工具的简版
         tool_descriptions = "\n".join([
             LITE_TOOL_SCHEMAS["search_memories"],
-            LITE_TOOL_SCHEMAS["query_memory_facts"],
             LITE_TOOL_SCHEMAS["query_photo_people"],
             LITE_TOOL_SCHEMAS["inspect_photo"],
             LITE_TOOL_SCHEMAS["read_photo_text"],
@@ -120,7 +115,7 @@ def build_jit_system_prompt(
     if open_reqs:
         state_desc += f"待确认证据：{', '.join(open_reqs)}"
     else:
-        state_desc += "所有证据已确认充分，请直接整理 final 回答。"
+        state_desc += "没有强制的证据需求：可直接 final；若答案需要从相册核实，先调用检索工具再作答，不要编造。"
     parts.append(state_desc)
 
     # 3. JIT 只依据统一注册表和未满足需求提供工具，不按问题关键词
@@ -161,9 +156,17 @@ def build_jit_system_prompt(
         selected_specs.append(spec)
     selected_tools = [spec.name for spec in selected_specs]
 
-    # 如果所有需求都满足或无需工具，不暴露工具，直接引导 final
-    if not open_reqs or not selected_tools:
-        parts.append("当前已具备足够事实，请直接输出 final 结论。")
+    # 所有需求已满足 / 无需证据：有把握就直接 final；若需要核实相册记录（具体数字/金额/
+    # 年份/地点/有没有某物等），保留 search_memories 可选，避免模型"事实足够"时凭空编数字。
+    if not open_reqs:
+        parts.append("当前没有待确认的证据需求。可直接回答的问题请直接输出 final；"
+                     "若答案需要从相册照片核实，请先调用 search_memories 检索，"
+                     "再如实作答或说明无法确认，不要编造数字/细节。")
+        parts.append("本步骤可用工具（按需核实，也可直接 final）：\n"
+                     + LITE_TOOL_SCHEMAS["search_memories"])
+    elif not selected_tools:
+        # 有需求但暂无直接满足的工具：由模型按需调用已注册检索工具获取证据后再 final。
+        parts.append("当前有待确认的证据需求，请按需调用合适的工具获取证据后再 final。")
     else:
         # 去重并添加工具描述
         tool_text_list = []

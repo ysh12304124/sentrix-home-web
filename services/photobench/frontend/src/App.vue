@@ -17,6 +17,196 @@ const vllmTargets = ref({});
 const runs = ref([]);
 const activeRunId = ref(null);
 const activeRun = ref(null);
+const keyframeAnalysis = ref(null);
+const keyframeAnalysisLoading = ref(false);
+const keyframeAnalysisError = ref("");
+const memoryEffectiveness = ref(null);
+const memoryAttribution = computed(() => memoryEffectiveness.value?.details?.memory_answer_attribution || null);
+const errorChainDiagnosis = computed(() => memoryEffectiveness.value?.details?.error_chain_diagnosis || null);
+const memoryValidityArchitecture = computed(() => {
+  const levels = memoryEffectiveness.value?.levels || [];
+  const level = (key) => levels.find((item) => item.key === key) || {};
+  const raw = level("L0");
+  const scene = level("L1");
+  const events = level("L2");
+  const rules = level("L3");
+  const answers = level("L4+");
+  const details = memoryEffectiveness.value?.details || {};
+  const analysis = keyframeAnalysis.value?.status === "ready" ? keyframeAnalysis.value : null;
+  const runSummary = effectiveRunSummary(activeRun.value);
+  const visual = details.visual_calls || {};
+  const ocr = details.ocr_calls || {};
+  const correctness = details.answer_correctness || {};
+  const ratio = (value, total) => total ? fmtPct(Number(value || 0) / total) : "-";
+  return [
+    {
+      key: "L0", name: "原始媒体与检索", stage: "记忆库规模 → 测评检索结果",
+      nodes: [
+        { label: "原始媒体创建量", value: raw.created || 0, note: "记忆库输入规模，不代表测评有效" },
+        { label: "原始图片交付 Recall", value: runSummary.image_retrieval_recall_micro == null ? "未计算" : fmtPct(runSummary.image_retrieval_recall_micro), note: `${fmtPct(runSummary.image_retrieval_precision_micro)} Precision · 按模型使用（交付）口径；工具召回维度见下方两列矩阵` },
+        { label: "关键帧父级 Recall", value: analysis ? ratio(analysis.retrieval.video_gt_targets_hit_by_keyframe, analysis.retrieval.video_gt_targets) : "未计算", note: analysis ? `${analysis.retrieval.video_gt_targets_hit_by_keyframe || 0}/${analysis.retrieval.video_gt_targets || 0} 个 GT 源视频被覆盖` : "关键帧接口尚未返回" },
+        { label: "关键帧返回 Precision", value: analysis ? ratio(analysis.retrieval.predicted_relevant_keyframes, analysis.retrieval.predicted_keyframes) : "未计算", note: analysis ? `${analysis.retrieval.predicted_relevant_keyframes || 0}/${analysis.retrieval.predicted_keyframes || 0} 个返回关键帧与 GT 父视频一致` : "关键帧接口尚未返回" },
+      ],
+    },
+    {
+      key: "L1", name: "场景解析记忆", stage: "视觉 / OCR → 场景节点",
+      nodes: [
+        { label: "解析轨迹覆盖率", value: ratio(scene.effective, scene.created), note: `${scene.effective || 0}/${scene.created || 0} 个解析结果在测评轨迹出现；不是语义正确率` },
+        { label: "视觉工具成功率", value: ratio(visual.effective, visual.total), note: `${visual.effective || 0}/${visual.total || 0} 次 inspect_photo 成功` },
+        { label: "OCR 工具成功率", value: ratio(ocr.effective, ocr.total), note: `${ocr.effective || 0}/${ocr.total || 0} 次 read_photo_text 成功` },
+      ],
+    },
+    {
+      key: "L2", name: "事件记忆", stage: "场景 → 时间 / 地点 / 事件",
+      nodes: [
+        { label: "事件图谱覆盖率", value: ratio(events.effective, events.created), note: `${events.effective || 0}/${events.created || 0} 个事件在测评工具图谱中出现；不是事实正确率` },
+        { label: "跨媒体关联", value: memoryEffectiveness.value?.data_quality?.graph_ready ? "已校验" : "不完整", note: "事件 ID → 媒体 → 时间 / 地点字段" },
+      ],
+    },
+    {
+      key: "L3", name: "证据规则", stage: "事件记忆 → 目标证据",
+      nodes: [
+        { label: "证据闭合率（代理）", value: ratio(rules.effective, rules.created), note: `${rules.effective || 0}/${rules.created || 0} 项需求满足；仅表示证据链闭合` },
+        { label: "未闭合需求", value: rules.ineffective || 0, note: "open / running / failed，需继续形成证据" },
+      ],
+    },
+    {
+      key: "L4+", name: "回答结果", stage: "证据 → 最终回答 Judge",
+      nodes: [
+        { label: "Agent 完整闭环率", value: ratio(answers.effective, answers.created), note: `${answers.effective || 0}/${answers.created || 0} 条回答 complete` },
+        { label: "Exact Accuracy", value: ratio(correctness.correct, answers.created), note: `正确 ${correctness.correct || 0} · 部分 ${correctness.partial || 0} · 错误 ${correctness.incorrect || 0}` },
+      ],
+    },
+  ];
+});
+const memoryRecallMatrices = computed(() => {
+  const attribution = memoryAttribution.value || {};
+  const evidenceBlocks = memoryEffectiveness.value?.details?.evidence_effectiveness || {};
+  const correctness = memoryEffectiveness.value?.details?.answer_correctness || {};
+  const judgedTotal = Number(correctness.correct || 0) + Number(correctness.partial || 0) + Number(correctness.incorrect || 0);
+  const pct = (value, total) => total ? fmtPct(value / total) : "-";
+  const DIMS = [
+    {
+      key: "tool", title: "工具召回命中矩阵",
+      note: "工具召回命中：GT 媒体进入检索 / 工具返回集合（视频按关键帧父级覆盖）",
+      hitLabel: "工具召回命中", missLabel: "工具召回未命中", stageL1: "GT 是否进入检索候选",
+    },
+    {
+      key: "usage", title: "模型使用命中矩阵",
+      note: "模型使用命中：GT 媒体被模型显式用于回答（严格交付口径，与逐题指标一致）",
+      hitLabel: "模型使用命中", missLabel: "模型使用未命中", stageL1: "GT 是否被模型用于回答",
+    },
+  ];
+  return DIMS.map((dim) => {
+    const scope = attribution[dim.key] || {};
+    const matrix = scope.matrix || {};
+    const hit = Number(scope.hit_items || 0);
+    const miss = Number(scope.miss_items || 0);
+    const eligible = Number(scope.eligible || 0);
+    const evBlock = evidenceBlocks[dim.key] || {};
+    const evRow = (k) => evBlock[k] || {};
+    const imageEv = evRow("image");
+    const videoEv = evRow("video_keyframe");
+    const eventEv = evidenceBlocks.event || {};
+    const hitWrong = Number(matrix.hit_incorrect || 0);
+    const missWrong = Number(matrix.miss_incorrect || 0);
+    return {
+      key: dim.key, title: dim.title, note: dim.note, eligible, hit, miss,
+      layers: [
+        {
+          key: "L0", name: "评测题目范围", stage: "回答结果与 GT 媒体对齐",
+          nodes: [
+            { label: "全量已评分题", value: pct(judgedTotal, judgedTotal), note: `${judgedTotal} 题；正确 ${correctness.correct || 0} · 部分 ${correctness.partial || 0} · 错误 ${correctness.incorrect || 0}` },
+            { label: "可归因题占比", value: pct(eligible, judgedTotal), note: `${eligible}/${judgedTotal} 题有 GT 媒体；不可回答题不进归因` },
+          ],
+        },
+        {
+          key: "L1", name: "命中结果", stage: dim.stageL1,
+          nodes: [
+            { label: dim.hitLabel, value: "已找到", note: `${hit}/${eligible} 题` },
+            { label: dim.missLabel, value: "未找到", note: `${miss}/${eligible} 题` },
+          ],
+        },
+        {
+          key: "L2", name: "回答评分结果", stage: "在命中 / 未命中分支内看 Judge",
+          nodes: [
+            { label: "命中 → 正确", value: matrix.hit_correct || 0, note: `${pct(matrix.hit_correct, eligible)} 总体 · ${pct(matrix.hit_correct, hit)} 命中分支` },
+            { label: "命中 → 部分", value: matrix.hit_partial || 0, note: `${pct(matrix.hit_partial, eligible)} 总体 · ${pct(matrix.hit_partial, hit)} 命中分支` },
+            { label: "命中 → 错误", value: hitWrong, note: `${pct(hitWrong, eligible)} 总体 · ${pct(hitWrong, hit)} 命中分支` },
+            { label: "未命中 → 正确", value: matrix.miss_correct || 0, note: `${pct(matrix.miss_correct, eligible)} 总体 · ${pct(matrix.miss_correct, miss)} 未命中分支` },
+            { label: "未命中 → 部分", value: matrix.miss_partial || 0, note: `${pct(matrix.miss_partial, eligible)} 总体 · ${pct(matrix.miss_partial, miss)} 未命中分支` },
+            { label: "未命中 → 错误", value: missWrong, note: `${pct(missWrong, eligible)} 总体 · ${pct(missWrong, miss)} 未命中分支` },
+          ],
+          groups: [
+            {
+              label: dim.hitLabel, total: hit, note: "命中分支",
+              nodes: [
+                { label: "回答正确", value: pct(matrix.hit_correct, eligible), note: `${pct(matrix.hit_correct, hit)} 本分支；${matrix.hit_correct || 0}/${eligible} 全部` },
+                { label: "部分正确", value: pct(matrix.hit_partial, eligible), note: `${pct(matrix.hit_partial, hit)} 本分支；${matrix.hit_partial || 0}/${eligible} 全部` },
+                { label: "回答错误", value: pct(hitWrong, eligible), note: `${pct(hitWrong, hit)} 本分支；${hitWrong}/${eligible} 全部` },
+              ],
+            },
+            {
+              label: dim.missLabel, total: miss, note: "未命中分支",
+              nodes: [
+                { label: "回答正确", value: pct(matrix.miss_correct, eligible), note: `${pct(matrix.miss_correct, miss)} 本分支；${matrix.miss_correct || 0}/${eligible} 全部` },
+                { label: "部分正确", value: pct(matrix.miss_partial, eligible), note: `${pct(matrix.miss_partial, miss)} 本分支；${matrix.miss_partial || 0}/${eligible} 全部` },
+                { label: "回答错误", value: pct(missWrong, eligible), note: `${pct(missWrong, miss)} 本分支；${missWrong}/${eligible} 全部` },
+              ],
+            },
+          ],
+        },
+        {
+          key: "L3", name: "证据有效性", stage: "原图 / 关键帧 / 事件 → Judge 验证",
+          nodes: [
+            { label: "原图片证据有效率", value: imageEv.effective_rate_on_returned == null ? "未计算" : fmtPct(imageEv.effective_rate_on_returned), note: `${imageEv.effective_items || 0}/${imageEv.returned_items || 0} 有效 · 无效 ${imageEv.ineffective_items || 0}` },
+            { label: "视频 / 关键帧有效率", value: videoEv.effective_rate_on_returned == null ? "未计算" : fmtPct(videoEv.effective_rate_on_returned), note: `${videoEv.effective_items || 0}/${videoEv.returned_items || 0} 有效 · 无效 ${videoEv.ineffective_items || 0}` },
+            { label: "事件上下文有效率", value: eventEv.effective_rate_on_returned == null ? "未计算" : fmtPct(eventEv.effective_rate_on_returned), note: `${eventEv.effective_items || 0}/${eventEv.returned_items || 0} 有效 · 无效 ${eventEv.ineffective_items || 0}` },
+          ],
+        },
+      ],
+    };
+  });
+});
+function memoryLayerSpecialMetrics(level) {
+  const analysis = keyframeAnalysis.value?.status === "ready" ? keyframeAnalysis.value : null;
+  const details = memoryEffectiveness.value?.details || {};
+  const quality = memoryEffectiveness.value?.data_quality || {};
+  const correctness = details.answer_correctness || {};
+  if (level.key === "L0") {
+    return [
+      { label: "关键帧父级召回", value: analysis?.retrieval?.video_parent_recall == null ? "未计算" : fmtPct(analysis.retrieval.video_parent_recall), note: analysis ? `${analysis.retrieval.video_gt_targets_hit_by_keyframe || 0}/${analysis.retrieval.video_gt_targets || 0} 个源视频被覆盖` : "关键帧接口尚未返回" },
+      { label: "候选 / 最终精确率", value: analysis?.retrieval?.candidate_precision == null ? "未计算" : `${fmtPct(analysis.retrieval.candidate_precision)} / ${fmtPct(analysis.retrieval.predicted_precision)}`, note: analysis ? `候选 ${analysis.retrieval.candidate_relevant_keyframes || 0}/${analysis.retrieval.candidate_keyframes || 0} · 最终 ${analysis.retrieval.predicted_relevant_keyframes || 0}/${analysis.retrieval.predicted_keyframes || 0}` : "候选池 / 最终回答返回" },
+      { label: "关键帧压缩率", value: analysis?.processing?.compression_ratio == null ? "未保存原始帧" : fmtPct(analysis.processing.compression_ratio), note: analysis?.processing?.raw_frame_count ? `${analysis.assets.keyframes}/${analysis.processing.raw_frame_count} 原始帧` : "本次为复用记忆，未保存原始帧总数" },
+    ];
+  }
+  if (level.key === "L1") {
+    const visual = details.visual_calls || {};
+    const ocr = details.ocr_calls || {};
+    return [
+      { label: "视觉解析成功率", value: visual.total ? fmtPct(visual.effective / visual.total) : "-", note: `${visual.effective || 0}/${visual.total || 0} 次 inspect_photo 成功` },
+      { label: "OCR 成功率", value: ocr.total ? fmtPct(ocr.effective / ocr.total) : "-", note: `${ocr.effective || 0}/${ocr.total || 0} 次 read_photo_text 成功` },
+      { label: "图谱加载", value: quality.graph_ready ? "已校验" : "不完整", note: `${quality.preview_count || 0} 条媒体预览 · ${quality.event_context_count || 0} 个事件上下文` },
+    ];
+  }
+  if (level.key === "L2") {
+    return [
+      { label: "事件图谱覆盖率", value: level.created ? fmtPct(level.effective / level.created) : "-", note: `${level.effective}/${level.created} 个事件在工具图谱预览出现；不是事件事实正确率` },
+      { label: "跨媒体关联", value: quality.graph_ready ? "可追溯" : "待校验", note: "事件 ID → 媒体引用 → 时间/地点字段" },
+    ];
+  }
+  if (level.key === "L3") {
+    const status = details.requirement_status_counts || {};
+    return [
+      { label: "高层证据闭合率（代理）", value: level.created ? fmtPct(level.effective / level.created) : "-", note: `${status.satisfied || 0} satisfied / ${level.created} 项证据需求；不是回答正确率` },
+      { label: "未闭合需求", value: `${(status.open || 0) + (status.running || 0) + (status.failed || 0)}`, note: `open ${status.open || 0} · running ${status.running || 0} · failed ${status.failed || 0}` },
+    ];
+  }
+  return [
+    { label: "Agent 完整闭环率", value: level.created ? fmtPct(level.effective / level.created) : "-", note: `${level.effective}/${level.created} 条 complete` },
+    { label: "回答 Exact Accuracy", value: fmtPct(correctness.exact_accuracy), note: `正确 ${correctness.correct || 0} · 部分 ${correctness.partial || 0} · 错误 ${correctness.incorrect || 0}` },
+  ];
+}
 const qaPage = ref({ items: [], page: 1, page_size: 20, total: 0, pages: 1 });
 const qaDetails = reactive({});
 const openQaItems = reactive(new Set());
@@ -84,6 +274,8 @@ const cpuError = ref("");
 const error = ref("");
 const lightbox = ref(null);
 const judgeModal = ref(null);
+const chainMode = ref("creation");
+const chainDetail = ref(null);
 let pollTimer = null;
 let destroyed = false;
 
@@ -449,16 +641,17 @@ function itemMedia(item, gt = false) {
       return { ...ref, file_name: fileName, matched: (item.matched_file_names || []).includes(fileName) };
     }));
   }
-  // Model recall is the upstream evidence projection, not only explicit delivery.
-  if (item.evidence_source_media?.length) return decorateMedia(item.evidence_source_media);
-  if (item.evidence_source_images?.length) return decorateMedia(item.evidence_source_images);
-  if (item.evidence_source_file_names?.length) {
-    return decorateMedia(item.evidence_source_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
-  }
+  // 交付口径（E）：模型"召回/回答来源"= 模型显式交付的图（selected/predicted），
+  // 不再把上游 evidence 全量候选冒充回答来源。历史 run 只有 evidence/retrieved 字段时再回退。
   if (item.predicted_media?.length) return decorateMedia(item.predicted_media);
   if (item.predicted_images?.length) return decorateMedia(item.predicted_images);
   if (item.predicted_file_names?.length) {
     return item.predicted_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
+  }
+  if (item.evidence_source_media?.length) return decorateMedia(item.evidence_source_media);
+  if (item.evidence_source_images?.length) return decorateMedia(item.evidence_source_images);
+  if (item.evidence_source_file_names?.length) {
+    return decorateMedia(item.evidence_source_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
   }
   // A validator may leave all candidates as candidate_only.  They are not
   // answer evidence, but hiding them makes a healthy retrieval look empty
@@ -473,11 +666,23 @@ function itemMedia(item, gt = false) {
   return (item.retrieved_file_names || []).slice(0, 6)
     .map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
 }
+function toolRecallMedia(item) {
+  // 工具召回图片 = search 等找图工具返回的检索候选集（retrieved），与"模型使用图片"严格区分。
+  if (item.retrieved_candidate_media?.length) return decorateMedia(item.retrieved_candidate_media);
+  if (item.retrieved_candidate_images?.length) return decorateMedia(item.retrieved_candidate_images);
+  if (item.retrieved_file_names?.length) {
+    return item.retrieved_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
+  }
+  return [];
+}
 function itemEvidenceMedia(item) {
-  const media = item?.evidence_source_media || item?.evidence_source_images || [];
+  // 模型使用图片 = 模型显式交付图（predicted/selected）；未显式交付 → 空（"回答依据图片为空"），
+  // 绝不回退到 evidence/retrieved 候选（否则又变成"回答来源==完整候选集"）。
+  const media = item?.predicted_media || item?.predicted_images || [];
   if (media.length) return decorateMedia(media);
-  const names = item?.evidence_source_file_names || [];
-  return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
+  const names = item?.predicted_file_names || [];
+  if (names.length) return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
+  return [];
 }
 function isDirectEvidence(item, media) {
   const ref = typeof media === "string" ? { media_id: media, media_type: inferMediaType(media) } : media;
@@ -1170,6 +1375,255 @@ function attributionLabel(key) {
   return ({ R: "检索", V: "视觉", O: "OCR", T: "工具", S: "综合", G: "Guard", J: "Judge", PASS: "通过" })[key] || key;
 }
 function attributionClass(status) { return status === "fail" ? "score-0" : status === "pass" ? "score-2" : "score-none"; }
+function memoryLayerToolMetric(summary, name) {
+  const metric = summary?.tool_performance?.[name] || {};
+  return { calls: Number(metric.calls || 0), okRate: metric.ok_rate == null ? null : Number(metric.ok_rate) };
+}
+function memoryLayerMetrics() {
+  const run = activeRun.value || {};
+  const summary = effectiveRunSummary(run);
+  const manifest = manifests.value.find((item) => item.album_id === run.album_id) || {};
+  const photoCount = Number(manifest.photo_count || 0);
+  const videoCount = Number(manifest.video_count || 0);
+  const rawCount = photoCount + videoCount;
+  const progress = run.phases?.qa_eval?.progress || {};
+  const completed = Number(progress.completed ?? summary.completed ?? run.item_count ?? 0);
+  const total = Number(progress.total ?? summary.total ?? run.qa_count ?? 0);
+  const agent2 = summary.agent2_trace || {};
+  const requirementCounts = agent2.requirement_status_counts || {};
+  const requirementTotal = Object.values(requirementCounts).reduce((sum, value) => sum + Number(value || 0), 0);
+  const satisfiedRequirements = Number(requirementCounts.satisfied || 0);
+  // 优先用 memory-effectiveness 接口实测的调用次数（新老 run 都有）；汇总缺 tool_performance 时回退 0。
+  const meCalls = (kind) => {
+    const row = memoryEffectiveness.value?.details?.[kind] || {};
+    const total = Number(row.total || 0);
+    return { calls: total, okRate: total ? (Number(row.effective || 0) / total) : null };
+  };
+  const visual = meCalls("visual_calls");
+  const ocr = meCalls("ocr_calls");
+  const summaryCalls = memoryLayerToolMetric(summary, "get_core_memory");
+  const analysis = keyframeAnalysis.value?.status === "ready" ? keyframeAnalysis.value : {};
+  const analysisAssets = analysis.assets || {};
+  const analysisProcessing = analysis.processing || {};
+  const analysisRetrieval = analysis.retrieval || {};
+  const analysisUsefulness = analysis.usefulness || {};
+  const expanded = Object.values(qaDetails).filter(Boolean);
+  const previewRows = expanded.flatMap((item) => (item.tool_trace || []).flatMap((trace) => trace.observation?.preview || []));
+  const keyframes = new Set(previewRows.filter((row) => row.media_kind === "video_keyframe").map((row) => row.asset_id || row.file_name).filter(Boolean));
+  const events = new Set(previewRows.map((row) => row.event_context?.id).filter(Boolean));
+  const eventEvidenceRows = previewRows.filter((row) => row.event_context?.id).length;
+  const qaSampleCount = expanded.length || (qaPage.value.items || []).length;
+  const summaryTaskSampleCount = (qaPage.value.items || []).filter((item) => item.task_type === "T5_event_summary").length;
+  const layers = [
+    { key: "L0", name: "原始流", color: "raw", metric: rawCount ? `${rawCount} 个媒体` : "待读取", detail: `${photoCount} 图 · ${videoCount} 视频`, evidence: analysisAssets.keyframes == null ? "等待全量分析" : `${analysisAssets.source_videos} 个源视频 → ${analysisAssets.keyframes} 帧；保留 parent_asset_id 与时间戳`, note: "关键帧是视频派生媒体，仍归 L0" },
+    { key: "L1", name: "场景图", color: "scene", metric: visual.okRate == null ? "未记录" : `视觉 ${fmtPct(visual.okRate)}`, detail: `观察 ${visual.calls} 次 · OCR ${ocr.calls} 次`, evidence: `视觉成功 ${visual.calls ? fmtPct(visual.okRate) : "-"} · OCR 调用 ${ocr.calls} 次 · 场景 ${analysis.temporal?.scene_count ?? "-"} 个`, note: "画面、文字、人物、动作、空间关系" },
+    { key: "L2", name: "事件层", color: "event", metric: events.size ? `${events.size} 个事件` : (analysisUsefulness.event_context_count ? `${analysisUsefulness.event_context_count} 个事件上下文` : "待展开"), detail: `${eventEvidenceRows} 条证据带事件上下文`, evidence: `全量 QA 轨迹带回 ${analysisUsefulness.event_context_count ?? 0} 个事件上下文；当前展开 ${events.size} 个`, note: "同一事件聚合多个媒体与时间地点" },
+    { key: "L3", name: "目标/规则", color: "goal", metric: requirementTotal ? `${satisfiedRequirements}/${requirementTotal} 满足` : "未记录", detail: `规划 ${agent2.planner_decision_count || 0} 题 · 目标证据需求`, evidence: requirementTotal ? `证据账本满足 ${satisfiedRequirements} / ${requirementTotal}；规划决策 ${agent2.planner_decision_count || 0} 次` : "当前 run 未记录目标账本", note: "时间、事件、地点、人物、场景等查询要求" },
+    { key: "L4+", name: "总结/回答", color: "summary", metric: summaryCalls.calls ? `总结访问 ${summaryCalls.calls} 次` : "按题回答", detail: `当前页总结题 ${summaryTaskSampleCount} · 已完成 ${completed}/${total || "-"}`, evidence: `Judge 均分 ${summary.answer_quality_mean ?? "-"} / 2 · exact ${summary.exact_accuracy == null ? "-" : fmtPct(summary.exact_accuracy)} · 已完成 ${completed}/${total || "-"}`, note: "事件/相册级递归摘要与最终回答" },
+  ];
+  return { layers, rawMediaCount: rawCount, keyframes: keyframes.size, expandedCount: qaSampleCount, completed, total, visual, ocr, summaryCalls, analysisProcessing };
+}
+const memoryLayerView = computed(memoryLayerMetrics);
+function memoryEvidenceGraph() {
+  const view = memoryLayerView.value || { layers: [] };
+  const analysis = keyframeAnalysis.value?.status === "ready" ? keyframeAnalysis.value : {};
+  const assets = analysis.assets || {};
+  const processing = analysis.processing || {};
+  const retrieval = analysis.retrieval || {};
+  const temporal = analysis.temporal || {};
+  const usefulness = analysis.usefulness || {};
+  const rawAssets = Number(view.rawMediaCount || activeRun.value?.input_integrity?.files_checked || 0);
+  const keyframeCount = assets.keyframes == null ? null : Number(assets.keyframes);
+  const visualCalls = Number(view.visual?.calls || 0);
+  const ocrCalls = Number(view.ocr?.calls || 0);
+  const sceneCount = Number(temporal.scene_count || 0);
+  const eventCount = Number(usefulness.event_context_count || 0);
+  const requirements = getAgent2Requirements(Object.values(qaDetails).find(Boolean) || {});
+  const requirementCounts = effectiveRunSummary(activeRun.value).agent2_trace?.requirement_status_counts || {};
+  const requirementTotal = Object.values(requirementCounts).reduce((sum, value) => sum + Number(value || 0), 0);
+  const completed = view.completed || 0;
+  const total = view.total || 0;
+  const recorded = (value, fallback = "未记录") => value == null || value === 0 ? fallback : String(value);
+  const sourceEvidence = rawAssets ? `${rawAssets} 个原始媒体 · asset_id / file_name · 输入完整性校验` : "接口未返回原始媒体数量，暂不能证明记忆已入库";
+  return [
+    {
+      key: "L0", name: "原始流", color: "raw", stage: "输入与派生媒体",
+      nodes: [
+        { kind: "原始媒体", value: recorded(rawAssets), evidence: sourceEvidence },
+        { kind: "关键帧", value: keyframeCount == null ? "未记录" : String(keyframeCount), evidence: keyframeCount == null ? "待获取 parent_asset_id" : "parent_asset_id · source_timestamp_sec" },
+      ],
+      transition: "asset_id + 时间戳 → 场景观察",
+    },
+    {
+      key: "L1", name: "场景图", color: "scene", stage: "视觉、文字、人物、动作",
+      nodes: [
+        { kind: "视觉观察", value: recorded(visualCalls), evidence: "inspect_photo → observation.preview" },
+        { kind: "文字 / OCR", value: recorded(ocrCalls), evidence: "read_photo_text → text + media_id" },
+        { kind: "场景节点", value: recorded(sceneCount), evidence: "source_scene_index · 人物/动作/空间关系" },
+      ],
+      transition: "观察 + OCR + 时间地点 → 事件上下文",
+    },
+    {
+      key: "L2", name: "事件层", color: "event", stage: "跨媒体聚合",
+      nodes: [
+        { kind: "事件上下文", value: recorded(eventCount), evidence: "event_context.id · related_media_ids" },
+        { kind: "时间 / 地点", value: eventCount ? "已挂接" : "未记录", evidence: "event_context 的时间、地点、实体字段" },
+      ],
+      transition: "事件 ID + 媒体引用 → 查询证据需求",
+    },
+    {
+      key: "L3", name: "目标 / 规则", color: "goal", stage: "通用查询槽位",
+      nodes: [
+        { kind: "查询槽位", value: "时间 · 事件 · 地点 · 人物 · 场景", evidence: "query_anchors → evidence_refs" },
+        { kind: "证据账本", value: requirementTotal ? `${requirementTotal} 项` : (requirements.length ? `${requirements.length} 项` : "未记录"), evidence: requirementTotal ? "满足状态 + provenance_refs" : "本 run 未返回 Agent 证据账本" },
+      ],
+      transition: "evidence_refs + provenance → 总结与回答",
+    },
+    {
+      key: "L4+", name: "总结 / 回答", color: "summary", stage: "可验证输出",
+      nodes: [
+        { kind: "回答", value: total ? `${completed}/${total}` : "未记录", evidence: "final_answer · answer_claims" },
+        { kind: "证据核验", value: activeRun.value ? "Judge" : "未记录", evidence: "judge / evidence_judge → 分数与理由" },
+      ],
+      transition: "输出保留证据链，可回溯到 L0",
+    },
+  ];
+}
+const memoryEvidenceGraphView = computed(memoryEvidenceGraph);
+function effectiveEvidenceGraph() {
+  const item = Object.values(qaDetails).find(Boolean) || {};
+  const traces = item.tool_trace || [];
+  const previews = traces.flatMap((trace) => trace.observation?.preview || []);
+  const candidates = item.retrieved_candidate_media || item.retrieved_candidate_images || [];
+  const evidence = item.evidence_source_media || item.evidence_source_images || [];
+  const requirements = getAgent2Requirements(item);
+  const answer = item.final_answer || item.answer;
+  const recorded = (value, fallback = "未展开 QA") => value == null || value === 0 ? fallback : String(value);
+  return [
+    { key: "L0", name: "问题 / 原始证据", color: "raw", stage: "本题输入范围", nodes: [
+      { kind: "问题", value: item.question ? "1 条" : "未展开 QA", evidence: item.question ? item.question : "请先展开一条 QA" },
+      { kind: "GT 媒体", value: recorded(item.gt_media?.length, "未记录"), evidence: "gt_media · file_name / asset_id" },
+    ], transition: "问题槽位 → 工具查询" },
+    { key: "L1", name: "工具 / 检索", color: "scene", stage: "测评时实际调用", nodes: [
+      { kind: "工具调用", value: recorded(traces.length, "未记录"), evidence: "tool_trace · name · arguments" },
+      { kind: "候选媒体", value: recorded(candidates.length, "未记录"), evidence: "retrieved_candidate_media · result_set_id" },
+      { kind: "观察", value: recorded(previews.length, "未记录"), evidence: "observation.preview · evidence_summary" },
+    ], transition: "候选 + 观察 → 事件与证据" },
+    { key: "L2", name: "事件 / 记忆", color: "event", stage: "有效记忆上下文", nodes: [
+      { kind: "事件上下文", value: recorded(new Set(previews.map((row) => row.event_context?.id).filter(Boolean)).size, "未记录"), evidence: "event_context.id · title · summary" },
+      { kind: "时间 / 地点", value: previews.some((row) => row.captured_at || row.place || row.location_context) ? "已返回" : "未记录", evidence: "captured_at · place · location_context" },
+    ], transition: "事件引用 → 证据需求" },
+    { key: "L3", name: "目标 / 证据", color: "goal", stage: "本题判定依据", nodes: [
+      { kind: "查询锚点", value: item.query_anchors ? "已记录" : "未记录", evidence: item.query_anchors || "query_anchors 未返回" },
+      { kind: "证据账本", value: recorded(requirements.length, "未记录"), evidence: requirements.length ? requirements.map((req) => `${req.id}:${agent2RequirementStatusLabel(req.status)}`).join(" · ") : "evidence_refs 未返回" },
+      { kind: "实际证据", value: recorded(evidence.length, "未记录"), evidence: "evidence_source_media · answer_evidence" },
+    ], transition: "证据引用 → 回答与 Judge" },
+    { key: "L4+", name: "回答 / 评判", color: "summary", stage: "测评结果", nodes: [
+      { kind: "回答", value: answer ? "已形成" : "未形成", evidence: answer || "final_answer 未返回" },
+      { kind: "声明", value: recorded(item.answer_claims?.length, "未记录"), evidence: "answer_claims · claim evidence" },
+      { kind: "Judge", value: item.judge?.score == null ? "未记录" : `${item.judge.score} 分`, evidence: item.judge?.reason || "judge.reason 未返回" },
+    ], transition: "结果可回溯到原始媒体" },
+  ];
+}
+const effectiveEvidenceGraphView = computed(effectiveEvidenceGraph);
+const activeEvidenceGraphView = computed(() => chainMode.value === "effective" ? effectiveEvidenceGraphView.value : memoryEvidenceGraphView.value);
+function chainDetailMedia(item, previews) {
+  const values = [
+    ...(item?.gt_media || []), ...(item?.evidence_source_media || []),
+    ...(item?.predicted_media || []),
+    ...previews.map((row) => ({ ...row, file_name: row.file_name || row.media_id, media_type: row.media_kind === "video" ? "video" : "image" })),
+  ];
+  const unique = new Map();
+  for (const media of decorateMedia(values)) {
+    const key = mediaKey(media);
+    if (key && !unique.has(key)) unique.set(key, media);
+  }
+  return [...unique.values()].slice(0, 12);
+}
+function chainDetailStatements(item, previews, layer, node) {
+  const statements = [];
+  if (item?.question) statements.push({ label: "用户问题", value: item.question });
+  if (node?.evidence) statements.push({ label: `${layer.key} · ${node.kind}`, value: node.evidence });
+  for (const row of previews.slice(0, 8)) {
+    const event = row.event_context || {};
+    const text = row.evidence_summary || event.summary || row.description || row.text;
+    if (text) statements.push({ label: `${row.media_id || row.file_name || row.asset_id || "媒体"} · 观察`, value: text });
+  }
+  if (item?.answer) statements.push({ label: "模型回答", value: item.answer });
+  if (item?.judge?.reason) statements.push({ label: "Judge 理由", value: item.judge.reason });
+  return statements.slice(0, 12);
+}
+async function openChainNode(mode, layer, node) {
+  const pageItems = qaPage.value.items || [];
+  const indices = pageItems.map((summary) => summary.index).filter((index) => index != null);
+  await Promise.allSettled(indices.map((index) => loadQaDetail(index)));
+  const records = indices.map((index) => {
+    const item = qaDetails[index];
+    if (!item) return null;
+    const previews = (item.tool_trace || []).flatMap((trace) => trace.observation?.preview || []);
+    const traceRows = (item.tool_trace || []).slice(0, 12).map((trace, traceIndex) => ({
+      label: `${traceIndex + 1}. ${trace.tool_name || trace.name || trace.tool || "工具调用"}`,
+      value: JSON.stringify(trace, null, 2),
+    }));
+    return {
+      key: `${item.qa_id || "qa"}-${index}`,
+      index,
+      question: item.question || pageItems.find((summary) => summary.index === index)?.question || "未记录问题",
+      media: chainDetailMedia(item, previews),
+      statements: chainDetailStatements(item, previews, layer, node),
+      traceRows,
+      reasoning: JSON.stringify({ agent2_trace: item.agent2_trace, execution_trace: item.execution_trace, answer_grounding: item.answer_grounding }, null, 2),
+    };
+  }).filter(Boolean);
+  chainDetail.value = {
+    mode,
+    layer,
+    node,
+    records,
+    page: qaPage.value.page,
+    pageSize: qaPage.value.page_size,
+    total: qaPage.value.total,
+  };
+}
+function closeChainDetail() { chainDetail.value = null; }
+function itemLayerChain(item) {
+  const traces = item?.tool_trace || [];
+  const previews = traces.flatMap((trace) => trace.observation?.preview || []);
+  const keyframes = new Set(previews.filter((row) => row.media_kind === "video_keyframe").map((row) => row.asset_id || row.file_name).filter(Boolean));
+  const events = new Set(previews.map((row) => row.event_context?.id).filter(Boolean));
+  const observations = previews.length;
+  const requirements = getAgent2Requirements(item);
+  const satisfied = requirements.filter((req) => req.status === "satisfied").length;
+  const mediaNames = itemMedia(item).slice(0, 2).map((media) => media.file_name || media.asset_id || media.media_id).filter(Boolean);
+  const previewNames = previews.slice(0, 2).map((row) => row.asset_id || row.file_name || row.media_id).filter(Boolean);
+  const eventNames = [...events].slice(0, 2);
+  const requirementNames = requirements.slice(0, 2).map((req) => req.id).filter(Boolean);
+  const answer = item.final_answer || item.answer;
+  return [
+    { key: "L0", name: "原始流", status: itemMedia(item).length ? "pass" : "na", detail: `${itemMedia(item).length} 媒体${keyframes.size ? ` · 关键帧 ${keyframes.size}` : ""}`, evidence: mediaNames.join("、") || "无 asset_id / media_id" },
+    { key: "L1", name: "场景图", status: observations ? "pass" : "na", detail: observations ? `${observations} 条视觉/文字观察` : "未返回观察", evidence: previewNames.join("、") || "无 observation.preview" },
+    { key: "L2", name: "事件", status: events.size ? "pass" : "na", detail: events.size ? `${events.size} 个事件上下文` : "未带回事件上下文", evidence: eventNames.join("、") || "无 event_context.id" },
+    { key: "L3", name: "目标", status: requirements.length ? (satisfied === requirements.length ? "pass" : "fail") : "na", detail: requirements.length ? `${satisfied}/${requirements.length} 项证据需求` : "未记录规划", evidence: requirementNames.join("、") || "无 evidence_refs" },
+    { key: "L4+", name: "回答", status: answer ? "pass" : "fail", detail: answer ? "已形成回答" : "未形成回答", evidence: answer ? `answer_claims ${item.answer_claims?.length || 0} · Judge ${item.judge?.score ?? "-"}` : "无 final_answer" },
+  ];
+}
+function keyframeDeltaLabel(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "-";
+  const number = Number(value);
+  return `${number >= 0 ? "+" : ""}${number.toFixed(2)} / 2`;
+}
+function keyframeReasonLabel(value) {
+  return Object.entries(value || {}).map(([key, count]) => `${key}×${count}`).join(" · ") || "-";
+}
+const keyframeMetricDefinitions = [
+  { name: "保留率 / 压缩率", formula: "保留率 = 关键帧数 ÷ 原始视频帧数；压缩率 = 1 − 保留率", meaning: "衡量视频被压缩成关键帧后，计算量减少了多少；压缩越高不代表质量越高，必须结合父视频召回率观察。" },
+  { name: "源视频父级召回", formula: "被任一关键帧覆盖的 GT 源视频 ÷ GT 源视频目标", meaning: "回答需要某段视频时，关键帧是否至少代表了这段视频；允许返回关键帧而不是原视频。" },
+  { name: "候选关键帧精确率", formula: "与本题 GT 父视频一致的候选关键帧 ÷ 候选关键帧总数", meaning: "进入 Agent 候选池的关键帧有多少真正相关，反映检索噪声。" },
+  { name: "最终返回精确率", formula: "与本题 GT 父视频一致的最终关键帧 ÷ 最终返回关键帧总数", meaning: "模型实际用于回答的关键帧相关程度，反映重排和工具选择后的有效性。" },
+  { name: "时间间隔 / 覆盖跨度", formula: "同一视频关键帧相邻时间差的均值 / 最早至最晚时间差的均值", meaning: "间隔反映采样密度，跨度反映单个视频被覆盖的时间范围；二者都不是答案准确率。" },
+  { name: "回答质量差值", formula: "有关键帧候选题 Judge 均分 − 无关键帧候选题 Judge 均分", meaning: "用于观察关键帧与回答质量的关联；受题型、样本量和模型状态影响，不能单独视为因果结论。" },
+  { name: "视频处理速度", formula: "原始视频总时长 ÷ 视频处理耗时总和（real-time factor）", meaning: "1.0× 表示处理 1 秒视频约需 1 秒；低于 1.0× 表示处理慢于实时。页面同时给出总耗时和每视频均值。" },
+];
 function toolsForCall(item, callIndex) {
   return itemToolTrace(item).filter((trace) => Number(trace.model_call_index) === callIndex);
 }
@@ -1386,6 +1840,26 @@ async function resetQaFilters() {
   Object.assign(qaFilters, { search: "", score: "", task_type: "", tag: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
   await loadQaPage(1);
 }
+async function loadKeyframeAnalysis(runId) {
+  keyframeAnalysisLoading.value = true;
+  keyframeAnalysisError.value = "";
+  try {
+    const payload = await api(`/api/runs/${encodeURIComponent(runId)}/keyframe-analysis`);
+    if (activeRunId.value === runId) keyframeAnalysis.value = payload;
+  } catch (error) {
+    if (activeRunId.value === runId) keyframeAnalysisError.value = error.message || "关键帧分析失败";
+  } finally {
+    keyframeAnalysisLoading.value = false;
+  }
+}
+async function loadMemoryEffectiveness(runId) {
+  try {
+    const payload = await api(`/api/runs/${encodeURIComponent(runId)}/memory-effectiveness`);
+    if (activeRunId.value === runId) memoryEffectiveness.value = payload;
+  } catch (error) {
+    if (activeRunId.value === runId) memoryEffectiveness.value = { status: "unavailable", error: error.message || "记忆有效性分析失败" };
+  }
+}
 async function loadActiveRun({ resetPage = false } = {}) {
   if (!activeRunId.value) return;
   const runId = activeRunId.value;
@@ -1397,6 +1871,9 @@ async function loadActiveRun({ resetPage = false } = {}) {
     ? { ...run, summary: { ...(run.summary || {}), ...fallbackSummary } }
     : run);
   if (resetPage) {
+    keyframeAnalysis.value = null;
+    keyframeAnalysisError.value = "";
+    memoryEffectiveness.value = null;
     qaPage.value = { items: [], page: 1, page_size: qaPageSize.value, total: 0, pages: 1 };
     Object.keys(qaDetails).forEach((key) => delete qaDetails[key]);
     openQaItems.clear();
@@ -1404,7 +1881,7 @@ async function loadActiveRun({ resetPage = false } = {}) {
     const reviewPayload = await api(`/api/runs/${encodeURIComponent(runId)}/reviews`);
     Object.assign(reviewDrafts, reviewPayload.reviews || {});
   }
-  await loadQaPage(resetPage ? 1 : qaPage.value.page);
+  await Promise.all([loadKeyframeAnalysis(runId), loadMemoryEffectiveness(runId), loadQaPage(resetPage ? 1 : qaPage.value.page)]);
 }
 function reviewFor(summary) {
   const qaId = String(summary?.qa_id || "");
@@ -1622,11 +2099,12 @@ const startDisabledReason = computed(() => {
 });
 const modeLabel = (mode) => (({ full: "全链路", reuse: "复用测评", build: "构建相册" })[mode || "full"] || mode);
 const modeBadgeClass = (mode) => (({ full: "mode-full", reuse: "mode-reuse", build: "mode-build" })[mode || "full"] || "mode-full");
-function exportSftTraces() {
+function exportTraces() {
   if (!activeRunId.value) return;
   const scores = exportScores.value;
   if (!scores.length) { window.alert("请至少勾选一个评分再导出"); return; }
-  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft?scores=${scores.join(",")}`, "_blank");
+  // 每题只含两项：planner 完整输入/输出 + 完整轨迹
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-trace?scores=${scores.join(",")}`, "_blank");
 }
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
@@ -2073,7 +2551,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
               <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
             </span>
-            <button class="btn compact" @click="exportSftTraces">导出 SFT JSON</button>
+            <button class="btn compact" @click="exportTraces" title="每题导出 planner 完整输入/输出 + 完整轨迹">导出轨迹 JSON</button>
           </div>
         </div>
       </div>
@@ -2150,6 +2628,144 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </article>
 </div>
+      <section class="memory-layer-panel">
+        <div class="memory-layer-head">
+          <div><h3>记忆层级与有效证据链</h3><p>分别查看“原始创建链路”和“测评时生效链路”。图中节点都绑定实际字段；点击节点可查看图片、语句、工具记录和已保存的执行轨迹。</p></div>
+          <span class="layer-scope-badge">通用层级 · 时间 / 事件 / 地点 / 人物 / 场景</span>
+        </div>
+        <div class="memory-chain-tabs" role="tablist" aria-label="证据链类型">
+          <button type="button" role="tab" :aria-selected="chainMode === 'creation'" :class="{ active: chainMode === 'creation' }" @click="chainMode = 'creation'">原始创建链路</button>
+          <button type="button" role="tab" :aria-selected="chainMode === 'effective'" :class="{ active: chainMode === 'effective' }" @click="chainMode = 'effective'">测评时生效链路</button>
+          <span>点击节点查看具体图、语句、工具调用和保存的过程记录</span>
+        </div>
+        <div class="memory-tree-diagram" aria-label="记忆层级树状关系图">
+          <div class="memory-tree-title"><strong>层级关系图 / 树状证据链</strong><span>从原始媒体向上追踪到回答；每个彩色节点都可以点击展开证据</span></div>
+          <div class="memory-tree-levels">
+            <template v-for="(layer, layerIndex) in activeEvidenceGraphView" :key="`tree-${layer.key}`">
+              <div class="memory-tree-level" :class="`memory-tree-${layer.color}`">
+                <div class="memory-tree-level-label"><b>{{ layer.key }}</b><strong>{{ layer.name }}</strong></div>
+                <div class="memory-tree-nodes">
+                  <button v-for="node in layer.nodes" :key="`tree-${layer.key}-${node.kind}`" type="button" class="memory-tree-node" @click="openChainNode(chainMode, layer, node)">
+                    <small>{{ node.kind }}</small><b>{{ node.value }}</b><span>{{ node.evidence }}</span>
+                  </button>
+                </div>
+              </div>
+              <div v-if="layerIndex < activeEvidenceGraphView.length - 1" class="memory-tree-link" aria-hidden="true"><i></i><span>↓ {{ layer.transition }}</span></div>
+            </template>
+          </div>
+        </div>
+        <section class="memory-effectiveness-panel">
+          <div class="memory-effectiveness-head">
+            <div><strong>创建记忆 vs 测评覆盖（工程指标，非正确率）</strong><span>这张表只说明数据是否被工具返回、图谱是否挂接、证据需求是否闭合；不能直接代表记忆正确或回答正确。</span></div>
+            <span v-if="memoryEffectiveness?.data_quality?.graph_ready" class="phase-status completed">工具 / 图谱已校验</span>
+            <span v-else-if="memoryEffectiveness?.status === 'ready'" class="phase-status failed">数据不完整</span>
+            <span v-else class="phase-status pending">计算中</span>
+          </div>
+          <div v-if="memoryEffectiveness?.status === 'ready'" class="memory-effect-quality">
+            <span>工具轨迹 {{ memoryEffectiveness.data_quality.tool_trace_count }} 条</span>
+            <span>成功 {{ memoryEffectiveness.data_quality.tool_success_count }} 条</span>
+            <span>媒体预览 {{ memoryEffectiveness.data_quality.preview_count }} 条</span>
+            <span>事件上下文 {{ memoryEffectiveness.data_quality.event_context_count }} 个</span>
+          </div>
+          <div v-if="memoryEffectiveness?.status === 'ready'" class="memory-effect-table-wrap">
+            <table class="memory-effect-table">
+              <thead><tr><th>层级</th><th>创建 / 可用基数</th><th>评测轨迹覆盖</th><th>未覆盖 / 未闭合</th><th>覆盖率（非正确率）</th><th>专项指标（正确性/可用性）</th><th>判定口径</th></tr></thead>
+              <tbody>
+                <tr v-for="level in memoryEffectiveness.levels" :key="level.key">
+                  <td><b>{{ level.key }}</b><strong>{{ level.name }}</strong></td>
+                  <td><b>{{ level.created }}</b><small>{{ level.created_detail }}</small></td>
+                  <td class="effect-good"><b>{{ level.effective }}</b><small>{{ level.effective_detail }}</small></td>
+                  <td class="effect-bad"><b>{{ level.ineffective }}</b><small>{{ level.ineffective_detail }}</small><ul v-if="level.ineffective_reasons?.length" class="memory-invalid-reasons"><li v-for="reason in level.ineffective_reasons" :key="`${level.key}-${reason.label}`"><strong>{{ reason.label }}：{{ reason.count }}</strong><span>{{ reason.meaning }}</span></li></ul></td>
+                  <td><b>{{ fmtPct(level.rate) }}</b><div class="memory-effect-bar"><i :style="{ width: `${Math.min(100, Math.max(0, Number(level.rate || 0) * 100))}%` }"></i></div></td>
+                  <td><div v-for="metric in memoryLayerSpecialMetrics(level)" :key="metric.label" class="memory-special-metric"><b>{{ metric.label }}：{{ metric.value }}</b><small>{{ metric.note }}</small></div></td>
+                  <td><small>创建 → 生效：{{ level.name }} 下游实际可追溯引用</small></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-if="memoryEffectiveness?.status === 'ready'" class="memory-effect-note">口径边界：L0/L1/L2/L3 的数字是工程覆盖、工具可用或证据闭合代理指标，不是语义正确率；只有关键帧相对 GT 的召回/精确率和最终回答 Judge 结果可以作为正确性依据。真正的“记忆是否导致答错”见下方归因矩阵。</p>
+          <p v-else-if="memoryEffectiveness?.error" class="error">{{ memoryEffectiveness.error }}</p>
+          <section v-if="memoryEffectiveness?.status === 'ready' && memoryEffectiveness.details?.answer_correctness" class="answer-correctness-panel">
+            <div class="answer-correctness-head"><strong>最终回答正确性对比</strong><span>按 Judge 评分统计，不等同于工具调用成功率</span></div>
+            <div class="answer-correctness-grid">
+              <div class="answer-correct answer-correct-good"><small>回答正确 · 2 分</small><b>{{ memoryEffectiveness.details.answer_correctness.correct }}</b><span>{{ fmtPct(memoryEffectiveness.details.answer_correctness.exact_accuracy) }} · 共 {{ memoryEffectiveness.levels.find(level => level.key === 'L4+')?.created || 0 }} 题</span></div>
+              <div class="answer-correct answer-correct-partial"><small>部分正确 · 1 分</small><b>{{ memoryEffectiveness.details.answer_correctness.partial }}</b><span>{{ fmtPct((memoryEffectiveness.details.answer_correctness.partial || 0) / (memoryEffectiveness.levels.find(level => level.key === 'L4+')?.created || 1)) }}</span></div>
+              <div class="answer-correct answer-correct-bad"><small>回答错误 · 0 分</small><b>{{ memoryEffectiveness.details.answer_correctness.incorrect }}</b><span>{{ fmtPct((memoryEffectiveness.details.answer_correctness.incorrect || 0) / (memoryEffectiveness.levels.find(level => level.key === 'L4+')?.created || 1)) }}</span></div>
+              <div class="answer-correct answer-correct-na"><small>未评分</small><b>{{ memoryEffectiveness.details.answer_correctness.unjudged }}</b><span>不纳入正确率</span></div>
+            </div>
+            <div class="answer-layer-architecture memory-validity-architecture">
+              <div class="answer-layer-title"><strong>记忆有效性分层指标</strong><span>原始媒体与关键帧从 L0 逐层进入最终回答</span></div>
+              <div v-for="(layer, layerIndex) in memoryValidityArchitecture" :key="layer.key" class="answer-layer-row" :class="`answer-layer-${layer.key.toLowerCase().replace('+','')}`">
+                <div class="answer-layer-label"><b>{{ layer.key }}</b><strong>{{ layer.name }}</strong><small>{{ layer.stage }}</small></div>
+                <div class="answer-layer-track">
+                  <div v-for="node in layer.nodes" :key="`${layer.key}-${node.label}`" class="answer-layer-node"><small>{{ node.label }}</small><b>{{ node.value }}</b><span>{{ node.note }}</span></div>
+                </div>
+                <div v-if="layerIndex < memoryValidityArchitecture.length - 1" class="answer-layer-bridge"><i>↓</i><span>{{ layerIndex === 0 ? '解析并形成场景记忆' : layerIndex === 1 ? '聚合为事件记忆' : layerIndex === 2 ? '形成可引用证据' : '生成并判定回答' }}</span></div>
+              </div>
+      <p class="answer-layer-note">口径：L0 的创建量只是记忆库规模；原始图片用测评 Recall，关键帧用“父级视频 Recall / 返回关键帧 Precision”。L1–L3 是测评期间的解析、图谱和证据链覆盖代理，只有 L4+ 的 Exact Accuracy 才是最终回答正确率。</p>
+            </div>
+          </section>
+          <section v-if="memoryRecallMatrices.length" class="memory-answer-attribution-panel">
+            <div class="answer-correctness-head"><strong>命中 × 回答结果分层矩阵</strong><span>工具召回命中 / 模型使用命中分开统计；只统计有 GT 媒体的可归因题目（{{ memoryRecallMatrices[0].eligible }} 题），数字由当前 run 实时计算</span></div>
+            <div class="recall-matrices">
+              <div v-for="matrix in memoryRecallMatrices" :key="matrix.key" class="answer-layer-architecture recall-layer-architecture recall-matrix" :class="`recall-matrix-${matrix.key}`">
+                <div class="answer-layer-title"><strong>{{ matrix.title }}</strong><span>{{ matrix.note }}</span></div>
+                <div v-for="(layer, layerIndex) in matrix.layers" :key="`${matrix.key}-${layer.key}`" class="answer-layer-row" :class="`answer-layer-${layer.key.toLowerCase().replace('+','')}`">
+                  <div class="answer-layer-label"><b>{{ layer.key }}</b><strong>{{ layer.name }}</strong><small>{{ layer.stage }}</small></div>
+                  <div v-if="layer.key === 'L2'" class="answer-layer-track answer-layer-branch-track">
+                    <div v-for="group in layer.groups" :key="group.label" class="answer-layer-branch-group">
+                      <div class="answer-layer-branch-head"><strong>{{ group.label }}</strong><b>{{ fmtPct(group.total / matrix.eligible) }}</b><small>{{ group.total }} 题 · {{ group.note }}</small></div>
+                      <div class="answer-layer-branch-nodes">
+                        <div v-for="node in group.nodes" :key="`${matrix.key}-${group.label}-${node.label}`" class="answer-layer-node"><small>{{ node.label }}</small><b>{{ node.value }}</b><span>{{ node.note }}</span></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else class="answer-layer-track">
+                    <div v-for="node in layer.nodes" :key="`${matrix.key}-${layer.key}-${node.label}`" class="answer-layer-node"><small>{{ node.label }}</small><b>{{ node.value }}</b><span>{{ node.note }}</span></div>
+                  </div>
+                  <div v-if="layerIndex < matrix.layers.length - 1" class="answer-layer-bridge"><i>↓</i><span>{{ layerIndex === 0 ? '进入命中判定' : layerIndex === 1 ? '进入 Judge 评分' : '汇总为有效性指标' }}</span></div>
+                </div>
+                <p class="answer-layer-note">口径：{{ matrix.note }}；命中后按 Judge 判定：2 或 1 的有效证据计有效、0 计无效，未命中单独计为未命中。样本量随当前 run 变化，不做预设。</p>
+              </div>
+            </div>
+          </section>
+        </section>
+        <div class="memory-graph-caption">字段证据明细（与上方树状关系图对应）</div>
+        <div class="memory-evidence-graph" role="img" aria-label="L0 到 L4+ 逐层证据链图">
+          <div v-for="(layer, layerIndex) in activeEvidenceGraphView" :key="layer.key" class="memory-graph-lane" :class="`memory-graph-${layer.color}`">
+            <div class="memory-graph-label"><b>{{ layer.key }}</b><strong>{{ layer.name }}</strong><span>{{ layer.stage }}</span></div>
+            <div class="memory-graph-track">
+              <button v-for="node in layer.nodes" :key="`${layer.key}-${node.kind}`" type="button" class="memory-graph-node" @click="openChainNode(chainMode, layer, node)">
+                <small>{{ node.kind }}</small><b>{{ node.value }}</b><span>{{ node.evidence }}</span>
+              </button>
+            </div>
+            <div v-if="layerIndex < activeEvidenceGraphView.length - 1" class="memory-graph-bridge"><i aria-hidden="true">↓</i><span>{{ layer.transition }}</span></div>
+          </div>
+        </div>
+        <section class="keyframe-analysis-panel">
+          <div class="keyframe-analysis-head"><div><strong>关键帧有效性评估</strong><span>只保留关键帧规模、覆盖/检索、时间采样、回答对照、压缩率和视频处理速度</span><span v-if="keyframeAnalysis?.asset_source_note" class="keyframe-source-note">证据源：{{ keyframeAnalysis.asset_source_note }}</span></div><span v-if="keyframeAnalysisLoading" class="phase-status running">分析中</span><span v-else-if="keyframeAnalysis?.status === 'ready'" class="phase-status completed">已计算</span></div>
+          <p v-if="keyframeAnalysisError" class="error">{{ keyframeAnalysisError }}</p>
+          <div v-else-if="keyframeAnalysis?.status === 'ready'" class="keyframe-analysis-grid">
+            <div><small>关键帧规模</small><b>{{ keyframeAnalysis.assets.keyframes }}</b><span>{{ keyframeAnalysis.assets.source_videos }} 个源视频 · 平均 {{ keyframeAnalysis.assets.keyframes_per_video_mean ?? "-" }} 帧/视频</span></div>
+            <div><small>源视频父级召回</small><b>{{ fmtPct(keyframeAnalysis.retrieval.video_parent_recall) }}</b><span>{{ keyframeAnalysis.retrieval.video_gt_targets }} 个 GT 视频目标中，{{ keyframeAnalysis.retrieval.video_gt_targets_hit_by_keyframe }} 个被关键帧覆盖</span></div>
+            <div><small>候选关键帧精确率</small><b>{{ fmtPct(keyframeAnalysis.retrieval.candidate_precision) }}</b><span>{{ keyframeAnalysis.retrieval.candidate_relevant_keyframes }}/{{ keyframeAnalysis.retrieval.candidate_keyframes }} 个候选与 GT 父视频一致</span></div>
+            <div><small>模型最终返回精确率</small><b>{{ fmtPct(keyframeAnalysis.retrieval.predicted_precision) }}</b><span>{{ keyframeAnalysis.retrieval.predicted_relevant_keyframes }}/{{ keyframeAnalysis.retrieval.predicted_keyframes }} 个返回关键帧有效</span></div>
+            <div><small>时间采样</small><b>{{ keyframeAnalysis.temporal.mean_gap_sec == null ? "-" : `${keyframeAnalysis.temporal.mean_gap_sec.toFixed(1)}s` }}</b><span>平均间隔 · 平均覆盖跨度 {{ keyframeAnalysis.temporal.mean_span_sec == null ? "-" : `${keyframeAnalysis.temporal.mean_span_sec.toFixed(1)}s` }}</span></div>
+            <div><small>回答质量对照</small><b>{{ keyframeDeltaLabel(keyframeAnalysis.usefulness.answer_quality_delta) }}</b><span>有关键帧 {{ keyframeAnalysis.usefulness.answer_quality_with_keyframe ?? "-" }} · 无关键帧 {{ keyframeAnalysis.usefulness.answer_quality_without_keyframe ?? "-" }}（非因果）</span></div>
+            <div><small>全量帧保留 / 压缩</small><b>{{ keyframeAnalysis.processing?.retained_frame_ratio == null ? "未保存原始帧" : `${fmtPct(keyframeAnalysis.processing.retained_frame_ratio)} / ${fmtPct(keyframeAnalysis.processing.compression_ratio)}` }}</b><span>{{ keyframeAnalysis.processing?.raw_frame_count ? `${keyframeAnalysis.processing.keyframe_count ?? keyframeAnalysis.assets.keyframes} / ${keyframeAnalysis.processing.raw_frame_count} 原始帧` : "复用记忆未重新执行视频处理，无法计算原始帧压缩率" }}</span></div>
+            <div><small>视频处理速度</small><b>{{ keyframeAnalysis.processing?.realtime_factor == null ? "未记录" : `${keyframeAnalysis.processing.realtime_factor.toFixed(3)}×` }}</b><span>{{ keyframeAnalysis.processing?.processing_seconds_total ? `总耗时 ${keyframeAnalysis.processing.processing_seconds_total}s · 均值 ${keyframeAnalysis.processing.processing_seconds_mean ?? "-"}s/视频` : "复用记忆没有视频处理耗时，不估算速度" }}</span></div>
+          </div>
+          <details v-if="keyframeAnalysis?.status === 'ready'" class="metric-definition-panel">
+            <summary>指标定义、计算式与判读</summary>
+            <div v-for="definition in keyframeMetricDefinitions" :key="definition.name" class="metric-definition-row">
+              <strong>{{ definition.name }}</strong><span><b>计算式：</b>{{ definition.formula }}</span><span><b>含义：</b>{{ definition.meaning }}</span>
+            </div>
+          </details>
+          <p v-if="keyframeAnalysis?.status === 'ready'" class="keyframe-analysis-note">选择策略：{{ keyframeReasonLabel(keyframeAnalysis.temporal.selection_reasons) }} · 已覆盖 {{ keyframeAnalysis.temporal.videos_sampled }} 个视频、{{ keyframeAnalysis.usefulness.event_context_count }} 个事件上下文。父级召回衡量“关键帧能否代表源视频”，候选精确率衡量“是否混入无关帧”，两者应同时观察。</p>
+          <p v-else-if="!keyframeAnalysisLoading" class="keyframe-analysis-note">尚未取得完整 run 轨迹，暂不能计算关键帧有效性。</p>
+        </section>
+        <p class="memory-layer-footnote">指标口径：运行级指标来自本次 run 的汇总轨迹；“已展开轨迹”只对当前打开的 QA 逐题核验。这样可以直接定位是 L0 媒体、L1 解析、L2 事件聚合、L3 目标分解还是 L4+ 回答阶段出了问题。</p>
+      </section>
       <h3 class="result-heading">结果指标</h3>
 <div class="result-phase-list">
         <article class="phase-card result-phase-card gpu-result-card">
@@ -2300,6 +2916,17 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                 <span v-if="itemDetail(summary).answerability">{{ itemDetail(summary).answerability }}</span>
                 <span v-for="tag in itemDetail(summary).tags || []" :key="tag" class="qa-run-tag">{{ tag }}</span>
               </div>
+              <section class="qa-layer-chain">
+                <div class="qa-layer-chain-head"><strong>本题证据链</strong><span>关键帧若存在，显示为 L0 媒体；不会直接标成 L2 事件</span></div>
+                <div class="qa-layer-chain-row">
+                  <div v-for="(node, nodeIndex) in itemLayerChain(itemDetail(summary))" :key="node.key" class="qa-layer-node-wrap">
+                    <div class="qa-layer-node" :class="`qa-layer-node-${node.status}`">
+                      <b>{{ node.key }}</b><strong>{{ node.name }}</strong><span>{{ node.detail }}</span><em>{{ node.evidence }}</em>
+                    </div>
+                    <i v-if="nodeIndex < itemLayerChain(itemDetail(summary)).length - 1" class="qa-layer-arrow" aria-hidden="true">→</i>
+                  </div>
+                </div>
+              </section>
               <section v-if="conversationTurns(itemDetail(summary)).length > 1" class="result-conversation-card">
                 <header class="result-conversation-head">
                   <div><small>MULTI-TURN CONVERSATION</small><strong>同一个多轮对话样本</strong><span>{{ conversationTurns(itemDetail(summary)).length }} 轮按顺序执行，后续轮次复用同一会话上下文</span></div>
@@ -2336,11 +2963,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                     <span><small>JSON 解析</small><b>{{ itemParseRate(itemDetail(summary)) }}</b></span>
                     <span><small>步数内完成</small><b>{{ completionLabel(itemDetail(summary)) }}</b></span>
                   </div>
-                  <h4>模型召回媒体（{{ itemMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemMedia(itemDetail(summary)).length" class="muted small">模型没有返回可识别的媒体</span></div>
-                  <h4>回答来源媒体（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`evidence-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
-                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`evidence-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
+                  <h4>工具召回图片（{{ toolRecallMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in toolRecallMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!toolRecallMedia(itemDetail(summary)).length" class="muted small">检索未返回可识别媒体</span></div>
+                  <h4>模型使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`used-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">回答依据图片为空（模型未选择交付图）</span></div>
+                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`used-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>
@@ -2605,5 +3232,28 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <p>{{ lightbox.name }}</p>
 </div>
   </div>
+  <Teleport to="body">
+    <div v-if="chainDetail" class="chain-detail-backdrop" @click.self="closeChainDetail">
+      <section class="chain-detail-modal" role="dialog" aria-modal="true" aria-label="证据链节点详情">
+        <header class="chain-detail-head">
+          <div><small>{{ chainDetail.mode === 'creation' ? 'ORIGINAL CREATION CHAIN' : 'EFFECTIVE EVALUATION CHAIN' }}</small><h3>{{ chainDetail.layer.key }} · {{ chainDetail.layer.name }} · {{ chainDetail.node.kind }}</h3><span>{{ chainDetail.node.value }} · {{ chainDetail.node.evidence }}</span></div>
+          <button class="judge-modal-close" type="button" aria-label="关闭" @click="closeChainDetail">×</button>
+        </header>
+        <div class="chain-detail-body">
+          <div class="chain-detail-summary">当前展示第 {{ chainDetail.page }} 页的 {{ chainDetail.records.length }} 条 QA 链路（每页 {{ chainDetail.pageSize }} 条，共 {{ chainDetail.total }} 条）。切换 QA 分页后，可继续查看其他链路。</div>
+          <details v-for="(record, recordIndex) in chainDetail.records" :key="record.key" class="chain-record" :open="recordIndex === 0">
+            <summary><b>QA {{ record.index + 1 }}</b><span>{{ record.question }}</span><em>{{ record.media.length }} 媒体 · {{ record.statements.length }} 语句 · {{ record.traceRows.length }} 调用</em></summary>
+            <div class="chain-record-body">
+              <section class="chain-detail-section"><h4>图像 / 媒体证据 <small>{{ record.media.length }} 项</small></h4><div class="chain-detail-media-grid"><div v-for="media in record.media" :key="`${record.key}-${mediaKey(media)}`" class="chain-detail-media"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><button v-else-if="imageUrl(media)" type="button" @click="openImage(media)"><img :src="imageUrl(media)" :alt="media.file_name || media.media_id" loading="lazy" /></button><span v-else class="image-empty">媒体文件未能解析</span><small>{{ media.file_name || media.media_id || media.asset_id }}</small></div><p v-if="!record.media.length" class="muted small">该节点没有保存可展示的媒体引用。</p></div></section>
+              <section class="chain-detail-section"><h4>结构化语句 / 观察 <small>{{ record.statements.length }} 项</small></h4><div class="chain-detail-statements"><article v-for="statement in record.statements" :key="`${record.key}-${statement.label}-${statement.value}`"><b>{{ statement.label }}</b><p>{{ statement.value }}</p></article><p v-if="!record.statements.length" class="muted small">没有保存文字观察或回答声明。</p></div></section>
+              <section class="chain-detail-section"><h4>工具调用与返回 <small>{{ record.traceRows.length }} 项</small></h4><details v-for="row in record.traceRows" :key="`${record.key}-${row.label}`" class="chain-trace-row"><summary>{{ row.label }}</summary><pre>{{ row.value }}</pre></details><p v-if="!record.traceRows.length" class="muted small">该节点没有保存工具调用轨迹。</p></section>
+              <section class="chain-detail-section"><h4>已保存的执行过程 / 证据归因</h4><p class="chain-detail-disclaimer">以下只展示系统实际保存的 execution trace、Agent 证据账本和 grounding 信息，不把未保存的模型隐藏思维链伪装成可复现推理。</p><pre class="chain-reasoning-pre">{{ record.reasoning }}</pre></section>
+            </div>
+          </details>
+          <p v-if="!chainDetail.records.length" class="muted small">当前页没有成功读取到可展开的 QA 记录，请先确认 QA 接口可用。</p>
+        </div>
+      </section>
+    </div>
+  </Teleport>
   <Teleport to="body"><div v-if="judgeModal" class="judge-modal-backdrop" @click.self="closeJudgeInput"><section class="judge-modal" role="dialog" aria-modal="true" aria-label="Judge 模型原始输入"><header><div><h3>JUDGE 模型原始输入</h3><span class="muted small">{{ judgeModal.qaId }}</span></div><button class="judge-modal-close" type="button" aria-label="关闭" @click="closeJudgeInput">×</button></header><pre v-if="judgeModal.complete">{{ judgeModal.rawJson }}</pre><p v-else class="judge-input-note">该历史结果在运行时未保存 Judge 原始请求 JSON，无法恢复。</p></section></div></Teleport>
 </template>
