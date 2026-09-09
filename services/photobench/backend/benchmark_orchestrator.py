@@ -5910,6 +5910,75 @@ class OrchestratorRepository:
             return None
         return values[max(0, min(len(values) - 1, math.ceil(len(values) * percentile) - 1))]
 
+    def export_traces(self, run_id: str, scores: list[int] | None = None,
+                      min_score: int | None = None) -> dict:
+        """按问题导出，每问只给两项：planner 完整输入/输出 + 完整 debug 轨迹。
+
+        不做任何重排/合成：
+        - planner：保留该步原始 prompt（输入）与 raw_full（输出/声明），显式标为 planner；
+        - trajectory：其余步按原顺序给出（model 步带该步完整 prompt 与 raw_full，
+          工具返回已包含在后续 prompt 的 user 消息里），供逐题核对"模型看到什么、输出了什么"。
+        scores: 非空时只导出评分落在该集合内的题目；min_score: 导出评分 >= 该值的题目。
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = run.state if isinstance(run, BenchmarkRun) else run
+            include = set(scores) if scores else None
+            items_out = []
+            for index, item in enumerate(state.get("items") or []):
+                if include is not None:
+                    item_score = (item.get("judge") or {}).get("score")
+                    if item_score not in include:
+                        continue
+                elif min_score is not None:
+                    item_score = (item.get("judge") or {}).get("score")
+                    if item_score is None or item_score < min_score:
+                        continue
+                planner = None
+                trajectory = []
+                for turn in (item.get("runtime_turns") or []):
+                    for step in (turn.get("debug_trace") or []):
+                        if not isinstance(step, dict):
+                            continue
+                        stype = step.get("type")
+                        if stype == "planner":
+                            # planner 单独成块并显式标注，不进 trajectory
+                            planner = {
+                                "type": "planner",
+                                "prompt": step.get("prompt"),
+                                "raw_full": step.get("raw_full") or step.get("raw"),
+                            }
+                            continue
+                        entry = {"type": stype}
+                        for key in ("step_id", "call_type", "status", "tool", "role",
+                                    "codes", "problems", "faithful", "reason",
+                                    "attempt", "tool_candidates"):
+                            if step.get(key) is not None:
+                                entry[key] = step[key]
+                        if step.get("prompt") is not None:
+                            entry["prompt"] = step["prompt"]
+                        content = step.get("raw_full") or step.get("raw")
+                        if content:
+                            entry["raw_full"] = content
+                        trajectory.append(entry)
+                items_out.append({
+                    "index": index,
+                    "qa_id": item.get("qa_id"),
+                    "question": item.get("question"),
+                    "planner": planner or {"type": "planner",
+                                           "note": "该题未产生 planner 步"},
+                    "trajectory": trajectory,
+                })
+            return {
+                "run_id": run_id,
+                "album_id": state.get("album_id"),
+                "qa_set": state.get("qa_set"),
+                "count": len(items_out),
+                "items": items_out,
+            }
+
     @classmethod
     def _effective_summary(cls, state: dict) -> dict:
         saved = dict(state.get("summary") or {})
@@ -6839,6 +6908,22 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/memory-effectiveness"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/memory-effectiveness"))
                 self._json(self.repo.get_memory_effectiveness(run_id))
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-trace"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-trace"))
+                _q = parse_qs(parsed.query)
+                _raw_scores = (_q.get("scores") or [""])[0]
+                scores = [int(x) for x in _raw_scores.split(",") if x.strip() in {"0", "1", "2"}]
+                _raw = (_q.get("min_score") or [""])[0]
+                min_score = int(_raw) if _raw in {"1", "2"} else None
+                payload = self.repo.export_traces(run_id, scores=scores or None, min_score=min_score)
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{run_id}-trace.json"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))

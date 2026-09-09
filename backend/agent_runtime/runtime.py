@@ -2705,8 +2705,10 @@ class AgentRuntime:
                             stage="recovering", status="running",
                             text="结果里有一处信息对不上，我正在重新核对。")
                         last_answer = (turn.final_answer or "").strip()[:300]
-                        messages.append({"role": "assistant",
-                                         "content": f"（你上一版 final 回答）{last_answer}"})
+                        # 不要把"（你上一版 final 回答）"这类代码元注释冒充模型自己的话塞给它；
+                        # 只原样回放上一条最终回答，并在下一条 user 里点明"上一条是你的最终回答"。
+                        if last_answer:
+                            messages.append({"role": "assistant", "content": last_answer})
                         inspect_obs = [
                             tr.get("inspect_text") for tr in task.tool_results
                             if tr.get("tool") == "inspect_photo" and tr.get("inspect_text")
@@ -2720,7 +2722,8 @@ class AgentRuntime:
                         issue_lines = problems.natural_messages if hasattr(problems, "natural_messages") \
                             else [str(p) for p in problems]
                         recovery = (
-                            "你的最终回答与工具结果有冲突，需要修正后重新输出 final：\n- "
+                            "上一条（你刚输出的内容）是你的最终回答。你的最终回答与工具结果有冲突，"
+                            "需要修正后重新输出 final：\n- "
                             + "\n- ".join(issue_lines) +
                             "\n\n可信事实（只能基于这些，不要重新调用昂贵工具）：\n- "
                             + "\n- ".join(trusted or ["(无工具结果)"]) +
