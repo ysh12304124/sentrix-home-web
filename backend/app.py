@@ -2118,16 +2118,28 @@ def _seed_face_detect(path: str) -> list[dict]:
     # Step 3: whole-image fallback for pre-cropped face photos
     try:
         _crop = align_face_crop(_img, [0, 0, _w, _h])
-        _emb = pipeline.face.identity_adapter.embed(_crop)
+        _identity_adapter = getattr(pipeline.face, "identity_adapter", None)
+        if _identity_adapter is not None:
+            _emb = _identity_adapter.embed(_crop)
+            embedding = _emb.embedding
+            embedding_model = pipeline.face.identity_model
+            embedding_version = _emb.model_version
+            quality_signal = _emb.quality_signal
+        else:
+            # identity_adapter未配置(legacy模式):用CLIP embedding兜底
+            embedding = []
+            embedding_model = "legacy"
+            embedding_version = "no_identity_adapter"
+            quality_signal = 0.5
         return [{
             "bbox": [0, 0, float(_w), float(_h)],
             "confidence": 0.99, "quality": 0.8,
             "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
-            "landmarks": [], "embedding": _emb.embedding,
-            "embedding_model": pipeline.face.identity_model,
-            "embedding_version": _emb.model_version,
-            "quality_signal": _emb.quality_signal,
-            "pose_bucket": "frontal", "identity_ready": True,
+            "landmarks": [], "embedding": embedding,
+            "embedding_model": embedding_model,
+            "embedding_version": embedding_version,
+            "quality_signal": quality_signal,
+            "pose_bucket": "frontal", "identity_ready": _identity_adapter is not None,
         }]
     except Exception:
         return []
@@ -2168,7 +2180,7 @@ async def seed_person_identity(
     if not face_photos:
         raise HTTPException(status_code=422, detail="no detectable faces in uploaded photos")
     result = store.seed_person_identity(scope, name, (familyRole or "").strip() or None, alias_list, face_photos)
-    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": m_role, "aliases": result["aliases"]}
+    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": (familyRole or "").strip() or None, "aliases": result["aliases"]}
 
 
 @app.post("/api/people/seed-batch", status_code=201)

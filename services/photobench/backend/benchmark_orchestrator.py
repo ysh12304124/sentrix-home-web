@@ -1853,6 +1853,7 @@ class BenchmarkRun:
         return snapshot
 
     def execute(self):
+        print(f"[execute] entering execute() for run {self.run_id}", flush=True)
         if self._cancel.is_set():
             self.state["status"] = "cancelled"
             self.state["finished_at"] = self.state.get("finished_at") or now_iso()
@@ -1877,12 +1878,15 @@ class BenchmarkRun:
         ]
         selected_phase_names = self._selected_phase_names()
         phases = [(name, fn) for name, fn in all_phases if name in selected_phase_names]
+        print(f"[execute] phases to run: {[n for n,_ in phases]}", flush=True)
         try:
             for name, fn in phases:
+                print(f"[execute] starting phase: {name}", flush=True)
                 if self._cancel.is_set():
                     break
                 self._current_phase = name
                 fn()
+                print(f"[execute] finished phase: {name}", flush=True)
             if self._cancel.is_set():
                 if self._current_phase:
                     self._record_phase(self._current_phase, "status", "cancelled")
@@ -2029,6 +2033,17 @@ class BenchmarkRun:
                 "health_check": "skipped",
                 "model_probe": "skipped",
                 "runtime": runtime,
+            })
+            return
+        if self.use_current_model:
+            print(f"[model_deploy] using current model: {self.model_profile} at {self.vllm_model_base_url}", flush=True)
+            self._phase_done("model_deploy", {
+                "source": "current_model",
+                "deployment_mode": "local_existing",
+                "manager_status": "not_applicable",
+                "health_check": "skipped",
+                "model_probe": "skipped",
+                "model_name": self.model_profile,
             })
             return
         t0 = time.perf_counter()
@@ -5742,13 +5757,20 @@ class OrchestratorRepository:
 
         def _run_sequentially():
             for rid in created_runs:
-                run = self.runs.get(rid)
-                if run is None or not isinstance(run, BenchmarkRun):
-                    print(f"[suite] run {rid} not found in registry; skipping", flush=True)
-                    continue
-                if run._cancel.is_set() or run.state.get("status") == "cancelled":
-                    continue
-                run.execute()
+                try:
+                    run = self.runs.get(rid)
+                    if run is None or not isinstance(run, BenchmarkRun):
+                        print(f"[suite] run {rid} not found in registry; skipping", flush=True)
+                        continue
+                    if run._cancel.is_set() or run.state.get("status") == "cancelled":
+                        continue
+                    print(f"[suite] starting run {rid}", flush=True)
+                    run.execute()
+                    print(f"[suite] run {rid} finished", flush=True)
+                except Exception as e:
+                    print(f"[suite] run {rid} crashed: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc(flush=True)
 
         threading.Thread(target=_run_sequentially, name=f"suite-{suite_id}", daemon=True).start()
         return {"suite_id": suite_id, "run_ids": created_runs, "album_id": album_id,
