@@ -26,7 +26,10 @@ _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精�
 只声明回答问题所必需的最小证据集合，不要把检索步骤本身当成答案证据重复声明。规则：
 - goal 必须用简体中文描述用户目标（家庭记忆系统使用中文，英文目标会导致语义检索
   与中文图片描述失配、召回失败）；描述要保留完整语义，不要压缩成几个词。
-- 数量、是否存在、分组等结构化问题声明 structured_fact；拍摄时间/日期/年份声明 temporal_metadata；只有用户明确要求找出照片时才增加 memory_asset。
+- 凡答案要从相册照片里得到（地点/时间/人物/内容/合影张数/有没有某物/礼金账本文字等），都应声明 memory_asset 并先检索；
+  金额/礼金总额/花费这类若相册里没有照片或文字依据就答不上来的题，不要声明 structured_fact——检索后没有依据就如实说明无法确认，绝不编造数字。
+- structured_fact 只用于能从照片/文字直接确认的确定事实（如某张照片的拍摄年份、读到的价格/年份、几种不同人数的合影张数）；
+  拍摄时间/日期/年份声明 temporal_metadata；照片里的文字/数字/价格声明 visible_text。
 - 用户没有明确要求“历史对话/之前说过什么”时，不要声明 user_statement。
 - 地点问题声明 location_metadata；照片内容/颜色/动作声明 visual_observation；照片文字/数字声明 visible_text。
 - 身份问题只有在需要确认照片中的人名时才声明 photo_identity；不要用 visual_observation 代替身份。
@@ -85,7 +88,7 @@ class GoalPlanner:
             {"role": "user", "content": message},
         ]
         if history:
-            messages[0]["content"] = messages[0]["content"] + "\n\n历史对话背景：\n" + history
+            messages.insert(1, {"role": "system", "content": "历史对话背景：\n" + history})
         prompt_copy = copy.deepcopy(messages) if include_debug else None
         try:
             sig = inspect.signature(self.chat_fn)
@@ -165,11 +168,9 @@ class GoalPlanner:
                     "required": bool(item.get("required", True)),
                 })
         if not normalized_reqs:
-            normalized_reqs.append({
-                "id": "req_1",
-                "evidence_type": "memory_asset",
-                "description": "查找相关记忆照片",
-            })
+            # 允许零需求：无照片证据可确认的全库统计/拒答题，或纯聊天，不强行凑一个
+            # memory_asset 需求。模型在回答阶段决定是否需要检索。
+            pass
         decl["requirements"] = normalized_reqs
         return payload
 

@@ -69,24 +69,28 @@ class ToolPolicy:
         "unresolved", "delivered", "blocked", "observation", "certainty",
         "confirms_visual_only", "source", "persisted", "question", "asset_handle",
         "reason", "url", "status", "family_role", "photo_identities",
-        "call_status", "_model_call_metrics",
+        "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
-        "query_memory_facts": _DEFAULT_ALLOWED | {
-            "operation", "answer_type", "value", "rows", "filters_applied",
-            "scanned_observations", "total_meal_observations", "event_count",
-            "explicit_foods", "explicit_food_events", "meal_scene_events",
-            "possible_events", "time_range", "rows_truncated", "samples", "items",
-        },
         "query_photo_people": _DEFAULT_ALLOWED | {
             "result_set_id", "asset_id", "people", "unconfirmed_people",
             "unconfirmed_people_count", "source_asset_ids", "source_handles",
             "evidence_asset_ids", "evidence_kind", "summary",
         },
         "search_memories": _DEFAULT_ALLOWED | {
-            # 只保留模型决策需要的顶层字段;检索内部/统计/诊断字段留在服务端
-            # 与 debug trace,不进入模型上下文（见 runtime._model_visible_observation）。
-            "query", "query_satisfaction", "recommended_handle", "place",
+            "query", "mode", "gaps", "query_satisfaction", "answerability",
+            "condition_summary", "can_inspect", "inspect_hint",
+            "recommended_resolution", "recommended_handle",
+            "asset_ids", "evidence_count", "place",
+            "retrieved_total", "evidence_total", "selected_total",
+            "raw_candidate_count", "validation_candidate_count",
+            "validation_batches", "validation_error", "validation_rows",
+            "ranked_asset_ids", "selected_asset_ids",
+            "candidate_window", "relaxation_level",
+            "retrieval_timing", "_preview_asset_ids", "_retrieved_asset_ids",
+            "retrieval_channels",
+            "retrieved_asset_ids", "evidence_asset_ids", "source_asset_ids",
+            "reference_resolution", "evidence_status", "validation_status",
             "group_photo_count", "group_photo_sizes", "group_photo_rows",
         },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id", "media_type",

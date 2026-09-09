@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from .guard_types import (GuardIssue, GuardResult, REVISION_REWRITE_ONLY,
                           SEVERITY_STYLE, SEVERITY_TRUTH)
@@ -22,6 +23,7 @@ from .guard_types import (GuardIssue, GuardResult, REVISION_REWRITE_ONLY,
 JUDGE_SYSTEM = """你是 Sentrix 家庭记忆助手的“事实一致性评审”。你的任务是核对模型的最终回答是否忠实于工具观察。
 
 工具观察是唯一可信事实来源。请判断最终回答是否存在以下问题：
+注意：完整轨迹里的"观察"不止是读出的文字，还包括照片/视频/事件的拍摄时间（captured_at）、地点等元数据与检索命中的照片信息；这些元数据与文字同等可信，回答依据拍摄时间给出年份/日期不算编造。
 1. fabrication（编造）：回答断言了观察中明确没有的事实或细节。例如观察说“照片中没有猫”，回答却说“猫是白色的”。
 2. contradiction（矛盾）：回答与观察直接冲突。例如观察说“多云天气”，回答说“晴天阳光充足”；工具确认数量是 5，回答写 3。
 3. omission（漏报/否认）：工具返回了结果（total>0 或有观察），回答却整体否认“没有找到/没找到/未找到/不存在”。
@@ -98,8 +100,14 @@ def parse_verdict(raw: str) -> dict | None:
 
 def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
                        trusted_facts: list[str] | None = None,
+                       messages: list | None = None,
                        include_debug: bool = False):
-    """返回 (faithful, issues[, debug])。任何异常/输出不可解析都降级为放行。"""
+    """返回 (faithful, issues[, debug])。任何异常/输出不可解析都降级为放行。
+
+    messages: 完整 agent 对话轨迹（含全部工具返回与 captured_at 等元数据）。
+    提供时评审以完整轨迹为准（不再只看压缩投影/可信事实白名单），避免"依据拍摄时间
+    答对却被误判编造"。
+    """
     try:
         obs_lines = []
         for tr in tool_results or []:
@@ -116,12 +124,34 @@ def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
             obs_lines.append("- " + json.dumps(compact, ensure_ascii=False))
         facts_block = ("\n".join(f"- {f}" for f in (trusted_facts or []))
                        or "(从观察中提取)")
-        user = (
-            f"用户问题：{query}\n"
-            f"工具观察：\n" + ("\n".join(obs_lines) or "(无)") + "\n"
-            f"可信事实（回答必须与之一致）：\n{facts_block}\n"
-            f"模型最终回答：{answer}"
-        )
+        if messages:
+            # 完整轨迹优先：评审能看到工具返回里被压缩投影丢弃的字段
+            # （captured_at/地点/preview 等），不会被"可信事实白名单"误导。
+            transcript_lines = []
+            for m in messages[-8:]:
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role") or "?")
+                content = str(m.get("content") or "")
+                content = re.sub(r"\s+", " ", content).strip()
+                if len(content) > 900:
+                    content = content[:900] + "…(截断)"
+                if content:
+                    transcript_lines.append(f"{role}: {content}")
+            transcript = "\n".join(transcript_lines)
+            user = (
+                f"用户问题：{query}\n"
+                f"完整对话轨迹（含全部工具返回与 captured_at 等元数据）：\n"
+                f"{transcript or '(无)'}\n"
+                f"模型最终回答：{answer}"
+            )
+        else:
+            user = (
+                f"用户问题：{query}\n"
+                f"工具观察：\n" + ("\n".join(obs_lines) or "(无)") + "\n"
+                f"可信事实（回答必须与之一致）：\n{facts_block}\n"
+                f"模型最终回答：{answer}"
+            )
         judge_messages = [
             {"role": "system", "content": JUDGE_SYSTEM},
             {"role": "user", "content": user},

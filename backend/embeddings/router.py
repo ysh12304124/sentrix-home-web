@@ -26,9 +26,14 @@ class EmbeddingRouter:
 
     @classmethod
     def from_clip(cls, clip):
-        """Build from a ClipAdapter with env-driven slot selection."""
-        image_kind = os.getenv("SENTRIX_IMAGE_EMBEDDER", "clip").strip().lower()
-        text_kind = os.getenv("SENTRIX_TEXT_EMBEDDER", "clip").strip().lower()
+        """Build with the LOCKED scheme (see embeddings/scheme.py).
+
+        历史上 IMAGE/TEXT 可被 env 切成 clip/chinese_clip/bge，导致向量/索引多套并存、
+        检索时好时坏。现钉死单一方案，不再读 env 选择：IMAGE=chinese_clip、TEXT=bge。
+        """
+        from . import scheme
+        image_kind = scheme.IMAGE_EMBEDDER
+        text_kind = scheme.TEXT_EMBEDDER
         visual = None
         if image_kind == "chinese_clip":
             from .chinese_clip_visual import ChineseClipVisualEmbedder
