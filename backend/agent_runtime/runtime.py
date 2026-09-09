@@ -2610,15 +2610,21 @@ class AgentRuntime:
                     "codes": list(problems) if problems else [],
                     "attempt": guard_retries + 1,
                 })
-                # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性
-                if not problems and task.tool_results and turn.budget.can_model_step():
+                # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性。
+                # 原则（2026-09 重构）：每问只评审一次；评审看完整 agent 轨迹
+                # （含 captured_at 拍摄时间等元数据，见 judge.messages）。首次 final
+                # 未通过时不反复逼审，只加一条软引导、让模型基于完整上下文再输出一次；
+                # 之后不再复评，放行的答案打"possibly_fabricated"标签供分析。
+                if (not problems and task.tool_results and turn.budget.can_model_step()
+                        and not getattr(turn, "l2_faithfulness_checked", False)):
+                    turn.l2_faithfulness_checked = True
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                     try:
                         judge_result = judge_faithfulness(
                             self.chat_fn, query=message, tool_results=task.tool_results,
                             answer=turn.final_answer, trusted_facts=trusted,
-                            include_debug=self.include_debug)
+                            messages=messages, include_debug=self.include_debug)
                         if self.include_debug:
                             faithful, judge_problems, judge_debug = judge_result
                         else:
@@ -2633,7 +2639,27 @@ class AgentRuntime:
                             judge_step["call_type"] = "faithfulness_judge"
                         turn.steps.append(judge_step)
                         if not faithful:
-                            problems = judge_problems
+                            # 只对"事实性"问题做软引导；纯风格(missing_disclosure)当提示放行。
+                            _l2_sev = (judge_problems.severity
+                                       if hasattr(judge_problems, "severity") else "truth")
+                            if _l2_sev == "truth":
+                                turn.l2_unverified = True
+                                turn.l2_unverified_reason = "; ".join(str(p) for p in judge_problems)
+                                if turn.budget.can_model_step():
+                                    self._emit_progress(
+                                        turn, progress_callback, stage="recovering",
+                                        status="running", text="我重新核对一遍信息再回答。")
+                                    messages.append({"role": "assistant",
+                                                     "content": _model_visible_action(action)})
+                                    messages.append({"role": "user", "content": (
+                                        "（复核提醒）系统评审认为你上一条 final 里可能有未被工具观察充分"
+                                        "支持的内容。请基于完整对话里出现的所有工具结果重新核对——包括照片/视频"
+                                        "的拍摄时间（captured_at）、地点元数据与检索命中的照片信息，而不只是"
+                                        "OCR 文字。如果按这些元数据能确认年份/日期/数量就直接如实给出；确实"
+                                        "没有任何工具结果能支撑的内容才如实说明无法确认。不要把有依据的信息删掉。"
+                                        "重新输出一个 final（可直接复用你上一版答案）。"
+                                    )})
+                                    continue
                     except Exception as exc:
                         turn.steps.append({"type": "judge", "status": "skipped",
                                            "reason": f"model_call_error:{exc}"})
@@ -2785,6 +2811,18 @@ class AgentRuntime:
                     turn, progress_callback,
                     stage="finalizing", status="complete",
                     text="正在整理回答…")
+                # L2 复核标签：某次 final 曾被语义评审判不实、经软引导后放行 → 打标供分析
+                if getattr(turn, "l2_unverified", False):
+                    turn.steps.append({
+                        "type": "judge", "status": "soft_release",
+                        "call_type": "l2_soft_release",
+                        "possibly_fabricated": True,
+                        "reason": getattr(turn, "l2_unverified_reason", "") or "",
+                    })
+                    if turn.agent2_trace:
+                        turn.agent2_trace.setdefault("quality", {})[
+                            "l2_soft_release"] = True
+
                 # G6：OCR 显式 partial —— 读文字失败且回答如实反映“没读清”时，
                 # 以 natural partial 收尾（status=partial, reason=ocr_timeout），不猜、不暴露工程错误
                 if turn.ocr_partial and re.search(
