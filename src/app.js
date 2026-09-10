@@ -404,7 +404,11 @@
     } else {
       heading = STAGE_LABELS[event.stage] || "记忆处理中";
     }
-    return `<article class="timeline-card ${stateClass}"><span class="timeline-dot" aria-hidden="true"></span><div><strong>${escapeHtml(heading)}</strong>${content ? `<p>${escapeHtml(content)}</p>` : ""}${artifact}</div></article>`;
+    const eventId = event.event_id || `${event.stage || "status"}-${event.step_index || ""}`;
+    const signatureSource = `${status}|${content}|${JSON.stringify(payload)}`;
+    let signature = 0;
+    for (let index = 0; index < signatureSource.length; index += 1) signature = ((signature << 5) - signature) + signatureSource.charCodeAt(index) | 0;
+    return `<article class="timeline-card ${stateClass}" data-timeline-event-id="${escapeHtml(String(eventId))}" data-timeline-signature="${signature}"><span class="timeline-dot" aria-hidden="true"></span><div><strong>${escapeHtml(heading)}</strong>${content ? `<p>${escapeHtml(content)}</p>` : ""}${artifact}</div></article>`;
   }
 
   function recallCard(result) {
@@ -567,7 +571,28 @@
   function updateLiveProgress() {
     const host = document.querySelector("[data-live-progress]");
     if (!host) return;
-    host.innerHTML = `<div class="timeline-list">${timelineEvents(null, state.liveProgress).map(timelineCard).join("")}</div>`;
+    let list = host.querySelector(".timeline-list");
+    if (!list) {
+      host.innerHTML = '<div class="timeline-list"></div>';
+      list = host.querySelector(".timeline-list");
+    }
+    timelineEvents(null, state.liveProgress).forEach((event) => {
+      const eventId = String(event.event_id || `${event.stage || "status"}-${event.step_index || ""}`);
+      const existing = Array.from(list.querySelectorAll("[data-timeline-event-id]")).find((node) => node.dataset.timelineEventId === eventId);
+      const template = document.createElement("template");
+      template.innerHTML = timelineCard(event).trim();
+      const next = template.content.firstElementChild;
+      if (!next) return;
+      if (!existing) {
+        list.appendChild(next);
+        return;
+      }
+      if (existing.dataset.timelineSignature !== next.dataset.timelineSignature) {
+        existing.className = next.className;
+        existing.dataset.timelineSignature = next.dataset.timelineSignature;
+        existing.innerHTML = next.innerHTML;
+      }
+    });
   }
 
   function conversationRail() {
