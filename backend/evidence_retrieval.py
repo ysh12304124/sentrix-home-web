@@ -187,7 +187,7 @@ class EvidenceRetrievalKernel:
         # (measured on album3-max 100QA: threshold prefilter dropped
         # asset recall from 0.971 to 0.893, while rank top-50 kept 0.971).
         import os
-        candidate_limit = max(1, int(os.getenv("SENTRIX_SEARCH_CANDIDATE_TOP_K", "30")))
+        candidate_limit = max(1, int(os.getenv("SENTRIX_SEARCH_CANDIDATE_TOP_K", "50")))
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
         min_retrieval_score = 0.0

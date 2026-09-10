@@ -121,6 +121,53 @@ class ExtractImageIdsTests(unittest.TestCase):
             ],
         )
 
+    def test_video_keyframe_keeps_image_evidence_and_maps_to_parent_video_for_metrics(self):
+        assets_by_name = {
+            "video-001.mp4": [{
+                "id": "asset_video_1", "file_name": "video-001.mp4", "media_type": "video",
+            }],
+            "kf_0001.jpg": [{
+                "id": "asset_frame_1", "file_name": "kf_0001.jpg", "media_type": "image",
+                "derived_kind": "video_keyframe", "parent_asset_id": "asset_video_1",
+                "source_timestamp_sec": 4.5,
+            }],
+        }
+
+        media = MODULE._resolve_predicted_media(["asset_frame_1"], assets_by_name)
+
+        self.assertEqual(media[0]["media_type"], "image")
+        self.assertEqual(media[0]["file_name"], "kf_0001.jpg")
+        self.assertEqual(media[0]["source_video_media_id"], "video-001")
+        self.assertEqual(media[0]["source_timestamp_sec"], 4.5)
+        metrics = MODULE._modality_metrics(
+            [{"media_type": "video", "media_id": "video-001"}], media,
+        )
+        self.assertEqual(metrics["media"]["recall"], 1.0)
+        self.assertEqual(metrics["video"]["recall"], 1.0)
+        self.assertEqual(metrics["image"]["predicted"], 0)
+
+    def test_rank_metrics_deduplicate_keyframes_from_the_same_parent_video(self):
+        candidates = [
+            {
+                "media_type": "image", "file_name": "kf_0001.jpg",
+                "source_video_media_id": "video-001",
+            },
+            {
+                "media_type": "image", "file_name": "kf_0002.jpg",
+                "source_video_media_id": "video-001",
+            },
+            {"media_type": "video", "file_name": "video-002.mp4"},
+        ]
+
+        metrics = MODULE._ranked_retrieval_metrics(
+            [{"media_type": "video", "media_id": "video-002"}], candidates,
+        )
+
+        self.assertEqual(metrics["retrieval_first_relevant_rank"], 2)
+        self.assertEqual(metrics["retrieval_rank_candidate_count"], 2)
+        self.assertEqual(metrics["retrieval_r_at_1"], 0)
+        self.assertEqual(metrics["retrieval_r_at_3"], 1)
+
     def test_tool_binding_uses_conversation_turn_when_step_ids_repeat(self):
         calls = [
             {"conversation_turn": 0, "step_id": "model_call_1"},
@@ -449,7 +496,11 @@ class ExtractImageIdsTests(unittest.TestCase):
         qa_path = Path(__file__).resolve().parents[1] / "data" / "album3" / "qa" / "full-album3.jsonl"
         rows = {
             row["qa_id"]: row
-            for row in (json.loads(line) for line in qa_path.read_text().splitlines() if line.strip())
+            for row in (
+                json.loads(line)
+                for line in qa_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
         }
 
         clothing = rows["validation-album3-012-q08"]

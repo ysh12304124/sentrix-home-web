@@ -782,6 +782,7 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, c
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+RETRIEVAL_RANK_CUTOFFS = (1, 3, 5, 8)
 
 
 def _infer_media_type(value: object, explicit: object = None) -> str:
@@ -801,6 +802,25 @@ def _media_key(media_type: object, media_id: object) -> tuple[str, str]:
     name = Path(str(media_id or "").split("?", 1)[0].split("#", 1)[0]).name
     canonical = Path(name).stem if kind == "video" else name
     return kind, canonical.casefold()
+
+
+def _evaluation_media_key(media: dict) -> tuple[str, str]:
+    """Return the GT-granularity key for one retrieved media candidate.
+
+    Video ingestion exposes keyframes as image assets so the Agent can inspect
+    and display exact visual evidence. PhotoBench's current video GT is
+    video-level, however, so a derived keyframe represents its parent video for
+    retrieval metrics. Keeping this projection separate preserves the frame
+    record for UI/evidence while de-duplicating sibling frames in R@K and
+    precision denominators.
+    """
+    source_video = media.get("source_video_media_id") or media.get("source_video_file_name")
+    if source_video:
+        return _media_key("video", source_video)
+    return _media_key(
+        media.get("media_type"),
+        media.get("media_id") or media.get("file_name") or media.get("image_id"),
+    )
 
 
 def _normalize_media_refs(record: dict, prefix: str = "retrieval") -> list[dict[str, str]]:
@@ -921,7 +941,34 @@ def _extract_image_ids(result: dict) -> list[str]:
     return _extract_media_sets(result)["selected_asset_ids"]
 
 
-def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
+def _static_content_type(path: Path) -> str:
+    """Return browser-safe MIME types independent of the Windows registry.
+
+    ``mimetypes.guess_type`` reads platform MIME registrations.  Some Windows
+    installations register ``.js`` as ``text/plain``; browsers then refuse to
+    execute Vite's ``type=module`` bundle and PhotoBench renders a blank page.
+    """
+    explicit = {
+        ".css": "text/css",
+        ".html": "text/html",
+        ".js": "application/javascript",
+        ".json": "application/json",
+        ".mjs": "application/javascript",
+        ".svg": "image/svg+xml",
+    }
+    content_type = explicit.get(path.suffix.lower())
+    if content_type is None:
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    if content_type.startswith("text/") or content_type in {
+        "application/javascript", "application/json", "image/svg+xml",
+    }:
+        content_type += "; charset=utf-8"
+    return content_type
+
+
+def _build_reuse_bases(
+    spaces: list[dict], runs: list[dict], fallback_model_profile: str = "",
+) -> list[dict]:
     """Build exact reusable album/model bases from persisted run-to-scope links."""
     runs_by_scope = {}
     for run in runs or []:
@@ -951,14 +998,29 @@ def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
             if match:
                 album_id = album_id or match.group("album")
                 model_profile = model_profile or match.group("model")
+        # A locally migrated scope has no historical PhotoBench run linked to
+        # its new id.  Its source_path still points at the canonical benchmark
+        # album, so expose it as a reusable base instead of forcing a rebuild.
+        if not album_id and space.get("source_path"):
+            source_album = Path(str(space["source_path"])).name
+            if (BENCHMARK_DATA_ROOT / source_album / "manifest.json").is_file():
+                album_id = source_album
+        if album_id and not model_profile:
+            model_profile = str(fallback_model_profile or "imported-memory").strip()
         if not album_id or not model_profile:
             continue
-        key = (album_id, model_profile)
+        # Keep physically distinct memory scopes selectable even when they
+        # were built from the same album with the same model.  Their retrieval
+        # indexes are not necessarily interchangeable: for example a migrated
+        # scope may carry legacy Qdrant ID mappings while a freshly built scope
+        # does not.  Collapsing by only (album, model) can silently select the
+        # newest but vector-incompatible scope.
+        key = (album_id, model_profile, scope_id)
         matching_runs = [run for run in linked
                          if str(run.get("album_id") or "") == album_id
                          and str(run.get("model_profile") or "") == model_profile]
         group = groups.setdefault(key, {
-            "base_id": f"{album_id}::{model_profile}",
+            "base_id": f"{album_id}::{model_profile}::{scope_id}",
             "album_id": album_id,
             "model_profile": model_profile,
             "scope_id": scope_id,
@@ -998,6 +1060,26 @@ def _resolve_predicted_media(asset_ids: list[str], assets_by_name: dict) -> list
             "media_type": media_type,
             "media_id": Path(file_name).stem if media_type == "video" else file_name,
         }
+        metadata = asset.get("metadata_json") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        derived_kind = asset.get("derived_kind") or metadata.get("derived_kind")
+        parent_asset_id = asset.get("parent_asset_id") or metadata.get("parent_asset_id")
+        if derived_kind == "video_keyframe" and parent_asset_id:
+            parent_match = assets_by_id.get(str(parent_asset_id))
+            parent_file_name = parent_match[0] if parent_match else metadata.get("source_video_file_name")
+            if parent_file_name:
+                media.update({
+                    "derived_kind": "video_keyframe",
+                    "parent_asset_id": str(parent_asset_id),
+                    "source_video_file_name": str(parent_file_name),
+                    "source_video_media_id": Path(str(parent_file_name)).stem,
+                })
+                source_timestamp = asset.get("source_timestamp_sec")
+                if source_timestamp is None:
+                    source_timestamp = metadata.get("source_timestamp_sec")
+                if source_timestamp is not None:
+                    media["source_timestamp_sec"] = source_timestamp
         if asset.get("media_url"):
             media["media_url"] = asset["media_url"]
         resolved.append(media)
@@ -1038,10 +1120,7 @@ def _metric_triplet(gt_keys: set[tuple[str, str]], predicted_keys: set[tuple[str
 
 def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict]) -> dict[str, dict]:
     gt_keys = {_media_key(ref.get("media_type"), ref.get("media_id")) for ref in gt_refs}
-    predicted_keys = {
-        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
-        for item in predicted_media
-    }
+    predicted_keys = {_evaluation_media_key(item) for item in predicted_media}
     result = {"media": _metric_triplet(gt_keys, predicted_keys)}
     for media_type in ("image", "video"):
         result[media_type] = _metric_triplet(
@@ -1049,6 +1128,66 @@ def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict]) -> dict[
             {key for key in predicted_keys if key[0] == media_type},
         )
     return result
+
+
+def _ranked_retrieval_metrics(gt_refs: list[dict], predicted_media: list[dict] | None) -> dict:
+    """Compute first-relevant hit rates from the actual candidate order.
+
+    R@K here is the question-level hit rate used by the offline media benchmark:
+    a question scores 1 when at least one GT medium appears in the first K unique
+    candidates. This is intentionally distinct from the existing multi-GT
+    set-recall metric.
+    """
+    gt_keys = {
+        key for ref in gt_refs
+        if (key := _media_key(ref.get("media_type"), ref.get("media_id")))[1]
+    }
+    available = bool(gt_keys) and isinstance(predicted_media, list)
+    first_rank = None
+    candidate_count = 0
+    if available:
+        seen = set()
+        for candidate in predicted_media:
+            if not isinstance(candidate, dict):
+                continue
+            key = _evaluation_media_key(candidate)
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            candidate_count += 1
+            if first_rank is None and key in gt_keys:
+                first_rank = candidate_count
+
+    result = {
+        "retrieval_rank_metrics_available": available,
+        "retrieval_first_relevant_rank": first_rank,
+        "retrieval_reciprocal_rank": (1.0 / first_rank) if first_rank else (0.0 if available else None),
+        "retrieval_rank_candidate_count": candidate_count if available else None,
+    }
+    for cutoff in RETRIEVAL_RANK_CUTOFFS:
+        result[f"retrieval_r_at_{cutoff}"] = (
+            int(first_rank is not None and first_rank <= cutoff) if available else None
+        )
+    return result
+
+
+def _ranked_retrieval_metrics_from_item(item: dict) -> dict:
+    """Read saved rank metrics or reconstruct them only from ordered candidates."""
+    expected = [f"retrieval_r_at_{cutoff}" for cutoff in RETRIEVAL_RANK_CUTOFFS]
+    if all(isinstance(item.get(field), (int, float)) for field in expected) \
+            and isinstance(item.get("retrieval_reciprocal_rank"), (int, float)):
+        return {
+            "retrieval_rank_metrics_available": True,
+            "retrieval_first_relevant_rank": item.get("retrieval_first_relevant_rank"),
+            "retrieval_reciprocal_rank": item.get("retrieval_reciprocal_rank"),
+            "retrieval_rank_candidate_count": item.get("retrieval_rank_candidate_count"),
+            **{field: item.get(field) for field in expected},
+        }
+
+    candidates = item.get("retrieved_candidate_media")
+    if not isinstance(candidates, list) and isinstance(item.get("retrieved_candidate_images"), list):
+        candidates = item.get("retrieved_candidate_images")
+    return _ranked_retrieval_metrics(_normalize_media_refs(item, "retrieval"), candidates)
 
 
 def _micro_metrics_from_counts(items: list[dict], field: str) -> dict:
@@ -1102,10 +1241,7 @@ def _resolve_gt_media(gt_refs: list[dict], assets_by_name: dict,
         for asset in assets:
             media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
             asset_index.setdefault(_media_key(media_type, file_name), []).append(asset)
-    retrieved_keys = {
-        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
-        for item in retrieved_media
-    }
+    retrieved_keys = {_evaluation_media_key(item) for item in retrieved_media}
     result = []
     for ref in gt_refs:
         media_type = ref["media_type"]
@@ -2916,19 +3052,11 @@ class BenchmarkRun:
 
             # Match against GT
             metrics = _modality_metrics(gt_refs, retrieved_media)
+            rank_metrics = _ranked_retrieval_metrics(gt_refs, retrieved_media)
             gt_media = _resolve_gt_media(gt_refs, assets_by_name, retrieved_media)
-            retrieved_keys = {
-                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
-                for value in retrieved_media
-            }
-            evidence_keys = {
-                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
-                for value in evidence_media
-            }
-            selected_keys = {
-                _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
-                for value in selected_media
-            }
+            retrieved_keys = {_evaluation_media_key(value) for value in retrieved_media}
+            evidence_keys = {_evaluation_media_key(value) for value in evidence_media}
+            selected_keys = {_evaluation_media_key(value) for value in selected_media}
             matched = sorted(entry["file_name"] for entry in gt_media
                              if _media_key(entry["media_type"], entry["media_id"]) in retrieved_keys)
             evidence_matched = sorted(entry["file_name"] for entry in gt_media
@@ -2986,6 +3114,7 @@ class BenchmarkRun:
                 "retrieval_recall": metrics["media"]["recall"],
                 "retrieval_precision": metrics["media"]["precision"],
                 "retrieval_f1": metrics["media"]["f1"],
+                **rank_metrics,
                 "gt_media": gt_media,
                 "gt_images": gt_images,
                 "judge": {"score": None, "reason": "pending_judge"},
@@ -3031,7 +3160,8 @@ class BenchmarkRun:
                          "image_retrieval_recall": 0 if gt_image_ids else None,
                          "video_retrieval_recall": 0 if gt_video_ids else None,
                          "judge": {"score": None, "reason": "error"},
-                         "wall_clock_ms": round((time.perf_counter() - t0) * 1000, 1)})
+                         "wall_clock_ms": round((time.perf_counter() - t0) * 1000, 1),
+                         **_ranked_retrieval_metrics(gt_refs, [])})
         return item
 
     def _judge_item(self, item: dict, row: dict, assets_by_name: dict) -> dict:
@@ -4041,6 +4171,18 @@ class BenchmarkRun:
         answer_dist = {str(score): answer_scores.count(score) for score in (0, 1, 2)}
         metric_items = [item for item in items if _retrieval_metric_eligible(item)]
         excluded_unanswerable_count = len(items) - len(metric_items)
+        rank_metric_rows = [
+            metrics for item in metric_items
+            if (metrics := _ranked_retrieval_metrics_from_item(item))["retrieval_rank_metrics_available"]
+        ]
+        rank_means = {
+            field: (sum(float(row[field]) for row in rank_metric_rows) / len(rank_metric_rows)
+                    if rank_metric_rows else None)
+            for field in [
+                *(f"retrieval_r_at_{cutoff}" for cutoff in RETRIEVAL_RANK_CUTOFFS),
+                "retrieval_reciprocal_rank",
+            ]
+        }
         typed_retrieval_items = [item for item in metric_items if "retrieval_media_refs" in item]
         if typed_retrieval_items:
             media_metrics = _micro_metrics_from_counts(typed_retrieval_items, "media_retrieval_counts")
@@ -4171,6 +4313,15 @@ class BenchmarkRun:
             "retrieval_metric_count": retrieval_metric_count,
             "retrieval_metric_scope": "all_media" if typed_retrieval_items else "legacy_image_only",
             "retrieval_excluded_unanswerable_count": excluded_unanswerable_count,
+            "retrieval_rank_metric_count": len(rank_metric_rows),
+            "retrieval_rank_metric_cutoffs": list(RETRIEVAL_RANK_CUTOFFS),
+            "retrieval_mrr": round(rank_means["retrieval_reciprocal_rank"], 3)
+                if rank_means["retrieval_reciprocal_rank"] is not None else None,
+            **{
+                field: round(value, 3) if value is not None else None
+                for field, value in rank_means.items()
+                if field.startswith("retrieval_r_at_")
+            },
             "media_retrieval_precision_micro": round(media_metrics["precision"], 3) if media_metrics and media_metrics["precision"] is not None else None,
             "media_retrieval_recall_micro": round(media_metrics["recall"], 3) if media_metrics and media_metrics["recall"] is not None else None,
             "media_retrieval_f1_micro": round(media_metrics["f1"], 3) if media_metrics and media_metrics["f1"] is not None else None,
@@ -4343,6 +4494,10 @@ class OrchestratorRepository:
                 hydrated["retrieval_recall"] = recall
             if hydrated.get("retrieval_f1") is None:
                 hydrated["retrieval_f1"] = f1
+        rank_metrics = _ranked_retrieval_metrics_from_item(hydrated)
+        for field, value in rank_metrics.items():
+            if field not in hydrated or hydrated.get(field) is None:
+                hydrated[field] = value
         # Historical results can be reconstructed from saved structured fields.
         if not hydrated.get("attribution"):
             hydrated["attribution"] = BenchmarkRun._derive_attribution(hydrated)
@@ -4995,6 +5150,7 @@ class OrchestratorRepository:
     @staticmethod
     def _item_summary(item: dict, index: int, review: dict | None = None) -> dict:
         judge = item.get("judge") or {}
+        rank_metrics = _ranked_retrieval_metrics_from_item(item)
         return {
             "index": index,
             "qa_id": item.get("qa_id"),
@@ -5008,6 +5164,7 @@ class OrchestratorRepository:
             "retrieval_recall": item.get("retrieval_recall"),
             "retrieval_precision": item.get("retrieval_precision"),
             "retrieval_f1": item.get("retrieval_f1"),
+            **rank_metrics,
             "media_retrieval_recall": item.get("media_retrieval_recall"),
             "media_retrieval_precision": item.get("media_retrieval_precision"),
             "media_retrieval_f1": item.get("media_retrieval_f1"),
@@ -5792,8 +5949,12 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     spaces or [],
                     key=lambda s: str(s.get("created_at") or ""), reverse=True,
                 )
+                fallback_model = (
+                    str(RUNTIME_CONNECTION_CONFIG.get("endpoint_model") or "").strip()
+                    or JUDGE_MODEL
+                )
                 self._json({"spaces": spaces, "reuse_bases": _build_reuse_bases(
-                    spaces, self.repo.list_runs())})
+                    spaces, self.repo.list_runs(), fallback_model)})
                 return
             if parsed.path == "/api/config":
                 self._json({
@@ -6068,9 +6229,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def _serve_file(self, path: Path):
         if not path.is_file():
             raise FileNotFoundError(path)
-        ct = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        if ct.startswith("text/") or ct == "application/javascript":
-            ct += "; charset=utf-8"
+        ct = _static_content_type(path)
         if ct.startswith("video/"):
             size = path.stat().st_size
             start, end = 0, size - 1

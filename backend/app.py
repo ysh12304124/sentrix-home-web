@@ -178,11 +178,14 @@ def _allowed_import_roots():
     defaults = [
         DATA_DIR / "imports",
         ROOT / "data" / "imports",
+        ROOT / "services" / "photobench" / "data",
         Path("/home/asus/data"),
         Path("/home/asus/datasets"),
         Path("/home/asus/benchmarks"),
     ]
-    values = configured.split(":") if configured else [str(item) for item in defaults]
+    # ``os.pathsep`` is ':' on POSIX and ';' on Windows. Splitting on a
+    # hard-coded colon breaks drive-letter paths such as ``D:\\datasets``.
+    values = configured.split(os.pathsep) if configured else [str(item) for item in defaults]
     roots = []
     for value in values:
         try:

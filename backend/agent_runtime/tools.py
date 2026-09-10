@@ -1945,11 +1945,11 @@ def _place_matches(item, place_q: str, store) -> bool:
         return False
 
 
-# 拆槽多路召回：每路语义召回最多看前 30 名（排名>30 的 RRF 贡献≈0）；
-# 综合分排序后最多给 18 张候选（断层截断后可能更少）。候选上限是召回主导参数
-# （扫描：15→0.72 / 18→~0.80 / 30→0.89），18 为折中——召回足够、图数可控。
-_SLOT_ROUTE_HEAD = 30
-_SLOT_MAX_CANDIDATES = 18
+# 拆槽多路召回：每路保留 Top-50，跨路 RRF 后再由时间聚类 + BGE 重排；
+# 最终仍只向 Agent 暴露有限候选。环境变量允许离线评测做严格消融。
+_SLOT_ROUTE_HEAD = max(1, int(os.getenv("SENTRIX_SLOT_ROUTE_HEAD", "50")))
+_SLOT_RERANK_HEAD = max(1, int(os.getenv("SENTRIX_RERANK_HEAD", "50")))
+_SLOT_MAX_CANDIDATES = max(1, int(os.getenv("SENTRIX_SLOT_MAX_CANDIDATES", "18")))
 
 
 class _SlotRetrievalPacket:
@@ -2128,21 +2128,54 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         kept = list(scores)
     kept.sort(key=lambda a: -scores.get(a, 0))
 
-    # 断层截断（明显 gap 处截断，相对 gap > 45% 视为断层）+ 上限 15 + 保底 3。
-    # 45% 相对断层：多路重合的强候选与其后弱候选之间应有大 gap；单路语义召回时
-    # λ=0.3 下 rank1~6 分数（1→0.74→0.55→0.41→0.30→0.22）相邻差均 <45%，不误断。
-    final_ids = kept[:_SLOT_MAX_CANDIDATES]
-    if len(final_ids) > 3:
-        _top = scores.get(final_ids[0], 1) or 1.0
-        _cut = len(final_ids)
-        _gap_ratio = float(os.getenv("SENTRIX_SLOT_GAP_RATIO", "0.5"))
-        for i in range(1, len(final_ids)):
-            if _top > 0 and (scores.get(final_ids[i - 1], 0) - scores.get(final_ids[i], 0)) / _top > _gap_ratio:
-                _cut = i
-                break
-        final_ids = final_ids[:_cut]
-    if len(final_ids) < 3 and len(kept) > len(final_ids):
-        final_ids = kept[:3]  # 保底 3 张，避免模型无可选
+    # 多路 RRF 的 Top-50 是粗排候选。先按来源视频和时间戳做 +/-1 秒聚类，
+    # 再把结构化视觉文本交给本地 BGE cross-encoder 重排。聚类只使用资产元数据，
+    # 不读取 QA/GT。模型不可用时完整回退到原有 RRF + gap 截断路径。
+    _rerank_enabled = str(os.getenv("SENTRIX_RERANKER_ENABLED", "0")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    _rerank_scores: dict[str, float] = {}
+    _rerank_timing = {"status": "disabled", "coarse_candidates": min(len(kept), _SLOT_RERANK_HEAD)}
+    _rerank_applied = False
+    if _rerank_enabled and kept:
+        try:
+            from ..retrieval.reranker import rerank_candidates
+            _reranked = rerank_candidates(
+                query_for_retrieval,
+                kept[:_SLOT_RERANK_HEAD],
+                store,
+                window_seconds=float(os.getenv("SENTRIX_RERANKER_CLUSTER_WINDOW_SECONDS", "1")),
+                max_passage_chars=int(os.getenv("SENTRIX_RERANKER_MAX_PASSAGE_CHARS", "6000")),
+            )
+            _rerank_timing = _reranked.telemetry
+            _rerank_scores = _reranked.score_by_asset
+            # Whole-video-only migrated data has no frame timestamp to cluster.
+            # In that case preserve the previous RRF + gap behaviour exactly;
+            # real keyframe candidates still take the reranked path.
+            _rerank_applied = _rerank_timing.get("status") != "skipped_whole_video_only"
+            if _rerank_applied:
+                final_ids = _reranked.asset_ids[:_SLOT_MAX_CANDIDATES]
+        except Exception as error:
+            _rerank_timing = {
+                "status": "error",
+                "reason": f"{type(error).__name__}: {error}",
+                "coarse_candidates": min(len(kept), _SLOT_RERANK_HEAD),
+            }
+
+    if not _rerank_applied:
+        # 原始路径：明显 RRF gap 处截断 + 上限 + 保底 3。
+        final_ids = kept[:_SLOT_MAX_CANDIDATES]
+        if len(final_ids) > 3:
+            _top = scores.get(final_ids[0], 1) or 1.0
+            _cut = len(final_ids)
+            _gap_ratio = float(os.getenv("SENTRIX_SLOT_GAP_RATIO", "0.5"))
+            for i in range(1, len(final_ids)):
+                if _top > 0 and (scores.get(final_ids[i - 1], 0) - scores.get(final_ids[i], 0)) / _top > _gap_ratio:
+                    _cut = i
+                    break
+            final_ids = final_ids[:_cut]
+        if len(final_ids) < 3 and len(kept) > len(final_ids):
+            final_ids = kept[:3]  # 保底 3 张，避免模型无可选
 
     # 组装候选 assets（供 result set / preview）
     assets = []
@@ -2160,14 +2193,23 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "level": "strong" if _aid in event_member_ids else "approximate",
             "score": scores.get(_aid, 0),
             "fusion_score": scores.get(_aid, 0),
+            "rerank_score": _rerank_scores.get(_aid),
             "retrieval_score": 0.0,
             "observation_fields": {"place": _o.get("place"), "activity": _o.get("activity"),
                                    "subject_clothing": _o.get("subject_clothing") or []},
-            "attributions": [{"retriever": "slot_route", "rank": 0,
-                              "score": scores.get(_aid, 0), "score_kind": "structured"}],
+            "attributions": ([{"retriever": "slot_route", "rank": 0,
+                               "score": scores.get(_aid, 0), "score_kind": "structured"}]
+                             + ([{"retriever": "bge_reranker", "rank": final_ids.index(_aid) + 1,
+                                  "score": _rerank_scores.get(_aid), "score_kind": "cross_encoder"}]
+                                if _aid in _rerank_scores else [])),
         })
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
-    packet = _SlotRetrievalPacket(assets, gaps=[], retrieval_timing={}, channel_trace={})
+    packet = _SlotRetrievalPacket(
+        assets,
+        gaps=[],
+        retrieval_timing={"reranker": _rerank_timing},
+        channel_trace={"reranker": _rerank_timing},
+    )
     _relax_level = 0
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
     rs = _RUNTIME["result_sets"].new(
@@ -2175,8 +2217,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         unresolved=[g.get("reason") for g in (packet.gaps or [])],
     )
     preview_indices = _preview_indices(asset_ids, mode, store, query=query)
-    # 删模型重排：候选即最终。代码融合排序 + gap 截断已保证强相关在前，
-    # 不再逐批调用 12B 验证候选（省 ~5 批模型调用/题，避免上下文膨胀）。
+    # 不调用 12B 做逐图验证；启用时候选顺序已由本地 BGE cross-encoder 给出。
     validated_ids = list(asset_ids)
     candidate_only_ids = []
     ranked_ids = list(asset_ids)

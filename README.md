@@ -17,7 +17,70 @@ current work queue are maintained in [docs/PROJECT_MEMORY.md](docs/PROJECT_MEMOR
 - `test/`: Node-based frontend and repository-layout regression tests.
 - `docs/`: live project memory and approved design/implementation records.
 
-## Run on 153
+## Windows local deployment
+
+The Windows launcher uses one Conda environment for the API, local model
+gateway, BGE sidecar, PhotoBench, and Node.js.  Copy `.env.local.example` to
+`.env.local`, then point the model paths at local Qwen3-VL, BGE-M3,
+BGE-reranker-v2-m3, and OpenAI CLIP weights.
+
+One-time setup:
+
+```powershell
+conda activate memory
+python -m pip install -r backend\requirements.txt
+conda install -c conda-forge nodejs=22
+```
+
+Start, inspect, and stop the local stack:
+
+```powershell
+conda activate memory
+powershell -ExecutionPolicy Bypass -File .\scripts\runtime\start_local.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\runtime\start_local.ps1 -Status
+powershell -ExecutionPolicy Bypass -File .\scripts\runtime\stop_local.ps1
+```
+
+Defaults are Web `4174`, API `8090`, BGE `8101`, local Qwen `11434`, and
+PhotoBench `8772`.  The API stores SQLite, media, ANN data, and embedded Qdrant
+under `data/`.  Qwen loads on the first request and unloads after 60 idle
+seconds.  Face recognition is disabled in the example configuration because
+it additionally requires local InsightFace model weights.
+
+### Hybrid retrieval and reranking
+
+When `SENTRIX_RERANKER_ENABLED=true`, retrieval keeps the Top-50 candidates
+from the multi-channel RRF coarse stage, groups keyframes from the same video
+within one second, and reranks cluster text with the local
+`bge-reranker-v2-m3` cross-encoder.  The text contains caption, OCR, object,
+object description, relation, and action/event fields; `visual_text` is used
+only when those semantic fields are empty.  The reranker loads lazily and is
+unloaded after the configured idle interval.  Set the flag to `false` to
+return to the original coarse ranking.
+
+A migrated Sentrix Lite named-vector collection can be configured with the
+three `SENTRIX_LITE_NAMED_VECTOR_*` variables.  The main API then reads its
+CLIP image, visual/caption, object, and relation vectors directly and fuses
+them with lexical retrieval; no service on port `8091` is required.
+
+Run the controlled media-retrieval ablation with:
+
+```powershell
+conda activate memory
+powershell -ExecutionPolicy Bypass -File .\scripts\runtime\stop_local.ps1 `
+  -KeepModel -KeepBge -KeepPhotoBench
+python scripts\benchmarks\evaluate_bge_reranker.py `
+  --out docs\reports\bge-reranker-ablation.json
+powershell -ExecutionPolicy Bypass -File .\scripts\runtime\start_local.ps1
+```
+
+The API is stopped during this command because embedded Qdrant permits only
+one process to own a local collection directory at a time.
+
+## Legacy network deployment (reference only)
+
+The commands below describe the upstream team's former LAN deployment. They
+are not used by the Windows local stack above and can be ignored for local use.
 
 ```bash
 cd /home/asus/Github/Sentrix-Home-Web
@@ -43,9 +106,9 @@ Start the web gateway separately:
 SENTRIX_BACKEND_URL=http://127.0.0.1:8090 PORT=4174 npm run dev
 ```
 
-The WorldMM video-timeline deployment is `http://192.168.0.200:4174` with its
-project-local API on `192.168.0.200:8091`. Existing services and shared model
-processes on that host are not stopped or reconfigured by this deployment.
+That deployment previously used a separate LAN host for the WorldMM timeline.
+The Windows launcher replaces those connections with the local API and local
+model services configured in `.env.local`.
 
 ## Verify
 

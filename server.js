@@ -1,7 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { execFile } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const { URL } = require("node:url");
 
 const root = __dirname;
@@ -12,6 +12,24 @@ const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:959
 const photobenchPort = Number(process.env.PHOTOBENCH_PORT || 8771);
 const photobenchDir = path.join(root, "services", "photobench");
 const photobenchPython = process.env.PHOTOBENCH_PYTHON || "python3";
+
+function readDotEnv(filePath) {
+  const values = {};
+  if (!fs.existsSync(filePath)) return values;
+  for (const rawLine of fs.readFileSync(filePath, "utf8").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || !line.includes("=")) continue;
+    const separator = line.indexOf("=");
+    const key = line.slice(0, separator).trim();
+    let value = line.slice(separator + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key) values[key] = value;
+  }
+  return values;
+}
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -98,21 +116,37 @@ async function ensurePhotobench(req, res) {
   const probeUrl = `http://127.0.0.1:${photobenchPort}/api/config`;
   try {
     const probe = await fetch(probeUrl, { signal: AbortSignal.timeout(2000) });
-    if (probe.ok) return json(res, 200, { status: "running" });
+    if (probe.ok) return json(res, 200, { status: "running", port: photobenchPort });
   } catch (_) { /* not running yet */ }
 
-  const logFile = path.join(photobenchDir, "logs", "orchestrator.log");
-  const command = `cd '${photobenchDir}' && mkdir -p logs && set -a && . ./.env.local 2>/dev/null; set +a; nohup '${photobenchPython}' backend/benchmark_orchestrator.py --host 0.0.0.0 --port ${photobenchPort} >> '${logFile}' 2>&1 &`;
-  execFile("bash", ["-c", command], () => {});
+  const logDir = path.join(photobenchDir, "logs");
+  fs.mkdirSync(logDir, { recursive: true });
+  const out = fs.openSync(path.join(logDir, "orchestrator.log"), "a");
+  const err = fs.openSync(path.join(logDir, "orchestrator.error.log"), "a");
+  const child = spawn(photobenchPython, [
+    path.join(photobenchDir, "backend", "benchmark_orchestrator.py"),
+    "--host", "0.0.0.0",
+    "--port", String(photobenchPort),
+  ], {
+    cwd: photobenchDir,
+    detached: true,
+    windowsHide: true,
+    env: {
+      ...process.env,
+      ...readDotEnv(path.join(photobenchDir, ".env.local")),
+    },
+    stdio: ["ignore", out, err],
+  });
+  child.unref();
 
   for (let i = 0; i < 60; i++) {
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
       const probe = await fetch(probeUrl, { signal: AbortSignal.timeout(1500) });
-      if (probe.ok) return json(res, 200, { status: "started" });
+      if (probe.ok) return json(res, 200, { status: "started", port: photobenchPort });
     } catch (_) { /* keep waiting */ }
   }
-  return json(res, 500, { status: "timeout" });
+  return json(res, 500, { status: "timeout", port: photobenchPort });
 }
 
 function serveFile(req, res, url) {

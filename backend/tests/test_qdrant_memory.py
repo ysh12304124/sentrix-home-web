@@ -1,39 +1,48 @@
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 
 import pytest
 
 from backend.db import MemoryStore
-from backend.qdrant_memory import get_qdrant_index
+import backend.qdrant_memory as qdrant_memory
+from backend.qdrant_memory import close_qdrant_clients, get_qdrant_index
 from scripts.maintenance.sync_qdrant_vectors import sync
 
 
 qdrant_client = pytest.importorskip("qdrant_client")
 
 
-def test_qdrant_returns_none_when_dir_locked_by_another_process(monkeypatch):
-    import fcntl
-
+@contextmanager
+def qdrant_temp_directory():
     with tempfile.TemporaryDirectory() as directory:
+        try:
+            yield directory
+        finally:
+            close_qdrant_clients()
+
+
+def test_qdrant_returns_none_when_dir_locked_by_another_process(monkeypatch):
+    with qdrant_temp_directory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
         monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
         monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_locked")
-        original_flock = fcntl.flock
-
-        def rejecting_flock(fd, operation):
-            if operation & fcntl.LOCK_NB and operation & fcntl.LOCK_EX:
-                raise BlockingIOError("directory owned by another process")
-            return original_flock(fd, operation)
-
-        monkeypatch.setattr(fcntl, "flock", rejecting_flock)
+        if qdrant_memory.fcntl is not None:
+            def rejecting_flock(_fd, operation):
+                if operation & qdrant_memory.fcntl.LOCK_NB:
+                    raise BlockingIOError("directory owned by another process")
+            monkeypatch.setattr(qdrant_memory.fcntl, "flock", rejecting_flock)
+        else:
+            def rejecting_locking(_fd, mode, _size):
+                if mode == qdrant_memory.msvcrt.LK_NBLCK:
+                    raise OSError("directory owned by another process")
+            monkeypatch.setattr(qdrant_memory.msvcrt, "locking", rejecting_locking)
         assert get_qdrant_index(os.path.join(directory, "memory.db")) is None
 
 
 def test_qdrant_single_instance_lock_acquired(monkeypatch):
-    import fcntl
-
-    with tempfile.TemporaryDirectory() as directory:
+    with qdrant_temp_directory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
         monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
         monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_owner")
@@ -42,17 +51,23 @@ def test_qdrant_single_instance_lock_acquired(monkeypatch):
         lock_path = os.path.join(directory, "qdrant", ".sentrix-qdrant.lock")
         assert os.path.exists(lock_path)
         assert get_qdrant_index(os.path.join(directory, "memory.db")) is index
-        fd = os.open(lock_path, os.O_RDONLY)
+        fd = os.open(lock_path, os.O_RDWR)
         try:
             with pytest.raises((BlockingIOError, OSError)):
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if qdrant_memory.fcntl is not None:
+                    qdrant_memory.fcntl.flock(
+                        fd, qdrant_memory.fcntl.LOCK_EX | qdrant_memory.fcntl.LOCK_NB
+                    )
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    qdrant_memory.msvcrt.locking(fd, qdrant_memory.msvcrt.LK_NBLCK, 1)
         finally:
             os.close(fd)
 
 
 
 def test_qdrant_dual_write_search_and_scope_fallback(monkeypatch):
-    with tempfile.TemporaryDirectory() as directory:
+    with qdrant_temp_directory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
         monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
         monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_memory")
@@ -72,7 +87,7 @@ def test_qdrant_dual_write_search_and_scope_fallback(monkeypatch):
 
 
 def test_different_dimensions_and_models_are_isolated(monkeypatch):
-    with tempfile.TemporaryDirectory() as directory:
+    with qdrant_temp_directory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
         monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
         monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_dimensions")
@@ -90,7 +105,7 @@ def test_different_dimensions_and_models_are_isolated(monkeypatch):
 
 
 def test_qdrant_never_returns_rows_deleted_from_sqlite(monkeypatch):
-    with tempfile.TemporaryDirectory() as directory:
+    with qdrant_temp_directory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
         monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
         monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_stale")
@@ -108,7 +123,7 @@ def test_qdrant_never_returns_rows_deleted_from_sqlite(monkeypatch):
 
 
 def test_qdrant_missing_collection_is_explicit_in_fallback_status(monkeypatch):
-    with tempfile.TemporaryDirectory() as directory:
+    with qdrant_temp_directory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
         monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
         monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_missing")
@@ -121,7 +136,7 @@ def test_qdrant_missing_collection_is_explicit_in_fallback_status(monkeypatch):
 
 
 def test_full_sync_removes_orphaned_qdrant_points(monkeypatch):
-    with tempfile.TemporaryDirectory() as directory:
+    with qdrant_temp_directory() as directory:
         monkeypatch.setenv("SENTRIX_VECTOR_BACKEND", "qdrant")
         monkeypatch.setenv("SENTRIX_QDRANT_PATH", os.path.join(directory, "qdrant"))
         monkeypatch.setenv("SENTRIX_QDRANT_COLLECTION_PREFIX", "test_rebuild")

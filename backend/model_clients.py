@@ -1549,7 +1549,17 @@ class ClipAdapter:
                 kwargs = {"model_name": self.model_name, "pretrained": "openai" if not self.checkpoint else None, "load_weights": not bool(self.checkpoint)}
                 self._model, _, self._preprocess = open_clip.create_model_and_transforms(**kwargs)
                 if self.checkpoint:
-                    state = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
+                    try:
+                        state = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
+                    except RuntimeError as error:
+                        # The official OpenAI CLIP cache is a trusted TorchScript
+                        # archive rather than a plain state-dict.  PyTorch 2.6+
+                        # rejects that archive when ``weights_only=True``; load
+                        # it through the TorchScript reader and only retain its
+                        # state-dict for the OpenCLIP model.
+                        if "TorchScript archive" not in str(error):
+                            raise
+                        state = torch.jit.load(self.checkpoint, map_location="cpu").state_dict()
                     self._model.load_state_dict(state, strict=False)
                 self._tokenizer = open_clip.get_tokenizer(self.model_name)
                 self.device = self._device(torch)

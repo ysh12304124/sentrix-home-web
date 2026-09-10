@@ -53,14 +53,15 @@ class ModelClientTests(unittest.TestCase):
 
     def test_vision_image_encoding_downsamples_without_modifying_source(self):
         client = GammaClient()
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as image_file:
+        with tempfile.TemporaryDirectory() as directory:
+            image_file = Path(directory) / "source.jpg"
             source = Image.new("RGB", (4032, 3024), color=(100, 120, 140))
-            source.save(image_file.name, format="JPEG")
-            original_bytes = Path(image_file.name).read_bytes()
+            source.save(image_file, format="JPEG")
+            original_bytes = image_file.read_bytes()
 
-            encoded, mime_type = client.encode_vision_image(image_file.name)
+            encoded, mime_type = client.encode_vision_image(image_file)
 
-            decoded_path = Path(image_file.name).with_suffix(".decoded.jpg")
+            decoded_path = image_file.with_suffix(".decoded.jpg")
             try:
                 import base64
                 decoded_path.write_bytes(base64.b64decode(encoded))
@@ -69,7 +70,7 @@ class ModelClientTests(unittest.TestCase):
             finally:
                 decoded_path.unlink(missing_ok=True)
             self.assertEqual(mime_type, "image/jpeg")
-            self.assertEqual(Path(image_file.name).read_bytes(), original_bytes)
+            self.assertEqual(image_file.read_bytes(), original_bytes)
 
     def test_chat_messages_caps_output_to_remaining_context(self):
         client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
@@ -243,11 +244,11 @@ class ModelClientTests(unittest.TestCase):
 
     def test_image_prompt_uses_approved_place_taxonomy(self):
         client = GammaClient()
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
-            image.write(b"synthetic-image")
-            image.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "synthetic.jpg"
+            image.write_bytes(b"synthetic-image")
             with patch.object(client, "chat", return_value=json.dumps({"scene_type": "餐饮空间"})) as chat:
-                client.analyze_image(image.name)
+                client.analyze_image(image)
 
         prompt = chat.call_args_list[0].args[0]
         self.assertIn("医疗与公共服务", prompt)
@@ -266,11 +267,11 @@ class ModelClientTests(unittest.TestCase):
                 "atmosphere": {"labels": ["温馨"], "details": ["暖色光线"]},
             },
         }
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
-            image.write(b"synthetic-image")
-            image.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "synthetic.jpg"
+            image.write_bytes(b"synthetic-image")
             with patch.object(client, "chat", return_value=json.dumps(payload)):
-                result = client.analyze_image(image.name)
+                result = client.analyze_image(image)
 
         self.assertEqual(result["semantic"]["place"]["primary"], "餐饮空间")
         self.assertEqual(result["semantic"]["objects"][0]["label"], "蛋糕")
@@ -295,11 +296,11 @@ class ModelClientTests(unittest.TestCase):
             "objects": ["玩具"],
             "ocr_text": "",
         }
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
-            image.write(b"synthetic-image")
-            image.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "synthetic.jpg"
+            image.write_bytes(b"synthetic-image")
             with patch.object(client, "chat", side_effect=[json.dumps(first), json.dumps(recovery)]) as chat:
-                result = client.analyze_image(image.name)
+                result = client.analyze_image(image)
 
         self.assertEqual(result["caption"], "孩子在客厅玩耍")
         self.assertEqual(result["activity"], "玩耍")
@@ -316,13 +317,13 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(adapter.checkpoint, str(checkpoint))
 
     def test_person_appearance_analysis_returns_only_target_clothing(self):
-        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
-            image.write(b"synthetic-crop")
-            image.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "synthetic.jpg"
+            image.write_bytes(b"synthetic-crop")
             client = GammaClient()
             with patch.object(client, "chat", return_value='{"clothing":["红色针织衫"],"confidence":0.88}') as chat:
                 result = client.analyze_person_appearance(
-                    image.name,
+                    image,
                     {"target_face_bbox": [20, 10, 60, 50], "face_instance_id": "face_1"},
                 )
 

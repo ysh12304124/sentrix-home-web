@@ -82,6 +82,13 @@ def build_default_retrievers(store, *, embedding_router=None, config=None, ann_d
         factory = _RETRIEVER_FACTORIES[name]
         retrievers.append(factory(store, embedding_router=embedding_router,
                                   config=config, ann_dir=ann_dir))
+    # A migrated Lite scope may retain its richer named-vector collection.
+    # Expose those routes in-process; the main API owns fusion and does not
+    # depend on the old port-8091 HTTP service.
+    from .lite_named_vectors import build_lite_named_vector_retrievers
+    retrievers.extend(build_lite_named_vector_retrievers(
+        store, embedding_router=embedding_router,
+    ))
     return retrievers
 
 

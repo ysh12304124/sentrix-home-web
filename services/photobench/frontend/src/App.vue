@@ -193,6 +193,61 @@ function macroMetrics(items, prefix) {
   });
   return { precision: averageMetric(values.map((row) => row.precision)), recall: averageMetric(values.map((row) => row.recall)), f1: averageMetric(values.map((row) => row.f1)), metricCount: values.length };
 }
+const retrievalRankCutoffs = [1, 3, 5, 8];
+function isInvalidTerminalRun(run) {
+  return run?.run_valid === false && ["cancelled", "interrupted", "failed"].includes(run?.status);
+}
+function rankedRetrievalMetrics(item) {
+  const savedFields = retrievalRankCutoffs.map((cutoff) => `retrieval_r_at_${cutoff}`);
+  if (savedFields.every((field) => Number.isFinite(Number(item?.[field])))
+      && Number.isFinite(Number(item?.retrieval_reciprocal_rank))) {
+    return {
+      available: true,
+      firstRank: item.retrieval_first_relevant_rank == null ? null : Number(item.retrieval_first_relevant_rank),
+      reciprocalRank: Number(item.retrieval_reciprocal_rank),
+      ...Object.fromEntries(savedFields.map((field) => [field, Number(item[field])])),
+    };
+  }
+  const gtKeys = new Set(mediaRefs(item).map(mediaKey).filter((key) => !key.endsWith(":")));
+  const candidates = Array.isArray(item?.retrieved_candidate_media)
+    ? item.retrieved_candidate_media
+    : Array.isArray(item?.retrieved_candidate_images) ? item.retrieved_candidate_images : null;
+  if (!gtKeys.size || candidates == null) return { available: false };
+  const seen = new Set();
+  let firstRank = null;
+  candidates.forEach((candidate) => {
+    const key = mediaKey(candidate);
+    if (key.endsWith(":") || seen.has(key)) return;
+    seen.add(key);
+    if (firstRank == null && gtKeys.has(key)) firstRank = seen.size;
+  });
+  return {
+    available: true,
+    firstRank,
+    reciprocalRank: firstRank ? 1 / firstRank : 0,
+    ...Object.fromEntries(retrievalRankCutoffs.map((cutoff) => [
+      `retrieval_r_at_${cutoff}`, firstRank != null && firstRank <= cutoff ? 1 : 0,
+    ])),
+  };
+}
+function compactRankMetrics(run = {}) {
+  if (isInvalidTerminalRun(run)) return "无效记录";
+  const summary = run.summary || {};
+  const values = retrievalRankCutoffs.map((cutoff) => summary?.[`retrieval_r_at_${cutoff}`]);
+  return values.some((value) => value != null) ? values.map(fmtPct).join(" / ") : "未记录";
+}
+function rankHitCount(summary, field) {
+  const rate = Number(summary?.[field]);
+  const count = Number(summary?.retrieval_rank_metric_count);
+  return Number.isFinite(rate) && Number.isFinite(count) ? Math.round(rate * count) : null;
+}
+function rankIncrementNote(summary, lowerField, upperField, rangeLabel) {
+  const upper = rankHitCount(summary, upperField);
+  const lower = lowerField ? rankHitCount(summary, lowerField) : 0;
+  return upper == null || lower == null
+    ? `${rangeLabel}新增命中未记录`
+    : `${rangeLabel}新增命中 ${Math.max(0, upper - lower)} 题`;
+}
 function effectiveRunSummary(run) {
   const saved = run?.summary || {};
   const items = run?.items || [];
@@ -216,6 +271,8 @@ function effectiveRunSummary(run) {
   const mediaMacro = macroMetrics(metricItems, "media");
   const imageMacro = macroMetrics(metricItems, "image");
   const videoMacro = macroMetrics(metricItems, "video");
+  const rankMetricRows = metricItems.map(rankedRetrievalMetrics).filter((row) => row.available);
+  const rankMetricMean = (field) => averageMetric(rankMetricRows.map((row) => row[field]));
   const actionJudges = items.flatMap((item) => item.task_judges?.length ? item.task_judges : [item.task_judge])
     .filter((judge) => [true, false].includes(judge?.correct));
   const parseTotals = items.map((item) => item.agent_stability?.json_parse_total).filter(Number.isFinite);
@@ -259,6 +316,12 @@ function effectiveRunSummary(run) {
     retrieval_f1_micro: saved.retrieval_f1_micro ?? (typedRetrieval ? mediaMicro.f1 : retrievalF1),
     retrieval_metric_count: saved.retrieval_metric_count ?? retrievalItems.length,
     retrieval_metric_scope: saved.retrieval_metric_scope ?? (typedRetrieval ? "all_media" : "legacy_image_only"),
+    retrieval_rank_metric_count: saved.retrieval_rank_metric_count ?? rankMetricRows.length,
+    retrieval_r_at_1: saved.retrieval_r_at_1 ?? rankMetricMean("retrieval_r_at_1"),
+    retrieval_r_at_3: saved.retrieval_r_at_3 ?? rankMetricMean("retrieval_r_at_3"),
+    retrieval_r_at_5: saved.retrieval_r_at_5 ?? rankMetricMean("retrieval_r_at_5"),
+    retrieval_r_at_8: saved.retrieval_r_at_8 ?? rankMetricMean("retrieval_r_at_8"),
+    retrieval_mrr: saved.retrieval_mrr ?? rankMetricMean("reciprocalRank"),
     media_retrieval_precision_micro: saved.media_retrieval_precision_micro ?? (typedRetrieval ? mediaMicro.precision : null),
     media_retrieval_recall_micro: saved.media_retrieval_recall_micro ?? (typedRetrieval ? mediaMicro.recall : null),
     media_retrieval_f1_micro: saved.media_retrieval_f1_micro ?? (typedRetrieval ? mediaMicro.f1 : null),
@@ -532,7 +595,23 @@ function fmtMemory(value) {
   if (value == null || !Number.isFinite(Number(value))) return "-";
   return `${(Number(value) / 1024).toFixed(2)} GiB`;
 }
+function gpuUnavailableReason(reason, runStatus = "") {
+  const reasons = {
+    external_model_endpoint_has_no_manager_metrics: "当前 Qwen 通过直接模型端点接入，未配置模型管理器/NVML 采样接口",
+    cloud_api_has_no_local_gpu_metrics: "云端模型没有本机 GPU 指标",
+    run_cancelled_before_gpu_metrics: "评测在进入 GPU 指标阶段前被取消",
+  };
+  if (reasons[reason]) return reasons[reason];
+  if (["cancelled", "interrupted", "failed"].includes(runStatus)) return reasons.run_cancelled_before_gpu_metrics;
+  return "等待评测进入 GPU 指标汇总阶段";
+}
 function gpuMetricRows(phase = {}) {
+  const hasSamples = phase.samples_count != null || phase.memory_pressure
+    || phase.model_process_memory_used_mib || phase.memory_used_mib;
+  if (!hasSamples) {
+    const status = resultPhaseStatus(phase);
+    return [["采样状态", statusLabel(status), gpuUnavailableReason(phase.reason, activeRun.value?.status), true]];
+  }
   if (phase.memory_pressure) {
     const mp = phase.memory_pressure || {};
     const used = phase.memory_used_gib || {};
@@ -583,8 +662,21 @@ function comparableMemoryProfile(run) {
   if (!run) return null;
   if (run?.memory_profile) return { ...run.memory_profile, source: "replay" };
   const gpu = run?.phases?.gpu_metrics;
-  if (!gpu) return { source: "pending", status: "pending", memory_profile: {}, questions_completed: run.summary?.completed, questions_total: run.summary?.total };
-  if (!gpu?.memory_profile) return { source: "pending", status: gpu.status, memory_profile: {}, questions_completed: run.summary?.completed, questions_total: run.summary?.total };
+  if (!gpu) {
+    const terminal = ["cancelled", "interrupted", "failed"].includes(run.status);
+    return {
+      source: terminal ? "unavailable" : "pending",
+      status: terminal ? "not_run" : "pending",
+      reason: terminal ? "run_cancelled_before_gpu_metrics" : null,
+      memory_profile: {},
+    };
+  }
+  if (!gpu?.memory_profile) return {
+    source: ["skipped", "cancelled", "failed", "not_run"].includes(gpu.status) ? "unavailable" : "pending",
+    status: gpu.status,
+    reason: gpu.reason,
+    memory_profile: {},
+  };
   return {
     status: gpu.status,
     source: "gpu_metrics",
@@ -597,6 +689,14 @@ function comparableMemoryProfile(run) {
 function memoryProfileRows(profile = {}) {
   const memory = profile.memory_profile || {};
   const isBenchmarkGpuProfile = profile.source === "gpu_metrics";
+  if (["pending", "unavailable"].includes(profile.source)) {
+    return [[
+      "采样状态",
+      statusLabel(profile.status),
+      gpuUnavailableReason(profile.reason, activeRun.value?.status),
+      true,
+    ]];
+  }
   if (memory.method === "macos_unified_memory_v1") {
     return [
       ["内存占用峰值", memory.memory_used_peak_gib == null ? "-" : `${Number(memory.memory_used_peak_gib).toFixed(2)} GiB`, "16GB 统一内存整机峰值", true],
@@ -639,6 +739,11 @@ function aggregateMetricRows(phase = {}) {
       : "历史记录未保存 Agent 独立阶段墙钟";
   const typedMediaMetrics = summary.retrieval_metric_scope === "all_media";
   return [
+    ["媒体检索 R@1", fmtPct(summary.retrieval_r_at_1), `首位命中 ${rankHitCount(summary, "retrieval_r_at_1") ?? "-"}/${summary.retrieval_rank_metric_count ?? 0} 题`, true],
+    ["媒体检索 R@3", fmtPct(summary.retrieval_r_at_3), `${rankIncrementNote(summary, "retrieval_r_at_1", "retrieval_r_at_3", "第 2–3 位")} · R@K 为累计命中率`, true],
+    ["媒体检索 R@5", fmtPct(summary.retrieval_r_at_5), `${rankIncrementNote(summary, "retrieval_r_at_3", "retrieval_r_at_5", "第 4–5 位")} · R@K 为累计命中率`, true],
+    ["媒体检索 R@8", fmtPct(summary.retrieval_r_at_8), `${rankIncrementNote(summary, "retrieval_r_at_5", "retrieval_r_at_8", "第 6–8 位")} · R@K 为累计命中率`, true],
+    ["媒体检索 MRR", fmtPct(summary.retrieval_mrr), "第一个 GT 排名倒数的逐题平均；若只有首位命中或未命中，MRR 会与 R@1 相同", true],
     [typedMediaMetrics ? "媒体检索 Precision" : "历史图片检索 Precision", fmtPct(summary.retrieval_precision_macro), `逐 QA 求值后平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT · 排除 ${summary.retrieval_excluded_unanswerable_count ?? 0} 道不可回答题`, true],
     [typedMediaMetrics ? "媒体检索 Recall" : "历史图片检索 Recall", fmtPct(summary.retrieval_recall_macro), typedMediaMetrics ? "每道 QA 的 Recall 等权平均；图视频按类型与稳定标识匹配" : "每道 QA 的 Recall 等权平均；历史 run 无法补算视频指标", true],
     ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
@@ -1264,8 +1369,15 @@ function phaseSummary(key, phase) {
   if (key === "qa_eval") {
     const p = phase.progress;
     if (p && (p.completed != null || p.in_flight != null)) {
-      const agentText = `Agent ${p.agent_completed ?? p.completed ?? 0}/${p.agent_total ?? p.total ?? "?"}`;
-      const judgeText = `Judge ${p.judge_completed ?? 0}/${p.judge_total ?? p.total ?? "?"}`;
+      const cancelled = ["cancelled", "interrupted", "failed"].includes(phase.status);
+      const terminalFailures = Number(phase.failed_count || 0);
+      const agentCompleted = Number(p.agent_completed ?? p.completed ?? 0);
+      const agentText = cancelled
+        ? `Agent 成功 ${Math.max(0, agentCompleted - terminalFailures)}/${p.agent_total ?? p.total ?? "?"}`
+        : `Agent ${agentCompleted}/${p.agent_total ?? p.total ?? "?"}`;
+      const judgeText = cancelled
+        ? `Judge 有效 ${activeRun.value?.summary?.judge_valid_count ?? p.judge_submitted ?? 0}/${p.judge_total ?? p.total ?? "?"}`
+        : `Judge ${p.judge_completed ?? 0}/${p.judge_total ?? p.total ?? "?"}`;
       const concurrencyText = p.qa_concurrency > 1 || p.judge_concurrency > 1
         ? ` · 并发 Agent ${p.qa_concurrency ?? "-"} / Judge ${p.judge_concurrency ?? "-"}` : "";
       const failedText = phase.failed_count ? ` · 失败 ${phase.failed_count}` : "";
@@ -1332,6 +1444,9 @@ async function loadRuns() { runs.value = (await api("/api/runs")).runs || []; }
 function runProgressLabel(run) {
   if (run?.mode === "build") return "—";
   const progress = run?.phases?.qa_eval?.progress;
+  if (isInvalidTerminalRun(run)) {
+    return `有效 ${run?.summary?.judge_valid_count ?? progress?.judge_submitted ?? 0}/${run?.qa_count ?? progress?.judge_total ?? 0}`;
+  }
   if (progress && progress.judge_total != null) {
     return `${progress.judge_completed ?? 0}/${progress.judge_total}`;
   }
@@ -1555,6 +1670,8 @@ const selectedReuseBase = computed(() => reuseBases.value.find((item) => item.ba
 // 优先查 run 历史（scope_id → album_id），再按相册名子串匹配（长 id 优先），最后保持当前选择。
 function inferAlbumForScope(space) {
   if (!space) return null;
+  const reusable = reuseBases.value.find((base) => base.scope_id === space.id && base.album_id);
+  if (reusable?.album_id && manifests.value.some((m) => m.album_id === reusable.album_id)) return reusable.album_id;
   const run = runs.value.find((r) => r.scope_id === space.id && (r.mode === "build" || r.mode === "full" || !r.mode));
   if (run?.album_id && manifests.value.some((m) => m.album_id === run.album_id)) return run.album_id;
   const name = String(space.name || "");
@@ -2009,6 +2126,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <th>状态</th>
 <th>进度</th>
 <th>媒体召回率</th>
+<th>R@1 / R@3 / R@5 / R@8</th>
 <th>质量均分</th>
 <th>
 </th>
@@ -2027,8 +2145,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
 <td>{{ runProgressLabel(run) }}</td>
-<td>{{ fmtPct(run.summary?.media_retrieval_recall_micro ?? run.summary?.retrieval_recall_micro) }}</td>
-<td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
+<td>{{ isInvalidTerminalRun(run) ? '无效记录' : fmtPct(run.summary?.media_retrieval_recall_micro ?? run.summary?.retrieval_recall_micro) }}</td>
+<td class="muted small">{{ compactRankMetrics(run) }}</td>
+<td>{{ isInvalidTerminalRun(run) ? '无效记录' : (run.summary?.answer_quality_mean ?? "-") }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>
 </td>
@@ -2058,6 +2177,10 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </div>
       <p class="run-meta">开始 {{ fmtDate(activeRun.started_at) }} · 总耗时 {{ duration(activeRun) }}<template v-if="activeRun.mode === 'reuse'"> · 复用相册 {{ activeRun.scope_name || activeRun.scope_id || activeRun.existing_scope_id }}<span v-if="(activeRun.scope_reused_from_runs || []).length">（源自 run {{ activeRun.scope_reused_from_runs.join('、') }}）</span><span v-else>（外部创建，非编排器产物）</span></template><template v-else-if="activeRun.mode === 'build'"> · 产出相册 {{ activeRun.scope_id || '-' }}（已保留，可在复用测评中使用）</template></p>
       <div v-if="activeRun.fatal_error" class="run-error-banner"><b>任务终止原因</b><span>{{ activeRun.fatal_error }}</span><small v-if="activeRun.failed_phase">失败阶段：{{ EXECUTION_PHASES.find((item) => item.key === activeRun.failed_phase)?.label || activeRun.failed_phase }}</small></div>
+      <div v-else-if="activeRun.run_valid === false && activeRun.mode !== 'build' && ['cancelled','interrupted','failed'].includes(activeRun.status)" class="run-error-banner">
+        <b>本条记录不能作为完整评测结果</b>
+        <span>运行已{{ activeRun.status === 'cancelled' ? '取消' : '中断' }}；实际提交 Judge {{ activeRun.phases?.qa_eval?.progress?.judge_submitted ?? 0 }}/{{ activeRun.qa_count ?? 0 }} 题，失败或取消 {{ activeRun.phases?.qa_eval?.failed_count ?? 0 }} 题。下方空指标表示未采样，不代表 0 分。</span>
+      </div>
       <section v-if="activeRun.mode !== 'build'" class="rejudge-card">
         <div class="rejudge-head">
 <div>
@@ -2150,7 +2273,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <b>{{ comparableMemoryProfile(activeRun)?.source === 'replay' ? '可比较显存复测' : '可比较显存' }}</b>
 <span class="phase-status" :class="comparableMemoryProfile(activeRun)?.status || 'pending'">{{ statusLabel(comparableMemoryProfile(activeRun)?.status || 'pending') }}</span>
 </div>
-<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun)?.source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : comparableMemoryProfile(activeRun)?.source === 'replay' ? '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' : '本次 run 的 GPU 采样结束后生成；' }}可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
+<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun)?.source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : comparableMemoryProfile(activeRun)?.source === 'replay' ? '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' : comparableMemoryProfile(activeRun)?.source === 'unavailable' ? '本条记录没有可比较显存数据；' : '本次 run 的 GPU 采样结束后生成；' }}可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
 <p v-if="comparableMemoryProfile(activeRun).error" class="error">{{ comparableMemoryProfile(activeRun).error }}</p>
 <div class="phase-metrics">
 <div v-for="row in memoryProfileRows(comparableMemoryProfile(activeRun) || {})" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
@@ -2166,14 +2289,15 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.aggregate)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.aggregate)) }}</span>
 </div>
 <p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.aggregate)) }}</p>
-<div class="phase-metrics">
+<div v-if="isInvalidTerminalRun(activeRun)" class="qa-results-empty">本次运行未完整结束，不展示局部样本汇总；请重新运行后再比较指标。</div>
+<div v-else class="phase-metrics">
 <div v-for="row in aggregateMetricRows(activeRun.phases?.aggregate)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
 <strong>{{ row[1] }}</strong>
 <small>{{ row[2] }}</small>
 </div>
 </div>
-<div class="token-distribution-section">
+<div v-if="!isInvalidTerminalRun(activeRun)" class="token-distribution-section">
 <div class="phase-title">
 <b>主 Agent 单次调用 Token 分布</b>
 <span class="muted small">共 {{ tokenDistributionCount() }} 次模型调用</span>
@@ -2263,7 +2387,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <span class="item-idx">{{ String(summary.index + 1).padStart(2, "0") }}</span>
             <strong>{{ summary.question }}</strong>
             <span class="score" :class="[scoreClass(summary.judge?.score), 'judge-round-' + judgeRoundState(summary)]">{{ judgeScoreLabel(summary) }}</span>
-            <span v-if="summary.ground_truth_count > 0" class="muted small">精确率 {{ fmtPct(summary.retrieval_precision) }} · 召回率 {{ fmtPct(summary.retrieval_recall) }} · F1 {{ fmtPct(summary.retrieval_f1) }} · 命中 {{ summary.matched_count }}/{{ summary.ground_truth_count }}</span>
+            <span v-if="summary.ground_truth_count > 0 && !summary.has_error" class="muted small">精确率 {{ fmtPct(summary.retrieval_precision) }} · 召回率 {{ fmtPct(summary.retrieval_recall) }} · F1 {{ fmtPct(summary.retrieval_f1) }} · 命中 {{ summary.matched_count }}/{{ summary.ground_truth_count }}</span>
+            <span v-else-if="summary.ground_truth_count > 0 && summary.has_error" class="muted small">检索未执行</span>
+            <span v-if="summary.retrieval_rank_metrics_available" class="muted small">首个 GT {{ summary.retrieval_first_relevant_rank == null ? '未命中' : `第 ${summary.retrieval_first_relevant_rank} 位` }}</span>
             <span v-if="summary.evidence_judge?.score != null" class="score" :class="scoreClass(summary.evidence_judge.score)">证据 {{ summary.evidence_judge.score }}</span>
             <span class="muted small">模型 {{ summary.model_call_count }} · 工具 {{ summary.tool_call_count }}</span>
             <span class="qa-chevron" aria-hidden="true">⌄</span>

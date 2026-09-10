@@ -25,6 +25,11 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows fallback
+    msvcrt = None
+
 
 _CLIENTS = {}
 _CLIENTS_LOCK = threading.Lock()
@@ -238,7 +243,14 @@ class QdrantMemoryIndex:
         return self._matching_collections(space, dimension, model_name, scope_id)
 
     def clear(self) -> int:
-        """Drop only collections owned by this Sentrix index prefix."""
+        """Remove every point from collections owned by this index prefix.
+
+        Embedded Qdrant on Windows can retain a just-deleted collection handle
+        until the local client closes.  Recreating the same collection name in
+        a rebuild can then expose stale points.  Clearing point ids keeps the
+        collection schema and gives deterministic rebuild semantics on both
+        Windows and POSIX.
+        """
         with self._lock:
             client = self._get_client()
             collections = [
@@ -246,12 +258,31 @@ class QdrantMemoryIndex:
                 if item.name.startswith(f"{self.prefix}_")
             ]
             for collection in collections:
-                client.delete_collection(collection_name=collection)
+                self._clear_collection_points(client, collection)
         self.last_error = None
         return len(collections)
 
+    @staticmethod
+    def _clear_collection_points(client, collection: str) -> None:
+        from qdrant_client import models
+
+        while True:
+            points, _ = client.scroll(
+                collection_name=collection,
+                limit=256,
+                with_payload=False,
+                with_vectors=False,
+            )
+            if not points:
+                return
+            client.delete(
+                collection_name=collection,
+                points_selector=models.PointIdsList(points=[point.id for point in points]),
+                wait=True,
+            )
+
     def drop_scope(self, scope_id: str) -> int:
-        """Drop every collection partition owned by one scope. Returns count."""
+        """Clear every collection partition owned by one scope. Returns count."""
         if not scope_id:
             return 0
         removed = 0
@@ -261,7 +292,7 @@ class QdrantMemoryIndex:
             names = [item.name for item in client.get_collections().collections
                      if item.name.startswith(f"{self.prefix}_") and marker in item.name]
             for name in names:
-                client.delete_collection(collection_name=name)
+                self._clear_collection_points(client, name)
                 removed += 1
         self.last_error = None
         return removed
@@ -322,19 +353,26 @@ class QdrantMemoryIndex:
 
 
 def _acquire_dir_lock(directory: str):
-    """Take an exclusive flock on the Qdrant dir so only one API process owns it.
+    """Take an exclusive platform lock so only one API process owns Qdrant.
 
     Returns the open fd on success, or None when another process already holds
     the lock.  A POSIX advisory lock is released automatically when the fd is
     closed or the process exits, so no explicit unlock is needed on shutdown.
     """
-    if fcntl is None:
-        return True  # non-POSIX: no cross-process guard available
     lock_path = Path(directory) / _LOCK_FILENAME
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:
+            if os.fstat(fd).st_size < 1:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            os.close(fd)
+            return True  # uncommon platform without a process-lock primitive
     except OSError:
         os.close(fd)
         return None

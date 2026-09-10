@@ -1,23 +1,11 @@
 {
-  "default_target_id": "server-153",
+  "default_target_id": "local-qwen3-vl-4b",
   "targets": {
-    "backend-100": {
-      "label": "100 后端链路（默认）",
-      "manager_url": "http://192.168.0.153:8501",
-      "model_base_url": "http://192.168.0.153:8101/v1",
-      "description": "100 Sentrix 后端固定连接的第二套 vLLM Manager 和模型服务"
-    },
-    "server-153": {
-      "label": "153 产品链路",
-      "manager_url": "http://192.168.0.153:8500",
-      "model_base_url": "http://192.168.0.153:8100/v1",
-      "description": "153 产品后端固定连接的主 vLLM Manager 和模型服务"
-    },
-    "szu-via-mac": {
-      "label": "学校算力中心 4090（经 mac 隧道 192.168.1.65）",
-      "manager_url": "http://192.168.1.65:18500",
-      "model_base_url": "http://192.168.1.65:18100/v1",
-      "description": "学校 vllm_manager + vllm，SSH 反向隧道经 mac 中转"
+    "local-qwen3-vl-4b": {
+      "label": "本机 Qwen3-VL-4B",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:11434/v1",
+      "description": "本机 OpenAI-compatible Qwen3-VL 服务；按需加载并在空闲后卸载"
     }
   }
 }

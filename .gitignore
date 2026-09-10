@@ -1,9 +1,12 @@
 node_modules/
 .venv/
 .env
+.env.local
+!.env.local.example
 .DS_Store
 /data/
 logs/
+/artifacts/migration-backups/
 .ollama-sentrix/
 __pycache__/
 *.py[cod]
