@@ -1334,9 +1334,6 @@
   }
 
   async function deleteConversationAction(id) {
-    const target = (state.conversations || []).find((conv) => conv.conversation_id === id);
-    const title = (target && target.title) || "这个对话";
-    if (!window.confirm(`删除「${title}」？`)) return;
     try {
       await window.sentrixApi.deleteConversation(id);
       if (state.conversationId === id) {
