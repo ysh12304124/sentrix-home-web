@@ -258,7 +258,8 @@
   }
 
   function mediaResults(result) {
-    const media = result?.media_results || result?.mediaResults || result?.image_results || [];
+    const mediaSource = result?.media_results || result?.mediaResults || result?.image_results || [];
+    const media = Array.isArray(mediaSource) ? mediaSource : [];
     if (!media.length) return "";
     const rows = media.map((item) => {
       const mediaType = item.media_type === "video" ? "video" : "image";
@@ -349,8 +350,10 @@
 
   function timelineEvents(result, liveProgress = null) {
     const source = liveProgress || (result && result.public_progress) || [];
+    const events = Array.isArray(source) ? source : [];
     const byId = new Map();
-    source.forEach((event, index) => {
+    events.forEach((event, index) => {
+      if (!event || typeof event !== "object") return;
       const id = event.event_id || `${event.stage || "status"}-${event.step_index || index}`;
       byId.set(id, { ...event, event_id: id });
     });
@@ -358,11 +361,12 @@
   }
 
   function timelineToolArtifact(event) {
-    const data = event.payload || {};
+    const data = event?.payload && typeof event.payload === "object" ? event.payload : {};
     if (data.tool === "search_memories") {
       const conditions = data.condition_summary && typeof data.condition_summary === "object"
         ? Object.values(data.condition_summary).filter(Boolean).join(" · ") : "";
-      const meta = [data.query, conditions, data.total != null ? `找到 ${data.total} 张` : "", ...(data.gaps || [])].filter(Boolean);
+      const gaps = Array.isArray(data.gaps) ? data.gaps : [];
+      const meta = [data.query, conditions, data.total != null ? `找到 ${data.total} 张` : "", ...gaps].filter(Boolean);
       return meta.length ? `<small class="timeline-artifact">${escapeHtml(meta.join(" · "))}</small>` : "";
     }
     if (data.tool === "inspect_photo") return data.observation ? `<p class="timeline-observation">${escapeHtml(data.observation)}</p>` : "";
@@ -377,14 +381,15 @@
     const running = status === "running" || status === "cancelling";
     const blocked = ["blocked", "denied", "error", "cancelled", "partial"].includes(status);
     const stateClass = running ? "running" : blocked ? "blocked" : "complete";
-    const payload = event.payload || {};
+    const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
     let heading = "记忆处理中";
     let content = event.text || "";
     let artifact = "";
     if (event.kind === "plan" || event.kind === "plan_update") {
       heading = "本轮记忆目标";
       content = payload.goal || event.text || "";
-      artifact = (payload.requirements || []).map((item) => `<li>${escapeHtml(item.description || item.evidence_type || "待确认的依据")} · ${escapeHtml(item.status || "open")}</li>`).join("");
+      const requirements = Array.isArray(payload.requirements) ? payload.requirements : [];
+      artifact = requirements.map((item) => `<li>${escapeHtml(item.description || item.evidence_type || "待确认的依据")} · ${escapeHtml(item.status || "open")}</li>`).join("");
       artifact = artifact ? `<ul class="timeline-requirements">${artifact}</ul>` : "";
     } else if (event.kind === "model_action") {
       heading = "正在推进";
@@ -406,9 +411,11 @@
   function recallCard(result) {
     const event = timelineEvents(result).find((item) => item.kind === "tool_result" && item.payload && item.payload.tool === "search_memories");
     if (!event) return "";
-    const data = event.payload || {};
-    const preview = (data.preview || []).map((item) => `<button class="timeline-image" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url || "")}" data-image-label="${escapeHtml(item.evidence_summary || item.handle || "原始图片")}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || "")}" data-image-activity="${escapeHtml(item.activity || "")}" data-image-role="召回候选"><img src="${escapeHtml(item.media_url || "")}" alt="${escapeHtml(item.evidence_summary || item.handle || "召回图片")}" loading="lazy" /></button>`).join("");
-    const details = [data.query, data.total != null ? `${data.total} 张相关照片` : "", ...(data.gaps || [])].filter(Boolean).join(" · ");
+    const data = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const previews = Array.isArray(data.preview) ? data.preview : [];
+    const gaps = Array.isArray(data.gaps) ? data.gaps : [];
+    const preview = previews.map((item) => `<button class="timeline-image" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url || "")}" data-image-label="${escapeHtml(item.evidence_summary || item.handle || "原始图片")}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || "")}" data-image-activity="${escapeHtml(item.activity || "")}" data-image-role="召回候选"><img src="${escapeHtml(item.media_url || "")}" alt="${escapeHtml(item.evidence_summary || item.handle || "召回图片")}" loading="lazy" /></button>`).join("");
+    const details = [data.query, data.total != null ? `${data.total} 张相关照片` : "", ...gaps].filter(Boolean).join(" · ");
     return `<details class="recall-card"><summary>召回的照片${data.total != null ? ` · ${escapeHtml(String(data.total))} 张` : ""}</summary><p>${escapeHtml(details || "本轮召回依据")}</p>${preview ? `<div class="timeline-image-grid">${preview}</div>` : ""}</details>`;
   }
 
@@ -555,7 +562,7 @@
     const trace = timeline.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>记忆推理 · ${timeline.length} 个节点</summary><div class="timeline-list">${timeline.map(timelineCard).join("")}</div></details>` : "";
     const grounding = result.answerGrounding || result.answer_grounding || {};
     const selected = Boolean((grounding.selected_image_handles || grounding.selected_asset_ids || []).length);
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble">${selected ? imageResults(result) : ""}<p>${assistantAnswer(result) || "我在。"}</p>${trace}${recallCard(result)}${assistantEvidence(result)}</div></article>`;
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble">${selected ? mediaResults(result) : ""}<p>${assistantAnswer(result) || "我在。"}</p>${trace}${recallCard(result)}${assistantEvidence(result)}</div></article>`;
   }
 
   function updateLiveProgress() {
@@ -865,6 +872,7 @@
   function renderView() {
     const root = document.getElementById("view-root");
     const views = { overview, search: searchView, timeline: timelineView, people: peopleView, knowledge: semanticKnowledgeView, library: libraryView, stories: storiesView, imports: importsView, settings: settingsView };
+    root.classList.toggle("assistant-view", state.view === "search");
     root.innerHTML = state.loading ? emptyState("正在读取本地记忆", "正在加载 Asset、Observation、Event、Fact 和故事。") : views[state.view]();
     renderModal();
     bindViewEvents();

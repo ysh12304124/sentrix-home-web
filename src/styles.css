@@ -601,3 +601,13 @@ details.agent-trace-box > div { display: flex; flex-direction: column; gap: 6px;
 .conversation-menu { position: relative; flex: 0 0 auto; margin-right: 8px; }.conversation-menu summary { cursor: pointer; list-style: none; color: var(--faint); font-size: 12px; padding: 7px 3px; }.conversation-menu summary::-webkit-details-marker { display: none; }.conversation-menu[open] { z-index: 2; }.conversation-menu[open] > div, .conversation-menu[open] > button { display: block; }.conversation-menu button { display: block; width: 76px; padding: 7px 9px; border: 0; background: #fff; color: var(--ink); text-align: left; font-size: 10px; cursor: pointer; }.conversation-menu button:last-child { color: #a54f43; }.conversation-menu[open] { background: #fff; border: 1px solid var(--line); border-radius: 7px; box-shadow: var(--shadow); }
 .conversation-drawer { min-width: 0; }.conversation-drawer-toggle { display: none; }
 @media (max-width: 760px) { .conversation-drawer-toggle { display: inline-flex; align-items: center; margin: 0 0 9px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: #fffdf8; color: var(--ink); font-size: 11px; cursor: pointer; }.conversation-drawer .conversation-rail { display: none; }.conversation-drawer .conversation-rail.drawer-open { display: block; } }
+
+/* Let the conversation use the complete application canvas while retaining its reading hierarchy. */
+.assistant-layout { width: 100%; max-width: none; grid-template-columns: 230px minmax(0, 1fr); gap: 14px; margin: 12px 0; padding: 0 20px; box-sizing: border-box; }
+.view-root.assistant-view { max-width: none; padding-left: 20px; padding-right: 20px; }
+.assistant-main { width: 100%; }
+.assistant-conversation, .assistant-composer, .conversation-summary { max-width: none; }
+.assistant-conversation { gap: 14px; margin: 16px 0 12px; }
+.assistant-composer { margin: 0; bottom: 12px; }
+.assistant-bubble { padding: 14px 16px; }
+@media (max-width: 760px) { .view-root.assistant-view { padding-left: 12px; padding-right: 12px; }.assistant-layout { margin: 10px 0; padding: 0; }.assistant-conversation { margin-top: 12px; } }
