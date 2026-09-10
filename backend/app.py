@@ -2443,7 +2443,7 @@ def _turn_executor():
 def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns="",
                    progress_callback=None, selected_asset_handle=None,
                    selected_result_set_id=None, conversation_summary="",
-                   profile_name=None, include_debug=False):
+                   profile_name=None, include_debug=False, should_cancel=None):
     """SENTRIX_AGENT_PROFILE=tool_loop* 时走 AgentRuntime（模型自主 Tool-Loop）。"""
     from .agent_runtime import tools as runtime_tools
     from .agent_runtime.runtime import AgentRuntime, public_agent2_trace
@@ -2540,7 +2540,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                        progress_callback=progress_callback,
                        selected_handle=selected_asset_handle,
                        selected_result_set_id=selected_result_set_id,
-                       conversation_summary=conversation_summary)
+                       conversation_summary=conversation_summary,
+                       should_cancel=should_cancel)
     model_call_metrics.extend(gamma.get_and_clear_call_metrics())
     if conversation_id:
         _TOOL_LOOP_TASK_STATE[conversation_id] = turn.task_state
@@ -2740,7 +2741,7 @@ def assistant_turn(request: AssistantTurnRequest):
             recent_turns = ""
     # tool_loop 是唯一 agent 路径：异步执行，立即返回 turn_id 供前端轮询实时进度
     turn_id = make_id("turn")
-    _TURN_JOBS[turn_id] = {"status": "running", "public_progress": [],
+    _TURN_JOBS[turn_id] = {"status": "running", "cancel_requested": False, "public_progress": [],
                            "progress_events": [], "result": None,
                            "created_at": time.time()}
     _turn_executor().submit(
@@ -2770,10 +2771,21 @@ def assistant_turn_status(turn_id: str):
     result = job.get("result") or {}
     return {
         "turn_id": turn_id,
-        "status": "complete",
+        "status": job["status"],
         "public_progress": job.get("public_progress") or result.get("public_progress") or [],
         "result": result,
     }
+
+
+@app.post("/api/assistant/turn/{turn_id}/cancel")
+def cancel_assistant_turn(turn_id: str):
+    job = _TURN_JOBS.get(turn_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="turn not found")
+    if job.get("status") in {"complete", "error", "cancelled"}:
+        return {"turn_id": turn_id, "status": job.get("status")}
+    job["cancel_requested"] = True
+    return {"turn_id": turn_id, "status": "cancelling"}
 
 
 @app.get("/api/assistant/turn/{turn_id}/events")
@@ -2794,13 +2806,13 @@ async def assistant_turn_events(turn_id: str):
             for ev in events[sent:]:
                 sent += 1
                 yield f"event: progress\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
-            if job["status"] in {"complete", "error"}:
+            if job["status"] in {"complete", "cancelled", "error"}:
                 payload = {
                     "type": "complete", "turn_id": turn_id,
                     "status": job["status"],
                     "public_progress": job.get("progress_events") or job.get("public_progress") or [],
                 }
-                if job["status"] == "complete" and job.get("result"):
+                if job["status"] in {"complete", "cancelled"} and job.get("result"):
                     payload["result"] = job["result"]
                 if job["status"] == "error":
                     payload["error"] = job.get("error")
@@ -2832,10 +2844,26 @@ def _record_turn_conversation(message, request, result, turn_id=""):
             conversation_store.touch_conversation(cid)
         conversation_store.add_message(cid, "user", {"text": message},
                                        scope_id=scope_id, turn_id=turn_id)
+        grounding = result.get("answer_grounding") or result.get("answerGrounding") or {}
+        presentation = {
+            "answer": result.get("answer", ""),
+            "tool_loop_status": result.get("tool_loop_status", "complete"),
+            "tool_loop_reason": result.get("tool_loop_reason", ""),
+            "termination_reason": result.get("termination_reason", ""),
+            "public_progress": result.get("public_progress") or [],
+            "agent2_trace": result.get("agent2_trace") or {},
+            "image_results": result.get("image_results") or [],
+            "answer_grounding": {
+                "display_mode": grounding.get("display_mode") or "none",
+                "selected_image_handles": list(grounding.get("selected_image_handles") or []),
+            },
+        }
         conversation_store.add_message(cid, "assistant", {
             "text": result.get("answer", ""),
             "intent": result.get("intent"),
             "evidence_status": result.get("evidence_status"),
+            "turn_id": turn_id,
+            "presentation": presentation,
         }, scope_id=scope_id, turn_id=turn_id)
         trace = result.get("retrieval_trace") or result.get("trace") or []
         steps = []
@@ -2853,7 +2881,7 @@ def _record_turn_conversation(message, request, result, turn_id=""):
         ]
         conversation_store.save_trajectory(
             turn_id, cid, profile=os.getenv("SENTRIX_AGENT_PROFILE", "goal_driven_candidate"),
-            steps=steps, result={"answer": result.get("answer", ""), "intent": result.get("intent"),
+            steps=steps, result={**presentation, "intent": result.get("intent"),
                                  "telemetry": result.get("telemetry") or {}},
             public_progress=public_progress, scope_id=scope_id,
         )
@@ -3158,6 +3186,8 @@ def assistant_response(result):
         result.pop("retrieval_strategy", None)
         result.pop("structured_result", None)
         result.pop("parser_raw", None)
+        result.pop("retrieval_trace", None)
+        result.pop("tool_trace", None)
     return result
 
 
@@ -3178,7 +3208,8 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
                                  selected_asset_handle=selected_asset_handle,
                                  selected_result_set_id=selected_result_set_id,
                                  conversation_summary=conversation_summary,
-                                 include_debug=include_debug)
+                                 include_debug=include_debug,
+                                 should_cancel=lambda: bool(job and job.get("cancel_requested")))
         # B4 canary telemetry：profile / 工具序列 / guard / 延迟 / fallback 标记
         try:
             trace = result.get("retrieval_trace") or []
@@ -3204,7 +3235,7 @@ def _execute_turn_job(turn_id, message, conversation_id, scope_id, viewer_id, re
         _record_turn_conversation(message, _AssistantTurnLike(
             conversation_id=conversation_id, scope_id=scope_id), result, turn_id=turn_id)
         if job is not None:
-            job.update({"status": "complete", "result": result,
+            job.update({"status": "cancelled" if result.get("tool_loop_status") == "cancelled" else "complete", "result": result,
                         "public_progress": result.get("public_progress") or job.get("public_progress") or []})
         # D3：后台生成会话摘要（不阻塞回答交付）
         if CONVERSATION_STORE_ENABLED and conversation_id and result.get("tool_loop_status") == "complete":

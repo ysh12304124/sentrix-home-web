@@ -62,6 +62,7 @@
     renamePerson: (id, payload) => request(`/api/people/${encodeURIComponent(id)}/rename`, { method: "POST", body: JSON.stringify(payload) }),
     assistantTurnAsync: (message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", viewerId = "owner", selectedAsset = null) => request("/api/assistant/turn", { method: "POST", body: JSON.stringify({ message, conversation_id: conversationId || null, feedback, scope_id: scopeId, selected_entity_id: selectedEntityId || null, selected_asset_handle: (selectedAsset && selectedAsset.handle) || null, selected_result_set_id: (selectedAsset && selectedAsset.result_set_id) || null, viewer_id: viewerId || "owner" }) }),
     assistantTurnPoll: (turnId) => request(`/api/assistant/turn/${encodeURIComponent(turnId)}`),
+    assistantTurnCancel: (turnId) => request(`/api/assistant/turn/${encodeURIComponent(turnId)}/cancel`, { method: "POST" }),
     assistantTurnEventsUrl: (turnId) => `${configuredBase}/api/assistant/turn/${encodeURIComponent(turnId)}/events`,
     resultSetPhoto: (resultSetId, handle, scopeId = "home-default", original = false) => `${configuredBase}/api/assistant/result-set/${encodeURIComponent(resultSetId)}/photo?handle=${encodeURIComponent(handle)}&scope_id=${encodeURIComponent(scopeId)}${original ? "&original=1" : ""}`,
     conversationMessages: (conversationId, limit = 20) => request(`/api/conversation/${encodeURIComponent(conversationId)}/messages?limit=${limit}`),
