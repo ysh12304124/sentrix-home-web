@@ -263,21 +263,20 @@
     if (!media.length) return "";
     const rows = media.map((item) => {
       const mediaType = item.media_type === "video" ? "video" : "image";
-      const label = item.display_handle || (mediaType === "video" ? "原始视频" : "原始图片");
+      const label = item.display_handle || (mediaType === "video" ? "视频" : "照片");
       const aspects = [
         ...(item.supported_aspects || []).map((aspect) => `对上了：${aspect}`),
         ...(item.uncertain_aspects || []).map((aspect) => `还不能确认：${aspect}`),
       ];
       const caption = aspects.length
-        ? aspects.map(escapeHtml).join(" · ")
-        : (item.captured_at || item.caption || "可回看的原始证据");
-      const dup = item.near_duplicate_size > 1 ? `<small class="image-dup">另有 ${item.near_duplicate_size - 1} 张相似照片</small>` : "";
+        ? aspects.join(" · ")
+        : (item.captured_at || item.caption || "本轮相关内容");
       if (mediaType === "video") {
         return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
       }
-      return `<button class="image-result" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url)}" data-image-label="${escapeHtml(label)}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-activity="${escapeHtml(item.caption || "")}" data-image-role="模型选图"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
+      return `<button class="image-result" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url)}" data-image-label="${escapeHtml(label)}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || item.location || "")}" data-image-activity="${escapeHtml(item.caption || caption || "")}" title="查看照片"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /></button>`;
     }).join("");
-    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关媒体</p><h3>${media.length} 项</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
+    return `<section class="evidence-layer image-results"><div class="image-result-grid">${rows}</div></section>`;
   }
 
   function traceLabel(item) {
@@ -562,7 +561,7 @@
     const trace = timeline.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>记忆推理 · ${timeline.length} 个节点</summary><div class="timeline-list">${timeline.map(timelineCard).join("")}</div></details>` : "";
     const grounding = result.answerGrounding || result.answer_grounding || {};
     const selected = Boolean((grounding.selected_image_handles || grounding.selected_asset_ids || []).length);
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble">${selected ? mediaResults(result) : ""}<p>${assistantAnswer(result) || "我在。"}</p>${trace}${recallCard(result)}${assistantEvidence(result)}</div></article>`;
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble">${selected ? mediaResults(result) : ""}<p>${assistantAnswer(result) || "我在。"}</p>${trace}${recallCard(result)}</div></article>`;
   }
 
   function updateLiveProgress() {
@@ -585,12 +584,9 @@
 
   function searchView() {
     const messages = state.assistantMessages;
-    const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
-    const summary = state.activeConversationSummary ? `<details class="conversation-summary"><summary>本会话摘要</summary><p>${escapeHtml(state.activeConversationSummary).replace(/\n/g, "<br />")}</p></details>` : "";
     const rail = conversationRail();
-    const contentIntro = messages.length || state.searchLoading ? introduction : "";
-    const inner = `${contentIntro}${summary}<section class="assistant-conversation">${messages.map(assistantMessage).join("")}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><div class="agent-trace live" data-live-progress><div class="timeline-list">${timelineEvents(null, state.liveProgress).map(timelineCard).join("")}</div></div><button class="text-button" data-action="cancel-assistant-turn">停止本轮回答</button></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${rail ? `<div class="assistant-layout">${rail}<div class="assistant-main">${inner}</div></div>` : inner}`;
+    const inner = `<section class="assistant-conversation">${messages.map(assistantMessage).join("")}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><div class="agent-trace live" data-live-progress><div class="timeline-list">${timelineEvents(null, state.liveProgress).map(timelineCard).join("")}</div></div><button class="text-button" data-action="cancel-assistant-turn">停止本轮回答</button></div></article>` : ""}</section>${searchBar("")}`;
+    return rail ? `<div class="assistant-layout">${rail}<div class="assistant-main">${inner}</div></div>` : inner;
   }
 
   function timelineView() {
@@ -886,7 +882,8 @@
     if (modal.type === "loading") { root.innerHTML = `<div class="modal-backdrop"><div class="modal-panel"><button class="modal-close" data-action="close-modal">×</button><div class="empty-search"><div class="empty-symbol">◌</div><h2>正在读取证据</h2></div></div></div>`; return; }
     let body = "";
     if (modal.type === "timeline-image") {
-      body = `<div class="modal-kicker">MEMORY IMAGE</div><h2>${escapeHtml(modal.label || "原始图片")}</h2><div class="asset-modal-preview"><img src="${escapeHtml(modal.url || "")}" alt="${escapeHtml(modal.label || "原始图片")}" /></div><div class="detail-facts"><span>角色 · ${escapeHtml(modal.role || "本轮图片")}</span><span>时间 · ${escapeHtml(modal.time || "未标注")}</span><span>地点 · ${escapeHtml(modal.place || "未标注")}</span>${modal.activity ? `<span>线索 · ${escapeHtml(modal.activity)}</span>` : ""}</div>`;
+      const facts = [modal.time ? `时间 · ${escapeHtml(modal.time)}` : "", modal.place ? `地点 · ${escapeHtml(modal.place)}` : ""].filter(Boolean);
+      body = `<h2>照片详情</h2><div class="asset-modal-preview"><img src="${escapeHtml(modal.url || "")}" alt="${escapeHtml(modal.label || "照片")}" /></div>${facts.length ? `<div class="detail-facts">${facts.map((fact) => `<span>${fact}</span>`).join("")}</div>` : ""}${modal.activity ? `<p class="timeline-image-context">${escapeHtml(modal.activity)}</p>` : ""}`;
     } else if (modal.type === "event") {
       const detail = modal.detail;
       const eventEntities = detail.entities || [];
