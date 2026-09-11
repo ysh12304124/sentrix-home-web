@@ -464,6 +464,7 @@ def public_agent2_trace(trace: dict | None) -> dict:
             "failure_reason": str(requirement.get("failure_reason") or ""),
             "attempt_count": int(requirement.get("attempt_count") or 0),
             "last_attempt": str(requirement.get("last_attempt") or ""),
+            "description": str(requirement.get("description") or ""),
         })
     entries = ((trace.get("evidence_ledger") or {}).get("entries") or [])
     partial_entries = sum(
@@ -474,6 +475,7 @@ def public_agent2_trace(trace: dict | None) -> dict:
     )
     return {
         "trace_version": int(trace.get("trace_version") or 1),
+        "goal": str(((trace.get("task_declaration") or {}).get("goal")) or ""),
         "requirements": public_requirements,
         "requirement_status_counts": status_counts,
         "evidence_coverage": {"entries": len(entries), "partial_entries": partial_entries},
@@ -485,6 +487,63 @@ def public_agent2_trace(trace: dict | None) -> dict:
         "terminal_reason": str(trace.get("terminal_reason") or ""),
         "budget_outcome": dict(trace.get("budget_outcome") or {}),
     }
+
+
+def public_timeline_tool_payload(tool: str, observation: dict | None) -> dict:
+    """Project an existing tool observation into the ordinary-user timeline.
+
+    This is serialization and redaction only: it never derives a new fact and
+    deliberately keeps private asset IDs out of browser-visible text.
+    """
+    def safe(value):
+        private_keys = {"asset_id", "asset_ids", "source_asset_ids", "retrieved_asset_ids",
+                        "evidence_asset_ids", "scope_id", "source_video_asset_id",
+                        "observation_id", "observation_ids", "result_set_id", "face_id",
+                        "selected_face_id", "target_face_id", "_model_call_metrics"}
+        if isinstance(value, dict):
+            return {key: safe(item) for key, item in value.items()
+                    if key not in private_keys and not key.startswith("_")}
+        if isinstance(value, list):
+            return [safe(item) for item in value]
+        return value
+
+    observation = observation or {}
+    payload = {"tool": tool, "summary": str(observation.get("summary") or ""),
+               "certainty": str(observation.get("certainty") or ""),
+               "status": str(observation.get("status") or ""),
+               "reason": str(observation.get("reason") or "")}
+    if tool in {"search_memories", "get_result_page"}:
+        payload.update({key: observation.get(key) for key in (
+            "query", "total", "retrieved_total", "remaining", "has_more",
+            "condition_summary", "gaps", "filters_applied", "retrieval_channels",
+            "recommended_resolution", "page", "shown") if observation.get(key) is not None})
+        preview = []
+        for item in observation.get("preview") or []:
+            if not isinstance(item, dict):
+                continue
+            asset_id = str(item.get("asset_id") or "")
+            preview.append({
+                "handle": str(item.get("handle") or ""),
+                "captured_at": item.get("captured_at") or "",
+                "place": item.get("place") or "",
+                "activity": item.get("activity") or "",
+                "evidence_summary": item.get("evidence_summary") or "",
+                "media_kind": item.get("media_kind") or "image",
+                "media_url": f"/api/assets/{asset_id}/file" if asset_id else "",
+            })
+        payload["preview"] = preview
+    elif tool == "inspect_photo":
+        payload.update({key: observation.get(key) for key in (
+            "asset_handle", "question", "observation", "target_person",
+            "target_face_status", "unconfirmed_people_count") if observation.get(key) is not None})
+    elif tool == "read_photo_text":
+        payload.update({key: observation.get(key) for key in (
+            "asset_handle", "text", "ocr_text", "question") if observation.get(key) is not None})
+    else:
+        payload.update({key: observation.get(key) for key in (
+            "operation", "value", "items", "cards", "matches", "coverage",
+            "filters_applied", "delivered", "blocked", "note") if observation.get(key) is not None})
+    return safe(payload)
 
 
 def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
@@ -1600,7 +1659,9 @@ class AgentRuntime:
         return out
 
     @staticmethod
-    def _emit_progress(turn, callback, *, stage: str, text: str, status: str) -> None:
+    def _emit_progress(turn, callback, *, stage: str, text: str, status: str,
+                       kind: str = "status", event_id: str = "",
+                       parent_event_id: str = "", payload: dict | None = None) -> None:
         """记录一条公开进度事件（C13 数据合同：stage/step_index/timestamp 增量推送）。"""
         from datetime import datetime
         event = {
@@ -1610,6 +1671,14 @@ class AgentRuntime:
             "step_index": len(turn.public_progress) + 1,
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
+        if kind:
+            event["kind"] = kind
+        if event_id:
+            event["event_id"] = event_id
+        if parent_event_id:
+            event["parent_event_id"] = parent_event_id
+        if payload:
+            event["payload"] = payload
         turn.public_progress.append(event)
         if callback is not None:
             try:
@@ -1620,7 +1689,7 @@ class AgentRuntime:
     def run(self, message: str, *, history: str = "", task_state: dict | None = None,
             progress_callback=None, selected_handle: str | None = None,
             selected_result_set_id: str | None = None,
-            conversation_summary: str = "") -> RuntimeTurn:
+            conversation_summary: str = "", should_cancel=None) -> RuntimeTurn:
         """progress_callback(event: dict) 在每次新增公开进度事件后调用（C13 数据合同：stage/step_index/timestamp 增量推送）。"""
         turn = RuntimeTurn(profile=self.profile.name, budget=BudgetState(
             max_model_steps=self.profile.max_model_steps,
@@ -1630,6 +1699,23 @@ class AgentRuntime:
             final_reserve_s=self.profile.final_reserve_s,
         ))
         turn.budget.start()
+        def cancelled() -> bool:
+            try:
+                return bool(should_cancel and should_cancel())
+            except Exception:
+                return False
+
+        def stop_turn() -> RuntimeTurn:
+            turn.status = "cancelled"
+            turn.reason = "cancelled_by_user"
+            turn.termination_reason = "cancelled_by_user"
+            self._emit_progress(turn, progress_callback, stage="terminal",
+                                status="cancelled", text="已停止本轮回答。",
+                                kind="terminal", event_id="terminal_cancelled")
+            return turn
+
+        if cancelled():
+            return stop_turn()
         selected_image_handles: list[str] = []
         last_model_final_answer = ""
         policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget,
@@ -1720,6 +1806,19 @@ class AgentRuntime:
                 planner_step["prompt"] = planner_result.prompt
                 planner_step["raw_full"] = planner_result.raw
             turn.steps.append(planner_step)
+            if planner_result.ok:
+                declaration = planner_result.declaration.as_dict()
+                self._emit_progress(
+                    turn, progress_callback, stage="planning", status="complete",
+                    text=str(declaration.get("goal") or ""), kind="plan",
+                    event_id=planner_step_id,
+                    payload={"goal": declaration.get("goal") or "",
+                             "requirements": [{
+                                 "id": item.get("id") or "",
+                                 "description": item.get("description") or "",
+                                 "evidence_type": item.get("evidence_type") or "",
+                                 "status": "open",
+                             } for item in declaration.get("requirements") or []]})
             if self.profile.features.get("agent2_authoritative") and not planner_result.ok:
                 turn.final_answer = "当前问题的证据需求无法可靠规划，因此暂时无法确认。"
                 turn.status = "partial"
@@ -2042,6 +2141,8 @@ class AgentRuntime:
         answer_writer_pending = False
         answer_writer_messages = None
         while True:
+            if cancelled():
+                return stop_turn()
             if answer_writer_pending and answer_writer_messages:
                 if not turn.budget.can_model_step():
                     answer_writer_pending = False
@@ -2963,6 +3064,13 @@ class AgentRuntime:
                 arguments, corrected_handle = _normalize_preview_handle(
                     arguments, task.result_preview)
                 normalized_arguments = dict(arguments)
+            action_event_id = f"action_{tool_call_id}"
+            protocol_missing_public_status = not bool(str(action.get("public_status") or "").strip())
+            self._emit_progress(
+                turn, progress_callback, stage="action", status="running",
+                text=public_status, kind="model_action", event_id=action_event_id,
+                payload={"tool": tool_name, "tool_call_id": tool_call_id,
+                         "protocol_missing_public_status": protocol_missing_public_status})
             agent2_status_before = None
             agent2_requirements_before = None
             ledger_entries_before = 0
@@ -3006,14 +3114,15 @@ class AgentRuntime:
             })
             if corrected_handle and self.include_debug:
                 turn.steps[-1]["requested_asset_handle"] = corrected_handle
-            emit_text = public_status
-            if tool_name == "inspect_photo" and result.status == "ok":
-                handle_arg = str(arguments.get("asset_handle") or "")
-                emit_text = f"已检查照片 {handle_arg}…" if handle_arg else "已检查照片…"
             self._emit_progress(
                 turn, progress_callback,
                 stage="tool_result" if result.status == "ok" else "tool_error",
-                status=result.status, text=emit_text)
+                status=result.status,
+                text=str((result.observation or {}).get("summary") or public_status),
+                kind="tool_result" if result.status == "ok" else "tool_error",
+                event_id=f"result_{tool_call_id}", parent_event_id=action_event_id,
+                payload={"tool_call_id": tool_call_id,
+                         **public_timeline_tool_payload(tool_name, result.observation)})
             if not decision.allowed:
                 if agent2_task_state is not None:
                     turn.steps[-1]["standardized_evidence"] = []
@@ -3125,6 +3234,17 @@ class AgentRuntime:
                 search_has_preview = True
             if tool_name == "inspect_photo":
                 inspect_called = True
+            if agent2_task_state is not None:
+                self._emit_progress(
+                    turn, progress_callback, stage="planning", status="complete",
+                    text="证据进度已更新。", kind="plan_update",
+                    event_id=f"plan_update_{tool_call_id}", parent_event_id="planner_step_0",
+                    payload={"requirements": [
+                        {"id": state.requirement.id,
+                         "description": state.requirement.description,
+                         "evidence_type": state.requirement.evidence_type,
+                         "status": state.status}
+                        for state in agent2_task_state.requirements.values()]})
             # Observation 进入下一步模型上下文
             # Candidate 模式下根据最新 TaskState 动态更新首条 JIT System Prompt
             if is_candidate_mode and agent2_task_state is not None:
@@ -3254,6 +3374,10 @@ class AgentRuntime:
             turn.agent2_trace["writer_status"] = turn.writer_status
             turn.agent2_trace["stage_timing_ms"] = {
                 k: round(v, 1) for k, v in sorted(_stage_timing_ms.items())}
+        self._emit_progress(
+            turn, progress_callback, stage="terminal", status=turn.status or "complete",
+            text="已完成本轮回答。" if turn.status == "complete" else (turn.reason or "本轮已结束。"),
+            kind="terminal", event_id="terminal_final")
         self.chat_fn = _orig_chat_fn
         return turn
 
