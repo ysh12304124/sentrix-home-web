@@ -17,3 +17,4 @@ q_*.py
 /sentrix.db
 /web-*.log
 .venv-text/
+.chrome-debug-profile/
