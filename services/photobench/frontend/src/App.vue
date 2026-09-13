@@ -106,6 +106,11 @@ const duration = (run) => {
 };
 const fmtMs = (value) => value == null ? "-" : value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Number(value).toFixed(0)}ms`;
 const fmtPct = (value) => value == null ? "-" : `${(Number(value) * 100).toFixed(1)}%`;
+const fmtSignedPct = (value) => {
+  if (value == null) return "-";
+  const number = Number(value);
+  return `${number > 0 ? "+" : ""}${(number * 100).toFixed(1)}%`;
+};
 const fmtTokens = (value) => value == null || !Number.isFinite(Number(value)) ? "-" : `${Math.round(Number(value)).toLocaleString("en-US")} token`;
 const scoreClass = (score) => score === 2 ? "score-2" : score === 1 ? "score-1" : score === 0 ? "score-0" : "score-none";
 const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", completed_with_errors: "完成但有错误", interrupted: "中断", cancelled: "已取消", partial: "部分完成", stalled: "已停滞", not_run: "未执行", skipped: "不适用" }[status] || status || "等待");
@@ -681,15 +686,64 @@ function tokenDistributionRows() {
 function tokenDistributionCount() {
   return effectiveRunSummary(activeRun.value).llm_context_samples_count ?? 0;
 }
-function graphQualityRows() {
+function graphQualityPrimaryRows() {
+  const quality = graphQuality.value;
+  if (!quality?.available) return [];
+  const hasGroundTruth = quality.reference_edge_ground_truth_available === true;
+  const matched = quality.reference_edge_true_positive_count ?? 0;
+  const predicted = quality.evaluable_predicted_edge_count ?? 0;
+  const reference = quality.reference_edge_count ?? 0;
+  return [
+    [hasGroundTruth ? "可验证边真实准确率（P）" : "可验证边规则准确率（P）", fmtPct(quality.reference_edge_precision), hasGroundTruth ? `${matched}/${predicted} 条构建边匹配独立 GT` : `${matched}/${predicted} 条可验证构建边与确定性参考规则一致`, true],
+    [hasGroundTruth ? "可验证边真实召回率（R）" : "可验证边规则召回率（R）", fmtPct(quality.reference_edge_recall), hasGroundTruth ? `${matched}/${reference} 条独立 GT 关系被构建` : `${matched}/${reference} 条确定性参考关系被构建`, true],
+    [hasGroundTruth ? "可验证边真实 F1" : "可验证边规则 F1", fmtPct(quality.reference_edge_f1), hasGroundTruth ? "独立 GT 下准确率和召回率的综合指标" : "基于源字段和建图规则的工程回归指标，不代表独立人工真值", true],
+    ["节点来源可追溯率", fmtPct(quality.node_source_traceability_rate), `${quality.total_nodes ?? 0} 个节点都有来源；不代表内容或关系一定正确`, true],
+  ];
+}
+function graphQualityDiagnosticRows() {
   const quality = graphQuality.value;
   if (!quality?.available) return [];
   return [
-    ["可验证边准确率", fmtPct(quality.reference_edge_precision), `${quality.reference_edge_true_positive_count ?? 0}/${quality.evaluable_predicted_edge_count ?? 0} 条边与参考关系一致`, true],
-    ["可验证边召回率", fmtPct(quality.reference_edge_recall), `${quality.reference_edge_true_positive_count ?? 0}/${quality.reference_edge_count ?? 0} 条参考关系被构建`, true],
-    ["可验证边 F1", fmtPct(quality.reference_edge_f1), "参考关系 Precision 与 Recall 的综合结果", true],
-    ["节点来源可追溯率", fmtPct(quality.node_source_traceability_rate), `${quality.total_nodes ?? 0} 个节点逐条检查来源字段`, true],
+    ["源字段规则一致率（内部诊断）", quality.source_consistency_precision == null ? "-" : `${fmtPct(quality.source_consistency_precision)} / ${fmtPct(quality.source_consistency_recall)}`, `${quality.source_consistency_true_positive_count ?? 0}/${quality.source_consistency_reference_edge_count ?? 0}，与上方规则 P/R 同源`],
+    ["节点连接率", fmtPct(quality.node_connected_rate), `${quality.connected_nodes ?? 0}/${quality.total_nodes ?? 0} 个节点至少连接一条边`],
+    ["有效边率", fmtPct(quality.valid_edge_rate), `${quality.valid_edges ?? 0}/${quality.total_edges ?? 0} 条边通过端点、时序和字段校验`],
+    ["边证据支持率", fmtPct(quality.edge_evidence_support_rate), `${quality.supported_edges ?? 0}/${quality.total_edges ?? 0} 条边的证据字段能找到支持；不是独立真值准确率`],
+    ["边一致性率", fmtPct(quality.edge_consistency_rate), `${quality.consistent_edges ?? 0}/${quality.total_edges ?? 0} 条边通过端点、时间顺序和关系语义约束`],
+    ["重复边率", fmtPct(quality.duplicate_edge_rate), `${quality.duplicate_edges ?? 0} 条重复边 / ${quality.total_edges ?? 0} 条边`],
+    ["不可验证边占比", quality.total_edges ? fmtPct((quality.unverifiable_edge_count ?? 0) / quality.total_edges) : "-", "语义相似、因果等暂无独立参考真值的边，不混入真实性分数"],
   ];
+}
+function graphIdentityRows() {
+  const identity = graphQuality.value?.face_clustering;
+  if (!identity?.available) return [];
+  return [
+    ["同一人物聚类 F1", fmtPct(identity.same_person_pair_f1), "准确率和召回率的综合指标", true],
+    ["同一人物聚类准确率", fmtPct(identity.same_person_pair_precision),
+      "聚到一起的脸对中，真实同人的比例", true],
+    ["不同人物错误合并率", fmtPct(identity.false_merge_rate),
+      "聚到一起的脸对中，实际不同人的比例", true],
+    ["同一人物聚类召回率", fmtPct(identity.same_person_pair_recall),
+      "真实同人的脸对中，成功聚到一起的比例", true],
+  ];
+}
+function graphQuestionTypeRows() {
+  const rows = effectiveRunSummary(activeRun.value).graph_qa_by_type;
+  return Array.isArray(rows) ? rows : [];
+}
+function graphEdgeTypeSummary() {
+  const counts = graphQuality.value?.edge_type_counts;
+  if (!counts || typeof counts !== "object") return "未记录";
+  const entries = Object.entries(counts).filter(([, count]) => Number(count) > 0);
+  return entries.length ? entries.map(([type, count]) => `${type} ${count}`).join(" · ") : "未记录";
+}
+function graphEvaluableEdgeSummary() {
+  const counts = graphQuality.value?.evaluable_edge_subtype_counts;
+  if (!counts || typeof counts !== "object") return "未记录";
+  const labels = { SHARES_RELATION: "共享关系", MENTIONS_OBJECT: "对象提及", TIME_PRECEDES: "时间先后",
+    CLIP_CONTAINS: "片段包含", VIDEO_CONTAINS: "视频包含", MENTIONS_PERSON: "人物提及",
+    OCCURRED_AT: "地点", CAPTURED_ON: "日期" };
+  const entries = Object.entries(counts).filter(([, count]) => Number(count) > 0);
+  return entries.length ? entries.map(([type, count]) => `${labels[type] || type} ${count}`).join(" · ") : "未记录";
 }
 async function loadGraphQuality() {
   const runId = activeRunId.value;
@@ -1841,7 +1895,7 @@ async function loadQaBrowser() {
   finally { qaBrowserLoading.value = false; }
 }
 function qaTypeLabel(t) {
-  return ({event_memory_qa:"事件记忆",single_evidence_memory_qa:"单图证据",relationship_qa:"关系问答",multi_turn_clarify:"多轮澄清",multi_turn_disambiguation:"多轮消歧",ambiguous_retrieval:"模糊检索",evidence_insufficient:"证据不足",unsupported_retrieval:"无依据检索",instruction_injection:"指令注入",prompt_injection:"提示注入",data_exfiltration:"数据泄露",authority_impersonation:"权限伪造",mixed_injection:"混合注入",indirect_injection:"间接注入",jailbreak_attempt:"越狱尝试"}[t]) || t || "未分类";
+  return ({event_memory_qa:"事件记忆",single_evidence_memory_qa:"单图证据",relationship_qa:"关系问答",multi_hop:"多跳/因果",multi_turn_clarify:"多轮澄清",multi_turn_disambiguation:"多轮消歧",ambiguous_retrieval:"模糊检索",evidence_insufficient:"证据不足",unsupported_retrieval:"无依据检索",instruction_injection:"指令注入",prompt_injection:"提示注入",data_exfiltration:"数据泄露",authority_impersonation:"权限伪造",mixed_injection:"混合注入",indirect_injection:"间接注入",jailbreak_attempt:"越狱尝试"}[t]) || t || "未分类";
 }
 function qaActionBadge(a) {
   return ({answer:"回答",refuse:"拒答",clarify:"澄清"}[a]) || a || "-";
@@ -2221,20 +2275,70 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 <div class="token-distribution-section graph-quality-section">
 <div class="phase-title">
-<b>图结构真实性（全量参考一致性）</b>
+<b>可验证边指标（规则参考 / 独立 GT）</b>
 <span class="muted small" v-if="graphQuality?.available">{{ graphQuality.total_nodes }} 节点 · {{ graphQuality.total_edges }} 条边</span>
 <span class="muted small" v-else>{{ graphQualityLoading ? '计算中…' : '未生成图结构' }}</span>
 </div>
-<p class="metric-calc-time">逐条比较全部可验证边与独立参考关系；语义相似、因果等暂无独立真值的边单独排除，不参与真实性分数。</p>
-<div v-if="graphQuality?.available" class="token-distribution-grid">
-<div v-for="row in graphQualityRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<p class="metric-calc-time">可验证边按确定性规则筛选；有独立人工/外部 GT 时显示真实 P/R/F1，否则显示源字段规则参考 P/R/F1，用于建图回归检查。</p>
+<div v-if="graphQuality?.available" class="graph-quality-group">
+<div class="graph-quality-group-title"><b>可验证边 P/R/F1</b><span>{{ graphQuality.reference_edge_ground_truth_available === true ? '独立关系 GT' : '确定性规则参考' }}</span></div>
+<div class="token-distribution-grid graph-quality-primary-grid">
+<div v-for="row in graphQualityPrimaryRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
 <strong>{{ row[1] }}</strong>
 <small>{{ row[2] }}</small>
 </div>
 </div>
-<p v-if="graphQuality?.available" class="metric-calc-time">参考关系 {{ graphQuality.reference_edge_count ?? 0 }} 条 · 可验证构建边 {{ graphQuality.evaluable_predicted_edge_count ?? 0 }} 条 · 暂无独立真值 {{ graphQuality.unverifiable_edge_count ?? 0 }} 条</p>
-<p v-else class="qa-performance-empty">{{ graphQuality?.reason || '该运行暂无可用图结构快照。' }}</p>
+</div>
+<div v-if="graphQuality?.available" class="graph-quality-group graph-quality-diagnostic-group">
+<div class="graph-quality-group-title"><b>结构健康（用于定位图的缺陷，不等同真实性）</b><span>全量规则检查</span></div>
+<div class="token-distribution-grid">
+<div v-for="row in graphQualityDiagnosticRows()" :key="row[0]" class="phase-metric">
+<span>{{ row[0] }}</span>
+<strong>{{ row[1] }}</strong>
+<small>{{ row[2] }}</small>
+</div>
+</div>
+</div>
+<div v-if="graphQuality?.available && graphIdentityRows().length" class="graph-quality-group graph-quality-diagnostic-group">
+<div class="graph-quality-group-title"><b>人脸身份聚类质量</b><span>全量可对齐人脸对</span></div>
+<div class="token-distribution-grid graph-quality-primary-grid">
+<div v-for="row in graphIdentityRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<span>{{ row[0] }}</span>
+<strong>{{ row[1] }}</strong>
+<small>{{ row[2] }}</small>
+</div>
+</div>
+<p class="metric-calc-time">仅纳入标注中单人且检测到单张人脸的记录；多人照片因无法无歧义对齐而排除 {{ graphQuality.face_clustering.excluded_multi_face ?? 0 }} 张，不猜测其身份。</p>
+</div>
+<p v-if="graphQuality?.available" class="metric-calc-time">参考关系 {{ graphQuality.reference_edge_count ?? 0 }} 条 · 已构建可验证边 {{ graphQuality.evaluable_predicted_edge_count ?? 0 }} 条（{{ graphEvaluableEdgeSummary() }}） · 未纳入 P/R/F1 {{ graphQuality.unverifiable_edge_count ?? 0 }} 条。</p>
+<div v-if="graphQuality?.available && graphQuestionTypeRows().length" class="graph-quality-type-wrap">
+<div class="phase-title graph-quality-subtitle">
+<b>按问题类型的图记忆 QA 表现</b>
+<span class="muted small">全量题目分桶 · {{ effectiveRunSummary(activeRun).graph_qa_metric_scope === 'end_to_end_retrieval_chain' ? '整条检索链路' : '历史记录' }}</span>
+</div>
+<p class="metric-calc-time">检索 P/R/F1 与回答质量按评测元数据分组统计；“图效果”只显示同一题加入图重排后，对媒体 GT 召回的实际变化。</p>
+<div class="call-table-wrap">
+<table class="call-table graph-quality-type-table">
+<thead><tr><th>问题类型</th><th>题数</th><th>图路由</th><th>图效果</th><th>检索 Recall</th><th>检索 Precision</th><th>检索 F1</th><th>回答质量</th><th>证据支持率</th></tr></thead>
+<tbody>
+<tr v-for="row in graphQuestionTypeRows()" :key="row.type">
+<td>{{ row.label }}</td>
+<td>{{ row.sample_count }}<span class="muted small">（{{ row.retrieval_metric_count }} 题有媒体 GT）</span></td>
+<td>{{ row.graph_routed_count ? `${row.graph_enabled_count}/${row.graph_routed_count}` : '-' }}<span class="muted small" v-if="row.graph_intents">{{ Object.keys(row.graph_intents).join('、') }}</span></td>
+<td v-if="row.graph_effect_count"><span :class="row.graph_gt_improved_count > row.graph_gt_worsened_count ? 'metric-good' : 'muted'">召回 {{ fmtSignedPct(row.graph_recall_delta) }}</span><span class="muted small"> · 提升 {{ row.graph_gt_improved_count }} 题<template v-if="row.graph_gt_worsened_count">，降低 {{ row.graph_gt_worsened_count }} 题</template></span></td>
+<td v-else>-</td>
+<td>{{ fmtPct(row.retrieval_recall) }}</td>
+<td>{{ fmtPct(row.retrieval_precision) }}</td>
+<td>{{ fmtPct(row.retrieval_f1) }}</td>
+<td>{{ row.answer_quality_mean == null ? '-' : `${row.answer_quality_mean} / 2` }}<span class="muted small">（{{ row.judge_valid_count }}）</span></td>
+<td>{{ fmtPct(row.evidence_supported_rate) }}<span class="muted small" v-if="row.evidence_valid_count">（{{ row.evidence_valid_count }}）</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p v-if="!graphQuality?.available" class="qa-performance-empty">{{ graphQuality?.reason || '该运行暂无可用图结构快照。' }}</p>
 </div>
 </article>
         <article v-if="deliveryBreakdown()" class="phase-card result-phase-card">

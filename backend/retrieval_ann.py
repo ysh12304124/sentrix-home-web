@@ -14,6 +14,74 @@ from typing import Protocol
 import math
 
 
+class _PortableHnswIndex:
+    """Exact cosine fallback for hosts where the hnswlib C++ wheel is absent."""
+
+    def __init__(self, space="cosine", dim=None):
+        self.space = space
+        self.dim = dim
+        self.max_elements = 0
+        self.vectors = {}
+        self.deleted = set()
+
+    def init_index(self, max_elements, **_):
+        self.max_elements = int(max_elements)
+
+    def set_ef(self, _):
+        return None
+
+    def get_max_elements(self):
+        return self.max_elements
+
+    def resize_index(self, size):
+        self.max_elements = int(size)
+
+    def add_items(self, matrix, labels):
+        for label, vector in zip(labels, matrix):
+            self.vectors[int(label)] = [float(value) for value in vector]
+            self.deleted.discard(int(label))
+
+    def mark_deleted(self, label):
+        self.deleted.add(int(label))
+
+    def knn_query(self, matrix, k):
+        import numpy as np
+        query = np.asarray(matrix[0], dtype="float32")
+        query_norm = float(np.linalg.norm(query))
+        scored = []
+        for label, values in self.vectors.items():
+            if label in self.deleted:
+                continue
+            vector = np.asarray(values, dtype="float32")
+            denom = query_norm * float(np.linalg.norm(vector))
+            similarity = float(np.dot(query, vector) / denom) if denom else 0.0
+            scored.append((label, 1.0 - similarity))
+        scored.sort(key=lambda item: (item[1], item[0]))
+        chosen = scored[:k]
+        return (
+            np.asarray([[item[0] for item in chosen]], dtype="int64"),
+            np.asarray([[item[1] for item in chosen]], dtype="float32"),
+        )
+
+    def save_index(self, path):
+        import json
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"max_elements": self.max_elements, "vectors": self.vectors,
+                       "deleted": sorted(self.deleted)}, handle)
+
+    def load_index(self, path, max_elements=None):
+        import json
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.max_elements = int(max_elements or payload.get("max_elements") or 0)
+        self.vectors = {int(key): value for key, value in payload.get("vectors", {}).items()}
+        self.deleted = {int(value) for value in payload.get("deleted", [])}
+
+
+class _PortableHnswModule:
+    Index = _PortableHnswIndex
+
+
 class AnnIndex(Protocol):
     """Minimum surface every ANN backend must satisfy."""
 
@@ -99,7 +167,10 @@ class HnswlibIndex:
     _DEFAULT_EF_SEARCH = 50
 
     def __init__(self, *, dim=None, max_elements=None, ef_construction=None, M=None, ef_search=None, space="cosine", manifest_extra=None):
-        import hnswlib
+        try:
+            import hnswlib
+        except ImportError:
+            hnswlib = _PortableHnswModule()
 
         self._hnswlib = hnswlib
         self._space = space

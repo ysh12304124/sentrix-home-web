@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import threading
 
 import httpx
 
@@ -81,6 +82,14 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         self.api_mode = str(api_mode or "generic").strip().lower()
         self.manager_url = normalize_service_url(manager_url)
         self.timeout = float(timeout)
+        # ``httpx.stream(...)`` creates a new Client (and therefore a new
+        # Windows SSL context) for every request.  The API's tool-loop runs in
+        # worker threads; under a long PhotoBench run that repeated concurrent
+        # SSL initialisation has caused a native access violation and killed
+        # uvicorn.  Keep one transport per configured endpoint instead.
+        # Local model endpoints must not inherit an enterprise proxy either.
+        self._stream_client = httpx.Client(timeout=self.timeout, trust_env=False)
+        self._stream_lock = threading.RLock()
 
     @property
     def headers(self) -> dict:
@@ -129,10 +138,18 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         if self.api_mode == "generic":
             body.pop("chat_template_kwargs", None)
             body = {key: value for key, value in body.items() if value is not None}
-        return httpx.stream(
-            "POST", f"{self.base_url}/chat/completions", json=body,
-            headers=self.headers, timeout=timeout or self.timeout,
-        )
+        # The client is thread-safe.  The lock only protects context-manager
+        # creation, avoiding another transport mutation during the Windows
+        # SSL setup path; streaming itself remains owned by the caller.
+        with self._stream_lock:
+            return self._stream_client.stream(
+                "POST", f"{self.base_url}/chat/completions", json=body,
+                headers=self.headers, timeout=timeout or self.timeout,
+            )
+
+    def close(self):
+        """Release the shared streaming transport during controlled teardown."""
+        self._stream_client.close()
 
     def token_count(self, messages: list[dict], *, timeout: float = 15) -> dict | None:
         if not self.manager_url:

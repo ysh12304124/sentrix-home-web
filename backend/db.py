@@ -4715,7 +4715,13 @@ class MemoryStore:
         self.connection.commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (new_cluster["id"],))
 
-    def add_face_instance(self, asset_id, observation_id, face, threshold=0.30, model_name="buffalo_l"):
+    def add_face_instance(self, asset_id, observation_id, face, threshold=None, model_name="buffalo_l"):
+        # Online ingestion favors recall; callers may still pass an explicit
+        # threshold for controlled migrations/tests.
+        if threshold is None:
+            from .face_clustering import resolve_online_match_threshold
+
+            threshold = resolve_online_match_threshold()
         asset = self.get_asset(asset_id) or {}
         scope_id = asset.get("scope_id") or "home-default"
         embedding = self._normalise_vector(face.get("embedding"))
@@ -4856,9 +4862,12 @@ class MemoryStore:
             ),
         )
 
-    def recluster_faces(self, threshold=0.30, minimum_quality=0.55, scope_id=None):
+    def recluster_faces(self, threshold=None, minimum_quality=0.55, scope_id=None):
         """Globally regroup faces with quality-aware multi-view prototypes."""
-        from .face_clustering import FaceClusterer, FaceSample
+        from .face_clustering import FaceClusterer, FaceSample, resolve_recluster_match_threshold
+
+        if threshold is None:
+            threshold = resolve_recluster_match_threshold()
 
         instances = self._rows(
             """SELECT fi.id, fi.cluster_id, fi.embedding_json, fi.quality, fi.detection_confidence,

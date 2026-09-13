@@ -113,9 +113,20 @@ class SentrixFrameProvider:
 
         person_entities = [item for item in entities if item.get("entity_type") == "person"]
         place_entity = next((item for item in entities if item.get("entity_type") == "place"), None)
-        place = place_entity.get("canonical_name") if place_entity else (
-            observation.get("place") or (event or {}).get("place") or ""
-        )
+        if place_entity:
+            place = place_entity.get("canonical_name") or ""
+        else:
+            # Keep both the visual scene label (e.g. indoor/stage) and the
+            # event-level place label.  The previous ``or`` discarded the
+            # latter whenever the VLM supplied any scene place, making a
+            # human location impossible to retrieve for videos.
+            place_values = [observation.get("place"), (event or {}).get("place")]
+            place = " ".join(dict.fromkeys(
+                str(value).strip() for value in place_values
+                if str(value or "").strip() and not re.fullmatch(
+                    r"[-+]?\d+(?:\.\d+)?\s*[,; ]\s*[-+]?\d+(?:\.\d+)?",
+                    str(value).strip())
+            ))
         # GPS is often retained while reverse-geocoding is unavailable at
         # ingest time.  Resolve it lazily and append it to (rather than
         # replacing) the model's scene label: both "室内空间" and the real
@@ -146,6 +157,7 @@ class SentrixFrameProvider:
             "video_time_sec": timestamp,
             "frame_path": str(asset["path"] or ""),
             "clip_path": str(asset["parent_file_name"] or ""),
+            "source_video_file_name": str(asset["parent_file_name"] or ""),
             "narration_text": str(observation.get("caption") or (event or {}).get("title") or ""),
             "speech_text": str(observation.get("transcript") or ""),
             "action_text": str(observation.get("activity") or ""),
@@ -159,6 +171,7 @@ class SentrixFrameProvider:
             "person_labels": [str(item.get("canonical_name") or "") for item in person_entities],
             "entity_refs": entities,
             "place": str(place or ""),
+            "captured_location": location,
             "captured_at": str(asset["captured_at"] or asset["parent_captured_at"] or
                                   (event or {}).get("time_start") or ""),
             "scope_id": str(asset["scope_id"] or "home-default"),
@@ -198,13 +211,33 @@ class SentrixFrameProvider:
     def _event_for_observation(self, conn: sqlite3.Connection, observation_id: str) -> dict | None:
         if not observation_id:
             return None
-        row = conn.execute("""
+        rows = conn.execute("""
             SELECT e.* FROM events e
             JOIN event_observations eo ON eo.event_id = e.id
             WHERE eo.observation_id = ?
-            ORDER BY e.updated_at DESC LIMIT 1
-        """, (observation_id,)).fetchone()
-        return dict(row) if row else None
+        """, (observation_id,)).fetchall()
+        if not rows:
+            return None
+
+        def score(row):
+            title = str(row["title"] or "").strip()
+            summary = str(row["summary"] or "").strip()
+            place = str(row["place"] or "").strip()
+            # Prefer a semantically labelled event over a GPS-only or empty
+            # projection.  Length is only a tie-breaker for duplicate event
+            # summaries; newest update remains the final deterministic tie.
+            coordinate_only = bool(re.fullmatch(
+                r"[-+]?\d+(?:\.\d+)?\s*[,; ]\s*[-+]?\d+(?:\.\d+)?", place))
+            cjk = sum("\u4e00" <= char <= "\u9fff" for char in (title + summary + place))
+            return (
+                int(bool(place)) * 20 + int(bool(summary)) * 10
+                + int(not coordinate_only) * 30 + min(cjk, 80) * 0.2
+                + min(len(summary), 800) * 0.005,
+                str(row["updated_at"] or ""),
+                str(row["id"] or ""),
+            )
+
+        return dict(max(rows, key=score))
 
     def _visual_vector(self, conn: sqlite3.Connection, asset_id: str) -> list[float]:
         row = conn.execute("""

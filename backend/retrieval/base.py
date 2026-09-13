@@ -99,6 +99,10 @@ class RetrievalQuery:
 
     @classmethod
     def from_spec(cls, spec, *, embedding_router=None) -> "RetrievalQuery":
+        # Keep the historical whole-query contract for ANN/lexical channels.
+        # GraphExpander separately appends semantic facets for route decisions;
+        # mixing them here changes embedding input and can regress retrieval
+        # scores for callers that rely on the constraint-only text.
         whole = " ".join(c.source_text or c.value for c in spec.constraints)
         facets = list(spec.facets)
         if not facets and not whole:

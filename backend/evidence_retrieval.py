@@ -105,6 +105,14 @@ class EvidenceRetrievalKernel:
         self.embedding_router = embedding_router
         self.config = config
         self._trace_sink = trace
+        # A structured query can intentionally pass hundreds of candidates to
+        # the condition verifier.  Keep request-local bulk projections so that
+        # verification does not issue get_asset/list_observations/event SQL for
+        # every candidate (the former N+1 path cost 25-35s on a 350-asset
+        # benchmark scope).
+        self._asset_cache = None
+        self._observations_by_asset_cache = None
+        self._event_text_by_observation_cache = None
 
     def retrieve(self, spec: QuerySpec):
         if self.retrievers and self._multi_retriever_enabled():
@@ -125,10 +133,20 @@ class EvidenceRetrievalKernel:
         # here silently removed older media from the fallback/single-retriever
         # path, which is especially damaging for benchmark albums where the
         # answer image is near the end of the import order.
-        assets = {item["id"]: item for item in self.store.list_assets(
-            scope_id=query_scope, limit=100_000)}
-        observations = [item for item in self.store.list_observations(
-            scope_id=query_scope, limit=100_000) if item.get("asset_id") in assets]
+        try:
+            asset_rows = self.store.list_assets(scope_id=query_scope, limit=100_000)
+        except TypeError:
+            # Keep lightweight test/integration stores compatible with the
+            # production pagination argument while preserving the full-scope
+            # behavior on MemoryStore.
+            asset_rows = self.store.list_assets(scope_id=query_scope)
+        assets = {item["id"]: item for item in asset_rows}
+        try:
+            observation_rows = self.store.list_observations(
+                scope_id=query_scope, limit=100_000)
+        except TypeError:
+            observation_rows = self.store.list_observations(scope_id=query_scope)
+        observations = [item for item in observation_rows if item.get("asset_id") in assets]
         by_asset = {}
         for observation in observations:
             by_asset.setdefault(observation["asset_id"], []).append(observation)
@@ -264,15 +282,26 @@ class EvidenceRetrievalKernel:
         packet.channel_hits = {name: [hit.asset_id for hit in hits] for name, hits in channel_hits.items()}
 
         primary_fusion_started = time.monotonic()
+        # Keep this baseline order only for selecting graph seeds and for
+        # explaining the later graph-induced ranking delta.  It is *not* the
+        # final order once an expander has returned graph evidence.
+        baseline_fused = rank(
+            channel_hits, strategy, candidate_limit,
+            fusion_weights=DEFAULT_CHANNEL_WEIGHTS,
+        )
+        baseline_rank_by_asset = {
+            candidate.asset_id: position
+            for position, candidate in enumerate(baseline_fused, 1)
+        }
         primary_items = self._evaluate_fused(
-            rank(channel_hits, strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
+            baseline_fused,
             spec, packet, filters, all_authorized, scope_id, skip_assets=set())
         primary_fusion_ms = round((time.monotonic() - primary_fusion_started) * 1000, 1)
 
         # R3B seed-gated adjacency — R8-3: only expands when the strategy is
         # not visual_only, and only for all_relevant or reliable seeds.
         already = {item["asset_id"] for item in primary_items}
-        adjacency_items = []
+        graph_policy_for_fusion = None
         graph_expanders = [expander for expander in expanders
                            if getattr(expander, "name", "") == "graph"]
         if expanders and ((strategy != VISUAL_ONLY or all_relevant) or graph_expanders):
@@ -283,10 +312,46 @@ class EvidenceRetrievalKernel:
                 # Graph late-fusion intentionally starts from the wider
                 # baseline head; adjacency keeps its stricter reliable-seed
                 # gate to avoid changing existing photo retrieval semantics.
-                seeds = ([item["asset_id"] for item in primary_items[:30]
-                          if item.get("asset_id")] if getattr(expander, "name", "") == "graph"
+                # A graph seed must only have passed the *hard* scope/media
+                # filters.  Requiring it to have already passed final
+                # condition verification turns graph retrieval into a
+                # post-processing step: a plausible anchor that needs its
+                # neighbours to answer the question is discarded before the
+                # graph can ever see it.  ``baseline_fused`` is already made
+                # from hard-filtered retriever outputs; the expanded results
+                # still go through _evaluate_fused below before being returned.
+                seeds = ([candidate.asset_id for candidate in baseline_fused[:30]
+                          if candidate.asset_id] if getattr(expander, "name", "") == "graph"
                          else reliable_seeds)
+                graph_policy = None
+                if getattr(expander, "name", "") == "graph" and hasattr(expander, "route"):
+                    try:
+                        graph_policy = expander.route(query, filters)
+                    except Exception as error:
+                        graph_policy = {
+                            "enabled": False,
+                            "mode": "auto",
+                            "intent": "unknown",
+                            "reason": f"policy_error:{type(error).__name__}",
+                            "policy_version": "graph-route-v1",
+                        }
+                    graph_policy_for_fusion = graph_policy
                 channel_started = time.monotonic()
+                if graph_policy and not graph_policy.get("enabled"):
+                    adjacency_hits = []
+                    adjacency_trace = {
+                        "invoked": False,
+                        "candidate_count": 0,
+                        "status": "skipped_policy",
+                        "seeds": len(seeds),
+                        "policy": graph_policy,
+                        "latency_ms": 0.0,
+                        "embedding_ms": 0.0,
+                        "embedding_events": [],
+                    }
+                    channel_hits[expander.name] = adjacency_hits
+                    channel_trace[expander.name] = adjacency_trace
+                    continue
                 try:
                     try:
                         adjacency_hits = expander.expand(
@@ -295,26 +360,137 @@ class EvidenceRetrievalKernel:
                         adjacency_hits = expander.expand(seeds, filters, limit=recall_limit)
                     adjacency_trace = {"invoked": True, "candidate_count": len(adjacency_hits),
                                        "status": "ok", "seeds": len(seeds)}
+                    if graph_policy:
+                        adjacency_trace["policy"] = graph_policy
                 except Exception as error:
                     adjacency_hits = []
                     adjacency_trace = {"invoked": True, "candidate_count": 0, "status": "error", "reason": str(error)}
+                    if graph_policy:
+                        adjacency_trace["policy"] = graph_policy
                 adjacency_trace["latency_ms"] = round((time.monotonic() - channel_started) * 1000, 1)
                 adjacency_trace["embedding_ms"] = 0.0
                 adjacency_trace["embedding_events"] = []
                 channel_hits[expander.name] = adjacency_hits
                 channel_trace[expander.name] = adjacency_trace
             packet.channel_hits[expander.name] = [hit.asset_id for hit in channel_hits.get(expander.name, [])]
-            adjacency_fusion_started = time.monotonic()
-            adjacency_items = self._evaluate_fused(
-                rank({expander.name: channel_hits[expander.name] for expander in expanders},
-                     strategy, candidate_limit, fusion_weights=DEFAULT_CHANNEL_WEIGHTS),
-                spec, packet, filters, all_authorized, scope_id, skip_assets=already)
-            adjacency_fusion_ms = round((time.monotonic() - adjacency_fusion_started) * 1000, 1)
-        else:
-            adjacency_fusion_ms = 0.0
+
+        # This is the actual graph re-rank.  The old implementation ranked
+        # graph hits in isolation and appended them after the ordinary list;
+        # graph evidence could therefore never move an existing candidate.
+        # Fuse every channel together so a path hit boosts an existing seed
+        # and a newly reached node competes in the same candidate universe.
+        adjacency_fusion_started = time.monotonic()
+        # Graph candidates are useful evidence, but their safe weight depends
+        # on the query intent.  A generic/ordinary query has no directional
+        # path requirement, so broad graph neighbours must not displace
+        # stronger visual/lexical hits.  Temporal, relation, causal and
+        # multi-hop queries explicitly ask for graph semantics and get a
+        # stronger graph contribution.  This keeps ``on`` useful for an
+        # ablation while making the ranking itself intent-aware.
+        graph_fusion_weights = dict(DEFAULT_CHANNEL_WEIGHTS)
+        graph_intent = str((graph_policy_for_fusion or {}).get("intent") or "ordinary")
+        # A graph-semantic route must be able to introduce a candidate that
+        # no ordinary channel recalled.  With the old 1.35 weight, a rank-1
+        # graph-only hit contributed less than a rank-1 visual hit and almost
+        # never entered the final top-30, so telemetry showed many graph
+        # promotions but essentially no GT recall change.  Use a bounded
+        # intent-specific boost: explicit path questions get the strongest
+        # boost, while ordinary/on-mode queries remain conservative.
+        graph_fusion_weights["graph"] = {
+            "multi_hop": 4.0,
+            "causal": 3.5,
+            "temporal": 3.0,
+            "relationship": 3.0,
+            "cross_media": 3.0,
+        }.get(graph_intent, 0.35)
+        # Rank a wider pool first, then reserve a small number of head slots
+        # for graph-only candidates.  Weighted RRF alone cannot do this: a
+        # graph hit that was absent from the visual/lexical channels gets one
+        # rank contribution and is routinely pushed below the 30-item head.
+        # That made graph telemetry look active while the returned candidate
+        # set was effectively unchanged.  The quota is bounded and only
+        # applies when graph retrieval is enabled; ordinary ``auto`` queries
+        # still have no graph channel at all.
+        graph_pool_limit = max(candidate_limit, candidate_limit * 3)
+        ranked_pool = rank(
+            channel_hits, strategy, graph_pool_limit,
+            fusion_weights=graph_fusion_weights,
+        )
+        graph_hits = channel_hits.get("graph") or []
+        graph_asset_ids = {hit.asset_id for hit in graph_hits}
+        baseline_ids = set(baseline_rank_by_asset)
+        graph_only_pool = [candidate for candidate in ranked_pool
+                           if candidate.asset_id in graph_asset_ids
+                           and candidate.asset_id not in baseline_ids]
+        try:
+            configured_graph_quota = int(os.getenv("SENTRIX_GRAPH_HEAD_QUOTA", "8"))
+        except (TypeError, ValueError):
+            configured_graph_quota = 6
+        graph_quota = min(
+            max(0, configured_graph_quota),
+            candidate_limit // 3,
+            len(graph_only_pool),
+        )
+        combined_fused = list(ranked_pool[:candidate_limit])
+        forced_graph_ids = []
+        if graph_quota:
+            current_graph_count = sum(
+                candidate.asset_id in graph_asset_ids for candidate in combined_fused)
+            missing_quota = max(0, graph_quota - current_graph_count)
+            if missing_quota:
+                forced = graph_only_pool[:missing_quota]
+                forced_graph_ids = [candidate.asset_id for candidate in forced]
+                forced_set = set(forced_graph_ids)
+                kept = [candidate for candidate in combined_fused
+                        if candidate.asset_id not in forced_set]
+                # Replace the weakest non-graph tail instead of prepending a
+                # broad graph result.  This preserves most of the baseline
+                # order while guaranteeing that graph recall is observable in
+                # the actual returned head.
+                combined_fused = (kept[:max(0, candidate_limit - len(forced))]
+                                  + forced)
+        combined_rank_by_asset = {
+            candidate.asset_id: position
+            for position, candidate in enumerate(combined_fused, 1)
+        }
+        graph_supported_top = [
+            candidate.asset_id for candidate in combined_fused[:candidate_limit]
+            if candidate.asset_id in graph_asset_ids
+        ]
+        graph_rerank = {
+            "applied": bool(graph_hits),
+            "baseline_candidate_count": len(baseline_fused),
+            "combined_candidate_count": len(combined_fused),
+            "graph_candidate_count": len(graph_hits),
+            "graph_supported_top_count": len(graph_supported_top),
+            "new_candidate_count": sum(
+                asset_id not in baseline_rank_by_asset for asset_id in graph_asset_ids),
+            "promoted_count": sum(
+                1 for asset_id, position in combined_rank_by_asset.items()
+                if asset_id in baseline_rank_by_asset
+                and position < baseline_rank_by_asset[asset_id]),
+            "demoted_count": sum(
+                1 for asset_id, position in combined_rank_by_asset.items()
+                if asset_id in baseline_rank_by_asset
+                and position > baseline_rank_by_asset[asset_id]),
+            "graph_fusion_weight": graph_fusion_weights["graph"],
+            "graph_intent": graph_intent,
+            "graph_head_quota": graph_quota,
+            "graph_forced_head_count": len(forced_graph_ids),
+            # Raw IDs stay in the sanitized-out debug observation only.  The
+            # evaluator resolves them to media names and measures whether the
+            # graph changed GT recall/precision for this exact question.
+            "baseline_ranked_asset_ids": [candidate.asset_id for candidate in baseline_fused],
+            "reranked_asset_ids": [candidate.asset_id for candidate in combined_fused],
+        }
+        combined_items = self._evaluate_fused(
+            combined_fused, spec, packet, filters, all_authorized, scope_id,
+            skip_assets=set(),
+        )
+        adjacency_fusion_ms = round((time.monotonic() - adjacency_fusion_started) * 1000, 1)
 
         postprocess_started = time.monotonic()
-        packet.assets = primary_items + [item for item in adjacency_items if item["asset_id"] not in already]
+        packet.assets = combined_items
         for item in packet.assets:
             if item["level"] == "exact":
                 packet.exact_results.append(item)
@@ -323,7 +499,14 @@ class EvidenceRetrievalKernel:
             else:
                 packet.approximate_results.append(item)
 
-        packet.assets.sort(key=lambda item: ({"exact": 0, "strong": 1, "approximate": 2}[item["level"]], -item["score"]))
+        # Evidence level remains a safety boundary; within a level preserve
+        # the unified multi-channel fusion order rather than comparing raw
+        # graph-path and ANN scores that live on incompatible scales.
+        packet.assets.sort(key=lambda item: (
+            {"exact": 0, "strong": 1, "approximate": 2}[item["level"]],
+            -float(item.get("fusion_score") or 0.0),
+            item["asset_id"],
+        ))
         # Optional confidence gate. It is disabled by default because score
         # scales differ by retriever. When calibrated, this threshold is the
         # only reduction mechanism; there is no fixed candidate Top-K.
@@ -357,17 +540,27 @@ class EvidenceRetrievalKernel:
             "postprocess_ms": round((time.monotonic() - postprocess_started) * 1000, 1),
             "min_retrieval_score": min_retrieval_score,
         }
+        graph_trace = channel_trace.get("graph") or {}
+        if graph_trace.get("policy"):
+            packet.retrieval_timing["graph_policy"] = graph_trace["policy"]
+            packet.retrieval_timing["graph_invoked"] = bool(graph_trace.get("invoked"))
+            packet.retrieval_timing["graph_candidate_count"] = int(graph_trace.get("candidate_count") or 0)
+            packet.retrieval_timing["graph_rerank"] = graph_rerank
         if self.embedding_router and hasattr(self.embedding_router, "status"):
             packet.retrieval_timing["embedding_status"] = self.embedding_router.status()
         return packet
 
     def _evaluate_fused(self, fused, spec, packet, filters, all_authorized, scope_id, *, skip_assets):
         """Run the condition pass over fused candidates; return non-excluded items."""
+        fused = list(fused)
+        self._prime_evaluation_cache(None if all_authorized else scope_id)
         items = []
         for candidate in fused:
             if candidate.asset_id in skip_assets:
                 continue
-            asset = self.store.get_asset(candidate.asset_id)
+            asset = (self._asset_cache or {}).get(candidate.asset_id)
+            if asset is None and self._asset_cache is None:
+                asset = self.store.get_asset(candidate.asset_id)
             if asset is None:
                 continue
             if not all_authorized and (asset.get("scope_id") or "home-default") != scope_id:
@@ -399,9 +592,57 @@ class EvidenceRetrievalKernel:
         return items
 
     def _observations_for_asset(self, asset_id):
-        # Indexed lookup: the old full-scan-and-filter decoded every observation
-        # JSON (~11k rows) once per fusion candidate (~100x per search).
+        if self._observations_by_asset_cache is not None:
+            return self._observations_by_asset_cache.get(asset_id, [])
+        # Compatibility fallback for lightweight stores that cannot serve the
+        # bulk projection used by production retrieval.
         return self.store.list_observations(asset_id=asset_id, limit=1000)
+
+    def _prime_evaluation_cache(self, scope_id):
+        """Load verifier inputs once for the current retrieval request.
+
+        ``list_assets`` and ``list_observations`` decode rows in one query each.
+        Event evidence is also projected in one join.  This keeps full-scope
+        recall semantics while making verifier cost linear in rows instead of
+        linear in candidates multiplied by database round trips.
+        """
+        if self._asset_cache is not None:
+            return
+        try:
+            assets = self.store.list_assets(scope_id=scope_id, limit=100_000)
+            observations = self.store.list_observations(
+                scope_id=scope_id, limit=100_000)
+        except (AttributeError, TypeError):
+            return
+        self._asset_cache = {str(item.get("id")): item for item in assets if item.get("id")}
+        by_asset = {}
+        observation_ids = set()
+        for observation in observations:
+            asset_id = str(observation.get("asset_id") or "")
+            if not asset_id or asset_id not in self._asset_cache:
+                continue
+            by_asset.setdefault(asset_id, []).append(observation)
+            if observation.get("id"):
+                observation_ids.add(str(observation["id"]))
+        self._observations_by_asset_cache = by_asset
+        event_text = {}
+        try:
+            rows = self.store.connection.execute(
+                "SELECT eo.observation_id, e.place, e.title, e.summary "
+                "FROM event_observations eo JOIN events e ON e.id=eo.event_id"
+            ).fetchall()
+            for row in rows:
+                observation_id = str(row[0] or "")
+                if observation_id not in observation_ids:
+                    continue
+                value = " ".join(str(item or "") for item in row[1:])
+                if value:
+                    event_text[observation_id] = (
+                        event_text.get(observation_id, "") + " " + value
+                    ).strip()
+        except Exception:
+            pass
+        self._event_text_by_observation_cache = event_text
 
     def probe(self, raw_text: str, scope_id: str | None, viewer_id: str = "owner",
               *, focus=None, media_hint=None):
@@ -558,6 +799,20 @@ class EvidenceRetrievalKernel:
                 if entity and entity.get("status") == "confirmed" \
                         and entity.get("canonical_name") == name:
                     return True
+            # Entity mentions are a sparse annotation projection.  A confirmed
+            # face cluster attached to the same observation is already a valid
+            # identity bridge and must participate in retrieval conditions.
+            row = self.store.connection.execute(
+                "SELECT 1 FROM face_instances fi "
+                "JOIN face_clusters fc ON fc.id = fi.cluster_id "
+                "JOIN entities e ON e.id = fc.entity_id "
+                "WHERE fi.observation_id = ? AND fc.status = 'confirmed' "
+                "AND e.status = 'confirmed' AND e.entity_type = 'person' "
+                "AND e.canonical_name = ? LIMIT 1",
+                (observation_id, name),
+            ).fetchone()
+            if row:
+                return True
         except Exception:
             return False
         return False
@@ -651,6 +906,26 @@ class EvidenceRetrievalKernel:
         if _contains(pool, value):
             return ("possible", "observation", observation.get("id"),
                     float(observation.get("confidence") or 0))
+        # Event summaries are separate from the observation projection and
+        # often carry the only human-readable place for videos.  Treat a
+        # direct place mention there as supported (not authoritative matched)
+        # so the Agent receives a useful partial-support signal without
+        # turning a generated summary into a hard geocode fact.
+        try:
+            observation_id = str(observation.get("id") or "")
+            if self._event_text_by_observation_cache is not None:
+                event_pool = self._event_text_by_observation_cache.get(observation_id, "")
+            else:
+                event_rows = self.store.connection.execute(
+                    "SELECT e.place, e.title, e.summary FROM events e "
+                    "JOIN event_observations eo ON eo.event_id=e.id "
+                    "WHERE eo.observation_id=?", (observation_id,)
+                ).fetchall()
+                event_pool = " ".join(str(value or "") for row in event_rows for value in row)
+            if _contains(event_pool, value):
+                return ("possible", "event_summary", observation.get("id"), 0.7)
+        except Exception:
+            pass
         if geocode:
             return ("contradicted", "asset_metadata", asset.get("id"),
                     float(geocode.get("confidence") or 0.9))

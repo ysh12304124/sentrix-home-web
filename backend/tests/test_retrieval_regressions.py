@@ -4,6 +4,11 @@ import unittest
 from backend.retrieval.metadata import MetadataRetriever
 from backend.retrieval.base import HardFilterContext, RetrievalQuery
 from backend.agent_runtime.canonical_intent import extract_constraints
+from backend.agent_runtime.tools import (
+    _query_is_video_intent,
+    _query_requests_collection,
+    _slot_candidate_limit,
+)
 
 
 class _Store:
@@ -54,6 +59,15 @@ class RetrievalRegressionTests(unittest.TestCase):
 
         result = extract_constraints("赵州桥石桥上的合影", Store(), "s")
         self.assertEqual(result["place"], "赵县")
+
+    def test_collection_intent_gets_wider_window_without_affecting_focused_query(self):
+        self.assertTrue(_query_requests_collection("按时间顺序总结2017到2023年的成长轨迹"))
+        self.assertGreater(_slot_candidate_limit("按时间顺序总结2017到2023年的成长轨迹", "best"), 18)
+        self.assertEqual(_slot_candidate_limit("2018年在哪拍的照片", "best"), 18)
+
+    def test_video_intent_is_detected_from_user_wording(self):
+        self.assertTrue(_query_is_video_intent("这段视频主要记录了什么"))
+        self.assertFalse(_query_is_video_intent("这张照片里有几个人"))
 
 
 if __name__ == "__main__":

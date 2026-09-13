@@ -15,6 +15,9 @@ class ToolDecision:
     allowed: bool
     reason: str = ""
     observation: dict | None = None
+    # Server-side payload retained for benchmark/debug telemetry.  This is
+    # never passed to the model; ``observation`` remains the sanitized view.
+    raw_observation: dict | None = None
     error: str | None = None
 
 
@@ -61,7 +64,8 @@ class ToolPolicy:
         if self.budget is not None:
             self.budget.record_tool_call(inspection=spec.cost_class == "expensive")
         observation = self._sanitize(payload, spec.name)
-        return ToolDecision(True, "ok", observation=observation)
+        return ToolDecision(True, "ok", observation=observation,
+                            raw_observation=payload)
 
     _DEFAULT_ALLOWED = {
         "summary", "result_set_id", "handle", "total", "preview", "has_more",
@@ -92,6 +96,7 @@ class ToolPolicy:
             "retrieved_asset_ids", "evidence_asset_ids", "source_asset_ids",
             "reference_resolution", "evidence_status", "validation_status",
             "group_photo_count", "group_photo_sizes", "group_photo_rows",
+            "asset_ids",
         },
         "get_original_photos": _DEFAULT_ALLOWED | {"scope_id", "media_type",
                                                   "source_timestamp_sec", "source_video_asset_id"},

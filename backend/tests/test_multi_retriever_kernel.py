@@ -5,7 +5,7 @@ import unittest
 from backend.db import MemoryStore
 from backend.evidence_retrieval import EvidenceRetrievalKernel
 from backend.query_contracts import Constraint, QueryParseDraft, build_query_spec
-from backend.retrieval import HardFilterContext, RetrievalQuery, fuse
+from backend.retrieval import CandidateHit, HardFilterContext, RetrievalQuery, fuse
 from backend.retrieval.lexical import LexicalRetriever
 from backend.retrieval.metadata import MetadataRetriever
 from backend.retrieval_indexes import RetrievalIndex
@@ -22,6 +22,46 @@ class StubEmbedderRouter:
 
     def embed_text(self, text):
         return []
+
+
+class _StaticPrimary:
+    kind = "primary"
+    name = "visual_ann"
+
+    def __init__(self, asset_id):
+        self.asset_id = asset_id
+
+    def retrieve(self, query, filters, limit):
+        return [CandidateHit(
+            asset_id=self.asset_id, retriever=self.name, raw_score=0.9,
+            score_kind="cosine", higher_is_better=True, rank=1,
+        )]
+
+
+class _SeedAwareGraph:
+    kind = "expander"
+    name = "graph"
+
+    def route(self, query, filters):
+        return {"enabled": True, "intent": "multi_hop", "reason": "test"}
+
+    def expand(self, seeds, filters, limit, query=None):
+        # The seed itself is a path-supported result.  It must be retained so
+        # graph evidence can change that candidate's fused rank.
+        return [CandidateHit(
+            asset_id="asset_1", retriever=self.name, raw_score=1.0,
+            score_kind="graph_path", higher_is_better=True, rank=1,
+        )]
+
+
+class _ConditionRejectingGraph(_SeedAwareGraph):
+    """Records that graph expansion receives hard-filtered, not final, hits."""
+
+    seen_seeds = []
+
+    def expand(self, seeds, filters, limit, query=None):
+        self.seen_seeds = list(seeds)
+        return super().expand(seeds, filters, limit, query=query)
 
 
 def _seed_store():
@@ -99,6 +139,86 @@ class MultiRetrieverKernelTests(unittest.TestCase):
             self.assertIn("attributions", item)
             self.assertIn("fusion_score", item)
             self.assertTrue(any(attr["retriever"] in {"metadata", "lexical"} for attr in item["attributions"]))
+        finally:
+            store.close()
+
+    def test_graph_path_signal_is_fused_with_its_seed_not_appended_after_it(self):
+        store = _seed_store()
+        try:
+            kernel = EvidenceRetrievalKernel(
+                store,
+                retrievers=[_StaticPrimary("asset_1"), _SeedAwareGraph()],
+                embedding_router=StubEmbedderRouter(),
+            )
+            packet = kernel._retrieve_multi(self._spec())
+            item = next(row for row in packet.assets if row["asset_id"] == "asset_1")
+            self.assertTrue(any(hit["retriever"] == "graph" for hit in item["attributions"]))
+            rerank = packet.retrieval_timing["graph_rerank"]
+            self.assertTrue(rerank["applied"])
+            self.assertEqual(rerank["graph_supported_top_count"], 1)
+        finally:
+            store.close()
+
+    def test_graph_seeds_come_from_baseline_before_condition_verification(self):
+        store = _seed_store()
+        try:
+            graph = _ConditionRejectingGraph()
+            kernel = EvidenceRetrievalKernel(
+                store,
+                retrievers=[_StaticPrimary("asset_2"), graph],
+                embedding_router=StubEmbedderRouter(),
+            )
+            kernel._retrieve_multi(self._spec())
+            # asset_2 does not satisfy the clothing condition, therefore it
+            # is absent from primary_items but must remain a graph anchor.
+            self.assertIn("asset_2", graph.seen_seeds)
+        finally:
+            store.close()
+
+    def test_condition_verification_bulk_loads_scope_instead_of_n_plus_one(self):
+        store = _seed_store()
+        calls = {"assets": 0, "observations": 0}
+        original_list_assets = store.list_assets
+        original_list_observations = store.list_observations
+
+        def counted_assets(*args, **kwargs):
+            calls["assets"] += 1
+            return original_list_assets(*args, **kwargs)
+
+        def counted_observations(*args, **kwargs):
+            calls["observations"] += 1
+            return original_list_observations(*args, **kwargs)
+
+        store.list_assets = counted_assets
+        store.list_observations = counted_observations
+        try:
+            retrievers = [MetadataRetriever(store), LexicalRetriever(store)]
+            kernel = EvidenceRetrievalKernel(store, retrievers=retrievers,
+                                             embedding_router=StubEmbedderRouter())
+            packet = kernel._retrieve_multi(self._spec())
+            self.assertTrue(packet.assets)
+            # Metadata itself enumerates assets once; verifier adds one bulk
+            # asset and one bulk observation read regardless of candidate count.
+            self.assertLessEqual(calls["assets"], 3)
+            self.assertEqual(calls["observations"], 1)
+        finally:
+            store.close()
+
+    def test_metadata_retriever_pushes_single_scope_into_store_queries(self):
+        store = _seed_store()
+        seen_scopes = []
+        original = store.list_assets
+
+        def tracked(*args, **kwargs):
+            seen_scopes.append(kwargs.get("scope_id"))
+            return original(*args, **kwargs)
+
+        store.list_assets = tracked
+        try:
+            filters = HardFilterContext(scope_ids=("album1",), media_types=("image",))
+            MetadataRetriever(store).retrieve(
+                RetrievalQuery(whole_query="卧室", facets=[]), filters, 20)
+            self.assertEqual(seen_scopes, ["album1"])
         finally:
             store.close()
 

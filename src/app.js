@@ -2004,11 +2004,15 @@
     if (action === "open-help") return openModal({ type: "help" });
     if (action === "open-qa-dashboard") {
       const benchUrl = `${window.location.protocol}//${window.location.hostname}:8771/`;
+      // Open synchronously while the click still carries a user gesture;
+      // browsers otherwise block window.open after the async service probe.
+      const benchWindow = window.open("about:blank", "_blank");
       showToast("正在启动评测服务，请稍候…");
       try {
         await fetch("/api/photobench/ensure", { method: "POST" });
       } catch (_) { /* 评测服务不可达时仍打开，让用户看到连接状态 */ }
-      window.open(benchUrl, "_blank");
+      if (benchWindow) benchWindow.location.href = benchUrl;
+      else window.location.href = benchUrl;
       return;
     }
     if (action === "command") return openModal({ type: "command" });

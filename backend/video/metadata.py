@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,6 +12,53 @@ from .contracts import VideoMetadata
 
 ISO6709_RE = re.compile(r"^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)?/?$")
 COMPACT_TZ_RE = re.compile(r"([+-]\d{2})(\d{2})$")
+
+
+_FFMPEG_BINARIES = {}
+
+
+def resolve_ffmpeg_binary(name: str) -> str:
+    """Resolve ffmpeg/ffprobe on Windows and Unix without changing the pipeline.
+
+    The video pipeline intentionally shells out to FFmpeg.  On Windows a
+    WinGet installation is not visible to an already-running Python process,
+    so ``shutil.which`` alone leaves uploads stuck at ``video-metadata``.
+    Prefer an explicit project setting, then PATH, then common WinGet/Scoop
+    locations; returning the bare command preserves the normal OS lookup and
+    keeps tests/mocks unchanged.
+    """
+    cached = _FFMPEG_BINARIES.get(name)
+    if cached:
+        return cached
+    candidates = []
+    configured = os.getenv("SENTRIX_FFMPEG_BIN", "").strip()
+    if configured:
+        configured_path = Path(configured)
+        candidates.append(configured_path / f"{name}.exe" if configured_path.is_dir() else configured_path)
+    found = shutil.which(name)
+    if found:
+        candidates.append(Path(found))
+    if os.name == "nt":
+        local = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        candidates.extend([
+            local / "Microsoft" / "WinGet" / "Links" / f"{name}.exe",
+            local / "Programs" / "ffmpeg" / "bin" / f"{name}.exe",
+            Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin" / f"{name}.exe",
+        ])
+        packages = local / "Microsoft" / "WinGet" / "Packages"
+        if packages.is_dir():
+            # WinGet package layout is <package>/<archive>/bin/<binary>.exe.
+            candidates.extend(packages.glob(f"*/*/bin/{name}.exe"))
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                resolved = str(candidate.resolve())
+                _FFMPEG_BINARIES[name] = resolved
+                return resolved
+        except OSError:
+            continue
+    _FFMPEG_BINARIES[name] = name
+    return name
 
 
 def _rate(value):
@@ -39,7 +88,7 @@ def _normalized_datetime(value):
 def probe_video_metadata(path: str | Path) -> VideoMetadata:
     path = Path(path).resolve()
     process = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        [resolve_ffmpeg_binary("ffprobe"), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         check=False, capture_output=True, text=True, timeout=60,
     )
     if process.returncode:

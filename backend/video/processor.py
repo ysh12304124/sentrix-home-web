@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..db import make_id
 from ..geocoding import format_gps_prefix
-from .metadata import probe_video_metadata
+from .metadata import probe_video_metadata, resolve_ffmpeg_binary
 from .worldmm_adapter import WorldMMAdapter
 
 
@@ -59,7 +59,7 @@ def _browser_preview(video_path, target, codec):
         return None
     target.parent.mkdir(parents=True, exist_ok=True)
     process = subprocess.run([
-        "ffmpeg", "-y", "-v", "error", "-i", str(video_path),
+        resolve_ffmpeg_binary("ffmpeg"), "-y", "-v", "error", "-i", str(video_path),
         "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
         "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(target),
     ], check=False, capture_output=True, text=True, timeout=3600)

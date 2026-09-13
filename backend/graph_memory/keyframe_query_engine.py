@@ -861,9 +861,15 @@ class KeyframeQueryEngine:
     def _graph_traversal(self, anchor_nodes, keywords, params,
                          question: str = None, max_nodes=600,
                          scope: Optional[Dict] = None,
-                         bidirectional: bool = False):
+                         bidirectional: bool = False,
+                         allow_unmatched_events: bool = False):
         """BFS from anchors, filtering by keyword relevance, link types and
         temporal direction (sub-type consumption).
+
+        ``allow_unmatched_events`` is used only by temporal/multi-hop routes:
+        a path's next event often does not repeat the anchor's object words,
+        so applying the ordinary keyword gate to every neighbour would erase
+        the very relation the graph is meant to recover.
 
         ENTITY nodes (object/relation hubs) are conduits: all of their
         neighbours are expanded (no hard cap), while the total result count
@@ -916,7 +922,8 @@ class KeyframeQueryEngine:
                          if n.node_id not in visited
                          and (n.node_type.value != "EVENT"
                               or (self._scope_match(n, scope)
-                                  and self._lightweight_filter(n, keywords)))]
+                                  and (allow_unmatched_events
+                                       or self._lightweight_filter(n, keywords))))]
             if is_hub:
                 # Hub neighbours keep narrative locality: same clip as the
                 # anchor first, then temporal distance, then node id.
@@ -1726,7 +1733,8 @@ class KeyframeQueryEngine:
             t_phase = time.perf_counter()
             traversed, graph_paths = self._graph_traversal(
                 initial, keywords, params, question=question, max_nodes=200,
-                scope=scope, bidirectional=multi_hop_expansion)
+                scope=scope, bidirectional=multi_hop_expansion,
+                allow_unmatched_events=query_type in {"multi_hop", "temporal"})
             phase_ms["traversal_ms"] = round((time.perf_counter() - t_phase) * 1000, 1)
         traversed_node_ids = {node.node_id for node, _ in traversed}
         # Persist reachability for graph-aware reranking.  Reset on every node

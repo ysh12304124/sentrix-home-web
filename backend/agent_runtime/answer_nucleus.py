@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -177,7 +178,43 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                         nucleus.values.append(NucleusValue(
                             kind="year", value=m.group(1), certainty="confirmed",
                             source="ocr", display=m.group(1)))
-        # 4) 地点（GPS 反编码，条件匹配）；where 题把匹配照片地点绑为硬值防编造
+    # 4) 时间/地点（来自搜索结果的结构化媒体元数据）。
+    # 搜索预览已经携带 captured_at，但此前只有 query_memory_facts 的
+    # date/first/last 结果会进入 Nucleus，导致“哪一年/哪天”问题明明有
+    # 时间戳却被 Writer/Judge 当成没有硬证据。按预览中的多数值提取，
+    # 只回答用户明确询问的时间粒度，不把时间戳泛化成事件事实。
+    if any((tr or {}).get("tool") == "search_memories"
+           for tr in task_state.get("tool_results") or []):
+        preview_times = []
+        for tr in task_state.get("tool_results") or []:
+            if tr.get("tool") != "search_memories":
+                continue
+            preview_times.extend(
+                str(item.get("captured_at") or "").strip()
+                for item in (tr.get("preview") or [])
+                if isinstance(item, dict) and item.get("captured_at")
+            )
+        if preview_times and _Q_YEAR.search(question or ""):
+            years = [m.group(1) for value in preview_times
+                     for m in [_YEAR_RE.search(value)] if m]
+            if years:
+                year, _ = Counter(years).most_common(1)[0]
+                nucleus.values.append(NucleusValue(
+                    kind="year", value=year, certainty="confirmed",
+                    source="search_memories.captured_at", display=year))
+        elif preview_times and _Q_DATE.search(question or ""):
+            dates = []
+            for value in preview_times:
+                m = re.match(r"(\d{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})", value)
+                if m:
+                    dates.append(f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日")
+            if dates:
+                date, _ = Counter(dates).most_common(1)[0]
+                nucleus.values.append(NucleusValue(
+                    kind="date", value=date, certainty="confirmed",
+                    source="search_memories.captured_at", display=date))
+
+    # 地点（GPS 反编码，条件匹配）；where 题把匹配照片地点绑为硬值防编造
         _place_counter: dict[str, int] = {}
         if tr.get("tool") == "search_memories":
             for p in (tr.get("preview") or []) or []:
@@ -212,7 +249,7 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
 # ---------------------------------------------------------------------------
 
 def classify_deterministic(question: str) -> str | None:
-    """返回 'count' | 'date' | 'year' | 'price' | 'boolean' | None。"""
+    """返回 'count' | 'date' | 'year' | 'place' | 'price' | 'boolean' | None。"""
     q = question or ""
     if _Q_PRICE.search(q):
         return "price"
@@ -220,6 +257,8 @@ def classify_deterministic(question: str) -> str | None:
         return "year"
     if _Q_DATE.search(q) and not _Q_COUNT.search(q):
         return "date"
+    if _Q_WHERE.search(q):
+        return "place"
     if _Q_COUNT.search(q):
         return "count"
     if _Q_BOOL.search(q):
@@ -260,6 +299,11 @@ def render_simple(nucleus: AnswerNucleus, kind: str, question: str = "") -> str 
                 break
         v = best or vs[0]
         return f"{v.value} 年。"
+    if kind == "place":
+        v = nucleus.get("place")
+        if v is None:
+            return None
+        return f"地点是 {v.display or v.value}。"
     if kind == "price":
         # 只当问题里的商品词与核值 label 匹配时才确定性渲染，避免错配（如多个价格）
         q = question or ""

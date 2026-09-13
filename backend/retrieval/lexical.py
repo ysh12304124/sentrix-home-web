@@ -12,7 +12,10 @@ Kernel's condition pass — never copied from a matched FTS row directly
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import threading
+import time
+from typing import ClassVar
 
 from ..retrieval_indexes import RetrievalIndex
 from .base import CandidateHit, HardFilterContext, RetrievalQuery
@@ -23,17 +26,25 @@ class LexicalRetriever:
     name: str = "lexical"
     kind: str = "primary"
 
+    # Retriever objects are request-local, but index health is process-wide.
+    # A per-instance lock allowed concurrent QA requests to launch overlapping
+    # scoped FTS rebuilds.  Share both the lock and healthy-scope memo across
+    # instances.
+    _shared_populate_lock: ClassVar[threading.Lock] = threading.Lock()
+    _shared_populated_scopes: ClassVar[set[tuple[int, str | None]]] = set()
+    _shared_population_retry_after: ClassVar[dict[tuple[int, str | None], float]] = {}
+
     def __init__(self, store):
         self.store = store
         self.index = RetrievalIndex(store)
         # A benchmark creates a fresh scope for every run.  Keep health state
         # per scope instead of globally, otherwise the first scope searched in
         # a process suppresses the self-heal for every later album.
-        self._populated_scopes: set[str | None] = set()
+        self._populated_scopes = self._shared_populated_scopes
         # A fresh benchmark scope can be queried by many QA workers at once.
         # Serialize the one-time FTS self-heal; concurrent rebuild_all calls
         # can corrupt SQLite/FTS on Windows and crash the API process.
-        self._populate_lock = threading.Lock()
+        self._populate_lock = self._shared_populate_lock
 
     def _scope(self, filters: HardFilterContext) -> str | None:
         if filters.all_authorized or not filters.scope_ids:
@@ -53,8 +64,19 @@ class LexicalRetriever:
         whole album.  Compare distinct indexed observations with the current
         scope and rebuild that scope when the projection is materially behind.
         """
-        scope_key = str(scope_id or "") or None
+        # Include the store identity: test fixtures and maintenance jobs may
+        # open separate SQLite connections containing the same scope name.
+        # Sharing a bare scope string across those stores would skip required
+        # health checks in the second database.
+        scope_key = (id(self.store), str(scope_id or "") or None)
         if scope_key in self._populated_scopes:
+            return
+        # A freshly-created benchmark scope can briefly race the final SQLite
+        # commit from graph/pipeline processing.  Do not turn one transient
+        # lock/connection failure into a permanently healthy-but-empty index.
+        # Retry on a later query instead of poisoning this process-wide memo.
+        retry_after = self._shared_population_retry_after.get(scope_key, 0.0)
+        if retry_after > time.monotonic():
             return
         try:
             conn = self.store.connection
@@ -68,31 +90,32 @@ class LexicalRetriever:
                 "SELECT COUNT(DISTINCT observation_id) FROM observation_search_fts "
                 + ("WHERE scope_id = ?" if scope_id else ""), params
             ).fetchone()[0] or 0)
-            # Event-level evidence was added to the derived lexical
-            # projection after older databases had already been built.  A
-            # one-time self-heal is needed even when the observation row count
-            # looks healthy; otherwise date/place/event queries never see the
-            # new terms until a manual maintenance rebuild.
-            event_terms = int(conn.execute(
-                "SELECT COUNT(*) FROM observation_search_terms WHERE field_type='event_summary'"
-                + (" AND scope_id = ?" if scope_id else ""), params
-            ).fetchone()[0] or 0)
             # Some observations legitimately have no textual fields.  A 50%
             # floor still catches truncated projections while avoiding a
             # rebuild for tiny/mostly-empty fixtures.
-            event_exists_sql = (
-                "SELECT 1 FROM events e JOIN event_observations eo ON eo.event_id=e.id "
-                "JOIN observations o ON o.id=eo.observation_id "
-                "JOIN assets a ON a.id=o.asset_id "
-                "WHERE a.scope_id = ? LIMIT 1" if scope_id else
-                "SELECT 1 FROM events LIMIT 1"
-            )
-            event_exists = conn.execute(event_exists_sql, params if scope_id else ()).fetchone()
-            if expected and (indexed < max(1, expected // 2) or
-                             (event_terms == 0 and event_exists)):
+            # Do not require an event_summary term here: RetrievalIndex indexes
+            # canonical Observation fields, while event text is joined by the
+            # metadata/event ranking path.  The old impossible condition made
+            # every request rebuild the same FTS projection (22-60s each).
+            if expected and indexed < max(1, expected // 2):
                 self.index.rebuild_all(scope_id=scope_id)
-        except Exception:
-            pass
+                # A rebuild that returns without enough rows is not healthy;
+                # leave the scope un-memoized so the next request can retry.
+                indexed_after = int(conn.execute(
+                    "SELECT COUNT(DISTINCT observation_id) FROM observation_search_fts "
+                    + ("WHERE scope_id = ?" if scope_id else ""), params
+                ).fetchone()[0] or 0)
+                if indexed_after < max(1, expected // 2):
+                    self._shared_population_retry_after[scope_key] = time.monotonic() + 2.0
+                    return
+        except Exception as exc:
+            self._shared_population_retry_after[scope_key] = time.monotonic() + 2.0
+            logging.getLogger(__name__).warning(
+                "lexical index self-heal failed for scope %s: %s",
+                scope_id or "all", exc,
+            )
+            return
+        self._shared_population_retry_after.pop(scope_key, None)
         self._populated_scopes.add(scope_key)
 
     def retrieve(self, query: RetrievalQuery, filters: HardFilterContext, limit: int) -> list[CandidateHit]:

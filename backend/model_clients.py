@@ -332,7 +332,10 @@ class OllamaBackend:
                 "num_predict": vision_options["num_predict"],
             })
         try:
-            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response = httpx.post(
+                f"{self._base_url}/api/chat", json=payload, timeout=self.timeout,
+                trust_env=False,
+            )
             response.raise_for_status()
             data = response.json()
             return data.get("message", {}).get("content", "")
@@ -345,7 +348,12 @@ class OllamaBackend:
             return []
         model = os.getenv("SENTRIX_TEXT_EMBED_MODEL", self._model)
         try:
-            response = httpx.post(f"{self._base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout)
+            response = httpx.post(
+                f"{self._base_url}/api/embed",
+                json={"model": model, "input": [str(text)]},
+                timeout=self.timeout,
+                trust_env=False,
+            )
             response.raise_for_status()
             payload = response.json()
             embeddings = payload.get("embeddings") or []
@@ -547,6 +555,12 @@ class GammaClient:
         )
         self.manager_url = str(manager_setting or "").strip().rstrip("/")
         self._call_metrics_local = threading.local()
+        # A non-default role can route to a different OpenAI-compatible
+        # endpoint even when the primary backend is Ollama.  Cache those
+        # providers too: creating one per turn recreates httpx/SSL transports
+        # in executor threads and can terminate the Windows API process.
+        self._inference_providers = {}
+        self._inference_provider_lock = threading.RLock()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
         _init_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
@@ -632,13 +646,18 @@ class GammaClient:
         endpoint_base = normalize_openai_base_url(endpoint_base)
         if self.inference_provider and self.inference_provider.base_url == endpoint_base:
             return self.inference_provider
-        return OpenAICompatibleInferenceProvider(
-            endpoint_base,
-            api_key=self.api_key,
-            api_mode=self.api_mode,
-            manager_url=self.manager_url,
-            timeout=self.timeout,
-        )
+        with self._inference_provider_lock:
+            provider = self._inference_providers.get(endpoint_base)
+            if provider is None:
+                provider = OpenAICompatibleInferenceProvider(
+                    endpoint_base,
+                    api_key=self.api_key,
+                    api_mode=self.api_mode,
+                    manager_url=self.manager_url,
+                    timeout=self.timeout,
+                )
+                self._inference_providers[endpoint_base] = provider
+            return provider
 
     _CACHE_TTL_SECONDS = 5.0
 
@@ -922,15 +941,39 @@ class GammaClient:
                 "num_ctx": vision_options["num_ctx"],
                 "num_predict": vision_options["num_predict"],
             })
+        # Ollama may briefly reset/refuse the HTTP connection while loading a
+        # model or recovering from VRAM pressure.  A single transient failure
+        # must not turn the rest of a 487-question benchmark into failures.
         try:
-            response = httpx.post(f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout)
-            response.raise_for_status()
-            data = response.json()
-            text = data.get("message", {}).get("content", "")
-            self._record_validation_call(role, endpoint_base, model, json_mode, text)
-            return text
-        except (httpx.HTTPError, ValueError) as error:
-            raise ModelError(f"model request failed: {_http_error_detail(error)}") from error
+            retry_count = max(0, min(5, int(os.getenv("OLLAMA_RETRY_COUNT", "3"))))
+        except (TypeError, ValueError):
+            retry_count = 3
+        last_error = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = httpx.post(
+                    f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout,
+                    trust_env=False,
+                )
+                response.raise_for_status()
+                data = response.json()
+                text = data.get("message", {}).get("content", "")
+                self._record_validation_call(role, endpoint_base, model, json_mode, text)
+                return text
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
+                    httpx.ReadTimeout, httpx.RemoteProtocolError,
+                    httpx.PoolTimeout, httpx.WriteError, httpx.WriteTimeout) as error:
+                last_error = error
+                if attempt >= retry_count:
+                    break
+                # Short bounded backoff lets Ollama finish restarting/loading.
+                time.sleep(min(8.0, 0.75 * (2 ** attempt)))
+            except (httpx.HTTPError, ValueError) as error:
+                # HTTP 4xx/5xx and malformed payloads are deterministic; do
+                # not duplicate those requests.
+                last_error = error
+                break
+        raise ModelError(f"model request failed after retries: {_http_error_detail(last_error)}") from last_error
 
 
     def _record_call_metrics(self, role, model, endpoint, metrics):

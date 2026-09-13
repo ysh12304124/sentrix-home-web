@@ -3,9 +3,45 @@
 from __future__ import annotations
 
 import itertools
+import os
 from dataclasses import dataclass, field
 
 from .face_embeddings import normalize_embedding
+
+
+# Cosine similarity is computed on L2-normalized buffalo_l embeddings.  The
+# previous 0.30 default was permissive enough to merge visually similar but
+# different people.  Online ingestion keeps more recall; global reclustering
+# is a cleanup pass with stricter matching plus a quality filter.
+DEFAULT_FACE_MATCH_THRESHOLD = 0.42
+DEFAULT_FACE_RECLUSTER_THRESHOLD = 0.48
+
+
+def _resolve_threshold(value, env_name, default):
+    if value is not None:
+        raw = value
+    else:
+        # Keep the old variable as a backwards-compatible override while
+        # allowing the two paths to be tuned independently.
+        raw = os.getenv(env_name, os.getenv("FACE_CLUSTER_THRESHOLD", str(default)))
+    try:
+        threshold = float(raw)
+    except (TypeError, ValueError):
+        threshold = default
+    return max(0.0, min(1.0, threshold))
+
+
+def resolve_online_match_threshold(value=None):
+    return _resolve_threshold(value, "FACE_ONLINE_CLUSTER_THRESHOLD", DEFAULT_FACE_MATCH_THRESHOLD)
+
+
+def resolve_recluster_match_threshold(value=None):
+    return _resolve_threshold(value, "FACE_RECLUSTER_THRESHOLD", DEFAULT_FACE_RECLUSTER_THRESHOLD)
+
+
+def resolve_match_threshold(value=None):
+    """Backward-compatible alias for generic/online clustering callers."""
+    return resolve_online_match_threshold(value)
 
 
 def cosine(left, right):
@@ -64,9 +100,9 @@ class FaceClusterer:
     member, which prevents single-link bridge chaining.
     """
 
-    def __init__(self, match_threshold=0.30, minimum_quality=0.30, prototype_limit=6,
+    def __init__(self, match_threshold=None, minimum_quality=0.30, prototype_limit=6,
                  match_strategy="all", topk=3, percentile=0.1):
-        self.match_threshold = float(match_threshold)
+        self.match_threshold = resolve_match_threshold(match_threshold)
         self.minimum_quality = float(minimum_quality)
         self.prototype_limit = int(prototype_limit)
         self.match_strategy = str(match_strategy)

@@ -251,12 +251,24 @@ def process_asset(asset_id):
 
 def _pipeline_worker_limits():
     configured = max(1, int(os.getenv("SENTRIX_PIPELINE_MAX_WORKERS", "2")))
-    state = _load_vllm_state() or {}
-    service_limit = max(1, int(state.get("max_num_seqs") or 1))
+    backend = str(os.getenv("SENTRIX_LLM_BACKEND", "")).strip().lower()
+    # A managed vLLM service reports its scheduling capacity through the
+    # manager state.  Ollama has no such state; treating the missing value as
+    # one silently serializes every image in a batch even when its own bounded
+    # scheduler has been configured for more than one request.
+    if backend == "ollama":
+        service_limit = max(1, int(os.getenv("OLLAMA_NUM_PARALLEL", "1")))
+        concurrency_source = "ollama_num_parallel"
+    else:
+        state = _load_vllm_state() or {}
+        service_limit = max(1, int(state.get("max_num_seqs") or 1))
+        concurrency_source = "vllm_max_num_seqs"
     summary_configured = max(1, int(os.getenv("SENTRIX_EVENT_SUMMARY_MAX_WORKERS", "2")))
     return {
         "configured_workers": configured,
         "vllm_max_num_seqs": service_limit,
+        "service_concurrency_limit": service_limit,
+        "concurrency_source": concurrency_source,
         "effective_workers": min(configured, service_limit),
         "event_summary_workers": min(summary_configured, service_limit),
     }
@@ -2446,7 +2458,10 @@ def _turn_executor():
         # concurrency (aligned with the serving model's max_num_seqs, e.g. 16);
         # the old fixed 2 workers serialized those turns and silently throttled
         # concurrent runs. Env-overridable, default 16.
-        workers = max(2, int(os.getenv("SENTRIX_ASSISTANT_TURN_WORKERS", "16")))
+        # A local Ollama endpoint has one generation queue.  In that mode the
+        # launcher intentionally sets this to 1; do not silently turn it back
+        # into two concurrent tool-loop/model calls.
+        workers = max(1, int(os.getenv("SENTRIX_ASSISTANT_TURN_WORKERS", "16")))
         _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=workers)
     return _TURN_EXECUTOR
 
@@ -2677,7 +2692,12 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     for step in turn.steps:
         if step.get("type") != "tool":
             continue
-        observation = step.get("observation") or {}
+        # Keep the model-safe observation in normal responses, but expose the
+        # original server payload to benchmark/admin debug consumers so graph
+        # routing telemetry (retrieval_timing.graph_policy) is scoreable.
+        observation = (step.get("debug_observation")
+                       if include_debug and isinstance(step.get("debug_observation"), dict)
+                       else step.get("observation")) or {}
         tool_record = {
             "tool": step.get("tool", ""), "status": step.get("status", ""),
             "tool_call_id": step.get("tool_call_id") or "",
@@ -2724,7 +2744,13 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "selected_image_handles": list(getattr(turn, "selected_image_handles", []) or []),
         "selected_image_ids": list(getattr(turn, "selected_image_ids", []) or []),
         "termination_reason": turn.termination_reason,
-        "debug_trace": turn.steps if include_debug else None,
+        "debug_trace": (
+            [dict(step, observation=(step.get("debug_observation")
+                                     if isinstance(step.get("debug_observation"), dict)
+                                     else step.get("observation")))
+             for step in turn.steps]
+            if include_debug else None
+        ),
     }
 
 

@@ -33,6 +33,20 @@ scripts/                 本地启动脚本
 ./scripts/stop.sh
 ```
 
+## Windows 本地 Sentrix 评测
+
+当前项目的本地 Sentrix 使用 `127.0.0.1:11001`，本地 Judge/模型使用 Ollama
+`qwen3-vl:4b-instruct` 的 OpenAI-compatible 接口。Windows 下先启动 Sentrix
+主服务，再执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+```
+
+评测页面为 <http://127.0.0.1:8771/>。`start-local.ps1` 只负责加载本地连接
+配置和启动编排器，不改变任何评测、打分或数据集逻辑；代码修改后重启主服务
+（仓库根目录的 `start.ps1 -Restart`）即可继续使用同一评测入口。
+
 ## 生产构建
 
 ```bash
