@@ -1,6 +1,6 @@
 ﻿# Sentrix Home one-click start (Windows PowerShell)
-# Usage:  .\start.ps1                                      start with the shared vLLM service
-#         .\start.ps1 -Restart                             restart with the shared vLLM service
+# Usage:  .\start.ps1                                      connect to independently started local WSL vLLM
+#         .\start.ps1 -Restart                             reconnect to local WSL vLLM
 #         .\start.ps1 -Restart -LlmBackend ollama           use local Ollama explicitly
 #         .\start.ps1 -Restart -GraphRetrievalMode off      disable graph traversal for A/B baseline
 #         .\start.ps1 -Status                              show status only
@@ -9,9 +9,9 @@ param(
   [switch]$Status,
   [ValidateSet("ollama", "vllm")]
   [string]$LlmBackend = "vllm",
-  [string]$VllmBaseUrl = "http://192.168.0.153:8100/v1",
+  [string]$VllmBaseUrl = "http://127.0.0.1:8000/v1",
   [string]$VllmModel = "gemma4-12b-it",
-  [string]$VllmManagerUrl = "http://192.168.0.153:8500",
+  [string]$VllmManagerUrl = "",
   [ValidateSet("auto", "on", "off")]
   [string]$GraphRetrievalMode = "auto"
 )
@@ -65,9 +65,8 @@ $env:FACE_PROVIDERS    = "CPUExecutionProvider"
 $env:FACE_EMBEDDING_MODE = "legacy"
 $env:RETINAFACE_MODEL_PATH = Join-Path $env:FACE_MODEL_ROOT "retinaface_r50.onnx"
 
-# Ollama is the default local backend.  When vLLM is explicitly selected, the
-# benchmark inherits the same endpoint so ingest, Agent and Judge do not
-# silently use different backends.
+# vLLM is an independently managed local WSL service.  Sentrix only connects
+# to its OpenAI-compatible endpoint; it never owns, starts, or stops vLLM.
 if ($LlmBackend -eq "vllm") {
   $env:SENTRIX_LLM_BACKEND = "openai"
   $env:SENTRIX_OPENAI_API_MODE = "vllm"
@@ -78,13 +77,13 @@ if ($LlmBackend -eq "vllm") {
   $env:SENTRIX_VLLM_MANAGER_API = $VllmManagerUrl.TrimEnd('/')
   $env:BENCH_VLLM_BASE_URL = $env:SENTRIX_VLLM_BASE_URL
   $env:BENCH_VLLM_API_URL = $env:SENTRIX_VLLM_MANAGER_API
-  $env:BENCH_JUDGE_URL = $env:SENTRIX_VLLM_BASE_URL
-  $env:BENCH_JUDGE_MODEL = $VllmModel
-  # Match the remote PhotoBench main-branch Agent pool.  Judge shares this
-  # endpoint locally, so keep it serial unless a separate Judge service is set.
-  $env:PHOTOBENCH_QA_CONCURRENCY = "12"
-  $env:PHOTOBENCH_JUDGE_CONCURRENCY = "1"
-  $env:SENTRIX_ASSISTANT_TURN_WORKERS = "12"
+  # Keep the main-branch split: Agent uses vLLM, while the configured Judge
+  # provider remains separate and therefore does not consume vLLM GPU slots.
+  Remove-Item Env:BENCH_JUDGE_URL -ErrorAction SilentlyContinue
+  Remove-Item Env:BENCH_JUDGE_MODEL -ErrorAction SilentlyContinue
+  $env:PHOTOBENCH_QA_CONCURRENCY = "16"
+  $env:PHOTOBENCH_JUDGE_CONCURRENCY = "8"
+  $env:SENTRIX_ASSISTANT_TURN_WORKERS = "16"
 } else {
   # Local Ollama model available on this Windows host.
   $env:SENTRIX_LLM_BACKEND = "ollama"
@@ -161,17 +160,13 @@ if (-not (Test-Path $python)) { $python = Join-Path $root ".venv\Scripts\python.
 if (-not (Test-Path $python)) { Write-Error "python not found: $python" }
 $env:PYTHONFAULTHANDLER = "1"
 
-# MAGMA owns the WSL systemd vLLM instance.  Start it before Sentrix and
-# PhotoBench so a bare `./start.ps1 -Restart` has a ready model endpoint.
+# vLLM is deliberately not started by this project.  Start or inspect it from
+# D:\vllm-runtime\start-gemma-vllm.ps1, then start Sentrix normally.
 if (-not $Status -and $LlmBackend -eq "vllm" -and $VllmBaseUrl -match "127\.0\.0\.1:8000") {
-  $vllmLauncher = "D:\MAGMA-V3\start_vllm_backend.py"
-  if (-not (Test-Path $vllmLauncher)) {
-    throw "WSL vLLM launcher not found: $vllmLauncher"
-  }
-  "Starting MAGMA WSL vLLM (Agent concurrency 12)..."
-  & $python $vllmLauncher --daemon --wait 300
-  if ($LASTEXITCODE -ne 0) {
-    throw "WSL vLLM failed to become ready; inspect D:\MAGMA-V3\restart_wsl_admin.out.log and run .\start_vllm_backend.py --log"
+  try {
+    Invoke-RestMethod -Uri "$($env:SENTRIX_VLLM_BASE_URL)/models" -TimeoutSec 3 | Out-Null
+  } catch {
+    Write-Warning "Local WSL vLLM is not ready. Start it separately: D:\vllm-runtime\start-gemma-vllm.ps1"
   }
 }
 $node = $null

@@ -1,6 +1,12 @@
 {
-  "default_target_id": "server-153",
+  "default_target_id": "local-wsl-gemma",
   "targets": {
+    "local-wsl-gemma": {
+      "label": "本机 WSL vLLM Gemma 12B",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:8000/v1",
+      "description": "独立运行于本机 WSL 的 vLLM；Sentrix 和 PhotoBench 仅连接该 OpenAI 接口，不控制模型进程"
+    },
     "local-ollama": {
       "label": "本地 Ollama Qwen3-VL 4B",
       "manager_url": "",
