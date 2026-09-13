@@ -24,7 +24,7 @@ DELIVER_MEDIA = "deliver_media"
 ANSWER = "answer"
 
 _RETRIEVAL_TOOLS = {
-    "search_memories", "query_memory_facts", "search_conversation_history",
+    "search_memories", "search_conversation_history",
     "get_core_memory", "get_person_memory",
 }
 

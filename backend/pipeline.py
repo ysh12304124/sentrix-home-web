@@ -62,19 +62,21 @@ class IngestionPipeline:
         self.video_memory_adapter = VideoMemoryAdapter()
 
     def _text_embed(self, text: str):
-        """文本嵌入：SENTRIX_TEXT_EMBEDDER=bge 时走 bge sidecar，否则 clip。返回 (vector, model_name)。"""
-        if os.getenv("SENTRIX_TEXT_EMBEDDER", "clip").strip().lower() == "bge":
-            try:
-                import httpx
-                url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
-                resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=15)
-                resp.raise_for_status()
-                vec = (resp.json() or {}).get("vector")
-                if vec:
-                    return vec, os.getenv("SENTRIX_TEXT_EMBED_MODEL", "BAAI/bge-m3")
-            except Exception:
-                pass
-        return self.clip.embed_text(str(text)), self.clip.model_name
+        """文本嵌入：单一方案 TEXT=bge（BAAI/bge-m3），见 embeddings/scheme.py。
+
+        历史上这里会按 env 在 clip 与 bge 之间切换，导致 semantic/episodic 向量多套
+        并存、索引对不上。现在钉死 bge：sidecar 失败就显式报错，绝不静默降级成 clip
+        （否则又写入一套错误模型的向量）。
+        """
+        from .embeddings import scheme
+        import httpx
+        url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
+        resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=20)
+        resp.raise_for_status()
+        vec = (resp.json() or {}).get("vector")
+        if not vec:
+            raise RuntimeError("bge sidecar returned empty vector")
+        return vec, scheme.TEXT_MODEL
 
     def _field_desc_text(self, analysis: dict) -> str:
         """完整描述文本：caption + place + objects + event_type + ocr_text（observations 字段）。

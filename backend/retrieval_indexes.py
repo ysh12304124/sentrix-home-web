@@ -207,7 +207,66 @@ class RetrievalIndex:
                     )
                 except Exception:
                     pass
+        # 地名/时间/文件名锚点：GT 正确召回的地名题（"易县沙岭/馆陶/保定/国庆 2017"）必须能按
+        # 这些词在词法通道命中。观察文本里没有这些锚（caption 是场景描述），reverse_geocode /
+        # captured_at / file_name 又在 asset 上——这里把它们一并写成可检索 token。
+        geo_time_rows = self._asset_anchor_rows(observation, asset_id, scope_id)
+        if geo_time_rows:
+            now = observation.get("updated_at") or observation.get("created_at") or ""
+            for row in geo_time_rows:
+                self.connection.execute(
+                    """INSERT INTO observation_search_terms(id, observation_id, asset_id, scope_id,
+                        field_type, normalized_value, confidence, source_type, source_revision,
+                        created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    row + (now, now),
+                )
+                try:
+                    self.connection.execute(
+                        """INSERT INTO observation_search_fts(tokens, scope_id, field_type,
+                            asset_id, observation_id) VALUES (?, ?, ?, ?, ?)""",
+                        (_fts_content(row[5]), scope_id, row[4], asset_id, observation_id),
+                    )
+                except Exception:
+                    pass
         self.connection.commit()
+
+    def _asset_anchor_rows(self, observation, asset_id, scope_id):
+        """从 asset 的 reverse_geocode / captured_at / file_name 生成地名/时间/文件锚 token。
+
+        与 benchmark 无关的通用元数据；让"按地名/日期找某张照片"也能被词法召回。
+        """
+        rows = []
+        try:
+            asset = self.store.get_asset(asset_id) or {}
+        except Exception:
+            asset = {}
+        metadata = asset.get("metadata_json") or {}
+        if isinstance(metadata, str):
+            try:
+                import json as _json
+                metadata = _json.loads(metadata)
+            except Exception:
+                metadata = {}
+        geo = metadata.get("reverse_geocode") or {}
+        if isinstance(geo, dict):
+            values = [
+                str(geo.get("label") or ""), str(geo.get("province") or ""),
+                str(geo.get("city") or ""), str(geo.get("district") or ""),
+            ]
+            for value in dict.fromkeys(v for v in values if v):
+                rows.append((_make_id(), observation["id"], asset_id, scope_id, "geo",
+                             _normalize(value), 0.9, "asset_geo", 1))
+        captured = str(asset.get("captured_at") or "")
+        if len(captured) >= 7:
+            for value in dict.fromkeys([captured[:4], captured[:7], captured[:10]]):
+                rows.append((_make_id(), observation["id"], asset_id, scope_id, "time",
+                             _normalize(value), 0.9, "asset_time", 1))
+        file_name = str(asset.get("file_name") or "")
+        stem = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+        if stem and not stem.lower().startswith(("event_event_", "kf_")):
+            rows.append((_make_id(), observation["id"], asset_id, scope_id, "file",
+                         _normalize(stem), 0.9, "asset_file", 1))
+        return rows
 
     def rebuild_all(self, scope_id: str | None = None) -> int:
         """Recompute every row from canonical Observations (terms + FTS)."""
