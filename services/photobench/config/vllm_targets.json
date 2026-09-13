@@ -1,5 +1,5 @@
 {
-  "default_target_id": "local-ollama",
+  "default_target_id": "server-153",
   "targets": {
     "local-ollama": {
       "label": "本地 Ollama Qwen3-VL 4B",

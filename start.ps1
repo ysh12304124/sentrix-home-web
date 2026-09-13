@@ -1,17 +1,17 @@
 ﻿# Sentrix Home one-click start (Windows PowerShell)
-# Usage:  .\start.ps1                                      start with local Ollama
-#         .\start.ps1 -Restart                             restart with local Ollama
-#         .\start.ps1 -Restart -LlmBackend vllm             use WSL vLLM explicitly
+# Usage:  .\start.ps1                                      start with the shared vLLM service
+#         .\start.ps1 -Restart                             restart with the shared vLLM service
+#         .\start.ps1 -Restart -LlmBackend ollama           use local Ollama explicitly
 #         .\start.ps1 -Restart -GraphRetrievalMode off      disable graph traversal for A/B baseline
 #         .\start.ps1 -Status                              show status only
 param(
   [switch]$Restart,
   [switch]$Status,
   [ValidateSet("ollama", "vllm")]
-  [string]$LlmBackend = "ollama",
-  [string]$VllmBaseUrl = "http://127.0.0.1:8000/v1",
-  [string]$VllmModel = "Qwen/Qwen3-VL-4B-Instruct",
-  [string]$VllmManagerUrl = "",
+  [string]$LlmBackend = "vllm",
+  [string]$VllmBaseUrl = "http://192.168.0.153:8100/v1",
+  [string]$VllmModel = "gemma4-12b-it",
+  [string]$VllmManagerUrl = "http://192.168.0.153:8500",
   [ValidateSet("auto", "on", "off")]
   [string]$GraphRetrievalMode = "auto"
 )
