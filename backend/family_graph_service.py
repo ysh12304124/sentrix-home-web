@@ -114,6 +114,13 @@ class FamilyGraphService:
                     (people[subject].get("observation_ids") or []) + (people[object_id].get("observation_ids") or [])
                 )), inference_run_id=run_id,
             )
+            for related_person_id in (subject, object_id):
+                self.store.set_family_membership(
+                    scope_id, related_person_id, "family", source="model",
+                    confidence=float(item.get("confidence") or 0),
+                    evidence_refs=people[related_person_id].get("observation_ids") or [],
+                    inference_run_id=run_id,
+                )
             relationships += 1
         return {"people": len(people), "memberships": memberships, "relationships": relationships}
 
