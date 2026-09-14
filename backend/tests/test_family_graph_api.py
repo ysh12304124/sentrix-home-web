@@ -53,6 +53,14 @@ class FamilyGraphApiTests(unittest.TestCase):
         self.assertIn("appearance_count", person)
         self.assertEqual(person["representative_media"], [])
 
+    def test_graph_hides_pending_cluster_internal_name(self):
+        pending = self.store.create_entity("待确认人物簇 · cluster_private", "person", "pending", scope_id="album-a")
+
+        response = self.client.get("/api/family-graph", params={"scope_id": "album-a"})
+
+        person = next(item for item in response.json()["people"] if item["id"] == pending["id"])
+        self.assertEqual(person["display_name"], "待命名人物")
+
 
 if __name__ == "__main__":
     unittest.main()

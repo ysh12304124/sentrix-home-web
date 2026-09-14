@@ -5669,7 +5669,7 @@ class MemoryStore:
                 people.append({
                     "id": entity["id"],
                     "scope_id": scope_id,
-                    "display_name": entity.get("canonical_name") or "待命名人物",
+                    "display_name": "待命名人物" if entity.get("status") == "pending" else (entity.get("canonical_name") or "待命名人物"),
                     "membership": self.get_effective_family_membership(scope_id, entity["id"]),
                     "portrait": self.get_active_family_portrait(scope_id, entity["id"]),
                     "avatar_face_instance_id": avatar["id"] if avatar else None,
@@ -5769,6 +5769,16 @@ class MemoryStore:
         self.connection.commit()
         return [self._decode_family_row(self._row("SELECT * FROM family_relationships WHERE id = ?", (row["id"],)))
                 for row in current]
+
+    def supersede_model_family_relationships(self, scope_id):
+        """Clear prior model edges before a fresh inference; user edges remain authoritative."""
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE family_relationships SET state = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND state = 'effective' AND source = 'model' AND locked = 0""",
+            (timestamp, scope_id),
+        )
+        self.connection.commit()
 
     def list_effective_family_relationships(self, scope_id, entity_id=None):
         if entity_id:

@@ -79,6 +79,7 @@ class FamilyGraphService:
 
     def _persist(self, scope_id, run_id, evidence, output):
         people = {item["person_id"]: item for item in evidence.get("people") or []}
+        self.store.supersede_model_family_relationships(scope_id)
         memberships = 0
         relationships = 0
         by_person = {
@@ -107,6 +108,8 @@ class FamilyGraphService:
                 validate_relationship_pair(predicate, inverse)
             except ValueError:
                 continue
+            if not self._has_explicit_relation_evidence(predicate, people[subject], people[object_id]):
+                continue
             self.store.set_family_relationship(
                 scope_id, subject, predicate, object_id, inverse, source="model",
                 confidence=float(item.get("confidence") or 0),
@@ -123,6 +126,21 @@ class FamilyGraphService:
                 )
             relationships += 1
         return {"people": len(people), "memberships": memberships, "relationships": relationships}
+
+    @staticmethod
+    def _has_explicit_relation_evidence(predicate, subject, object_person):
+        """Anonymous co-occurrence is never enough to assign a family role."""
+        text = " ".join((subject.get("descriptions") or []) + (object_person.get("descriptions") or []))
+        signals = {
+            "父亲": ("父亲", "爸爸", "父女", "父子"), "母亲": ("母亲", "妈妈", "母女", "母子"),
+            "儿子": ("儿子", "父子", "母子"), "女儿": ("女儿", "父女", "母女"),
+            "丈夫": ("丈夫", "夫妻", "夫妇"), "妻子": ("妻子", "夫妻", "夫妇"),
+            "哥哥": ("哥哥", "兄妹", "兄弟", "姐弟"), "姐姐": ("姐姐", "兄妹", "姐弟", "姐妹"),
+            "弟弟": ("弟弟", "兄弟", "姐弟"), "妹妹": ("妹妹", "兄妹", "姐妹"),
+            "朋友": ("朋友", "同学", "闺蜜", "好友"), "密友": ("密友", "闺蜜", "挚友"),
+            "其他亲属": ("亲属", "家人", "家庭成员"),
+        }
+        return any(token in text for token in signals.get(predicate, (predicate,)))
 
     def _write_portraits(self, scope_id, run_id, evidence):
         relationships = self.store.list_effective_family_relationships(scope_id)
