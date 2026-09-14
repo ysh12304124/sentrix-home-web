@@ -46,6 +46,12 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from backend.runtime_providers import (
     ManagerLifecycleProvider,
     ManagerTelemetryProvider,
+    HostNvidiaTelemetryProvider,
+    LlamaCppTelemetryProvider,
+    LocalJetsonLlamaCppTelemetryProvider,
+    is_jetson_host,
+    OrinLlamaCppTelemetryProvider,
+    OllamaTelemetryProvider,
     OpenAICompatibleInferenceProvider,
     UnavailableLifecycleProvider,
     UnavailableTelemetryProvider,
@@ -86,6 +92,19 @@ def local_lan_ip() -> str:
         return "127.0.0.1"
     finally:
         probe.close()
+
+
+def resolve_runtime_framework(value: str, model_base_url: str) -> str:
+    framework = str(value or "").strip().lower().replace("_", ".")
+    if framework and framework != "generic":
+        return framework
+    endpoint = urlparse(model_base_url)
+    if endpoint.port == 11434:
+        return "ollama"
+    if endpoint.port == 8100 and (endpoint.hostname == "192.168.0.118" or is_jetson_host()):
+        return "llama.cpp"
+    # Port 8100 is also used by vLLM; an arbitrary service is not llama.cpp.
+    return "generic"
 
 
 VLLM_TARGETS_PATH = PROJECT_ROOT / "config/vllm_targets.json"
@@ -1462,6 +1481,9 @@ class GpuSampler:
                     sample["model_process_memory_limit_mib"] = process_memory.get("process_memory_limit_mib")
                     sample["model_process_memory_over_limit"] = process_memory.get("process_memory_over_limit")
                     sample["model_process_pid"] = process_memory.get("root_pid")
+                    sample["memory_unit"] = process_memory.get("memory_unit") or sample.get("memory_unit")
+                    sample["pss_sampled_at_monotonic"] = process_memory.get("pss_sampled_at_monotonic")
+                    sample["kv_cache_used_tokens"] = process_memory.get("kv_cache_used_tokens")
                     vllm_metrics = process_memory.get("vllm_metrics") or {}
                     sample["kv_cache_usage_pct"] = vllm_metrics.get("kv_cache_usage_pct")
                     memory_profile = process_memory.get("memory_profile") or {}
@@ -1487,7 +1509,7 @@ class GpuSampler:
         metrics = {}
         for key in (
             "temperature_c", "gpu_utilization_pct", "memory_used_mib",
-            "model_process_memory_used_mib", "kv_cache_usage_pct",
+            "model_process_memory_used_mib", "kv_cache_usage_pct", "kv_cache_used_tokens",
             "power_draw_w", "sm_clock_mhz",
         ):
             values = [
@@ -1509,6 +1531,23 @@ class GpuSampler:
         over_limit_flags = [sample.get("model_process_memory_over_limit") for sample in self.samples
                             if isinstance(sample.get("model_process_memory_over_limit"), bool)]
         latest = self.samples[-1]
+        if latest.get("memory_unit") == "process_pss_uma_mib":
+            pss_sample_count = len({s["pss_sampled_at_monotonic"] for s in self.samples
+                                    if s.get("pss_sampled_at_monotonic") is not None})
+            return {
+                "samples_count": len(self.samples), "pss_samples_count": pss_sample_count,
+                "source": ("jetson_local_pss" if isinstance(self.provider, LocalJetsonLlamaCppTelemetryProvider)
+                           else "orin_ssh_pss"),
+                "memory_profile": {
+                    "method": "orin_process_pss_uma_v1",
+                    "memory_unit": "process_pss_uma_mib",
+                    "kv_cache_used_peak_tokens": (metrics.get("kv_cache_used_tokens") or {}).get("peak"),
+                    "kv_cache_usage_peak_pct": (metrics.get("kv_cache_usage_pct") or {}).get("peak"),
+                    "kv_cache_used_peak_gib": None,
+                    "comparable_workload_memory_gib": None,
+                    "note": "PSS is shared physical RAM, not dedicated GPU VRAM; KV bytes unavailable without verified per-token allocation.",
+                }, **metrics,
+            }
         kv_capacity_gib = latest.get("kv_cache_capacity_gib")
         process_memory = metrics.get("model_process_memory_used_mib") or {}
         kv_usage = metrics.get("kv_cache_usage_pct") or {}
@@ -1534,6 +1573,7 @@ class GpuSampler:
             "model_process_over_limit_samples": sum(over_limit_flags) if over_limit_flags else None,
             "memory_profile": {
                 "method": "idle_process_minus_reserved_kv_plus_peak_used_kv_v1",
+                "comparable_memory_is_estimate": True,
                 "idle_process_memory_gib": round(idle_process_mib / 1024, 4)
                     if isinstance(idle_process_mib, (int, float)) else None,
                 "kv_cache_capacity_gib": kv_capacity_gib,
@@ -1569,6 +1609,7 @@ class BenchmarkRun:
                  mode: str = "full", existing_scope_id: str = "",
                  scope_reused_from_runs: list | None = None,
                  use_current_model: bool = False, current_model_snapshot: dict | None = None,
+                 runtime_framework: str = "generic",
                  use_cloud_model: bool = False, resume_state: dict | None = None):
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
@@ -1597,12 +1638,30 @@ class BenchmarkRun:
         self.vllm_api_url = vllm_api_url.rstrip("/")
         self.vllm_target_id = vllm_target_id
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
+        self.runtime_framework = resolve_runtime_framework(runtime_framework, self.vllm_model_base_url)
         if self.vllm_api_url:
             self.lifecycle_provider = ManagerLifecycleProvider(self.vllm_api_url)
             self.telemetry_provider = ManagerTelemetryProvider(self.vllm_api_url)
+            self.telemetry_source = "vllm_manager"
+        elif (not self.use_cloud_model and self.runtime_framework in {"llama.cpp", "llamacpp"}
+              and is_jetson_host() and urlparse(self.vllm_model_base_url).hostname in
+              {"127.0.0.1", "localhost", local_lan_ip(), "192.168.0.118"}):
+            self.lifecycle_provider = UnavailableLifecycleProvider()
+            self.telemetry_provider = LocalJetsonLlamaCppTelemetryProvider(endpoint_url=self.vllm_model_base_url)
+            self.telemetry_source = "jetson_local_pss"
+        elif not self.use_cloud_model and self.runtime_framework in {"llama.cpp", "llamacpp"} and urlparse(self.vllm_model_base_url).hostname == "192.168.0.118" and urlparse(self.vllm_model_base_url).port == 8100:
+            self.lifecycle_provider = UnavailableLifecycleProvider()
+            self.telemetry_provider = OrinLlamaCppTelemetryProvider(endpoint_url=self.vllm_model_base_url)
+            self.telemetry_source = "orin_ssh_pss"
+        elif not self.use_cloud_model and urlparse(self.vllm_model_base_url).hostname in {"127.0.0.1", "localhost", local_lan_ip(), "192.168.0.153"}:
+            self.lifecycle_provider = UnavailableLifecycleProvider()
+            telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider, "ollama": OllamaTelemetryProvider}.get(self.runtime_framework, HostNvidiaTelemetryProvider)
+            self.telemetry_provider = telemetry_class(endpoint_url=self.vllm_model_base_url)
+            self.telemetry_source = "host_nvidia_smi"
         else:
             self.lifecycle_provider = UnavailableLifecycleProvider()
             self.telemetry_provider = UnavailableTelemetryProvider()
+            self.telemetry_source = "unavailable"
         self.results_root = results_root
         self.lock = threading.RLock()
         self._judge_rate_lock = threading.Lock()
@@ -1640,6 +1699,8 @@ class BenchmarkRun:
             "vllm_target_id": vllm_target_id,
             "vllm_manager_url": vllm_api_url,
             "vllm_model_base_url": vllm_model_base_url,
+            "telemetry_source": self.telemetry_source,
+            "runtime_framework": self.runtime_framework,
             "qa_count": len(self.qa_rows),
             "input_integrity": self.input_integrity,
             "hardware_snapshots": {"start": None, "end": None},
@@ -1691,6 +1752,8 @@ class BenchmarkRun:
                 "vllm_target_id": vllm_target_id,
                 "vllm_manager_url": vllm_api_url,
                 "vllm_model_base_url": vllm_model_base_url,
+                "runtime_framework": self.runtime_framework,
+                "telemetry_source": self.telemetry_source,
                 "status": "pending",
                 "started_at": None,
                 "finished_at": None,
@@ -1940,7 +2003,7 @@ class BenchmarkRun:
             self.state["fatal_error"] = str(e)
             traceback.print_exc()
         finally:
-            if not self.use_cloud_model and self.vllm_api_url:
+            if not self.use_cloud_model and self.telemetry_source != "unavailable":
                 self._gpu_sampler.stop()
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
@@ -2424,7 +2487,7 @@ class BenchmarkRun:
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        if not self.use_cloud_model and self.vllm_api_url:
+        if not self.use_cloud_model and self.telemetry_source != "unavailable":
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -2626,7 +2689,7 @@ class BenchmarkRun:
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
         # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
-        if not self.use_cloud_model and self.vllm_api_url and not self._gpu_sampling_started:
+        if not self.use_cloud_model and self.telemetry_source != "unavailable" and not self._gpu_sampling_started:
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -2731,7 +2794,7 @@ class BenchmarkRun:
                 self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
                 self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
                 self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
-                if not self.use_cloud_model and self.vllm_api_url:
+                if not self.use_cloud_model and self.telemetry_source != "unavailable":
                     self._gpu_sampler.stop()
 
             while pending:
@@ -3418,20 +3481,44 @@ class BenchmarkRun:
         return bound
 
     @staticmethod
-    def _trace_action(step: dict) -> dict | None:
-        detail = step.get("detail")
-        if isinstance(detail, dict) and detail.get("action"):
-            return detail
-        text = str(detail or "").strip()
+    @staticmethod
+    def _parse_action_payload(value) -> dict | None:
+        """Extract a structured Agent action from trace payloads.
+
+        New Sentrix traces store the model JSON in ``raw`` / ``raw_full`` and
+        may wrap it in a markdown fence. Older traces used ``detail``.
+        """
+        if isinstance(value, dict):
+            return value if value.get("action") else None
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.startswith("```"):
+            body = text.split("\n", 1)[-1]
+            if body.rstrip().endswith("```"):
+                body = body.rstrip()[:-3]
+            text = body.strip()
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and parsed.get("action"):
+                return parsed
+        except json.JSONDecodeError:
+            pass
         start = text.find("{")
         if start < 0:
             return None
-        for end in range(len(text), start, -1):
-            try:
-                value = json.loads(text[start:end])
-            except json.JSONDecodeError:
-                continue
-            return value if isinstance(value, dict) else None
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) and parsed.get("action") else None
+
+    @classmethod
+    def _trace_action(cls, step: dict) -> dict | None:
+        for key in ("detail", "raw", "raw_full"):
+            parsed = cls._parse_action_payload(step.get(key))
+            if parsed is not None:
+                return parsed
         return None
 
     @classmethod
@@ -4024,16 +4111,11 @@ class BenchmarkRun:
 
     def _phase_gpu_metrics(self):
         self._phase_start("gpu_metrics")
-        if self.use_cloud_model or not self.vllm_api_url:
-            self._phase_done("gpu_metrics", {
-                "status": "skipped",
-                "source": "cloud_api" if self.use_cloud_model else "external",
-                "reason": (
-                    "cloud_api_has_no_local_gpu_metrics"
-                    if self.use_cloud_model else
-                    "external_model_endpoint_has_no_manager_metrics"
-                ),
-            })
+        if self.use_cloud_model:
+            self._phase_done("gpu_metrics", {"status": "skipped", "source": "cloud_api", "reason": "cloud_api_has_no_local_gpu_metrics"})
+            return
+        if self.telemetry_source == "unavailable":
+            self._phase_done("gpu_metrics", {"status": "skipped", "source": "external", "reason": "remote_endpoint_has_no_local_telemetry"})
             return
         agg = self._gpu_sampler.aggregate()
         self._phase_done("gpu_metrics", agg)
@@ -4422,7 +4504,7 @@ class OrchestratorRepository:
                        if isinstance(step, dict)
                        and str(step.get("stage") or step.get("type") or "") == "model"
                        and str(step.get("call_type") or "agent") in {"agent", "recovery"}]
-        if agent_steps and any(step.get("parse_status") is not None for step in agent_steps):
+        if agent_steps:
             hydrated["agent_stability"] = BenchmarkRun._agent_stability(hydrated)
         return hydrated
 
@@ -5960,6 +6042,9 @@ class OrchestratorRepository:
     def _effective_summary(cls, state: dict) -> dict:
         saved = dict(state.get("summary") or {})
         items = state.get("items") or []
+        for item in items:
+            if isinstance(item, dict) and item.get("execution_trace"):
+                item["agent_stability"] = BenchmarkRun._agent_stability(item)
         recalls = [item.get("retrieval_recall") for item in items
                    if isinstance(item.get("retrieval_recall"), (int, float))]
         scores = [score for item in items
@@ -6017,6 +6102,7 @@ class OrchestratorRepository:
         for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
             if (key == "retrieval_recall_mean"
                     or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
+                    or key.startswith("json_parse_")
                     or saved.get(key) is None):
                 saved[key] = value
         if saved.get("benchmark_e2e_latency_excluding_judge_ms") is None:
@@ -6247,6 +6333,7 @@ class OrchestratorRepository:
                 delete_scope_after_run=False, mode="resume", existing_scope_id=scope_id,
                 scope_reused_from_runs=old_state.get("scope_reused_from_runs") or [],
                 use_current_model=use_current_model, current_model_snapshot=current_snapshot,
+                runtime_framework=old_state.get("runtime_framework") or "generic",
                 use_cloud_model=False, resume_state=old_state,
             )
             self.runs[run_id] = run
@@ -6615,6 +6702,7 @@ class OrchestratorRepository:
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
         model_base_url = normalize_model_base_url(payload.get("model_base_url"))
         endpoint_model = str(payload.get("endpoint_model") or "").strip()
+        runtime_framework = resolve_runtime_framework(payload.get("runtime_framework"), model_base_url)
         vllm_manager_url = normalize_service_url(payload.get("vllm_manager_url"))
         if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
             raise ValueError("big_model cannot be combined with current model")
@@ -6724,6 +6812,7 @@ class OrchestratorRepository:
                     scope_reused_from_runs=scope_reused_from_runs,
                     use_current_model=use_current_model,
                     current_model_snapshot=current_model_snapshot,
+                    runtime_framework=runtime_framework,
                     use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
                 )
                 self.runs[run_id] = run

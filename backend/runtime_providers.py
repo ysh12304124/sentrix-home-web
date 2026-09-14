@@ -8,8 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import csv
+import io
+import subprocess
+import time
+from urllib.parse import urlparse
 
 import httpx
+from backend.jetson_telemetry import LocalJetsonLlamaCppTelemetryProvider, is_jetson_host
 
 
 def normalize_service_url(value: str | None) -> str:
@@ -233,6 +239,141 @@ class UnavailableLifecycleProvider(LifecycleProvider):
 
     def state(self) -> dict:
         return dict(self._result)
+
+
+class HostNvidiaTelemetryProvider(TelemetryProvider):
+    """Framework-neutral local NVIDIA telemetry for external runtimes."""
+    framework = "generic"
+    def __init__(self, process_hint: str = "", endpoint_url: str = ""):
+        self.process_hint = str(process_hint or "").strip().lower()
+        self.endpoint_url = normalize_service_url(endpoint_url)
+    @staticmethod
+    def _query(query: str):
+        result = subprocess.run(["nvidia-smi", f"--query-{query}", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5, check=True)
+        return list(csv.reader(io.StringIO(result.stdout), skipinitialspace=True))
+    def gpu_stats(self) -> dict:
+        try:
+            rows = self._query("gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm")
+            gpus = []
+            for row in rows:
+                if len(row) < 7: continue
+                v = [float(x) for x in row[1:]]
+                gpus.append({"index": int(float(row[0])), "gpu_utilization_pct": v[0], "memory_used_mib": v[1], "memory_total_mib": v[2], "temperature_c": v[3], "power_draw_w": v[4], "sm_clock_mhz": v[5]})
+            return {"status": "available", "source": "host_nvidia_smi", "data": {"gpus": gpus}}
+        except Exception as exc:
+            return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
+    def process_memory(self) -> dict:
+        if not self.process_hint:
+            return {"status": "unavailable", "source": "host_nvidia_smi",
+                    "reason": "model_process_identity_not_configured"}
+        try:
+            rows = self._query("compute-apps=pid,process_name,used_memory")
+            matches = [{"pid": int(float(r[0])), "process_name": r[1], "used_memory_mib": float(r[2])} for r in rows if len(r) >= 3 and (not self.process_hint or self.process_hint in r[1].lower())]
+            if not matches:
+                return {"status": "unavailable", "source": "host_nvidia_smi",
+                        "reason": "matching_model_process_not_found"}
+            return {"status": "available", "source": "host_nvidia_smi", "data": {"process_memory_used_mib": sum(x["used_memory_mib"] for x in matches), "processes": matches}}
+        except Exception as exc:
+            return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
+    def kv_cache(self) -> dict:
+        return {"status": "not_applicable", "source": "host_nvidia_smi", "runtime_framework": self.framework, "reason": "framework_does_not_expose_kv_cache"}
+
+class LlamaCppTelemetryProvider(HostNvidiaTelemetryProvider):
+    framework = "llama.cpp"
+    def __init__(self, endpoint_url: str = ""):
+        super().__init__(process_hint="llama-server", endpoint_url=endpoint_url)
+
+
+class OrinLlamaCppTelemetryProvider(TelemetryProvider):
+    """Read the *specific* 118 llama-server process over SSH; Orin has UMA, not VRAM.
+
+    The remote identity, PID file and command are fixed, not derived from a
+    user-supplied URL. A missing/changed process must never be reported as 0 MB.
+    """
+    endpoint = "http://192.168.0.118:8100"
+    remote = "orin@192.168.0.118"
+    pid_file = "/home/orin/VLM/gemma4/results/orin/server_photobench_8100.pid"
+
+    def __init__(self, endpoint_url: str = ""):
+        parsed = urlparse(normalize_service_url(endpoint_url))
+        if parsed.hostname != "192.168.0.118" or parsed.port != 8100:
+            raise ValueError("Orin telemetry is only configured for the 118:8100 endpoint")
+        self._last_memory: dict = {"status": "unavailable", "reason": "not_sampled"}
+        self._last_pss_probe = 0.0
+
+    def gpu_stats(self) -> dict:
+        data = dict(self._last_memory.get("data") or {})
+        data.setdefault("memory_unit", "process_pss_uma_mib")
+        data.setdefault("memory_profile", {"method": "orin_process_pss_uma_v1"})
+        try:
+            response = httpx.get(f"{self.endpoint}/metrics", timeout=2)
+            response.raise_for_status()
+            values = {}
+            for line in response.text.splitlines():
+                if line.startswith("llamacpp:kv_cache_") and "{" not in line:
+                    name, _, value = line.partition(" ")
+                    try:
+                        values[name] = float(value.strip().split()[0])
+                    except (ValueError, IndexError):
+                        continue
+            ratio = values.get("llamacpp:kv_cache_usage_ratio")
+            if ratio is not None and 0 <= ratio <= 1:
+                data["vllm_metrics"] = {"kv_cache_usage_pct": round(ratio * 100, 2)}
+            tokens = values.get("llamacpp:kv_cache_tokens")
+            if tokens is not None and tokens >= 0:
+                data["kv_cache_used_tokens"] = int(tokens)
+        except (httpx.HTTPError, ValueError):
+            pass
+        if time.monotonic() - self._last_pss_probe < 5:
+            self._last_memory = {"status": "available", "source": "orin_ssh_pss", "data": data}
+            return {"status": "available", "source": "orin_ssh_pss", "data": {"gpus": [{"index": 0, "memory_unit": "process_pss_uma_mib"}]}}
+        self._last_pss_probe = time.monotonic()
+        command = (
+            f'pid=$(cat {self.pid_file}) || exit 1; '
+            'case "$pid" in *[!0-9]*|"") exit 2;; esac; '
+            'ps -p "$pid" -o args= | grep -Fq "/llama-server --model " || exit 3; '
+            'ps -p "$pid" -o args= | grep -Fq -- "--port 8100" || exit 3; '
+            'awk \'/^Pss:/{print $2}\' "/proc/$pid/smaps_rollup"; '
+            'printf "pid=%s\\n" "$pid"'
+        )
+        try:
+            completed = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                 "-o", "ConnectionAttempts=1", self.remote, command],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            lines = completed.stdout.strip().splitlines()
+            pss_mib = int(lines[0]) / 1024
+            pid = int(lines[1].removeprefix("pid="))
+            data["root_pid"] = pid
+            data["process_memory_used_mib"] = round(pss_mib, 2)
+            data["pss_sampled_at_monotonic"] = time.monotonic()
+            self._last_memory = {"status": "available", "source": "orin_ssh_pss", "data": data}
+            return {"status": "available", "source": "orin_ssh_pss", "data": {"gpus": [{"index": 0, "memory_unit": "process_pss_uma_mib"}]}}
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+            data.pop("process_memory_used_mib", None)
+            data["pss_error"] = str(exc)
+            self._last_memory = {"status": "available", "source": "orin_ssh_pss", "data": data}
+            return {"status": "available", "source": "orin_ssh_pss", "data": {"gpus": [{"index": 0, "memory_unit": "process_pss_uma_mib"}]}}
+
+    def process_memory(self) -> dict:
+        return self._last_memory
+
+    def kv_cache(self) -> dict:
+        data = self._last_memory.get("data") or {}
+        if "kv_cache_used_tokens" not in data and "vllm_metrics" not in data:
+            return {"status": "unavailable", "source": "llamacpp_metrics", "reason": "metrics_missing_or_disabled"}
+        return {"status": "available", "source": "llamacpp_metrics", "data": {
+            "used_tokens": data.get("kv_cache_used_tokens"),
+            "usage_pct": (data.get("vllm_metrics") or {}).get("kv_cache_usage_pct"),
+            "used_bytes": None, "bytes_status": "unavailable_without_model_kv_allocation_bytes",
+        }}
+
+
+class OllamaTelemetryProvider(HostNvidiaTelemetryProvider):
+    framework = "ollama"
+    def __init__(self, endpoint_url: str = ""):
+        super().__init__(process_hint="ollama", endpoint_url=endpoint_url)
 
 
 class UnavailableTelemetryProvider(TelemetryProvider):

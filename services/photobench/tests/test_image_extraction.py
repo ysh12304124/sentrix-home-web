@@ -12,6 +12,18 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 
+class RuntimeFrameworkTests(unittest.TestCase):
+    @patch.object(MODULE, "is_jetson_host", return_value=False)
+    def test_port_8100_is_not_automatically_llamacpp_on_discrete_gpu(self, _jetson):
+        self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.153:8100/v1"), "generic")
+        self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.118:8100/v1"), "llama.cpp")
+
+    @patch.object(MODULE, "is_jetson_host", return_value=True)
+    def test_jetson_local_llamacpp_and_explicit_framework(self, _jetson):
+        self.assertEqual(MODULE.resolve_runtime_framework("", "http://127.0.0.1:8100/v1"), "llama.cpp")
+        self.assertEqual(MODULE.resolve_runtime_framework("vllm", "http://127.0.0.1:8100/v1"), "vllm")
+
+
 class ExtractImageIdsTests(unittest.TestCase):
     def test_extracts_current_tool_result_asset_id_strings(self):
         result = {
@@ -409,6 +421,56 @@ class ExtractImageIdsTests(unittest.TestCase):
         stability = MODULE.BenchmarkRun._agent_stability(item)
         self.assertIsNone(stability["json_parse_total"])
         self.assertIsNone(stability["json_parse_rate"])
+
+    def test_trace_action_reads_raw_and_markdown_fenced_json(self):
+        parse = MODULE.BenchmarkRun._trace_action
+        self.assertEqual(
+            parse({"raw": '{"action":"tool_call","tool":"search_memories"}'})["tool"],
+            "search_memories",
+        )
+        fenced = "```json\n{\n  \"action\": \"declare\",\n  \"declaration\": {\"goal\": \"x\"}\n}\n```"
+        self.assertEqual(parse({"raw": fenced, "detail": None})["action"], "declare")
+        self.assertIsNone(parse({"prompt": '{"action":"tool_call"}'}))
+        self.assertEqual(
+            parse({"detail": '{"action":"final","answer":"ok"}'})["action"],
+            "final",
+        )
+
+    def test_agent_stability_counts_raw_payload_without_detail(self):
+        item = {
+            "answer": "保定市易县",
+            "agent_status": "complete",
+            "termination_reason": "complete",
+            "turn_outcome": "final_answer",
+            "execution_trace": [
+                {"type": "model", "call_type": "agent", "raw": '{"action":"tool_call","tool":"search_memories"}'},
+                {
+                    "type": "model",
+                    "call_type": "agent",
+                    "raw": "```json\n{\"action\":\"final\",\"answer\":\"保定市易县\"}\n```",
+                },
+            ],
+        }
+        stability = MODULE.BenchmarkRun._agent_stability(item)
+        self.assertEqual(stability["json_parse_total"], 2)
+        self.assertEqual(stability["json_parse_success"], 2)
+        self.assertEqual(stability["json_parse_rate"], 1.0)
+
+    def test_hydration_recomputes_parse_rate_from_raw_trace(self):
+        repository = MODULE.OrchestratorRepository.__new__(MODULE.OrchestratorRepository)
+        repository.qa_metadata = {}
+        hydrated = repository._hydrate_qa_metadata({
+            "qa_id": "raw-trace",
+            "answer": "ok",
+            "agent_status": "complete",
+            "turn_outcome": "final_answer",
+            "agent_stability": {"json_parse_total": 1, "json_parse_success": 0, "json_parse_rate": 0.0},
+            "execution_trace": [
+                {"type": "model", "call_type": "agent", "raw": '{"action":"final","answer":"ok"}'},
+            ],
+        })
+        self.assertEqual(hydrated["agent_stability"]["json_parse_success"], 1)
+        self.assertEqual(hydrated["agent_stability"]["json_parse_rate"], 1.0)
 
     def test_json_parse_rate_trusts_runtime_failed_status_over_embedded_json(self):
         item = {
