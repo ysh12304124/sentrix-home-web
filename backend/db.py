@@ -699,6 +699,45 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS family_person_memberships (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL REFERENCES entities(id),
+                membership TEXT NOT NULL,
+                source TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                inference_run_id TEXT,
+                state TEXT NOT NULL DEFAULT 'effective',
+                locked INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1,
+                supersedes_id TEXT REFERENCES family_person_memberships(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_membership_effective
+                ON family_person_memberships(scope_id, entity_id, state);
+            CREATE TABLE IF NOT EXISTS family_relationships (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                family_graph_id TEXT,
+                subject_entity_id TEXT NOT NULL REFERENCES entities(id),
+                predicate TEXT NOT NULL,
+                object_entity_id TEXT NOT NULL REFERENCES entities(id),
+                inverse_predicate TEXT NOT NULL,
+                source TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                inference_run_id TEXT,
+                state TEXT NOT NULL DEFAULT 'effective',
+                locked INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1,
+                supersedes_id TEXT REFERENCES family_relationships(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_relationship_effective
+                ON family_relationships(scope_id, subject_entity_id, object_entity_id, state);
             CREATE TABLE IF NOT EXISTS memory_vectors (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -5516,6 +5555,150 @@ class MemoryStore:
         self.connection.execute("UPDATE relationships SET status = 'retracted', updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), relationship_id))
         self.connection.commit()
         return self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
+
+    _FAMILY_MEMBERSHIPS = {"core_family", "relative", "close_friend", "friend", "unknown"}
+    _FAMILY_SOURCES = {"model", "user_override"}
+
+    def _family_entity(self, scope_id, entity_id):
+        entity = self.get_entity(entity_id)
+        if not entity or entity.get("entity_type") != "person":
+            raise ValueError("family graph requires a person entity")
+        if (entity.get("scope_id") or "home-default") != (scope_id or "home-default"):
+            raise ValueError("family graph entities must belong to the same memory space")
+        return entity
+
+    def _decode_family_row(self, row):
+        return self._decode(row, ["evidence_refs_json"]) if row else None
+
+    def get_effective_family_membership(self, scope_id, entity_id):
+        row = self._row(
+            """SELECT * FROM family_person_memberships
+            WHERE scope_id = ? AND entity_id = ? AND state = 'effective'
+            ORDER BY locked DESC, revision DESC, updated_at DESC LIMIT 1""",
+            (scope_id, entity_id),
+        )
+        return self._decode_family_row(row)
+
+    def list_effective_family_memberships(self, scope_id):
+        rows = self._rows(
+            """SELECT * FROM family_person_memberships
+            WHERE scope_id = ? AND state = 'effective'
+            ORDER BY locked DESC, updated_at DESC""",
+            (scope_id,),
+        )
+        return [self._decode_family_row(row) for row in rows]
+
+    def set_family_membership(self, scope_id, entity_id, membership, *, source,
+                              confidence=0.0, evidence_refs=None, inference_run_id=None):
+        scope_id = scope_id or "home-default"
+        membership = str(membership or "").strip()
+        if membership not in self._FAMILY_MEMBERSHIPS:
+            raise ValueError("unsupported family membership")
+        if source not in self._FAMILY_SOURCES:
+            raise ValueError("unsupported family membership source")
+        self._family_entity(scope_id, entity_id)
+        current = self.get_effective_family_membership(scope_id, entity_id)
+        if source == "model" and current and current.get("locked"):
+            return current
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                "UPDATE family_person_memberships SET state = 'superseded', updated_at = ? WHERE id = ?",
+                (timestamp, current["id"]),
+            )
+        record_id = make_id("family_membership")
+        self.connection.execute(
+            """INSERT INTO family_person_memberships(
+                id, scope_id, entity_id, membership, source, confidence,
+                evidence_refs_json, inference_run_id, state, locked, revision,
+                supersedes_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'effective', ?, 1, ?, ?, ?)""",
+            (
+                record_id, scope_id, entity_id, membership, source, float(confidence or 0),
+                json_value(list(dict.fromkeys(evidence_refs or [])), []), inference_run_id,
+                1 if source == "user_override" else 0, current["id"] if current else None,
+                timestamp, timestamp,
+            ),
+        )
+        self.connection.commit()
+        return self._decode_family_row(self._row("SELECT * FROM family_person_memberships WHERE id = ?", (record_id,)))
+
+    def _effective_family_pair(self, scope_id, subject_entity_id, object_entity_id):
+        rows = self._rows(
+            """SELECT * FROM family_relationships
+            WHERE scope_id = ? AND state = 'effective' AND (
+                (subject_entity_id = ? AND object_entity_id = ?)
+                OR (subject_entity_id = ? AND object_entity_id = ?)
+            ) ORDER BY locked DESC, revision DESC, updated_at DESC""",
+            (scope_id, subject_entity_id, object_entity_id, object_entity_id, subject_entity_id),
+        )
+        return [self._decode_family_row(row) for row in rows]
+
+    def list_effective_family_relationships(self, scope_id, entity_id=None):
+        if entity_id:
+            rows = self._rows(
+                """SELECT * FROM family_relationships
+                WHERE scope_id = ? AND state = 'effective'
+                AND (subject_entity_id = ? OR object_entity_id = ?)
+                ORDER BY locked DESC, updated_at DESC""",
+                (scope_id, entity_id, entity_id),
+            )
+        else:
+            rows = self._rows(
+                "SELECT * FROM family_relationships WHERE scope_id = ? AND state = 'effective' ORDER BY locked DESC, updated_at DESC",
+                (scope_id,),
+            )
+        return [self._decode_family_row(row) for row in rows]
+
+    def set_family_relationship(self, scope_id, subject_entity_id, predicate, object_entity_id,
+                                inverse_predicate, *, source, confidence=0.0,
+                                evidence_refs=None, inference_run_id=None):
+        scope_id = scope_id or "home-default"
+        if source not in self._FAMILY_SOURCES:
+            raise ValueError("unsupported family relationship source")
+        if subject_entity_id == object_entity_id:
+            raise ValueError("family relationship requires distinct people")
+        self._family_entity(scope_id, subject_entity_id)
+        self._family_entity(scope_id, object_entity_id)
+        predicate = str(predicate or "").strip()
+        inverse_predicate = str(inverse_predicate or "").strip()
+        if not predicate or not inverse_predicate:
+            raise ValueError("family relationship requires both predicates")
+        current = self._effective_family_pair(scope_id, subject_entity_id, object_entity_id)
+        if source == "model" and any(row.get("locked") for row in current):
+            return current
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                """UPDATE family_relationships SET state = 'superseded', updated_at = ?
+                WHERE scope_id = ? AND state = 'effective' AND (
+                    (subject_entity_id = ? AND object_entity_id = ?)
+                    OR (subject_entity_id = ? AND object_entity_id = ?)
+                )""",
+                (timestamp, scope_id, subject_entity_id, object_entity_id, object_entity_id, subject_entity_id),
+            )
+        refs = json_value(list(dict.fromkeys(evidence_refs or [])), [])
+        locked = 1 if source == "user_override" else 0
+        inserted = []
+        for left, rel, right, inverse in (
+            (subject_entity_id, predicate, object_entity_id, inverse_predicate),
+            (object_entity_id, inverse_predicate, subject_entity_id, predicate),
+        ):
+            record_id = make_id("family_rel")
+            self.connection.execute(
+                """INSERT INTO family_relationships(
+                    id, scope_id, family_graph_id, subject_entity_id, predicate,
+                    object_entity_id, inverse_predicate, source, confidence,
+                    evidence_refs_json, inference_run_id, state, locked, revision,
+                    supersedes_id, created_at, updated_at
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'effective', ?, 1, NULL, ?, ?)""",
+                (record_id, scope_id, left, rel, right, inverse, source,
+                 float(confidence or 0), refs, inference_run_id, locked, timestamp, timestamp),
+            )
+            inserted.append(record_id)
+        self.connection.commit()
+        return [self._decode_family_row(self._row("SELECT * FROM family_relationships WHERE id = ?", (record_id,)))
+                for record_id in inserted]
 
     def maintain_relationship_claim(self, relationship):
         """Write a user-confirmed relationship into the subject's semantic claims so
