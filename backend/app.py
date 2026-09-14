@@ -1597,6 +1597,83 @@ def rename_person_api(person_id: str, payload: dict):
     return {"ok": True, "name": updated["entity"]["canonical_name"]}
 
 
+def _execute_family_analysis_run(run_id: str, scope_id: str):
+    from .family_graph_service import FamilyGraphService
+
+    FamilyGraphService(store, gamma).run(run_id, scope_id)
+
+
+@app.get("/api/family-graph")
+def family_graph(scope_id: str):
+    people = []
+    for entity in store.list_entities(scope_id=scope_id):
+        if entity.get("entity_type") != "person":
+            continue
+        membership = store.get_effective_family_membership(scope_id, entity["id"])
+        people.append({
+            "id": entity["id"],
+            "display_name": entity.get("canonical_name") or "待命名成员",
+            "membership": membership,
+        })
+    return {
+        "scope_id": scope_id,
+        "run": store.latest_family_analysis_run(scope_id),
+        "people": people,
+        "relationships": store.list_effective_family_relationships(scope_id),
+    }
+
+
+@app.patch("/api/family-graph/people/{person_id}/membership")
+def update_family_membership(person_id: str, payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    membership = str((payload or {}).get("membership") or "").strip()
+    if not scope_id or not membership:
+        raise HTTPException(status_code=400, detail="scope_id and membership are required")
+    try:
+        value = store.set_family_membership(
+            scope_id, person_id, membership, source="user_override", confidence=1.0,
+            evidence_refs=(payload or {}).get("evidence_refs") or [],
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "membership": value}
+
+
+@app.put("/api/family-graph/relationships")
+def update_family_relationship(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    try:
+        rows = store.set_family_relationship(
+            scope_id,
+            str((payload or {}).get("subject_entity_id") or ""),
+            str((payload or {}).get("predicate") or ""),
+            str((payload or {}).get("object_entity_id") or ""),
+            str((payload or {}).get("inverse_predicate") or ""),
+            source="user_override", confidence=1.0,
+            evidence_refs=(payload or {}).get("evidence_refs") or [],
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "relationships": rows}
+
+
+@app.post("/api/family-graph/runs")
+def start_family_analysis_run(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    latest = store.latest_family_analysis_run(scope_id)
+    if latest and latest.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail="family analysis run already in progress")
+    run = store.create_family_analysis_run(scope_id, {
+        "trigger_type": "user_rerun", "input_mode": "semantic_text_only",
+    })
+    threading.Thread(target=_execute_family_analysis_run, args=(run["id"], scope_id), daemon=True).start()
+    return {"status": 202, "run": run}
+
+
 @app.post("/api/relationship-hypotheses/{hypothesis_id}/decision")
 def relationship_hypothesis_decision(hypothesis_id: str, payload: dict):
     decision = str((payload or {}).get("decision") or "").strip()
