@@ -28,6 +28,7 @@
     assets: [],
     persons: [],
     personInsights: null,
+    familyGraph: null,
     entities: [],
     entityGroups: [],
     geoPlaces: [],
@@ -643,6 +644,8 @@
     const singles = visible.filter((person) => !person.confirmed && person.single_sample);
     const batchCandidates = pending.filter((person) => !person.single_sample).sort((a, b) => (b.photo_count || 0) - (a.photo_count || 0));
     const insights = state.personInsights;
+    const familyGraph = state.familyGraph || { people: [], relationships: [] };
+    const familyByPerson = new Map((familyGraph.people || []).map((item) => [item.id, item.membership]));
     const tiers = (insights && insights.tiers) || { core: [], common: [], incidental: [] };
     const insightByPerson = new Map();
     [...(tiers.core || []), ...(tiers.common || []), ...(tiers.incidental || [])].forEach((item) => insightByPerson.set(item.person_id, item));
@@ -665,12 +668,15 @@
       const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : "";
       const sampleThumbs = samples.length ? `<div class="cluster-samples-inline">${samples.map((s) => faceAvatar(s.id, "人脸样本", "gray")).join("")}</div>` : "";
       const roleLine = insight ? (insight.role_state === "confirmed" ? (insight.family_role || "角色已确认") : (insight.role_candidates && insight.role_candidates[0] ? `建议 · ${insight.role_candidates[0].role} ${Math.round((insight.role_candidates[0].confidence || 0) * 100)}%` : "角色待定")) : (person.family_role ? `角色 · ${person.family_role}` : "待确认角色");
+      const membership = familyByPerson.get(person.id);
+      const membershipLine = membership ? `<small class="person-profile-line">家庭归属：${escapeHtml(membership.membership || "unknown")} · ${membership.source === "user_override" ? "已由你确认" : "模型判断"}</small>` : "";
       const portraitText = insight && insight.portrait && insight.portrait.portrait_text ? insight.portrait.portrait_text : (person.profile?.preference_summary_zh || person.profile?.summary_zh || "");
       const portraitLine = portraitText ? `<small class="person-profile-line" title="${escapeHtml(portraitText)}">${escapeHtml(portraitText.length > 60 ? portraitText.slice(0, 60) + "…" : portraitText)}</small>` : "";
       const coverage = insight ? `<span><strong>${insight.date_count || 0}</strong> 天</span><span><strong>${insight.event_count || 0}</strong> 个事件</span>` : (person.confirmed ? `<span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>✓</strong> 已确认</span>` : `<span><strong>${person.cluster_count || 0}</strong> 个人物簇</span><span>待确认</span>`);
       const coreBadge = insight && (tiers.core || []).some((item) => item.person_id === person.id) ? `<span class="suggestion-badge">重要</span>` : "";
-      const actions = insight ? `<button class="button small primary" data-action="open-person-insight" data-person-id="${escapeHtml(person.id)}">查看 / 处理</button>` : (person.confirmed ? `<button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button><button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(person.id)}">画像</button>` : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`);
-      return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${coreBadge}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(roleLine)}</p>${sampleThumbs}${portraitLine}${caution}<div class="person-stats">${coverage}</div><div class="person-actions">${actions}</div></article>`;
+      const familyAction = membership ? `<button class="button small ghost" data-action="edit-family-membership" data-person-id="${escapeHtml(person.id)}" data-membership="${escapeHtml(membership.membership || "unknown")}">修正归属</button>` : "";
+      const actions = insight ? `<button class="button small primary" data-action="open-person-insight" data-person-id="${escapeHtml(person.id)}">查看 / 处理</button>${familyAction}` : (person.confirmed ? `<button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button><button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(person.id)}">画像</button>${familyAction}` : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>${familyAction}`);
+      return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${coreBadge}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(roleLine)}</p>${membershipLine}${sampleThumbs}${portraitLine}${caution}<div class="person-stats">${coverage}</div><div class="person-actions">${actions}</div></article>`;
     };
     const primarySorted = sortedVisible.filter((person) => !person.single_sample);
     const relHypotheses = (insights && insights.relationship_hypotheses) || [];
@@ -1182,7 +1188,7 @@
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
           window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId), window.sentrixApi.entityGroups(scopeId),
-          window.sentrixApi.geoPlaces(scopeId), window.sentrixApi.personInsights(scopeId),
+          window.sentrixApi.geoPlaces(scopeId), window.sentrixApi.personInsights(scopeId), window.sentrixApi.familyGraph(scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -1200,6 +1206,7 @@
     state.clusters = calls[7].status === "fulfilled" ? calls[7].value.clusters || [] : [];
     state.relationships = calls[8].status === "fulfilled" ? calls[8].value.relationships || [] : [];
     state.personInsights = calls[14].status === "fulfilled" ? calls[14].value : null;
+    state.familyGraph = calls[15].status === "fulfilled" ? calls[15].value : null;
         state.knowledge = calls[9].status === "fulfilled" ? calls[9].value : { profiles: [], claims: [] };
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
         state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
@@ -1881,6 +1888,15 @@
     if (action === "delete-story") { await window.sentrixApi.deleteStory(element.dataset.storyId); state.toast = "故事草稿已删除"; return refreshData(); }
     if (action === "open-person") { openModal({ type: "loading" }, { push: true }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
     if (action === "open-person-profile") { openModal({ type: "loading" }, { push: true }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
+    if (action === "edit-family-membership") {
+      const membership = window.prompt("家庭归属（family / friend / unknown）", element.dataset.membership || "unknown");
+      if (membership === null) return;
+      try {
+        await window.sentrixApi.updateFamilyMembership(element.dataset.personId, { scope_id: state.scopeId, membership: membership.trim() });
+        state.toast = "已保存你的家庭归属修正；后续模型推断不会覆盖它";
+        return refreshData();
+      } catch (error) { state.toast = `保存家庭归属失败：${error.message}`; return renderShellNavigation(); }
+    }
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
