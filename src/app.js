@@ -645,7 +645,7 @@
     const batchCandidates = pending.filter((person) => !person.single_sample).sort((a, b) => (b.photo_count || 0) - (a.photo_count || 0));
     const insights = state.personInsights;
     const familyGraph = state.familyGraph || { people: [], relationships: [] };
-    const familyByPerson = new Map((familyGraph.people || []).map((item) => [item.id, item.membership]));
+    const familyByPerson = new Map((familyGraph.people || []).map((item) => [item.id, item]));
     const tiers = (insights && insights.tiers) || { core: [], common: [], incidental: [] };
     const insightByPerson = new Map();
     [...(tiers.core || []), ...(tiers.common || []), ...(tiers.incidental || [])].forEach((item) => insightByPerson.set(item.person_id, item));
@@ -668,9 +668,10 @@
       const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : "";
       const sampleThumbs = samples.length ? `<div class="cluster-samples-inline">${samples.map((s) => faceAvatar(s.id, "人脸样本", "gray")).join("")}</div>` : "";
       const roleLine = insight ? (insight.role_state === "confirmed" ? (insight.family_role || "角色已确认") : (insight.role_candidates && insight.role_candidates[0] ? `建议 · ${insight.role_candidates[0].role} ${Math.round((insight.role_candidates[0].confidence || 0) * 100)}%` : "角色待定")) : (person.family_role ? `角色 · ${person.family_role}` : "待确认角色");
-      const membership = familyByPerson.get(person.id);
+      const familyEntry = familyByPerson.get(person.id);
+      const membership = familyEntry && familyEntry.membership;
       const membershipLine = membership ? `<small class="person-profile-line">家庭归属：${escapeHtml(membership.membership || "unknown")} · ${membership.source === "user_override" ? "已由你确认" : "模型判断"}</small>` : "";
-      const portraitText = insight && insight.portrait && insight.portrait.portrait_text ? insight.portrait.portrait_text : (person.profile?.preference_summary_zh || person.profile?.summary_zh || "");
+      const portraitText = familyEntry && familyEntry.portrait && familyEntry.portrait.portrait_text ? familyEntry.portrait.portrait_text : (insight && insight.portrait && insight.portrait.portrait_text ? insight.portrait.portrait_text : (person.profile?.preference_summary_zh || person.profile?.summary_zh || ""));
       const portraitLine = portraitText ? `<small class="person-profile-line" title="${escapeHtml(portraitText)}">${escapeHtml(portraitText.length > 60 ? portraitText.slice(0, 60) + "…" : portraitText)}</small>` : "";
       const coverage = insight ? `<span><strong>${insight.date_count || 0}</strong> 天</span><span><strong>${insight.event_count || 0}</strong> 个事件</span>` : (person.confirmed ? `<span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>✓</strong> 已确认</span>` : `<span><strong>${person.cluster_count || 0}</strong> 个人物簇</span><span>待确认</span>`);
       const coreBadge = insight && (tiers.core || []).some((item) => item.person_id === person.id) ? `<span class="suggestion-badge">重要</span>` : "";

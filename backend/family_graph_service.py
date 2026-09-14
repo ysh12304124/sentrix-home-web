@@ -32,6 +32,8 @@ class FamilyGraphService:
             output = self._infer(evidence)
             self.store.update_family_analysis_run(run_id, status="running", stage="write_graph")
             counts = self._persist(scope_id, run_id, evidence, output)
+            self.store.update_family_analysis_run(run_id, status="running", stage="write_portraits")
+            counts["portraits"] = self._write_portraits(scope_id, run_id, evidence)
             counts["event_watermark"] = self._event_count(scope_id)
             return self.store.update_family_analysis_run(
                 run_id, status="completed", stage="done", stats={**counts, "input_mode": "semantic_text_only"}
@@ -97,6 +99,24 @@ class FamilyGraphService:
             )
             relationships += 1
         return {"people": len(people), "memberships": memberships, "relationships": relationships}
+
+    def _write_portraits(self, scope_id, run_id, evidence):
+        relationships = self.store.list_effective_family_relationships(scope_id)
+        count = 0
+        for person in evidence.get("people") or []:
+            person_id = person["person_id"]
+            membership = self.store.get_effective_family_membership(scope_id, person_id) or {}
+            rels = [item["predicate"] for item in relationships if item.get("subject_entity_id") == person_id]
+            descriptions = person.get("descriptions") or []
+            text = "；".join(filter(None, [
+                f"家庭归属：{membership.get('membership') or 'unknown'}",
+                ("关系：" + "、".join(rels)) if rels else "",
+                "近期记忆：" + "；".join(descriptions[:3]) if descriptions else "",
+            ]))
+            if text:
+                self.store.write_family_portrait(scope_id, person_id, text, source="model", evidence_refs=person.get("observation_ids") or [], inference_run_id=run_id)
+                count += 1
+        return count
 
     def _build_text_evidence(self, scope_id):
         rows = self.store.connection.execute(

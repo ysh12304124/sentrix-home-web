@@ -752,6 +752,20 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_family_analysis_runs_scope
                 ON family_analysis_runs(scope_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS family_person_portraits (
+                id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, entity_id TEXT NOT NULL REFERENCES entities(id),
+                portrait_text TEXT NOT NULL, evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                source TEXT NOT NULL, inference_run_id TEXT, state TEXT NOT NULL DEFAULT 'effective',
+                locked INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_portrait_active
+                ON family_person_portraits(scope_id, entity_id, state);
+            CREATE TABLE IF NOT EXISTS family_scope_groups (
+                scope_id TEXT PRIMARY KEY REFERENCES memory_spaces(id), graph_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'user_override', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_scope_groups_graph ON family_scope_groups(graph_id);
             CREATE TABLE IF NOT EXISTS memory_vectors (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -5769,6 +5783,44 @@ class MemoryStore:
         )
         self.connection.commit()
         return self.get_family_analysis_run(run_id)
+
+    def get_active_family_portrait(self, scope_id, entity_id):
+        row = self._row("SELECT * FROM family_person_portraits WHERE scope_id = ? AND entity_id = ? AND state = 'effective' ORDER BY created_at DESC LIMIT 1", (scope_id, entity_id))
+        return self._decode_family_row(row)
+
+    def write_family_portrait(self, scope_id, entity_id, portrait_text, *, source, evidence_refs=None, inference_run_id=None):
+        current = self.get_active_family_portrait(scope_id, entity_id)
+        if source == "model" and current and current.get("locked"):
+            return current
+        timestamp = now_iso()
+        if current:
+            self.connection.execute("UPDATE family_person_portraits SET state = 'superseded', updated_at = ? WHERE id = ?", (timestamp, current["id"]))
+        portrait_id = make_id("family_portrait")
+        self.connection.execute("""INSERT INTO family_person_portraits(id, scope_id, entity_id, portrait_text, evidence_refs_json, source, inference_run_id, state, locked, revision, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'effective', ?, 1, ?, ?)""", (portrait_id, scope_id, entity_id, str(portrait_text or "").strip(), json_value(evidence_refs or [], []), source, inference_run_id, 1 if source == "user_override" else 0, timestamp, timestamp))
+        self.connection.commit()
+        return self.get_active_family_portrait(scope_id, entity_id)
+
+    def merge_family_scopes(self, scope_ids):
+        scope_ids = list(dict.fromkeys(str(item) for item in scope_ids if item))
+        if len(scope_ids) < 2:
+            raise ValueError("at least two scopes are required")
+        for scope_id in scope_ids:
+            if not self._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,)):
+                raise ValueError("unknown memory space")
+        existing = self._row("SELECT graph_id FROM family_scope_groups WHERE scope_id IN (%s) ORDER BY updated_at DESC LIMIT 1" % ",".join("?" * len(scope_ids)), scope_ids)
+        graph_id = (existing or {}).get("graph_id") or make_id("family_graph")
+        timestamp = now_iso()
+        for scope_id in scope_ids:
+            self.connection.execute("INSERT INTO family_scope_groups(scope_id, graph_id, source, created_at, updated_at) VALUES (?, ?, 'user_override', ?, ?) ON CONFLICT(scope_id) DO UPDATE SET graph_id = excluded.graph_id, updated_at = excluded.updated_at", (scope_id, graph_id, timestamp, timestamp))
+        self.connection.commit()
+        return {"graph_id": graph_id, "scope_ids": self.family_graph_scope_ids(scope_ids[0])}
+
+    def family_graph_scope_ids(self, scope_id):
+        row = self._row("SELECT graph_id FROM family_scope_groups WHERE scope_id = ?", (scope_id,))
+        if not row:
+            return [scope_id]
+        return [item["scope_id"] for item in self._rows("SELECT scope_id FROM family_scope_groups WHERE graph_id = ? ORDER BY scope_id", (row["graph_id"],))]
 
     def maintain_relationship_claim(self, relationship):
         """Write a user-confirmed relationship into the subject's semantic claims so

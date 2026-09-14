@@ -1605,21 +1605,25 @@ def _execute_family_analysis_run(run_id: str, scope_id: str):
 
 @app.get("/api/family-graph")
 def family_graph(scope_id: str):
+    scope_ids = store.family_graph_scope_ids(scope_id)
     people = []
-    for entity in store.list_entities(scope_id=scope_id):
+    for item_scope_id in scope_ids:
+      for entity in store.list_entities(scope_id=item_scope_id):
         if entity.get("entity_type") != "person":
             continue
-        membership = store.get_effective_family_membership(scope_id, entity["id"])
+        membership = store.get_effective_family_membership(item_scope_id, entity["id"])
         people.append({
             "id": entity["id"],
             "display_name": entity.get("canonical_name") or "待命名成员",
             "membership": membership,
+            "portrait": store.get_active_family_portrait(item_scope_id, entity["id"]),
         })
     return {
         "scope_id": scope_id,
         "run": store.latest_family_analysis_run(scope_id),
         "people": people,
-        "relationships": store.list_effective_family_relationships(scope_id),
+        "scope_ids": scope_ids,
+        "relationships": [rel for item_scope_id in scope_ids for rel in store.list_effective_family_relationships(item_scope_id)],
     }
 
 
@@ -1672,6 +1676,23 @@ def start_family_analysis_run(payload: dict):
     })
     threading.Thread(target=_execute_family_analysis_run, args=(run["id"], scope_id), daemon=True).start()
     return {"status": 202, "run": run}
+
+
+@app.post("/api/family-graph/scopes/merge")
+def merge_family_graph_scopes(payload: dict):
+    try:
+        return store.merge_family_scopes((payload or {}).get("scope_ids") or [])
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.patch("/api/family-graph/people/{person_id}/portrait")
+def update_family_portrait(person_id: str, payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    text = str((payload or {}).get("portrait_text") or "").strip()
+    if not scope_id or not text:
+        raise HTTPException(status_code=400, detail="scope_id and portrait_text are required")
+    return {"ok": True, "portrait": store.write_family_portrait(scope_id, person_id, text, source="user_override", evidence_refs=(payload or {}).get("evidence_refs") or [])}
 
 
 @app.post("/api/relationship-hypotheses/{hypothesis_id}/decision")
