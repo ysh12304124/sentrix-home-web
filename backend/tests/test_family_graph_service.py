@@ -103,3 +103,7 @@ def test_run_rejects_model_parent_edge_without_explicit_kinship_text():
         FamilyGraphService(store, FakeGamma(*people)).run(run["id"], "album-a")
 
         assert store.list_effective_family_relationships("album-a") == []
+        assert all(
+            (store.get_effective_family_membership("album-a", person_id) or {})["membership"] == "unknown"
+            for person_id in people
+        )

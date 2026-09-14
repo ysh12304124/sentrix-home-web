@@ -89,6 +89,8 @@ class FamilyGraphService:
         for person_id, person in people.items():
             item = by_person.get(person_id) or {}
             membership = item.get("membership") if item.get("membership") in {"family", "friend", "unknown"} else "unknown"
+            if membership != "unknown" and not self._has_explicit_membership_evidence(membership, person):
+                membership = "unknown"
             self.store.set_family_membership(
                 scope_id, person_id, membership, source="model",
                 confidence=float(item.get("confidence") or 0),
@@ -141,6 +143,15 @@ class FamilyGraphService:
             "其他亲属": ("亲属", "家人", "家庭成员"),
         }
         return any(token in text for token in signals.get(predicate, (predicate,)))
+
+    @staticmethod
+    def _has_explicit_membership_evidence(membership, person):
+        text = " ".join(person.get("descriptions") or [])
+        signals = {
+            "family": ("家人", "全家", "亲属", "家庭成员", "父亲", "母亲", "爸爸", "妈妈", "儿子", "女儿", "夫妻"),
+            "friend": ("朋友", "同学", "闺蜜", "好友", "同事"),
+        }
+        return any(token in text for token in signals.get(membership, ()))
 
     def _write_portraits(self, scope_id, run_id, evidence):
         relationships = self.store.list_effective_family_relationships(scope_id)
