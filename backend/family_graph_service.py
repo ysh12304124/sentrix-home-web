@@ -52,14 +52,14 @@ class FamilyGraphService:
         model_people = sorted(
             evidence.get("people") or [],
             key=lambda item: (-len(item.get("observation_ids") or []), item["person_id"]),
-        )[:12]
+        )[:8]
         model_evidence = {
             "scope_id": evidence.get("scope_id"),
             "input_mode": "semantic_text_only",
             "people": [{
                 "person_id": item["person_id"],
-                "observation_ids": (item.get("observation_ids") or [])[:12],
-                "descriptions": [str(text)[:500] for text in (item.get("descriptions") or [])[:3]],
+                "observation_ids": (item.get("observation_ids") or [])[:6],
+                "descriptions": [str(text)[:300] for text in (item.get("descriptions") or [])[:2]],
             } for item in model_people],
         }
         response = self.gamma.chat(
