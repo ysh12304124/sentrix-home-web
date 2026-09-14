@@ -2825,6 +2825,7 @@ class MemoryStore:
         profile = memory.get("profile") or {}
         scope = scope_id or entity.get("scope_id") or "home-default"
         membership = self.get_effective_family_membership(scope, person_id)
+        family_portrait = self.get_active_family_portrait(scope, person_id)
         relationships = []
         for rel in self.list_effective_family_relationships(scope):
             if rel.get("subject_entity_id") != person_id:
@@ -2854,7 +2855,7 @@ class MemoryStore:
             "membership": (membership or {}).get("membership") or "unknown",
             "membership_source": (membership or {}).get("source") or "",
             "status": entity.get("status"),
-            "summary_zh": profile.get("summary_zh") or "",
+            "summary_zh": (family_portrait or {}).get("portrait_text") or profile.get("summary_zh") or "",
             "preference_summary_zh": profile.get("preference_summary_zh") or "",
             "activity_summary_zh": profile.get("activity_summary_zh") or "",
             "place_summary_zh": profile.get("place_summary_zh") or "",
