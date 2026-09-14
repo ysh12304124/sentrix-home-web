@@ -6,6 +6,7 @@ from .family_graph import validate_relationship_pair
 FAMILY_GRAPH_PROMPT = """你是家庭相册关系推断器。只能使用输入中已经落库的文字描述、事件与人物绑定 ID；
 绝不查看、索取或假设原始图片。请判断人物是否为家庭成员，并在有足够文本证据时输出直接中文关系。
 成员 membership 只能是 family、friend、unknown；低频或证据不足必须为 unknown。
+共现记录表示稳定人物在同一张已描述照片中出现；反复的成人-儿童家庭场景、家庭合影和长期共同出游是家庭成员及亲子/配偶关系的强证据。不要因一次活动同框就认定家庭。
 关系只能在证据充分时输出，必须填写合法的正反向标签。只返回 JSON：
 {"memberships":[{"person_id":"","membership":"family|friend|unknown","confidence":0.0}],
  "relationships":[{"subject_entity_id":"","predicate":"父亲","object_entity_id":"","inverse_predicate":"女儿","confidence":0.0}]}。
@@ -53,6 +54,7 @@ class FamilyGraphService:
             evidence.get("people") or [],
             key=lambda item: (-len(item.get("observation_ids") or []), item["person_id"]),
         )[:8]
+        core_ids = {item["person_id"] for item in model_people}
         model_evidence = {
             "scope_id": evidence.get("scope_id"),
             "input_mode": "semantic_text_only",
@@ -61,6 +63,8 @@ class FamilyGraphService:
                 "observation_ids": (item.get("observation_ids") or [])[:6],
                 "descriptions": [str(text)[:300] for text in (item.get("descriptions") or [])[:2]],
             } for item in model_people],
+            "cooccurrences": [item for item in (evidence.get("cooccurrences") or [])
+                              if item["person_a"] in core_ids and item["person_b"] in core_ids][:30],
         }
         response = self.gamma.chat(
             FAMILY_GRAPH_PROMPT + json.dumps(model_evidence, ensure_ascii=False),
@@ -149,6 +153,7 @@ class FamilyGraphService:
             (scope_id, scope_id),
         ).fetchall()
         people = {}
+        people_by_observation = {}
         for row in rows:
             value = dict(row)
             person = people.setdefault(value["entity_id"], {
@@ -158,6 +163,7 @@ class FamilyGraphService:
                 "descriptions": [],
                 "confidence": 0.0,
             })
+            people_by_observation.setdefault(value["observation_id"], set()).add(value["entity_id"])
             if value.get("face_instance_id"):
                 person["face_instance_ids"].append(value["face_instance_id"])
             person["observation_ids"].append(value["observation_id"])
@@ -171,7 +177,21 @@ class FamilyGraphService:
             person["observation_ids"] = list(dict.fromkeys(person["observation_ids"]))
             person["descriptions"] = list(dict.fromkeys(person["descriptions"]))[:20]
             values.append(person)
-        return {"scope_id": scope_id, "input_mode": "semantic_text_only", "people": values}
+        pair_counts = {}
+        for observation_id, entity_ids in people_by_observation.items():
+            ordered = sorted(entity_ids)
+            for index, left in enumerate(ordered):
+                for right in ordered[index + 1:]:
+                    item = pair_counts.setdefault((left, right), {"count": 0, "observation_ids": []})
+                    item["count"] += 1
+                    item["observation_ids"].append(observation_id)
+        cooccurrences = [
+            {"person_a": left, "person_b": right, "count": item["count"], "observation_ids": item["observation_ids"][:8]}
+            for (left, right), item in pair_counts.items()
+        ]
+        cooccurrences.sort(key=lambda item: (-item["count"], item["person_a"], item["person_b"]))
+        return {"scope_id": scope_id, "input_mode": "semantic_text_only", "people": values,
+                "cooccurrences": cooccurrences}
 
     @staticmethod
     def _semantic_description(row):
