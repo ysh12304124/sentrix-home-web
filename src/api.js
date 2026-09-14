@@ -110,6 +110,7 @@
     startFamilyGraphRun: (scopeId) => request("/api/family-graph/runs", { method: "POST", body: JSON.stringify({ scope_id: scopeId }) }),
     updateFamilyMembership: (personId, payload) => request(`/api/family-graph/people/${encodeURIComponent(personId)}/membership`, { method: "PATCH", body: JSON.stringify(payload) }),
     updateFamilyRelationship: (payload) => request("/api/family-graph/relationships", { method: "PUT", body: JSON.stringify(payload) }),
+    retractFamilyRelationship: (payload) => request("/api/family-graph/relationships", { method: "DELETE", body: JSON.stringify(payload) }),
     mergeFamilyGraphScopes: (scopeIds) => request("/api/family-graph/scopes/merge", { method: "POST", body: JSON.stringify({ scope_ids: scopeIds }) }),
     updateFamilyPortrait: (personId, payload) => request(`/api/family-graph/people/${encodeURIComponent(personId)}/portrait`, { method: "PATCH", body: JSON.stringify(payload) }),
     startPersonInsightRun: (payload) => request("/api/person-insight-runs", { method: "POST", body: JSON.stringify(payload) }),
