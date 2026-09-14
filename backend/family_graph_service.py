@@ -100,13 +100,18 @@ class FamilyGraphService:
 
     def _build_text_evidence(self, scope_id):
         rows = self.store.connection.execute(
-            """SELECT em.entity_id, em.face_instance_id, em.confidence,
+            """SELECT fc.entity_id, fi.id AS face_instance_id,
+                      COALESCE(em.confidence, fi.detection_confidence, 0) AS confidence,
                       o.id AS observation_id, o.caption, o.activity,
                       o.canonical_json, o.detail_json
-               FROM entity_mentions em
-               JOIN observations o ON o.id = em.observation_id
-               JOIN entities e ON e.id = em.entity_id
+               FROM face_instances fi
+               JOIN face_clusters fc ON fc.id = fi.cluster_id
+               JOIN entities e ON e.id = fc.entity_id
+               JOIN observations o ON o.id = fi.observation_id
+               LEFT JOIN entity_mentions em
+                 ON em.entity_id = fc.entity_id AND em.face_instance_id = fi.id
                WHERE o.scope_id = ? AND e.scope_id = ?
+                 AND e.entity_type = 'person' AND e.status NOT IN ('rejected', 'superseded')
                ORDER BY o.created_at ASC""",
             (scope_id, scope_id),
         ).fetchall()
