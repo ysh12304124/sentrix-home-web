@@ -107,6 +107,26 @@ def resolve_runtime_framework(value: str, model_base_url: str) -> str:
     return "generic"
 
 
+def select_runtime_providers(manager_url: str, endpoint_url: str,
+                             framework: str, *, cloud: bool = False):
+    """Choose the model lifecycle and local telemetry by runtime and host."""
+    if manager_url:
+        return ManagerLifecycleProvider(manager_url), ManagerTelemetryProvider(manager_url), "vllm_manager"
+    lifecycle = UnavailableLifecycleProvider()
+    host = urlparse(endpoint_url).hostname
+    local_hosts = {"127.0.0.1", "localhost", local_lan_ip()}
+    jetson = is_jetson_host()
+    if not cloud and framework in {"llama.cpp", "llamacpp"} and jetson and host in local_hosts:
+        return lifecycle, LocalJetsonLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "jetson_local_pss"
+    if not cloud and framework in {"llama.cpp", "llamacpp"} and host == "192.168.0.118" and urlparse(endpoint_url).port == 8100:
+        return lifecycle, OrinLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "orin_ssh_pss"
+    if not cloud and not jetson and host in local_hosts:
+        telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider,
+                           "ollama": OllamaTelemetryProvider}.get(framework, HostNvidiaTelemetryProvider)
+        return lifecycle, telemetry_class(endpoint_url=endpoint_url), "host_nvidia_smi"
+    return lifecycle, UnavailableTelemetryProvider(), "unavailable"
+
+
 VLLM_TARGETS_PATH = PROJECT_ROOT / "config/vllm_targets.json"
 CUSTOM_JUDGE_PROMPT_PATH = PROJECT_ROOT / "config/custom_judge_prompt.json"
 TASK_ACTION_POLICY_PATH = PROJECT_ROOT / "config/qa_task_actions.json"
@@ -1639,29 +1659,9 @@ class BenchmarkRun:
         self.vllm_target_id = vllm_target_id
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
         self.runtime_framework = resolve_runtime_framework(runtime_framework, self.vllm_model_base_url)
-        if self.vllm_api_url:
-            self.lifecycle_provider = ManagerLifecycleProvider(self.vllm_api_url)
-            self.telemetry_provider = ManagerTelemetryProvider(self.vllm_api_url)
-            self.telemetry_source = "vllm_manager"
-        elif (not self.use_cloud_model and self.runtime_framework in {"llama.cpp", "llamacpp"}
-              and is_jetson_host() and urlparse(self.vllm_model_base_url).hostname in
-              {"127.0.0.1", "localhost", local_lan_ip(), "192.168.0.118"}):
-            self.lifecycle_provider = UnavailableLifecycleProvider()
-            self.telemetry_provider = LocalJetsonLlamaCppTelemetryProvider(endpoint_url=self.vllm_model_base_url)
-            self.telemetry_source = "jetson_local_pss"
-        elif not self.use_cloud_model and self.runtime_framework in {"llama.cpp", "llamacpp"} and urlparse(self.vllm_model_base_url).hostname == "192.168.0.118" and urlparse(self.vllm_model_base_url).port == 8100:
-            self.lifecycle_provider = UnavailableLifecycleProvider()
-            self.telemetry_provider = OrinLlamaCppTelemetryProvider(endpoint_url=self.vllm_model_base_url)
-            self.telemetry_source = "orin_ssh_pss"
-        elif not self.use_cloud_model and urlparse(self.vllm_model_base_url).hostname in {"127.0.0.1", "localhost", local_lan_ip(), "192.168.0.153"}:
-            self.lifecycle_provider = UnavailableLifecycleProvider()
-            telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider, "ollama": OllamaTelemetryProvider}.get(self.runtime_framework, HostNvidiaTelemetryProvider)
-            self.telemetry_provider = telemetry_class(endpoint_url=self.vllm_model_base_url)
-            self.telemetry_source = "host_nvidia_smi"
-        else:
-            self.lifecycle_provider = UnavailableLifecycleProvider()
-            self.telemetry_provider = UnavailableTelemetryProvider()
-            self.telemetry_source = "unavailable"
+        (self.lifecycle_provider, self.telemetry_provider, self.telemetry_source) = select_runtime_providers(
+            self.vllm_api_url, self.vllm_model_base_url, self.runtime_framework, cloud=self.use_cloud_model,
+        )
         self.results_root = results_root
         self.lock = threading.RLock()
         self._judge_rate_lock = threading.Lock()
@@ -1910,7 +1910,7 @@ class BenchmarkRun:
         self._record_phase(phase, "status", "partial")
 
     def _hardware_snapshot(self) -> dict:
-        """Use existing Manager endpoints; absence is recorded, never inferred from logs."""
+        """Sample the selected runtime provider; do not require a model manager."""
         if self.use_cloud_model:
             return {
                 "captured_at": now_iso(),
@@ -1918,14 +1918,15 @@ class BenchmarkRun:
                 "status": "not_applicable",
                 "reason": "cloud_api_has_no_local_gpu_metrics",
             }
-        if not self.vllm_api_url:
+        if self.telemetry_source == "unavailable":
             return {
                 "captured_at": now_iso(),
                 "source": "external",
                 "status": "not_applicable",
-                "reason": "external model endpoint has no manager metrics",
+                "reason": "external model endpoint has no local telemetry",
             }
-        snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
+        snapshot = {"captured_at": now_iso(), "source": self.telemetry_source,
+                    "manager": None, "gpu": None, "process_memory": None}
         try:
             snapshot["manager"] = self.lifecycle_provider.state()
         except Exception as exc:
@@ -2078,7 +2079,7 @@ class BenchmarkRun:
                     return exc
             served_names = {state.get("profile"), state.get("served_model_name")}
             if self.model_profile in served_names:
-                base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
+                base = state.get("external_url_hint") or f"http://127.0.0.1:{state.get('port', 8100)}/v1"
                 root = base.rstrip("/").removesuffix("/v1")
                 probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
                 if probe is None:
@@ -2182,7 +2183,7 @@ class BenchmarkRun:
         # 3. Health check (cancel-aware)
         state = self.lifecycle_provider.state()
         port = state.get("port", 8105)
-        base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
+        base = state.get("external_url_hint") or f"http://127.0.0.1:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
         t_health0 = time.perf_counter()
         health_error = self._probe_model_endpoint(state, model_api_root)
@@ -2240,7 +2241,8 @@ class BenchmarkRun:
         t0 = time.perf_counter()
         # Auto-name: PhotoBench-{timestamp}-{album}-{model}
         ts_short = datetime.now().strftime("%Y%m%d-%H%M%S")
-        scope_name = f"PhotoBench-{ts_short}-{safe_slug(self.album_id)}-{safe_slug(self.model_profile)}"
+        model_slug = safe_slug(self.model_profile)[-40:]
+        scope_name = f"PhotoBench-{ts_short}-{safe_slug(self.album_id)}-{model_slug}"[:100]
         result = request_json(f"{self.sentrix_url}/api/memory-spaces",
                               {"name": scope_name}, "POST", 30)
         scope_id = result.get("id") or result.get("scope_id")
@@ -6841,8 +6843,15 @@ class OrchestratorRepository:
 # ---------------------------------------------------------------------------
 
 class OrchestratorHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     repo: OrchestratorRepository
     web_root: Path
+
+    def end_headers(self):
+        # Every response has a known end even on clients/proxies with broken keep-alive.
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        super().end_headers()
 
     def _json(self, value, status: int = 200):
         body = json.dumps(value, ensure_ascii=False).encode()

@@ -1,7 +1,7 @@
 import importlib.util
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 
@@ -22,6 +22,51 @@ class RuntimeFrameworkTests(unittest.TestCase):
     def test_jetson_local_llamacpp_and_explicit_framework(self, _jetson):
         self.assertEqual(MODULE.resolve_runtime_framework("", "http://127.0.0.1:8100/v1"), "llama.cpp")
         self.assertEqual(MODULE.resolve_runtime_framework("vllm", "http://127.0.0.1:8100/v1"), "vllm")
+
+    @patch.object(MODULE, "local_lan_ip", return_value="192.168.0.118")
+    @patch.object(MODULE, "is_jetson_host", return_value=True)
+    def test_jetson_uses_local_pss_without_ssh_or_nvidia_smi(self, _jetson, _ip):
+        _, provider, source = MODULE.select_runtime_providers(
+            "", "http://192.168.0.118:8100/v1", "llama.cpp")
+        self.assertIsInstance(provider, MODULE.LocalJetsonLlamaCppTelemetryProvider)
+        self.assertEqual(source, "jetson_local_pss")
+
+    @patch.object(MODULE, "local_lan_ip", return_value="192.168.0.153")
+    @patch.object(MODULE, "is_jetson_host", return_value=False)
+    def test_discrete_gpu_and_remote_host_are_distinct(self, _jetson, _ip):
+        _, provider, source = MODULE.select_runtime_providers(
+            "", "http://192.168.0.153:8100/v1", "generic")
+        self.assertIsInstance(provider, MODULE.HostNvidiaTelemetryProvider)
+        self.assertEqual(source, "host_nvidia_smi")
+        _, provider, source = MODULE.select_runtime_providers(
+            "", "http://192.168.0.119:8100/v1", "llama.cpp")
+        self.assertIsInstance(provider, MODULE.UnavailableTelemetryProvider)
+        self.assertEqual(source, "unavailable")
+
+    def test_hardware_snapshot_samples_external_provider_without_manager(self):
+        run = MODULE.BenchmarkRun.__new__(MODULE.BenchmarkRun)
+        run.use_cloud_model = False
+        run.telemetry_source = "jetson_local_pss"
+        run.lifecycle_provider = Mock(state=Mock(return_value={"status": "not_applicable"}))
+        run.telemetry_provider = Mock(
+            gpu_stats=Mock(return_value={"status": "available", "data": {"gpus": [{"index": 0}]}}),
+            process_memory=Mock(return_value={"status": "available", "data": {"process_memory_used_mib": 512}}),
+        )
+        snapshot = run._hardware_snapshot()
+        self.assertEqual(snapshot["source"], "jetson_local_pss")
+        self.assertEqual(snapshot["process_memory"]["process_memory_used_mib"], 512)
+
+    @patch.object(MODULE, "request_json", return_value={"id": "scope-1", "name": "ok"})
+    def test_long_model_path_is_bounded_in_scope_name(self, request):
+        run = MODULE.BenchmarkRun.__new__(MODULE.BenchmarkRun)
+        run.album_id = "album3-14"
+        run.model_profile = "/some/long/path/" + "very-long-model-name-" * 12
+        run.sentrix_url = "http://127.0.0.1:11001"
+        run.state = {}
+        run._phase_start = Mock()
+        run._phase_done = Mock()
+        run._phase_scope_setup()
+        self.assertLessEqual(len(request.call_args.args[1]["name"]), 100)
 
 
 class ExtractImageIdsTests(unittest.TestCase):
