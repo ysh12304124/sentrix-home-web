@@ -49,8 +49,21 @@ class FamilyGraphService:
     def _infer(self, evidence):
         if not self.gamma:
             return {"memberships": [], "relationships": []}
+        model_people = sorted(
+            evidence.get("people") or [],
+            key=lambda item: (-len(item.get("observation_ids") or []), item["person_id"]),
+        )[:12]
+        model_evidence = {
+            "scope_id": evidence.get("scope_id"),
+            "input_mode": "semantic_text_only",
+            "people": [{
+                "person_id": item["person_id"],
+                "observation_ids": (item.get("observation_ids") or [])[:12],
+                "descriptions": [str(text)[:500] for text in (item.get("descriptions") or [])[:3]],
+            } for item in model_people],
+        }
         response = self.gamma.chat(
-            FAMILY_GRAPH_PROMPT + json.dumps(evidence, ensure_ascii=False),
+            FAMILY_GRAPH_PROMPT + json.dumps(model_evidence, ensure_ascii=False),
             images=None, json_mode=True, role="verify",
         )
         if isinstance(response, dict):
