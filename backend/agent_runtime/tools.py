@@ -2143,7 +2143,7 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
 
 
 def _confirmed_photo_identities(store, asset_id: str) -> list[dict]:
-    """Read existing confirmed face/entity links without mutating identity data."""
+    """Read face-bound people and their effective family membership without mutation."""
     if store is None or not asset_id:
         return []
     rows = store.connection.execute(
@@ -2151,34 +2151,38 @@ def _confirmed_photo_identities(store, asset_id: str) -> list[dict]:
         SELECT fi.id AS face_instance_id, fi.asset_id, fi.observation_id,
                fi.cluster_id, fi.bbox_json, fi.detection_confidence, fi.quality,
                fc.entity_id, fc.status AS cluster_status,
-               e.canonical_name, e.family_role, e.status AS entity_status,
+               e.canonical_name, e.status AS entity_status,
                em.confidence AS mention_confidence
         FROM face_instances fi
         JOIN face_clusters fc ON fc.id = fi.cluster_id
         JOIN entities e ON e.id = fc.entity_id
-        JOIN entity_mentions em
+        LEFT JOIN entity_mentions em
           ON em.face_instance_id = fi.id
          AND em.entity_id = fc.entity_id
         WHERE fi.asset_id = ?
-          AND fc.status = 'confirmed'
           AND e.entity_type = 'person'
-          AND e.status = 'confirmed'
         ORDER BY fi.quality DESC, fi.detection_confidence DESC
         """, (asset_id,)
     ).fetchall()
-    return [{
-        "evidence_type": "photo_identity",
-        "asset_id": str(row["asset_id"] or asset_id),
-        "face_instance_id": str(row["face_instance_id"]),
-        "cluster_id": str(row["cluster_id"] or ""),
-        "entity_id": str(row["entity_id"] or ""),
-        "person_name": str(row["canonical_name"] or ""),
-        "family_role": str(row["family_role"] or ""),
-        "identity_status": "confirmed",
-        "mention_confidence": row["mention_confidence"],
-        "bbox": _decode_bbox(row["bbox_json"]),
-        "source": "existing_face_cluster_entity_mention",
-    } for row in rows]
+    scope_id = (store.get_asset(asset_id) or {}).get("scope_id") or "home-default"
+    values = []
+    for row in rows:
+        entity_id = str(row["entity_id"] or "")
+        membership = store.get_effective_family_membership(scope_id, entity_id) if entity_id else None
+        values.append({
+            "evidence_type": "photo_identity",
+            "asset_id": str(row["asset_id"] or asset_id),
+            "face_instance_id": str(row["face_instance_id"]),
+            "cluster_id": str(row["cluster_id"] or ""),
+            "entity_id": entity_id,
+            "person_name": str(row["canonical_name"] or ""),
+            "membership": (membership or {}).get("membership") or "unknown",
+            "identity_status": "bound",
+            "mention_confidence": row["mention_confidence"],
+            "bbox": _decode_bbox(row["bbox_json"]),
+            "source": "face_cluster_entity_binding",
+        })
+    return values
 
 
 def _photo_face_manifest(store, asset_id: str) -> list[dict]:
@@ -2399,16 +2403,17 @@ def _get_core_memory(arguments: dict, *, context: dict | None = None) -> dict:
     }
 
 
-# 人物实体解析（get_person_profile 使用）
+# 人物实体解析：家庭图谱是人物关系的唯一权威来源。
 def _resolve_person_entity(person: str, scope_id: str):
     store = _RUNTIME.get("store")
     if store is None or not person:
         return None
     try:
-        for ent in store.list_entities(status="confirmed", scope_id=scope_id or None):
+        for ent in store.list_entities(scope_id=scope_id or None):
+            if ent.get("entity_type") != "person":
+                continue
             name = ent.get("canonical_name") or ""
-            role = ent.get("family_role") or ""
-            if person in name or person in role or name in person or role in person:
+            if person in name or name in person:
                 return ent
     except Exception:
         return None
@@ -2450,8 +2455,8 @@ def _query_photo_people(arguments: dict, *, context: dict | None = None) -> dict
         people_count = 0
     unknown_count = max(0, people_count - len(identities))
     people = [{"person_name": row.get("person_name"),
-               "family_role": row.get("family_role") or "",
-               "identity_status": "confirmed",
+               "membership": row.get("membership") or "unknown",
+               "identity_status": row.get("identity_status") or "bound",
                "asset_id": asset_id}
               for row in identities if row.get("person_name")]
     return {
@@ -2504,8 +2509,8 @@ def person_profile_summary(person: str, scope_id: str = "") -> str:
         if not digest or not digest.get("summary_zh"):
             return ""
         lines = []
-        if digest.get("family_role"):
-            lines.append(f"家庭角色：{digest['family_role']}")
+        if digest.get("membership"):
+            lines.append(f"家庭归属：{digest['membership']}")
         if digest.get("relationships"):
             lines.append("关系：" + "、".join(f"{r.get('other_name')}（{r.get('predicate')}）" for r in digest["relationships"]))
         if digest.get("preference_summary_zh"):
@@ -2534,7 +2539,8 @@ def _get_person_profile(arguments: dict, *, context: dict | None = None) -> dict
                 "note": "画像数据不足时返回 limited，不编造。"}
     return {
         "person": digest.get("person"),
-        "family_role": digest.get("family_role") or "",
+        "membership": digest.get("membership") or "unknown",
+        "membership_source": digest.get("membership_source") or "",
         "readiness": "ready",
         "summary": digest.get("summary_zh") or "",
         "preference_summary": digest.get("preference_summary_zh") or "",

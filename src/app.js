@@ -681,7 +681,10 @@
     const primarySorted = sortedVisible.filter((person) => !person.single_sample);
     const relHypotheses = (insights && insights.relationship_hypotheses) || [];
     const suggestedRelHtml = relHypotheses.length ? `<section class="insight-tier"><h3 class="insight-tier-title">系统建议的关系</h3><div class="suggested-relations">${relHypotheses.map((rel) => `<div class="suggested-relation"><span class="suggestion-badge">系统建议</span><span>${escapeHtml(rel.subject_person_id)} → ${escapeHtml(rel.predicate)} → ${escapeHtml(rel.object_person_id)}</span><button class="button small primary" data-action="confirm-relationship-hypothesis" data-hypothesis-id="${escapeHtml(rel.id)}">确认</button><button class="button small ghost" data-action="reject-relationship-hypothesis" data-hypothesis-id="${escapeHtml(rel.id)}">拒绝</button></div>`).join("")}</div></section>` : "";
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。系统会推断重要人物、建议角色和鲜活画像；单张样本会折叠在下方，仍可展开查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}${suggestedRelHtml}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div>${batchCandidates.length >= 2 ? `<div class="people-banner"><div><strong>我在照片里发现了 ${batchCandidates.length} 个常出现的人</strong><small>先给他们命名并设定家庭角色，系统会在此基础上持续积累每个人的记忆和关系。</small></div><button class="button primary" data-action="batch-confirm">${icon("＋")}批量命名</button></div>` : ""}<section class="people-grid">${primarySorted.length ? primarySorted.map((person, index) => personCard(person, index)).join("") : emptyState(singles.length ? "没有待确认的多人物簇" : "还没有人物候选", singles.length ? "单样本候选折叠在下方，可能是小脸或误检。" : "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", singles.length ? "" : `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>${singles.length ? `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">单张样本（${singles.length}）· 可能是小脸或误检，展开后谨慎确认</summary><div class="people-grid" style="margin-top:12px;">${singles.map((person, index) => personCard(person, primarySorted.length + index)).join("")}</div></details>` : ""}`;
+    const personNames = new Map(state.persons.map((person) => [person.id, person.display_name || person.name || "待命名成员"]));
+    const graphRelHtml = (familyGraph.relationships || []).filter((rel) => rel.subject_entity_id < rel.object_entity_id).map((rel) => `<div class="suggested-relation"><span class="suggestion-badge">${escapeHtml(rel.source === "user_override" ? "你已确认" : "模型判断")}</span><span>${escapeHtml(personNames.get(rel.subject_entity_id) || "待命名成员")} 是 ${escapeHtml(personNames.get(rel.object_entity_id) || "待命名成员")}的${escapeHtml(rel.predicate)}</span><button class="button small ghost" data-action="edit-family-relationship" data-subject-id="${escapeHtml(rel.subject_entity_id)}" data-object-id="${escapeHtml(rel.object_entity_id)}" data-predicate="${escapeHtml(rel.predicate)}" data-inverse="${escapeHtml(rel.inverse_predicate)}">修正</button></div>`).join("");
+    const familyGraphHtml = graphRelHtml ? `<section class="insight-tier"><h3 class="insight-tier-title">家庭关系图谱</h3><div class="suggested-relations">${graphRelHtml}</div></section>` : "";
+    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "家庭归属和亲属关系由已落库的文字描述推断；标签标明“模型判断”或“你已确认”，你的修正会直接写回数据库。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}${familyGraphHtml}${suggestedRelHtml}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div>${batchCandidates.length >= 2 ? `<div class="people-banner"><div><strong>我在照片里发现了 ${batchCandidates.length} 个常出现的人</strong><small>先给他们命名并设定家庭角色，系统会在此基础上持续积累每个人的记忆和关系。</small></div><button class="button primary" data-action="batch-confirm">${icon("＋")}批量命名</button></div>` : ""}<section class="people-grid">${primarySorted.length ? primarySorted.map((person, index) => personCard(person, index)).join("") : emptyState(singles.length ? "没有待确认的多人物簇" : "还没有人物候选", singles.length ? "单样本候选折叠在下方，可能是小脸或误检。" : "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", singles.length ? "" : `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>${singles.length ? `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">单张样本（${singles.length}）· 可能是小脸或误检，展开后谨慎确认</summary><div class="people-grid" style="margin-top:12px;">${singles.map((person, index) => personCard(person, primarySorted.length + index)).join("")}</div></details>` : ""}`;
   }
 
   function knowledgeView() {
@@ -1896,6 +1899,22 @@
         state.toast = "已保存你的家庭归属修正；后续模型推断不会覆盖它";
         return refreshData();
       } catch (error) { state.toast = `保存家庭归属失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "edit-family-relationship") {
+      const predicate = window.prompt("正向关系（例如：父亲、母亲、丈夫、妻子）", element.dataset.predicate || "");
+      if (predicate === null) return;
+      const inverse = window.prompt("反向关系（例如：女儿、儿子、妻子、丈夫）", element.dataset.inverse || "");
+      if (inverse === null) return;
+      try {
+        await window.sentrixApi.updateFamilyRelationship({
+          scope_id: state.scopeId,
+          subject_entity_id: element.dataset.subjectId,
+          object_entity_id: element.dataset.objectId,
+          predicate: predicate.trim(), inverse_predicate: inverse.trim(),
+        });
+        state.toast = "已保存你的关系修正；后续模型推断不会覆盖它";
+        return refreshData();
+      } catch (error) { state.toast = `保存家庭关系失败：${error.message}`; return renderShellNavigation(); }
     }
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });

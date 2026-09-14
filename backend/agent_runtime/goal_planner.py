@@ -33,6 +33,7 @@ _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精�
 - 用户没有明确要求“历史对话/之前说过什么”时，不要声明 user_statement。
 - 地点问题声明 location_metadata；照片内容/颜色/动作声明 visual_observation；照片文字/数字声明 visible_text。
 - 身份问题只有在需要确认照片中的人名时才声明 photo_identity；不要用 visual_observation 代替身份。
+- 人物关系、家庭归属或人物画像问题，声明 structured_fact，并在描述中写明需要家庭图谱证据；如还要找对应照片，再额外声明 memory_asset。
 - 同一种 evidence_type 只声明一次；不要为了同一个答案同时声明多个等价需求。
 每个 requirement 都必须能由注册表中的工具直接或通过 prerequisite 获得。
 

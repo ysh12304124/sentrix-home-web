@@ -35,7 +35,7 @@ LITE_TOOL_SCHEMAS = {
         '  输入: {"query": "关键词", "filters": {"time": "<问题时间，缺省省略>", "person": "人物", "place": "地点"}}'
     ),
     "query_photo_people": (
-        "- query_photo_people: 读取当前预览中一张照片自己的已确认人物和未确认同行者。\n"
+        "- query_photo_people: 读取当前预览中一张照片的人脸绑定人物及其家庭归属；没有稳定绑定的同行者明确标为未知。\n"
         '  输入: {"asset_handle": "photo_1", "result_set_id": "..."}'
     ),
     "inspect_photo": (
@@ -64,7 +64,7 @@ LITE_TOOL_SCHEMAS = {
         '  输入: {"subject": "人物名", "topic": "话题"}'
     ),
     "get_person_profile": (
-        "- get_person_profile: 读取人物高维画像（家庭角色/关系/行为规律/近期事件）。\n"
+        "- get_person_profile: 读取人物高维画像（家庭归属/关系/行为规律/近期事件）；关系来源会标注模型或用户确认。\n"
         '  输入: {"person": "人物名"}'
     ),
 }

@@ -955,7 +955,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             person = str(observation.get("person") or "")
             evidence_rows.append({"evidence_type": "confirmed_identity",
                                   "value": {"person": person,
-                                            "family_role": observation.get("family_role")},
+                                            "membership": observation.get("membership"),
+                                            "membership_source": observation.get("membership_source")},
                                   "subject": person})
             if observation.get("claims") or observation.get("patterns") or observation.get("relationships"):
                 evidence_rows.append({"evidence_type": "structured_fact",

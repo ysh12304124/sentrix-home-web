@@ -2809,12 +2809,18 @@ class MemoryStore:
             return None
         memory = self.get_person_memory(person_id, scope_id)
         profile = memory.get("profile") or {}
+        scope = scope_id or entity.get("scope_id") or "home-default"
+        membership = self.get_effective_family_membership(scope, person_id)
         relationships = []
-        for rel in self.list_person_relationships(scope_id):
-            if rel.get("subject_entity_id") == person_id:
-                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("object_name"), "id": rel.get("id"), "status": rel.get("status")})
-            elif rel.get("object_entity_id") == person_id:
-                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("subject_name"), "id": rel.get("id"), "status": rel.get("status")})
+        for rel in self.list_effective_family_relationships(scope):
+            if rel.get("subject_entity_id") != person_id:
+                continue
+            other = self.get_entity(rel.get("object_entity_id")) or {}
+            relationships.append({
+                "predicate": rel.get("predicate"),
+                "other_name": other.get("canonical_name") or "未命名成员",
+                "source": rel.get("source"),
+            })
         pattern_groups = {}
         for pattern in memory.get("patterns") or []:
             pattern_groups.setdefault(pattern.get("pattern_type"), []).append(
@@ -2831,7 +2837,8 @@ class MemoryStore:
         claims_top = [{"dimension": c.get("dimension"), "predicate": c.get("predicate"), "value": c.get("value_text"), "confidence": c.get("confidence")} for c in claims[:12]]
         return {
             "person": entity.get("canonical_name"),
-            "family_role": entity.get("family_role") or "",
+            "membership": (membership or {}).get("membership") or "unknown",
+            "membership_source": (membership or {}).get("source") or "",
             "status": entity.get("status"),
             "summary_zh": profile.get("summary_zh") or "",
             "preference_summary_zh": profile.get("preference_summary_zh") or "",
