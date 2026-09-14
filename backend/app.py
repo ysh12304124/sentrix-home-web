@@ -246,6 +246,36 @@ def process_asset(asset_id):
         task_store.close()
 
 
+def _finalize_scope_async(scope_id: str) -> None:
+    """导入收尾：补该 scope 的 chinese-clip 视觉向量 + 重建 FTS。
+
+    为什么必须做：新相册导入只写了文本向量（bge-m3），**视觉侧 chinese-clip 没有落库**；
+    而查询侧由 scheme.py 锁死 chinese-clip 768 维，库里缺该模型的向量时 visual_ann 会
+    静默 no_candidates —— 表现为图片检索全空、agent 从不调用 inspect_photo、
+    image_retrieval_recall = 0（实测多批评测就栽在这里）。
+
+    scope_finalize 的契约本就写着"补向量 + 重建 FTS + 供调用方同步索引"，
+    此前全仓库没有调用方，所以 import 路径一直漏了这一步。这里补上那个调用方。
+    store.upsert_vector 会自动同步 Qdrant，故 SQLite 与 Qdrant 一次写齐。
+
+    跑后台线程：视觉向量重嵌是分钟级（数百张图），不能挡住批次收尾。
+    """
+    def _work():
+        try:
+            from . import scope_finalize
+            finalize_store = MemoryStore(store.path)
+            try:
+                scope_finalize.run(finalize_store, scope_id)
+            finally:
+                finalize_store.close()
+        except Exception:
+            import logging
+            logging.getLogger("sentrix.scope_finalize").exception(
+                "scope finalize failed: scope=%s", scope_id)
+
+    threading.Thread(target=_work, daemon=True, name="sentrix-scope-finalize").start()
+
+
 def _pipeline_worker_limits():
     configured = max(1, int(os.getenv("SENTRIX_PIPELINE_MAX_WORKERS", "2")))
     state = _load_vllm_state() or {}
@@ -589,6 +619,12 @@ def process_ingest_batch(asset_ids, batch_id):
             summary_wall_seconds = round(time.perf_counter() - summary_started, 4)
             with db_write_guard("ingest-batch-finish"):
                 task_store.finish_ingest_batch(batch_id)
+            # 收尾后补该 scope 的视觉向量与 FTS：不补则新相册图片检索全空
+            for row in task_store._rows(
+                "SELECT DISTINCT scope_id FROM assets WHERE batch_id = ?", (batch_id,)
+            ):
+                if row["scope_id"]:
+                    _finalize_scope_async(row["scope_id"])
             metrics = {
                 **limits, "status": "completed", "asset_count": len(all_asset_ids),
                 "image_count": len(all_asset_ids), "event_count": len(event_ids),
