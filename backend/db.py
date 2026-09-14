@@ -738,6 +738,20 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_family_relationship_effective
                 ON family_relationships(scope_id, subject_entity_id, object_entity_id, state);
+            CREATE TABLE IF NOT EXISTS family_analysis_runs (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                status TEXT NOT NULL DEFAULT 'queued',
+                current_stage TEXT NOT NULL DEFAULT 'queued',
+                config_json TEXT NOT NULL DEFAULT '{}',
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_analysis_runs_scope
+                ON family_analysis_runs(scope_id, created_at DESC);
             CREATE TABLE IF NOT EXISTS memory_vectors (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -5701,6 +5715,53 @@ class MemoryStore:
         self.connection.commit()
         return [self._decode_family_row(self._row("SELECT * FROM family_relationships WHERE id = ?", (record_id,)))
                 for record_id in inserted]
+
+    def create_family_analysis_run(self, scope_id, config):
+        run_id = make_id("family_run")
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO family_analysis_runs(
+                id, scope_id, status, current_stage, config_json, stats_json, created_at, updated_at
+            ) VALUES (?, ?, 'queued', 'queued', ?, '{}', ?, ?)""",
+            (run_id, scope_id, json_value(config, {}), timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self.get_family_analysis_run(run_id)
+
+    def get_family_analysis_run(self, run_id):
+        row = self._row("SELECT * FROM family_analysis_runs WHERE id = ?", (run_id,))
+        if not row:
+            return None
+        row["config"] = json.loads(row.pop("config_json") or "{}")
+        row["stats"] = json.loads(row.pop("stats_json") or "{}")
+        return row
+
+    def latest_family_analysis_run(self, scope_id):
+        row = self._row(
+            "SELECT id FROM family_analysis_runs WHERE scope_id = ? ORDER BY created_at DESC LIMIT 1",
+            (scope_id,),
+        )
+        return self.get_family_analysis_run(row["id"]) if row else None
+
+    def update_family_analysis_run(self, run_id, *, status=None, stage=None, stats=None, error=None):
+        fields = {"updated_at": now_iso()}
+        if status is not None:
+            fields["status"] = status
+        if stage is not None:
+            fields["current_stage"] = stage
+        if stats is not None:
+            fields["stats_json"] = json_value(stats, {})
+        if error is not None:
+            fields["error"] = error
+        if status == "completed":
+            fields["completed_at"] = now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        self.connection.execute(
+            f"UPDATE family_analysis_runs SET {assignments} WHERE id = ?",
+            (*fields.values(), run_id),
+        )
+        self.connection.commit()
+        return self.get_family_analysis_run(run_id)
 
     def maintain_relationship_claim(self, relationship):
         """Write a user-confirmed relationship into the subject's semantic claims so
