@@ -13,6 +13,7 @@ const graph = {
     { id: "father", display_name: "爸爸", membership: { membership: "family" } },
     { id: "daughter", display_name: "小雨", membership: { membership: "family" } },
     { id: "friend", display_name: "小陈", membership: { membership: "friend" } },
+    { id: "friend-alone", display_name: "小周", membership: { membership: "friend" } },
     { id: "unknown", display_name: "路人", membership: { membership: "unknown" } },
   ],
   relationships: [
@@ -31,10 +32,10 @@ test("folds inverse records into one directed visible edge", () => {
   });
 });
 
-test("keeps only family and connected friends in graph", () => {
+test("keeps confirmed friends in graph so a user can connect them", () => {
   const groups = partitionPeople(toGraphModel(graph));
   assert.deepEqual(groups.family.map((person) => person.id), ["father", "daughter"]);
-  assert.deepEqual(groups.friends.map((person) => person.id), ["friend"]);
+  assert.deepEqual(groups.friends.map((person) => person.id), ["friend", "friend-alone"]);
   assert.deepEqual(groups.pending.map((person) => person.id), ["unknown"]);
 });
 

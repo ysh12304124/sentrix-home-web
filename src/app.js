@@ -1950,6 +1950,7 @@
         state.peopleGraphDraftEdge.objectId = personId;
       }
       state.peopleGraphSelection = personId;
+      state.peopleGraphView = "graph";
       return renderView();
     }
     if (action === "close-people-graph-person") { state.peopleGraphSelection = ""; return renderView(); }

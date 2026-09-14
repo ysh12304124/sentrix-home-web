@@ -57,10 +57,7 @@
   function partitionPeople(model) {
     const family = model.people.filter((person) => person.membershipValue === "family");
     const familyIds = new Set(family.map((person) => person.id));
-    const friendIds = new Set(
-      model.edges.filter((edge) => friendRelations.has(edge.predicate) && (familyIds.has(edge.subjectId) || familyIds.has(edge.objectId)))
-        .flatMap((edge) => [edge.subjectId, edge.objectId]),
-    );
+    const friendIds = new Set(model.people.filter((person) => person.membershipValue === "friend").map((person) => person.id));
     familyIds.forEach((id) => friendIds.delete(id));
     const friends = model.people.filter((person) => person.membershipValue === "friend" && friendIds.has(person.id));
     const visibleIds = new Set([...family.map((person) => person.id), ...friends.map((person) => person.id)]);
