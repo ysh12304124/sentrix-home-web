@@ -625,6 +625,7 @@ def process_ingest_batch(asset_ids, batch_id):
             ):
                 if row["scope_id"]:
                     _finalize_scope_async(row["scope_id"])
+                    pipeline._trigger_family_analysis(row["scope_id"])
             metrics = {
                 **limits, "status": "completed", "asset_count": len(all_asset_ids),
                 "image_count": len(all_asset_ids), "event_count": len(event_ids),
