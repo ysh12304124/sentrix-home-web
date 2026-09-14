@@ -5664,6 +5664,8 @@ class MemoryStore:
         inverse_predicate = str(inverse_predicate or "").strip()
         if not predicate or not inverse_predicate:
             raise ValueError("family relationship requires both predicates")
+        from .family_graph import validate_relationship_pair
+        validate_relationship_pair(predicate, inverse_predicate)
         current = self._effective_family_pair(scope_id, subject_entity_id, object_entity_id)
         if source == "model" and any(row.get("locked") for row in current):
             return current
