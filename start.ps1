@@ -10,7 +10,7 @@ param(
   [ValidateSet("ollama", "vllm")]
   [string]$LlmBackend = "vllm",
   [string]$VllmBaseUrl = "http://127.0.0.1:8000/v1",
-  [string]$VllmModel = "gemma4-12b-it",
+  [string]$VllmModel = "qwen3-vl-4b",
   [string]$VllmManagerUrl = "",
   [ValidateSet("auto", "on", "off")]
   [string]$GraphRetrievalMode = "auto"
@@ -36,6 +36,10 @@ $env:SENTRIX_DB_PATH   = Join-Path $env:SENTRIX_DATA_DIR "sentrix.db"
 $env:SENTRIX_ANN_DIR   = Join-Path $env:SENTRIX_DATA_DIR "ann"
 $env:SENTRIX_API_PORT  = "11001"
 $env:SENTRIX_BACKEND_URL = "http://127.0.0.1:$env:SENTRIX_API_PORT"
+# PhotoBench is launched as a child of this script/web server.  Its default
+# connection file may contain a former LAN deployment address, so the local
+# runtime must be explicit in the inherited environment.
+$env:BENCH_SENTRIX_URL = $env:SENTRIX_BACKEND_URL
 $env:PORT              = "11000"
 # Local model calls must bypass any desktop/enterprise HTTP proxy. Without this,
 # httpx in the API process turns 127.0.0.1 Ollama requests into a 502 Bad Gateway.
@@ -77,13 +81,15 @@ if ($LlmBackend -eq "vllm") {
   $env:SENTRIX_VLLM_MANAGER_API = $VllmManagerUrl.TrimEnd('/')
   $env:BENCH_VLLM_BASE_URL = $env:SENTRIX_VLLM_BASE_URL
   $env:BENCH_VLLM_API_URL = $env:SENTRIX_VLLM_MANAGER_API
-  # Keep the main-branch split: Agent uses vLLM, while the configured Judge
-  # provider remains separate and therefore does not consume vLLM GPU slots.
-  Remove-Item Env:BENCH_JUDGE_URL -ErrorAction SilentlyContinue
-  Remove-Item Env:BENCH_JUDGE_MODEL -ErrorAction SilentlyContinue
-  $env:PHOTOBENCH_QA_CONCURRENCY = "16"
-  $env:PHOTOBENCH_JUDGE_CONCURRENCY = "8"
-  $env:SENTRIX_ASSISTANT_TURN_WORKERS = "16"
+  # The local Qwen3-VL 4B WSL server advertises max_num_seqs=16, but that is
+  # the scheduler ceiling, not a safe Windows-client burst size.  A 16-way
+  # PhotoBench burst leaves half of the requests queued until the 180 s HTTP
+  # timeout (measured on this host), which produces planner_call_error and
+  # makes retrieval recall appear as 0.  Four workers keep the GPU saturated
+  # without starving requests; callers may still override these after launch.
+  $env:PHOTOBENCH_QA_CONCURRENCY = "4"
+  $env:PHOTOBENCH_JUDGE_CONCURRENCY = "2"
+  $env:SENTRIX_ASSISTANT_TURN_WORKERS = "4"
 } else {
   # Local Ollama model available on this Windows host.
   $env:SENTRIX_LLM_BACKEND = "ollama"
@@ -158,13 +164,15 @@ if ($ffmpegBin) {
 $python = "E:\anaconda\envs\magma\python.exe"
 if (-not (Test-Path $python)) { $python = Join-Path $root ".venv\Scripts\python.exe" }
 if (-not (Test-Path $python)) { Write-Error "python not found: $python" }
+$env:PHOTOBENCH_PYTHON = $python
 $env:PYTHONFAULTHANDLER = "1"
 
 # vLLM is deliberately not started by this project.  Start or inspect it from
 # D:\vllm-runtime\start-gemma-vllm.ps1, then start Sentrix normally.
 if (-not $Status -and $LlmBackend -eq "vllm" -and $VllmBaseUrl -match "127\.0\.0\.1:8000") {
   try {
-    Invoke-RestMethod -Uri "$($env:SENTRIX_VLLM_BASE_URL)/models" -TimeoutSec 3 | Out-Null
+    # Do not send the local WSL loopback probe through a corporate proxy.
+    Invoke-RestMethod -Uri "$($env:SENTRIX_VLLM_BASE_URL)/models" -NoProxy -TimeoutSec 3 | Out-Null
   } catch {
     Write-Warning "Local WSL vLLM is not ready. Start it separately: D:\vllm-runtime\start-gemma-vllm.ps1"
   }
@@ -273,21 +281,31 @@ for ($i = 0; $i -lt 20; $i++) {
 # local evaluator as part of the normal project boot, while keeping the UI
 # ensure endpoint as a safe retry path.  A missing Judge/Ollama endpoint must
 # not prevent the core Sentrix Web/API from starting.
-$photobenchScript = Join-Path $root "services\photobench\scripts\start-local.ps1"
 $photobenchReady = $false
-if (Test-Path $photobenchScript) {
-  try {
-    # Do not pipe the child PowerShell through Out-Host.  In an interactive
-    # console that pipeline can remain open after PhotoBench has printed its
-    # ready message, making the launcher appear frozen without a prompt.
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $photobenchScript
-    $photobenchReady = Test-Port $photobenchPort
-    if (-not $photobenchReady) {
-      Write-Warning "PhotoBench start command returned, but port 8771 is not listening"
-    }
-  } catch {
-    Write-Warning "PhotoBench evaluator did not start: $($_.Exception.Message)"
+try {
+  # The previous path pointed at a script that no longer exists after the
+  # main-branch merge.  Start the evaluator directly with the same Python and
+  # environment as the API, instead of leaving the UI to lazily revive a stale
+  # 8771 process that may still target a remote Sentrix instance.
+  $photobenchDir = Join-Path $root "services\photobench"
+  $photobenchLog = Join-Path $photobenchDir "logs\orchestrator.log"
+  $photobenchErr = Join-Path $photobenchDir "logs\orchestrator.err.log"
+  $photobenchProc = Start-Process -FilePath $python `
+    -ArgumentList @("backend/benchmark_orchestrator.py", "--host", "0.0.0.0", "--port", "$photobenchPort") `
+    -WorkingDirectory $photobenchDir -WindowStyle Hidden `
+    -RedirectStandardOutput $photobenchLog -RedirectStandardError $photobenchErr -PassThru
+  for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Milliseconds 300
+    try {
+      if ((Invoke-WebRequest "http://127.0.0.1:$photobenchPort/api/config" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) {
+        $photobenchReady = $true
+        break
+      }
+    } catch { }
   }
+  if (-not $photobenchReady) { Write-Warning "PhotoBench evaluator did not become ready; check $photobenchLog" }
+} catch {
+  Write-Warning "PhotoBench evaluator did not start: $($_.Exception.Message)"
 }
 "Ready:"
 "  Web  http://127.0.0.1:$webPort  $(if ($webOk) {'OK'} else {'no response; check log'})"

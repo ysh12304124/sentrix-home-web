@@ -7,8 +7,10 @@ installing the Sentrix vLLM Manager.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 import threading
+import urllib.request
 
 import httpx
 
@@ -89,6 +91,12 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         # uvicorn.  Keep one transport per configured endpoint instead.
         # Local model endpoints must not inherit an enterprise proxy either.
         self._stream_client = httpx.Client(timeout=self.timeout, trust_env=False)
+        # Binding an external local vLLM endpoint probes ``/v1/models`` before
+        # a run starts.  These non-streaming calls used module-level httpx
+        # helpers, which inherited Windows HTTP_PROXY and made 127.0.0.1:8000
+        # time out even though the server was healthy.  Keep one no-proxy
+        # client for every request path, not only streaming.
+        self._client = httpx.Client(timeout=self.timeout, trust_env=False)
         self._stream_lock = threading.RLock()
 
     @property
@@ -103,7 +111,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
             root = self.base_url.removesuffix("/v1")
             for suffix in ("/health", "/api/health"):
                 try:
-                    response = httpx.get(f"{root}{suffix}", headers=self.headers, timeout=min(10, self.timeout))
+                    response = self._client.get(f"{root}{suffix}", headers=self.headers, timeout=min(10, self.timeout))
                     response.raise_for_status()
                     body = response.json() if response.content else {}
                     return {"status": "available", "source": suffix, "detail": body}
@@ -112,9 +120,40 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
             return {"status": "unavailable", "error": str(models_error)}
 
     def list_models(self) -> dict:
-        response = httpx.get(f"{self.base_url}/models", headers=self.headers, timeout=min(15, self.timeout))
-        response.raise_for_status()
-        body = response.json()
+        def stdlib_models():
+            request = urllib.request.Request(
+                f"{self.base_url}/models", headers=self.headers, method="GET",
+            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=min(15, self.timeout)) as reply:
+                return json.loads(reply.read().decode("utf-8"))
+
+        is_loopback = self.base_url.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]"))
+        if is_loopback:
+            # WSL-hosted vLLM occasionally drops an httpx/WinHTTP loopback
+            # connection, while the stdlib no-proxy transport is stable.
+            try:
+                body = stdlib_models()
+            except Exception:
+                response = self._client.get(
+                    f"{self.base_url}/models", headers=self.headers,
+                    timeout=min(15, self.timeout),
+                )
+                response.raise_for_status()
+                body = response.json()
+        else:
+            try:
+                response = self._client.get(
+                    f"{self.base_url}/models", headers=self.headers,
+                    timeout=min(15, self.timeout),
+                )
+                response.raise_for_status()
+                body = response.json()
+            except httpx.HTTPError as http_error:
+                try:
+                    body = stdlib_models()
+                except Exception as fallback_error:
+                    raise http_error from fallback_error
         models = [
             str(item.get("id")) for item in body.get("data") or []
             if isinstance(item, dict) and item.get("id")
@@ -126,7 +165,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         if self.api_mode == "generic":
             body.pop("chat_template_kwargs", None)
             body = {key: value for key, value in body.items() if value is not None}
-        response = httpx.post(
+        response = self._client.post(
             f"{self.base_url}/chat/completions", json=body, headers=self.headers,
             timeout=timeout or self.timeout,
         )
@@ -150,11 +189,12 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
     def close(self):
         """Release the shared streaming transport during controlled teardown."""
         self._stream_client.close()
+        self._client.close()
 
     def token_count(self, messages: list[dict], *, timeout: float = 15) -> dict | None:
         if not self.manager_url:
             return None
-        response = httpx.post(
+        response = self._client.post(
             f"{self.manager_url}/tokenize-current",
             json={"messages": messages, "add_generation_prompt": True},
             timeout=min(timeout, self.timeout),

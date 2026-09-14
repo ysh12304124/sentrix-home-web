@@ -1820,12 +1820,38 @@ class AgentRuntime:
                                  "status": "open",
                              } for item in declaration.get("requirements") or []]})
             if self.profile.features.get("agent2_authoritative") and not planner_result.ok:
-                turn.final_answer = "当前问题的证据需求无法可靠规划，因此暂时无法确认。"
-                turn.status = "partial"
-                turn.reason = planner_result.fallback_reason or "planner_invalid"
-                turn.termination_reason = "planner_blocked"
-                self.chat_fn = _orig_chat_fn
-                return turn
+                # A transient planner timeout must not terminate the turn before
+                # retrieval.  The old behaviour converted every vLLM queue/read
+                # timeout into a refusal, yielding zero retrieval recall even
+                # though the legacy tool loop could still search the album.
+                # Build the smallest safe declaration locally and continue with
+                # the normal tool loop; the user question remains the semantic
+                # retrieval goal and memory_asset is the only required source.
+                from .task_state import TaskDeclaration, EvidenceRequirement
+                fallback_declaration = TaskDeclaration(
+                    goal=str(message or "").strip() or "检索相册中的相关记忆",
+                    scope_id=self.scope_id,
+                    requirements=(EvidenceRequirement(
+                        id="req_fallback_memory",
+                        evidence_type="memory_asset",
+                        description="从相册中检索与用户问题相关的照片或视频",
+                        required=True,
+                    ),),
+                )
+                agent2_task_state = Agent2TaskState.from_declaration(fallback_declaration)
+                agent2_evidence_ledger = EvidenceLedger(scope_id=self.scope_id)
+                decision.update({
+                    "status": "fallback_recovery",
+                    "reason": planner_result.fallback_reason or "planner_invalid",
+                })
+                turn.agent2_trace = {
+                    "trace_version": 2,
+                    "task_declaration": fallback_declaration.as_dict(),
+                    "task_state": agent2_task_state.as_dict(),
+                    "evidence_ledger": agent2_evidence_ledger.as_dict(),
+                    "planner_decisions": [decision],
+                    "planner_revisions": [],
+                }
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
         is_candidate_mode = bool(
             self.profile.features.get("agent2_authoritative")

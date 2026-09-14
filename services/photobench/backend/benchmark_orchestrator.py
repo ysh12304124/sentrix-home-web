@@ -25,8 +25,10 @@ import re
 import shutil
 import shlex
 import socket
+import sqlite3
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -107,13 +109,20 @@ JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
 JUDGE_REQUEST_INTERVAL_SECONDS = max(
     0.0, float(os.environ.get("PHOTOBENCH_JUDGE_REQUEST_INTERVAL_SECONDS", "0.5"))
 )
+from backend.face_clustering import pairwise_metrics
+from backend.graph_memory.service import GraphMemoryService
 
 
 def _judge_thinking_kwargs(judge_url: str | None) -> dict:
-    """Disable cloud-provider reasoning while preserving local judge payloads."""
+    """Disable reasoning using the option understood by the active provider."""
     endpoint = str(judge_url or "").lower()
     if "volces.com" in endpoint or "volcengine.com" in endpoint:
         return {"thinking": {"type": "disabled"}}
+    # vLLM forwards this value to Qwen's chat template.  ``enable_thinking``
+    # at the payload top level is ignored by vLLM, which needlessly lets the
+    # judge consume a long reasoning response for every QA item.
+    if "vllm" in endpoint or ":8000" in endpoint:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
     return {"enable_thinking": False}
 
 
@@ -1338,6 +1347,106 @@ def load_jsonl(path: Path) -> list[dict]:
         if line:
             rows.append(json.loads(line))
     return rows
+
+
+def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
+    """Evaluate clustering only inside PhotoBench, where identity GT is allowed.
+
+    The production API deliberately never reads benchmark sidecars.  Keeping
+    this calculation here prevents evaluation labels leaking into retrieval,
+    while making the score reproducible for full and reused benchmark runs.
+    """
+    truth_path = album_dir / "identity" / "face_info_cn.json"
+    if not truth_path.is_file():
+        return {"available": False, "reason": "benchmark identity GT not found"}
+    try:
+        image_to_face_ids = (json.loads(truth_path.read_text(encoding="utf-8"))
+                             .get("image_to_face_ids") or {})
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"available": False, "reason": f"benchmark identity GT could not be read: {exc}"}
+
+    # A multi-person GT image cannot be mapped unambiguously to one detected
+    # face without an annotation box, so it is intentionally excluded.
+    truth_by_name = {
+        Path(str(name)).name.lower(): str(face_ids[0])
+        for name, face_ids in image_to_face_ids.items()
+        if isinstance(face_ids, list) and len(face_ids) == 1
+    }
+    excluded_multi_face = sum(
+        1 for face_ids in image_to_face_ids.values()
+        if isinstance(face_ids, list) and len(face_ids) != 1
+    )
+    db_path = REPOSITORY_ROOT / "data" / "sentrix.db"
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT fi.id, fi.cluster_id, a.file_name "
+                "FROM face_instances fi JOIN assets a ON a.id = fi.asset_id "
+                "WHERE a.scope_id = ?", (scope_id,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return {"available": False, "reason": f"face clustering data could not be read: {exc}"}
+
+    by_file: dict[str, list[tuple[str, str | None]]] = {}
+    for face_id, cluster_id, file_name in rows:
+        by_file.setdefault(Path(str(file_name)).name.lower(), []).append(
+            (str(face_id), str(cluster_id) if cluster_id else None)
+        )
+    predicted, truth = {}, {}
+    excluded_ambiguous = 0
+    for file_name, label in truth_by_name.items():
+        detected = by_file.get(file_name) or []
+        if len(detected) != 1 or not detected[0][1]:
+            excluded_ambiguous += 1
+            continue
+        face_id, cluster_id = detected[0]
+        predicted[face_id] = cluster_id
+        truth[face_id] = label
+    if len(predicted) < 2:
+        return {
+            "available": False,
+            "reason": "fewer than two unambiguous labelled face instances",
+            "excluded_multi_face": excluded_multi_face,
+            "excluded_ambiguous": excluded_ambiguous,
+        }
+    counts = pairwise_metrics(predicted, truth)
+    false_merge_denominator = counts["true_positive"] + counts["false_positive"]
+    return {
+        "available": True,
+        "ground_truth_source": str(truth_path.relative_to(album_dir)),
+        "same_person_pair_precision": counts["precision"],
+        "same_person_pair_recall": counts["recall"],
+        "same_person_pair_f1": counts["f1"],
+        "false_merge_rate": (
+            counts["false_positive"] / false_merge_denominator
+            if false_merge_denominator else 0.0
+        ),
+        "true_positive_pair_count": counts["true_positive"],
+        "false_positive_pair_count": counts["false_positive"],
+        "false_negative_pair_count": counts["false_negative"],
+        "evaluable_pair_count": len(predicted) * (len(predicted) - 1) // 2,
+        "evaluable_face_count": len(predicted),
+        "excluded_multi_face": excluded_multi_face,
+        "excluded_ambiguous": excluded_ambiguous,
+    }
+
+
+def benchmark_graph_quality_snapshot(scope_id: str, album_dir: Path) -> dict:
+    """Build an isolated, disposable projection for a run-quality snapshot."""
+    if not scope_id:
+        return {"available": False, "reason": "run has no memory scope"}
+    db_path = REPOSITORY_ROOT / "data" / "sentrix.db"
+    with tempfile.TemporaryDirectory(prefix="photobench-graph-quality-") as temp_dir:
+        graph_path = Path(temp_dir) / "graph_memory.db"
+        service = GraphMemoryService(db_path=db_path, graph_path=graph_path)
+        built = service.build(scope_id=scope_id, include_images=True, enable_causal_edges=False)
+        if not built.get("ok"):
+            return {"available": False, "scope_id": scope_id,
+                    "reason": str(built.get("error") or "graph projection could not be built")}
+        quality = service.quality(scope_id=scope_id)
+    quality["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+    quality["snapshot_source"] = "photobench_isolated_scope_projection"
+    return quality
 
 
 def load_task_action_policy() -> dict[tuple[str, str], str]:
@@ -4848,6 +4957,43 @@ class OrchestratorRepository:
             result["summary"] = self._effective_summary(state)
             return result
 
+    def get_graph_quality(self, run_id: str) -> dict:
+        """Return a run-bound graph-quality snapshot, never the mutable live graph.
+
+        ``graph_memory.db`` is a shared derived index and is replaced by the
+        next full build.  Reusing it for a historical run made old reports
+        incorrectly show 0 nodes/0 edges.  Build a scoped disposable graph
+        once, persist the resulting metrics with that run, and reuse it later.
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = run.state if isinstance(run, BenchmarkRun) else run
+            summary = state.get("summary") or {}
+            cached = summary.get("graph_quality")
+            if isinstance(cached, dict) and cached.get("scope_id") == (
+                state.get("scope_id") or state.get("existing_scope_id")
+            ):
+                return copy.deepcopy(cached)
+            scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+            album_id = str(state.get("album_id") or "").strip()
+
+        quality = benchmark_graph_quality_snapshot(
+            scope_id, BENCHMARK_DATA_ROOT / album_id,
+        )
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = run.state if isinstance(run, BenchmarkRun) else run
+            state.setdefault("summary", {})["graph_quality"] = quality
+            if isinstance(run, BenchmarkRun):
+                run.persist(wait=True)
+            else:
+                atomic_json(self.results_root / run_id / "run.json", state)
+            return copy.deepcopy(quality)
+
     def get_keyframe_analysis(self, run_id: str) -> dict:
         """Analyze whether video keyframes are useful for this complete run.
 
@@ -6073,6 +6219,8 @@ class OrchestratorRepository:
             "llm_context_tokens_p95": saved.get("llm_context_tokens_p95", cls._percentile(contexts, 0.95)),
             "llm_context_samples_count": saved.get("llm_context_samples_count", len(contexts)),
             "tool_performance": cls._aggregate_tool_performance(items),
+            "graph_qa_by_type": cls._aggregate_graph_qa_by_type(items),
+            "graph_qa_metric_scope": "end_to_end_retrieval_chain",
             "attribution": {"primary": attribution_primary, "layer_failures": attribution_layers},
             "delivery_breakdown": saved.get("delivery_breakdown", cls._aggregate_delivery(items)),
         })
@@ -6086,6 +6234,108 @@ class OrchestratorRepository:
                 state.get("phases") or {}, items,
             )
         return saved
+
+    @classmethod
+    def _aggregate_graph_qa_by_type(cls, items: list[dict]) -> list[dict]:
+        """Build the per-question-type graph report from persisted QA traces.
+
+        This deliberately lives in PhotoBench, where benchmark GT is allowed.
+        The runtime graph service never reads evaluator annotations, so it
+        cannot truthfully calculate per-question retrieval deltas on its own.
+        """
+        labels = {
+            "event_memory_qa": "事件记忆",
+            "single_evidence_memory_qa": "单证据记忆",
+            "multi_turn_clarify": "多轮澄清",
+            "time_sequence": "时间/时序",
+            "location_scene": "地点/场景",
+            "visual_scene_understanding": "视觉/场景理解",
+            "video_media": "视频/媒体",
+            "evidence_insufficient": "证据不足",
+            "prompt_injection": "提示注入",
+            "multi_hop": "多跳/因果",
+        }
+
+        def walk(value):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from walk(child)
+
+        def graph_trace(item):
+            for node in walk(item.get("tool_trace") or []):
+                timing = node.get("retrieval_timing")
+                if isinstance(timing, dict) and isinstance(timing.get("graph_policy"), dict):
+                    return timing
+            return None
+
+        buckets: dict[str, list[dict]] = {}
+        for item in items:
+            key = str(item.get("question_type") or item.get("task_type") or "other")
+            buckets.setdefault(key, []).append(item)
+
+        rows = []
+        for key, bucket in buckets.items():
+            recalls = [float(i.get("media_retrieval_recall", i.get("retrieval_recall"))) for i in bucket
+                       if isinstance(i.get("media_retrieval_recall", i.get("retrieval_recall")), (int, float))]
+            precisions = [float(i.get("media_retrieval_precision", i.get("retrieval_precision"))) for i in bucket
+                          if isinstance(i.get("media_retrieval_precision", i.get("retrieval_precision")), (int, float))]
+            f1s = [float(i.get("media_retrieval_f1", i.get("retrieval_f1"))) for i in bucket
+                   if isinstance(i.get("media_retrieval_f1", i.get("retrieval_f1")), (int, float))]
+            judge_scores = [score for i in bucket
+                            if (score := judge_score_for_summary(i.get("judge"))) is not None]
+            evidence_scores = [float((i.get("evidence_judge") or {}).get("score")) for i in bucket
+                               if isinstance((i.get("evidence_judge") or {}).get("score"), (int, float))]
+            routes = [trace for i in bucket if (trace := graph_trace(i)) is not None]
+            policies = [trace.get("graph_policy") or {} for trace in routes]
+            intents: dict[str, int] = {}
+            for policy in policies:
+                intent = str(policy.get("intent") or "ordinary")
+                intents[intent] = intents.get(intent, 0) + 1
+
+            deltas = []
+            improved = worsened = 0
+            for item, trace in ((i, graph_trace(i)) for i in bucket):
+                rerank = (trace or {}).get("graph_rerank") or {}
+                baseline = rerank.get("baseline_ranked_asset_ids") or []
+                final = rerank.get("reranked_asset_ids") or []
+                gt = {str(entry.get("asset_id")) for entry in (item.get("gt_media") or [])
+                      if isinstance(entry, dict) and entry.get("asset_id")}
+                if not baseline or not final or not gt:
+                    continue
+                before = len(set(map(str, baseline)) & gt) / len(gt)
+                after = len(set(map(str, final)) & gt) / len(gt)
+                delta = after - before
+                deltas.append(delta)
+                if delta > 1e-9:
+                    improved += 1
+                elif delta < -1e-9:
+                    worsened += 1
+            rows.append({
+                "type": key,
+                "label": labels.get(key, key),
+                "sample_count": len(bucket),
+                "retrieval_metric_count": len(recalls),
+                "graph_routed_count": len(routes),
+                "graph_enabled_count": sum(1 for policy in policies if policy.get("enabled") is True),
+                "graph_intents": intents,
+                "graph_effect_count": len(deltas),
+                "graph_recall_delta": round(sum(deltas) / len(deltas), 4) if deltas else None,
+                "graph_gt_improved_count": improved,
+                "graph_gt_worsened_count": worsened,
+                "retrieval_recall": round(sum(recalls) / len(recalls), 4) if recalls else None,
+                "retrieval_precision": round(sum(precisions) / len(precisions), 4) if precisions else None,
+                "retrieval_f1": round(sum(f1s) / len(f1s), 4) if f1s else None,
+                "answer_quality_mean": round(sum(judge_scores) / len(judge_scores), 3) if judge_scores else None,
+                "judge_valid_count": len(judge_scores),
+                "evidence_valid_count": len(evidence_scores),
+                "evidence_supported_rate": round(sum(1 for score in evidence_scores if score >= 2) / len(evidence_scores), 4)
+                    if evidence_scores else None,
+            })
+        return sorted(rows, key=lambda row: (-row["sample_count"], row["type"]))
 
     @classmethod
     def _aggregate_tool_performance(cls, items: list[dict]) -> dict:
@@ -6369,7 +6619,12 @@ class OrchestratorRepository:
 
     def _persist_run_state(self, run_id: str, run, state: dict) -> None:
         if isinstance(run, BenchmarkRun):
-            run.persist()
+            # Rejudge runs are commonly followed by a service restart from
+            # start.ps1.  The old async-only snapshot could still be queued
+            # when that restart killed the evaluator, silently discarding all
+            # newly computed judge scores.  This helper is used only by the
+            # rejudge path, so make that checkpoint durable before returning.
+            run.persist(wait=True)
             return
         run_dir = self.results_root / run_id
         atomic_json(run_dir / "run.json", state)
@@ -6397,6 +6652,8 @@ class OrchestratorRepository:
             "answer_quality_mean": round(sum(valid_scores) / denom, 3) if denom else None,
             "exact_accuracy": round(distribution["2"] / denom, 3) if denom else None,
             "core_accuracy": round((distribution["1"] + distribution["2"]) / denom, 3) if denom else None,
+            "graph_qa_by_type": OrchestratorRepository._aggregate_graph_qa_by_type(items),
+            "graph_qa_metric_scope": "end_to_end_retrieval_chain",
         })
         summary.update(BenchmarkRun._capability_summary(items, state.get("phases") or {}))
         state["summary"] = summary
@@ -6987,6 +7244,10 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/runs":
                 self._json({"runs": self.repo.list_runs()})
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/graph-quality"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/graph-quality"))
+                self._json(self.repo.get_graph_quality(run_id))
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/items"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/items"))

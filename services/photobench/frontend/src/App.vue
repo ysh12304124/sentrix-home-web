@@ -94,7 +94,29 @@ const api = async (path, options = {}) => {
 };
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
 const esc = (value) => String(value ?? "");
-const modelName = (run) => run?.model_profile || run?.model_name || run?.profile || "unknown";
+// vLLM's served ID is intentionally short, while the UI uses the product
+// model name.  Keep the raw value in <option value> and API requests.
+const modelDisplayName = (value) => (
+  /^qwen3-vl(?::|-)?4b(?:-instruct)?$/i.test(String(value || ""))
+    ? "qwen3-vl-4b-instruct"
+    : String(value || "")
+);
+const modelName = (run) => {
+  const storedName = run?.model_profile || run?.model_name || run?.profile || "unknown";
+  const backend = String(run?.model_backend || "").toLowerCase();
+  const endpoint = String(
+    run?.model_base_url
+      || run?.vllm_model_base_url
+      || run?.current_model_snapshot?.model_base_url
+      || "",
+  ).toLowerCase();
+  const isVllmRun = backend === "openai_compatible" || endpoint.includes(":8000");
+  const legacyVllmName = /^qwen3-vl(?::|-)?4b(?:-instruct)?$/i.test(String(storedName));
+
+  // 旧评测记录曾把 vLLM 的 served model 写成 Ollama 的标签；仅在 vLLM
+  // 调用链下做显示层兼容，避免把真实 Ollama 记录误标为 vLLM。
+  return isVllmRun && legacyVllmName ? modelDisplayName(storedName) : storedName;
+};
 const albumName = (run) => run?.scope_name || run?.album_id || run?.qa_name || "album";
 const qaName = (run) => run?.qa_set || run?.qa_name || "qa";
 const fmtDate = (value) => value ? new Date(value).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-";
@@ -747,16 +769,12 @@ function graphEvaluableEdgeSummary() {
 }
 async function loadGraphQuality() {
   const runId = activeRunId.value;
-  const base = String(sentrixUrl.value || "").trim().replace(/\/$/, "");
-  if (!runId || !base) { graphQuality.value = null; return; }
-  const run = activeRun.value;
-  const scopeId = run?.scope_id || run?.existing_scope_id || "";
+  if (!runId) { graphQuality.value = null; return; }
   graphQualityLoading.value = true;
   try {
-    const query = scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : "";
-    const response = await fetch(`${base}/api/graph-memory/quality${query}`, { headers: { "content-type": "application/json" } });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    // Graph memory is a mutable shared index.  Ask PhotoBench for the
+    // run-bound snapshot instead of auditing whichever scope was built last.
+    const payload = await api(`/api/runs/${encodeURIComponent(runId)}/graph-quality`);
     if (activeRunId.value === runId) graphQuality.value = payload;
   } catch (error) {
     if (activeRunId.value === runId) graphQuality.value = { available: false, reason: error.message };
@@ -2025,7 +2043,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <div v-if="currentModelInfo && currentModelPopoverOpen" class="current-model-popover" role="status" aria-live="polite">
               <span class="popover-arrow"></span>
               <div class="current-model-popover-head"><span>MODEL ENDPOINT</span><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></div>
-              <strong>{{ currentModelInfo.served_model_name || `${currentModelInfo.served_models.length} 个模型待选择` }}</strong>
+              <strong>{{ currentModelInfo.served_model_name ? modelDisplayName(currentModelInfo.served_model_name) : `${currentModelInfo.served_models.length} 个模型待选择` }}</strong>
               <div class="current-model-status"><i></i>{{ currentModelInfo.manager_available ? '已读取 Manager 当前运行状态' : '已连接 OpenAI-compatible 端点' }}</div>
               <dl>
                 <div><dt>模型服务</dt><dd>{{ currentModelInfo.model_base_url }}</dd></div>
@@ -2052,13 +2070,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <label class="endpoint-model-select">可用模型
               <select v-model="selectedEndpointModel" :disabled="!endpointModels.length" @change="onEndpointModelChange">
                 <option value="">{{ endpointModels.length ? '请选择模型' : '先获取模型列表' }}</option>
-                <option v-for="model in endpointModels" :key="model" :value="model">{{ model }}</option>
+                <option v-for="model in endpointModels" :key="model" :value="model">{{ modelDisplayName(model) }}</option>
               </select>
             </label>
             <button class="btn ghost compact endpoint-test-button" type="button" :disabled="!selectedEndpointModel || modelTestState === 'testing'" @click="testEndpointModel">{{ modelTestState === 'testing' ? '测试中…' : '测试 POST' }}</button>
             <span v-if="modelTestMessage" class="model-test-feedback" :class="`state-${modelTestState}`">{{ modelTestMessage }}</span>
             <label class="check endpoint-reuse-check" :class="{ active: selectedModels.has('__current__') }">
-              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ selectedEndpointModel }}，不启停）</span>
+              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ modelDisplayName(selectedEndpointModel) }}，不启停）</span>
             </label>
           </div>
           <div v-if="vllmManagerUrl.trim()" class="model-picker">

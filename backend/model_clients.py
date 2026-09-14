@@ -823,27 +823,75 @@ class GammaClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request_started = time.perf_counter()
+        budget_metrics = {
+            "requested_max_tokens": requested_max_tokens,
+            "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
+            "available_output_tokens": (
+                int(budget["max_model_len"]) - int(budget["prompt_tokens"])
+                if budget else None
+            ),
+            "max_model_len": int(budget["max_model_len"]) if budget else None,
+            "preflight_prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
+            "estimated_total_tokens": (
+                int(budget["prompt_tokens"]) + int(max_tokens)
+                if budget and max_tokens is not None else None
+            ),
+            "token_count_source": budget_source if (budget or is_cloud_api) else "response_usage",
+            "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
+            "preflight_fallback_reason": preflight_reason,
+        }
         try:
             return self._chat_openai_stream(
                 endpoint_base, payload, headers, role, model, json_mode=False,
-                budget_metrics={
-                    "requested_max_tokens": requested_max_tokens,
-                    "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
-                    "available_output_tokens": (
-                        int(budget["max_model_len"]) - int(budget["prompt_tokens"])
-                        if budget else None
-                    ),
-                    "max_model_len": int(budget["max_model_len"]) if budget else None,
-                    "preflight_prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
-                    "estimated_total_tokens": (
-                        int(budget["prompt_tokens"]) + int(max_tokens)
-                        if budget and max_tokens is not None else None
-                    ),
-                    "token_count_source": budget_source if (budget or is_cloud_api) else "response_usage",
-                    "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
-                    "preflight_fallback_reason": preflight_reason,
-                })
+                budget_metrics=budget_metrics)
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            # The local vLLM endpoint applies the chat template after our
+            # lightweight estimate.  A long evidence/result-set context can
+            # therefore be a few hundred tokens larger than the estimate.  In
+            # that case vLLM returns the exact output room in its 400 message;
+            # retry once with that bound instead of converting an otherwise
+            # valid turn into an empty answer / unscored benchmark item.
+            retry_max_tokens = self._vllm_available_output_tokens(error)
+            current_max_tokens = payload.get("max_tokens")
+            if (retry_max_tokens is not None and isinstance(current_max_tokens, int)
+                    and 16 <= retry_max_tokens < current_max_tokens):
+                retry_payload = dict(payload)
+                retry_payload["max_tokens"] = retry_max_tokens
+                retry_metrics = dict(budget_metrics)
+                retry_metrics.update({
+                    "effective_max_tokens": retry_max_tokens,
+                    "available_output_tokens": retry_max_tokens,
+                    "preflight_status": "vllm_context_retry",
+                    "preflight_fallback_reason": "vllm_reported_context_limit",
+                })
+                try:
+                    return self._chat_openai_stream(
+                        endpoint_base, retry_payload, headers, role, model,
+                        json_mode=False, budget_metrics=retry_metrics)
+                except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as retry_error:
+                    error = retry_error
+            # A second vLLM 400 form reports that the *input itself* is above
+            # max-model-len (rather than that the requested completion is too
+            # large).  This happens after several verbose tool observations.
+            # Keep the system prompt and latest observation intact, compact
+            # older tool observations, then retry the same turn once.
+            overflow_tokens = self._vllm_input_overflow_tokens(error)
+            compacted_messages = self._compact_messages_for_vllm_context(
+                payload.get("messages") or [], overflow_tokens)
+            if compacted_messages is not None:
+                retry_payload = dict(payload)
+                retry_payload["messages"] = compacted_messages
+                retry_metrics = dict(budget_metrics)
+                retry_metrics.update({
+                    "preflight_status": "vllm_context_compaction_retry",
+                    "preflight_fallback_reason": "vllm_reported_input_overflow",
+                })
+                try:
+                    return self._chat_openai_stream(
+                        endpoint_base, retry_payload, headers, role, model,
+                        json_mode=False, budget_metrics=retry_metrics)
+                except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as retry_error:
+                    error = retry_error
             error_detail = _http_error_detail(error)
             self._record_call_metrics(role, model, endpoint_base, {
                 "status": "error",
@@ -862,6 +910,74 @@ class GammaClient:
                 "preflight_fallback_reason": preflight_reason,
             })
             raise ModelError(f"model request failed: {error_detail}") from error
+
+    @staticmethod
+    def _vllm_available_output_tokens(error) -> int | None:
+        """Extract vLLM's exact remaining generation room from a 400 body."""
+        response = getattr(error, "response", None)
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return None
+        try:
+            body = response.text
+        except Exception:
+            return None
+        # vLLM: "384 > 4501 - 4311".  Prefer the explicit subtraction over
+        # the requested value so this remains valid for max_completion_tokens.
+        match = re.search(r"\b(\d+)\s*>\s*(\d+)\s*-\s*(\d+)", str(body))
+        if not match:
+            return None
+        available = int(match.group(2)) - int(match.group(3))
+        return max(0, available)
+
+    @staticmethod
+    def _vllm_input_overflow_tokens(error) -> int | None:
+        """Return how far a vLLM prompt exceeds its context window."""
+        response = getattr(error, "response", None)
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return None
+        try:
+            body = str(response.text)
+        except Exception:
+            return None
+        match = re.search(
+            r"maximum context length is\s*(\d+)\s*tokens.*?request has\s*(\d+)\s*input tokens",
+            body, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        return max(0, int(match.group(2)) - int(match.group(1)))
+
+    @staticmethod
+    def _compact_messages_for_vllm_context(messages, overflow_tokens: int | None):
+        """Shrink prior tool-result messages without removing the latest evidence."""
+        if not overflow_tokens or overflow_tokens < 1 or len(messages) < 4:
+            return None
+        compacted = [dict(message) if isinstance(message, dict) else message for message in messages]
+        # Four chars/token is intentionally conservative.  Reduce at least the
+        # reported overflow plus a safety margin for vLLM's chat template.
+        remaining_chars = max(1200, (int(overflow_tokens) + 96) * 4)
+        changed = False
+        # Never compact the system message or newest tool observation.
+        for index in range(1, len(compacted) - 1):
+            message = compacted[index]
+            if not isinstance(message, dict) or str(message.get("role") or "") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or len(content) <= 900:
+                continue
+            keep_head, keep_tail = 620, 180
+            removed = len(content) - keep_head - keep_tail
+            if removed <= 0:
+                continue
+            message["content"] = (
+                content[:keep_head]
+                + "\n[较早工具返回已压缩；保留关键信息]\n"
+                + content[-keep_tail:]
+            )
+            remaining_chars -= removed
+            changed = True
+            if remaining_chars <= 0:
+                break
+        return compacted if changed else None
 
     def _tokenize_for_budget(self, endpoint_base, messages):
         """Ask the Manager bound to this endpoint to tokenize with the active model."""
