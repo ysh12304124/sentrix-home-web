@@ -5570,7 +5570,7 @@ class MemoryStore:
         self.connection.commit()
         return self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
 
-    _FAMILY_MEMBERSHIPS = {"core_family", "relative", "close_friend", "friend", "unknown"}
+    _FAMILY_MEMBERSHIPS = {"family", "friend", "unknown"}
     _FAMILY_SOURCES = {"model", "user_override"}
 
     def _family_entity(self, scope_id, entity_id):
