@@ -1607,22 +1607,10 @@ def _execute_family_analysis_run(run_id: str, scope_id: str):
 @app.get("/api/family-graph")
 def family_graph(scope_id: str):
     scope_ids = store.family_graph_scope_ids(scope_id)
-    people = []
-    for item_scope_id in scope_ids:
-      for entity in store.list_entities(scope_id=item_scope_id):
-        if entity.get("entity_type") != "person":
-            continue
-        membership = store.get_effective_family_membership(item_scope_id, entity["id"])
-        people.append({
-            "id": entity["id"],
-            "display_name": entity.get("canonical_name") or "待命名成员",
-            "membership": membership,
-            "portrait": store.get_active_family_portrait(item_scope_id, entity["id"]),
-        })
     return {
         "scope_id": scope_id,
         "run": store.latest_family_analysis_run(scope_id),
-        "people": people,
+        "people": store.family_graph_people(scope_ids),
         "scope_ids": scope_ids,
         "relationships": [rel for item_scope_id in scope_ids for rel in store.list_effective_family_relationships(item_scope_id)],
     }
@@ -1662,6 +1650,20 @@ def update_family_relationship(payload: dict):
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
     return {"ok": True, "relationships": rows}
+
+
+@app.delete("/api/family-graph/relationships")
+def retract_family_relationship(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    subject_entity_id = str((payload or {}).get("subject_entity_id") or "").strip()
+    object_entity_id = str((payload or {}).get("object_entity_id") or "").strip()
+    if not scope_id or not subject_entity_id or not object_entity_id:
+        raise HTTPException(status_code=400, detail="scope_id, subject_entity_id and object_entity_id are required")
+    try:
+        rows = store.retract_family_relationship(scope_id, subject_entity_id, object_entity_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "retracted": rows}
 
 
 @app.post("/api/family-graph/runs")

@@ -60,3 +60,23 @@ class FamilyGraphStoreTests(unittest.TestCase):
         self.assertEqual(retained["membership"], "friend")
         self.assertEqual(retained["source"], "user_override")
         self.assertTrue(retained["locked"])
+
+    def test_user_retraction_blocks_later_model_relationship(self):
+        self.store.set_family_relationship(
+            "album-a", self.father["id"], "父亲", self.daughter["id"], "女儿",
+            source="user_override", confidence=1.0,
+        )
+
+        retracted = self.store.retract_family_relationship(
+            "album-a", self.father["id"], self.daughter["id"],
+        )
+        self.assertEqual(len(retracted), 2)
+        self.assertTrue(all(row["state"] == "retracted" for row in retracted))
+        self.assertEqual(self.store.list_effective_family_relationships("album-a"), [])
+
+        retained = self.store.set_family_relationship(
+            "album-a", self.father["id"], "父亲", self.daughter["id"], "女儿",
+            source="model", confidence=0.99,
+        )
+        self.assertEqual(retained, [])
+        self.assertEqual(self.store.list_effective_family_relationships("album-a"), [])

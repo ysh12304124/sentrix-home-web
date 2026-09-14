@@ -738,6 +738,19 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_family_relationship_effective
                 ON family_relationships(scope_id, subject_entity_id, object_entity_id, state);
+            CREATE TABLE IF NOT EXISTS family_relationship_blocks (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                left_entity_id TEXT NOT NULL REFERENCES entities(id),
+                right_entity_id TEXT NOT NULL REFERENCES entities(id),
+                source TEXT NOT NULL,
+                locked INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(scope_id, left_entity_id, right_entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_relationship_blocks_pair
+                ON family_relationship_blocks(scope_id, left_entity_id, right_entity_id);
             CREATE TABLE IF NOT EXISTS family_analysis_runs (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
@@ -5624,6 +5637,47 @@ class MemoryStore:
         )
         return [self._decode_family_row(row) for row in rows]
 
+    def family_graph_people(self, scope_ids):
+        """Return the small, render-ready person projection for the family graph."""
+        people = []
+        for scope_id in scope_ids:
+            for entity in self.list_entities(scope_id=scope_id):
+                if entity.get("entity_type") != "person":
+                    continue
+                avatar = self._row(
+                    """SELECT fi.id FROM face_instances fi
+                    JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    WHERE fc.entity_id = ? AND fc.status != 'rejected'
+                    ORDER BY fi.quality DESC, fi.detection_confidence DESC, fi.created_at ASC LIMIT 1""",
+                    (entity["id"],),
+                )
+                media = self._rows(
+                    """SELECT DISTINCT a.id, a.media_type, a.file_name
+                    FROM face_instances fi
+                    JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    JOIN assets a ON a.id = fi.asset_id
+                    WHERE fc.entity_id = ? AND fc.status != 'rejected'
+                    ORDER BY a.id DESC LIMIT 3""",
+                    (entity["id"],),
+                )
+                appearance_count = self._row(
+                    """SELECT COUNT(*) AS count FROM face_instances fi
+                    JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    WHERE fc.entity_id = ? AND fc.status != 'rejected'""",
+                    (entity["id"],),
+                )
+                people.append({
+                    "id": entity["id"],
+                    "scope_id": scope_id,
+                    "display_name": entity.get("canonical_name") or "待命名人物",
+                    "membership": self.get_effective_family_membership(scope_id, entity["id"]),
+                    "portrait": self.get_active_family_portrait(scope_id, entity["id"]),
+                    "avatar_face_instance_id": avatar["id"] if avatar else None,
+                    "appearance_count": int((appearance_count or {}).get("count") or 0),
+                    "representative_media": [dict(row) for row in media],
+                })
+        return people
+
     def set_family_membership(self, scope_id, entity_id, membership, *, source,
                               confidence=0.0, evidence_refs=None, inference_run_id=None):
         scope_id = scope_id or "home-default"
@@ -5670,6 +5724,52 @@ class MemoryStore:
         )
         return [self._decode_family_row(row) for row in rows]
 
+    @staticmethod
+    def _family_pair_key(subject_entity_id, object_entity_id):
+        return tuple(sorted((subject_entity_id, object_entity_id)))
+
+    def _family_relationship_block(self, scope_id, subject_entity_id, object_entity_id):
+        left_entity_id, right_entity_id = self._family_pair_key(subject_entity_id, object_entity_id)
+        return self._row(
+            """SELECT * FROM family_relationship_blocks
+            WHERE scope_id = ? AND left_entity_id = ? AND right_entity_id = ?""",
+            (scope_id, left_entity_id, right_entity_id),
+        )
+
+    def retract_family_relationship(self, scope_id, subject_entity_id, object_entity_id):
+        """Retract a pair without erasing history and keep model inference from restoring it."""
+        scope_id = scope_id or "home-default"
+        self._family_entity(scope_id, subject_entity_id)
+        self._family_entity(scope_id, object_entity_id)
+        current = self._effective_family_pair(scope_id, subject_entity_id, object_entity_id)
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                """UPDATE family_relationships SET state = 'retracted', updated_at = ?
+                WHERE scope_id = ? AND state = 'effective' AND (
+                    (subject_entity_id = ? AND object_entity_id = ?)
+                    OR (subject_entity_id = ? AND object_entity_id = ?)
+                )""",
+                (timestamp, scope_id, subject_entity_id, object_entity_id, object_entity_id, subject_entity_id),
+            )
+        left_entity_id, right_entity_id = self._family_pair_key(subject_entity_id, object_entity_id)
+        block = self._family_relationship_block(scope_id, subject_entity_id, object_entity_id)
+        if block:
+            self.connection.execute(
+                "UPDATE family_relationship_blocks SET source = 'user_override', locked = 1, updated_at = ? WHERE id = ?",
+                (timestamp, block["id"]),
+            )
+        else:
+            self.connection.execute(
+                """INSERT INTO family_relationship_blocks(
+                    id, scope_id, left_entity_id, right_entity_id, source, locked, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'user_override', 1, ?, ?)""",
+                (make_id("family_rel_block"), scope_id, left_entity_id, right_entity_id, timestamp, timestamp),
+            )
+        self.connection.commit()
+        return [self._decode_family_row(self._row("SELECT * FROM family_relationships WHERE id = ?", (row["id"],)))
+                for row in current]
+
     def list_effective_family_relationships(self, scope_id, entity_id=None):
         if entity_id:
             rows = self._rows(
@@ -5702,6 +5802,11 @@ class MemoryStore:
             raise ValueError("family relationship requires both predicates")
         from .family_graph import validate_relationship_pair
         validate_relationship_pair(predicate, inverse_predicate)
+        block = self._family_relationship_block(scope_id, subject_entity_id, object_entity_id)
+        if source == "model" and block and block["locked"]:
+            return []
+        if source == "user_override" and block:
+            self.connection.execute("DELETE FROM family_relationship_blocks WHERE id = ?", (block["id"],))
         current = self._effective_family_pair(scope_id, subject_entity_id, object_entity_id)
         if source == "model" and any(row.get("locked") for row in current):
             return current
