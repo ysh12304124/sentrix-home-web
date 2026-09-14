@@ -18,7 +18,7 @@ from .budget_manager import BudgetState
 # 单个需求的最大取证尝试次数：达到仍未 satisfied → failed 终态（已尝试未确认），
 # 避免模型反复 search 无证据而一直 running、耗尽预算导致"未完成"。
 _MAX_REQUIREMENT_ATTEMPTS = 3
-from .jit_prompt import build_jit_system_prompt
+from .jit_prompt import build_jit_system_prompt, select_jit_tool_specs
 from .answer_nucleus import (build_nucleus, classify_deterministic,
                              render_simple)
 from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
@@ -32,6 +32,7 @@ from .profile import get_profile
 from .result_set import TaskState
 from .tool_policy import ToolPolicy
 from .tool_registry import get_tool, list_tools
+from .runtime_contract import serialize_runtime_action
 
 
 def _people_count_from_summary(text: str) -> int:
@@ -227,8 +228,8 @@ def _normalize_selected_image_handles(handles, preview_handles, limit: int = 6) 
 
 
 def _model_visible_action(action: dict) -> str:
-    """Feed the parsed action back without model reasoning or prose."""
-    return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+    """Feed the canonical Sentrix action back to the model."""
+    return serialize_runtime_action(action)
 
 
 _RECOVERY_MESSAGE_MARKERS = (
@@ -464,6 +465,7 @@ def public_agent2_trace(trace: dict | None) -> dict:
             "failure_reason": str(requirement.get("failure_reason") or ""),
             "attempt_count": int(requirement.get("attempt_count") or 0),
             "last_attempt": str(requirement.get("last_attempt") or ""),
+            "description": str(requirement.get("description") or ""),
         })
     entries = ((trace.get("evidence_ledger") or {}).get("entries") or [])
     partial_entries = sum(
@@ -474,6 +476,7 @@ def public_agent2_trace(trace: dict | None) -> dict:
     )
     return {
         "trace_version": int(trace.get("trace_version") or 1),
+        "goal": str(((trace.get("task_declaration") or {}).get("goal")) or ""),
         "requirements": public_requirements,
         "requirement_status_counts": status_counts,
         "evidence_coverage": {"entries": len(entries), "partial_entries": partial_entries},
@@ -485,6 +488,63 @@ def public_agent2_trace(trace: dict | None) -> dict:
         "terminal_reason": str(trace.get("terminal_reason") or ""),
         "budget_outcome": dict(trace.get("budget_outcome") or {}),
     }
+
+
+def public_timeline_tool_payload(tool: str, observation: dict | None) -> dict:
+    """Project an existing tool observation into the ordinary-user timeline.
+
+    This is serialization and redaction only: it never derives a new fact and
+    deliberately keeps private asset IDs out of browser-visible text.
+    """
+    def safe(value):
+        private_keys = {"asset_id", "asset_ids", "source_asset_ids", "retrieved_asset_ids",
+                        "evidence_asset_ids", "scope_id", "source_video_asset_id",
+                        "observation_id", "observation_ids", "result_set_id", "face_id",
+                        "selected_face_id", "target_face_id", "_model_call_metrics"}
+        if isinstance(value, dict):
+            return {key: safe(item) for key, item in value.items()
+                    if key not in private_keys and not key.startswith("_")}
+        if isinstance(value, list):
+            return [safe(item) for item in value]
+        return value
+
+    observation = observation or {}
+    payload = {"tool": tool, "summary": str(observation.get("summary") or ""),
+               "certainty": str(observation.get("certainty") or ""),
+               "status": str(observation.get("status") or ""),
+               "reason": str(observation.get("reason") or "")}
+    if tool in {"search_memories", "get_result_page"}:
+        payload.update({key: observation.get(key) for key in (
+            "query", "total", "retrieved_total", "remaining", "has_more",
+            "condition_summary", "gaps", "filters_applied", "retrieval_channels",
+            "recommended_resolution", "page", "shown") if observation.get(key) is not None})
+        preview = []
+        for item in observation.get("preview") or []:
+            if not isinstance(item, dict):
+                continue
+            asset_id = str(item.get("asset_id") or "")
+            preview.append({
+                "handle": str(item.get("handle") or ""),
+                "captured_at": item.get("captured_at") or "",
+                "place": item.get("place") or "",
+                "activity": item.get("activity") or "",
+                "evidence_summary": item.get("evidence_summary") or "",
+                "media_kind": item.get("media_kind") or "image",
+                "media_url": f"/api/assets/{asset_id}/file" if asset_id else "",
+            })
+        payload["preview"] = preview
+    elif tool == "inspect_photo":
+        payload.update({key: observation.get(key) for key in (
+            "asset_handle", "question", "observation", "target_person",
+            "target_face_status", "unconfirmed_people_count") if observation.get(key) is not None})
+    elif tool == "read_photo_text":
+        payload.update({key: observation.get(key) for key in (
+            "asset_handle", "text", "ocr_text", "question") if observation.get(key) is not None})
+    else:
+        payload.update({key: observation.get(key) for key in (
+            "operation", "value", "items", "cards", "matches", "coverage",
+            "filters_applied", "delivered", "blocked", "note") if observation.get(key) is not None})
+    return safe(payload)
 
 
 def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
@@ -1600,7 +1660,9 @@ class AgentRuntime:
         return out
 
     @staticmethod
-    def _emit_progress(turn, callback, *, stage: str, text: str, status: str) -> None:
+    def _emit_progress(turn, callback, *, stage: str, text: str, status: str,
+                       kind: str = "status", event_id: str = "",
+                       parent_event_id: str = "", payload: dict | None = None) -> None:
         """记录一条公开进度事件（C13 数据合同：stage/step_index/timestamp 增量推送）。"""
         from datetime import datetime
         event = {
@@ -1610,6 +1672,14 @@ class AgentRuntime:
             "step_index": len(turn.public_progress) + 1,
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
+        if kind:
+            event["kind"] = kind
+        if event_id:
+            event["event_id"] = event_id
+        if parent_event_id:
+            event["parent_event_id"] = parent_event_id
+        if payload:
+            event["payload"] = payload
         turn.public_progress.append(event)
         if callback is not None:
             try:
@@ -1620,7 +1690,7 @@ class AgentRuntime:
     def run(self, message: str, *, history: str = "", task_state: dict | None = None,
             progress_callback=None, selected_handle: str | None = None,
             selected_result_set_id: str | None = None,
-            conversation_summary: str = "") -> RuntimeTurn:
+            conversation_summary: str = "", should_cancel=None) -> RuntimeTurn:
         """progress_callback(event: dict) 在每次新增公开进度事件后调用（C13 数据合同：stage/step_index/timestamp 增量推送）。"""
         turn = RuntimeTurn(profile=self.profile.name, budget=BudgetState(
             max_model_steps=self.profile.max_model_steps,
@@ -1630,6 +1700,23 @@ class AgentRuntime:
             final_reserve_s=self.profile.final_reserve_s,
         ))
         turn.budget.start()
+        def cancelled() -> bool:
+            try:
+                return bool(should_cancel and should_cancel())
+            except Exception:
+                return False
+
+        def stop_turn() -> RuntimeTurn:
+            turn.status = "cancelled"
+            turn.reason = "cancelled_by_user"
+            turn.termination_reason = "cancelled_by_user"
+            self._emit_progress(turn, progress_callback, stage="terminal",
+                                status="cancelled", text="已停止本轮回答。",
+                                kind="terminal", event_id="terminal_cancelled")
+            return turn
+
+        if cancelled():
+            return stop_turn()
         selected_image_handles: list[str] = []
         last_model_final_answer = ""
         policy = ToolPolicy(scope_id=self.scope_id, viewer_id=self.viewer_id, budget=turn.budget,
@@ -1720,6 +1807,19 @@ class AgentRuntime:
                 planner_step["prompt"] = planner_result.prompt
                 planner_step["raw_full"] = planner_result.raw
             turn.steps.append(planner_step)
+            if planner_result.ok:
+                declaration = planner_result.declaration.as_dict()
+                self._emit_progress(
+                    turn, progress_callback, stage="planning", status="complete",
+                    text=str(declaration.get("goal") or ""), kind="plan",
+                    event_id=planner_step_id,
+                    payload={"goal": declaration.get("goal") or "",
+                             "requirements": [{
+                                 "id": item.get("id") or "",
+                                 "description": item.get("description") or "",
+                                 "evidence_type": item.get("evidence_type") or "",
+                                 "status": "open",
+                             } for item in declaration.get("requirements") or []]})
             if self.profile.features.get("agent2_authoritative") and not planner_result.ok:
                 turn.final_answer = "当前问题的证据需求无法可靠规划，因此暂时无法确认。"
                 turn.status = "partial"
@@ -2042,6 +2142,8 @@ class AgentRuntime:
         answer_writer_pending = False
         answer_writer_messages = None
         while True:
+            if cancelled():
+                return stop_turn()
             if answer_writer_pending and answer_writer_messages:
                 if not turn.budget.can_model_step():
                     answer_writer_pending = False
@@ -2238,9 +2340,11 @@ class AgentRuntime:
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 from .requirement_completion import RequirementCompletion
                 model_step["tool_candidates"] = [
-                    spec.name for spec in RequirementCompletion(
-                        agent2_task_state, agent2_evidence_ledger
-                    ).allowed_capabilities(list_tools(readiness="ready"))
+                    spec.name for spec in select_jit_tool_specs(
+                        task_state=agent2_task_state,
+                        preview_handles=task.result_preview,
+                        allowed_tool_names=self.profile.tools,
+                    )
                 ]
             if self.include_debug:
                 import copy as _copy
@@ -2325,9 +2429,11 @@ class AgentRuntime:
                     })
                     if agent2_status != "complete":
                         from .requirement_completion import RequirementCompletion
-                        available = RequirementCompletion(
-                            agent2_task_state, agent2_evidence_ledger
-                        ).allowed_capabilities(list_tools(readiness="ready"))
+                        available = select_jit_tool_specs(
+                            task_state=agent2_task_state,
+                            preview_handles=task.result_preview,
+                            allowed_tool_names=self.profile.tools,
+                        )
                         # Planner declarations describe semantic evidence
                         # (location/memory) but may omit the prerequisite
                         # visual resolution tool. If search explicitly marks
@@ -2610,15 +2716,21 @@ class AgentRuntime:
                     "codes": list(problems) if problems else [],
                     "attempt": guard_retries + 1,
                 })
-                # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性
-                if not problems and task.tool_results and turn.budget.can_model_step():
+                # L2：L1 确定性规则通过后，有工具结果时用 12B 评审语义级真实性。
+                # 原则（2026-09 重构）：每问只评审一次；评审看完整 agent 轨迹
+                # （含 captured_at 拍摄时间等元数据，见 judge.messages）。首次 final
+                # 未通过时不反复逼审，只加一条软引导、让模型基于完整上下文再输出一次；
+                # 之后不再复评，放行的答案打"possibly_fabricated"标签供分析。
+                if (not problems and task.tool_results and turn.budget.can_model_step()
+                        and not getattr(turn, "l2_faithfulness_checked", False)):
+                    turn.l2_faithfulness_checked = True
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
                     try:
                         judge_result = judge_faithfulness(
                             self.chat_fn, query=message, tool_results=task.tool_results,
                             answer=turn.final_answer, trusted_facts=trusted,
-                            include_debug=self.include_debug)
+                            messages=messages, include_debug=self.include_debug)
                         if self.include_debug:
                             faithful, judge_problems, judge_debug = judge_result
                         else:
@@ -2633,7 +2745,27 @@ class AgentRuntime:
                             judge_step["call_type"] = "faithfulness_judge"
                         turn.steps.append(judge_step)
                         if not faithful:
-                            problems = judge_problems
+                            # 只对"事实性"问题做软引导；纯风格(missing_disclosure)当提示放行。
+                            _l2_sev = (judge_problems.severity
+                                       if hasattr(judge_problems, "severity") else "truth")
+                            if _l2_sev == "truth":
+                                turn.l2_unverified = True
+                                turn.l2_unverified_reason = "; ".join(str(p) for p in judge_problems)
+                                if turn.budget.can_model_step():
+                                    self._emit_progress(
+                                        turn, progress_callback, stage="recovering",
+                                        status="running", text="我重新核对一遍信息再回答。")
+                                    messages.append({"role": "assistant",
+                                                     "content": _model_visible_action(action)})
+                                    messages.append({"role": "user", "content": (
+                                        "（复核提醒）系统评审认为你上一条 final 里可能有未被工具观察充分"
+                                        "支持的内容。请基于完整对话里出现的所有工具结果重新核对——包括照片/视频"
+                                        "的拍摄时间（captured_at）、地点元数据与检索命中的照片信息，而不只是"
+                                        "OCR 文字。如果按这些元数据能确认年份/日期/数量就直接如实给出；确实"
+                                        "没有任何工具结果能支撑的内容才如实说明无法确认。不要把有依据的信息删掉。"
+                                        "重新输出一个 final（可直接复用你上一版答案）。"
+                                    )})
+                                    continue
                     except Exception as exc:
                         turn.steps.append({"type": "judge", "status": "skipped",
                                            "reason": f"model_call_error:{exc}"})
@@ -2679,8 +2811,10 @@ class AgentRuntime:
                             stage="recovering", status="running",
                             text="结果里有一处信息对不上，我正在重新核对。")
                         last_answer = (turn.final_answer or "").strip()[:300]
-                        messages.append({"role": "assistant",
-                                         "content": f"（你上一版 final 回答）{last_answer}"})
+                        # 不要把"（你上一版 final 回答）"这类代码元注释冒充模型自己的话塞给它；
+                        # 只原样回放上一条最终回答，并在下一条 user 里点明"上一条是你的最终回答"。
+                        if last_answer:
+                            messages.append({"role": "assistant", "content": last_answer})
                         inspect_obs = [
                             tr.get("inspect_text") for tr in task.tool_results
                             if tr.get("tool") == "inspect_photo" and tr.get("inspect_text")
@@ -2694,7 +2828,8 @@ class AgentRuntime:
                         issue_lines = problems.natural_messages if hasattr(problems, "natural_messages") \
                             else [str(p) for p in problems]
                         recovery = (
-                            "你的最终回答与工具结果有冲突，需要修正后重新输出 final：\n- "
+                            "上一条（你刚输出的内容）是你的最终回答。你的最终回答与工具结果有冲突，"
+                            "需要修正后重新输出 final：\n- "
                             + "\n- ".join(issue_lines) +
                             "\n\n可信事实（只能基于这些，不要重新调用昂贵工具）：\n- "
                             + "\n- ".join(trusted or ["(无工具结果)"]) +
@@ -2785,6 +2920,18 @@ class AgentRuntime:
                     turn, progress_callback,
                     stage="finalizing", status="complete",
                     text="正在整理回答…")
+                # L2 复核标签：某次 final 曾被语义评审判不实、经软引导后放行 → 打标供分析
+                if getattr(turn, "l2_unverified", False):
+                    turn.steps.append({
+                        "type": "judge", "status": "soft_release",
+                        "call_type": "l2_soft_release",
+                        "possibly_fabricated": True,
+                        "reason": getattr(turn, "l2_unverified_reason", "") or "",
+                    })
+                    if turn.agent2_trace:
+                        turn.agent2_trace.setdefault("quality", {})[
+                            "l2_soft_release"] = True
+
                 # G6：OCR 显式 partial —— 读文字失败且回答如实反映“没读清”时，
                 # 以 natural partial 收尾（status=partial, reason=ocr_timeout），不猜、不暴露工程错误
                 if turn.ocr_partial and re.search(
@@ -2922,6 +3069,13 @@ class AgentRuntime:
                 arguments, corrected_handle = _normalize_preview_handle(
                     arguments, task.result_preview)
                 normalized_arguments = dict(arguments)
+            action_event_id = f"action_{tool_call_id}"
+            protocol_missing_public_status = not bool(str(action.get("public_status") or "").strip())
+            self._emit_progress(
+                turn, progress_callback, stage="action", status="running",
+                text=public_status, kind="model_action", event_id=action_event_id,
+                payload={"tool": tool_name, "tool_call_id": tool_call_id,
+                         "protocol_missing_public_status": protocol_missing_public_status})
             agent2_status_before = None
             agent2_requirements_before = None
             ledger_entries_before = 0
@@ -2965,14 +3119,15 @@ class AgentRuntime:
             })
             if corrected_handle and self.include_debug:
                 turn.steps[-1]["requested_asset_handle"] = corrected_handle
-            emit_text = public_status
-            if tool_name == "inspect_photo" and result.status == "ok":
-                handle_arg = str(arguments.get("asset_handle") or "")
-                emit_text = f"已检查照片 {handle_arg}…" if handle_arg else "已检查照片…"
             self._emit_progress(
                 turn, progress_callback,
                 stage="tool_result" if result.status == "ok" else "tool_error",
-                status=result.status, text=emit_text)
+                status=result.status,
+                text=str((result.observation or {}).get("summary") or public_status),
+                kind="tool_result" if result.status == "ok" else "tool_error",
+                event_id=f"result_{tool_call_id}", parent_event_id=action_event_id,
+                payload={"tool_call_id": tool_call_id,
+                         **public_timeline_tool_payload(tool_name, result.observation)})
             if not decision.allowed:
                 if agent2_task_state is not None:
                     turn.steps[-1]["standardized_evidence"] = []
@@ -3084,6 +3239,17 @@ class AgentRuntime:
                 search_has_preview = True
             if tool_name == "inspect_photo":
                 inspect_called = True
+            if agent2_task_state is not None:
+                self._emit_progress(
+                    turn, progress_callback, stage="planning", status="complete",
+                    text="证据进度已更新。", kind="plan_update",
+                    event_id=f"plan_update_{tool_call_id}", parent_event_id="planner_step_0",
+                    payload={"requirements": [
+                        {"id": state.requirement.id,
+                         "description": state.requirement.description,
+                         "evidence_type": state.requirement.evidence_type,
+                         "status": state.status}
+                        for state in agent2_task_state.requirements.values()]})
             # Observation 进入下一步模型上下文
             # Candidate 模式下根据最新 TaskState 动态更新首条 JIT System Prompt
             if is_candidate_mode and agent2_task_state is not None:
@@ -3213,6 +3379,10 @@ class AgentRuntime:
             turn.agent2_trace["writer_status"] = turn.writer_status
             turn.agent2_trace["stage_timing_ms"] = {
                 k: round(v, 1) for k, v in sorted(_stage_timing_ms.items())}
+        self._emit_progress(
+            turn, progress_callback, stage="terminal", status=turn.status or "complete",
+            text="已完成本轮回答。" if turn.status == "complete" else (turn.reason or "本轮已结束。"),
+            kind="terminal", event_id="terminal_final")
         self.chat_fn = _orig_chat_fn
         return turn
 

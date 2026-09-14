@@ -25,7 +25,7 @@ MIN_SIZES = [[16, 32], [64, 128], [256, 512]]
 INPUT_SIZE = (640, 640)
 VARIANCES = (0.1, 0.2)
 
-DEFAULT_MODEL_PATH = "/home/asus/benchmarks/retinaface/retinaface_r50.onnx"
+DEFAULT_MODEL_PATH = "/home/realmagic/benchmarks/retinaface/retinaface_r50.onnx"
 
 
 def _generate_priors(input_size):

@@ -715,6 +715,9 @@ class IngestionPipeline:
             return batch
         for event_id in self.store.batch_event_ids(batch_id):
             self.summarize_event(event_id)
+        from .scope_finalize import finalize_ingest_scope
+        retrieval_finalize = finalize_ingest_scope(self.store, batch.get("scope_id"))
+        self.store.update_ingest_batch_metadata(batch_id, {"retrieval_finalize": retrieval_finalize})
         batch = self.store.finish_ingest_batch(batch_id)
         scope_id = (batch or {}).get("scope_id")
         if scope_id:

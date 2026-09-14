@@ -71,7 +71,7 @@ RUNTIME_CONNECTION_CONFIG = _load_runtime_connection_config()
 DEFAULT_SENTRIX_URL = (
     os.environ.get("BENCH_SENTRIX_URL")
     or str(RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or "")
-    or "http://192.168.0.153:8091"
+    or "http://127.0.0.1:8091"
 )
 
 
@@ -179,7 +179,7 @@ DEFAULT_JUDGE_URL = (
 DEFAULT_VLLM_API_URL = (
     os.environ.get("BENCH_VLLM_API_URL")
     or (str(RUNTIME_CONNECTION_CONFIG.get("vllm_manager_url"))
-        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://192.168.0.153:8500")
+        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://127.0.0.1:8500")
 )
 DEFAULT_VLLM_BASE_URL = (
     os.environ.get("BENCH_VLLM_BASE_URL")
@@ -588,7 +588,7 @@ def judge_score_consistency(score: int | None, reason: str) -> bool:
     # Strip negated positive phrases so "不符合预期"/"回答不正确" don't false-match
     cleaned = re.sub(r"(?:未|不|没有|并非).{0,10}(?:正确|准确|一致|完整|符合|预期)", "", text)
     positive_patterns = (
-        r"(?:回答|模型回答).{0,12}(?:正确|准确)",
+        r"(?:回答|模型回答)(?:(?!参考答案|标准答案)[^，。；]){0,12}(?:正确|准确)",
         r"与.{0,24}(?:参考答案|标准答案).{0,12}一致",
         r"(?:参考答案|标准答案).{0,24}(?:回答|结论).{0,12}一致",
         r"符合.{0,8}预期",
@@ -2015,7 +2015,7 @@ class BenchmarkRun:
                     return exc
             served_names = {state.get("profile"), state.get("served_model_name")}
             if self.model_profile in served_names:
-                base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
+                base = state.get("external_url_hint") or f"http://127.0.0.1:{state.get('port', 8100)}/v1"
                 root = base.rstrip("/").removesuffix("/v1")
                 probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
                 if probe is None:
@@ -2119,7 +2119,7 @@ class BenchmarkRun:
         # 3. Health check (cancel-aware)
         state = self.lifecycle_provider.state()
         port = state.get("port", 8105)
-        base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
+        base = state.get("external_url_hint") or f"http://127.0.0.1:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
         t_health0 = time.perf_counter()
         health_error = self._probe_model_endpoint(state, model_api_root)
@@ -3420,6 +3420,18 @@ class BenchmarkRun:
     @staticmethod
     def _trace_action(step: dict) -> dict | None:
         detail = step.get("detail")
+        if detail is None:
+            # New runtime debug traces retain the response as raw_full/raw,
+            # not detail. Only accept a complete JSON response (optional fence).
+            text = str(step.get("raw_full") or step.get("raw") or "").strip()
+            fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+            if fenced:
+                text = fenced.group(1).strip()
+            try:
+                value = json.loads(text)
+            except (ValueError, TypeError):
+                return None
+            return value if isinstance(value, dict) and value.get("action") else None
         if isinstance(detail, dict) and detail.get("action"):
             return detail
         text = str(detail or "").strip()
@@ -4422,7 +4434,7 @@ class OrchestratorRepository:
                        if isinstance(step, dict)
                        and str(step.get("stage") or step.get("type") or "") == "model"
                        and str(step.get("call_type") or "agent") in {"agent", "recovery"}]
-        if agent_steps and any(step.get("parse_status") is not None for step in agent_steps):
+        if agent_steps:
             hydrated["agent_stability"] = BenchmarkRun._agent_stability(hydrated)
         return hydrated
 
@@ -5910,10 +5922,60 @@ class OrchestratorRepository:
             return None
         return values[max(0, min(len(values) - 1, math.ceil(len(values) * percentile) - 1))]
 
+    def export_traces(self, run_id: str, scores: list[int] | None = None,
+                      min_score: int | None = None) -> list:
+        """每题只导两项：planner 完整输入/输出 + 最终 final 那一次的完整轨迹。
+
+        每题对象仅含：qa_id / question / planner{prompt,raw_full} /
+        final_trace{step_id,prompt,raw_full}（prompt 为该次模型调用完整 messages，
+        含唯一 system 与到 final 前的全部历史；raw_full 为最终答案输出）。
+        scores: 非空时只导出评分落在该集合内的题目；min_score: 导出评分 >= 该值的题目。
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = run.state if isinstance(run, BenchmarkRun) else run
+            include = set(scores) if scores else None
+            items_out = []
+            for item in (state.get("items") or []):
+                item_score = (item.get("judge") or {}).get("score")
+                if include is not None and item_score not in include:
+                    continue
+                if min_score is not None and (item_score is None or item_score < min_score):
+                    continue
+                planner = None
+                model_steps = []
+                for turn in (item.get("runtime_turns") or []):
+                    for step in (turn.get("debug_trace") or []):
+                        if not isinstance(step, dict):
+                            continue
+                        if step.get("type") == "planner":
+                            planner = {"type": "planner",
+                                       "prompt": step.get("prompt"),
+                                       "raw_full": step.get("raw_full") or step.get("raw")}
+                        elif step.get("type") == "model":
+                            model_steps.append(step)
+                final_trace = None
+                if model_steps:
+                    last = model_steps[-1]
+                    final_trace = {"step_id": last.get("step_id"),
+                                   "prompt": last.get("prompt"),
+                                   "raw_full": last.get("raw_full") or last.get("raw")}
+                items_out.append({"qa_id": item.get("qa_id"),
+                                  "question": item.get("question"),
+                                  "planner": planner,
+                                  "final_trace": final_trace})
+            return items_out
+
     @classmethod
     def _effective_summary(cls, state: dict) -> dict:
         saved = dict(state.get("summary") or {})
-        items = state.get("items") or []
+        items = [
+            {**item, "agent_stability": BenchmarkRun._agent_stability(item)}
+            if item.get("execution_trace") else item
+            for item in (state.get("items") or [])
+        ]
         recalls = [item.get("retrieval_recall") for item in items
                    if isinstance(item.get("retrieval_recall"), (int, float))]
         scores = [score for item in items
@@ -5970,6 +6032,7 @@ class OrchestratorRepository:
         })
         for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
             if (key == "retrieval_recall_mean"
+                    or key.startswith("json_parse_")
                     or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
                     or saved.get(key) is None):
                 saved[key] = value
@@ -6839,6 +6902,22 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/memory-effectiveness"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/memory-effectiveness"))
                 self._json(self.repo.get_memory_effectiveness(run_id))
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-trace"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-trace"))
+                _q = parse_qs(parsed.query)
+                _raw_scores = (_q.get("scores") or [""])[0]
+                scores = [int(x) for x in _raw_scores.split(",") if x.strip() in {"0", "1", "2"}]
+                _raw = (_q.get("min_score") or [""])[0]
+                min_score = int(_raw) if _raw in {"1", "2"} else None
+                payload = self.repo.export_traces(run_id, scores=scores or None, min_score=min_score)
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{run_id}-trace.json"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/export-sft"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/export-sft"))
