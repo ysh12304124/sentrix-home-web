@@ -14,6 +14,7 @@ import argparse
 import copy
 import concurrent.futures
 import base64
+import gzip
 import hashlib
 from io import BytesIO
 import json
@@ -678,6 +679,37 @@ def request_json(url: str, payload=None, method: str = "GET", timeout: int = 120
             detail = json.dumps(detail, ensure_ascii=False)
         detail = str(detail or exc.reason or "request failed")[:1000]
         raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {detail}") from exc
+
+
+def arbiter_status_snapshot(sentrix_url: str) -> dict:
+    """Proxy optional Arbiter state without exposing server-local URLs to browsers."""
+    try:
+        return {
+            "supported": True,
+            "status": request_json(f"{sentrix_url.rstrip('/')}/api/arbiter/status", timeout=3),
+        }
+    except Exception as exc:
+        error = str(exc)
+        unsupported = error.startswith("HTTP 404 ") or error.startswith("HTTP 405 ")
+        return {
+            "supported": False if unsupported else None,
+            "status": None,
+            "reason": "endpoint_not_supported" if unsupported else "temporarily_unavailable",
+        }
+
+
+def paginate_rows(rows: list, page: int, page_size: int, *, max_page_size: int = 100) -> dict:
+    page = max(1, int(page))
+    page_size = max(1, min(max_page_size, int(page_size)))
+    total = len(rows)
+    pages = max(1, math.ceil(total / page_size))
+    page = min(page, pages)
+    start = (page - 1) * page_size
+    return {
+        "runs": rows[start:start + page_size], "page": page,
+        "page_size": page_size, "total": total, "pages": pages,
+        "has_previous": page > 1, "has_next": page < pages,
+    }
 
 
 def request_text(url: str, timeout: int = 120) -> str:
@@ -4845,6 +4877,41 @@ class OrchestratorRepository:
         return {"task_id": task_id, "run_ids": run_ids, "status": "running",
                 "vllm_target_id": target_id}
 
+    @staticmethod
+    def _run_list_entry(state: dict) -> dict:
+        """Return only fields needed by the run table and reuse-base index."""
+        summary = OrchestratorRepository._list_summary(state)
+        summary_keys = {
+            "total", "completed", "judge_valid_count", "judge_distribution",
+            "retrieval_recall_mean", "retrieval_recall_macro",
+            "media_retrieval_recall_macro", "answer_quality_mean",
+        }
+        result = {
+            key: state.get(key) for key in (
+                "run_id", "mode", "scope_source", "scope_id", "scope_name",
+                "album_id", "model_profile", "model_name", "model_source",
+                "model_backend", "qa_set", "qa_count", "status", "created_at",
+                "started_at", "finished_at", "failed_phase", "fatal_error",
+                "telemetry_source", "runtime_framework",
+            )
+            if state.get(key) is not None
+        }
+        result["item_count"] = len(state.get("items") or [])
+        result["summary"] = {key: summary.get(key) for key in summary_keys
+                             if summary.get(key) is not None}
+        qa_phase = (state.get("phases") or {}).get("qa_eval") or {}
+        if qa_phase:
+            result["phases"] = {"qa_eval": {
+                key: qa_phase.get(key) for key in ("status", "progress")
+                if qa_phase.get(key) is not None
+            }}
+        rejudge = state.get("rejudge") or {}
+        if rejudge:
+            result["rejudge"] = {key: rejudge.get(key) for key in (
+                "status", "completed", "total", "failed", "rejudge_id",
+            ) if rejudge.get(key) is not None}
+        return result
+
     def list_runs(self) -> list[dict]:
         with self.lock:
             result = []
@@ -4853,11 +4920,8 @@ class OrchestratorRepository:
                     state = run.state
                 else:
                     state = run
-                public = self._public_run(state, include_items=False)
-                public["item_count"] = len(state.get("items") or [])
-                public["summary"] = self._list_summary(state)
-                result.append(public)
-            return sorted(result, key=lambda r: r.get("started_at") or "", reverse=True)
+                result.append(self._run_list_entry(state))
+            return sorted(result, key=lambda r: r.get("started_at") or r.get("created_at") or "", reverse=True)
 
     def get_run(self, run_id: str) -> dict:
         with self.lock:
@@ -6853,14 +6917,27 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         super().end_headers()
 
+    def _write_body(self, body: bytes):
+        try:
+            for offset in range(0, len(body), 16 * 1024):
+                self.wfile.write(body[offset:offset + 16 * 1024])
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _json(self, value, status: int = 200):
-        body = json.dumps(value, ensure_ascii=False).encode()
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        compressed = len(body) >= 1024 and "gzip" in self.headers.get("Accept-Encoding", "").lower()
+        if compressed:
+            body = gzip.compress(body, compresslevel=5)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def _payload(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -6900,6 +6977,13 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                    "judge_providers": _public_judge_providers(JUDGE_PROVIDERS),
                    "default_judge_provider_id": DEFAULT_JUDGE_PROVIDER_ID,
                 })
+                return
+            if parsed.path == "/api/arbiter-status":
+                with RUNTIME_CONNECTION_CONFIG_LOCK:
+                    sentrix_url = str(
+                        RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or DEFAULT_SENTRIX_URL
+                    ).rstrip("/")
+                self._json(arbiter_status_snapshot(sentrix_url))
                 return
             if parsed.path == "/api/manifests":
                 self._json({"manifests": self.repo.list_manifests()})
@@ -6953,7 +7037,20 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 self._json({"error": "media not found"}, 404)
                 return
             if parsed.path == "/api/runs":
-                self._json({"runs": self.repo.list_runs()})
+                query = parse_qs(parsed.query)
+                try:
+                    page = max(1, int((query.get("page") or ["1"])[0]))
+                    page_size = max(1, min(100, int((query.get("page_size") or ["20"])[0])))
+                except ValueError as exc:
+                    raise ValueError("page and page_size must be integers") from exc
+                runs = self.repo.list_runs()
+                response = paginate_rows(runs, page, page_size)
+                response["active_count"] = sum(
+                    1 for run in runs
+                    if run.get("status") in {"running", "pending", "cancelling"}
+                    or (run.get("rejudge") or {}).get("status") == "running"
+                )
+                self._json(response)
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/items"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/items"))
@@ -7232,12 +7329,24 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 pass
             return
         body = path.read_bytes()
+        compressed = (len(body) >= 1024
+                      and (ct.startswith("text/") or ct == "application/javascript")
+                      and "gzip" in self.headers.get("Accept-Encoding", "").lower())
+        if compressed:
+            body = gzip.compress(body, compresslevel=5)
         self.send_response(200)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        if relative := path.relative_to(self.web_root.resolve()).as_posix():
+            immutable = relative.startswith("assets/") and bool(re.search(r"-[A-Za-z0-9_-]{6,}\.", path.name))
+        else:
+            immutable = False
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if immutable else "no-cache")
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def log_message(self, *args):
         pass

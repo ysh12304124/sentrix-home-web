@@ -15,6 +15,7 @@ const manifests = ref([]);
 const profiles = ref([]);
 const vllmTargets = ref({});
 const runs = ref([]);
+const runPage = ref({ page: 1, page_size: 20, total: 0, pages: 1, has_previous: false, has_next: false, active_count: 0 });
 const activeRunId = ref(null);
 const activeRun = ref(null);
 const keyframeAnalysis = ref(null);
@@ -277,10 +278,39 @@ let pollTimer = null;
 let destroyed = false;
 
 const api = async (path, options = {}) => {
-  const response = await fetch(path, { headers: { "content-type": "application/json", ...(options.headers || {}) }, ...options });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
+  const { timeoutMs = 10000, retries, ...requestOptions } = options;
+  const method = String(requestOptions.method || "GET").toUpperCase();
+  const retryCount = retries ?? (method === "GET" ? 1 : 0);
+  let lastError;
+  for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(path, {
+        headers: { "content-type": "application/json", ...(requestOptions.headers || {}) },
+        ...requestOptions,
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; }
+      catch { throw new Error(`响应不是有效 JSON：${path}`); }
+      if (!response.ok) {
+        const httpError = new Error(data.error || `HTTP ${response.status}`);
+        httpError.retryable = response.status >= 500;
+        throw httpError;
+      }
+      return data;
+    } catch (requestError) {
+      lastError = requestError;
+      const retryable = requestError?.name === "AbortError" || requestError instanceof TypeError || requestError?.retryable;
+      if (attempt >= retryCount || !retryable) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+  throw new Error(lastError?.name === "AbortError" ? `请求超时：${path}` : (lastError?.message || `请求失败：${path}`));
 };
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
 const esc = (value) => String(value ?? "");
@@ -312,7 +342,8 @@ function setModelSelected(modelId, checked) {
 }
 
 const qaOptions = computed(() => manifests.value.find((m) => m.album_id === selectedAlbum.value)?.qa_sets || ["compact-10q"]);
-const hasRunning = computed(() => runs.value.some((run) => ["running", "pending", "cancelling"].includes(run.status) || run.rejudge?.status === "running"));
+const hasRunning = computed(() => Number(runPage.value.active_count || 0) > 0
+  || runs.value.some((run) => ["running", "pending", "cancelling"].includes(run.status) || run.rejudge?.status === "running"));
 const activeRejudge = computed(() => activeRun.value?.rejudge || null);
 const visibleQaItems = computed(() => {
   const items = qaPage.value?.items || [];
@@ -1796,7 +1827,26 @@ function pipelineMetricRows(phase = {}) {
   ].filter(Boolean);
 }
 
-async function loadRuns() { runs.value = (await api("/api/runs")).runs || []; }
+async function loadRuns(page = runPage.value.page || 1) {
+  const payload = await api(`/api/runs?page=${Math.max(1, Number(page) || 1)}&page_size=${runPage.value.page_size}`, {
+    timeoutMs: 8000,
+    retries: 2,
+  });
+  runs.value = payload.runs || [];
+  runPage.value = {
+    page: payload.page || 1,
+    page_size: payload.page_size || 20,
+    total: payload.total ?? runs.value.length,
+    pages: payload.pages || 1,
+    has_previous: Boolean(payload.has_previous),
+    has_next: Boolean(payload.has_next),
+    active_count: Number(payload.active_count || 0),
+  };
+}
+async function changeRunPage(page) {
+  await loadRuns(page);
+  document.querySelector("#runs-region")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 function runProgressLabel(run) {
   if (run?.mode === "build") return "—";
   const progress = run?.phases?.qa_eval?.progress;
@@ -2226,7 +2276,7 @@ async function startSuite() {
   try {
    const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value.trim(), judge_url: judgeUrl.value.trim(), judge_model: judgeModel.value.trim(), judge_provider_id: judgeProviderId.value, ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}), vllm_target_id: vllmTargetId.value, vllm_manager_url: vllmManagerUrl.value.trim(), model_base_url: selectedModels.has("__current__") || modelEndpointUserEdited.value ? modelEndpoint.value.trim() : "", endpoint_model: selectedModels.has("__current__") ? selectedEndpointModel.value : "", delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
     activeRunId.value = result.run_ids[0];
-    await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
+    await loadRuns(1); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
 }
 async function stopSuite() {
@@ -2255,11 +2305,18 @@ function startPolling() {
 const arbiterStatus = ref(null);
 let arbiterTimer = null;
 async function loadArbiterStatus() {
-  if (!sentrixUrl.value) return;
+  if (!sentrixUrl.value) return false;
   try {
-    const resp = await fetch(`${sentrixUrl.value.replace(/\/$/, "")}/api/arbiter/status`, { signal: AbortSignal.timeout(3000) });
-    if (resp.ok) arbiterStatus.value = await resp.json();
-  } catch (_) { /* backend 暂不可达时保持上次值 */ }
+    const payload = await api("/api/arbiter-status", { timeoutMs: 5000, retries: 0 });
+    if (payload.supported === false) {
+      arbiterStatus.value = null;
+      return false;
+    }
+    if (payload.status) arbiterStatus.value = payload.status;
+    return true;
+  } catch (_) {
+    return true; // transient failure: retain the previous value and retry later
+  }
 }
 function arbStateLabel(s) {
   return ({idle: "空闲", import_running: "导入运行中", agent_active: "Agent 活跃", preempting: "抢占中"})[s] || s || "-";
@@ -2268,6 +2325,7 @@ function thermalStateLabel(v) {
   return ({0: "nominal", 1: "fair", 2: "serious", 3: "critical"})[v] ?? "-";
 }
 async function init() {
+  let current = null;
   try {
     config.value = await api("/api/config");
     vllmTargets.value = config.value.vllm_targets || {};
@@ -2283,18 +2341,25 @@ async function init() {
     judgeApiKey.value = "";
     judgeApiKeyDirty.value = false;
     rejudgePrompt.value = config.value.custom_judge_prompt || config.value.judge_prompt || "";
-    await loadJudgePrompts();
     judgeProviderId.value = runtimeConfig.judge_provider_id || config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
     connectionConfigState.value = "saved";
     connectionConfigMessage.value = "已读取配置文件";
-    manifests.value = (await api("/api/manifests")).manifests || [];
-    await loadRuns(); if (vllmManagerUrl.value.trim()) await loadProfiles();
-    if (modelEndpoint.value.trim()) await loadCurrentModel({ openPopover: false });
-    const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
-    if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
+    const [, manifestPayload] = await Promise.all([
+      loadJudgePrompts(),
+      api("/api/manifests"),
+      loadRuns(1),
+      vllmManagerUrl.value.trim() ? loadProfiles() : Promise.resolve(),
+    ]);
+    manifests.value = manifestPayload.manifests || [];
+    current = runs.value.find((run) => ["running", "pending"].includes(run.status));
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
-  loadArbiterStatus();
-  arbiterTimer = setInterval(loadArbiterStatus, 3000);
+  if (modelEndpoint.value.trim()) void loadCurrentModel({ openPopover: false });
+  if (current) {
+    activeRunId.value = current.run_id;
+    void loadActiveRun({ resetPage: true });
+    startPolling();
+  }
+  if (await loadArbiterStatus()) arbiterTimer = window.setInterval(loadArbiterStatus, 3000);
 }
 const qaBrowserOptions = computed(() => manifests.value.find((m) => m.album_id === qaBrowserAlbum.value)?.qa_sets || []);
 const qaBrowserTags = computed(() => [...new Set(qaBrowserItems.value.flatMap(item => Array.isArray(item.tags) ? item.tags : []))].sort());
@@ -2502,11 +2567,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       <p v-if="error" class="error">{{ error }}</p>
     </section>
 
-    <section id="runs-region" class="section">
-      <div class="section-head">
-<h2>评测记录</h2>
-<span class="muted">{{ runs.length }} 条</span>
-</div>
+	    <section id="runs-region" class="section">
+	      <div class="section-head">
+	<h2>评测记录</h2>
+	<div class="pager" v-if="runPage.pages > 1">
+	  <button class="btn ghost compact" :disabled="!runPage.has_previous" @click="changeRunPage(runPage.page - 1)">上一页</button>
+	  <span>{{ runPage.page }} / {{ runPage.pages }}</span>
+	  <button class="btn ghost compact" :disabled="!runPage.has_next" @click="changeRunPage(runPage.page + 1)">下一页</button>
+	</div>
+	<span class="muted">共 {{ runPage.total }} 条</span>
+	</div>
       <div class="runs-list">
 <table>
 <thead>

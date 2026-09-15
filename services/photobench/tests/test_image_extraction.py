@@ -69,6 +69,53 @@ class RuntimeFrameworkTests(unittest.TestCase):
         self.assertLessEqual(len(request.call_args.args[1]["name"]), 100)
 
 
+class RunListLoadingTests(unittest.TestCase):
+    def test_run_list_entry_drops_large_detail_only_fields(self):
+        state = {
+            "run_id": "run-1", "model_profile": "model", "album_id": "album",
+            "scope_id": "scope-1", "status": "completed", "qa_count": 10,
+            "started_at": "2026-09-15T00:00:00+08:00",
+            "items": [{
+                "retrieval_recall": 1.0, "media_retrieval_recall": 0.9,
+                "retrieval_media_refs": [{"media_type": "image", "media_id": "a.jpg"}],
+                "predicted_media_refs": [{"media_type": "image", "media_id": "a.jpg"}],
+                "media_retrieval_counts": {"matched": 9, "predicted": 10, "gt": 10},
+                "image_retrieval_counts": {"matched": 9, "predicted": 10, "gt": 10},
+                "video_retrieval_counts": {"matched": 0, "predicted": 0, "gt": 0},
+                "judge": {"score": 2},
+            }],
+            "summary": {
+                "media_retrieval_recall_macro": 0.9,
+                "agent2_trace": {"large": "x" * 100000},
+            },
+            "phases": {
+                "qa_eval": {"status": "done", "progress": {"completed": 1, "total": 10}},
+                "aggregate": {"agent2_trace": {"large": "x" * 100000}},
+            },
+        }
+        row = MODULE.OrchestratorRepository._run_list_entry(state)
+        self.assertEqual(row["scope_id"], "scope-1")
+        self.assertEqual(row["summary"]["media_retrieval_recall_macro"], 0.9)
+        self.assertNotIn("agent2_trace", row["summary"])
+        self.assertNotIn("aggregate", row.get("phases", {}))
+        self.assertLess(len(json.dumps(row)), 3000)
+
+    def test_run_list_pagination_is_bounded(self):
+        payload = MODULE.paginate_rows(list(range(205)), page=2, page_size=500)
+        self.assertEqual(payload["page_size"], 100)
+        self.assertEqual(payload["page"], 2)
+        self.assertEqual(payload["total"], 205)
+        self.assertEqual(len(payload["runs"]), 100)
+        self.assertTrue(payload["has_previous"])
+        self.assertTrue(payload["has_next"])
+
+    @patch.object(MODULE, "request_json", side_effect=RuntimeError("HTTP 404 Not Found: missing"))
+    def test_missing_arbiter_endpoint_is_reported_as_unsupported(self, _request):
+        result = MODULE.arbiter_status_snapshot("http://127.0.0.1:11001")
+        self.assertFalse(result["supported"])
+        self.assertEqual(result["reason"], "endpoint_not_supported")
+
+
 class ExtractImageIdsTests(unittest.TestCase):
     def test_extracts_current_tool_result_asset_id_strings(self):
         result = {
