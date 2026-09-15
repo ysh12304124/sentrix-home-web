@@ -804,7 +804,7 @@ function gpuMetricRows(phase = {}) {
   const processLimit = phase.model_process_memory_limit_mib;
   const processLimitLabel = processLimit == null ? "模型进程显存上限" : `${fmtMemory(processLimit)} 上限告警`;
   if (["orin_ssh_pss", "jetson_local_pss"].includes(phase.source)) return [
-    ["Orin 模型进程 PSS", fmtMemory(modelMemory.mean), `峰值 ${fmtMemory(modelMemory.peak)} · 统一物理内存，非独立显存`, true],
+    ["Orin 模型进程物理内存峰值（PSS）", fmtMemory(modelMemory.peak), `均值 ${fmtMemory(modelMemory.mean)} · P95 ${fmtMemory(modelMemory.p95)} · 统一物理内存，非独立显存`, true],
     ["KV Cache 已用 token", fmtNumber(phase.kv_cache_used_tokens?.mean), `峰值 ${fmtNumber(phase.kv_cache_used_tokens?.peak)}`],
     ["KV Cache 使用率", fmtNumber(kvCache.mean, "%"), `峰值 ${fmtNumber(kvCache.peak, "%")}`],
     ["GPU 利用率", fmtNumber(util.mean, "%"), `tegrastats GR3D 峰值 ${fmtNumber(util.peak, "%")}`],
@@ -861,6 +861,13 @@ function comparableMemoryProfile(run) {
     questions_total: run.summary?.total,
   };
 }
+function isOrinPssRun(run) {
+  return ["orin_ssh_pss", "jetson_local_pss"].includes(run?.telemetry_source)
+    || ["orin_ssh_pss", "jetson_local_pss"].includes(run?.telemetry_live?.source)
+    || ["orin_ssh_pss", "jetson_local_pss"].includes(run?.phases?.gpu_metrics?.source)
+    || run?.phases?.gpu_metrics?.memory_profile?.method === "orin_process_pss_uma_v1"
+    || comparableMemoryProfile(run)?.memory_profile?.method === "orin_process_pss_uma_v1";
+}
 function memoryProfileRows(profile = {}) {
   const memory = profile.memory_profile || {};
   const isBenchmarkGpuProfile = profile.source === "gpu_metrics";
@@ -876,7 +883,8 @@ function memoryProfileRows(profile = {}) {
   }
   const processMemory = profile.model_process_memory_used_mib || {};
   if (memory.method === "orin_process_pss_uma_v1") return [
-    ["进程 PSS 峰值", fmtMemory(processMemory.peak), "Orin 统一物理内存；不可与独立显存 MB 直接比较", true],
+    ["进程物理内存峰值（PSS）", fmtMemory(processMemory.peak), "Orin 统一物理内存平台的进程峰值；不是独立显存，也不是工作负载估算", true],
+    ["工作负载内存估算", "不可计算", "当前 llama.cpp 未提供可靠的 KV Cache 实际使用量"],
     ["KV Cache 已用峰值", memory.kv_cache_used_peak_tokens == null ? "-" : `${Number(memory.kv_cache_used_peak_tokens).toLocaleString("en-US")} token`, `使用率峰值 ${fmtNumber(memory.kv_cache_usage_peak_pct, "%")}`],
     ["KV 实际字节数", "不可用", "未验证模型每 token KV 字节数；不以 token 数伪造 GiB"],
     ["数据来源", "118 本机 PSS + tegrastats", "KV 仅在 llama.cpp metrics 确实提供时记录"],
@@ -2882,7 +2890,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <b>GPU 指标</b>
 <span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.gpu_metrics)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.gpu_metrics)) }}</span>
 </div>
-<p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics)) }} · {{ ['orin_ssh_pss', 'jetson_local_pss'].includes(activeRun.phases?.gpu_metrics?.source) ? 'Orin：进程 PSS 是共享物理内存，不是独立显存；KV 指标只在服务端确实暴露时显示' : activeRun.phases?.gpu_metrics?.memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
+<p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics)) }} · {{ ['orin_ssh_pss', 'jetson_local_pss'].includes(activeRun.phases?.gpu_metrics?.source) ? 'Orin：进程 PSS 是统一物理内存峰值，不是独立显存；工作负载内存和 KV 实际用量未拆分' : activeRun.phases?.gpu_metrics?.memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
 <div class="phase-metrics">
 <div v-for="row in gpuMetricRows(activeRun.phases?.gpu_metrics)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
@@ -2891,7 +2899,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 </article>
-        <article class="phase-card result-phase-card gpu-result-card">
+        <article v-if="!isOrinPssRun(activeRun)" class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
 <b>{{ comparableMemoryProfile(activeRun)?.source === 'replay' ? '可比较显存复测' : '可比较显存' }}</b>
 <span class="phase-status" :class="comparableMemoryProfile(activeRun)?.status || 'pending'">{{ statusLabel(comparableMemoryProfile(activeRun)?.status || 'pending') }}</span>
