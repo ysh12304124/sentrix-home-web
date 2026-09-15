@@ -177,6 +177,127 @@ def _resolve_entity(name, scope_id):
         pass
     return None
 
+
+_STRUCTURED_FACT_OPERATIONS = {"count", "exists", "first", "last", "group"}
+_STRUCTURED_FACT_SUBJECTS = {"asset", "person_appearance", "processing"}
+_STRUCTURED_FACT_FILTERS = {"time", "media", "place", "person"}
+_ASSET_GROUPS = {"month", "place", "media"}
+
+
+def _structured_fact_error(status: str, reason: str) -> dict:
+    return {
+        "status": status,
+        "reason": reason,
+        "value": None,
+        "rows": [],
+        "samples": [],
+        "coverage": {"complete": False},
+    }
+
+
+def _fact_samples(executor, draft, spec) -> list[dict]:
+    try:
+        rows = executor._sample_observations(draft, spec, limit=3)
+    except Exception:
+        return []
+    return [{key: row.get(key) for key in ("captured_at", "media_type", "caption")}
+            for row in rows]
+
+
+def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict:
+    """Run an exact, single-album aggregate without exposing asset records to the model."""
+    arguments = arguments if isinstance(arguments, dict) else {}
+    unknown_args = set(arguments) - {"operation", "subject", "group_by", "filters"}
+    if unknown_args:
+        return _structured_fact_error("unsupported_filter", "unsupported_argument")
+    operation = str(arguments.get("operation") or "").strip()
+    subject = str(arguments.get("subject") or "").strip()
+    group_by = str(arguments.get("group_by") or "").strip()
+    filters = arguments.get("filters") or {}
+    if not isinstance(filters, dict):
+        return _structured_fact_error("unsupported_filter", "filters_must_be_object")
+    unknown_filters = set(filters) - _STRUCTURED_FACT_FILTERS
+    if unknown_filters:
+        return _structured_fact_error("unsupported_filter", "unsupported_filter")
+    if operation not in _STRUCTURED_FACT_OPERATIONS:
+        return _structured_fact_error("unsupported_operation", "unsupported_operation")
+    if subject not in _STRUCTURED_FACT_SUBJECTS:
+        return _structured_fact_error("unsupported_subject", "unsupported_subject")
+    media = str(filters.get("media") or "").strip().lower()
+    if media and media not in {"image", "video"}:
+        return _structured_fact_error("unsupported_filter", "unsupported_media")
+    if operation == "group":
+        allowed_groups = {"status"} if subject == "processing" else _ASSET_GROUPS
+        if group_by not in allowed_groups:
+            return _structured_fact_error("unsupported_filter", "unsupported_group_by")
+    elif group_by:
+        return _structured_fact_error("unsupported_filter", "group_by_requires_group_operation")
+    if subject == "processing" and str(filters.get("person") or "").strip():
+        return _structured_fact_error("unsupported_filter", "processing_does_not_support_person")
+    person = str(filters.get("person") or "").strip()
+    if subject == "person_appearance" and not person:
+        return _structured_fact_error("unresolved_person", "person_required")
+    if person and _resolve_entity(person, (context or {}).get("scope_id") or "") is None:
+        return _structured_fact_error("unresolved_person", "person_not_named_in_current_album")
+
+    scope_id = str((context or {}).get("scope_id") or "")
+    viewer_id = str((context or {}).get("viewer_id") or "owner")
+    if not scope_id or _RUNTIME.get("store") is None:
+        return _structured_fact_error("unavailable", "missing_runtime_scope")
+    from ..structured_memory import StructuredMemoryExecutor
+    draft_answer_type = {
+        "count": "count", "exists": "exists", "first": "first_occurrence",
+        "last": "last_occurrence", "group": "grouped_list",
+    }[operation]
+    draft = _draft_from_filters(filters, answer_type=draft_answer_type,
+                                group_by=group_by if operation == "group" else None)
+    spec = _spec_for(draft, scope_id, viewer_id)
+    executor = StructuredMemoryExecutor(_RUNTIME["store"])
+
+    if subject == "processing" and operation == "group":
+        joins, where, params = executor._base_query(draft, spec)
+        rows = executor._rows(
+            "SELECT COALESCE(NULLIF(a.status, ''), 'unknown') AS g, "
+            "COUNT(DISTINCT a.id) AS n FROM assets a " + joins +
+            " WHERE " + where + " GROUP BY g ORDER BY n DESC, g", params)
+        value = [{"group": row["g"], "count": int(row["n"] or 0)} for row in rows]
+        total = sum(row["count"] for row in value)
+        result_rows = value
+    else:
+        result = executor.execute(draft, spec, strategy="structured_fact")
+        value = result.value
+        total = result.total
+        result_rows = result.rows
+
+    unit = (
+        "original_image" if media == "image" else
+        "original_video" if media == "video" else
+        "original_asset"
+    )
+    if operation in {"first", "last"}:
+        unit = "captured_at"
+    if operation == "group":
+        unit = "original_asset_breakdown"
+    fact_type = f"{subject}_{operation}"
+    return {
+        "status": "ok",
+        "fact_type": fact_type,
+        "subject": subject,
+        "value": value,
+        "total": total,
+        "unit": unit,
+        "rows": result_rows if operation == "group" else [],
+        "filters_applied": executor._filters_applied(draft, spec),
+        "samples": [] if operation == "group" else _fact_samples(executor, draft, spec),
+        "coverage": {
+            "complete": True,
+            "scope": "current_album",
+            "asset_kind": "original_only",
+            "identity_scope": "named_face_entity" if subject == "person_appearance" else None,
+        },
+    }
+
+
 # ---- Tool 2: search_memories ----
 _RESULT_PREVIEW_LIMIT = 6
 _RESULT_PAGE_SIZE = 6
@@ -2556,6 +2677,22 @@ def _get_person_profile(arguments: dict, *, context: dict | None = None) -> dict
 def register_tools():
 
     register(ToolSpec(
+        name="query_memory_facts",
+        description=("精确统计当前相册的原始图片/视频、已命名人物出现记录和处理状态。"
+                     "仅支持数量、是否存在、最早/最近拍摄时间和按月/地点/媒体/处理状态分组。"
+                     "不支持颜色、物体、场景、活动、关系、OCR 金额、桌数或事件主题统计；"
+                     "这些条件不要调用本工具，也不要把照片检索候选数当作统计答案。"
+                     "当前相册范围由系统注入，不要传 scope_id。"),
+        input_schema={
+            "operation": "count|exists|first|last|group",
+            "subject": "asset|person_appearance|processing",
+            "group_by": "month|place|media|status",
+            "filters": {"time": "", "media": "image|video", "place": "", "person": ""},
+        },
+        executor=_query_memory_facts, read_write="read", cost_class="cheap", readiness="ready",
+        produces_evidence=("structured_fact",), required_inputs=("operation", "subject"),
+    ))
+    register(ToolSpec(
         name="search_memories",
         description=("检索照片（人/物/场景/衣着/颜色）。返回结果集摘要。"
                      "返回的每张 preview 自带 captured_at（拍摄时间）/ place（拍摄地点）/ people（已确认人物）/ evidence_summary（描述），"
@@ -2567,8 +2704,7 @@ def register_tools():
         input_schema={"query": "", "mode": "best|all|representative",
                       "filters": {"time": "", "place": "", "person": ""}},
         executor=_search_memories, read_write="read", cost_class="medium", readiness="ready",
-        produces_evidence=("memory_asset", "temporal_metadata", "location_metadata",
-                           "structured_fact"),
+        produces_evidence=("memory_asset", "temporal_metadata", "location_metadata"),
         required_inputs=("query",),
     ))
     register(ToolSpec(
@@ -2654,6 +2790,6 @@ def register_tools():
                      "性格等主观问题：照片无法确认时回答 insufficient evidence。"),
         input_schema={"person": ""},
         executor=_get_person_profile, read_write="read", cost_class="cheap", readiness="ready",
-        produces_evidence=("confirmed_identity", "structured_fact"),
+        produces_evidence=("confirmed_identity",),
         required_inputs=("person",),
     ))

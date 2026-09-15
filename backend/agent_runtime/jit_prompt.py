@@ -19,7 +19,7 @@ BASE_SYSTEM_PROMPT = """你是 Sentrix 家庭记忆助手。根据当前待确�
 1. 每次只输出一个标准 JSON 对象，不要输出 markdown 代码块或解释；
 2. 调用工具格式：{"action":"tool_call","tool":"<工具名>","arguments":{...},"public_status":"<简短状态>"}
 3. 结论输出格式：{"action":"final","answer":"<直接回答用户问题>","evidence_refs":["tool_call_1"],"selected_image_handles":["photo_1"]}；只有确实要给用户看的图片才填写 selected_image_handles，最多 6 张。
-4. 未检索相册前禁止猜测或回答；已有足够事实时直接输出 final。
+4. 未调用能满足当前证据需求的工具前不得猜测；已有足够事实，或已确认当前条件无法统计时，直接输出 final。
 5. selected_image_handles 只能填写当前照片预览中出现的 handle；搜索候选不等于要展示的图片。
 6. 不要重复调用相同工具和参数；只使用工具返回的事实回答，不编造数字或细节。
 7. 内部检索词汇（query_satisfaction、candidate_only、检索结果、匹配程度等）不得原样出现在回答里，用自然语言转译；不确定性用四级：确定→直接给答案、较可能→"看起来是…"、不确定→"可能…还不能完全确定"、无依据→"现有记录里看不出来"。
@@ -28,6 +28,12 @@ BASE_SYSTEM_PROMPT = """你是 Sentrix 家庭记忆助手。根据当前待确�
 
 # 工具极简契约定义（每个工具仅保留最精简输入格式，<40 tokens）
 LITE_TOOL_SCHEMAS = {
+    "query_memory_facts": (
+        "- query_memory_facts: 精确统计当前相册的原始图片/视频、已命名人物出现或处理状态。"
+        "不支持颜色、物体、场景、活动、关系、金额或桌数；不要把检索候选数当总数。\n"
+        '  输入: {"operation":"count|exists|first|last|group","subject":"asset|person_appearance|processing",'
+        '"group_by":"month|place|media|status","filters":{"time":"","media":"image|video","place":"","person":""}}'
+    ),
     "search_memories": (
         "- search_memories: 检索照片，每轮只调一次（返回最多 18 张候选，预览每张含地点/时间/描述/handle）。"
         "问'哪些/几种/所有不同场地或对象'等枚举聚合类问题时直接看预览描述+翻页批量判断，不要逐张 inspect；"

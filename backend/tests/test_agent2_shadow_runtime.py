@@ -160,6 +160,84 @@ class Agent2ShadowRuntimeTests(unittest.TestCase):
         self.assertEqual(len(auto_steps), 1)
         self.assertEqual(auto_steps[0]["arguments"]["asset_handle"], "photo_2")
 
+    def test_only_complete_fact_tool_can_satisfy_structured_requirement(self):
+        def make_state():
+            return TaskState.from_declaration(TaskDeclaration(
+                goal="统计照片", scope_id="album1",
+                requirements=(EvidenceRequirement(id="fact", evidence_type="structured_fact"),),
+            ))
+
+        search_state = make_state()
+        search_ledger = EvidenceLedger(scope_id="album1")
+        search_spec = SimpleNamespace(
+            name="search_memories", produces_evidence=("memory_asset",),
+            can_satisfy=lambda evidence_type: evidence_type == "memory_asset",
+        )
+        record_agent2_tool_evidence(
+            search_state, search_ledger, search_spec, tool_call_id="search_1",
+            observation={"total": 99, "preview": [{"handle": "photo_1"}]},
+        )
+        self.assertEqual(search_state.requirement("fact").status, "open")
+
+        failed_state = make_state()
+        failed_ledger = EvidenceLedger(scope_id="album1")
+        fact_spec = SimpleNamespace(
+            name="query_memory_facts", produces_evidence=("structured_fact",),
+            can_satisfy=lambda evidence_type: evidence_type == "structured_fact",
+        )
+        record_agent2_tool_evidence(
+            failed_state, failed_ledger, fact_spec, tool_call_id="fact_1",
+            observation={"status": "unsupported_filter", "reason": "unsupported_filter",
+                         "value": None, "coverage": {"complete": False}},
+        )
+        self.assertNotEqual(failed_state.requirement("fact").status, "satisfied")
+
+        complete_state = make_state()
+        complete_ledger = EvidenceLedger(scope_id="album1")
+        record_agent2_tool_evidence(
+            complete_state, complete_ledger, fact_spec, tool_call_id="fact_2",
+            observation={"status": "ok", "fact_type": "asset_count", "subject": "asset",
+                         "value": 3, "unit": "original_image",
+                         "coverage": {"complete": True}},
+        )
+        self.assertEqual(complete_state.requirement("fact").status, "satisfied")
+
+    def test_structured_fact_final_gets_one_specific_reminder_then_releases(self):
+        fact_spec = ToolSpec(
+            name="query_memory_facts", description="facts", input_schema={},
+            executor=lambda arguments, context=None: {}, produces_evidence=("structured_fact",),
+        )
+
+        class ScriptedChat:
+            def __init__(self):
+                self.agent_messages = []
+                self.agent_responses = iter([
+                    '{"action":"final","answer":"现有记录无法确认","evidence_refs":[]}'
+                ] * 6)
+
+            def __call__(self, messages, **kwargs):
+                if kwargs.get("call_type") == "planner":
+                    return ('{"action":"declare","declaration":{"goal":"统计相册照片",'
+                            '"scope_id":"album1","requirements":[{"id":"fact",'
+                            '"evidence_type":"structured_fact","description":"照片数量"}]}}')
+                if kwargs.get("call_type") == "agent":
+                    self.agent_messages.append(list(messages))
+                    return next(self.agent_responses)
+                return '{"faithful":true,"problems":[],"reason":"ok"}'
+
+        chat = ScriptedChat()
+        runtime = AgentRuntime(chat_fn=chat, profile_name="goal_driven_candidate", scope_id="album1")
+        with patch("backend.agent_runtime.runtime.list_tools", return_value=[fact_spec]):
+            turn = runtime.run("这个相册有多少张照片？")
+
+        self.assertEqual(turn.status, "complete", f"{turn.reason} {turn.termination_reason} {turn.steps}")
+        self.assertEqual(turn.final_answer, "现有记录无法确认。")
+        reminder_messages = [
+            message["content"] for call in chat.agent_messages for message in call
+            if message.get("role") == "user" and "全量结构化统计" in message.get("content", "")
+        ]
+        self.assertEqual(len(reminder_messages), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

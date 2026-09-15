@@ -575,8 +575,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         """
         if not spec.can_satisfy(evidence_type):
             return False
-        # query_memory_facts / query_memory_metadata 已删除：没有按 operation
-        # 收窄证据类型的聚合工具，回归统一的 spec.can_satisfy 判定。
+        if spec.name == "query_memory_facts":
+            return evidence_type == "structured_fact"
         return True
 
     def mark_failure(reason: str) -> bool:
@@ -625,6 +625,12 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             or observation_certainty in {"uncertain", "unsupported"}):
         return mark_failure(str(observation.get("reason") or observation_status
                                 or "uncertain_evidence"))
+    if spec.name == "query_memory_facts" and (
+            observation_status != "ok"
+            or observation.get("value") is None
+            or not bool((observation.get("coverage") or {}).get("complete"))):
+        return mark_failure(str(observation.get("reason") or observation_status
+                                or "incomplete_structured_fact"))
 
     confidence = _evidence_confidence(observation)
     preview = observation.get("preview") or []
@@ -741,31 +747,6 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "asset_id": asset_id or str(item.get("handle") or ""),
                     "certainty": "confirmed",
                 })
-        cond_summary = observation.get("condition_summary") or {}
-        for cond_key, cond_status in cond_summary.items():
-            if preview_evidence_allowed and cond_status in {"matched", "confirmed"}:
-                evidence_rows.append({
-                    "evidence_type": "structured_fact",
-                    "value": f"检索确认满足条件：{cond_key}（共找到 {len(assets)} 张照片）",
-                    "certainty": "confirmed",
-                    "subject": cond_key,
-                })
-        group_count = observation.get("group_photo_count")
-        group_sizes = observation.get("group_photo_sizes") or []
-        if preview_evidence_allowed and group_count:
-            evidence_rows.append({
-                "evidence_type": "structured_fact",
-                "value": {
-                    "group_photo_count": int(group_count),
-                    "group_photo_sizes": list(group_sizes),
-                    "rows": observation.get("group_photo_rows") or [],
-                },
-                "subject": "事件合影人数统计",
-                "asset_id": ((observation.get("group_photo_rows") or [{}])[0].get("asset_id")
-                             if isinstance((observation.get("group_photo_rows") or [{}])[0], dict)
-                             else ""),
-                "certainty": "supported",
-            })
         location_question = (not question_text or bool(re.search(
             r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text)))
         places = [item for item in assets if item.get("place")]
@@ -882,21 +863,21 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             evidence_rows.append({"evidence_type": "visible_text", "value": value,
                                   "subject": str(observation.get("question") or "照片文字"),
                                   "asset_id": str(observation.get("asset_handle") or (input_refs[0] if input_refs else ""))})
-        for ev in (observation.get("exact_values") or []):
-            if ev.get("type") == "year" and ev.get("value"):
-                evidence_rows.append({
-                    "evidence_type": "structured_fact",
-                    "value": f"创立/创建年份为 {ev.get('value')} 年",
-                    "certainty": "confirmed",
-                    "subject": "品牌创立年份",
-                })
-            elif ev.get("type") == "price" and ev.get("value"):
-                evidence_rows.append({
-                    "evidence_type": "structured_fact",
-                    "value": f"价格: {ev.get('text', ev.get('value'))}",
-                    "certainty": "confirmed",
-                    "subject": "商品价格",
-                })
+    elif spec.name == "query_memory_facts":
+        evidence_rows.append({
+            "evidence_type": "structured_fact",
+            "value": {
+                "fact_type": observation.get("fact_type"),
+                "subject": observation.get("subject"),
+                "value": observation.get("value"),
+                "unit": observation.get("unit"),
+                "rows": observation.get("rows") or [],
+                "filters_applied": observation.get("filters_applied") or {},
+                "coverage": observation.get("coverage") or {},
+            },
+            "subject": str(observation.get("fact_type") or "结构化统计"),
+            "certainty": "confirmed",
+        })
     elif spec.name == "query_photo_people":
         people = observation.get("people") or []
         unknown = observation.get("unconfirmed_people") or []
@@ -958,12 +939,6 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                                             "membership": observation.get("membership"),
                                             "membership_source": observation.get("membership_source")},
                                   "subject": person})
-            if observation.get("claims") or observation.get("patterns") or observation.get("relationships"):
-                evidence_rows.append({"evidence_type": "structured_fact",
-                                      "value": {"claims": observation.get("claims") or [],
-                                                "patterns": observation.get("patterns") or [],
-                                                "relationships": observation.get("relationships") or []},
-                                      "subject": person})
 
     covered_types = {row["evidence_type"] for row in evidence_rows}
     # A summary string is transport metadata, never a substitute for an
@@ -1923,6 +1898,7 @@ class AgentRuntime:
         # 5B：证据需求未满足时，最多给模型一次补证/修正的机会；模型坚持 final 就放行，
         # 代码不再写死"现有证据不足，无法确认。"覆盖模型已给的好答案。
         gate_unattempted_prompted = False
+        structured_fact_reminder_prompted = False
         # 反编造：零工具调用却给出具体数字断言时，只给一次"检索核实"机会；模型坚持再放行。
         fabrication_check_prompted = False
         wants_visual = visual_intent(message)
@@ -2468,12 +2444,40 @@ class AgentRuntime:
                         # 5B 软门槛：需求未满足时只给一次"补证/如实收尾"的机会，不再无限
                         # continue，也不再写死固定文案。模型在提醒后仍输出 final → 放行，
                         # 让其自然回答（包括诚实的"无法确认"），不被代码覆盖。
-                        if unattempted and available and turn.budget.can_model_step() \
+                        structured_unattempted = [
+                            state for state in unattempted
+                            if state.requirement.evidence_type == "structured_fact"
+                        ]
+                        if (structured_unattempted and not structured_fact_reminder_prompted
+                                and not any(tr.get("tool") == "query_memory_facts"
+                                            for tr in task.tool_results)
+                                and turn.budget.can_model_step()):
+                            structured_fact_reminder_prompted = True
+                            final_gate.update({
+                                "decision": "continue_structured_fact_once",
+                                "unattempted_requirements": [
+                                    state.requirement.id for state in structured_unattempted
+                                ],
+                            })
+                            messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                            messages.append({"role": "user", "content": (
+                                "该问题声明了全量结构化统计需求。若要报告数量、日期或分组，"
+                                "请调用 query_memory_facts 获取当前相册的精确统计；"
+                                "如果条件不支持或没有可确认口径，也可以直接输出 final 如实说明，"
+                                "不要把检索候选数当作统计答案。"
+                            )})
+                            continue
+                        unattempted_for_prompt = [
+                            state for state in unattempted
+                            if not (structured_fact_reminder_prompted
+                                    and state.requirement.evidence_type == "structured_fact")
+                        ]
+                        if unattempted_for_prompt and available and turn.budget.can_model_step() \
                                 and not gate_unattempted_prompted:
                             gate_unattempted_prompted = True
                             prompt_pending = [
                                 f"{state.requirement.id}:{state.requirement.evidence_type}"
-                                for state in unattempted
+                                for state in unattempted_for_prompt
                             ]
                             final_gate.update({
                                 "decision": "continue_unattempted_once",
@@ -2533,7 +2537,11 @@ class AgentRuntime:
                 # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
                 if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
                     open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
-                    if open_ev_types and turn.budget.can_model_step():
+                    only_reminded_structured_fact = (
+                        structured_fact_reminder_prompted
+                        and open_ev_types == {"structured_fact"}
+                    )
+                    if open_ev_types and not only_reminded_structured_fact and turn.budget.can_model_step():
                         messages.append({"role": "assistant", "content": _model_visible_action(action)})
                         messages.append({"role": "user", "content": (
                             "你尚未检索相册，禁止直接猜测回答。请先调用 search_memories 检索相关照片。"

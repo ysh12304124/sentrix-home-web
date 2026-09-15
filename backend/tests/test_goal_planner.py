@@ -66,6 +66,19 @@ class GoalPlannerTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(calls, ["planner", "planner_format_rewrite"])
 
+    def test_prompt_marks_single_album_counts_as_structured_facts(self):
+        prompts = []
+
+        def chat(messages, **kwargs):
+            prompts.append(messages)
+            return ('{"action":"declare","declaration":{"goal":"统计相册照片",'
+                    '"scope_id":"album1","requirements":[{"id":"fact",'
+                    '"evidence_type":"structured_fact"}]}}')
+
+        self.assertTrue(GoalPlanner(chat_fn=chat).declare("相册有多少张照片", scope_id="album1").ok)
+        self.assertIn("相册数量、拍摄时间、地点、媒体、已命名人物、处理状态：声明 structured_fact",
+                      prompts[0][0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
