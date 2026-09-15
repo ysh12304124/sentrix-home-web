@@ -854,14 +854,35 @@ function liveTelemetryRows(run) {
     ["KV Cache", latest.kv_cache_usage_pct == null ? "未提供" : fmtLive(latest.kv_cache_usage_pct, "%"), latest.kv_cache_used_tokens == null ? "当前框架未暴露运行时 KV 指标" : `峰值 token ${fmtLive(peak.kv_cache_used_tokens)}`],
   ];
 }
+function telemetryLiveState(run) {
+  const value = run?.telemetry_live;
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function telemetryHistory(run) {
+  const history = telemetryLiveState(run).history;
+  return Array.isArray(history) ? history : [];
+}
+function telemetryProcessList(run) {
+  const processes = telemetryLiveState(run).all_processes;
+  return Array.isArray(processes) ? processes : [];
+}
+function telemetrySampleCount(run) {
+  const value = Number(telemetryLiveState(run).samples_count);
+  return Math.max(
+    Number.isFinite(value) && value > 0 ? value : 0,
+    telemetryHistory(run).length,
+  );
+}
 function telemetryChart(run) {
-  let history = Array.isArray(run?.telemetry_live?.history) ? run.telemetry_live.history : [];
+  let history = telemetryHistory(run);
   // Legacy runs may only have phase snapshots. Render a compact phase trend
   // instead of leaving the chart area blank.
   if (history.length < 2) {
-    const phases = run?.telemetry_live?.phase_snapshots || {};
-    history = Object.values(phases).map((phase, i) => ({
+    const phases = telemetryLiveState(run).phase_snapshots;
+    const phaseEntries = phases && typeof phases === "object" && !Array.isArray(phases) ? Object.entries(phases) : [];
+    history = phaseEntries.map(([phaseKey, phase], i) => ({
       t: i,
+      phase: phaseKey,
       ...(phase?.latest || phase?.peak || {}),
     })).filter((item) => Object.keys(item).some((key) => key.endsWith("_mib")));
   }
@@ -879,12 +900,20 @@ function renderTelemetryChart() {
   }
   telemetryChartInstance ||= echarts.init(telemetryChartEl.value);
   const history = chartData.history;
+  const source = telemetryLiveState(activeRun.value).source
+    || activeRun.value?.telemetry_source
+    || activeRun.value?.phases?.gpu_metrics?.source
+    || "";
+  const isOrin = ["orin_ssh_pss", "jetson_local_pss"].includes(source);
   const definitions = [
-    { key: "memory_used_mib", name: "整卡显存", color: "#4f7cff" },
-    { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" },
-    { key: "model_process_memory_used_mib", name: "模型进程", color: "#ef8a4b" },
-    { key: "all_processes_memory_mib", name: "全部 GPU 进程", color: "#d9488b" },
-    { key: "other_processes_memory_mib", name: "其他 GPU 进程", color: "#8b6de8" },
+    ...(isOrin
+      ? [{ key: "system_memory_used_mib", name: "整机 RAM（Orin UMA）", color: "#20a36a" },
+         { key: "model_process_memory_used_mib", name: "主模型进程 PSS（Orin UMA）", color: "#ef8a4b" }]
+      : [{ key: "memory_used_mib", name: "整卡 GPU 显存", color: "#4f7cff" },
+         { key: "model_process_memory_used_mib", name: "主模型进程 GPU 显存", color: "#ef8a4b" },
+         { key: "all_processes_memory_mib", name: "全部 GPU 进程显存", color: "#d9488b" },
+         { key: "other_processes_memory_mib", name: "其他 GPU 进程显存", color: "#8b6de8" },
+         { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" }]),
   ];
   const available = definitions.filter((definition) => history.some((item) => Number.isFinite(Number(item[definition.key]))));
   const firstTimestamp = Number(history[0]?.t);
@@ -892,18 +921,35 @@ function renderTelemetryChart() {
     const elapsed = Number(item?.t) - firstTimestamp;
     return Number.isFinite(elapsed) ? `+${(elapsed / 60).toFixed(1)} min` : `#${index + 1}`;
   });
+  const phaseAreas = [];
+  let phaseStart = 0;
+  for (let index = 1; index <= history.length; index += 1) {
+    const previous = history[index - 1]?.phase || "unassigned";
+    const current = index < history.length ? (history[index]?.phase || "unassigned") : null;
+    if (current !== previous) {
+      const label = history[index - 1]?.phase_label
+        || EXECUTION_PHASES.find((item) => item.key === previous)?.label
+        || previous;
+      phaseAreas.push([
+        { xAxis: phaseStart, name: label, itemStyle: { color: `rgba(${["79,124,255", "32,163,106", "239,138,75", "217,72,139", "139,109,232"][phaseAreas.length % 5]},.07)` } },
+        { xAxis: Math.max(phaseStart, index - 1) },
+      ]);
+      phaseStart = index;
+    }
+  }
   telemetryChartInstance.setOption({
     animation: false,
     color: available.map((item) => item.color),
-    grid: { left: 62, right: 28, top: 48, bottom: 64 },
-    legend: { top: 8, left: 8, type: "scroll", selectedMode: "multiple", textStyle: { color: "#59627c", fontSize: 12 } },
+    grid: { left: 72, right: 28, top: 74, bottom: 64 },
+    legend: { top: 10, left: 12, right: 12, type: "scroll", selectedMode: "multiple", itemGap: 16, textStyle: { color: "#59627c", fontSize: 11 } },
     tooltip: {
       trigger: "axis",
       axisPointer: { type: "cross", label: { backgroundColor: "#667085" } },
       formatter(params) {
         const rows = (Array.isArray(params) ? params : [params]).filter((item) => item.value != null);
         const title = rows[0]?.axisValueLabel || "";
-        return `<b>${title}</b><br/>${rows.map((item) => `${item.marker}${item.seriesName}: <b>${Number(item.value).toFixed(2)} GiB</b>`).join("<br/>")}`;
+        const phase = history[rows[0]?.dataIndex]?.phase_label || history[rows[0]?.dataIndex]?.phase;
+        return `<b>${title}</b>${phase ? `<br/><span>阶段：${phase}</span>` : ""}<br/>${rows.map((item) => `${item.marker}${item.seriesName}: <b>${Number(item.value).toFixed(2)} GiB</b>`).join("<br/>")}`;
       },
     },
     xAxis: { type: "category", boundaryGap: false, data: labels, axisLabel: { color: "#7a849e", hideOverlap: true }, axisLine: { lineStyle: { color: "#d8deea" } } },
@@ -917,8 +963,12 @@ function renderTelemetryChart() {
       connectNulls: false,
       lineStyle: { width: 2.5 },
       emphasis: { focus: "series", lineStyle: { width: 4 } },
-      markPoint: { symbolSize: 42, label: { formatter: (params) => `峰值\n${Number(params.value).toFixed(2)} GiB`, color: "#344054", fontSize: 10 }, data: [{ type: "max", name: "峰值" }] },
       data: history.map((item) => Number.isFinite(Number(item[definition.key])) ? Number(item[definition.key]) / 1024 : null),
+      markArea: definition === available[0] && phaseAreas.length ? {
+        silent: true,
+        label: { show: true, position: "insideTop", color: "#59627c", fontSize: 10 },
+        data: phaseAreas,
+      } : undefined,
     })),
   }, true);
   telemetryChartInstance.resize();
@@ -2966,16 +3016,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </section>
       <h3 class="result-heading">结果指标</h3>
 <div class="result-phase-list">
-        <article v-if="activeRun?.telemetry_live?.samples_count" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
-<div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live?.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
-<p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live?.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
+        <article v-if="telemetrySampleCount(activeRun)" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
+<div class="phase-title"><b>实时资源遥测</b><span class="phase-status" :class="telemetryLiveState(activeRun).status === 'running' ? 'running' : 'completed'">{{ telemetryLiveState(activeRun).status === 'running' ? '实时更新中' : '已停止' }}</span></div>
+<p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ ['jetson_local_pss', 'orin_ssh_pss'].includes(telemetryLiveState(activeRun).source) ? ' Orin 使用进程 PSS 表示统一物理内存，不显示独立 GPU 显存。' : ' 153 使用 NVIDIA GPU 显存；整机 RAM 为宿主机全部进程。' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
-<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">最近 {{ (activeRun.telemetry_live?.history || []).length }} 个采样点；悬浮查看每个时刻的 GiB，图例可单独隐藏曲线，底部可拖动缩放。整机 RAM 为宿主机全部进程，模型进程/全部 GPU 进程按可归因范围记录。</small></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">最近 {{ telemetryHistory(activeRun).length }} 个采样点；悬浮查看时间、阶段和各项 GiB，图例可隐藏曲线，底部可缩放。曲线只绘制实际采集到的数据，不用 0 填充缺失指标。</small></div>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
-<details v-if="(activeRun.telemetry_live?.all_processes || []).length" class="telemetry-processes">
-  <summary>GPU 进程明细（{{ (activeRun.telemetry_live?.all_processes || []).length }} 个）</summary>
+<details v-if="telemetryProcessList(activeRun).length" class="telemetry-processes">
+  <summary>GPU 进程明细（{{ telemetryProcessList(activeRun).length }} 个）</summary>
   <div class="telemetry-process-grid">
-    <div v-for="process in (activeRun.telemetry_live?.all_processes || [])" :key="`${process.pid}-${process.process_name}`" class="telemetry-process-row">
+    <div v-for="process in telemetryProcessList(activeRun)" :key="`${process.pid}-${process.process_name}`" class="telemetry-process-row">
       <span>{{ process.process_name || "未知进程" }}</span><small>PID {{ process.pid }}</small><b>{{ fmtMemory(process.used_memory_mib) }}</b>
     </div>
   </div>

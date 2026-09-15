@@ -1960,7 +1960,25 @@ class BenchmarkRun:
                 "all_gpu_processes": sample.get("all_processes_scope"),
                 "process_attribution": sample.get("process_attribution"),
             }
-            live["history"].append({"t": sample.get("_t", time.time()), **live["latest"]})
+            phase = self._current_phase or "unassigned"
+            phase_labels = {
+                "model_deploy": "模型加载",
+                "scope_setup": "创建相册",
+                "scope_attach": "绑定相册",
+                "identity_seed": "身份预置",
+                "photo_import": "数据导入",
+                "pipeline_processing": "相册流水线预处理",
+                "qa_eval": "QA 测评",
+                "gpu_metrics": "资源指标收尾",
+                "aggregate": "结果汇总",
+                "unassigned": "未分配阶段",
+            }
+            live["history"].append({
+                "t": sample.get("_t", time.time()),
+                "phase": phase,
+                "phase_label": phase_labels.get(phase, phase),
+                **live["latest"],
+            })
             if len(live["history"]) > 240:
                 del live["history"][:-240]
             peak = live.setdefault("peak", {})
@@ -1968,7 +1986,6 @@ class BenchmarkRun:
                 value = sample.get(key)
                 if isinstance(value, (int, float)):
                     peak[key] = max(float(peak.get(key, value)), float(value))
-            phase = self._current_phase or "unassigned"
             phase_view = live.setdefault("phase_snapshots", {}).setdefault(phase, {
                 "samples_count": 0, "latest": {}, "peak": {},
             })
