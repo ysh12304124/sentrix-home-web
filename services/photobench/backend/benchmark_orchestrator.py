@@ -2676,7 +2676,11 @@ class BenchmarkRun:
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        if not self.use_cloud_model and self.telemetry_source != "unavailable":
+        # The sampler starts once at run begin and must remain continuous across
+        # phases; resetting here would silently erase model-deploy/scope/import
+        # telemetry from the full-run curve.
+        if (not self.use_cloud_model and self.telemetry_source != "unavailable"
+                and not self._gpu_sampling_started):
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
