@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 from pathlib import Path
@@ -114,6 +115,31 @@ class RunListLoadingTests(unittest.TestCase):
         result = MODULE.arbiter_status_snapshot("http://127.0.0.1:11001")
         self.assertFalse(result["supported"])
         self.assertEqual(result["reason"], "endpoint_not_supported")
+
+    def test_live_telemetry_snapshot_keeps_latest_peak_and_phase(self):
+        run = MODULE.BenchmarkRun.__new__(MODULE.BenchmarkRun)
+        run.lock = MODULE.threading.RLock()
+        run.telemetry_source = "host_nvidia_smi"
+        run._current_phase = "qa_eval"
+        run.state = {}
+        run.persist = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            run.results_root = Path(directory)
+            run.run_id = "run-1"
+            run.run_dir.mkdir(parents=True)
+            run._persist_gpu_sample({
+                "gpu_utilization_pct": 40, "memory_used_mib": 1000,
+                "model_process_memory_used_mib": 800, "temperature_c": 50,
+            })
+            run._persist_gpu_sample({
+                "gpu_utilization_pct": 90, "memory_used_mib": 1200,
+                "model_process_memory_used_mib": 900, "temperature_c": 55,
+            })
+            live = run.state["telemetry_live"]
+            self.assertEqual(live["samples_count"], 2)
+            self.assertEqual(live["latest"]["gpu_utilization_pct"], 90)
+            self.assertEqual(live["peak"]["memory_used_mib"], 1200)
+            self.assertEqual(live["phase_snapshots"]["qa_eval"]["samples_count"], 2)
 
 
 class ExtractImageIdsTests(unittest.TestCase):

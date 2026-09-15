@@ -823,6 +823,29 @@ function gpuMetricRows(phase = {}) {
     ["SM 时钟", fmtNumber(clock.mean, "MHz"), `峰值 ${fmtNumber(clock.peak, "MHz")} · P95 ${fmtNumber(clock.p95, "MHz")}`],
   ];
 }
+function liveTelemetryRows(run) {
+  const live = run?.telemetry_live || {};
+  const latest = live.latest || {};
+  const peak = live.peak || {};
+  const unit = live.source === "jetson_local_pss" || live.source === "orin_ssh_pss" ? "PSS" : "显存";
+  const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(1)}${suffix}`;
+  return [
+    ["当前阶段", EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中", `已采样 ${live.samples_count || 0} 次`],
+    [`当前${unit}`, fmtLive(latest.model_process_memory_used_mib, " MiB"), `峰值 ${fmtLive(peak.model_process_memory_used_mib, " MiB")}`],
+    ["整卡内存/显存", fmtLive(latest.memory_used_mib, " MiB"), `峰值 ${fmtLive(peak.memory_used_mib, " MiB")}`],
+    ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(peak.gpu_utilization_pct, "%")}`],
+    ["温度 / 功耗", `${fmtLive(latest.temperature_c, " °C")} / ${fmtLive(latest.power_draw_w, " W")}`, `峰值功耗 ${fmtLive(peak.power_draw_w, " W")}`],
+    ["KV Cache", latest.kv_cache_usage_pct == null ? "未提供" : fmtLive(latest.kv_cache_usage_pct, "%"), latest.kv_cache_used_tokens == null ? "当前框架未暴露运行时 KV 指标" : `峰值 token ${fmtLive(peak.kv_cache_used_tokens)}`],
+  ];
+}
+function liveTelemetryPhaseRows(run) {
+  const phases = run?.telemetry_live?.phase_snapshots || {};
+  const fmt = (value) => value == null ? "-" : `${Number(value).toFixed(1)} MiB`;
+  return Object.entries(phases).map(([key, value]) => {
+    const label = EXECUTION_PHASES.find((item) => item.key === key)?.label || key;
+    return [label, fmt(value?.peak?.model_process_memory_used_mib), `整卡/统一内存峰值 ${fmt(value?.peak?.memory_used_mib)} · ${value?.samples_count || 0} 次`];
+  });
+}
 function comparableMemoryProfile(run) {
   if (!run) return null;
   if (run?.memory_profile) return { ...run.memory_profile, source: "replay" };
@@ -2848,6 +2871,12 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </section>
       <h3 class="result-heading">结果指标</h3>
 <div class="result-phase-list">
+        <article v-if="activeRun?.telemetry_live?.samples_count" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
+<div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
+<p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
+<div class="phase-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
+<div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
+</article>
         <article class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
 <b>GPU 指标</b>

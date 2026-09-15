@@ -1869,6 +1869,41 @@ class BenchmarkRun:
         with self.lock:
             with self._gpu_samples_path().open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+            # Keep a compact live view in run.json.  The JSONL file retains the
+            # full time series; this snapshot is what the UI polls while a run
+            # is still executing (and remains available after failure/cancel).
+            live = self.state.setdefault("telemetry_live", {
+                "status": "running", "source": self.telemetry_source,
+                "samples_count": 0, "latest": {}, "peak": {}, "phase_snapshots": {},
+            })
+            live["status"] = "running"
+            live["source"] = sample.get("source") or self.telemetry_source
+            live["samples_count"] = int(live.get("samples_count") or 0) + 1
+            fields = (
+                "temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                "model_process_memory_used_mib", "kv_cache_usage_pct",
+                "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
+            )
+            live["latest"] = {key: sample.get(key) for key in fields if sample.get(key) is not None}
+            peak = live.setdefault("peak", {})
+            for key in fields:
+                value = sample.get(key)
+                if isinstance(value, (int, float)):
+                    peak[key] = max(float(peak.get(key, value)), float(value))
+            phase = self._current_phase or "unassigned"
+            phase_view = live.setdefault("phase_snapshots", {}).setdefault(phase, {
+                "samples_count": 0, "latest": {}, "peak": {},
+            })
+            phase_view["samples_count"] = int(phase_view.get("samples_count") or 0) + 1
+            phase_view["latest"] = live["latest"]
+            phase_peak = phase_view.setdefault("peak", {})
+            for key in fields:
+                value = sample.get(key)
+                if isinstance(value, (int, float)):
+                    phase_peak[key] = max(float(phase_peak.get(key, value)), float(value))
+            # Debounced persistence prevents one disk write per sample while
+            # still making the latest values visible to the next API poll.
+            self.persist()
 
     def cancel(self, source: str = "api"):
         self._cancel.set()
@@ -1989,6 +2024,11 @@ class BenchmarkRun:
         self.state["started_at"] = now_iso()
         self.state["status"] = "running"
         self.state["hardware_snapshots"]["start"] = self._hardware_snapshot()
+        if (not self.use_cloud_model and self.telemetry_source != "unavailable"
+                and not self._gpu_sampling_started):
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         self._current_phase = None
         self.persist()
         all_phases = [
@@ -2009,6 +2049,10 @@ class BenchmarkRun:
                 if self._cancel.is_set():
                     break
                 self._current_phase = name
+                self._record_phase(name, "status", "running")
+                with self.lock:
+                    self.state["current_phase"] = name
+                    self.state.setdefault("telemetry_live", {})["current_phase"] = name
                 fn()
             if self._cancel.is_set():
                 if self._current_phase:
@@ -2038,6 +2082,7 @@ class BenchmarkRun:
         finally:
             if not self.use_cloud_model and self.telemetry_source != "unavailable":
                 self._gpu_sampler.stop()
+                self.state.setdefault("telemetry_live", {})["status"] = "stopped"
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
             if self._gpu_sampling_started and gpu_phase.get("status") != "done":
@@ -2045,6 +2090,9 @@ class BenchmarkRun:
                 partial.update({"status": "partial", "partial": True, "finished_at": now_iso()})
                 self.state["phases"]["gpu_metrics"] = partial
             self.state["finished_at"] = now_iso()
+            with self.lock:
+                self.state["current_phase"] = None
+                self.state.setdefault("telemetry_live", {})["current_phase"] = None
             self.persist(wait=True)
             if self.delete_scope_after_run:
                 self._cleanup_scope()
