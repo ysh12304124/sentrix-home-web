@@ -1928,6 +1928,15 @@ class BenchmarkRun:
                 "status": "running", "source": self.telemetry_source,
                 "samples_count": 0, "latest": {}, "peak": {}, "phase_snapshots": {}, "history": [],
             })
+            # Runs created by older builds may contain null/absent collections;
+            # normalize them before appending live samples so one legacy field
+            # cannot disable all realtime persistence.
+            if not isinstance(live.get("history"), list):
+                live["history"] = []
+            if not isinstance(live.get("peak"), dict):
+                live["peak"] = {}
+            if not isinstance(live.get("phase_snapshots"), dict):
+                live["phase_snapshots"] = {}
             live["status"] = "running"
             live["source"] = sample.get("source") or self.telemetry_source
             live["samples_count"] = int(live.get("samples_count") or 0) + 1
@@ -5046,6 +5055,34 @@ class OrchestratorRepository:
             result = self._public_run(state, include_items=False)
             result["item_count"] = len(state.get("items") or [])
             result["summary"] = self._effective_summary(state)
+            # Backfill live history for runs sampled by an older build or
+            # interrupted during persistence.  The JSONL sampler is the
+            # authoritative append-only source and remains available on
+            # failures/cancellation.
+            live = result.get("telemetry_live")
+            if isinstance(live, dict) and not isinstance(live.get("history"), list):
+                samples_path = (self.results_root / run_id / "gpu_samples.jsonl")
+                history, latest, peak = [], {}, {}
+                try:
+                    for line in samples_path.read_text(encoding="utf-8").splitlines():
+                        item = json.loads(line)
+                        fields = ("temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                                  "model_process_memory_used_mib", "power_draw_w", "sm_clock_mhz",
+                                  "other_processes_memory_mib", "all_processes_memory_mib",
+                                  "system_memory_used_mib", "system_memory_total_mib")
+                        point = {k: item[k] for k in fields if item.get(k) is not None}
+                        if point:
+                            history.append({"t": item.get("_t", time.time()), **point})
+                            latest = point
+                            for key, value in point.items():
+                                if isinstance(value, (int, float)):
+                                    peak[key] = max(float(peak.get(key, value)), float(value))
+                    live["history"] = history[-240:]
+                    live["latest"] = live.get("latest") or latest
+                    live["peak"] = live.get("peak") or peak
+                    live["samples_count"] = live.get("samples_count") or len(history)
+                except Exception:
+                    live["history"] = []
             return result
 
     def get_keyframe_analysis(self, run_id: str) -> dict:

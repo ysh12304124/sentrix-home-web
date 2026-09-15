@@ -836,6 +836,7 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
   overflow-x: auto;
 }
 .telemetry-chart { margin-top:12px; padding:10px 12px 8px; border:1px solid #dfe4f0; border-radius:8px; background:#fff; }
+.live-telemetry-metrics { display:none; }
 .telemetry-chart svg { display:block; width:100%; height:auto; min-height:180px; }
 .telemetry-chart-legend { display:flex; flex-wrap:wrap; gap:10px 16px; margin-bottom:5px; color:#59627c; font-size:10px; }
 .telemetry-chart-legend span { display:inline-flex; align-items:center; gap:5px; }

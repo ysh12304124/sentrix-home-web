@@ -834,18 +834,20 @@ function liveTelemetryRows(run) {
   const live = run?.telemetry_live || {};
   const latest = live.latest || {};
   const peak = live.peak || {};
+  // Older persisted runs may have latest values but no peak object.
+  const effectivePeak = Object.keys(peak).length ? peak : latest;
   const unit = live.source === "jetson_local_pss" || live.source === "orin_ssh_pss" ? "PSS" : "显存";
   const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(2)}${suffix}`;
   const fmtGiB = (value) => value == null ? "-" : `${(Number(value) / 1024).toFixed(2)} GiB`;
   return [
     ["当前阶段", ["completed", "failed", "cancelled"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
-    [`模型进程${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(peak.model_process_memory_used_mib)} · 仅可归因到模型的进程`],
-    ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(peak.memory_used_mib)} · NVIDIA GPU 总占用`],
-    ["整机 RAM", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(peak.system_memory_used_mib)} · ${latest.system_memory_scope === "host_all_processes" ? "宿主机全部进程" : "未标注范围"}`],
-    ["全部 GPU 进程", fmtGiB(latest.all_processes_memory_mib), `峰值 ${fmtGiB(peak.all_processes_memory_mib)} · nvidia-smi 可见进程总和`],
-    ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_mib), `峰值 ${fmtGiB(peak.other_processes_memory_mib)} · 除模型进程外`],
-    ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(peak.gpu_utilization_pct, "%")}`],
-    ["温度 / 功耗", `${fmtLive(latest.temperature_c, " °C")} / ${fmtLive(latest.power_draw_w, " W")}`, `峰值功耗 ${fmtLive(peak.power_draw_w, " W")}`],
+    [`模型进程${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · 仅可归因到模型的进程`],
+    ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(effectivePeak.memory_used_mib)} · NVIDIA GPU 总占用`],
+    ["整机 RAM", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.system_memory_used_mib)} · ${latest.system_memory_scope === "host_all_processes" ? "宿主机全部进程" : "未标注范围"}`],
+    ["全部 GPU 进程", fmtGiB(latest.all_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.all_processes_memory_mib)} · nvidia-smi 可见进程总和`],
+    ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_used_mib ?? latest.other_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.other_processes_memory_mib)} · 除模型进程外`],
+    ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(effectivePeak.gpu_utilization_pct, "%")}`],
+    ["温度 / 功耗", `${fmtLive(latest.temperature_c, " °C")} / ${fmtLive(latest.power_draw_w, " W")}`, `峰值功耗 ${fmtLive(effectivePeak.power_draw_w, " W")}`],
     ["KV Cache", latest.kv_cache_usage_pct == null ? "未提供" : fmtLive(latest.kv_cache_usage_pct, "%"), latest.kv_cache_used_tokens == null ? "当前框架未暴露运行时 KV 指标" : `峰值 token ${fmtLive(peak.kv_cache_used_tokens)}`],
   ];
 }
@@ -2911,7 +2913,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
         <article v-if="activeRun?.telemetry_live?.samples_count" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
-<div class="phase-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
+<div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div class="telemetry-chart-legend"><span v-for="line in telemetryChart(activeRun).lines" :key="line.key"><i :style="{ background: line.color }"></i>{{ line.label }}</span></div><div class="telemetry-chart-axis">0 - {{ telemetryChart(activeRun).maxGiB.toFixed(1) }} GiB</div><svg :viewBox="`0 0 ${telemetryChart(activeRun).width} ${telemetryChart(activeRun).height}`" role="img" aria-label="资源占用趋势"><polyline v-for="line in telemetryChart(activeRun).lines" :key="line.key" v-if="line.points" :points="line.points" fill="none" :stroke="line.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" /></svg><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点，内存单位 GiB；不同曲线按各自采样范围记录</small></div>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <details v-if="(activeRun.telemetry_live.all_processes || []).length" class="telemetry-processes">
