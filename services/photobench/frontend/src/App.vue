@@ -2631,7 +2631,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <div v-if="currentModelInfo && currentModelPopoverOpen" class="current-model-popover" role="status" aria-live="polite">
               <span class="popover-arrow"></span>
               <div class="current-model-popover-head"><span>MODEL ENDPOINT</span><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></div>
-              <strong>{{ currentModelInfo.served_model_name || `${currentModelInfo.served_models.length} 个模型待选择` }}</strong>
+              <strong>{{ currentModelInfo.served_model_name || `${(currentModelInfo.served_models || []).length} 个模型待选择` }}</strong>
               <div class="current-model-status"><i></i>{{ currentModelInfo.manager_available ? '已读取 Manager 当前运行状态' : '已连接 OpenAI-compatible 端点' }}</div>
               <dl>
                 <div><dt>模型服务</dt><dd>{{ currentModelInfo.model_base_url }}</dd></div>
@@ -2970,10 +2970,10 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
-<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点；悬浮查看每个时刻的 GiB，图例可单独隐藏曲线，底部可拖动缩放。整机 RAM 为宿主机全部进程，模型进程/全部 GPU 进程按可归因范围记录。</small></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">最近 {{ (activeRun.telemetry_live.history || []).length }} 个采样点；悬浮查看每个时刻的 GiB，图例可单独隐藏曲线，底部可拖动缩放。整机 RAM 为宿主机全部进程，模型进程/全部 GPU 进程按可归因范围记录。</small></div>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <details v-if="(activeRun.telemetry_live.all_processes || []).length" class="telemetry-processes">
-  <summary>GPU 进程明细（{{ activeRun.telemetry_live.all_processes.length }} 个）</summary>
+  <summary>GPU 进程明细（{{ (activeRun.telemetry_live.all_processes || []).length }} 个）</summary>
   <div class="telemetry-process-grid">
     <div v-for="process in activeRun.telemetry_live.all_processes" :key="`${process.pid}-${process.process_name}`" class="telemetry-process-row">
       <span>{{ process.process_name || "未知进程" }}</span><small>PID {{ process.pid }}</small><b>{{ fmtMemory(process.used_memory_mib) }}</b>

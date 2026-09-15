@@ -7097,6 +7097,9 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/current-model":
+                self._json({"error": "current-model requires POST"}, 405)
+                return
             if parsed.path == "/api/memory-spaces":
                 # 复用相册测评的相册下拉数据：转发 Sentrix 后端列表（新创建的在前）。
                 params = parse_qs(parsed.query)
