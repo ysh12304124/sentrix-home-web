@@ -2967,7 +2967,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       <h3 class="result-heading">结果指标</h3>
 <div class="result-phase-list">
         <article v-if="activeRun?.telemetry_live?.samples_count" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
-<div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
+<div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live?.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live?.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">最近 {{ (activeRun.telemetry_live?.history || []).length }} 个采样点；悬浮查看每个时刻的 GiB，图例可单独隐藏曲线，底部可拖动缩放。整机 RAM 为宿主机全部进程，模型进程/全部 GPU 进程按可归因范围记录。</small></div>
