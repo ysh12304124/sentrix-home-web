@@ -7138,7 +7138,7 @@ class OrchestratorRepository:
 # ---------------------------------------------------------------------------
 
 class OrchestratorHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    protocol_version = "HTTP/1.0"
     repo: OrchestratorRepository
     web_root: Path
 
@@ -7150,6 +7150,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
 
     def _write_body(self, body: bytes):
         try:
+            self.wfile.flush()
             self.connection.settimeout(10)
             for offset in range(0, len(body), 16 * 1024):
                 self.connection.sendall(body[offset:offset + 16 * 1024])
