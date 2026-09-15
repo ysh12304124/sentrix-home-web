@@ -7,6 +7,7 @@ from backend.runtime_providers import (
     HostNvidiaTelemetryProvider,
     ManagerLifecycleProvider,
     ManagerTelemetryProvider,
+    VllmTelemetryProvider,
     LlamaCppTelemetryProvider,
     OrinLlamaCppTelemetryProvider,
     OllamaTelemetryProvider,
@@ -28,6 +29,13 @@ class RuntimeProviderTests(unittest.TestCase):
         provider = HostNvidiaTelemetryProvider(endpoint_url="http://127.0.0.1:8100/v1")
         self.assertEqual(provider.process_memory()["status"], "unavailable")
         self.assertEqual(provider.process_memory()["reason"], "model_process_identity_not_configured")
+
+    @patch.object(VllmTelemetryProvider, "_query")
+    def test_vllm_provider_separates_model_and_other_gpu_processes(self, query):
+        query.return_value = [["10", "VLLM::EngineCore", "2048"], ["11", "python", "512"]]
+        data = VllmTelemetryProvider().process_memory()["data"]
+        self.assertEqual(data["process_memory_used_mib"], 2048)
+        self.assertEqual(data["other_processes_memory_mib"], 512)
 
     @patch.object(LlamaCppTelemetryProvider, "_query", return_value=[])
     def test_missing_named_process_is_not_zero_memory(self, _query):

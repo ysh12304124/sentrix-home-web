@@ -544,7 +544,7 @@ function resultPhaseStatus(phase) {
 }
 
 function imageUrl(image) {
-  return image?.media_url || (image?.asset_id ? `${sentrixUrl.value.replace(/\/$/, "")}/api/assets/${image.asset_id}/file` : "");
+  return image?.asset_id ? `/api/assets/${encodeURIComponent(image.asset_id)}/file` : (image?.media_url || "");
 }
 function actionLabel(value) {
   return ({ answer: "回答", refuse: "拒答", clarify: "澄清", none: "无有效行为" })[value] || "未记录";
@@ -628,6 +628,13 @@ function isVideoMedia(image) {
     const fileName = text.split(/[/?#]/).filter(Boolean).pop() || "";
     return /^video-\d+(?:\.mp4)?$/i.test(fileName) || /\.mp4(?:$|[?#])/i.test(text);
   });
+}
+function pauseVideoAtEvidenceFrame(media, event) {
+  const seconds = Number(media?.source_timestamp_sec);
+  const player = event?.target;
+  if (!player || !Number.isFinite(seconds) || seconds < 0) return;
+  player.pause();
+  player.currentTime = seconds;
 }
 function decorateMedia(list) {
   return (list || []).map((img) => {
@@ -828,22 +835,33 @@ function liveTelemetryRows(run) {
   const latest = live.latest || {};
   const peak = live.peak || {};
   const unit = live.source === "jetson_local_pss" || live.source === "orin_ssh_pss" ? "PSS" : "显存";
-  const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(1)}${suffix}`;
+  const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(2)}${suffix}`;
+  const fmtGiB = (value) => value == null ? "-" : `${(Number(value) / 1024).toFixed(2)} GiB`;
   return [
     ["当前阶段", EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中", `已采样 ${live.samples_count || 0} 次`],
-    [`当前${unit}`, fmtLive(latest.model_process_memory_used_mib, " MiB"), `峰值 ${fmtLive(peak.model_process_memory_used_mib, " MiB")}`],
-    ["整卡内存/显存", fmtLive(latest.memory_used_mib, " MiB"), `峰值 ${fmtLive(peak.memory_used_mib, " MiB")}`],
+    [`当前${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(peak.model_process_memory_used_mib)}`],
+    ["整卡内存/显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(peak.memory_used_mib)}`],
+    ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_mib), `峰值 ${fmtGiB(peak.other_processes_memory_mib)}`],
     ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(peak.gpu_utilization_pct, "%")}`],
     ["温度 / 功耗", `${fmtLive(latest.temperature_c, " °C")} / ${fmtLive(latest.power_draw_w, " W")}`, `峰值功耗 ${fmtLive(peak.power_draw_w, " W")}`],
     ["KV Cache", latest.kv_cache_usage_pct == null ? "未提供" : fmtLive(latest.kv_cache_usage_pct, "%"), latest.kv_cache_used_tokens == null ? "当前框架未暴露运行时 KV 指标" : `峰值 token ${fmtLive(peak.kv_cache_used_tokens)}`],
   ];
+}
+function telemetryChart(run) {
+  const history = run?.telemetry_live?.history || [];
+  if (history.length < 2) return null;
+  const width = 720, height = 220, pad = 28;
+  const values = history.flatMap((x) => [x.memory_used_mib, x.model_process_memory_used_mib, x.other_processes_memory_mib]).filter((x) => Number.isFinite(Number(x)));
+  const max = Math.max(1, ...values), x = (i) => pad + i * (width - pad * 2) / (history.length - 1), y = (v) => height - pad - Number(v || 0) / max * (height - pad * 2);
+  const line = (key) => history.map((item, i) => Number.isFinite(Number(item[key])) ? `${x(i).toFixed(1)},${y(item[key]).toFixed(1)}` : null).filter(Boolean).join(" ");
+  return { width, height, lines: [{ key: "memory_used_mib", label: "整卡/整机", color: "#4f7cff", points: line("memory_used_mib") }, { key: "model_process_memory_used_mib", label: "模型进程", color: "#ef8a4b", points: line("model_process_memory_used_mib") }, { key: "other_processes_memory_mib", label: "其他进程", color: "#8b6de8", points: line("other_processes_memory_mib") }] };
 }
 function liveTelemetryPhaseRows(run) {
   const phases = run?.telemetry_live?.phase_snapshots || {};
   const fmt = (value) => value == null ? "-" : `${Number(value).toFixed(1)} MiB`;
   return Object.entries(phases).map(([key, value]) => {
     const label = EXECUTION_PHASES.find((item) => item.key === key)?.label || key;
-    return [label, fmt(value?.peak?.model_process_memory_used_mib), `整卡/统一内存峰值 ${fmt(value?.peak?.memory_used_mib)} · ${value?.samples_count || 0} 次`];
+    return [label, value?.peak?.model_process_memory_used_mib == null ? "-" : `${(Number(value.peak.model_process_memory_used_mib) / 1024).toFixed(2)} GiB`, `整卡/统一内存峰值 ${value?.peak?.memory_used_mib == null ? "-" : `${(Number(value.peak.memory_used_mib) / 1024).toFixed(2)} GiB`} · ${value?.samples_count || 0} 次`];
   });
 }
 function comparableMemoryProfile(run) {
@@ -2433,11 +2451,9 @@ function qaHasVideoEvidence(item) {
   return qaEvidenceRefs(item).some((ref) => ref.media_type === "video");
 }
 function qaMediaUrl(albumId, item, media) {
-  if (typeof media !== "string" && media?.media_url) return media.media_url;
   const assetId = typeof media === "string" ? "" : media?.asset_id;
-  return assetId && sentrixUrl.value
-    ? `${sentrixUrl.value.replace(/\/$/, "")}/api/assets/${encodeURIComponent(assetId)}/file`
-    : "";
+  return assetId ? `/api/assets/${encodeURIComponent(assetId)}/file`
+    : (typeof media === "string" ? "" : (media?.media_url || ""));
 }
 function qaClaimMediaRefs(claim) {
   return mediaRefs(claim, "evidence");
@@ -2883,6 +2899,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
 <div class="phase-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div class="telemetry-chart-legend"><span v-for="line in telemetryChart(activeRun).lines" :key="line.key"><i :style="{ background: line.color }"></i>{{ line.label }}</span></div><svg :viewBox="`0 0 ${telemetryChart(activeRun).width} ${telemetryChart(activeRun).height}`" role="img" aria-label="资源占用趋势"><polyline v-for="line in telemetryChart(activeRun).lines" :key="line.key" v-if="line.points" :points="line.points" fill="none" :stroke="line.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" /></svg><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点，单位 GiB</small></div>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 </article>
         <article class="phase-card result-phase-card gpu-result-card">
@@ -3081,15 +3098,15 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                     <span><small>步数内完成</small><b>{{ completionLabel(itemDetail(summary)) }}</b></span>
                   </div>
                   <h4>工具召回图片（{{ toolRecallMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in toolRecallMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!toolRecallMedia(itemDetail(summary)).length" class="muted small">检索未返回可识别媒体</span></div>
+                  <div class="image-grid"><div v-for="media in toolRecallMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!toolRecallMedia(itemDetail(summary)).length" class="muted small">检索未返回可识别媒体</span></div>
                   <h4>模型使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`used-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">回答依据图片为空（模型未选择交付图）</span></div>
-                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`used-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
+                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`used-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">回答依据图片为空（模型未选择交付图）</span></div>
+                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`used-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>
                   <h4>检索 GT 媒体（{{ itemMedia(itemDetail(summary), true).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary), true)" :key="media.asset_id || `${media.media_type}-${media.media_id}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}<em v-if="media.matched === false"> · 未召回</em></span></div></div>
+                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary), true)" :key="media.asset_id || `${media.media_type}-${media.media_id}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}<em v-if="media.matched === false"> · 未召回</em></span></div></div>
                   <h4 v-if="judgeReason(itemDetail(summary).judge)">回答质量评分说明</h4><p v-if="judgeReason(itemDetail(summary).judge)" class="muted">{{ judgeReason(itemDetail(summary).judge) }}</p>
                   <h4 v-if="judgeReason(itemDetail(summary).task_judge)">任务判断说明</h4><p v-if="judgeReason(itemDetail(summary).task_judge)" class="muted">{{ judgeReason(itemDetail(summary).task_judge) }}</p>
                   <h4 v-if="judgeReason(itemDetail(summary).evidence_judge)">媒体证据评分说明</h4><p v-if="judgeReason(itemDetail(summary).evidence_judge)" class="muted">{{ judgeReason(itemDetail(summary).evidence_judge) }}</p>
@@ -3336,7 +3353,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <details v-for="(record, recordIndex) in chainDetail.records" :key="record.key" class="chain-record" :open="recordIndex === 0">
             <summary><b>QA {{ record.index + 1 }}</b><span>{{ record.question }}</span><em>{{ record.media.length }} 媒体 · {{ record.statements.length }} 语句 · {{ record.traceRows.length }} 调用</em></summary>
             <div class="chain-record-body">
-              <section class="chain-detail-section"><h4>图像 / 媒体证据 <small>{{ record.media.length }} 项</small></h4><div class="chain-detail-media-grid"><div v-for="media in record.media" :key="`${record.key}-${mediaKey(media)}`" class="chain-detail-media"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><button v-else-if="imageUrl(media)" type="button" @click="openImage(media)"><img :src="imageUrl(media)" :alt="media.file_name || media.media_id" loading="lazy" /></button><span v-else class="image-empty">媒体文件未能解析</span><small>{{ media.file_name || media.media_id || media.asset_id }}</small></div><p v-if="!record.media.length" class="muted small">该节点没有保存可展示的媒体引用。</p></div></section>
+              <section class="chain-detail-section"><h4>图像 / 媒体证据 <small>{{ record.media.length }} 项</small></h4><div class="chain-detail-media-grid"><div v-for="media in record.media" :key="`${record.key}-${mediaKey(media)}`" class="chain-detail-media"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><button v-else-if="imageUrl(media)" type="button" @click="openImage(media)"><img :src="imageUrl(media)" :alt="media.file_name || media.media_id" loading="lazy" /></button><span v-else class="image-empty">媒体文件未能解析</span><small>{{ media.file_name || media.media_id || media.asset_id }}</small></div><p v-if="!record.media.length" class="muted small">该节点没有保存可展示的媒体引用。</p></div></section>
               <section class="chain-detail-section"><h4>结构化语句 / 观察 <small>{{ record.statements.length }} 项</small></h4><div class="chain-detail-statements"><article v-for="statement in record.statements" :key="`${record.key}-${statement.label}-${statement.value}`"><b>{{ statement.label }}</b><p>{{ statement.value }}</p></article><p v-if="!record.statements.length" class="muted small">没有保存文字观察或回答声明。</p></div></section>
               <section class="chain-detail-section"><h4>工具调用与返回 <small>{{ record.traceRows.length }} 项</small></h4><details v-for="row in record.traceRows" :key="`${record.key}-${row.label}`" class="chain-trace-row"><summary>{{ row.label }}</summary><pre>{{ row.value }}</pre></details><p v-if="!record.traceRows.length" class="muted small">该节点没有保存工具调用轨迹。</p></section>
               <section class="chain-detail-section"><h4>已保存的执行过程 / 证据归因</h4><p class="chain-detail-disclaimer">以下只展示系统实际保存的 execution trace、Agent 证据账本和 grounding 信息，不把未保存的模型隐藏思维链伪装成可复现推理。</p><pre class="chain-reasoning-pre">{{ record.reasoning }}</pre></section>

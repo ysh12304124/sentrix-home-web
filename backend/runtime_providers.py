@@ -268,11 +268,19 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                     "reason": "model_process_identity_not_configured"}
         try:
             rows = self._query("compute-apps=pid,process_name,used_memory")
-            matches = [{"pid": int(float(r[0])), "process_name": r[1], "used_memory_mib": float(r[2])} for r in rows if len(r) >= 3 and (not self.process_hint or self.process_hint in r[1].lower())]
+            candidates = [{"pid": int(float(r[0])), "process_name": r[1], "used_memory_mib": float(r[2])}
+                          for r in rows if len(r) >= 3]
+            hints = [self.process_hint]
+            matches = [item for item in candidates if any(hint in item["process_name"].lower() for hint in hints)]
             if not matches:
                 return {"status": "unavailable", "source": "host_nvidia_smi",
-                        "reason": "matching_model_process_not_found"}
-            return {"status": "available", "source": "host_nvidia_smi", "data": {"process_memory_used_mib": sum(x["used_memory_mib"] for x in matches), "processes": matches}}
+                        "reason": "matching_model_process_not_found", "data": {"processes": candidates}}
+            others = [item for item in candidates if item not in matches]
+            return {"status": "available", "source": "host_nvidia_smi", "data": {
+                "process_memory_used_mib": sum(x["used_memory_mib"] for x in matches),
+                "processes": matches, "other_processes_memory_mib": sum(x["used_memory_mib"] for x in others),
+                "other_processes": others,
+            }}
         except Exception as exc:
             return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
     def kv_cache(self) -> dict:
@@ -282,6 +290,12 @@ class LlamaCppTelemetryProvider(HostNvidiaTelemetryProvider):
     framework = "llama.cpp"
     def __init__(self, endpoint_url: str = ""):
         super().__init__(process_hint="llama-server", endpoint_url=endpoint_url)
+
+class VllmTelemetryProvider(HostNvidiaTelemetryProvider):
+    """Best-effort process attribution for a local, unmanaged vLLM endpoint."""
+    framework = "vllm"
+    def __init__(self, endpoint_url: str = ""):
+        super().__init__(process_hint="vllm", endpoint_url=endpoint_url)
 
 
 class OrinLlamaCppTelemetryProvider(TelemetryProvider):

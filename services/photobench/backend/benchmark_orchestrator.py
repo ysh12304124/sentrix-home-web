@@ -47,6 +47,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from backend.runtime_providers import (
     ManagerLifecycleProvider,
     ManagerTelemetryProvider,
+    VllmTelemetryProvider,
     HostNvidiaTelemetryProvider,
     LlamaCppTelemetryProvider,
     LocalJetsonLlamaCppTelemetryProvider,
@@ -108,6 +109,22 @@ def resolve_runtime_framework(value: str, model_base_url: str) -> str:
     return "generic"
 
 
+def detect_runtime_framework(value: str, model_base_url: str) -> str:
+    framework = resolve_runtime_framework(value, model_base_url)
+    if framework != "generic" or not model_base_url:
+        return framework
+    metrics_url = normalize_model_base_url(model_base_url).removesuffix("/v1") + "/metrics"
+    try:
+        metrics = request_text(metrics_url, timeout=3).lower()
+    except Exception:
+        return framework
+    if "vllm:" in metrics:
+        return "vllm"
+    if "llamacpp:" in metrics or "llama_" in metrics:
+        return "llama.cpp"
+    return framework
+
+
 def select_runtime_providers(manager_url: str, endpoint_url: str,
                              framework: str, *, cloud: bool = False):
     """Choose the model lifecycle and local telemetry by runtime and host."""
@@ -123,7 +140,7 @@ def select_runtime_providers(manager_url: str, endpoint_url: str,
         return lifecycle, OrinLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "orin_ssh_pss"
     if not cloud and not jetson and host in local_hosts:
         telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider,
-                           "ollama": OllamaTelemetryProvider}.get(framework, HostNvidiaTelemetryProvider)
+                           "ollama": OllamaTelemetryProvider, "vllm": VllmTelemetryProvider}.get(framework, HostNvidiaTelemetryProvider)
         return lifecycle, telemetry_class(endpoint_url=endpoint_url), "host_nvidia_smi"
     return lifecycle, UnavailableTelemetryProvider(), "unavailable"
 
@@ -1062,6 +1079,24 @@ def _resolve_predicted_media(asset_ids: list[str], assets_by_name: dict) -> list
         if not match:
             continue
         file_name, asset = match
+        metadata = asset.get("metadata_json") if isinstance(asset.get("metadata_json"), dict) else {}
+        derived_kind = str(asset.get("derived_kind") or metadata.get("derived_kind") or "")
+        parent_asset_id = str(asset.get("parent_asset_id") or metadata.get("parent_asset_id") or "")
+        if derived_kind in {"video_keyframe", "video_keyframe_webp"} and parent_asset_id in assets_by_id:
+            source_file_name, source_asset = assets_by_id[parent_asset_id]
+            if _infer_media_type(source_file_name, source_asset.get("media_type") or source_asset.get("asset_type")) == "video":
+                media = {
+                    "asset_id": parent_asset_id,
+                    "file_name": source_file_name,
+                    "media_type": "video",
+                    "media_id": Path(source_file_name).stem,
+                    "source_timestamp_sec": asset.get("source_timestamp_sec") or metadata.get("source_timestamp_sec"),
+                    "source_keyframe_asset_id": str(asset_id),
+                }
+                if source_asset.get("media_url"):
+                    media["media_url"] = source_asset["media_url"]
+                resolved.append(media)
+                continue
         media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
         media = {
             "asset_id": str(asset_id),
@@ -1530,6 +1565,7 @@ class GpuSampler:
                     sample = dict(gpu)
                     sample["_t"] = ts
                     sample["model_process_memory_used_mib"] = process_memory.get("process_memory_used_mib")
+                    sample["other_processes_memory_mib"] = process_memory.get("other_processes_memory_mib")
                     sample["model_process_memory_limit_mib"] = process_memory.get("process_memory_limit_mib")
                     sample["model_process_memory_over_limit"] = process_memory.get("process_memory_over_limit")
                     sample["model_process_pid"] = process_memory.get("root_pid")
@@ -1874,7 +1910,7 @@ class BenchmarkRun:
             # is still executing (and remains available after failure/cancel).
             live = self.state.setdefault("telemetry_live", {
                 "status": "running", "source": self.telemetry_source,
-                "samples_count": 0, "latest": {}, "peak": {}, "phase_snapshots": {},
+                "samples_count": 0, "latest": {}, "peak": {}, "phase_snapshots": {}, "history": [],
             })
             live["status"] = "running"
             live["source"] = sample.get("source") or self.telemetry_source
@@ -1882,9 +1918,12 @@ class BenchmarkRun:
             fields = (
                 "temperature_c", "gpu_utilization_pct", "memory_used_mib",
                 "model_process_memory_used_mib", "kv_cache_usage_pct",
-                "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
+                "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
             )
             live["latest"] = {key: sample.get(key) for key in fields if sample.get(key) is not None}
+            live["history"].append({"t": sample.get("_t", time.time()), **live["latest"]})
+            if len(live["history"]) > 240:
+                del live["history"][:-240]
             peak = live.setdefault("peak", {})
             for key in fields:
                 value = sample.get(key)
@@ -6816,7 +6855,7 @@ class OrchestratorRepository:
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
         model_base_url = normalize_model_base_url(payload.get("model_base_url"))
         endpoint_model = str(payload.get("endpoint_model") or "").strip()
-        runtime_framework = resolve_runtime_framework(payload.get("runtime_framework"), model_base_url)
+        runtime_framework = detect_runtime_framework(payload.get("runtime_framework"), model_base_url)
         vllm_manager_url = normalize_service_url(payload.get("vllm_manager_url"))
         if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
             raise ValueError("big_model cannot be combined with current model")
@@ -7084,6 +7123,13 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                         return
                 self._json({"error": "media not found"}, 404)
                 return
+            if parsed.path.startswith("/api/assets/") and parsed.path.endswith("/file"):
+                asset_id = unquote(parsed.path.removeprefix("/api/assets/").removesuffix("/file")).strip("/")
+                if not asset_id or "/" in asset_id:
+                    self._json({"error": "invalid asset id"}, 400)
+                    return
+                self._proxy_sentrix_asset(asset_id)
+                return
             if parsed.path == "/api/runs":
                 query = parse_qs(parsed.query)
                 try:
@@ -7325,6 +7371,27 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 404)
         except Exception as e:
             self._json({"error": str(e)}, 400)
+
+    def _proxy_sentrix_asset(self, asset_id: str):
+        """Serve Sentrix media from the 8771 origin, preserving video ranges and MIME type."""
+        headers = {}
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers["Range"]
+        request = urllib.request.Request(
+            f"{DEFAULT_SENTRIX_URL.rstrip('/')}/api/assets/{quote(asset_id)}/file",
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                self.send_response(getattr(response, "status", HTTPStatus.OK))
+                for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"):
+                    value = response.headers.get(name)
+                    if value:
+                        self.send_header(name, value)
+                self.end_headers()
+                shutil.copyfileobj(response, self.wfile)
+        except urllib.error.HTTPError as exc:
+            self._json({"error": f"asset proxy failed: {exc.code}"}, exc.code)
 
     def _serve_file(self, path: Path):
         if not path.is_file():

@@ -14,6 +14,10 @@ SPEC.loader.exec_module(MODULE)
 
 
 class RuntimeFrameworkTests(unittest.TestCase):
+    @patch.object(MODULE, "request_text", return_value="# HELP vllm:num_requests_running\nvllm:num_requests_running 0\n")
+    def test_metrics_probe_identifies_unmanaged_vllm(self, _request):
+        self.assertEqual(MODULE.detect_runtime_framework("", "http://127.0.0.1:8100/v1"), "vllm")
+
     @patch.object(MODULE, "is_jetson_host", return_value=False)
     def test_port_8100_is_not_automatically_llamacpp_on_discrete_gpu(self, _jetson):
         self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.153:8100/v1"), "generic")
