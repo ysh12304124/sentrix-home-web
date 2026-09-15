@@ -838,10 +838,12 @@ function liveTelemetryRows(run) {
   const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(2)}${suffix}`;
   const fmtGiB = (value) => value == null ? "-" : `${(Number(value) / 1024).toFixed(2)} GiB`;
   return [
-    ["当前阶段", EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中", `已采样 ${live.samples_count || 0} 次`],
-    [`当前${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(peak.model_process_memory_used_mib)}`],
-    ["整卡内存/显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(peak.memory_used_mib)}`],
-    ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_mib), `峰值 ${fmtGiB(peak.other_processes_memory_mib)}`],
+    ["当前阶段", ["completed", "failed", "cancelled"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
+    [`模型进程${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(peak.model_process_memory_used_mib)} · 仅可归因到模型的进程`],
+    ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(peak.memory_used_mib)} · NVIDIA GPU 总占用`],
+    ["整机 RAM", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(peak.system_memory_used_mib)} · ${latest.system_memory_scope === "host_all_processes" ? "宿主机全部进程" : "未标注范围"}`],
+    ["全部 GPU 进程", fmtGiB(latest.all_processes_memory_mib), `峰值 ${fmtGiB(peak.all_processes_memory_mib)} · nvidia-smi 可见进程总和`],
+    ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_mib), `峰值 ${fmtGiB(peak.other_processes_memory_mib)} · 除模型进程外`],
     ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(peak.gpu_utilization_pct, "%")}`],
     ["温度 / 功耗", `${fmtLive(latest.temperature_c, " °C")} / ${fmtLive(latest.power_draw_w, " W")}`, `峰值功耗 ${fmtLive(peak.power_draw_w, " W")}`],
     ["KV Cache", latest.kv_cache_usage_pct == null ? "未提供" : fmtLive(latest.kv_cache_usage_pct, "%"), latest.kv_cache_used_tokens == null ? "当前框架未暴露运行时 KV 指标" : `峰值 token ${fmtLive(peak.kv_cache_used_tokens)}`],
@@ -851,17 +853,28 @@ function telemetryChart(run) {
   const history = run?.telemetry_live?.history || [];
   if (history.length < 2) return null;
   const width = 720, height = 220, pad = 28;
-  const values = history.flatMap((x) => [x.memory_used_mib, x.model_process_memory_used_mib, x.other_processes_memory_mib]).filter((x) => Number.isFinite(Number(x)));
-  const max = Math.max(1, ...values), x = (i) => pad + i * (width - pad * 2) / (history.length - 1), y = (v) => height - pad - Number(v || 0) / max * (height - pad * 2);
+  const values = history.flatMap((x) => [x.memory_used_mib, x.model_process_memory_used_mib, x.system_memory_used_mib, x.all_processes_memory_mib, x.other_processes_memory_mib]).filter((x) => Number.isFinite(Number(x)));
+  const max = Math.max(1, ...values) / 1024;
+  const x = (i) => pad + i * (width - pad * 2) / (history.length - 1);
+  const y = (v) => height - pad - Number(v || 0) / 1024 / max * (height - pad * 2);
   const line = (key) => history.map((item, i) => Number.isFinite(Number(item[key])) ? `${x(i).toFixed(1)},${y(item[key]).toFixed(1)}` : null).filter(Boolean).join(" ");
-  return { width, height, lines: [{ key: "memory_used_mib", label: "整卡/整机", color: "#4f7cff", points: line("memory_used_mib") }, { key: "model_process_memory_used_mib", label: "模型进程", color: "#ef8a4b", points: line("model_process_memory_used_mib") }, { key: "other_processes_memory_mib", label: "其他进程", color: "#8b6de8", points: line("other_processes_memory_mib") }] };
+  return { width, height, maxGiB: max, lines: [
+    { key: "memory_used_mib", label: "整卡显存", color: "#4f7cff", points: line("memory_used_mib") },
+    { key: "system_memory_used_mib", label: "整机 RAM", color: "#20a36a", points: line("system_memory_used_mib") },
+    { key: "model_process_memory_used_mib", label: "模型进程", color: "#ef8a4b", points: line("model_process_memory_used_mib") },
+    { key: "all_processes_memory_mib", label: "全部 GPU 进程", color: "#d9488b", points: line("all_processes_memory_mib") },
+    { key: "other_processes_memory_mib", label: "其他 GPU 进程", color: "#8b6de8", points: line("other_processes_memory_mib") },
+  ] };
 }
 function liveTelemetryPhaseRows(run) {
   const phases = run?.telemetry_live?.phase_snapshots || {};
-  const fmt = (value) => value == null ? "-" : `${Number(value).toFixed(1)} MiB`;
   return Object.entries(phases).map(([key, value]) => {
     const label = EXECUTION_PHASES.find((item) => item.key === key)?.label || key;
-    return [label, value?.peak?.model_process_memory_used_mib == null ? "-" : `${(Number(value.peak.model_process_memory_used_mib) / 1024).toFixed(2)} GiB`, `整卡/统一内存峰值 ${value?.peak?.memory_used_mib == null ? "-" : `${(Number(value.peak.memory_used_mib) / 1024).toFixed(2)} GiB`} · ${value?.samples_count || 0} 次`];
+    const peak = value?.peak || {};
+    const model = peak.model_process_memory_used_mib == null ? "-" : `${(Number(peak.model_process_memory_used_mib) / 1024).toFixed(2)} GiB`;
+    const card = peak.memory_used_mib == null ? "-" : `${(Number(peak.memory_used_mib) / 1024).toFixed(2)} GiB`;
+    const host = peak.system_memory_used_mib == null ? "-" : `${(Number(peak.system_memory_used_mib) / 1024).toFixed(2)} GiB`;
+    return [label, model, `模型进程峰值 · 整卡 ${card} · 整机 RAM ${host} · ${value?.samples_count || 0} 次`];
   });
 }
 function comparableMemoryProfile(run) {
@@ -2899,8 +2912,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
 <div class="phase-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
-<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div class="telemetry-chart-legend"><span v-for="line in telemetryChart(activeRun).lines" :key="line.key"><i :style="{ background: line.color }"></i>{{ line.label }}</span></div><svg :viewBox="`0 0 ${telemetryChart(activeRun).width} ${telemetryChart(activeRun).height}`" role="img" aria-label="资源占用趋势"><polyline v-for="line in telemetryChart(activeRun).lines" :key="line.key" v-if="line.points" :points="line.points" fill="none" :stroke="line.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" /></svg><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点，单位 GiB</small></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div class="telemetry-chart-legend"><span v-for="line in telemetryChart(activeRun).lines" :key="line.key"><i :style="{ background: line.color }"></i>{{ line.label }}</span></div><div class="telemetry-chart-axis">0 - {{ telemetryChart(activeRun).maxGiB.toFixed(1) }} GiB</div><svg :viewBox="`0 0 ${telemetryChart(activeRun).width} ${telemetryChart(activeRun).height}`" role="img" aria-label="资源占用趋势"><polyline v-for="line in telemetryChart(activeRun).lines" :key="line.key" v-if="line.points" :points="line.points" fill="none" :stroke="line.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" /></svg><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点，内存单位 GiB；不同曲线按各自采样范围记录</small></div>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
+<details v-if="(activeRun.telemetry_live.all_processes || []).length" class="telemetry-processes">
+  <summary>GPU 进程明细（{{ activeRun.telemetry_live.all_processes.length }} 个）</summary>
+  <div class="telemetry-process-grid">
+    <div v-for="process in activeRun.telemetry_live.all_processes" :key="`${process.pid}-${process.process_name}`" class="telemetry-process-row">
+      <span>{{ process.process_name || "未知进程" }}</span><small>PID {{ process.pid }}</small><b>{{ fmtMemory(process.used_memory_mib) }}</b>
+    </div>
+  </div>
+</details>
 </article>
         <article class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">

@@ -1552,24 +1552,39 @@ class GpuSampler:
             try:
                 gpu_result = self.provider.gpu_stats()
                 memory_result = self.provider.process_memory()
+                system_result = self.provider.system_memory() if hasattr(self.provider, "system_memory") else {}
                 if gpu_result.get("status") != "available":
                     self._stop.wait(self.interval)
                     continue
                 data = gpu_result.get("data") or {}
-                process_memory = (
-                    memory_result.get("data") or {}
-                    if memory_result.get("status") == "available" else {}
-                )
+                # Keep auxiliary process/system data even when model PID
+                # attribution is unavailable; never turn a missing model
+                # process into a false zero.
+                process_memory = memory_result.get("data") or {}
+                system_memory = system_result.get("data") or {}
                 ts = time.perf_counter()
                 for gpu in data.get("gpus", []):
                     sample = dict(gpu)
                     sample["_t"] = ts
                     sample["model_process_memory_used_mib"] = process_memory.get("process_memory_used_mib")
                     sample["other_processes_memory_mib"] = process_memory.get("other_processes_memory_mib")
+                    sample["all_processes_memory_mib"] = process_memory.get("all_processes_memory_mib")
+                    sample["system_memory_used_mib"] = system_memory.get("system_memory_used_mib", process_memory.get("system_memory_used_mib"))
+                    sample["system_memory_total_mib"] = system_memory.get("system_memory_total_mib", process_memory.get("system_memory_total_mib"))
+                    sample["system_memory_available_mib"] = system_memory.get("system_memory_available_mib", process_memory.get("system_memory_available_mib"))
+                    sample["system_memory_scope"] = system_memory.get("system_memory_scope", process_memory.get("system_memory_scope"))
+                    sample["memory_scope"] = process_memory.get("memory_scope") or sample.get("memory_scope")
+                    sample["process_memory_scope"] = process_memory.get("process_memory_scope")
+                    sample["process_attribution"] = process_memory.get("process_attribution")
+                    sample["all_processes_scope"] = process_memory.get("all_processes_scope")
+                    sample["model_processes"] = process_memory.get("processes") or []
+                    sample["other_processes"] = process_memory.get("other_processes") or []
+                    sample["all_processes"] = process_memory.get("all_processes") or []
                     sample["model_process_memory_limit_mib"] = process_memory.get("process_memory_limit_mib")
                     sample["model_process_memory_over_limit"] = process_memory.get("process_memory_over_limit")
                     sample["model_process_pid"] = process_memory.get("root_pid")
                     sample["memory_unit"] = process_memory.get("memory_unit") or sample.get("memory_unit")
+                    sample["source"] = gpu_result.get("source") or self.provider.__class__.__name__
                     sample["pss_sampled_at_monotonic"] = process_memory.get("pss_sampled_at_monotonic")
                     sample["kv_cache_used_tokens"] = process_memory.get("kv_cache_used_tokens")
                     vllm_metrics = process_memory.get("vllm_metrics") or {}
@@ -1598,7 +1613,8 @@ class GpuSampler:
         for key in (
             "temperature_c", "gpu_utilization_pct", "memory_used_mib",
             "model_process_memory_used_mib", "kv_cache_usage_pct", "kv_cache_used_tokens",
-            "power_draw_w", "sm_clock_mhz",
+            "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
+            "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
         ):
             values = [
                 s[key] for s in self.samples
@@ -1919,8 +1935,19 @@ class BenchmarkRun:
                 "temperature_c", "gpu_utilization_pct", "memory_used_mib",
                 "model_process_memory_used_mib", "kv_cache_usage_pct",
                 "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
+                "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
             )
             live["latest"] = {key: sample.get(key) for key in fields if sample.get(key) is not None}
+            live["model_processes"] = sample.get("model_processes") or []
+            live["other_processes"] = sample.get("other_processes") or []
+            live["all_processes"] = sample.get("all_processes") or []
+            live["scopes"] = {
+                "system_memory": sample.get("system_memory_scope"),
+                "gpu_memory": sample.get("memory_scope"),
+                "model_process": sample.get("process_memory_scope"),
+                "all_gpu_processes": sample.get("all_processes_scope"),
+                "process_attribution": sample.get("process_attribution"),
+            }
             live["history"].append({"t": sample.get("_t", time.time()), **live["latest"]})
             if len(live["history"]) > 240:
                 del live["history"][:-240]

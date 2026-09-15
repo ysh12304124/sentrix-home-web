@@ -16,7 +16,7 @@ SPEC.loader.exec_module(MODULE)
 class RuntimeFrameworkTests(unittest.TestCase):
     @patch.object(MODULE, "request_text", return_value="# HELP vllm:num_requests_running\nvllm:num_requests_running 0\n")
     def test_metrics_probe_identifies_unmanaged_vllm(self, _request):
-        self.assertEqual(MODULE.detect_runtime_framework("", "http://127.0.0.1:8100/v1"), "vllm")
+        self.assertEqual(MODULE.detect_runtime_framework("", "http://127.0.0.1:9100/v1"), "vllm")
 
     @patch.object(MODULE, "is_jetson_host", return_value=False)
     def test_port_8100_is_not_automatically_llamacpp_on_discrete_gpu(self, _jetson):
@@ -134,15 +134,21 @@ class RunListLoadingTests(unittest.TestCase):
             run._persist_gpu_sample({
                 "gpu_utilization_pct": 40, "memory_used_mib": 1000,
                 "model_process_memory_used_mib": 800, "temperature_c": 50,
+                "system_memory_used_mib": 4000, "all_processes_memory_mib": 900,
+                "other_processes_memory_mib": 100, "system_memory_scope": "host_all_processes",
             })
             run._persist_gpu_sample({
                 "gpu_utilization_pct": 90, "memory_used_mib": 1200,
                 "model_process_memory_used_mib": 900, "temperature_c": 55,
+                "system_memory_used_mib": 4200, "all_processes_memory_mib": 1000,
+                "other_processes_memory_mib": 100, "system_memory_scope": "host_all_processes",
             })
             live = run.state["telemetry_live"]
             self.assertEqual(live["samples_count"], 2)
             self.assertEqual(live["latest"]["gpu_utilization_pct"], 90)
             self.assertEqual(live["peak"]["memory_used_mib"], 1200)
+            self.assertEqual(live["peak"]["system_memory_used_mib"], 4200)
+            self.assertEqual(live["peak"]["all_processes_memory_mib"], 1000)
             self.assertEqual(live["phase_snapshots"]["qa_eval"]["samples_count"], 2)
 
 

@@ -36,6 +36,16 @@ class RuntimeProviderTests(unittest.TestCase):
         data = VllmTelemetryProvider().process_memory()["data"]
         self.assertEqual(data["process_memory_used_mib"], 2048)
         self.assertEqual(data["other_processes_memory_mib"], 512)
+        self.assertEqual(data["all_processes_memory_mib"], 2560)
+        self.assertEqual(data["all_processes_scope"], "gpu_compute_processes")
+
+    @patch("backend.runtime_providers.Path.read_text")
+    def test_system_memory_is_host_ram_in_mib(self, read_text):
+        read_text.return_value = "MemTotal:       16384000 kB\nMemAvailable:    8192000 kB\n"
+        data = HostNvidiaTelemetryProvider().system_memory()["data"]
+        self.assertEqual(data["system_memory_total_mib"], 16000)
+        self.assertEqual(data["system_memory_used_mib"], 8000)
+        self.assertEqual(data["system_memory_scope"], "host_all_processes")
 
     @patch.object(LlamaCppTelemetryProvider, "_query", return_value=[])
     def test_missing_named_process_is_not_zero_memory(self, _query):

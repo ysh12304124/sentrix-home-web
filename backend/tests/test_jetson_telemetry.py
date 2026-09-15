@@ -35,6 +35,19 @@ class JetsonTelemetryTests(unittest.TestCase):
         get.return_value.text = "llamacpp:kv_cache_tokens 3\nllamacpp:kv_cache_usage_ratio 0.25\n"
         self.assertEqual(provider._metrics()["kv_cache_used_tokens"], 3)
 
+    @patch.object(LocalJetsonLlamaCppTelemetryProvider, "_device", return_value={
+        "system_memory_used_mib": 6000,
+        "system_memory_total_mib": 16000,
+        "system_memory_available_mib": 10000,
+        "system_memory_scope": "host_all_processes",
+    })
+    def test_system_memory_scope_is_host(self, _device):
+        provider = LocalJetsonLlamaCppTelemetryProvider("http://127.0.0.1:8100/v1")
+        provider._device_sample = _device.return_value
+        result = provider.system_memory()
+        self.assertEqual(result["data"]["system_memory_used_mib"], 6000)
+        self.assertEqual(result["data"]["system_memory_scope"], "host_all_processes")
+
 
 if __name__ == "__main__":
     unittest.main()

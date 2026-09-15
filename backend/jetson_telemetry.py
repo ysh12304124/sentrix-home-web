@@ -102,6 +102,7 @@ class LocalJetsonLlamaCppTelemetryProvider:
             line = output.splitlines()[0] if output.splitlines() else ""
             sample = {}
             for key, pattern, scale in (
+                ("system_memory_used_mib", r"RAM\s+(\d+)/(\d+)MB", 1),
                 ("gpu_utilization_pct", r"GR3D_FREQ\s+(\d+)%", 1),
                 ("power_draw_w", r"VDD_GPU_SOC\s+(\d+)mW", 0.001),
                 ("temperature_c", r"(?:gpu|tj)@([\d.]+)C", 1),
@@ -109,6 +110,12 @@ class LocalJetsonLlamaCppTelemetryProvider:
                 match = re.search(pattern, line)
                 if match:
                     sample[key] = round(float(match.group(1)) * scale, 3)
+                    if key == "system_memory_used_mib":
+                        sample["system_memory_total_mib"] = round(float(match.group(2)) * scale, 3)
+                        sample["system_memory_available_mib"] = round(
+                            max(0.0, sample["system_memory_total_mib"] - sample[key]), 3
+                        )
+                        sample["system_memory_scope"] = "host_all_processes"
             self._device_sample = sample
         except (OSError, subprocess.SubprocessError, ValueError):
             self._device_sample = {}
@@ -122,6 +129,7 @@ class LocalJetsonLlamaCppTelemetryProvider:
         data = dict(self._last_memory.get("data") or {})
         data.update(self._metrics())
         data["memory_unit"] = "process_pss_uma_mib"
+        data["memory_scope"] = "model_process_pss"
         data["memory_profile"] = {"method": "orin_process_pss_uma_v1"}
         try:
             pid = self._pid()
@@ -133,6 +141,7 @@ class LocalJetsonLlamaCppTelemetryProvider:
             if time.monotonic() - self._last_probe >= self.pss_interval:
                 self._last_probe = time.monotonic()
                 data["process_memory_used_mib"] = self._pss_mib(pid)
+                data["process_memory_scope"] = "llama_server_pss"
                 data["pss_sampled_at_monotonic"] = time.monotonic()
                 data.pop("pss_error", None)
         except (OSError, ValueError, IndexError) as exc:
@@ -140,11 +149,19 @@ class LocalJetsonLlamaCppTelemetryProvider:
             data["pss_error"] = str(exc)
         self._last_memory = {"status": "available", "source": "jetson_local_pss", "data": data}
         return {"status": "available", "source": "jetson_local_pss", "data": {
-            "gpus": [{"index": 0, "memory_unit": "process_pss_uma_mib", **self._device()}],
+            "gpus": [{"index": 0, "memory_unit": "process_pss_uma_mib", "memory_scope": "model_process_pss", **self._device()}],
         }}
 
     def process_memory(self) -> dict:
         return self._last_memory
+
+    def system_memory(self) -> dict:
+        data = self._device_sample.copy()
+        keys = {"system_memory_used_mib", "system_memory_total_mib", "system_memory_available_mib", "system_memory_scope"}
+        data = {key: value for key, value in data.items() if key in keys}
+        if "system_memory_used_mib" not in data:
+            return {"status": "unavailable", "source": "tegrastats", "reason": "ram_sample_unavailable"}
+        return {"status": "available", "source": "tegrastats", "data": data}
 
     def kv_cache(self) -> dict:
         data = self._last_memory.get("data") or {}

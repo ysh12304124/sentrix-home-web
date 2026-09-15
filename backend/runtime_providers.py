@@ -12,6 +12,7 @@ import csv
 import io
 import subprocess
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -75,6 +76,9 @@ class TelemetryProvider:
 
     def kv_cache(self) -> dict:  # pragma: no cover - interface contract
         raise NotImplementedError
+
+    def system_memory(self) -> dict:
+        return {"status": "unavailable", "reason": "system_memory_not_supported"}
 
 
 class OpenAICompatibleInferenceProvider(InferenceProvider):
@@ -217,6 +221,9 @@ class ManagerTelemetryProvider(TelemetryProvider):
     def process_memory(self) -> dict:
         return self._optional("/process-memory")
 
+    def system_memory(self) -> dict:
+        return self._optional("/system-memory")
+
     def kv_cache(self) -> dict:
         memory = self.process_memory()
         if memory.get("status") != "available":
@@ -247,6 +254,12 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
     def __init__(self, process_hint: str = "", endpoint_url: str = ""):
         self.process_hint = str(process_hint or "").strip().lower()
         self.endpoint_url = normalize_service_url(endpoint_url)
+
+    @property
+    def endpoint_port(self) -> str:
+        parsed = urlparse(self.endpoint_url)
+        return str(parsed.port or "")
+
     @staticmethod
     def _query(query: str):
         result = subprocess.run(["nvidia-smi", f"--query-{query}", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5, check=True)
@@ -259,9 +272,39 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                 if len(row) < 7: continue
                 v = [float(x) for x in row[1:]]
                 gpus.append({"index": int(float(row[0])), "gpu_utilization_pct": v[0], "memory_used_mib": v[1], "memory_total_mib": v[2], "temperature_c": v[3], "power_draw_w": v[4], "sm_clock_mhz": v[5]})
-            return {"status": "available", "source": "host_nvidia_smi", "data": {"gpus": gpus}}
+            return {"status": "available", "source": "host_nvidia_smi", "data": {
+                "gpus": gpus,
+                "memory_scope": "gpu_device",
+            }}
         except Exception as exc:
             return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
+
+    @staticmethod
+    def _read_system_memory() -> dict:
+        values = {}
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                key, _, raw = line.partition(":")
+                if key in {"MemTotal", "MemAvailable"}:
+                    # Linux /proc/meminfo reports kB (despite the historical
+                    # field name). Convert once here so every API field whose
+                    # suffix is _mib is genuinely MiB.
+                    values[key] = float(raw.strip().split()[0]) / 1024.0
+            total = values.get("MemTotal")
+            available = values.get("MemAvailable")
+            if total is None or available is None:
+                raise ValueError("MemTotal/MemAvailable missing")
+            return {"status": "available", "source": "proc_meminfo", "data": {
+                "system_memory_used_mib": round(max(0.0, total - available), 2),
+                "system_memory_total_mib": round(total, 2),
+                "system_memory_available_mib": round(available, 2),
+                "system_memory_scope": "host_all_processes",
+            }}
+        except (OSError, ValueError, IndexError) as exc:
+            return {"status": "unavailable", "source": "proc_meminfo", "reason": str(exc)}
+
+    def system_memory(self) -> dict:
+        return self._read_system_memory()
     def process_memory(self) -> dict:
         if not self.process_hint:
             return {"status": "unavailable", "source": "host_nvidia_smi",
@@ -271,15 +314,40 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
             candidates = [{"pid": int(float(r[0])), "process_name": r[1], "used_memory_mib": float(r[2])}
                           for r in rows if len(r) >= 3]
             hints = [self.process_hint]
-            matches = [item for item in candidates if any(hint in item["process_name"].lower() for hint in hints)]
+            matches = []
+            for item in candidates:
+                process_name = item["process_name"].lower()
+                identity = process_name
+                try:
+                    raw_cmdline = Path(f"/proc/{item['pid']}/cmdline").read_bytes()
+                    identity = f"{identity} {raw_cmdline.replace(bytes([0]), bytes([32])).decode('utf-8', 'replace').lower()}"
+                except (OSError, ValueError):
+                    pass
+                item["identity"] = identity[:500]
+                if any(hint and hint in identity for hint in hints):
+                    matches.append(item)
+                elif self.endpoint_port and self.endpoint_port in identity:
+                    # A generic Python executable may hide the runtime name;
+                    # a command line bound to this endpoint is still a useful
+                    # best-effort identity signal for unmanaged runtimes.
+                    matches.append(item)
             if not matches:
                 return {"status": "unavailable", "source": "host_nvidia_smi",
-                        "reason": "matching_model_process_not_found", "data": {"processes": candidates}}
+                        "reason": "matching_model_process_not_found", "data": {
+                            "processes": [], "model_processes": [],
+                            "all_processes": candidates,
+                            "all_processes_memory_mib": sum(x["used_memory_mib"] for x in candidates),
+                            "process_attribution": "unavailable",
+                            "process_attribution_reason": "matching_model_process_not_found",
+                        }}
             others = [item for item in candidates if item not in matches]
             return {"status": "available", "source": "host_nvidia_smi", "data": {
                 "process_memory_used_mib": sum(x["used_memory_mib"] for x in matches),
-                "processes": matches, "other_processes_memory_mib": sum(x["used_memory_mib"] for x in others),
-                "other_processes": others,
+                "processes": matches, "model_processes": matches,
+                "model_process_scope": "gpu_compute_processes",
+                "other_processes_memory_mib": sum(x["used_memory_mib"] for x in others),
+                "other_processes": others, "all_processes_memory_mib": sum(x["used_memory_mib"] for x in candidates),
+                "all_processes": candidates, "all_processes_scope": "gpu_compute_processes",
             }}
         except Exception as exc:
             return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}

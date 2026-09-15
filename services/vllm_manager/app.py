@@ -36,6 +36,28 @@ STATE_FILE_DEFAULT = "/home/asus/sentrix-vllm/state/current.json"
 app = FastAPI(title="Sentrix vLLM Manager API", version="1.0.0")
 
 
+def _system_memory() -> dict:
+    """Return host RAM from Linux MemTotal/MemAvailable (MiB)."""
+    try:
+        values = {}
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            key, _, raw = line.partition(":")
+            if key in {"MemTotal", "MemAvailable"}:
+                # /proc/meminfo values are kB.  Convert to MiB before exposing
+                # fields with the _mib suffix so the API and UI share one unit.
+                values[key] = float(raw.strip().split()[0]) / 1024.0
+        total = values["MemTotal"]
+        available = values["MemAvailable"]
+        return {
+            "system_memory_used_mib": round(max(0.0, total - available), 2),
+            "system_memory_total_mib": round(total, 2),
+            "system_memory_available_mib": round(available, 2),
+            "system_memory_scope": "host",
+        }
+    except (OSError, KeyError, ValueError, IndexError):
+        return {}
+
+
 def _read_json(path: Path, fallback):
     try:
         return json.loads(path.read_text())
@@ -407,23 +429,42 @@ def gpu_stats():
                 "sm_clock_mhz": float(parts[7]),
                 "mem_clock_mhz": float(parts[8]),
             })
-        return {"gpus": gpus}
+        return {"gpus": gpus, "memory_scope": "gpu_device"}
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="nvidia-smi timeout")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/system-memory")
+def system_memory():
+    data = _system_memory()
+    if not data:
+        raise HTTPException(status_code=503, detail="/proc/meminfo unavailable")
+    return data
+
+
 @app.get("/process-memory")
 def process_memory():
     """Return GPU memory physically occupied by the managed vLLM process tree."""
     state = _read_json(_state_file_path(), None)
+    system = _system_memory()
     if not state or not state.get("pid"):
         return {
             "sampled_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "active": False,
-            "process_memory_used_mib": 0.0,
+            "process_memory_used_mib": None,
+            "process_memory_scope": "model_process_gpu_compute",
+            "process_attribution": "unavailable",
             "processes": [],
+            "model_processes": [],
+            "all_processes": [],
+            "all_processes_memory_mib": None,
+            "other_processes": [],
+            "other_processes_memory_mib": None,
+            "all_processes_scope": "gpu_compute_processes",
+            "memory_unit": "gpu_process_mib",
+            **system,
             "vllm_metrics": {},
         }
     try:
@@ -431,6 +472,7 @@ def process_memory():
         tracked_pids = _process_tree(root_pid)
         all_processes = _compute_process_memory()
         model_processes = [item for item in all_processes if item["pid"] in tracked_pids]
+        other_processes = [item for item in all_processes if item["pid"] not in tracked_pids]
         return {
             "sampled_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "active": Path(f"/proc/{root_pid}").exists(),
@@ -438,10 +480,19 @@ def process_memory():
             "served_model_name": state.get("served_model_name"),
             "root_pid": root_pid,
             "tracked_pids": sorted(tracked_pids),
+            "process_memory_scope": "model_process_gpu_compute",
+            "process_attribution": "tracked_process_tree",
             "process_memory_used_mib": round(sum(item["memory_used_mib"] for item in model_processes), 1),
             "process_memory_limit_mib": 10240.0,
             "process_memory_over_limit": sum(item["memory_used_mib"] for item in model_processes) > 10240.0,
             "processes": model_processes,
+            "all_processes": all_processes,
+            "all_processes_memory_mib": round(sum(item["memory_used_mib"] for item in all_processes), 1),
+            "other_processes": other_processes,
+            "other_processes_memory_mib": round(sum(item["memory_used_mib"] for item in other_processes), 1),
+            "all_processes_scope": "gpu_compute_processes",
+            "memory_unit": "gpu_process_mib",
+            **system,
             "configured_gpu_memory_utilization": state.get("gpu_memory_utilization"),
             "configured_max_model_len": state.get("max_model_len"),
             "configured_max_num_seqs": state.get("max_num_seqs"),
