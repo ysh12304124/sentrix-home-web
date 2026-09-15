@@ -2079,11 +2079,12 @@ const startDisabledReason = computed(() => {
 });
 const modeLabel = (mode) => (({ full: "全链路", reuse: "复用测评", build: "构建相册" })[mode || "full"] || mode);
 const modeBadgeClass = (mode) => (({ full: "mode-full", reuse: "mode-reuse", build: "mode-build" })[mode || "full"] || "mode-full");
-function exportSftTraces() {
+function exportTraces() {
   if (!activeRunId.value) return;
   const scores = exportScores.value;
   if (!scores.length) { window.alert("请至少勾选一个评分再导出"); return; }
-  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft?scores=${scores.join(",")}`, "_blank");
+  // 每题只含两项：planner 完整输入/输出 + 完整轨迹
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-trace?scores=${scores.join(",")}`, "_blank");
 }
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
@@ -2529,7 +2530,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
               <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
             </span>
-            <button class="btn compact" @click="exportSftTraces">导出 SFT JSON</button>
+            <button class="btn compact" @click="exportTraces" title="每题导出 planner 完整输入/输出 + 完整轨迹">导出轨迹 JSON</button>
           </div>
         </div>
       </div>

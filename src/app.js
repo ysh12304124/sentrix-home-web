@@ -11,6 +11,9 @@
     activeConversationSummary: "",
     searchLoading: false,
     liveProgress: [],
+    activeTurnId: "",
+    pendingMessage: "",
+    conversationDrawerOpen: false,
     selectedAsset: null,
     photoInspector: null,
     loading: true,
@@ -255,25 +258,25 @@
   }
 
   function mediaResults(result) {
-    const media = result?.media_results || result?.mediaResults || result?.image_results || [];
+    const mediaSource = result?.media_results || result?.mediaResults || result?.image_results || [];
+    const media = Array.isArray(mediaSource) ? mediaSource : [];
     if (!media.length) return "";
     const rows = media.map((item) => {
       const mediaType = item.media_type === "video" ? "video" : "image";
-      const label = item.display_handle || (mediaType === "video" ? "原始视频" : "原始图片");
+      const label = item.display_handle || (mediaType === "video" ? "视频" : "照片");
       const aspects = [
         ...(item.supported_aspects || []).map((aspect) => `对上了：${aspect}`),
         ...(item.uncertain_aspects || []).map((aspect) => `还不能确认：${aspect}`),
       ];
       const caption = aspects.length
-        ? aspects.map(escapeHtml).join(" · ")
-        : (item.captured_at || item.caption || "可回看的原始证据");
-      const dup = item.near_duplicate_size > 1 ? `<small class="image-dup">另有 ${item.near_duplicate_size - 1} 张相似照片</small>` : "";
+        ? aspects.join(" · ")
+        : (item.captured_at || item.caption || "本轮相关内容");
       if (mediaType === "video") {
         return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
       }
-      return `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
+      return `<button class="image-result" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url)}" data-image-label="${escapeHtml(label)}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || item.location || "")}" data-image-activity="${escapeHtml(item.caption || caption || "")}" title="查看照片"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /></button>`;
     }).join("");
-    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关媒体</p><h3>${media.length} 项</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
+    return `<section class="evidence-layer image-results"><div class="image-result-grid">${rows}</div></section>`;
   }
 
   function traceLabel(item) {
@@ -344,46 +347,79 @@
     return STAGE_LABELS[step.stage] || (step.stage ? String(step.stage) : "思考");
   }
 
-  function buildThinkingSteps(result, liveProgress = null) {
-    const progress = liveProgress || (result && (result.public_progress || [])) || [];
-    const tools = (result && (result.toolTrace || result.tool_trace)) || [];
-    const taskTools = (result && result.task_state && result.task_state.tool_results) || [];
-    let toolIndex = 0;
-    let taskIndex = 0;
-    return progress.map((item) => {
-      const stage = item.stage || "";
-      const status = item.status || "running";
-      if (stage === "tool_result" || stage === "tool_error") {
-        const tool = tools[toolIndex] || {};
-        const fallback = taskTools[taskIndex] || {};
-        toolIndex += 1;
-        taskIndex += 1;
-        const denied = tool.status === "denied" || stage === "tool_error";
-        return {
-          type: "tool",
-          tool: tool.tool || fallback.tool,
-          text: item.text || tool.reason || (denied ? "工具调用被拒绝" : "正在处理…"),
-          status: denied ? "blocked" : "complete",
-          latency: tool.latency_s,
-        };
-      }
-      return {
-        type: "stage",
-        stage,
-        text: item.text || "",
-        status: status === "ok" ? "complete" : status,
-      };
+  function timelineEvents(result, liveProgress = null) {
+    const source = liveProgress || (result && result.public_progress) || [];
+    const events = Array.isArray(source) ? source : [];
+    const byId = new Map();
+    events.forEach((event, index) => {
+      if (!event || typeof event !== "object") return;
+      const id = event.event_id || `${event.stage || "status"}-${event.step_index || index}`;
+      byId.set(id, { ...event, event_id: id });
     });
+    return [...byId.values()].sort((a, b) => (a.step_index || 0) - (b.step_index || 0));
   }
 
-  function agentStepHtml(step) {
-    const running = step.status === "running";
-    const blocked = step.status === "blocked" || step.status === "denied" || step.status === "error";
+  function timelineToolArtifact(event) {
+    const data = event?.payload && typeof event.payload === "object" ? event.payload : {};
+    if (data.tool === "search_memories") {
+      const conditions = data.condition_summary && typeof data.condition_summary === "object"
+        ? Object.values(data.condition_summary).filter(Boolean).join(" · ") : "";
+      const gaps = Array.isArray(data.gaps) ? data.gaps : [];
+      const meta = [data.query, conditions, data.total != null ? `找到 ${data.total} 张` : "", ...gaps].filter(Boolean);
+      return meta.length ? `<small class="timeline-artifact">${escapeHtml(meta.join(" · "))}</small>` : "";
+    }
+    if (data.tool === "inspect_photo") return data.observation ? `<p class="timeline-observation">${escapeHtml(data.observation)}</p>` : "";
+    if (data.tool === "read_photo_text") return (data.text || data.ocr_text) ? `<p class="timeline-observation">${escapeHtml(data.text || data.ocr_text)}</p>` : "";
+    if (data.summary) return `<small class="timeline-artifact">${escapeHtml(data.summary)}</small>`;
+    if (data.reason) return `<small class="timeline-artifact">${escapeHtml(data.reason)}</small>`;
+    return "";
+  }
+
+  function timelineCard(event) {
+    const status = event.status || "running";
+    const running = status === "running" || status === "cancelling";
+    const blocked = ["blocked", "denied", "error", "cancelled", "partial"].includes(status);
     const stateClass = running ? "running" : blocked ? "blocked" : "complete";
-    const mark = step.type === "tool" ? "🔧" : "💭";
-    const statusMark = running ? "…" : blocked ? "!" : "✓";
-    const latency = step.latency != null ? `<small>${escapeHtml(String(step.latency))}s</small>` : "";
-    return `<div class="agent-step ${stateClass}"><span class="agent-step-mark">${mark}</span><div class="agent-step-body"><strong>${escapeHtml(thinkingStepLabel(step))}</strong><span>${escapeHtml(step.text || "")}</span>${latency}</div><span class="agent-step-status">${statusMark}</span></div>`;
+    const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+    let heading = "记忆处理中";
+    let content = event.text || "";
+    let artifact = "";
+    if (event.kind === "plan" || event.kind === "plan_update") {
+      heading = "本轮记忆目标";
+      content = payload.goal || event.text || "";
+      const requirements = Array.isArray(payload.requirements) ? payload.requirements : [];
+      artifact = requirements.map((item) => `<li>${escapeHtml(item.description || item.evidence_type || "待确认的依据")} · ${escapeHtml(item.status || "open")}</li>`).join("");
+      artifact = artifact ? `<ul class="timeline-requirements">${artifact}</ul>` : "";
+    } else if (event.kind === "model_action") {
+      heading = "正在推进";
+    } else if (event.kind === "tool_result" || event.kind === "tool_error") {
+      heading = "找到的依据";
+      artifact = timelineToolArtifact(event);
+    } else if (event.kind === "evaluation") {
+      heading = "正在核对结论";
+    } else if (event.kind === "recovery") {
+      heading = "重新核对";
+    } else if (event.kind === "terminal") {
+      heading = status === "cancelled" ? "本轮已停止" : "本轮处理完成";
+    } else {
+      heading = STAGE_LABELS[event.stage] || "记忆处理中";
+    }
+    const eventId = event.event_id || `${event.stage || "status"}-${event.step_index || ""}`;
+    const signatureSource = `${status}|${content}|${JSON.stringify(payload)}`;
+    let signature = 0;
+    for (let index = 0; index < signatureSource.length; index += 1) signature = ((signature << 5) - signature) + signatureSource.charCodeAt(index) | 0;
+    return `<article class="timeline-card ${stateClass}" data-timeline-event-id="${escapeHtml(String(eventId))}" data-timeline-signature="${signature}"><span class="timeline-dot" aria-hidden="true"></span><div><strong>${escapeHtml(heading)}</strong>${content ? `<p>${escapeHtml(content)}</p>` : ""}${artifact}</div></article>`;
+  }
+
+  function recallCard(result) {
+    const event = timelineEvents(result).find((item) => item.kind === "tool_result" && item.payload && item.payload.tool === "search_memories");
+    if (!event) return "";
+    const data = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const previews = Array.isArray(data.preview) ? data.preview : [];
+    const gaps = Array.isArray(data.gaps) ? data.gaps : [];
+    const preview = previews.map((item) => `<button class="timeline-image" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url || "")}" data-image-label="${escapeHtml(item.evidence_summary || item.handle || "原始图片")}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || "")}" data-image-activity="${escapeHtml(item.activity || "")}" data-image-role="召回候选"><img src="${escapeHtml(item.media_url || "")}" alt="${escapeHtml(item.evidence_summary || item.handle || "召回图片")}" loading="lazy" /></button>`).join("");
+    const details = [data.query, data.total != null ? `${data.total} 张相关照片` : "", ...gaps].filter(Boolean).join(" · ");
+    return `<details class="recall-card"><summary>召回的照片${data.total != null ? ` · ${escapeHtml(String(data.total))} 张` : ""}</summary><p>${escapeHtml(details || "本轮召回依据")}</p>${preview ? `<div class="timeline-image-grid">${preview}</div>` : ""}</details>`;
   }
 
   function assistantAnswer(result) {
@@ -461,8 +497,8 @@
     const ordered = result.evidence_order || [];
     const order = ordered.length && isAdmin ? `<details class="algorithm-evidence admin-only"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
     const directEvidence = Boolean(result.original_evidence_requested || presentation.direct_original_evidence);
-    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${mediaResults(result) || evidence || gapContent}</section>` : "";
-    const optionalMedia = directEvidence ? "" : mediaResults(result);
+    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${evidence || gapContent}</section>` : "";
+    const optionalMedia = "";
     const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
     const toolSamples = toolLoopEvidence(result);
     const toolEvidence = toolSamples.length ? `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">本次依据（工具结果）</p><h3>${toolSamples.length} 项</h3></div></div><div class="evidence-list">${toolSamples.map(evidenceCard).join("")}</div></section>` : "";
@@ -474,7 +510,7 @@
     // RX-6: a chat turn (memory_used === false) never shows an evidence entry; tool-loop turns use task_state evidence.
     const requiresEvidence = (result.memory_used !== false && presentation.required !== false) || hasToolEvidence || hasResultSet;
     const hasGap = result.evidence_status === "gap" || (!evidenceCount && result.tool_loop_status === "complete");
-    const resultSetBlock = displayMode === "collapsed" ? resultSetCard(result) : "";
+    const resultSetBlock = "";
     const basisOpen = displayMode === "result_grid" || hasGap || (displayMode !== "collapsed" && evidenceCount > 0);
     const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalMedia}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     if (displayMode === "none") return `${followups}${gapContent}`;
@@ -502,21 +538,19 @@
     const hasMore = Boolean(ts.has_more) && remaining > 0;
     const head = totalKnown ? `共 ${total} 张${hasMore ? ` · 还有 ${remaining} 张` : ""}` : "找到一批相关结果";
     const handles = (ts.result_preview || []).slice(0, 6);
-    const selected = state.selectedAsset && state.selectedAsset.result_set_id === rid ? state.selectedAsset.handle : "";
     // C8：本轮的 inspect_photo 复核结果与 handle 对应展示（已复核徽标 + 复核观察）
     const inspectRows = (ts.tool_results || []).filter((tr) => tr.tool === "inspect_photo" && tr.inspect_handle);
     const inspected = new Set(inspectRows.map((tr) => tr.inspect_handle));
     const inspectedNotes = inspectRows.filter((tr) => tr.inspect_text)
       .map((tr) => `<span>${escapeHtml(tr.inspect_handle)} · 复核：${escapeHtml(tr.inspect_text)}</span>`).join("");
     const thumbs = handles.length ? `<div class="result-set-thumbs">${handles.map((h) => {
-      const active = h === selected ? " selected" : "";
       const checked = inspected.has(h) ? " inspected" : "";
-      return `<div class="result-set-thumb-wrap${active}${checked}"><button class="result-set-thumb" data-action="open-photo-inspector" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}" title="打开照片检查器"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button><button class="result-set-select" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}" title="在主对话中选中这张">${h === selected ? "✓" : "＋"}</button></div>`;
+      const originalUrl = window.sentrixApi.resultSetPhoto(rid, h, state.scopeId, true);
+      return `<div class="result-set-thumb-wrap${checked}"><button class="result-set-thumb" data-action="open-timeline-image" data-image-url="${escapeHtml(originalUrl)}" data-image-label="${escapeHtml(h)}" title="查看原图"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button></div>`;
     }).join("")}</div>` : "";
     const inspectBlock = inspectedNotes ? `<div class="result-set-inspect-notes">${inspectedNotes}</div>` : "";
-    const originalButton = selected ? `<button class="text-button" data-action="open-selected-original" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(selected)}">查看原图 ${icon("→")}</button>` : "";
     const next = hasMore ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
-    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${originalButton}${next}</section>`;
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${next}</section>`;
   }
 
   function assistantMessage(message) {
@@ -527,17 +561,38 @@
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
     const failureStatus = ["partial", "timeout", "error", "blocked_by_guard"].includes(result.tool_loop_status || "");
-    const traceSteps = buildThinkingSteps(result);
-    const trace = traceSteps.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>思考过程 · ${traceSteps.length} 步</summary><div>${traceSteps.map(agentStepHtml).join("")}</div></details>` : "";
+    const timeline = timelineEvents(result);
+    const trace = timeline.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>记忆推理 · ${timeline.length} 个节点</summary><div class="timeline-list">${timeline.map(timelineCard).join("")}</div></details>` : "";
     const grounding = result.answerGrounding || result.answer_grounding || {};
-    const gridVisible = ["result_grid", "inline_images"].includes(grounding.display_mode);
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${trace}${gridVisible ? resultSetCard(result) : ""}${assistantEvidence(result)}</div></article>`;
+    const selected = Boolean((grounding.selected_image_handles || grounding.selected_asset_ids || []).length);
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble">${selected ? mediaResults(result) : ""}<p>${assistantAnswer(result) || "我在。"}</p>${trace}${recallCard(result)}</div></article>`;
   }
 
   function updateLiveProgress() {
     const host = document.querySelector("[data-live-progress]");
     if (!host) return;
-    host.innerHTML = buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("");
+    let list = host.querySelector(".timeline-list");
+    if (!list) {
+      host.innerHTML = '<div class="timeline-list"></div>';
+      list = host.querySelector(".timeline-list");
+    }
+    timelineEvents(null, state.liveProgress).forEach((event) => {
+      const eventId = String(event.event_id || `${event.stage || "status"}-${event.step_index || ""}`);
+      const existing = Array.from(list.querySelectorAll("[data-timeline-event-id]")).find((node) => node.dataset.timelineEventId === eventId);
+      const template = document.createElement("template");
+      template.innerHTML = timelineCard(event).trim();
+      const next = template.content.firstElementChild;
+      if (!next) return;
+      if (!existing) {
+        list.appendChild(next);
+        return;
+      }
+      if (existing.dataset.timelineSignature !== next.dataset.timelineSignature) {
+        existing.className = next.className;
+        existing.dataset.timelineSignature = next.dataset.timelineSignature;
+        existing.innerHTML = next.innerHTML;
+      }
+    });
   }
 
   function conversationRail() {
@@ -547,19 +602,16 @@
       const active = conv.conversation_id === state.conversationId;
       const when = conv.last_message_at || conv.updated_at || "";
       const whenLabel = when ? String(when).slice(5, 16).replace("T", " ") : "";
-      return `<div class="conversation-item${active ? " active" : ""}"><button class="conversation-open" data-action="open-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}"><span class="conversation-title">${escapeHtml(conv.title || "新对话")}</span><small>${escapeHtml(whenLabel)}</small></button><button class="conversation-delete" data-action="delete-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}" aria-label="删除对话" title="删除对话">✕</button></div>`;
+      return `<div class="conversation-item${active ? " active" : ""}"><button class="conversation-open" data-action="open-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}"><span class="conversation-title">${escapeHtml(conv.title || "新对话")}</span><small>${escapeHtml(whenLabel)}</small></button><details class="conversation-menu"><summary aria-label="更多操作">•••</summary><button data-action="rename-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}">重命名</button><button data-action="delete-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}">删除</button></details></div>`;
     }).join("") : `<div class="conversation-empty">还没有历史对话</div>`;
-    return `<aside class="conversation-rail"><div class="conversation-rail-head"><strong>对话</strong><button class="text-button" data-action="new-conversation">${icon("＋")}新对话</button></div><div class="conversation-list">${items}</div></aside>`;
+    return `<div class="conversation-drawer"><button class="conversation-drawer-toggle" data-action="toggle-conversation-drawer">对话</button><aside class="conversation-rail${state.conversationDrawerOpen ? " drawer-open" : ""}"><div class="conversation-rail-head"><strong>对话</strong><button class="text-button" data-action="new-conversation">${icon("＋")}新对话</button></div><div class="conversation-list">${items}</div></aside></div>`;
   }
 
   function searchView() {
     const messages = state.assistantMessages;
-    const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
-    const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    const summary = state.activeConversationSummary ? `<details class="conversation-summary"><summary>本会话摘要</summary><p>${escapeHtml(state.activeConversationSummary).replace(/\n/g, "<br />")}</p></details>` : "";
     const rail = conversationRail();
-    const inner = `${introduction}${summary}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想，正在整理这段记忆。</p><div class="agent-trace live" data-live-progress>${buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("")}</div></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${rail ? `<div class="assistant-layout">${rail}<div class="assistant-main">${inner}</div></div>` : inner}`;
+    const inner = `<section class="assistant-conversation">${messages.map(assistantMessage).join("")}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><div class="agent-trace live" data-live-progress><div class="timeline-list">${timelineEvents(null, state.liveProgress).map(timelineCard).join("")}</div></div><button class="text-button" data-action="cancel-assistant-turn">停止本轮回答</button></div></article>` : ""}</section>${searchBar("")}`;
+    return rail ? `<div class="assistant-layout">${rail}<div class="assistant-main">${inner}</div></div>` : inner;
   }
 
   function timelineView() {
@@ -841,6 +893,7 @@
   function renderView() {
     const root = document.getElementById("view-root");
     const views = { overview, search: searchView, timeline: timelineView, people: peopleView, knowledge: semanticKnowledgeView, library: libraryView, stories: storiesView, imports: importsView, settings: settingsView };
+    root.classList.toggle("assistant-view", state.view === "search");
     root.innerHTML = state.loading ? emptyState("正在读取本地记忆", "正在加载 Asset、Observation、Event、Fact 和故事。") : views[state.view]();
     renderModal();
     bindViewEvents();
@@ -853,7 +906,10 @@
     const modal = state.modal;
     if (modal.type === "loading") { root.innerHTML = `<div class="modal-backdrop"><div class="modal-panel"><button class="modal-close" data-action="close-modal">×</button><div class="empty-search"><div class="empty-symbol">◌</div><h2>正在读取证据</h2></div></div></div>`; return; }
     let body = "";
-    if (modal.type === "event") {
+    if (modal.type === "timeline-image") {
+      const facts = [modal.time ? `时间 · ${escapeHtml(modal.time)}` : "", modal.place ? `地点 · ${escapeHtml(modal.place)}` : ""].filter(Boolean);
+      body = `<h2>照片详情</h2><div class="asset-modal-preview"><img src="${escapeHtml(modal.url || "")}" alt="${escapeHtml(modal.label || "照片")}" /></div>${facts.length ? `<div class="detail-facts">${facts.map((fact) => `<span>${fact}</span>`).join("")}</div>` : ""}${modal.activity ? `<p class="timeline-image-context">${escapeHtml(modal.activity)}</p>` : ""}`;
+    } else if (modal.type === "event") {
       const detail = modal.detail;
       const eventEntities = detail.entities || [];
       const coverSelection = detail.event.cover_selection || {};
@@ -1236,22 +1292,24 @@
   async function submitSearch(event, selectedEntityId = "") {
     if (event?.preventDefault) event.preventDefault();
     const input = document.getElementById("search-input");
-    state.query = input ? input.value.trim() : state.query.trim();
-    if (!state.query) return;
+    const submittedMessage = input ? input.value.trim() : state.query.trim();
+    if (!submittedMessage || state.searchLoading) return;
+    state.query = "";
+    state.pendingMessage = submittedMessage;
     state.view = "search";
-    state.assistantMessages.push({ role: "user", text: state.query });
+    state.assistantMessages.push({ role: "user", text: submittedMessage });
     state.searchLoading = true;
     state.liveProgress = [];
     renderShellNavigation();
     try {
-      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
+      const { result, conversationId } = await runAssistantTurn(submittedMessage, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
       state.conversationId = conversationId;
       state.searchResult = result;
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
     }
     state.assistantMessages.push({ role: "steward", result: state.searchResult });
-    state.query = "";
+    state.pendingMessage = "";
     state.searchLoading = false;
     state.liveProgress = [];
     loadConversations().catch(() => {});
@@ -1293,16 +1351,14 @@
       state.assistantMessages = (data.messages || []).map((msg) => {
         const text = (msg.content && (msg.content.text || msg.content.content)) || "";
         if (msg.role === "user") return { role: "user", text };
-        return { role: "steward", result: { answer: text, conversation_id: id, answer_grounding: { display_mode: "none" }, tool_loop_status: "complete" } };
+        const presentation = (msg.content && msg.content.presentation) || null;
+        return { role: "steward", result: presentation || { answer: text, conversation_id: id, answer_grounding: { display_mode: "none" }, tool_loop_status: "complete" } };
       });
     } catch { state.assistantMessages = []; }
     renderShellNavigation();
   }
 
   async function deleteConversationAction(id) {
-    const target = (state.conversations || []).find((conv) => conv.conversation_id === id);
-    const title = (target && target.title) || "这个对话";
-    if (!window.confirm(`删除「${title}」？\n这会删除聊天记录和处理过程，但不会删除已经保存的家庭照片和记忆。`)) return;
     try {
       await window.sentrixApi.deleteConversation(id);
       if (state.conversationId === id) {
@@ -1313,6 +1369,17 @@
       }
       await loadConversations();
     } catch (error) { state.toast = `删除失败：${error.message}`; }
+    renderShellNavigation();
+  }
+
+  async function renameConversationAction(id) {
+    const current = (state.conversations || []).find((item) => item.conversation_id === id);
+    const title = window.prompt("对话名称", (current && current.title) || "");
+    if (title == null || !title.trim()) return;
+    try {
+      await window.sentrixApi.renameConversation(id, title.trim());
+      await loadConversations();
+    } catch (error) { state.toast = `重命名失败：${error.message}`; }
     renderShellNavigation();
   }
 
@@ -1341,19 +1408,21 @@
   async function runAssistantTurn(message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", selectedAsset = null) {
     const start = await window.sentrixApi.assistantTurnAsync(message, conversationId, feedback, scopeId, selectedEntityId, "owner", selectedAsset);
     if (start && start.turn_id && start.status === "running") {
+      state.activeTurnId = start.turn_id;
       const nextConversationId = start.conversation_id || conversationId;
       // Phase C C13：优先 SSE 实时事件；EventSource 不可用时回退 700ms 轮询。
       let done = await subscribeTurnEvents(start.turn_id);
       if (!done) done = await pollTurnEvents(start.turn_id);
+      state.activeTurnId = "";
       return { result: done || { answer: "执行超时，请重试。", evidence_status: "error" }, conversationId: nextConversationId };
     }
     return { result: start, conversationId: (start && start.conversation_id) || conversationId };
   }
 
   function mergeLiveProgress(event) {
-    const idx = event && event.step_index != null ? event.step_index : null;
-    if (idx != null && Array.isArray(state.liveProgress)) {
-      const existing = state.liveProgress.findIndex((p) => p.step_index === idx);
+    const key = event && (event.event_id || event.step_index);
+    if (key != null && Array.isArray(state.liveProgress)) {
+      const existing = state.liveProgress.findIndex((p) => (p.event_id || p.step_index) === key);
       if (existing >= 0) state.liveProgress[existing] = event;
       else state.liveProgress.push(event);
     } else {
@@ -1388,7 +1457,7 @@
         const poll = await window.sentrixApi.assistantTurnPoll(turnId);
         if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
         updateLiveProgress();
-        if (poll.status === "complete") done = poll.result;
+        if (poll.status === "complete" || poll.status === "cancelled") done = poll.result;
         else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
       } catch (pollError) { /* 单次轮询失败继续等待 */ }
     }
@@ -1732,8 +1801,29 @@
     }
     if (action === "result-next-page") { state.query = "下一页"; state.view = "search"; renderShellNavigation(); submitSearch(); return; }
     if (action === "new-conversation") { await newConversation(); return; }
+    if (action === "toggle-conversation-drawer") { state.conversationDrawerOpen = !state.conversationDrawerOpen; renderShellNavigation(); return; }
     if (action === "open-conversation") { await openConversation(element.dataset.conversationId); return; }
+    if (action === "rename-conversation") { await renameConversationAction(element.dataset.conversationId); return; }
     if (action === "delete-conversation") { await deleteConversationAction(element.dataset.conversationId); return; }
+    if (action === "cancel-assistant-turn") {
+      const turnId = state.activeTurnId;
+      if (!turnId) return;
+      try { await window.sentrixApi.assistantTurnCancel(turnId); } catch (_) { state.toast = "停止请求未能发送"; }
+      state.query = state.pendingMessage || "";
+      state.toast = "正在停止本轮回答…";
+      renderShellNavigation();
+      return;
+    }
+    if (action === "open-timeline-image") {
+      const url = element.dataset.imageUrl;
+      if (url) openModal({ type: "timeline-image", url,
+        label: element.dataset.imageLabel || "原始图片",
+        time: element.dataset.imageTime || "",
+        place: element.dataset.imagePlace || "",
+        activity: element.dataset.imageActivity || "",
+        role: element.dataset.imageRole || "本轮图片" });
+      return;
+    }
     if (action === "open-photo-inspector") { await openPhotoInspector(element.dataset.resultSetId, element.dataset.handle); return; }
     if (action === "photo-inspector-quick") {
       if (state.photoInspector) state.photoInspector.draft = element.dataset.query || "";
