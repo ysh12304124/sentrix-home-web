@@ -7150,9 +7150,12 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
 
     def _write_body(self, body: bytes):
         try:
+            self.connection.settimeout(10)
             for offset in range(0, len(body), 16 * 1024):
-                self.wfile.write(body[offset:offset + 16 * 1024])
+                self.connection.sendall(body[offset:offset + 16 * 1024])
         except (BrokenPipeError, ConnectionResetError):
+            pass
+        except TimeoutError:
             pass
 
     def _json(self, value, status: int = 200):
