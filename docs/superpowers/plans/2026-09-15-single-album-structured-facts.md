@@ -52,6 +52,7 @@
    未知字段返回 `unsupported_filter`；不实现 `meal/list/event` 或自由语义条件。
 5. 工具从 `context['scope_id']` 取 scope、从 `context['viewer_id']` 取 viewer，调用 `_draft_from_filters()`、`_spec_for()`、`StructuredMemoryExecutor.execute()`；不接受外部 scope 参数。
 6. 将数据库结果映射为稳定事实：`fact_type`、`subject`、`value`、`unit`、`filters_applied`、`coverage`、`samples`。人物无法精确解析返回 `unresolved_person`，不退化为全相册。
+   对 `count|exists|first|last`，忽略模型附带的无害 `group_by`，避免小模型填充可选枚举字段而拒绝本可精确回答的问题。
 7. 注册 `ToolSpec(name='query_memory_facts')`，描述明确列出允许统计的事实和“不支持颜色、物体、场景、活动、关系、OCR 金额、桌数”的禁止边界；`produces_evidence=('structured_fact',)`。
 8. 从 `search_memories.produces_evidence` 删除 `structured_fact`，确保候选召回总数不能闭合全量统计需求。
 9. 在 `ToolPolicy._TOOL_ALLOWED` 为该工具加入 `fact_type`、`subject`、`value`、`unit`、`filters_applied`、`coverage`、`rows`、`samples`、`status`、`reason`；在 `LITE_TOOL_SCHEMAS` 加入相同能力边界的简版描述。

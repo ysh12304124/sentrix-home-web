@@ -231,7 +231,11 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
         if group_by not in allowed_groups:
             return _structured_fact_error("unsupported_filter", "unsupported_group_by")
     elif group_by:
-        return _structured_fact_error("unsupported_filter", "group_by_requires_group_operation")
+        # Smaller models often populate every optional enum field from the
+        # schema.  A group_by attached to count/exists/first/last is harmless,
+        # so ignore it rather than turning an otherwise exact query into a
+        # false "unsupported" result.
+        group_by = ""
     if subject == "processing" and str(filters.get("person") or "").strip():
         return _structured_fact_error("unsupported_filter", "processing_does_not_support_person")
     person = str(filters.get("person") or "").strip()

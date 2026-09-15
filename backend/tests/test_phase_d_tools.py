@@ -75,6 +75,17 @@ class PhaseDToolsTest(unittest.TestCase):
         self.assertIsNone(out["value"])
         self.assertFalse(out["coverage"]["complete"])
 
+    def test_query_memory_facts_ignores_group_by_for_non_group_operation(self):
+        self.store.create_asset("image", "image.jpg", "image", "/x/image.jpg", scope_id="album3-v2")
+
+        out = runtime_tools._query_memory_facts(
+            {"operation": "count", "subject": "asset", "group_by": "month", "filters": {"media": "image"}},
+            context={"scope_id": "album3-v2", "viewer_id": "owner"},
+        )
+
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["value"], 1)
+
     def test_query_memory_facts_groups_original_processing_status(self):
         self.store.create_asset("completed", "completed.jpg", "image", "/x/completed.jpg",
                                 scope_id="album3-v2")
