@@ -158,6 +158,13 @@ EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
 PERSIST_DEBOUNCE_SECONDS = max(
     0.05, float(os.environ.get("PHOTOBENCH_PERSIST_DEBOUNCE_SECONDS", "0.25"))
 )
+# Keep the frequently rewritten run.json snapshot bounded.  The append-only
+# gpu_samples.jsonl file is the complete telemetry source and get_run() loads
+# its full history for the UI, so this tail is an I/O safeguard rather than a
+# user-visible time-range limit.
+LIVE_TELEMETRY_TAIL_POINTS = max(
+    0, int(os.environ.get("PHOTOBENCH_LIVE_TELEMETRY_TAIL_POINTS", "240"))
+)
 JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "6")))
 JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "5.0")))
 JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
@@ -1922,11 +1929,29 @@ class BenchmarkRun:
     def _persist_gpu_sample(self, sample: dict) -> None:
         """Append each sample immediately so cancellation does not lose in-memory data."""
         with self.lock:
+            phase = self._current_phase or "unassigned"
+            phase_labels = {
+                "model_deploy": "模型加载",
+                "scope_setup": "创建相册",
+                "scope_attach": "绑定相册",
+                "identity_seed": "身份预置",
+                "photo_import": "数据导入",
+                "pipeline_processing": "相册流水线预处理",
+                "qa_eval": "QA 测评",
+                "gpu_metrics": "资源指标收尾",
+                "aggregate": "结果汇总",
+                "unassigned": "未分配阶段",
+            }
+            persisted_sample = dict(sample)
+            # Keep phase metadata beside every raw sample so a complete
+            # time-series can be reconstructed after a restart/failure.
+            persisted_sample.setdefault("phase", phase)
+            persisted_sample.setdefault("phase_label", phase_labels.get(phase, phase))
             with self._gpu_samples_path().open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
-            # Keep a compact live view in run.json.  The JSONL file retains the
-            # full time series; this snapshot is what the UI polls while a run
-            # is still executing (and remains available after failure/cancel).
+                handle.write(json.dumps(persisted_sample, ensure_ascii=False) + "\n")
+            # Keep the full live view in run.json as well as in JSONL.  The
+            # append-only JSONL remains the authoritative source for rebuilding
+            # a complete curve after a restart/failure.
             live = self.state.setdefault("telemetry_live", {
                 "status": "running", "source": self.telemetry_source,
                 "samples_count": 0, "latest": {}, "peak": {}, "phase_snapshots": {}, "history": [],
@@ -1960,27 +1985,14 @@ class BenchmarkRun:
                 "all_gpu_processes": sample.get("all_processes_scope"),
                 "process_attribution": sample.get("process_attribution"),
             }
-            phase = self._current_phase or "unassigned"
-            phase_labels = {
-                "model_deploy": "模型加载",
-                "scope_setup": "创建相册",
-                "scope_attach": "绑定相册",
-                "identity_seed": "身份预置",
-                "photo_import": "数据导入",
-                "pipeline_processing": "相册流水线预处理",
-                "qa_eval": "QA 测评",
-                "gpu_metrics": "资源指标收尾",
-                "aggregate": "结果汇总",
-                "unassigned": "未分配阶段",
-            }
             live["history"].append({
                 "t": sample.get("_t", time.time()),
                 "phase": phase,
                 "phase_label": phase_labels.get(phase, phase),
                 **live["latest"],
             })
-            if len(live["history"]) > 240:
-                del live["history"][:-240]
+            if LIVE_TELEMETRY_TAIL_POINTS and len(live["history"]) > LIVE_TELEMETRY_TAIL_POINTS:
+                del live["history"][:-LIVE_TELEMETRY_TAIL_POINTS]
             peak = live.setdefault("peak", {})
             for key in fields:
                 value = sample.get(key)
@@ -5078,31 +5090,56 @@ class OrchestratorRepository:
             # Backfill live history for runs sampled by an older build or
             # interrupted during persistence.  The JSONL sampler is the
             # authoritative append-only source and remains available on
-            # failures/cancellation.
+            # failures/cancellation.  Always prefer the complete JSONL series;
+            # the UI must not silently fall back to a recent-point window.
             live = result.get("telemetry_live")
-            if isinstance(live, dict) and not isinstance(live.get("history"), list):
-                samples_path = (self.results_root / run_id / "gpu_samples.jsonl")
+            if isinstance(live, dict):
+                # _public_run intentionally avoids a deep copy for normal
+                # responses.  Do not mutate the in-memory run while rebuilding
+                # a large response from JSONL.
+                live = copy.deepcopy(live)
+                result["telemetry_live"] = live
+                samples_path = self.results_root / run_id / "gpu_samples.jsonl"
                 history, latest, peak = [], {}, {}
                 try:
-                    for line in samples_path.read_text(encoding="utf-8").splitlines():
-                        item = json.loads(line)
-                        fields = ("temperature_c", "gpu_utilization_pct", "memory_used_mib",
-                                  "model_process_memory_used_mib", "power_draw_w", "sm_clock_mhz",
-                                  "other_processes_memory_mib", "all_processes_memory_mib",
-                                  "system_memory_used_mib", "system_memory_total_mib")
+                    fields = (
+                        "temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                        "model_process_memory_used_mib", "kv_cache_usage_pct",
+                        "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
+                        "other_processes_memory_mib", "all_processes_memory_mib",
+                        "system_memory_used_mib", "system_memory_total_mib",
+                    )
+                    lines = samples_path.read_text(encoding="utf-8").splitlines() if samples_path.is_file() else []
+                    for line in lines:
+                        try:
+                            item = json.loads(line)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            # A sampler may append while this response is
+                            # reading the file; ignore only a partial/malformed
+                            # line instead of dropping the whole curve.
+                            continue
                         point = {k: item[k] for k in fields if item.get(k) is not None}
                         if point:
-                            history.append({"t": item.get("_t", time.time()), **point})
+                            history.append({
+                                "t": item.get("_t", time.time()),
+                                "phase": item.get("phase", "unassigned"),
+                                "phase_label": item.get("phase_label", "未分配阶段"),
+                                **point,
+                            })
                             latest = point
                             for key, value in point.items():
                                 if isinstance(value, (int, float)):
                                     peak[key] = max(float(peak.get(key, value)), float(value))
-                    live["history"] = history[-240:]
-                    live["latest"] = live.get("latest") or latest
-                    live["peak"] = live.get("peak") or peak
-                    live["samples_count"] = live.get("samples_count") or len(history)
+                    if history:
+                        live["history"] = history
+                        live["latest"] = latest
+                        live["peak"] = peak
+                        live["samples_count"] = max(int(live.get("samples_count") or 0), len(history))
+                    elif not isinstance(live.get("history"), list):
+                        live["history"] = []
                 except Exception:
-                    live["history"] = []
+                    if not isinstance(live.get("history"), list):
+                        live["history"] = []
             return result
 
     def get_keyframe_analysis(self, run_id: str) -> dict:
