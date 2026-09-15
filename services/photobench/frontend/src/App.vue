@@ -844,7 +844,10 @@ function liveTelemetryRows(run) {
   const fmtGiB = (value) => value == null ? "-" : `${(Number(value) / 1024).toFixed(2)} GiB`;
   return [
     ["当前阶段", ["completed", "failed", "cancelled"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
-    [`模型进程${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · 仅可归因到模型的进程`],
+    ["主模型 RAM", fmtGiB(latest.model_process_system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_system_memory_used_mib)} · 主模型进程 RSS/PSS`],
+    [`主模型 GPU ${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · 仅可归因到模型的 GPU/UMA 进程`],
+    ["测评系统 RAM", fmtGiB(latest.benchmark_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_memory_used_mib)} · 8771/8091/8500/8100/Qdrant 等相关进程`],
+    ["测评系统 GPU 显存", fmtGiB(latest.benchmark_process_gpu_memory_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_gpu_memory_mib)} · 相关 GPU compute 进程合计`],
     ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(effectivePeak.memory_used_mib)} · NVIDIA GPU 总占用`],
     ["整机 RAM", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.system_memory_used_mib)} · ${latest.system_memory_scope === "host_all_processes" ? "宿主机全部进程" : "未标注范围"}`],
     ["全部 GPU 进程", fmtGiB(latest.all_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.all_processes_memory_mib)} · nvidia-smi 可见进程总和`],
@@ -908,12 +911,15 @@ function renderTelemetryChart() {
   const definitions = [
     ...(isOrin
       ? [{ key: "system_memory_used_mib", name: "整机 RAM（Orin UMA）", color: "#20a36a" },
+         { key: "benchmark_process_memory_used_mib", name: "测评系统进程内存（Orin UMA）", color: "#d9488b" },
+         { key: "model_process_system_memory_used_mib", name: "主模型进程 RAM（Orin UMA）", color: "#f2b84b" },
          { key: "model_process_memory_used_mib", name: "主模型进程 PSS（Orin UMA）", color: "#ef8a4b" }]
       : [{ key: "memory_used_mib", name: "整卡 GPU 显存", color: "#4f7cff" },
-         { key: "model_process_memory_used_mib", name: "主模型进程 GPU 显存", color: "#ef8a4b" },
-         { key: "all_processes_memory_mib", name: "全部 GPU 进程显存", color: "#d9488b" },
-         { key: "other_processes_memory_mib", name: "其他 GPU 进程显存", color: "#8b6de8" },
-         { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" }]),
+         { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" },
+         { key: "benchmark_process_gpu_memory_mib", name: "测评系统 GPU 显存", color: "#d9488b" },
+         { key: "benchmark_process_memory_used_mib", name: "测评系统 RAM", color: "#8b6de8" },
+         { key: "model_process_memory_used_mib", name: "主模型 GPU 显存", color: "#ef8a4b" },
+         { key: "model_process_system_memory_used_mib", name: "主模型 RAM", color: "#f2b84b" }]),
   ];
   const available = definitions.filter((definition) => history.some((item) => Number.isFinite(Number(item[definition.key]))));
   const firstTimestamp = Number(history[0]?.t);

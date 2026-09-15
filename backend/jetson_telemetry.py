@@ -11,6 +11,156 @@ from urllib.parse import urlparse
 import httpx
 
 
+def _configured_set(env_name: str, defaults: tuple[str, ...]) -> set[str]:
+    raw = os.environ.get(env_name)
+    if not raw:
+        return set(defaults)
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+SYSTEM_PROCESS_PORTS = _configured_set(
+    "PHOTOBENCH_SYSTEM_PROCESS_PORTS",
+    ("8771", "8091", "8500", "8501", "8100", "8101", "6333"),
+)
+SYSTEM_PROCESS_KEYWORDS = _configured_set(
+    "PHOTOBENCH_SYSTEM_PROCESS_KEYWORDS",
+    (
+        "photobench", "benchmark_orchestrator.py", "sentrix", "vllm",
+        "llama-server", "ollama", "qdrant",
+    ),
+)
+
+
+def _process_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        text = raw.replace(bytes([0]), bytes([32])).decode("utf-8", "replace").strip()
+        if text:
+            return text
+    except (OSError, ValueError):
+        pass
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _process_rss_mib(pid: int) -> float | None:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines():
+            if line.startswith("VmRSS:"):
+                return round(float(line.split()[1]) / 1024.0, 2)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _listening_ports_by_pid(target_ports: set[str] | None = None) -> dict[int, set[str]]:
+    target_ports = {str(port) for port in (target_ports or set())}
+    socket_ports: dict[str, str] = {}
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(table).read_text(encoding="ascii").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10 or parts[3] != "0A":
+                continue
+            try:
+                port = str(int(parts[1].rsplit(":", 1)[1], 16))
+            except (ValueError, IndexError):
+                continue
+            if target_ports and port not in target_ports:
+                continue
+            socket_ports[parts[9]] = port
+    if not socket_ports:
+        return {}
+    result: dict[int, set[str]] = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdecimal():
+            continue
+        fd_dir = proc / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match and match.group(1) in socket_ports:
+                result.setdefault(int(proc.name), set()).add(socket_ports[match.group(1)])
+    return result
+
+
+def _host_process_rows() -> list[dict]:
+    ports_by_pid = _listening_ports_by_pid(SYSTEM_PROCESS_PORTS)
+    rows = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdecimal():
+            continue
+        pid = int(proc.name)
+        rss_mib = _process_rss_mib(pid)
+        cmdline = _process_cmdline(pid)
+        if rss_mib is None and not cmdline:
+            continue
+        rows.append({
+            "pid": pid,
+            "process_name": Path(cmdline.split(" ", 1)[0]).name if cmdline else "",
+            "rss_mib": rss_mib,
+            "listening_ports": sorted(ports_by_pid.get(pid, set()), key=lambda value: int(value)),
+            "identity": cmdline.lower()[:1000],
+        })
+    return rows
+
+
+def _is_system_related_process(row: dict) -> bool:
+    identity = str(row.get("identity") or "").lower()
+    ports = {str(port) for port in row.get("listening_ports") or []}
+    if ports & SYSTEM_PROCESS_PORTS:
+        return True
+    return any(keyword and keyword in identity for keyword in SYSTEM_PROCESS_KEYWORDS)
+
+
+def _sum_mib(rows: list[dict], key: str) -> float | None:
+    values = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
+    return round(sum(values), 2) if values else None
+
+
+def _augment_local_process_memory(data: dict | None, *, model_pid: int | None, endpoint_port: str) -> dict:
+    data = dict(data or {})
+    try:
+        rows = _host_process_rows()
+    except Exception:
+        rows = []
+    model_rows = [
+        row for row in rows
+        if row["pid"] == model_pid or "llama-server" in str(row.get("identity") or "")
+        or str(endpoint_port) in str(row.get("identity") or "")
+    ]
+    system_rows = [row for row in rows if _is_system_related_process(row)]
+    model_rss = _sum_mib(model_rows, "rss_mib")
+    system_rss = _sum_mib(system_rows, "rss_mib")
+    if model_rss is not None:
+        data["model_process_system_memory_used_mib"] = model_rss
+        data["model_process_system_memory_scope"] = "host_process_rss"
+        data["model_system_processes"] = [
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            for row in model_rows[:20]
+        ]
+    if system_rss is not None:
+        data["benchmark_process_memory_used_mib"] = system_rss
+        data["benchmark_process_memory_scope"] = "photobench_related_host_process_rss"
+        data["benchmark_processes"] = [
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            for row in system_rows[:50]
+        ]
+    return data
+
+
 def is_jetson_host() -> bool:
     try:
         return "jetson" in Path("/proc/device-tree/model").read_bytes().replace(b"\0", b"").decode("utf-8", "replace").lower()
@@ -153,6 +303,13 @@ class LocalJetsonLlamaCppTelemetryProvider:
         }}
 
     def process_memory(self) -> dict:
+        if self._last_memory.get("status") == "available":
+            data = self._last_memory.get("data") or {}
+            pid = int(data["root_pid"]) if str(data.get("root_pid") or "").isdigit() else None
+            return {
+                **self._last_memory,
+                "data": _augment_local_process_memory(data, model_pid=pid, endpoint_port=str(self.port)),
+            }
         return self._last_memory
 
     def system_memory(self) -> dict:

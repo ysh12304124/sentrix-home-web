@@ -1577,6 +1577,9 @@ class GpuSampler:
                     sample = dict(gpu)
                     sample["_t"] = ts
                     sample["model_process_memory_used_mib"] = process_memory.get("process_memory_used_mib")
+                    sample["model_process_system_memory_used_mib"] = process_memory.get("model_process_system_memory_used_mib")
+                    sample["benchmark_process_memory_used_mib"] = process_memory.get("benchmark_process_memory_used_mib")
+                    sample["benchmark_process_gpu_memory_mib"] = process_memory.get("benchmark_process_gpu_memory_mib")
                     sample["other_processes_memory_mib"] = process_memory.get("other_processes_memory_mib")
                     sample["all_processes_memory_mib"] = process_memory.get("all_processes_memory_mib")
                     sample["system_memory_used_mib"] = system_memory.get("system_memory_used_mib", process_memory.get("system_memory_used_mib"))
@@ -1585,9 +1588,15 @@ class GpuSampler:
                     sample["system_memory_scope"] = system_memory.get("system_memory_scope", process_memory.get("system_memory_scope"))
                     sample["memory_scope"] = process_memory.get("memory_scope") or sample.get("memory_scope")
                     sample["process_memory_scope"] = process_memory.get("process_memory_scope")
+                    sample["model_process_system_memory_scope"] = process_memory.get("model_process_system_memory_scope")
+                    sample["benchmark_process_memory_scope"] = process_memory.get("benchmark_process_memory_scope")
+                    sample["benchmark_process_gpu_memory_scope"] = process_memory.get("benchmark_process_gpu_memory_scope")
                     sample["process_attribution"] = process_memory.get("process_attribution")
                     sample["all_processes_scope"] = process_memory.get("all_processes_scope")
                     sample["model_processes"] = process_memory.get("processes") or []
+                    sample["model_system_processes"] = process_memory.get("model_system_processes") or []
+                    sample["benchmark_processes"] = process_memory.get("benchmark_processes") or []
+                    sample["benchmark_gpu_processes"] = process_memory.get("benchmark_gpu_processes") or []
                     sample["other_processes"] = process_memory.get("other_processes") or []
                     sample["all_processes"] = process_memory.get("all_processes") or []
                     sample["model_process_memory_limit_mib"] = process_memory.get("process_memory_limit_mib")
@@ -1971,17 +1980,25 @@ class BenchmarkRun:
             fields = (
                 "temperature_c", "gpu_utilization_pct", "memory_used_mib",
                 "model_process_memory_used_mib", "kv_cache_usage_pct",
+                "model_process_system_memory_used_mib",
+                "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
                 "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
                 "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
             )
             live["latest"] = {key: sample.get(key) for key in fields if sample.get(key) is not None}
             live["model_processes"] = sample.get("model_processes") or []
+            live["model_system_processes"] = sample.get("model_system_processes") or []
+            live["benchmark_processes"] = sample.get("benchmark_processes") or []
+            live["benchmark_gpu_processes"] = sample.get("benchmark_gpu_processes") or []
             live["other_processes"] = sample.get("other_processes") or []
             live["all_processes"] = sample.get("all_processes") or []
             live["scopes"] = {
                 "system_memory": sample.get("system_memory_scope"),
                 "gpu_memory": sample.get("memory_scope"),
                 "model_process": sample.get("process_memory_scope"),
+                "model_process_ram": sample.get("model_process_system_memory_scope"),
+                "benchmark_process_ram": sample.get("benchmark_process_memory_scope"),
+                "benchmark_process_gpu": sample.get("benchmark_process_gpu_memory_scope"),
                 "all_gpu_processes": sample.get("all_processes_scope"),
                 "process_attribution": sample.get("process_attribution"),
             }
@@ -5109,6 +5126,8 @@ class OrchestratorRepository:
                     fields = (
                         "temperature_c", "gpu_utilization_pct", "memory_used_mib",
                         "model_process_memory_used_mib", "kv_cache_usage_pct",
+                        "model_process_system_memory_used_mib",
+                        "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
                         "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
                         "other_processes_memory_mib", "all_processes_memory_mib",
                         "system_memory_used_mib", "system_memory_total_mib",
