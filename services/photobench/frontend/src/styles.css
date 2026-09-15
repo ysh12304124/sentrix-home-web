@@ -837,11 +837,7 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
 }
 .telemetry-chart { margin-top:12px; padding:10px 12px 8px; border:1px solid #dfe4f0; border-radius:8px; background:#fff; }
 .live-telemetry-metrics { display:none; }
-.telemetry-chart svg { display:block; width:100%; height:auto; min-height:180px; }
-.telemetry-chart-legend { display:flex; flex-wrap:wrap; gap:10px 16px; margin-bottom:5px; color:#59627c; font-size:10px; }
-.telemetry-chart-legend span { display:inline-flex; align-items:center; gap:5px; }
-.telemetry-chart-legend i { display:inline-block; width:10px; height:3px; border-radius:2px; }
-.telemetry-chart-axis { float:right; color:#8991a9; font-size:9px; }
+.telemetry-chart-canvas { width:100%; height:430px; min-height:320px; }
 .telemetry-processes { margin-top:10px; padding-top:8px; border-top:1px solid #e6e9f1; }
 .telemetry-processes summary { cursor:pointer; color:#5267c6; font-size:10px; font-weight:700; }
 .telemetry-process-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:5px 12px; margin-top:7px; }

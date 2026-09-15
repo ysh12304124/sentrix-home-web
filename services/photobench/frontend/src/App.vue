@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import * as echarts from "echarts";
 
 const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
@@ -276,6 +277,8 @@ const chainMode = ref("creation");
 const chainDetail = ref(null);
 let pollTimer = null;
 let destroyed = false;
+const telemetryChartEl = ref(null);
+let telemetryChartInstance = null;
 
 const api = async (path, options = {}) => {
   const { timeoutMs = 10000, retries, ...requestOptions } = options;
@@ -863,19 +866,62 @@ function telemetryChart(run) {
     })).filter((item) => Object.keys(item).some((key) => key.endsWith("_mib")));
   }
   if (history.length < 2) return null;
-  const width = 720, height = 220, pad = 28;
-  const values = history.flatMap((x) => [x.memory_used_mib, x.model_process_memory_used_mib, x.system_memory_used_mib, x.all_processes_memory_mib, x.other_processes_memory_mib]).filter((x) => Number.isFinite(Number(x)));
-  const max = Math.max(1, ...values) / 1024;
-  const x = (i) => pad + i * (width - pad * 2) / (history.length - 1);
-  const y = (v) => height - pad - Number(v || 0) / 1024 / max * (height - pad * 2);
-  const line = (key) => history.map((item, i) => Number.isFinite(Number(item[key])) ? `${x(i).toFixed(1)},${y(item[key]).toFixed(1)}` : null).filter(Boolean).join(" ");
-  return { width, height, maxGiB: max, lines: [
-    { key: "memory_used_mib", label: "整卡显存", color: "#4f7cff", points: line("memory_used_mib") },
-    { key: "system_memory_used_mib", label: "整机 RAM", color: "#20a36a", points: line("system_memory_used_mib") },
-    { key: "model_process_memory_used_mib", label: "模型进程", color: "#ef8a4b", points: line("model_process_memory_used_mib") },
-    { key: "all_processes_memory_mib", label: "全部 GPU 进程", color: "#d9488b", points: line("all_processes_memory_mib") },
-    { key: "other_processes_memory_mib", label: "其他 GPU 进程", color: "#8b6de8", points: line("other_processes_memory_mib") },
-  ] };
+  return { history };
+}
+function renderTelemetryChart() {
+  const chartData = telemetryChart(activeRun.value);
+  if (!telemetryChartEl.value || !chartData) {
+    if (telemetryChartInstance) {
+      telemetryChartInstance.dispose();
+      telemetryChartInstance = null;
+    }
+    return;
+  }
+  telemetryChartInstance ||= echarts.init(telemetryChartEl.value);
+  const history = chartData.history;
+  const definitions = [
+    { key: "memory_used_mib", name: "整卡显存", color: "#4f7cff" },
+    { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" },
+    { key: "model_process_memory_used_mib", name: "模型进程", color: "#ef8a4b" },
+    { key: "all_processes_memory_mib", name: "全部 GPU 进程", color: "#d9488b" },
+    { key: "other_processes_memory_mib", name: "其他 GPU 进程", color: "#8b6de8" },
+  ];
+  const available = definitions.filter((definition) => history.some((item) => Number.isFinite(Number(item[definition.key]))));
+  const firstTimestamp = Number(history[0]?.t);
+  const labels = history.map((item, index) => {
+    const elapsed = Number(item?.t) - firstTimestamp;
+    return Number.isFinite(elapsed) ? `+${(elapsed / 60).toFixed(1)} min` : `#${index + 1}`;
+  });
+  telemetryChartInstance.setOption({
+    animation: false,
+    color: available.map((item) => item.color),
+    grid: { left: 62, right: 28, top: 48, bottom: 64 },
+    legend: { top: 8, left: 8, type: "scroll", selectedMode: "multiple", textStyle: { color: "#59627c", fontSize: 12 } },
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "cross", label: { backgroundColor: "#667085" } },
+      formatter(params) {
+        const rows = (Array.isArray(params) ? params : [params]).filter((item) => item.value != null);
+        const title = rows[0]?.axisValueLabel || "";
+        return `<b>${title}</b><br/>${rows.map((item) => `${item.marker}${item.seriesName}: <b>${Number(item.value).toFixed(2)} GiB</b>`).join("<br/>")}`;
+      },
+    },
+    xAxis: { type: "category", boundaryGap: false, data: labels, axisLabel: { color: "#7a849e", hideOverlap: true }, axisLine: { lineStyle: { color: "#d8deea" } } },
+    yAxis: { type: "value", name: "GiB", nameTextStyle: { color: "#7a849e", padding: [0, 0, 8, 0] }, min: 0, axisLabel: { color: "#7a849e", formatter: (value) => `${value} GiB` }, splitLine: { lineStyle: { color: "#edf0f5" } } },
+    dataZoom: [{ type: "inside", filterMode: "none" }, { type: "slider", height: 18, bottom: 14, borderColor: "#d8deea", fillerColor: "rgba(79,124,255,.14)", handleStyle: { color: "#4f7cff" } }],
+    series: available.map((definition) => ({
+      name: definition.name,
+      type: "line",
+      smooth: 0.18,
+      showSymbol: false,
+      connectNulls: false,
+      lineStyle: { width: 2.5 },
+      emphasis: { focus: "series", lineStyle: { width: 4 } },
+      markPoint: { symbolSize: 42, label: { formatter: (params) => `峰值\n${Number(params.value).toFixed(2)} GiB`, color: "#344054", fontSize: 10 }, data: [{ type: "max", name: "峰值" }] },
+      data: history.map((item) => Number.isFinite(Number(item[definition.key])) ? Number(item[definition.key]) / 1024 : null),
+    })),
+  }, true);
+  telemetryChartInstance.resize();
 }
 function liveTelemetryPhaseRows(run) {
   const phases = run?.telemetry_live?.phase_snapshots || {};
@@ -2491,7 +2537,8 @@ function qaReferenceLabel(turn) {
   return turn?.expected_action === "clarify" ? "参考澄清示例" : "参考回答";
 }
 onMounted(init);
-onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if (arbiterTimer) clearInterval(arbiterTimer); });
+watch(activeRun, async () => { await nextTick(); renderTelemetryChart(); }, { deep: true });
+onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if (arbiterTimer) clearInterval(arbiterTimer); if (telemetryChartInstance) telemetryChartInstance.dispose(); });
 </script>
 
 <template>
@@ -2923,7 +2970,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
-<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div class="telemetry-chart-legend"><span v-for="line in telemetryChart(activeRun).lines" :key="line.key"><i :style="{ background: line.color }"></i>{{ line.label }}</span></div><div class="telemetry-chart-axis">0 - {{ telemetryChart(activeRun).maxGiB.toFixed(1) }} GiB</div><svg :viewBox="`0 0 ${telemetryChart(activeRun).width} ${telemetryChart(activeRun).height}`" role="img" aria-label="资源占用趋势"><template v-for="line in telemetryChart(activeRun).lines" :key="line.key"><polyline v-if="line.points" :points="line.points" fill="none" :stroke="line.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" /></template></svg><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点，内存单位 GiB；不同曲线按各自采样范围记录</small></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点；悬浮查看每个时刻的 GiB，图例可单独隐藏曲线，底部可拖动缩放。整机 RAM 为宿主机全部进程，模型进程/全部 GPU 进程按可归因范围记录。</small></div>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <details v-if="(activeRun.telemetry_live.all_processes || []).length" class="telemetry-processes">
   <summary>GPU 进程明细（{{ activeRun.telemetry_live.all_processes.length }} 个）</summary>
