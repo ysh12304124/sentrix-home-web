@@ -852,7 +852,16 @@ function liveTelemetryRows(run) {
   ];
 }
 function telemetryChart(run) {
-  const history = run?.telemetry_live?.history || [];
+  let history = Array.isArray(run?.telemetry_live?.history) ? run.telemetry_live.history : [];
+  // Legacy runs may only have phase snapshots. Render a compact phase trend
+  // instead of leaving the chart area blank.
+  if (history.length < 2) {
+    const phases = run?.telemetry_live?.phase_snapshots || {};
+    history = Object.values(phases).map((phase, i) => ({
+      t: i,
+      ...(phase?.latest || phase?.peak || {}),
+    })).filter((item) => Object.keys(item).some((key) => key.endsWith("_mib")));
+  }
   if (history.length < 2) return null;
   const width = 720, height = 220, pad = 28;
   const values = history.flatMap((x) => [x.memory_used_mib, x.model_process_memory_used_mib, x.system_memory_used_mib, x.all_processes_memory_mib, x.other_processes_memory_mib]).filter((x) => Number.isFinite(Number(x)));
@@ -2914,7 +2923,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status running">{{ activeRun.telemetry_live.status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ activeRun.telemetry_live.source === 'jetson_local_pss' ? ' Orin 使用进程 PSS 表示统一物理内存。' : '' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
-<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div class="telemetry-chart-legend"><span v-for="line in telemetryChart(activeRun).lines" :key="line.key"><i :style="{ background: line.color }"></i>{{ line.label }}</span></div><div class="telemetry-chart-axis">0 - {{ telemetryChart(activeRun).maxGiB.toFixed(1) }} GiB</div><svg :viewBox="`0 0 ${telemetryChart(activeRun).width} ${telemetryChart(activeRun).height}`" role="img" aria-label="资源占用趋势"><polyline v-for="line in telemetryChart(activeRun).lines" :key="line.key" v-if="line.points" :points="line.points" fill="none" :stroke="line.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" /></svg><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点，内存单位 GiB；不同曲线按各自采样范围记录</small></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div class="telemetry-chart-legend"><span v-for="line in telemetryChart(activeRun).lines" :key="line.key"><i :style="{ background: line.color }"></i>{{ line.label }}</span></div><div class="telemetry-chart-axis">0 - {{ telemetryChart(activeRun).maxGiB.toFixed(1) }} GiB</div><svg :viewBox="`0 0 ${telemetryChart(activeRun).width} ${telemetryChart(activeRun).height}`" role="img" aria-label="资源占用趋势"><template v-for="line in telemetryChart(activeRun).lines" :key="line.key"><polyline v-if="line.points" :points="line.points" fill="none" :stroke="line.color" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" /></template></svg><small class="muted">最近 {{ activeRun.telemetry_live.history.length }} 个采样点，内存单位 GiB；不同曲线按各自采样范围记录</small></div>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <details v-if="(activeRun.telemetry_live.all_processes || []).length" class="telemetry-processes">
   <summary>GPU 进程明细（{{ activeRun.telemetry_live.all_processes.length }} 个）</summary>
