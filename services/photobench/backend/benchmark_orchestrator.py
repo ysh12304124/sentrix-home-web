@@ -128,7 +128,10 @@ def detect_runtime_framework(value: str, model_base_url: str) -> str:
 def select_runtime_providers(manager_url: str, endpoint_url: str,
                              framework: str, *, cloud: bool = False):
     """Choose the model lifecycle and local telemetry by runtime and host."""
-    if manager_url:
+    # A Manager URL is only authoritative for managed vLLM. External
+    # OpenAI-compatible llama.cpp/Ollama endpoints may still carry a stale
+    # Manager setting in the UI; never let that hide their host telemetry.
+    if manager_url and framework in {"generic", "vllm", "vllm_manager"}:
         return ManagerLifecycleProvider(manager_url), ManagerTelemetryProvider(manager_url), "vllm_manager"
     lifecycle = UnavailableLifecycleProvider()
     host = urlparse(endpoint_url).hostname
