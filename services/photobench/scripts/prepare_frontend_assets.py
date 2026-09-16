@@ -6,6 +6,10 @@ By default this is a no-op.  Set --chunk-bytes (for example 30000 on Jetson
 that reassembles the original UTF-8 bytes before evaluating it.  Splitting is
 performed on bytes, not decoded text, so identifiers and UTF-8 sequences are
 never changed at chunk boundaries.
+
+Stylesheet links in dist/index.html are preserved.  If a previous split
+dropped them, the matching Vite CSS file is re-injected into index.html and
+the loader.
 """
 from __future__ import annotations
 
@@ -15,6 +19,20 @@ import re
 from pathlib import Path
 
 SCRIPT_RE = re.compile(r'<script[^>]+src="(?P<src>/assets/[^\"]+\.js)"[^>]*></script>')
+STYLE_RE = re.compile(r'<link[^>]+rel="stylesheet"[^>]*href="(?P<href>/assets/[^"]+\.css)"[^>]*>')
+
+
+def discover_stylesheet(dist: Path, html: str) -> str | None:
+    match = STYLE_RE.search(html)
+    if match:
+        href = match.group("href")
+        if (dist / href.lstrip("/")).is_file():
+            return href
+    assets = dist / "assets"
+    candidates = sorted(assets.glob("index-*.css"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if candidates:
+        return f"/assets/{candidates[0].name}"
+    return None
 
 
 def main() -> int:
@@ -40,6 +58,7 @@ def main() -> int:
     source = dist / match.group("src").lstrip("/")
     if not source.is_file():
         raise SystemExit(f"Vite JS entry not found: {source}")
+    css_href = discover_stylesheet(dist, html)
     data = source.read_bytes()
     assets = dist / "assets"
     parts: list[str] = []
@@ -48,7 +67,18 @@ def main() -> int:
         (assets / name).write_bytes(data[offset : offset + args.chunk_bytes])
         parts.append(name)
 
-    loader = f"""const parts = {json.dumps(parts, ensure_ascii=False)};
+    css_inject = ""
+    if css_href:
+        css_inject = f"""const cssHref = {json.dumps(css_href, ensure_ascii=False)};
+if (!document.querySelector('link[rel="stylesheet"][href="' + cssHref + '"]')) {{
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = cssHref;
+  document.head.appendChild(link);
+}}
+"""
+
+    loader = css_inject + f"""const parts = {json.dumps(parts, ensure_ascii=False)};
 (async () => {{
   try {{
     const buffers = [];
@@ -78,9 +108,19 @@ def main() -> int:
     loader_path.write_text(loader, encoding="utf-8")
     new_src = f"/assets/{args.loader_name}"
     html = html[: match.start("src")] + new_src + html[match.end("src") :]
+    if css_href and not STYLE_RE.search(html):
+        html = html.replace(
+            "<head>",
+            f'<head>\n    <link rel="stylesheet" crossorigin href="{css_href}">',
+            1,
+        )
     index.write_text(html, encoding="utf-8")
     print(f"split {source.name}: {len(data)} bytes into {len(parts)} parts of <= {args.chunk_bytes} bytes")
     print(f"loader: {loader_path.name} ({loader_path.stat().st_size} bytes)")
+    if css_href:
+        print(f"stylesheet: {css_href}")
+    else:
+        print("stylesheet: none found")
     return 0
 
 
