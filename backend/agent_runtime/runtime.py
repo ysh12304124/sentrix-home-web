@@ -90,6 +90,29 @@ def _natural_partial(task_state: dict, problems=None) -> str:
     return base + "你可以让我继续核对，或换个问法再试。"
 
 
+def _ocr_recovery_instruction(question: str, tool_results: list[dict]) -> str:
+    """Keep OCR recovery scoped to values that actually answer the question."""
+    kind = classify_deterministic(question)
+    nucleus = build_nucleus({"tool_results": tool_results or []}, question)
+    if kind == "price":
+        value = nucleus.get("price")
+        if value is not None:
+            return ("\nOCR 已直接读到与金额问题匹配的值：" + (value.display or str(value.value))
+                    + "。只报告这个已读到的值，不得替换、推断或补充其他数字。")
+        return ("\n上述 OCR 文字没有提供可确认的金额。必须明确说“现有记录不足以确认”，"
+                "不得为了直接回答补数字。")
+    if kind == "year":
+        values = nucleus.all("year")
+        if values:
+            return ("\nOCR 已直接读到与年份问题匹配的值："
+                    + "、".join(value.display or str(value.value) for value in values)
+                    + "。只报告这些已读到的值，不得推断其他年份。")
+        return ("\n上述 OCR 文字没有提供可确认的年份。必须明确说“现有记录不足以确认”，"
+                "不得为了直接回答补数字。")
+    return ("\n上述 OCR 文字只能按原文引用。若它不能直接回答当前问题，"
+            "必须明确说“现有记录不足以确认”，不得从无关文字推断或补充数字。")
+
+
 # 模型可见的检索窗口字段白名单：命中统计、候选规模、验证诊断都属于服务端遥测，
 # 会让模型把"返回了几张候选"当成事实（如 #004 的 363），也撑爆小上下文。
 # preview 每项只保留模型决策需要的最小字段；结果集规模/asset_id 只在 trace 中完整保留。
@@ -242,6 +265,8 @@ _RECOVERY_MESSAGE_MARKERS = (
     "请先调用 search_memories",
     "这与工具结果矛盾",
     "当前任务还没有完成",
+    "上一条（你刚输出的内容）是你的最终回答",
+    "基于这些读到的文字直接回答具体内容",
 )
 
 
@@ -1826,7 +1851,7 @@ class AgentRuntime:
             from .tools import result_set_context
             ctx = result_set_context(task.current_result_set, self.scope_id)
             if ctx:
-                messages.append({"role": "system", "content": ctx})
+                _merge_system_constraint(messages, ctx)
         if selected_handle:
             # Phase C C15：用户点选了结果集里的照片，模型可直接用该 handle 复核/交付原图
             ctx = f"用户当前选中了照片（handle={selected_handle}）"
@@ -1835,11 +1860,11 @@ class AgentRuntime:
             ctx += ("。问'这张/原图/里面有几个人'时，直接用 "
                     f"get_original_photos(handle={selected_handle}) 或 "
                     f"inspect_photo(asset_handle={selected_handle})，不要重新全库搜索。")
-            messages.append({"role": "system", "content": ctx})
+            _merge_system_constraint(messages, ctx)
         if history:
-            messages.append({"role": "system", "content": f"最近对话：\n{history}"})
+            _merge_system_constraint(messages, f"最近对话：\n{history}")
         if conversation_summary:
-            messages.append({"role": "system", "content": f"本会话摘要：\n{conversation_summary}"})
+            _merge_system_constraint(messages, f"本会话摘要：\n{conversation_summary}")
         active_lines = []
         if task.active_person:
             active_lines.append(f"当前关注人物：{task.active_person}")
@@ -1852,7 +1877,7 @@ class AgentRuntime:
         if task.open_questions:
             active_lines.append("未解决问题：" + "、".join(str(q) for q in task.open_questions[:5]))
         if active_lines:
-            messages.append({"role": "system", "content": "当前上下文：\n" + "\n".join(active_lines)})
+            _merge_system_constraint(messages, "当前上下文：\n" + "\n".join(active_lines))
         messages.append({"role": "user", "content": message})
         self._emit_progress(turn, progress_callback, stage="thinking", status="running",
                             text="正在理解你的问题…")
@@ -2851,13 +2876,13 @@ class AgentRuntime:
                              + "\n如果观察与用户假设矛盾，以观察为准回答，不要迎合用户假设。"
                              if inspect_obs else "") +
                             ("\nread_photo_text 实际读到的文字是：\n" + "\n".join(ocr_obs)
-                             + "\n基于这些读到的文字直接回答具体内容（价格/店名/电话/年份），"
-                               "不要笼统说'还不能确认'；检索层的不确定可单独用一句自然语言带过。"
+                             + _ocr_recovery_instruction(message, task.tool_results)
                              if ocr_obs else "") +
                             "\n请只输出一个 JSON final（保留 evidence_refs 引用你实际使用的工具结果，"
                             "并在 evidence_refs 中列出你引用过的 inspect_photo 调用编号），"
                             "并按 query_satisfaction 如实表述（candidate_only 不能声称确认）。"
-                            "final 必须先直接回答用户问题本身（地点问题直接说'是在…'，数字问题直接给数字），"
+                            "final 必须先回答用户问题本身；只有已有与问题匹配的确定值时才直接给出数字，"
+                            "否则明确说“现有记录不足以确认”，不能为了直答编造数字；地点问题可直接引用已确认地点，"
                             "不确定的其余条件用一句自然语言带过；禁止输出"
                             "'找到 N 张接近的照片；部分信息能对上；我可以继续帮你核对'这类套话。"
                         )

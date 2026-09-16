@@ -3286,13 +3286,31 @@ def assistant_response(result):
         projected = []
         for item in evidence_media[:3]:
             asset_id = str(item.get("asset_id"))
-            asset = None
-            if not item.get("media_type"):
-                try:
-                    asset = store.get_asset(asset_id)
-                except Exception:
-                    pass
+            try:
+                asset = store.get_asset(asset_id)
+            except Exception:
+                asset = None
             media_type = str(item.get("media_type") or (asset or {}).get("media_type") or "image")
+            source_asset = None
+            parent_asset_id = str((asset or {}).get("parent_asset_id") or "")
+            derived_kind = str((asset or {}).get("derived_kind") or "")
+            if derived_kind in {"video_keyframe", "video_keyframe_webp"} and parent_asset_id:
+                try:
+                    source_asset = store.get_asset(parent_asset_id)
+                except Exception:
+                    source_asset = None
+            if source_asset and source_asset.get("media_type") == "video":
+                projected.append({
+                    "asset_id": str(source_asset.get("id") or parent_asset_id),
+                    "file_name": source_asset.get("file_name") or "",
+                    "media_type": "video",
+                    "media_url": f"/api/assets/{source_asset.get('id') or parent_asset_id}/file",
+                    "display_handle": item.get("handle") or "源视频关键帧",
+                    "captured_at": item.get("captured_at") or (asset or {}).get("captured_at") or "",
+                    "source_timestamp_sec": (asset or {}).get("source_timestamp_sec"),
+                    "source_keyframe_asset_id": asset_id,
+                })
+                continue
             projected.append({
                 "asset_id": asset_id,
                 "file_name": item.get("file_name") or (asset or {}).get("file_name") or "",
