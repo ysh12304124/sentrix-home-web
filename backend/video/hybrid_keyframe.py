@@ -9,6 +9,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from ..platform_profile import profile
 
 
 def _value(item, key, default=""):
@@ -302,7 +303,7 @@ def check_video_gpu_capacity():
     consumer without a capacity check can OOM the production inference.
     Returns None when the device is CPU-only or capacity cannot be measured.
     """
-    device = str(os.getenv("SENTRIX_VIDEO_DEVICE", "cpu")).strip().lower()
+    device = str(profile.video_device()).strip().lower()
     if device in ("", "cpu", "auto"):
         return None
     min_free_mib = int(os.getenv("SENTRIX_VIDEO_GPU_MIN_FREE_MIB", "4096"))
@@ -335,7 +336,7 @@ def run(video_path, output_dir, video_id):
         "--target-decode-workers", os.getenv("SENTRIX_VIDEO_TARGET_DECODE_WORKERS", "4"),
         "--merge-max-sec", os.getenv("SENTRIX_VIDEO_PREFILTER_MERGE_MAX_SEC", "12"),
         "--webp-quality", os.getenv("SENTRIX_VIDEO_WEBP_QUALITY", "80"),
-        "--device", os.getenv("SENTRIX_VIDEO_DEVICE", "0"),
+        "--device", profile.video_device(),
     ]
     process = subprocess.run(command, check=False, capture_output=True, text=True,
                              timeout=int(os.getenv("SENTRIX_VIDEO_TIMEOUT_SECONDS", "7200")))

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from ..retrieval_ann import create_index
 from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from ..platform_profile import profile
 
 _DEFAULT_ANN_DIR = Path(__file__).resolve().parents[2] / "data" / "ann"
 
@@ -73,7 +74,7 @@ class VisualAnnRetriever:
         if self.embedding_router is None:
             self._status = "embedder_unavailable"
             return []
-        if os.getenv("SENTRIX_VECTOR_BACKEND", "sqlite").strip().lower() == "qdrant":
+        if profile.vector_backend() == "qdrant":
             return self._retrieve_qdrant(query, filters, limit)
         if not self.embedding_router.visual_available:
             self._status = "embedder_unavailable"

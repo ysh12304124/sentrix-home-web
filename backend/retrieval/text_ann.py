@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..retrieval_ann import create_index
 from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from ..platform_profile import profile
 
 _DEFAULT_ANN_DIR = Path(__file__).resolve().parents[2] / "data" / "ann"
 
@@ -74,7 +75,7 @@ class TextAnnRetriever:
         if not vector:
             return []
         scope = filters.scope_ids[0] if filters.scope_ids and not filters.all_authorized else None
-        if os.getenv("SENTRIX_VECTOR_BACKEND", "sqlite").strip().lower() == "qdrant":
+        if profile.vector_backend() == "qdrant":
             return self._retrieve_qdrant(vector, scope, limit)
         candidates: dict[str, tuple[float, int, dict]] = {}
         for space in self.spaces:
