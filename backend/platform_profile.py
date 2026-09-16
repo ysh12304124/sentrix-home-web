@@ -142,6 +142,10 @@ class PlatformProfile:
 
     # ---------- 计算设备 ----------
 
+    def is_jetson(self) -> bool:
+        """是否 Jetson（统一内存平台）。"""
+        return is_jetson()
+
     def clip_device(self) -> str:
         """视觉编码设备。env `CLIP_DEVICE` 优先；否则按 CUDA 自检结果。"""
         return _override("CLIP_DEVICE") or ("cuda" if cuda_usable() else "cpu")
