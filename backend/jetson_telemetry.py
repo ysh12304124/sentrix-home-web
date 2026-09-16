@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -168,14 +169,113 @@ def is_jetson_host() -> bool:
         return False
 
 
+JETSON_SAMPLE_INTERVAL_SECONDS = max(
+    0.1, float(os.environ.get("PHOTOBENCH_JETSON_SAMPLE_INTERVAL_SECONDS", "0.5"))
+)
+
+
+def _meminfo_mib() -> dict:
+    values: dict[str, float] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            name, _, rest = line.partition(":")
+            if name in {"MemTotal", "MemAvailable", "MemFree"}:
+                values[name] = float(rest.split()[0]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return {}
+    total = values.get("MemTotal")
+    available = values.get("MemAvailable", values.get("MemFree"))
+    if total is None or available is None:
+        return {}
+    return {
+        "system_memory_used_mib": round(max(0.0, total - available), 3),
+        "system_memory_total_mib": round(total, 3),
+        "system_memory_available_mib": round(max(0.0, available), 3),
+        "system_memory_scope": "host_all_processes",
+    }
+
+
+def _parse_tegrastats_line(line: str) -> dict:
+    sample = {}
+    for key, pattern, scale in (
+        ("system_memory_used_mib", r"RAM\s+(\d+)/(\d+)MB", 1),
+        ("gpu_utilization_pct", r"GR3D_FREQ\s+(\d+)%", 1),
+        ("power_draw_w", r"VDD_GPU_SOC\s+(\d+)mW", 0.001),
+        ("temperature_c", r"(?:gpu|tj)@([\d.]+)C", 1),
+    ):
+        match = re.search(pattern, line)
+        if not match:
+            continue
+        sample[key] = round(float(match.group(1)) * scale, 3)
+        if key == "system_memory_used_mib":
+            sample["system_memory_total_mib"] = round(float(match.group(2)) * scale, 3)
+            sample["system_memory_available_mib"] = round(
+                max(0.0, sample["system_memory_total_mib"] - sample[key]), 3
+            )
+            sample["system_memory_scope"] = "host_all_processes"
+    return sample
+
+
+class _TegrastatsStream:
+    """Keep one tegrastats process so 0.5s sampling does not spawn a child every tick."""
+
+    def __init__(self, interval_ms: int):
+        self.interval_ms = max(100, int(interval_ms))
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._latest = ""
+
+    def latest_line(self) -> str:
+        self._ensure()
+        with self._lock:
+            return self._latest
+
+    def _ensure(self) -> None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return
+            self._stop.clear()
+            try:
+                self._proc = subprocess.Popen(
+                    ["tegrastats", "--interval", str(self.interval_ms)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError:
+                self._proc = None
+                return
+            self._thread = threading.Thread(target=self._read, daemon=True, name="tegrastats-reader")
+            self._thread.start()
+
+    def _read(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        for line in proc.stdout:
+            if self._stop.is_set():
+                break
+            text = line.strip()
+            if text:
+                with self._lock:
+                    self._latest = text
+
+
+_TEGRASTATS = _TegrastatsStream(int(JETSON_SAMPLE_INTERVAL_SECONDS * 1000))
+
+
 class LocalJetsonLlamaCppTelemetryProvider:
     """Sample a verified local llama-server process, never an arbitrary remote PID.
 
-    PSS is sampled less frequently than HTTP metrics. Missing PSS/KV values stay
-    null; no whole-system RAM or per-token formula is mislabeled as GPU VRAM.
+    Device stats and PSS follow the same 0.5s GpuSampler cadence as 153 NVML.
+    tegrastats is kept as a single long-lived process. Missing PSS/KV values stay
+    null; no whole-system RAM is mislabeled as GPU VRAM.
     """
 
-    def __init__(self, endpoint_url: str, *, pid_file: str | None = None, pss_interval: float = 5):
+    def __init__(self, endpoint_url: str, *, pid_file: str | None = None, pss_interval: float | None = None):
         parsed = urlparse(endpoint_url)
         if parsed.scheme not in {"http", "https"} or not parsed.port:
             raise ValueError("a local llama.cpp endpoint with an explicit port is required")
@@ -185,7 +285,8 @@ class LocalJetsonLlamaCppTelemetryProvider:
             "PHOTOBENCH_LLAMA_PID_FILE",
             "/home/orin/VLM/gemma4/results/orin/server_photobench_8100.pid",
         ))
-        self.pss_interval = pss_interval
+        self.pss_interval = JETSON_SAMPLE_INTERVAL_SECONDS if pss_interval is None else max(0.0, float(pss_interval))
+        self.device_interval = self.pss_interval
         self._last_probe = 0.0
         self._last_device_probe = 0.0
         self._device_sample: dict = {}
@@ -237,42 +338,15 @@ class LocalJetsonLlamaCppTelemetryProvider:
         return data
 
     def _device(self) -> dict:
-        if time.monotonic() - self._last_device_probe < 5:
+        if time.monotonic() - self._last_device_probe < self.device_interval and self._device_sample:
             return self._device_sample
         self._last_device_probe = time.monotonic()
-        proc = None
-        try:
-            proc = subprocess.Popen(["tegrastats", "--interval", "100"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            try:
-                output, _ = proc.communicate(timeout=0.35)
-            except subprocess.TimeoutExpired:
-                proc.terminate()
-                output, _ = proc.communicate(timeout=1)
-            line = output.splitlines()[0] if output.splitlines() else ""
-            sample = {}
-            for key, pattern, scale in (
-                ("system_memory_used_mib", r"RAM\s+(\d+)/(\d+)MB", 1),
-                ("gpu_utilization_pct", r"GR3D_FREQ\s+(\d+)%", 1),
-                ("power_draw_w", r"VDD_GPU_SOC\s+(\d+)mW", 0.001),
-                ("temperature_c", r"(?:gpu|tj)@([\d.]+)C", 1),
-            ):
-                match = re.search(pattern, line)
-                if match:
-                    sample[key] = round(float(match.group(1)) * scale, 3)
-                    if key == "system_memory_used_mib":
-                        sample["system_memory_total_mib"] = round(float(match.group(2)) * scale, 3)
-                        sample["system_memory_available_mib"] = round(
-                            max(0.0, sample["system_memory_total_mib"] - sample[key]), 3
-                        )
-                        sample["system_memory_scope"] = "host_all_processes"
-            self._device_sample = sample
-        except (OSError, subprocess.SubprocessError, ValueError):
-            self._device_sample = {}
-        finally:
-            if proc is not None and proc.poll() is None:
-                proc.kill()
-                proc.communicate()
+        sample = _meminfo_mib()
+        line = _TEGRASTATS.latest_line()
+        if line:
+            parsed = _parse_tegrastats_line(line)
+            sample.update(parsed)
+        self._device_sample = sample
         return self._device_sample
 
     def gpu_stats(self) -> dict:

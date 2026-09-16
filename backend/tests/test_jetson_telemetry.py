@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from backend.jetson_telemetry import LocalJetsonLlamaCppTelemetryProvider
+from backend.jetson_telemetry import LocalJetsonLlamaCppTelemetryProvider, _parse_tegrastats_line
 
 
 class JetsonTelemetryTests(unittest.TestCase):
@@ -34,6 +34,18 @@ class JetsonTelemetryTests(unittest.TestCase):
         self.assertEqual(provider._metrics(), {})
         get.return_value.text = "llamacpp:kv_cache_tokens 3\nllamacpp:kv_cache_usage_ratio 0.25\n"
         self.assertEqual(provider._metrics()["kv_cache_used_tokens"], 3)
+
+    def test_default_sample_interval_matches_gpu_sampler(self):
+        provider = LocalJetsonLlamaCppTelemetryProvider("http://127.0.0.1:8100/v1")
+        self.assertEqual(provider.pss_interval, 0.5)
+        self.assertEqual(provider.device_interval, 0.5)
+
+    def test_parse_tegrastats_line(self):
+        sample = _parse_tegrastats_line("RAM 8192/16384MB GR3D_FREQ 41% VDD_GPU_SOC 1234mW gpu@52.5C")
+        self.assertEqual(sample["system_memory_used_mib"], 8192.0)
+        self.assertEqual(sample["gpu_utilization_pct"], 41.0)
+        self.assertEqual(sample["power_draw_w"], 1.234)
+        self.assertEqual(sample["temperature_c"], 52.5)
 
     @patch.object(LocalJetsonLlamaCppTelemetryProvider, "_device", return_value={
         "system_memory_used_mib": 6000,
