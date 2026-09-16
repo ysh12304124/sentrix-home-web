@@ -24,6 +24,7 @@ artifacts/*
 
 .env
 .env.*
-!.env.example\n
+!.env.example
+
 # Machine-local service endpoints; copy runtime_connection.example.json.
 config/runtime_connection.json
