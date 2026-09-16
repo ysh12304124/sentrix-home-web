@@ -96,6 +96,19 @@ def local_lan_ip() -> str:
         probe.close()
 
 
+def _is_orin_telemetry_host(host) -> bool:
+    """该主机是否被显式配置为远端 Orin 遥测目标。
+
+    原先这里直接比对字面量 `192.168.0.118`：把某一台机器的地址编进主干，换台机器
+    就得改代码。本机是 Jetson 时由 is_jetson_host() 判定（能力信号）；跨机场景由
+    SENTRIX_ORIN_TELEMETRY_HOST 显式声明（形如 orin@<host>）。
+    """
+    if not host:
+        return False
+    remote = os.getenv("SENTRIX_ORIN_TELEMETRY_HOST", "").strip()
+    return bool(remote) and host == remote.split("@", 1)[-1]
+
+
 def resolve_runtime_framework(value: str, model_base_url: str) -> str:
     framework = str(value or "").strip().lower().replace("_", ".")
     if framework and framework != "generic":
@@ -103,7 +116,7 @@ def resolve_runtime_framework(value: str, model_base_url: str) -> str:
     endpoint = urlparse(model_base_url)
     if endpoint.port == 11434:
         return "ollama"
-    if endpoint.port == 8100 and (endpoint.hostname == "192.168.0.118" or is_jetson_host()):
+    if endpoint.port == 8100 and (is_jetson_host() or _is_orin_telemetry_host(endpoint.hostname)):
         return "llama.cpp"
     # Port 8100 is also used by vLLM; an arbitrary service is not llama.cpp.
     return "generic"
@@ -139,7 +152,7 @@ def select_runtime_providers(manager_url: str, endpoint_url: str,
     jetson = is_jetson_host()
     if not cloud and framework in {"llama.cpp", "llamacpp"} and jetson and host in local_hosts:
         return lifecycle, LocalJetsonLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "jetson_local_pss"
-    if not cloud and framework in {"llama.cpp", "llamacpp"} and host == "192.168.0.118" and urlparse(endpoint_url).port == 8100:
+    if not cloud and framework in {"llama.cpp", "llamacpp"} and _is_orin_telemetry_host(host) and urlparse(endpoint_url).port == 8100:
         return lifecycle, OrinLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "orin_ssh_pss"
     if not cloud and not jetson and host in local_hosts:
         telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider,
