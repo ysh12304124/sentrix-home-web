@@ -77,7 +77,7 @@ class VideoMemoryAdapter:
     def _keyframe_algorithm(self):
         return str(
             self.keyframe_algorithm
-            or os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm")
+            or profile.video_keyframe_algorithm()
         ).strip().lower()
 
     def process(self, asset, pipeline):

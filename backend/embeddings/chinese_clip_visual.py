@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
+from ..platform_profile import profile
 
 _DEFAULT_CHECKPOINT = os.getenv(
     "CHINESE_CLIP_CHECKPOINT",
@@ -32,7 +33,7 @@ class ChineseClipVisualEmbedder:
         model_name: str = "ViT-L-14", device: str | None = None,
     ):
         resolved_checkpoint = str(Path(checkpoint or _DEFAULT_CHECKPOINT).expanduser().resolve())
-        resolved_device = device or os.getenv("CLIP_DEVICE", "cpu")
+        resolved_device = device or profile.clip_device()
         key = (resolved_checkpoint, model_name, resolved_device)
         with cls._shared_lock:
             instance = cls._shared_instances.get(key)
@@ -50,7 +51,7 @@ class ChineseClipVisualEmbedder:
         self.model_name = model_name
         self._model = None
         self._preprocess = None
-        self._device = device or os.getenv("CLIP_DEVICE", "cpu")
+        self._device = device or profile.clip_device()
         self._error = None
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()

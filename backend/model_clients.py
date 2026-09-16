@@ -12,6 +12,7 @@ from .face_embeddings import FaceEmbeddingUnavailable, compute_face_quality
 from .geocoding import format_gps_prefix
 from .onnx_runtime import face_gpu_inference_gate, face_onnx_provider_options, face_onnx_providers
 from .runtime_providers import OpenAICompatibleInferenceProvider, normalize_openai_base_url
+from .platform_profile import profile
 
 
 def align_face_crop(image, bbox, landmarks=None):
@@ -1505,7 +1506,7 @@ class ClipAdapter:
         self._tokenizer = None
         self._load_lock = threading.Lock()
         self.error = None
-        self.device = os.getenv("CLIP_DEVICE", "auto")
+        self.device = profile.clip_device()
         # A randomly initialized model must never be used as retrieval evidence.
         self.weights_ready = bool(self.checkpoint) or os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() in {"1", "true", "yes"}
 

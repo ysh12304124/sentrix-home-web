@@ -38,6 +38,7 @@ from .runtime_providers import (
     normalize_openai_base_url,
     normalize_service_url,
 )
+from .platform_profile import profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -277,10 +278,12 @@ def _finalize_scope_async(scope_id: str) -> None:
 
 
 def _pipeline_worker_limits():
-    configured = max(1, int(os.getenv("SENTRIX_PIPELINE_MAX_WORKERS", "2")))
+    configured = max(1, int(profile.pipeline_workers()))
     state = _load_vllm_state() or {}
-    service_limit = max(1, int(state.get("max_num_seqs") or 1))
-    summary_configured = max(1, int(os.getenv("SENTRIX_EVENT_SUMMARY_MAX_WORKERS", "2")))
+    # vLLM 托管时有 manager 公布的值；llama.cpp 走 openai-compatible 外部端点时
+    # 没有 manager，此时由能力档案（或 SENTRIX_SERVICE_MAX_SEQS）给出槽位数。
+    service_limit = max(1, int(state.get("max_num_seqs") or profile.service_parallel()))
+    summary_configured = max(1, int(profile.event_summary_workers()))
     return {
         "configured_workers": configured,
         "vllm_max_num_seqs": service_limit,
@@ -842,6 +845,9 @@ def _run_vllm_switch(request: ModelSwitchRequest):
 @app.on_event("startup")
 def _sync_vllm_state_on_startup():
     """Sync gamma client with remote vLLM state on startup."""
+    # 把这台机器实际生效的能力打出来。46 上曾因为少一个环境变量而静默切到
+    # 另一条视频链路，排查花了很久——留痕后这类问题一眼可见。
+    profile.log_summary()
     try:
         state = _load_vllm_state()
         if state and state.get("pid"):
@@ -850,7 +856,7 @@ def _sync_vllm_state_on_startup():
         pass
 
 def _video_extraction_status():
-    algorithm = os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm").strip().lower()
+    algorithm = profile.video_keyframe_algorithm()
     if algorithm == "hybrid_webp":
         return {
             "adapter": "hybrid_webp_memory", "algorithm": algorithm, "status": "available",

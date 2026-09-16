@@ -257,6 +257,23 @@ class PlatformProfile:
     def face_embedding_is_adaface(self) -> bool:
         return self.face_embedding_mode() == "adaface"
 
+    def video_keyframe_algorithm(self) -> str:
+        """视频关键帧算法。
+
+        默认 `hybrid_webp` 而不是 `worldmm`。这不是口味问题，是实测结论：
+
+        - `worldmm` 产出的场景摘要是**占位符**（"视频场景 2" / "视频场景 · 5.9s~10.0s"），
+          VLM 根本没有真正总结；
+        - 针对 NVDEC 并发上限、编解码器映射、CPU 回退做的全部修复**只在 hybrid_webp 生效**。
+
+        默认值选错会让这些修复静默失效 —— 46 上就因为 `.env` 少写这一个变量，
+        整轮视频都跑在 worldmm 上，日志里看不出任何异常。
+        """
+        override = _override("SENTRIX_VIDEO_KEYFRAME_ALGORITHM")
+        if override:
+            return override.lower()
+        return "hybrid_webp"
+
     # ---------- 汇总（用于启动时打日志） ----------
 
     def summary(self) -> dict:
