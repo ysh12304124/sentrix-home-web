@@ -1570,7 +1570,16 @@ class MemoryStore:
     def complete_ingest_batch(self, batch_id):
         timestamp = now_iso()
         self.connection.execute(
-            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'summarizing', 'cancelled') THEN status ELSE 'complete' END,
+            # 'summarizing' 刻意不在这里保留：它是个单向死结。收尾接口原本保留它，
+            # 而 claim_ingest_batch_summary 又要求 status=='complete' 才肯认领
+            # （且只做 complete→summarizing 的单向迁移），finish_ingest_batch 则要求
+            # status=='summarizing'。于是只要进程在 summarize 途中退出（OOM / 重启 /
+            # 部署），批次就永远停在 'summarizing'：认领不了、也复位不了，
+            # finish_ingest_batch 以及挂在其后的 scope_finalize 与 ANN 索引重建钩子
+            # 永不执行 —— 表现为相册建好了但**检索全空，且无任何告警**。
+            # 复位成 'complete' 后，再次调用收尾接口即可重跑尾部（此时资产均已处理完，
+            # 不会重跑管线）。
+            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'complete' END,
             updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?""",
             (timestamp, timestamp, str(batch_id)),
         )
