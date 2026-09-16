@@ -4,7 +4,7 @@
 # PhotoBench evaluation service (8771) is lazy-started on first QA click
 # via POST /api/photobench/ensure handled by server.js.
 
-root=/home/realmagic/Github/Sentrix-Home-Web
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root" || exit 1
 
 exec env PORT=4174 \

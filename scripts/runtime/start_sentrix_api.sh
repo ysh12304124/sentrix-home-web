@@ -32,11 +32,15 @@ runtime_dirs=()
 while IFS= read -r directory; do
   runtime_dirs+=("$directory")
 done < <(find "$site_packages/nvidia" -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
-# GPU face detection (RetinaFace + buffalo_l onnxruntime CUDA) needs cudnn/cublas
-# shipped in the stmem conda env; the project .venv does not vendor nvidia libs.
-while IFS= read -r directory; do
-  runtime_dirs+=("$directory")
-done < <(find /home/realmagic/miniconda3/envs/stmem/lib/python3.10/site-packages/nvidia -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
+# GPU face detection (RetinaFace + buffalo_l onnxruntime CUDA) needs cudnn/cublas.
+# 项目 .venv 通常不自带 nvidia 库，需要从 conda 环境补。不要写死某个 conda 路径
+# —— 不同机器上用户名和环境名都不同，写死会让脚本换台机器就直接失效。
+# 有 CONDA_PREFIX 就用它；没有就跳过，让 onnxruntime 自己给出缺库的错误。
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+  while IFS= read -r directory; do
+    runtime_dirs+=("$directory")
+  done < <(find "$CONDA_PREFIX"/lib/python*/site-packages/nvidia -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
+fi
 
 if ((${#runtime_dirs[@]})); then
   runtime_path="$(IFS=:; echo "${runtime_dirs[*]}")"
@@ -64,8 +68,10 @@ export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8101}"
 # 153 GPU driver/library NVML mismatch breaks the CUDA caching allocator; run
 # CLIP embedding on CPU so visual/text recall stays available.
 export CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
-export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-/home/realmagic/Github/stmem-bak/models/open_clip_pytorch_model.bin}"
-export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/realmagic/.cache/clip/clip_cn_vit-l-14.pt}"
+# 默认值取仓库相对路径与标准缓存目录：写死别人的家目录在换机器时只会得到一个
+# 指向不存在文件的路径，而 ClipAdapter 拿到不存在的 checkpoint 会直接加载失败。
+export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-$root/data/models/clip/${CLIP_MODEL_NAME:-ViT-B-32}.bin}"
+export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-$HOME/.cache/clip/clip_cn_vit-l-14.pt}"
 # R1B proved ViT-B-32 text-to-image is random for Chinese (AUC 0.51); switch the
 # visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
 export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"
