@@ -36,10 +36,6 @@ from pathlib import Path
 
 log = logging.getLogger("sentrix.platform_profile")
 
-# 仓库根（本文件位于 <repo>/backend/platform_profile.py），用于在环境变量缺失时
-# 推断默认路径（如 data/qdrant）。
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-
 # ffmpeg 里 Jetson 硬件解码器的命名后缀；映射表必须按实测结果裁剪，
 # 不能凭"Orin 支持 H.264/HEVC/VP9..."的资料硬写 —— 见 `ffmpeg_hw_decoders`。
 _HW_DECODER_SUFFIX = "_nvv4l2dec"
@@ -220,22 +216,17 @@ class PlatformProfile:
     # ---------- 存储与模型 ----------
 
     def vector_backend(self) -> str:
-        """向量后端。env 优先；否则看本地有没有 qdrant 数据目录。
+        """向量后端。
 
-        路径候选：`SENTRIX_QDRANT_PATH` → 仓库默认 `data/qdrant`。
-        后端与路径分开判断，是为了让 153 在**一个变量都不设**的情况下也能选对 qdrant；
-        118/46 没有该目录，自然落到 sqlite。
+        默认 sqlite。**不**去探测仓库里有没有 `data/qdrant` 目录：那个目录在
+        153 上一直存在，一旦把它当作信号，任何没设 `SENTRIX_VECTOR_BACKEND`
+        的进程（包括单元测试）都会被导进 qdrant 分支并失败。
+        需要 qdrant 就显式设置后端与路径；选错时启动日志里的
+        `platform_profile vector_backend = ...` 会立刻暴露。
         """
         override = _override("SENTRIX_VECTOR_BACKEND")
         if override:
             return override.lower()
-        candidates = [
-            _override("SENTRIX_QDRANT_PATH"),
-            str(_REPO_ROOT / "data" / "qdrant"),
-        ]
-        for candidate in candidates:
-            if candidate and Path(candidate).expanduser().is_dir():
-                return "qdrant"
         return "sqlite"
 
     def face_embedding_mode(self) -> str:

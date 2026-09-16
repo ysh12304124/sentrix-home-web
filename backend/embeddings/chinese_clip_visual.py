@@ -12,10 +12,13 @@ Chinese-CLIP checkpoint (``~/.cache/clip/clip_cn_vit-l-14.pt`` on 153).
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from pathlib import Path
 from ..platform_profile import profile
+
+log = logging.getLogger("sentrix.chinese_clip")
 
 _DEFAULT_CHECKPOINT = os.getenv(
     "CHINESE_CLIP_CHECKPOINT",
@@ -111,6 +114,8 @@ class ChineseClipVisualEmbedder:
                 vector = model.encode_text(tokenize([str(text)]).to(self._device))
             return [float(value) for value in vector[0].cpu().tolist()]
         except Exception:
+            # 静默返回 [] 会让"没有向量"这件事完全不可见
+            log.exception("chinese-clip embed_query failed: text=%r", str(text)[:80])
             return []
 
     def embed_image(self, path: str) -> list[float]:
@@ -128,4 +133,8 @@ class ChineseClipVisualEmbedder:
                 vector = model.encode_image(image)
             return [float(value) for value in vector[0].cpu().tolist()]
         except Exception:
+            # 这里是静默返回空向量的元凶：调用方拿到 [] 仍会 upsert，整条链路不报错。
+            # 实测 numpy 2.x ABI 冲突期间 223 张图因此没有任何视觉向量，直到手工清点
+            # 才发现。必须留下痕迹，否则同样的失败仍然不可见。
+            log.exception("chinese-clip embed_image failed: path=%s", path)
             return []

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import shutil
 import hashlib
@@ -40,6 +41,8 @@ from .runtime_providers import (
 )
 from .platform_profile import profile
 
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("SENTRIX_DATA_DIR", ROOT / "data"))
@@ -235,10 +238,20 @@ def process_asset(asset_id):
     )
     try:
         asset = task_store.get_asset(asset_id) or {}
-        if asset.get("media_type") != "image":
-            task_pipeline.process(asset_id)
+        if not asset:
+            # 后台任务队列里可能残留已删除的资产（相册被删、scope 被清理）。
+            # 直接跳过即可，不要让一个陈旧任务把整批后台处理带崩。
+            log.warning("process_asset: asset %s no longer exists, skipped", asset_id)
             return
-        fast = task_pipeline.process_fast_image(asset_id)
+        if asset.get("media_type") != "image":
+            try:
+                task_pipeline.process(asset_id)
+            except KeyError:
+                # get_asset 与 process 之间资产被删掉的竞态，同上处理。
+                log.warning("process_asset: asset %s deleted mid-flight, skipped", asset_id)
+            return
+        # process_fast_image 对已删资产返回 None；直接 .get 会抛 AttributeError。
+        fast = task_pipeline.process_fast_image(asset_id) or {}
         if fast.get("status") == "semantic_enriching":
             # Finish the semantic observation and summarize its event in the
             # same background pipeline; imports must not require maintenance UI.

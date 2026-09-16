@@ -40,9 +40,21 @@ class Agent2ShadowRuntimeTests(unittest.TestCase):
         self.assertEqual(turn.agent2_trace["planner_decisions"][0]["status"], "accepted")
 
     def test_shadow_profile_records_fallback_without_blocking_legacy_loop(self):
-        responses = iter(("not-json", '{"action":"final","answer":"你好"}'))
+        # 第一次给非法规划输出，之后一律给最终答案。
+        #
+        # 不要写死"规划只调用一次"：规划失败后会带着失败原因重规划
+        # （SENTRIX_PLANNER_MAX_ATTEMPTS，默认 3），调用次数不是本测试要锁的契约；
+        # 本测试要保证的是「规划失败不阻塞 legacy 循环，最终仍能给出答案」。
+        calls = []
+
+        def chat(messages, **kwargs):
+            calls.append(messages)
+            if len(calls) == 1:
+                return "not-json"
+            return '{"action":"final","answer":"你好"}'
+
         runtime = AgentRuntime(
-            chat_fn=lambda messages: next(responses),
+            chat_fn=chat,
             profile_name="goal_driven_shadow",
             scope_id="album1",
         )
