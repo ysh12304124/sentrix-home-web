@@ -36,7 +36,7 @@ done < <(find "$site_packages/nvidia" -mindepth 2 -maxdepth 2 -type d -name lib 
 # shipped in the stmem conda env; the project .venv does not vendor nvidia libs.
 while IFS= read -r directory; do
   runtime_dirs+=("$directory")
-done < <(find /home/asus/miniconda3/envs/stmem/lib/python3.10/site-packages/nvidia -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
+done < <(find /home/realmagic/miniconda3/envs/stmem/lib/python3.10/site-packages/nvidia -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
 
 if ((${#runtime_dirs[@]})); then
   runtime_path="$(IFS=:; echo "${runtime_dirs[*]}")"
@@ -48,20 +48,24 @@ export SENTRIX_LLM_BACKEND="${SENTRIX_LLM_BACKEND:-vllm}"
 export SENTRIX_VLLM_BASE_URL="${SENTRIX_VLLM_BASE_URL:-http://127.0.0.1:8100/v1}"
 export SENTRIX_VLLM_MODEL="${SENTRIX_VLLM_MODEL:-gemma4-12b-it}"
 export SENTRIX_VLLM_REGISTRY="${SENTRIX_VLLM_REGISTRY:-$root/configs/sentrix_vllm_registry_192_168_0_153.json}"
+# Sentrix JSON v1 training targets allow up to 1024 output tokens. Keep the
+# local runtime budget aligned; cloud_api uses its separate provider budget.
+export SENTRIX_TOOL_LOOP_MAX_TOKENS="${SENTRIX_TOOL_LOOP_MAX_TOKENS:-1024}"
+export SENTRIX_BIG_MODEL_MAX_OUTPUT_TOKENS="${SENTRIX_BIG_MODEL_MAX_OUTPUT_TOKENS:-4096}"
 # Batch image work is configurable, but the backend also caps the effective
 # value at the active vLLM profile's max_num_seqs.
 export SENTRIX_PIPELINE_MAX_WORKERS="${SENTRIX_PIPELINE_MAX_WORKERS:-2}"
 export SENTRIX_EVENT_SUMMARY_MAX_WORKERS="${SENTRIX_EVENT_SUMMARY_MAX_WORKERS:-2}"
 # Legacy Ollama settings are kept only for explicit SENTRIX_LLM_BACKEND=ollama fallback.
-export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11435}"
-export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:12b}"
+export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e2b}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8101}"
 # 153 GPU driver/library NVML mismatch breaks the CUDA caching allocator; run
 # CLIP embedding on CPU so visual/text recall stays available.
 export CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
-export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-/home/asus/Github/stmem-bak/models/open_clip_pytorch_model.bin}"
-export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/asus/.cache/clip/clip_cn_vit-l-14.pt}"
+export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-/home/realmagic/Github/stmem-bak/models/open_clip_pytorch_model.bin}"
+export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/realmagic/.cache/clip/clip_cn_vit-l-14.pt}"
 # R1B proved ViT-B-32 text-to-image is random for Chinese (AUC 0.51); switch the
 # visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
 export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"

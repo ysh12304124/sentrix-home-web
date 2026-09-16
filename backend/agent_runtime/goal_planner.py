@@ -36,6 +36,7 @@ _DECLARATION_PROMPT = """你正在规划家庭记忆任务。只返回一个精�
 - 人物关系、家庭归属或人物画像问题声明 confirmed_identity；如还要找对应照片，再额外声明 memory_asset。
 - 同一种 evidence_type 只声明一次；不要为了同一个答案同时声明多个等价需求。
 每个 requirement 都必须能由注册表中的工具直接或通过 prerequisite 获得。
+- JSON 示例中的尖括号内容仅用于说明字段，不是要输出的固定值。goal、evidence_type、description 必须替换为当前用户问题对应的真实内容；禁止原样输出 <用户目标>、<证据类型>、<描述> 或任何其他尖括号占位符；scope_id 必须使用系统指定值。
 
 不要调用工具，不要输出 SQL，不要直接回答用户。"""
 

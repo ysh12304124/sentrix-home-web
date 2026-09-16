@@ -1,23 +1,54 @@
 {
-  "default_target_id": "server-153",
+  "default_target_id": "local-100-vllm",
   "targets": {
-    "backend-100": {
-      "label": "100 后端链路（默认）",
-      "manager_url": "http://192.168.0.153:8501",
-      "model_base_url": "http://192.168.0.153:8101/v1",
-      "description": "100 Sentrix 后端固定连接的第二套 vLLM Manager 和模型服务"
+    "local-100-ollama": {
+      "label": "100 本机 Ollama（Gemma4 E2B）",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:11434/v1",
+      "description": "100 本机 Ollama；不连接 153 模型服务",
+      "model": "gemma4:e2b"
     },
-    "server-153": {
-      "label": "153 产品链路",
-      "manager_url": "http://192.168.0.153:8500",
-      "model_base_url": "http://192.168.0.153:8100/v1",
-      "description": "153 产品后端固定连接的主 vLLM Manager 和模型服务"
+    "server-100": {
+      "label": "100 本机 Ollama（兼容别名）",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:11434/v1",
+      "description": "100 本机 Ollama；不连接 153 模型服务",
+      "model": "gemma4:e2b"
     },
-    "szu-via-mac": {
-      "label": "学校算力中心 4090（经 mac 隧道 192.168.1.65）",
-      "manager_url": "http://192.168.1.65:18500",
-      "model_base_url": "http://192.168.1.65:18100/v1",
-      "description": "学校 vllm_manager + vllm，SSH 反向隧道经 mac 中转"
+    "local-100-vllm": {
+      "label": "100 本机 vLLM 管理器（Qwen3.5 profiles）",
+      "manager_url": "http://127.0.0.1:8500",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "100 本机 vLLM Manager；按模型 profile 切换，不连接 153 模型服务",
+      "model": "qwen3.5-0.8b"
+    },
+    "local-100-vllm-4b": {
+      "label": "100 本机 vLLM（Qwen3.5-4B profile）",
+      "manager_url": "http://127.0.0.1:8500",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "100 本机 vLLM Manager；按模型 profile 切换，不连接 153 模型服务",
+      "model": "qwen3.5-4b"
+    },
+    "local-100-vllm-vl4b": {
+      "label": "100 本机 vLLM（Qwen3-VL-4B profile）",
+      "manager_url": "http://127.0.0.1:8500",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "100 本机 vLLM Manager；按模型 profile 切换，不连接 153 模型服务",
+      "model": "qwen3-vl-4b"
+    },
+    "local-100-vllm-gemma4-12b": {
+      "label": "100 本机 vLLM（Gemma4-12B-it 4bit/BF16）",
+      "manager_url": "http://127.0.0.1:8500",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "100 本机 vLLM Manager；Gemma4-12B-it bitsandbytes 4-bit 权重、BF16 计算/激活，单卡 GPU1。",
+      "model": "gemma4-12b-it"
+    },
+    "local-100-vllm-gemma4-12b-bf16": {
+      "label": "100 本机 vLLM（Gemma4-12B-it BF16 对照）",
+      "manager_url": "http://127.0.0.1:8500",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "仅用于对照的 Gemma4-12B-it BF16 profile；默认不启动。",
+      "model": "gemma4-12b-it-bf16"
     }
   }
 }

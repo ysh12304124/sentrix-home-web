@@ -279,7 +279,9 @@
         ? aspects.join(" · ")
         : (item.captured_at || item.caption || "本轮相关内容");
       if (mediaType === "video") {
-        return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
+        const timestamp = Number(item.source_timestamp_sec);
+        const frameTime = Number.isFinite(timestamp) && timestamp >= 0 ? ` data-evidence-timestamp="${timestamp}"` : "";
+        return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline${frameTime} aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
       }
       return `<button class="image-result" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url)}" data-image-label="${escapeHtml(label)}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || item.location || "")}" data-image-activity="${escapeHtml(item.caption || caption || "")}" title="查看照片"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /></button>`;
     }).join("");
@@ -1255,6 +1257,12 @@
       submitPhotoInspector();
     });
     document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action, element)));
+    document.querySelectorAll("video[data-evidence-timestamp]").forEach((player) => player.addEventListener("loadedmetadata", () => {
+      const timestamp = Number(player.dataset.evidenceTimestamp);
+      if (!Number.isFinite(timestamp) || timestamp < 0) return;
+      player.pause();
+      player.currentTime = timestamp;
+    }, { once: true }));
     document.querySelectorAll("[data-people-action]").forEach((element) => element.addEventListener("click", (event) => { event.stopPropagation(); handleAction(element.dataset.peopleAction, element); }));
     bindPeopleGraphEvents();
     const fileInput = document.getElementById("file-input");

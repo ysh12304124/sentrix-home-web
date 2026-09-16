@@ -80,6 +80,22 @@ def run(store, scope_id: str) -> dict:
     }
 
 
+def finalize_ingest_scope(store, scope_id):
+    """Finish derived retrieval data before publishing batch completion."""
+    if not scope_id:
+        return None
+    import logging
+    try:
+        result = run(store, scope_id)
+        visual = result.get("visual") or {}
+        if visual.get("error") or visual.get("failed"):
+            logging.getLogger(__name__).error("scope retrieval finalization incomplete: %s", result)
+        return result
+    except Exception as exc:
+        logging.getLogger(__name__).exception("scope retrieval finalization failed: %s", scope_id)
+        return {"scope_id": scope_id, "error": str(exc)}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=os.getenv("SENTRIX_DB_PATH", "data/sentrix.db"))

@@ -18,7 +18,7 @@ from .budget_manager import BudgetState
 # 单个需求的最大取证尝试次数：达到仍未 satisfied → failed 终态（已尝试未确认），
 # 避免模型反复 search 无证据而一直 running、耗尽预算导致"未完成"。
 _MAX_REQUIREMENT_ATTEMPTS = 3
-from .jit_prompt import build_jit_system_prompt
+from .jit_prompt import build_jit_system_prompt, select_jit_tool_specs
 from .answer_nucleus import (build_nucleus, classify_deterministic,
                              render_simple)
 from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
@@ -32,6 +32,7 @@ from .profile import get_profile
 from .result_set import TaskState
 from .tool_policy import ToolPolicy
 from .tool_registry import get_tool, list_tools
+from .runtime_contract import serialize_runtime_action
 
 
 def _people_count_from_summary(text: str) -> int:
@@ -227,8 +228,8 @@ def _normalize_selected_image_handles(handles, preview_handles, limit: int = 6) 
 
 
 def _model_visible_action(action: dict) -> str:
-    """Feed the parsed action back without model reasoning or prose."""
-    return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+    """Feed the canonical Sentrix action back to the model."""
+    return serialize_runtime_action(action)
 
 
 _RECOVERY_MESSAGE_MARKERS = (
@@ -2316,9 +2317,11 @@ class AgentRuntime:
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 from .requirement_completion import RequirementCompletion
                 model_step["tool_candidates"] = [
-                    spec.name for spec in RequirementCompletion(
-                        agent2_task_state, agent2_evidence_ledger
-                    ).allowed_capabilities(list_tools(readiness="ready"))
+                    spec.name for spec in select_jit_tool_specs(
+                        task_state=agent2_task_state,
+                        preview_handles=task.result_preview,
+                        allowed_tool_names=self.profile.tools,
+                    )
                 ]
             if self.include_debug:
                 import copy as _copy
@@ -2403,9 +2406,11 @@ class AgentRuntime:
                     })
                     if agent2_status != "complete":
                         from .requirement_completion import RequirementCompletion
-                        available = RequirementCompletion(
-                            agent2_task_state, agent2_evidence_ledger
-                        ).allowed_capabilities(list_tools(readiness="ready"))
+                        available = select_jit_tool_specs(
+                            task_state=agent2_task_state,
+                            preview_handles=task.result_preview,
+                            allowed_tool_names=self.profile.tools,
+                        )
                         # Planner declarations describe semantic evidence
                         # (location/memory) but may omit the prerequisite
                         # visual resolution tool. If search explicitly marks

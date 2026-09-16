@@ -63,8 +63,8 @@ runtime_lock = threading.Lock()
 batch_worker_lock = threading.Lock()
 db_write_lock = threading.RLock()
 active_batch_workers = set()
-VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
-VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
+VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/realmagic/sentrix-vllm/bin/sentrix_vllm_manager.py"))
+VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/realmagic/sentrix-vllm/registry.json"))
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
 RUNTIME_VLLM_API_URL = None
 RUNTIME_VLLM_BASE_URL = None
@@ -178,9 +178,9 @@ def _allowed_import_roots():
     defaults = [
         DATA_DIR / "imports",
         ROOT / "data" / "imports",
-        Path("/home/asus/data"),
-        Path("/home/asus/datasets"),
-        Path("/home/asus/benchmarks"),
+        Path("/home/realmagic/data"),
+        Path("/home/realmagic/datasets"),
+        Path("/home/realmagic/benchmarks"),
     ]
     values = configured.split(":") if configured else [str(item) for item in defaults]
     roots = []
@@ -617,6 +617,8 @@ def process_ingest_batch(asset_ids, batch_id):
             with ThreadPoolExecutor(max_workers=limits["event_summary_workers"], thread_name_prefix="sentrix-event-summary") as executor:
                 event_results = list(executor.map(_summarize_event_worker, event_ids))
             summary_wall_seconds = round(time.perf_counter() - summary_started, 4)
+            from .scope_finalize import finalize_ingest_scope
+            retrieval_finalize = finalize_ingest_scope(task_store, batch.get("scope_id"))
             with db_write_guard("ingest-batch-finish"):
                 task_store.finish_ingest_batch(batch_id)
             # 收尾后补该 scope 的视觉向量与 FTS：不补则新相册图片检索全空
@@ -631,6 +633,7 @@ def process_ingest_batch(asset_ids, batch_id):
                 "image_count": len(all_asset_ids), "event_count": len(event_ids),
                 "event_summary_call_count": len(event_results),
                 "event_summary_wall_seconds": summary_wall_seconds,
+                "retrieval_finalize": retrieval_finalize,
                 "event_summaries": event_results,
                 "failed_count": len(task_store._rows(
                     "SELECT id FROM assets WHERE batch_id = ? AND status = 'failed'", (batch_id,)
@@ -702,7 +705,7 @@ def _load_vllm_state(registry=None):
     if VLLM_API_URL:
         return _vllm_api("/state")
     registry = registry or _load_vllm_registry()
-    state_file = Path(registry.get("state_file") or "/home/asus/sentrix-vllm/state/current.json")
+    state_file = Path(registry.get("state_file") or "/home/realmagic/sentrix-vllm/state/current.json")
     return _read_json_file(state_file, None) if state_file.exists() else None
 
 
@@ -781,7 +784,7 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
     port = int(state.get("port") or profile.get("port") or registry.get("default_port") or 8100)
     served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
     with runtime_lock:
-        base_url = (state.get("external_url_hint") if state else None) or gamma.base_url
+        base_url = RUNTIME_VLLM_BASE_URL or (state.get("external_url_hint") if state else None) or gamma.base_url
         new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai", manager_url=RUNTIME_VLLM_API_URL or VLLM_API_URL)
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)

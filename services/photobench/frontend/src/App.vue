@@ -2373,7 +2373,7 @@ async function startRejudge() {
 async function loadCurrentModel({ openPopover = true } = {}) {
   const endpoint = modelEndpoint.value.trim();
   if (!endpoint) {
-    currentModelError.value = "请先填写模型服务地址，例如 192.168.0.153:8100";
+    currentModelError.value = "请先填写模型服务地址，例如 127.0.0.1:8100";
     return;
   }
   currentModelLoading.value = true;
@@ -2659,7 +2659,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
         <div class="config-group">
           <div class="config-group-head"><div><strong>评测服务</strong><span>配置 Sentrix 后端、Judge 评分服务及认证信息</span></div></div>
           <div class="config-grid config-grid-judge">
-        <label>Sentrix 后端<input v-model="sentrixUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.0.153:8091" />
+        <label>Sentrix 后端<input v-model="sentrixUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 127.0.0.1:8091" />
 </label>
        <label>Judge 服务<input v-model="judgeUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.1.65:1234/v1" />
 </label>
@@ -2677,7 +2677,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <div class="config-model-endpoint">
         <label>模型服务地址
           <div class="endpoint-line">
-          <input v-model="modelEndpoint" type="text" @input="onModelEndpointInput" placeholder="例如 192.168.0.153:8100 或 http://192.168.0.153:8100/v1" />
+          <input v-model="modelEndpoint" type="text" @input="onModelEndpointInput" placeholder="例如 127.0.0.1:8100 或 http://127.0.0.1:8100/v1" />
           <div class="current-model-control">
             <button class="current-model-trigger" type="button" :class="{ active: currentModelPopoverOpen }" :disabled="currentModelLoading" @click="currentModelInfo ? currentModelPopoverOpen = !currentModelPopoverOpen : loadCurrentModel()">
               <span class="current-model-icon">{{ currentModelLoading ? '…' : '↗' }}</span>
@@ -2705,7 +2705,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </div>
           <div class="config-model-manager">
             <label>模型管理器地址（可选）
-              <input v-model="vllmManagerUrl" type="text" @input="onModelManagerInput" @change="loadProfiles" placeholder="例如 192.168.0.153:8500；无管理器可留空" />
+              <input v-model="vllmManagerUrl" type="text" @input="onModelManagerInput" @change="loadProfiles" placeholder="例如 127.0.0.1:8500；无管理器可留空" />
               <span class="config-help">填写后从 Manager 的模型注册表自动扫描；留空时不显示普通模型选择。</span>
             </label>
             <button class="btn ghost compact model-registry-refresh" type="button" :disabled="!vllmManagerUrl.trim()" @click="loadProfiles">刷新模型注册表</button>

@@ -31,7 +31,7 @@ from pydantic import BaseModel
 ROOT = Path(__file__).resolve().parent.parent.parent
 MANAGER = Path(os.environ.get("SENTRIX_VLLM_MANAGER", str(ROOT / "services/vllm_manager/manager.py")))
 REGISTRY = Path(os.environ.get("SENTRIX_VLLM_REGISTRY", str(ROOT / "configs/sentrix_vllm_registry_192_168_0_153.json")))
-STATE_FILE_DEFAULT = "/home/asus/sentrix-vllm/state/current.json"
+STATE_FILE_DEFAULT = "/home/realmagic/sentrix-vllm/state/current.json"
 
 app = FastAPI(title="Sentrix vLLM Manager API", version="1.0.0")
 
