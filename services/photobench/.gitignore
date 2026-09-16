@@ -28,3 +28,4 @@ artifacts/*
 
 # Machine-local service endpoints; copy runtime_connection.example.json.
 config/runtime_connection.json
+config/vllm_targets.json

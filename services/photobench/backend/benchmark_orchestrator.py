@@ -306,12 +306,20 @@ if not DEFAULT_VLLM_BASE_URL and "model_base_url" not in RUNTIME_CONNECTION_CONF
     ).rstrip("/")
 
 
-def resolve_vllm_target(target_id: str | None) -> tuple[str, dict]:
-    selected = str(target_id or DEFAULT_VLLM_TARGET_ID)
+def resolve_vllm_target(target_id: str | None, *, manager_url: str = "", model_base_url: str = "") -> tuple[str, dict]:
+    selected = str(target_id or DEFAULT_VLLM_TARGET_ID).strip()
     target = VLLM_TARGETS.get(selected)
-    if not target:
-        raise ValueError(f"unknown vLLM target: {selected}")
-    return selected, target
+    if target:
+        return selected, target
+    if manager_url or model_base_url:
+        return selected or "external", {
+            "label": selected or "external",
+            "manager_url": manager_url,
+            "model_base_url": model_base_url,
+            "description": "ad-hoc endpoint from the evaluation form",
+        }
+    known = ", ".join(sorted(VLLM_TARGETS)) or "(none)"
+    raise ValueError(f"unknown vLLM target: {selected or DEFAULT_VLLM_TARGET_ID}; known: {known}")
 
 
 def normalize_model_base_url(value: str | None) -> str:
@@ -7034,9 +7042,13 @@ class OrchestratorRepository:
         if managed_models and not vllm_manager_url:
             raise ValueError("选择模型注册表中的模型时必须提供模型管理器地址")
         if managed_models:
-            target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
-            vllm_api_url = vllm_manager_url or str(target["manager_url"])
-            vllm_model_base_url = model_base_url or str(target["model_base_url"])
+            target_id, target = resolve_vllm_target(
+                payload.get("vllm_target_id"),
+                manager_url=vllm_manager_url,
+                model_base_url=model_base_url,
+            )
+            vllm_api_url = vllm_manager_url or str(target.get("manager_url") or "")
+            vllm_model_base_url = model_base_url or str(target.get("model_base_url") or "")
         else:
             target_id = ""
             vllm_api_url = ""
