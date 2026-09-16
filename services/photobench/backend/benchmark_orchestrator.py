@@ -2025,9 +2025,32 @@ class BenchmarkRun:
                 value = sample.get(key)
                 if isinstance(value, (int, float)):
                     phase_peak[key] = max(float(phase_peak.get(key, value)), float(value))
+            self._refresh_gpu_metrics_phase()
             # Debounced persistence prevents one disk write per sample while
             # still making the latest values visible to the next API poll.
             self.persist()
+
+    def _refresh_gpu_metrics_phase(self) -> None:
+        """Publish a rolling aggregate so the GPU card is live, not end-of-run only."""
+        existing = (self.state.get("phases") or {}).get("gpu_metrics") or {}
+        if existing.get("status") in {"done", "skipped"}:
+            return
+        now = time.monotonic()
+        if now - float(getattr(self, "_gpu_metrics_publish_at", 0.0) or 0.0) < 2.0:
+            return
+        if not self._gpu_sampler.samples:
+            return
+        self._gpu_metrics_publish_at = now
+        partial = self._gpu_sampler.aggregate()
+        if not partial.get("samples_count"):
+            return
+        partial.update({
+            "status": "running",
+            "partial": True,
+            "started_at": existing.get("started_at") or now_iso(),
+            "updated_at": now_iso(),
+        })
+        self.state.setdefault("phases", {})["gpu_metrics"] = partial
 
     def cancel(self, source: str = "api"):
         self._cancel.set()
@@ -4328,6 +4351,7 @@ class BenchmarkRun:
             self._phase_done("gpu_metrics", {"status": "skipped", "source": "external", "reason": "remote_endpoint_has_no_local_telemetry"})
             return
         agg = self._gpu_sampler.aggregate()
+        agg["partial"] = False
         self._phase_done("gpu_metrics", agg)
 
     def _phase_aggregate(self):
@@ -7214,6 +7238,17 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                    "evidence_judge_enabled": EVIDENCE_JUDGE_ENABLED,
                    "judge_providers": _public_judge_providers(JUDGE_PROVIDERS),
                    "default_judge_provider_id": DEFAULT_JUDGE_PROVIDER_ID,
+                   "cloud_model_profile": {
+                       "id": BIG_MODEL_PROFILE_ID,
+                       "label": "big_model（云端 API）",
+                       "source": "cloud_api",
+                       "available": BIG_MODEL_ENABLED,
+                       "base_url": BIG_MODEL_BASE_URL,
+                       "model": BIG_MODEL_MODEL,
+                       "manager_required": False,
+                       "local_token_preflight": False,
+                       "local_gpu_metrics": False,
+                   },
                 })
                 return
             if parsed.path == "/api/arbiter-status":

@@ -14,6 +14,10 @@ const EXECUTION_PHASES = [
 const config = ref(null);
 const manifests = ref([]);
 const profiles = ref([]);
+const cloudModelProfile = computed(() => config.value?.cloud_model_profile || {
+  id: "big_model", label: "big_model（云端 API）", source: "cloud_api",
+  available: true, model: "deepseek-v4.1-flash",
+});
 const vllmTargets = ref({});
 const runs = ref([]);
 const runPage = ref({ page: 1, page_size: 20, total: 0, pages: 1, has_previous: false, has_next: false, active_count: 0 });
@@ -832,6 +836,59 @@ function gpuMetricRows(phase = {}) {
     ["GPU 功耗", fmtNumber(power.mean, "W"), `峰值 ${fmtNumber(power.peak, "W")} · P95 ${fmtNumber(power.p95, "W")}`],
     ["SM 时钟", fmtNumber(clock.mean, "MHz"), `峰值 ${fmtNumber(clock.peak, "MHz")} · P95 ${fmtNumber(clock.p95, "MHz")}`],
   ];
+}
+function gpuMetricsView(run) {
+  const phase = run?.phases?.gpu_metrics || {};
+  const live = telemetryLiveState(run);
+  const history = telemetryHistory(run);
+  const finished = ["completed", "completed_with_errors", "failed", "cancelled", "interrupted"].includes(run?.status);
+  if (phase.status === "done" || phase.status === "skipped" || (phase.samples_count && !phase.partial)) {
+    return { ...phase, partial: false };
+  }
+  if (phase.samples_count) {
+    return {
+      ...phase,
+      status: finished ? (phase.status || "partial") : "running",
+      partial: !finished,
+    };
+  }
+  if (!history.length && !live.samples_count) return phase;
+  const stats = (key) => {
+    const values = history.map((item) => Number(item?.[key])).filter((value) => Number.isFinite(value));
+    if (!values.length) {
+      const latest = live.latest?.[key];
+      const peak = live.peak?.[key];
+      if (latest == null && peak == null) return {};
+      const value = Number(latest ?? peak);
+      return { mean: value, peak: Number(peak ?? value), p95: Number(peak ?? value) };
+    }
+    const sorted = [...values].sort((left, right) => left - right);
+    const count = sorted.length;
+    return {
+      peak: sorted[count - 1],
+      mean: values.reduce((sum, value) => sum + value, 0) / count,
+      p95: count >= 20 ? sorted[Math.floor(count * 0.95)] : sorted[count - 1],
+    };
+  };
+  return {
+    status: finished ? "partial" : "running",
+    partial: !finished,
+    source: live.source || run?.telemetry_source || phase.source,
+    samples_count: live.samples_count || history.length,
+    temperature_c: stats("temperature_c"),
+    gpu_utilization_pct: stats("gpu_utilization_pct"),
+    memory_used_mib: stats("memory_used_mib"),
+    model_process_memory_used_mib: stats("model_process_memory_used_mib"),
+    kv_cache_usage_pct: stats("kv_cache_usage_pct"),
+    kv_cache_used_tokens: stats("kv_cache_used_tokens"),
+    power_draw_w: stats("power_draw_w"),
+    sm_clock_mhz: stats("sm_clock_mhz"),
+  };
+}
+function gpuMetricsStatusLabel(run) {
+  const phase = gpuMetricsView(run);
+  if (phase.partial && phase.status === "running") return "实时更新中";
+  return statusLabel(resultPhaseStatus(phase));
 }
 function liveTelemetryRows(run) {
   const live = run?.telemetry_live || {};
@@ -2326,9 +2383,10 @@ function onModeChange() {
 }
 const startDisabledReason = computed(() => {
   if (hasRunning.value || suiteRunning.value) return "已有任务运行中";
-  if (!modelEndpoint.value.trim()) return "请先填写模型服务地址";
   if (!selectedModels.size) return "请先选择模型";
-  if ([...selectedModels].some((modelId) => modelId !== "__current__") && !vllmManagerUrl.value.trim()) return "选择注册表模型需要模型管理器地址";
+  const cloudOnly = [...selectedModels].every((modelId) => modelId === "big_model");
+  if (!cloudOnly && !modelEndpoint.value.trim()) return "请先填写模型服务地址";
+  if ([...selectedModels].some((modelId) => !["__current__", "big_model"].includes(modelId)) && !vllmManagerUrl.value.trim()) return "选择注册表模型需要模型管理器地址";
   if (selectedModels.has("__current__") && !selectedEndpointModel.value) return "请先从模型服务中选择要复用的模型";
   if (runMode.value === "reuse" && !existingScopeId.value) return "请先选择要复用的相册";
   return "";
@@ -2723,6 +2781,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ selectedEndpointModel }}，不启停）</span>
             </label>
           </div>
+          <div class="model-picker cloud-model-picker">
+            <span class="field-label">云端模型</span>
+            <label class="check" :class="{ active: selectedModels.has(cloudModelProfile.id) }">
+              <input type="checkbox" :checked="selectedModels.has(cloudModelProfile.id)" :disabled="cloudModelProfile.available === false" @change="setModelSelected(cloudModelProfile.id, $event.target.checked)" />{{ cloudModelProfile.label || cloudModelProfile.id }}<span>（{{ cloudModelProfile.model }}）</span>
+            </label>
+            <span class="config-help">云端 API 直连；不启动/切换本地 Manager，不执行本地 token 预检和 GPU 指标采样。</span>
+          </div>
           <div v-if="vllmManagerUrl.trim()" class="model-picker">
 <span class="field-label">模型注册表（可多选，串行测试）</span>
 <label v-for="profile in profiles" :key="profile.id" class="check" :class="{ active: selectedModels.has(profile.id) }">
@@ -3058,11 +3123,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
         <article class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
 <b>GPU 指标</b>
-<span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.gpu_metrics)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.gpu_metrics)) }}</span>
+<span class="phase-status" :class="resultPhaseStatus(gpuMetricsView(activeRun))">{{ gpuMetricsStatusLabel(activeRun) }}</span>
 </div>
-<p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics)) }} · {{ ['orin_ssh_pss', 'jetson_local_pss'].includes(activeRun.phases?.gpu_metrics?.source) ? 'Orin：进程 PSS 是统一物理内存峰值，不是独立显存；工作负载内存和 KV 实际用量未拆分' : activeRun.phases?.gpu_metrics?.memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
+<p class="metric-calc-time">{{ gpuMetricsView(activeRun).partial ? '已按当前已采样数据滚动汇总；全部阶段结束后更新为全程均值/峰值。' : ('指标计算耗时 ' + fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics))) }} · {{ ['orin_ssh_pss', 'jetson_local_pss'].includes(gpuMetricsView(activeRun).source) ? 'Orin：进程 PSS 是统一物理内存峰值，不是独立显存；工作负载内存和 KV 实际用量未拆分' : gpuMetricsView(activeRun).memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
 <div class="phase-metrics">
-<div v-for="row in gpuMetricRows(activeRun.phases?.gpu_metrics)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<div v-for="row in gpuMetricRows(gpuMetricsView(activeRun))" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
 <strong>{{ row[1] }}</strong>
 <small>{{ row[2] }}</small>
