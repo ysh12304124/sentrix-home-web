@@ -298,6 +298,16 @@ class PlatformProfile:
         为什么必须留痕：46 上曾经因为一个变量缺失而静默换掉了整条视频链路，
         排查花了很久。把实际生效的能力打出来，这类问题一眼可见。
         """
+        if not log.handlers:
+            # 后端没有配置 logging，`sentrix.*` 的 INFO 会被 Python 的 lastResort
+            # 处理器（只收 WARNING 以上）丢掉 —— 实测启动日志里一行都看不到。
+            # 这条摘要存在的意义就是"必须可见"，所以给本模块挂一个专属 handler；
+            # propagate=False 避免将来 root logger 配好后重复输出。
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+            log.addHandler(handler)
+            log.setLevel(logging.INFO)
+            log.propagate = False
         for key, value in self.summary().items():
             log.info("platform_profile %s = %s", key, value)
 
