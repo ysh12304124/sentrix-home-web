@@ -14,6 +14,7 @@ from ..db import MemoryStore, make_id
 from ..geocoding import format_gps_prefix
 from .metadata import probe_video_metadata
 from .worldmm_adapter import WorldMMAdapter
+from ..platform_profile import profile
 
 
 def _captured_at(value, offset=0.0):
@@ -77,7 +78,7 @@ class VideoMemoryAdapter:
     def _keyframe_algorithm(self):
         return str(
             self.keyframe_algorithm
-            or os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm")
+            or profile.video_keyframe_algorithm()
         ).strip().lower()
 
     def process(self, asset, pipeline):
@@ -220,7 +221,7 @@ class VideoMemoryAdapter:
                 "worldmm_selected_keyframe_count": result.selected_keyframe_count,
                 "video_scene_event_ids": scene_ids,
                 "derived_keyframe_asset_ids": keyframe_asset_ids, "video_processing_seconds": elapsed,
-                "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "cpu"),
+                "worldmm_device": profile.video_device(),
                 "vlm_device": os.getenv("SENTRIX_QWEN3_VL_DEVICE", "cpu"),
                 "error_stage": None, "error": None, "retryable": True,
             })
@@ -431,6 +432,6 @@ class VideoMemoryAdapter:
             "event_vlm_seconds": round(event_vlm_seconds, 3),
             "transient_vlm_frame_count": transient_vlm_frame_count,
             "persistent_keyframe_count": len(keyframe_asset_ids),
-            "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "0"), "vlm_device": "per-keyframe-pipeline",
+            "worldmm_device": profile.video_device(), "vlm_device": "per-keyframe-pipeline",
             "error_stage": None, "error": None, "retryable": True,
         })

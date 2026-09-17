@@ -45,9 +45,71 @@ class PhaseDToolsTest(unittest.TestCase):
         texts = " ".join(i["text"] for c in out["cards"] for i in c["items"])
         self.assertIn("丈夫", texts)
 
+    def test_query_memory_facts_counts_only_current_scope(self):
+        self.store.create_asset("current-image", "current.jpg", "image", "/x/current.jpg",
+                                metadata={"captured_at": "2025-01-03T10:00:00"}, scope_id="album3-v2")
+        self.store.create_asset("current-keyframe", "frame.jpg", "image", "/x/frame.jpg",
+                                metadata={"derived_kind": "video_keyframe"}, scope_id="album3-v2")
+        self.store.create_asset("other-image", "other.jpg", "image", "/x/other.jpg",
+                                metadata={"captured_at": "2025-01-03T10:00:00"}, scope_id="other-album")
+
+        out = runtime_tools._query_memory_facts(
+            {"operation": "count", "subject": "asset", "filters": {"media": "image"}},
+            context={"scope_id": "album3-v2", "viewer_id": "owner"},
+        )
+
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["fact_type"], "asset_count")
+        self.assertEqual(out["value"], 1)
+        self.assertEqual(out["unit"], "original_image")
+        self.assertTrue(out["coverage"]["complete"])
+        self.assertEqual(out["filters_applied"]["scope_id"], "album3-v2")
+
+    def test_query_memory_facts_rejects_visual_filter(self):
+        out = runtime_tools._query_memory_facts(
+            {"operation": "count", "subject": "asset", "filters": {"color": "红色"}},
+            context={"scope_id": "album3-v2", "viewer_id": "owner"},
+        )
+
+        self.assertEqual(out["status"], "unsupported_filter")
+        self.assertIsNone(out["value"])
+        self.assertFalse(out["coverage"]["complete"])
+
+    def test_query_memory_facts_ignores_group_by_for_non_group_operation(self):
+        self.store.create_asset("image", "image.jpg", "image", "/x/image.jpg", scope_id="album3-v2")
+
+        out = runtime_tools._query_memory_facts(
+            {"operation": "count", "subject": "asset", "group_by": "month", "filters": {"media": "image"}},
+            context={"scope_id": "album3-v2", "viewer_id": "owner"},
+        )
+
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["value"], 1)
+
+    def test_query_memory_facts_groups_original_processing_status(self):
+        self.store.create_asset("completed", "completed.jpg", "image", "/x/completed.jpg",
+                                scope_id="album3-v2")
+        self.store.create_asset("failed", "failed.mp4", "video", "/x/failed.mp4",
+                                scope_id="album3-v2")
+        self.store.create_asset("derived", "derived.jpg", "image", "/x/derived.jpg",
+                                metadata={"derived_kind": "video_keyframe"}, scope_id="album3-v2")
+        self.store.update_asset("completed", "completed")
+        self.store.update_asset("failed", "failed")
+
+        out = runtime_tools._query_memory_facts(
+            {"operation": "group", "subject": "processing", "group_by": "status", "filters": {}},
+            context={"scope_id": "album3-v2", "viewer_id": "owner"},
+        )
+
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["fact_type"], "processing_group")
+        self.assertEqual({row["group"]: row["count"] for row in out["rows"]},
+                         {"completed": 1, "failed": 1})
+        self.assertEqual(out["total"], 2)
+
     def test_get_person_memory_limited_unknown(self):
-        out = runtime_tools._get_person_memory({"person": "不存在的人"},
-                                               context={"scope_id": "album3-v2"})
+        out = runtime_tools._get_person_profile({"person": "不存在的人"},
+                                                context={"scope_id": "album3-v2"})
         self.assertEqual(out["readiness"], "limited")
         self.assertTrue(out.get("insufficient_evidence"))
 

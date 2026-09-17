@@ -23,6 +23,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# 把本目录放进 sys.path：decode_strategy / extract_keyframes 是同目录模块，
+# 但本文件既会被直接运行、也会被 run_yolo_prefilter_event_webp 导入、还会被
+# 测试用 importlib 加载 —— 只有直接运行时脚本目录才自动在 sys.path 上。
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from decode_strategy import detect_codec, select_strategy  # noqa: E402
+
 
 def _value(item, key, default=None):
     return item.get(key, default) if isinstance(item, dict) else getattr(item, key, default)
@@ -328,18 +337,22 @@ def select_unstable_segments(segments, percentile=75.0):
 def _decode_one_target(video, frame_index, fps, width, height):
     timestamp = max(0.0, float(frame_index) / max(float(fps), 0.1))
     frame_bytes = int(width) * int(height) * 3
+    # 解码路径按这台机器实测的能力选：Jetson 走 nvv4l2dec，x86+NVIDIA 走
+    # -hwaccel cuda（帧在显存，需 hwdownload 取回），无 GPU 直接软解。
+    # 写死任何一条都会让另外一台失败——46/118 的 ffmpeg 根本没有 cuda hwaccel。
+    strategy = select_strategy(detect_codec(video))
     gpu_command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-ss", f"{timestamp:.6f}",
-        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        *strategy.input_args,
         "-i", str(video), "-an", "-frames:v", "1",
-        "-vf", "hwdownload,format=nv12,format=bgr24",
+        "-vf", f"{strategy.vf_prefix}format=bgr24",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]
     gpu_result = subprocess.run(gpu_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if gpu_result.returncode == 0 and len(gpu_result.stdout) >= frame_bytes:
         frame = np.frombuffer(gpu_result.stdout[:frame_bytes], dtype=np.uint8).reshape((height, width, 3)).copy()
-        return int(frame_index), frame, "nvdec"
+        return int(frame_index), frame, strategy.name
 
     # vLLM can leave too little VRAM for a new NVDEC CUDA context even though
     # the coarse video analysis already succeeded. Preserve the GPU fast path,

@@ -699,6 +699,86 @@ class MemoryStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS family_person_memberships (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL REFERENCES entities(id),
+                membership TEXT NOT NULL,
+                source TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                inference_run_id TEXT,
+                state TEXT NOT NULL DEFAULT 'effective',
+                locked INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1,
+                supersedes_id TEXT REFERENCES family_person_memberships(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_membership_effective
+                ON family_person_memberships(scope_id, entity_id, state);
+            CREATE TABLE IF NOT EXISTS family_relationships (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                family_graph_id TEXT,
+                subject_entity_id TEXT NOT NULL REFERENCES entities(id),
+                predicate TEXT NOT NULL,
+                object_entity_id TEXT NOT NULL REFERENCES entities(id),
+                inverse_predicate TEXT NOT NULL,
+                source TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                inference_run_id TEXT,
+                state TEXT NOT NULL DEFAULT 'effective',
+                locked INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 1,
+                supersedes_id TEXT REFERENCES family_relationships(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_relationship_effective
+                ON family_relationships(scope_id, subject_entity_id, object_entity_id, state);
+            CREATE TABLE IF NOT EXISTS family_relationship_blocks (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                left_entity_id TEXT NOT NULL REFERENCES entities(id),
+                right_entity_id TEXT NOT NULL REFERENCES entities(id),
+                source TEXT NOT NULL,
+                locked INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(scope_id, left_entity_id, right_entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_relationship_blocks_pair
+                ON family_relationship_blocks(scope_id, left_entity_id, right_entity_id);
+            CREATE TABLE IF NOT EXISTS family_analysis_runs (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES memory_spaces(id),
+                status TEXT NOT NULL DEFAULT 'queued',
+                current_stage TEXT NOT NULL DEFAULT 'queued',
+                config_json TEXT NOT NULL DEFAULT '{}',
+                stats_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_analysis_runs_scope
+                ON family_analysis_runs(scope_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS family_person_portraits (
+                id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, entity_id TEXT NOT NULL REFERENCES entities(id),
+                portrait_text TEXT NOT NULL, evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                source TEXT NOT NULL, inference_run_id TEXT, state TEXT NOT NULL DEFAULT 'effective',
+                locked INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_portrait_active
+                ON family_person_portraits(scope_id, entity_id, state);
+            CREATE TABLE IF NOT EXISTS family_scope_groups (
+                scope_id TEXT PRIMARY KEY REFERENCES memory_spaces(id), graph_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'user_override', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_family_scope_groups_graph ON family_scope_groups(graph_id);
             CREATE TABLE IF NOT EXISTS memory_vectors (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL DEFAULT 'home-default',
@@ -1490,7 +1570,16 @@ class MemoryStore:
     def complete_ingest_batch(self, batch_id):
         timestamp = now_iso()
         self.connection.execute(
-            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'summarizing', 'cancelled') THEN status ELSE 'complete' END,
+            # 'summarizing' 刻意不在这里保留：它是个单向死结。收尾接口原本保留它，
+            # 而 claim_ingest_batch_summary 又要求 status=='complete' 才肯认领
+            # （且只做 complete→summarizing 的单向迁移），finish_ingest_batch 则要求
+            # status=='summarizing'。于是只要进程在 summarize 途中退出（OOM / 重启 /
+            # 部署），批次就永远停在 'summarizing'：认领不了、也复位不了，
+            # finish_ingest_batch 以及挂在其后的 scope_finalize 与 ANN 索引重建钩子
+            # 永不执行 —— 表现为相册建好了但**检索全空，且无任何告警**。
+            # 复位成 'complete' 后，再次调用收尾接口即可重跑尾部（此时资产均已处理完，
+            # 不会重跑管线）。
+            """UPDATE ingest_batches SET status = CASE WHEN status IN ('completed', 'cancelled') THEN status ELSE 'complete' END,
             updated_at = ?, completed_at = COALESCE(completed_at, ?) WHERE id = ?""",
             (timestamp, timestamp, str(batch_id)),
         )
@@ -2756,12 +2845,19 @@ class MemoryStore:
             return None
         memory = self.get_person_memory(person_id, scope_id)
         profile = memory.get("profile") or {}
+        scope = scope_id or entity.get("scope_id") or "home-default"
+        membership = self.get_effective_family_membership(scope, person_id)
+        family_portrait = self.get_active_family_portrait(scope, person_id)
         relationships = []
-        for rel in self.list_person_relationships(scope_id):
-            if rel.get("subject_entity_id") == person_id:
-                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("object_name"), "id": rel.get("id"), "status": rel.get("status")})
-            elif rel.get("object_entity_id") == person_id:
-                relationships.append({"predicate": rel.get("predicate"), "other_name": rel.get("subject_name"), "id": rel.get("id"), "status": rel.get("status")})
+        for rel in self.list_effective_family_relationships(scope):
+            if rel.get("subject_entity_id") != person_id:
+                continue
+            other = self.get_entity(rel.get("object_entity_id")) or {}
+            relationships.append({
+                "predicate": rel.get("predicate"),
+                "other_name": other.get("canonical_name") or "未命名成员",
+                "source": rel.get("source"),
+            })
         pattern_groups = {}
         for pattern in memory.get("patterns") or []:
             pattern_groups.setdefault(pattern.get("pattern_type"), []).append(
@@ -2778,9 +2874,10 @@ class MemoryStore:
         claims_top = [{"dimension": c.get("dimension"), "predicate": c.get("predicate"), "value": c.get("value_text"), "confidence": c.get("confidence")} for c in claims[:12]]
         return {
             "person": entity.get("canonical_name"),
-            "family_role": entity.get("family_role") or "",
+            "membership": (membership or {}).get("membership") or "unknown",
+            "membership_source": (membership or {}).get("source") or "",
             "status": entity.get("status"),
-            "summary_zh": profile.get("summary_zh") or "",
+            "summary_zh": (family_portrait or {}).get("portrait_text") or profile.get("summary_zh") or "",
             "preference_summary_zh": profile.get("preference_summary_zh") or "",
             "activity_summary_zh": profile.get("activity_summary_zh") or "",
             "place_summary_zh": profile.get("place_summary_zh") or "",
@@ -5516,6 +5613,339 @@ class MemoryStore:
         self.connection.execute("UPDATE relationships SET status = 'retracted', updated_at = ?, revision = revision + 1 WHERE id = ?", (now_iso(), relationship_id))
         self.connection.commit()
         return self._row("SELECT * FROM relationships WHERE id = ?", (relationship_id,))
+
+    _FAMILY_MEMBERSHIPS = {"family", "friend", "unknown"}
+    _FAMILY_SOURCES = {"model", "user_override"}
+
+    def _family_entity(self, scope_id, entity_id):
+        entity = self.get_entity(entity_id)
+        if not entity or entity.get("entity_type") != "person":
+            raise ValueError("family graph requires a person entity")
+        if (entity.get("scope_id") or "home-default") != (scope_id or "home-default"):
+            raise ValueError("family graph entities must belong to the same memory space")
+        return entity
+
+    def _decode_family_row(self, row):
+        return self._decode(row, ["evidence_refs_json"]) if row else None
+
+    def get_effective_family_membership(self, scope_id, entity_id):
+        row = self._row(
+            """SELECT * FROM family_person_memberships
+            WHERE scope_id = ? AND entity_id = ? AND state = 'effective'
+            ORDER BY locked DESC, revision DESC, updated_at DESC LIMIT 1""",
+            (scope_id, entity_id),
+        )
+        return self._decode_family_row(row)
+
+    def list_effective_family_memberships(self, scope_id):
+        rows = self._rows(
+            """SELECT * FROM family_person_memberships
+            WHERE scope_id = ? AND state = 'effective'
+            ORDER BY locked DESC, updated_at DESC""",
+            (scope_id,),
+        )
+        return [self._decode_family_row(row) for row in rows]
+
+    def family_graph_people(self, scope_ids):
+        """Return the small, render-ready person projection for the family graph."""
+        people = []
+        for scope_id in scope_ids:
+            for entity in self.list_entities(scope_id=scope_id):
+                if entity.get("entity_type") != "person":
+                    continue
+                avatar = self._row(
+                    """SELECT fi.id FROM face_instances fi
+                    JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    WHERE fc.entity_id = ? AND fc.status != 'rejected'
+                    ORDER BY fi.quality DESC, fi.detection_confidence DESC, fi.created_at ASC LIMIT 1""",
+                    (entity["id"],),
+                )
+                media = self._rows(
+                    """SELECT DISTINCT a.id, a.media_type, a.file_name
+                    FROM face_instances fi
+                    JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    JOIN assets a ON a.id = fi.asset_id
+                    WHERE fc.entity_id = ? AND fc.status != 'rejected'
+                    ORDER BY a.id DESC LIMIT 3""",
+                    (entity["id"],),
+                )
+                appearance_count = self._row(
+                    """SELECT COUNT(*) AS count FROM face_instances fi
+                    JOIN face_clusters fc ON fc.id = fi.cluster_id
+                    WHERE fc.entity_id = ? AND fc.status != 'rejected'""",
+                    (entity["id"],),
+                )
+                people.append({
+                    "id": entity["id"],
+                    "scope_id": scope_id,
+                    "display_name": "待命名人物" if entity.get("status") == "pending" else (entity.get("canonical_name") or "待命名人物"),
+                    "membership": self.get_effective_family_membership(scope_id, entity["id"]),
+                    "portrait": self.get_active_family_portrait(scope_id, entity["id"]),
+                    "avatar_face_instance_id": avatar["id"] if avatar else None,
+                    "appearance_count": int((appearance_count or {}).get("count") or 0),
+                    "representative_media": [dict(row) for row in media],
+                })
+        return people
+
+    def set_family_membership(self, scope_id, entity_id, membership, *, source,
+                              confidence=0.0, evidence_refs=None, inference_run_id=None):
+        scope_id = scope_id or "home-default"
+        membership = str(membership or "").strip()
+        if membership not in self._FAMILY_MEMBERSHIPS:
+            raise ValueError("unsupported family membership")
+        if source not in self._FAMILY_SOURCES:
+            raise ValueError("unsupported family membership source")
+        self._family_entity(scope_id, entity_id)
+        current = self.get_effective_family_membership(scope_id, entity_id)
+        if source == "model" and current and current.get("locked"):
+            return current
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                "UPDATE family_person_memberships SET state = 'superseded', updated_at = ? WHERE id = ?",
+                (timestamp, current["id"]),
+            )
+        record_id = make_id("family_membership")
+        self.connection.execute(
+            """INSERT INTO family_person_memberships(
+                id, scope_id, entity_id, membership, source, confidence,
+                evidence_refs_json, inference_run_id, state, locked, revision,
+                supersedes_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'effective', ?, 1, ?, ?, ?)""",
+            (
+                record_id, scope_id, entity_id, membership, source, float(confidence or 0),
+                json_value(list(dict.fromkeys(evidence_refs or [])), []), inference_run_id,
+                1 if source == "user_override" else 0, current["id"] if current else None,
+                timestamp, timestamp,
+            ),
+        )
+        self.connection.commit()
+        return self._decode_family_row(self._row("SELECT * FROM family_person_memberships WHERE id = ?", (record_id,)))
+
+    def _effective_family_pair(self, scope_id, subject_entity_id, object_entity_id):
+        rows = self._rows(
+            """SELECT * FROM family_relationships
+            WHERE scope_id = ? AND state = 'effective' AND (
+                (subject_entity_id = ? AND object_entity_id = ?)
+                OR (subject_entity_id = ? AND object_entity_id = ?)
+            ) ORDER BY locked DESC, revision DESC, updated_at DESC""",
+            (scope_id, subject_entity_id, object_entity_id, object_entity_id, subject_entity_id),
+        )
+        return [self._decode_family_row(row) for row in rows]
+
+    @staticmethod
+    def _family_pair_key(subject_entity_id, object_entity_id):
+        return tuple(sorted((subject_entity_id, object_entity_id)))
+
+    def _family_relationship_block(self, scope_id, subject_entity_id, object_entity_id):
+        left_entity_id, right_entity_id = self._family_pair_key(subject_entity_id, object_entity_id)
+        return self._row(
+            """SELECT * FROM family_relationship_blocks
+            WHERE scope_id = ? AND left_entity_id = ? AND right_entity_id = ?""",
+            (scope_id, left_entity_id, right_entity_id),
+        )
+
+    def retract_family_relationship(self, scope_id, subject_entity_id, object_entity_id):
+        """Retract a pair without erasing history and keep model inference from restoring it."""
+        scope_id = scope_id or "home-default"
+        self._family_entity(scope_id, subject_entity_id)
+        self._family_entity(scope_id, object_entity_id)
+        current = self._effective_family_pair(scope_id, subject_entity_id, object_entity_id)
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                """UPDATE family_relationships SET state = 'retracted', updated_at = ?
+                WHERE scope_id = ? AND state = 'effective' AND (
+                    (subject_entity_id = ? AND object_entity_id = ?)
+                    OR (subject_entity_id = ? AND object_entity_id = ?)
+                )""",
+                (timestamp, scope_id, subject_entity_id, object_entity_id, object_entity_id, subject_entity_id),
+            )
+        left_entity_id, right_entity_id = self._family_pair_key(subject_entity_id, object_entity_id)
+        block = self._family_relationship_block(scope_id, subject_entity_id, object_entity_id)
+        if block:
+            self.connection.execute(
+                "UPDATE family_relationship_blocks SET source = 'user_override', locked = 1, updated_at = ? WHERE id = ?",
+                (timestamp, block["id"]),
+            )
+        else:
+            self.connection.execute(
+                """INSERT INTO family_relationship_blocks(
+                    id, scope_id, left_entity_id, right_entity_id, source, locked, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'user_override', 1, ?, ?)""",
+                (make_id("family_rel_block"), scope_id, left_entity_id, right_entity_id, timestamp, timestamp),
+            )
+        self.connection.commit()
+        return [self._decode_family_row(self._row("SELECT * FROM family_relationships WHERE id = ?", (row["id"],)))
+                for row in current]
+
+    def supersede_model_family_relationships(self, scope_id):
+        """Clear prior model edges before a fresh inference; user edges remain authoritative."""
+        timestamp = now_iso()
+        self.connection.execute(
+            """UPDATE family_relationships SET state = 'superseded', updated_at = ?
+            WHERE scope_id = ? AND state = 'effective' AND source = 'model' AND locked = 0""",
+            (timestamp, scope_id),
+        )
+        self.connection.commit()
+
+    def list_effective_family_relationships(self, scope_id, entity_id=None):
+        if entity_id:
+            rows = self._rows(
+                """SELECT * FROM family_relationships
+                WHERE scope_id = ? AND state = 'effective'
+                AND (subject_entity_id = ? OR object_entity_id = ?)
+                ORDER BY locked DESC, updated_at DESC""",
+                (scope_id, entity_id, entity_id),
+            )
+        else:
+            rows = self._rows(
+                "SELECT * FROM family_relationships WHERE scope_id = ? AND state = 'effective' ORDER BY locked DESC, updated_at DESC",
+                (scope_id,),
+            )
+        return [self._decode_family_row(row) for row in rows]
+
+    def set_family_relationship(self, scope_id, subject_entity_id, predicate, object_entity_id,
+                                inverse_predicate, *, source, confidence=0.0,
+                                evidence_refs=None, inference_run_id=None):
+        scope_id = scope_id or "home-default"
+        if source not in self._FAMILY_SOURCES:
+            raise ValueError("unsupported family relationship source")
+        if subject_entity_id == object_entity_id:
+            raise ValueError("family relationship requires distinct people")
+        self._family_entity(scope_id, subject_entity_id)
+        self._family_entity(scope_id, object_entity_id)
+        predicate = str(predicate or "").strip()
+        inverse_predicate = str(inverse_predicate or "").strip()
+        if not predicate or not inverse_predicate:
+            raise ValueError("family relationship requires both predicates")
+        from .family_graph import validate_relationship_pair
+        validate_relationship_pair(predicate, inverse_predicate)
+        block = self._family_relationship_block(scope_id, subject_entity_id, object_entity_id)
+        if source == "model" and block and block["locked"]:
+            return []
+        if source == "user_override" and block:
+            self.connection.execute("DELETE FROM family_relationship_blocks WHERE id = ?", (block["id"],))
+        current = self._effective_family_pair(scope_id, subject_entity_id, object_entity_id)
+        if source == "model" and any(row.get("locked") for row in current):
+            return current
+        timestamp = now_iso()
+        if current:
+            self.connection.execute(
+                """UPDATE family_relationships SET state = 'superseded', updated_at = ?
+                WHERE scope_id = ? AND state = 'effective' AND (
+                    (subject_entity_id = ? AND object_entity_id = ?)
+                    OR (subject_entity_id = ? AND object_entity_id = ?)
+                )""",
+                (timestamp, scope_id, subject_entity_id, object_entity_id, object_entity_id, subject_entity_id),
+            )
+        refs = json_value(list(dict.fromkeys(evidence_refs or [])), [])
+        locked = 1 if source == "user_override" else 0
+        inserted = []
+        for left, rel, right, inverse in (
+            (subject_entity_id, predicate, object_entity_id, inverse_predicate),
+            (object_entity_id, inverse_predicate, subject_entity_id, predicate),
+        ):
+            record_id = make_id("family_rel")
+            self.connection.execute(
+                """INSERT INTO family_relationships(
+                    id, scope_id, family_graph_id, subject_entity_id, predicate,
+                    object_entity_id, inverse_predicate, source, confidence,
+                    evidence_refs_json, inference_run_id, state, locked, revision,
+                    supersedes_id, created_at, updated_at
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'effective', ?, 1, NULL, ?, ?)""",
+                (record_id, scope_id, left, rel, right, inverse, source,
+                 float(confidence or 0), refs, inference_run_id, locked, timestamp, timestamp),
+            )
+            inserted.append(record_id)
+        self.connection.commit()
+        return [self._decode_family_row(self._row("SELECT * FROM family_relationships WHERE id = ?", (record_id,)))
+                for record_id in inserted]
+
+    def create_family_analysis_run(self, scope_id, config):
+        run_id = make_id("family_run")
+        timestamp = now_iso()
+        self.connection.execute(
+            """INSERT INTO family_analysis_runs(
+                id, scope_id, status, current_stage, config_json, stats_json, created_at, updated_at
+            ) VALUES (?, ?, 'queued', 'queued', ?, '{}', ?, ?)""",
+            (run_id, scope_id, json_value(config, {}), timestamp, timestamp),
+        )
+        self.connection.commit()
+        return self.get_family_analysis_run(run_id)
+
+    def get_family_analysis_run(self, run_id):
+        row = self._row("SELECT * FROM family_analysis_runs WHERE id = ?", (run_id,))
+        if not row:
+            return None
+        row["config"] = json.loads(row.pop("config_json") or "{}")
+        row["stats"] = json.loads(row.pop("stats_json") or "{}")
+        return row
+
+    def latest_family_analysis_run(self, scope_id):
+        row = self._row(
+            "SELECT id FROM family_analysis_runs WHERE scope_id = ? ORDER BY created_at DESC LIMIT 1",
+            (scope_id,),
+        )
+        return self.get_family_analysis_run(row["id"]) if row else None
+
+    def update_family_analysis_run(self, run_id, *, status=None, stage=None, stats=None, error=None):
+        fields = {"updated_at": now_iso()}
+        if status is not None:
+            fields["status"] = status
+        if stage is not None:
+            fields["current_stage"] = stage
+        if stats is not None:
+            fields["stats_json"] = json_value(stats, {})
+        if error is not None:
+            fields["error"] = error
+        if status == "completed":
+            fields["completed_at"] = now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        self.connection.execute(
+            f"UPDATE family_analysis_runs SET {assignments} WHERE id = ?",
+            (*fields.values(), run_id),
+        )
+        self.connection.commit()
+        return self.get_family_analysis_run(run_id)
+
+    def get_active_family_portrait(self, scope_id, entity_id):
+        row = self._row("SELECT * FROM family_person_portraits WHERE scope_id = ? AND entity_id = ? AND state = 'effective' ORDER BY created_at DESC LIMIT 1", (scope_id, entity_id))
+        return self._decode_family_row(row)
+
+    def write_family_portrait(self, scope_id, entity_id, portrait_text, *, source, evidence_refs=None, inference_run_id=None):
+        current = self.get_active_family_portrait(scope_id, entity_id)
+        if source == "model" and current and current.get("locked"):
+            return current
+        timestamp = now_iso()
+        if current:
+            self.connection.execute("UPDATE family_person_portraits SET state = 'superseded', updated_at = ? WHERE id = ?", (timestamp, current["id"]))
+        portrait_id = make_id("family_portrait")
+        self.connection.execute("""INSERT INTO family_person_portraits(id, scope_id, entity_id, portrait_text, evidence_refs_json, source, inference_run_id, state, locked, revision, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'effective', ?, 1, ?, ?)""", (portrait_id, scope_id, entity_id, str(portrait_text or "").strip(), json_value(evidence_refs or [], []), source, inference_run_id, 1 if source == "user_override" else 0, timestamp, timestamp))
+        self.connection.commit()
+        return self.get_active_family_portrait(scope_id, entity_id)
+
+    def merge_family_scopes(self, scope_ids):
+        scope_ids = list(dict.fromkeys(str(item) for item in scope_ids if item))
+        if len(scope_ids) < 2:
+            raise ValueError("at least two scopes are required")
+        for scope_id in scope_ids:
+            if not self._row("SELECT id FROM memory_spaces WHERE id = ?", (scope_id,)):
+                raise ValueError("unknown memory space")
+        existing = self._row("SELECT graph_id FROM family_scope_groups WHERE scope_id IN (%s) ORDER BY updated_at DESC LIMIT 1" % ",".join("?" * len(scope_ids)), scope_ids)
+        graph_id = (existing or {}).get("graph_id") or make_id("family_graph")
+        timestamp = now_iso()
+        for scope_id in scope_ids:
+            self.connection.execute("INSERT INTO family_scope_groups(scope_id, graph_id, source, created_at, updated_at) VALUES (?, ?, 'user_override', ?, ?) ON CONFLICT(scope_id) DO UPDATE SET graph_id = excluded.graph_id, updated_at = excluded.updated_at", (scope_id, graph_id, timestamp, timestamp))
+        self.connection.commit()
+        return {"graph_id": graph_id, "scope_ids": self.family_graph_scope_ids(scope_ids[0])}
+
+    def family_graph_scope_ids(self, scope_id):
+        row = self._row("SELECT graph_id FROM family_scope_groups WHERE scope_id = ?", (scope_id,))
+        if not row:
+            return [scope_id]
+        return [item["scope_id"] for item in self._rows("SELECT scope_id FROM family_scope_groups WHERE graph_id = ? ORDER BY scope_id", (row["graph_id"],))]
 
     def maintain_relationship_claim(self, relationship):
         """Write a user-confirmed relationship into the subject's semantic claims so

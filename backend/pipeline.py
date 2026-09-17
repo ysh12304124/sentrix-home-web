@@ -713,11 +713,45 @@ class IngestionPipeline:
             return batch
         for event_id in self.store.batch_event_ids(batch_id):
             self.summarize_event(event_id)
+        from .scope_finalize import finalize_ingest_scope
+        retrieval_finalize = finalize_ingest_scope(self.store, batch.get("scope_id"))
+        self.store.update_ingest_batch_metadata(batch_id, {"retrieval_finalize": retrieval_finalize})
         batch = self.store.finish_ingest_batch(batch_id)
         scope_id = (batch or {}).get("scope_id")
         if scope_id:
+            self._trigger_family_analysis(scope_id)
             self._maybe_trigger_person_insight(scope_id)
         return batch
+
+    def _trigger_family_analysis(self, scope_id):
+        """Run the new scope-local family graph after every changed ingest batch.
+
+        The worker receives only existing semantic descriptions and face/entity
+        bindings; it never receives source image files in this stage.
+        """
+        event_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE scope_id = ?", (scope_id,)
+        ).fetchone()[0]
+        latest = self.store.latest_family_analysis_run(scope_id)
+        watermark = int(((latest or {}).get("stats") or {}).get("event_watermark", 0))
+        if latest is not None and event_count <= watermark:
+            return None
+        run = self.store.create_family_analysis_run(scope_id, {
+            "trigger_type": "ingest",
+            "input_mode": "semantic_text_only",
+        })
+
+        def execute():
+            from .family_graph_service import FamilyGraphService
+
+            worker = MemoryStore(self.store.path)
+            try:
+                FamilyGraphService(worker, self.gamma).run(run["id"], scope_id)
+            finally:
+                worker.close()
+
+        threading.Thread(target=execute, daemon=True).start()
+        return run
 
     def _maybe_trigger_person_insight(self, scope_id):
         """Trigger an incremental person-insight run only for allowlisted scopes.

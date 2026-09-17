@@ -1,0 +1,9 @@
+{
+  "sentrix_url": "http://127.0.0.1:8091",
+  "judge_url": "",
+  "judge_model": "",
+  "vllm_manager_url": "",
+  "model_base_url": "http://127.0.0.1:8100/v1",
+  "endpoint_model": "",
+  "judge_provider_id": ""
+}

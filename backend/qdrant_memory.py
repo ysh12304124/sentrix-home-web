@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from .platform_profile import profile
 
 try:
     import fcntl
@@ -68,7 +69,7 @@ _LOCK_FILENAME = ".sentrix-qdrant.lock"
 
 
 def _enabled() -> bool:
-    return os.getenv("SENTRIX_VECTOR_BACKEND", "sqlite").strip().lower() == "qdrant"
+    return profile.vector_backend() == "qdrant"
 
 
 def _safe(value: str, limit: int = 18) -> str:
