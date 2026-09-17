@@ -61,6 +61,21 @@ def is_jetson() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def qdrant_client_available() -> bool:
+    """能不能用 embedded qdrant。
+
+    153 用的就是 embedded 模式（`QdrantClient(path=...)`），不需要独立服务端；
+    所以只要装了 qdrant-client 就能用。没装则回落 sqlite（hnswlib 派生索引）。
+    """
+    try:
+        import qdrant_client  # noqa: F401
+    except ImportError:
+        log.warning("未安装 qdrant-client，向量后端回落 sqlite（hnswlib 派生索引）")
+        return False
+    return True
+
+
+@functools.lru_cache(maxsize=1)
 def _memory_mib() -> tuple[int, int]:
     """返回 (total, available) MiB。读不到时返回 (0, 0)。"""
     total = available = 0
@@ -220,18 +235,24 @@ class PlatformProfile:
     # ---------- 存储与模型 ----------
 
     def vector_backend(self) -> str:
-        """向量后端。
+        """向量后端，默认 qdrant —— 与 153 保持一致，让三台的检索路径可比。
 
-        默认 sqlite。**不**去探测仓库里有没有 `data/qdrant` 目录：那个目录在
-        153 上一直存在，一旦把它当作信号，任何没设 `SENTRIX_VECTOR_BACKEND`
-        的进程（包括单元测试）都会被导进 qdrant 分支并失败。
-        需要 qdrant 就显式设置后端与路径；选错时启动日志里的
-        `platform_profile vector_backend = ...` 会立刻暴露。
+        为什么默认 qdrant 而不是 sqlite：qdrant 与 hnswlib 都只是**派生索引**，
+        权威源永远是 `sentrix.db` 的 `memory_vectors`。但两者的生效方式不同 ——
+        qdrant 写入即生效，hnswlib 是文件、必须显式重建 `.hnsw`。默认值不一致会让
+        同一份代码在不同机器上走不同检索路径，结果不可比，且收尾要不要重建索引
+        也跟着变。统一到 qdrant 后这条差异不再存在。
+
+        降级：环境里没装 qdrant-client 时回落 sqlite（hnswlib 路径）并留痕 ——
+        这台机器上检索仍能工作，只是少了实时索引。
+
+        注意**不做**目录探测：把"仓库里有没有 data/qdrant"当信号会让任何没设
+        `SENTRIX_VECTOR_BACKEND` 的进程（包括单元测试）被导进 qdrant 分支并失败。
         """
         override = _override("SENTRIX_VECTOR_BACKEND")
         if override:
             return override.lower()
-        return "sqlite"
+        return "qdrant" if qdrant_client_available() else "sqlite"
 
     def face_embedding_mode(self) -> str:
         """人脸识别模型。
