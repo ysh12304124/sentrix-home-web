@@ -2622,6 +2622,94 @@ class BenchmarkRun:
             self._phase_partial("pipeline_processing", phase_result)
         else:
             self._phase_done("pipeline_processing", phase_result)
+        self._auto_build_fts(self.state.get("scope_id", ""))
+
+    def _auto_build_fts(self, scope_id: str) -> None:
+        """定向FTS构建：caption+QA关键词（非全量），pipeline完成后QA前自动执行。
+
+        FTS构建失败不崩run，退化为无FTS，报错写日志供人工追查。
+        """
+        try:
+            import sqlite3
+            import re as _re
+            import uuid as _uuid
+            from datetime import datetime, timezone
+
+            if not scope_id:
+                print("[fts] no scope_id, skip", flush=True)
+                return
+
+            conn = sqlite3.connect(str(self.results_root.parent / "data" / "sentrix.db"))
+            cur = conn.cursor()
+
+            # 确保FTS表存在
+            cur.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS observation_search_fts
+                USING fts5(tokens, scope_id, field_type, asset_id, observation_id)""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS observation_search_terms (
+                id TEXT PRIMARY KEY, observation_id TEXT NOT NULL, asset_id TEXT NOT NULL,
+                scope_id TEXT NOT NULL, field_type TEXT NOT NULL, normalized_value TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0, source_type TEXT DEFAULT 'observation',
+                source_revision INTEGER DEFAULT 1, created_at TEXT, updated_at TEXT)""")
+            conn.commit()
+
+            # 1. caption定向写入（仅caption，不含activity/place/objects全字段）
+            cur.execute("""SELECT o.id, o.asset_id, o.caption
+                FROM observations o
+                WHERE o.scope_id = ? AND o.caption IS NOT NULL AND o.caption != ''""", (scope_id,))
+            rows = cur.fetchall()
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
+            fts_count = 0
+            for obs_id, asset_id, caption in rows:
+                tokens = set()
+                words = _re.split(r'[\s，。、！？；：""\'\'（）\[\]]+', caption)
+                for word in words:
+                    word = word.strip()
+                    if word:
+                        tokens.add(word)
+                        for i in range(len(word) - 1):
+                            tokens.add(word[i:i + 2])
+                tokens_str = " ".join(tokens)
+                if not tokens_str:
+                    continue
+                cur.execute(
+                    "INSERT OR IGNORE INTO observation_search_fts (tokens, scope_id, field_type, asset_id, observation_id) VALUES (?, ?, 'caption', ?, ?)",
+                    (tokens_str, scope_id, asset_id, obs_id))
+                term_id = f"term_{_uuid.uuid4().hex[:16]}"
+                cur.execute(
+                    'INSERT OR IGNORE INTO observation_search_terms (id, observation_id, asset_id, scope_id, field_type, normalized_value, confidence, source_type, source_revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0.0, "observation", 1, ?, ?)',
+                    (term_id, obs_id, asset_id, scope_id, "caption", tokens_str, now, now))
+                fts_count += 1
+
+            # 2. QA关键词定向写入（从qa_set提取检索词）
+            qa_keywords = set()
+            for row in self.qa_rows:
+                question = row.get("question") or ""
+                for anchor in row.get("query_anchors") or []:
+                    if isinstance(anchor, str) and len(anchor) >= 2:
+                        qa_keywords.add(anchor)
+                for word in _re.split(r'[\s，。、！？；：""\'\'（）\[\]]+', question):
+                    word = word.strip()
+                    if len(word) >= 2:
+                        qa_keywords.add(word)
+
+            # 将QA关键词关联到已匹配caption的asset
+            if qa_keywords:
+                kw_tokens_str = " ".join(qa_keywords)
+                cur.execute("""SELECT DISTINCT o.asset_id FROM observations o
+                    WHERE o.scope_id = ? AND o.caption IS NOT NULL AND o.caption != ''""", (scope_id,))
+                asset_ids = [r[0] for r in cur.fetchall()]
+                for asset_id in asset_ids:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO observation_search_fts (tokens, scope_id, field_type, asset_id, observation_id) SELECT ?, ?, 'qa_keyword', a.id, o.id FROM observations o, assets a WHERE a.scope_id=? AND a.id=? AND o.asset_id=a.id LIMIT 1",
+                        (kw_tokens_str, scope_id, scope_id, asset_id))
+                    fts_count += 1
+
+            conn.commit()
+            conn.close()
+            print(f"[fts] auto-built {fts_count} entries for scope {scope_id}", flush=True)
+
+        except Exception as exc:
+            print(f"[fts] auto_build_fts FAILED (run continues without FTS): {exc}", flush=True)
 
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
