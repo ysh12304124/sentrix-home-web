@@ -76,7 +76,13 @@ class TextAnnRetriever:
             return []
         scope = filters.scope_ids[0] if filters.scope_ids and not filters.all_authorized else None
         if profile.vector_backend() == "qdrant":
-            return self._retrieve_qdrant(vector, scope, limit)
+            hits = self._retrieve_qdrant(vector, scope, limit)
+            if hits:
+                return hits
+        # qdrant 是**镜像**而非替代（qdrant_memory 的契约就写着 "searches fall back
+        # to SQLite when the client or a collection is unavailable"）。它为空、collection
+        # 缺失、模型/维度不匹配时都必须继续走下面的静态 HNSW 路径 —— 否则一次索引抖动
+        # 就会让检索**静默返回空**，而 .hnsw 明明完好。这类静默失败本仓库反复踩过。
         candidates: dict[str, tuple[float, int, dict]] = {}
         for space in self.spaces:
             index = self._load_index(space)
