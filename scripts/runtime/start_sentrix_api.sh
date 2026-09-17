@@ -13,12 +13,24 @@ if [[ -f "$root/.env" ]]; then
   source "$root/.env"
   set +a
 fi
+
+# 平台参数层：三台共用一份代码，机器相关的「人为选择」集中在那里；能探测的
+# （CUDA 是否真能用、ffmpeg 有哪些硬解、内存多大、装了 qdrant 没有）交给
+# backend/platform_profile.py，不需要任何参数。
+# 放在 .env **之后**：env 里显式写的值优先级最高，这里只补没写的。
+if [[ -f "$root/scripts/deploy/platform-profiles.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$root/scripts/deploy/platform-profiles.sh"
+  sentrix_apply_platform_profile
+fi
 python_bin="${SENTRIX_PYTHON:-$root/.venv/bin/python}"
 port="${SENTRIX_API_PORT:-8090}"
 export SENTRIX_DATA_DIR="${SENTRIX_DATA_DIR:-$root/data}"
 export SENTRIX_DB_PATH="${SENTRIX_DB_PATH:-$SENTRIX_DATA_DIR/sentrix.db}"
 export SENTRIX_ANN_DIR="${SENTRIX_ANN_DIR:-$SENTRIX_DATA_DIR/ann}"
-export SENTRIX_VECTOR_BACKEND="${SENTRIX_VECTOR_BACKEND:-sqlite}"
+# 向量后端**不在这里写死默认值**：由 backend/platform_profile.py 探测决定
+# （装了 qdrant-client 就用 qdrant，与 153 一致；否则回落 sqlite 并留痕）。
+# 在这里写死会覆盖探测结果 —— 153 用 qdrant、46/118 用 sqlite 的分歧正是这么来的。
 export SENTRIX_QDRANT_PATH="${SENTRIX_QDRANT_PATH:-$SENTRIX_DATA_DIR/qdrant}"
 mkdir -p "$SENTRIX_DATA_DIR/media" "$SENTRIX_ANN_DIR"
 
