@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from backend.jetson_telemetry import LocalJetsonLlamaCppTelemetryProvider, _parse_tegrastats_line
@@ -39,6 +40,18 @@ class JetsonTelemetryTests(unittest.TestCase):
         provider = LocalJetsonLlamaCppTelemetryProvider("http://127.0.0.1:8100/v1")
         self.assertEqual(provider.pss_interval, 0.5)
         self.assertEqual(provider.device_interval, 0.5)
+
+    def test_pid_falls_back_to_port_scan_when_pid_file_stale(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "server.pid"
+            pid_file.write_text("1\n", encoding="ascii")
+            provider = LocalJetsonLlamaCppTelemetryProvider(
+                "http://127.0.0.1:8100/v1", pid_file=str(pid_file),
+            )
+            with patch.object(provider, "_pid_from_proc", side_effect=[ValueError("stale"), 1801352]), \
+                 patch.object(provider, "_pid_from_port", return_value=1801352):
+                self.assertEqual(provider._pid(), 1801352)
 
     def test_parse_tegrastats_line(self):
         sample = _parse_tegrastats_line("RAM 8192/16384MB GR3D_FREQ 41% VDD_GPU_SOC 1234mW gpu@52.5C")

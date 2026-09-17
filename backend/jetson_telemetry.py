@@ -293,17 +293,38 @@ class LocalJetsonLlamaCppTelemetryProvider:
         self._last_pid = None
         self._last_memory = {"status": "unavailable", "reason": "not_sampled"}
 
-    def _pid(self) -> int:
-        raw = self.pid_file.read_text(encoding="ascii").strip()
-        if not raw.isdecimal():
-            raise ValueError("invalid llama-server PID file")
-        pid = int(raw)
+    def _pid_from_proc(self, pid: int) -> int:
         args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         if not args or Path(os.fsdecode(args[0])).name != "llama-server":
             raise ValueError("PID does not belong to llama-server")
         command = [os.fsdecode(arg) for arg in args if arg]
         if "--port" not in command or command[command.index("--port") + 1] != str(self.port):
             raise ValueError("PID is not serving the selected endpoint port")
+        return pid
+
+    def _pid_from_port(self) -> int:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                return self._pid_from_proc(int(entry.name))
+            except (ValueError, FileNotFoundError, PermissionError, OSError):
+                continue
+        raise ValueError(f"no llama-server is listening on port {self.port}")
+
+    def _pid(self) -> int:
+        try:
+            raw = self.pid_file.read_text(encoding="ascii").strip()
+            if raw.isdecimal():
+                return self._pid_from_proc(int(raw))
+        except (OSError, ValueError):
+            pass
+        pid = self._pid_from_port()
+        try:
+            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_file.write_text(f"{pid}\n", encoding="ascii")
+        except OSError:
+            pass
         return pid
 
     @staticmethod
