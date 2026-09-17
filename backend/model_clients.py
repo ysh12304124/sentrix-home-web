@@ -259,7 +259,7 @@ def _openai_thinking_kwargs():
     return {"enable_thinking": value in {"1", "true", "yes", "on"}}
 
 
-def _cloud_thinking_kwargs(endpoint_base=None):
+def _cloud_thinking_kwargs(endpoint_base=None, model=None):
     """Disable provider-side reasoning for cloud APIs by default.
 
     Ark's OpenAI-compatible Doubao endpoint uses ``thinking.type`` rather
@@ -268,6 +268,11 @@ def _cloud_thinking_kwargs(endpoint_base=None):
     vLLM payloads.
     """
     endpoint = str(endpoint_base or "").lower()
+    model_name = str(model or "").lower()
+    if "kimi" in model_name:
+        # Kimi accepts the compatible chat-completions payload but rejects
+        # Ark/Doubao provider-specific thinking parameters.
+        return {}
     if "volces.com" in endpoint or "volcengine.com" in endpoint:
         return {"thinking": {"type": "disabled"}}
     return {"enable_thinking": False}
@@ -796,7 +801,7 @@ class GammaClient:
             "temperature": temperature,
         }
         if is_cloud_api:
-            payload.update(_cloud_thinking_kwargs(endpoint_base))
+            payload.update(_cloud_thinking_kwargs(endpoint_base, model))
         elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if max_tokens is not None:
@@ -968,7 +973,7 @@ class GammaClient:
             "temperature": 0,
         }
         if self.runtime_source == "cloud_api":
-            payload.update(_cloud_thinking_kwargs(endpoint_base))
+            payload.update(_cloud_thinking_kwargs(endpoint_base, model))
         elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:

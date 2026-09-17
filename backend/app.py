@@ -6,6 +6,8 @@ import os
 import shutil
 import hashlib
 import tempfile
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -282,6 +284,23 @@ def _finalize_scope_async(scope_id: str) -> None:
                 scope_finalize.run(finalize_store, scope_id)
             finally:
                 finalize_store.close()
+            # 向量后端决定要不要重建 ANN：
+            #   qdrant   —— 写入即生效，没有派生索引这一步；
+            #   hnswlib  —— 检索读的是**派生文件** .hnsw，光写向量不够，必须重建。
+            # 这是 153 与 Orin 侧之间的一处真实架构差异，按能力档案判断，不靠启动参数。
+            if profile.vector_backend() != "qdrant":
+                # 刻意**不传** --visual-embedder：那一支会绕开数据库、给全库图片
+                # 重跑一遍 chinese-clip，而 scope_finalize 刚刚才算过完全相同的向量。
+                # rebuild_ann_indices.build() 的默认分支本来就从 memory_vectors 读
+                # （semantic/episodic 一直如此），visual 没有理由例外。
+                # 实测代价：465 张图重算 ≈ 20 分钟 + 2.3GB RSS，且与上面的
+                # scope_finalize 串在同一线程里 —— 46 上 00:47 那次 OOM 就出在这里。
+                subprocess.run(
+                    [sys.executable,
+                     str(ROOT / "scripts" / "maintenance" / "rebuild_ann_indices.py"),
+                     "--db", store.path, "--ann-dir", str(DATA_DIR / "ann"), "--apply"],
+                    cwd=str(ROOT), capture_output=True, timeout=7200, check=False,
+                )
         except Exception:
             import logging
             logging.getLogger("sentrix.scope_finalize").exception(
