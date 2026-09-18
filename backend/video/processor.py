@@ -6,13 +6,15 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ..db import make_id
+from ..db import MemoryStore, make_id
 from ..geocoding import format_gps_prefix
 from .metadata import probe_video_metadata
 from .worldmm_adapter import WorldMMAdapter
+from ..platform_profile import profile
 
 
 def _captured_at(value, offset=0.0):
@@ -76,7 +78,7 @@ class VideoMemoryAdapter:
     def _keyframe_algorithm(self):
         return str(
             self.keyframe_algorithm
-            or os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm")
+            or profile.video_keyframe_algorithm()
         ).strip().lower()
 
     def process(self, asset, pipeline):
@@ -141,6 +143,7 @@ class VideoMemoryAdapter:
             })
             scene_ids = []
             keyframe_asset_ids = []
+            keyframe_jobs = []  # (keyframe_id, event_id); semantic processing runs after all rows exist.
             for scene in result.scenes:
                 scene_start = _captured_at(captured_at, scene.start_sec)
                 scene_end = _captured_at(captured_at, scene.end_sec)
@@ -183,11 +186,28 @@ class VideoMemoryAdapter:
                         keyframe_id, target.name, "image", str(target), "image/jpeg", target.stat().st_size,
                         provenance, scope_id=asset.get("scope_id"),
                     )
-                    processed = pipeline.process(keyframe_id, summarize_event=False, forced_event_id=event["id"])
-                    if processed.get("status") != "processed":
-                        raise RuntimeError(f"keyframe semantic processing failed: {processed.get('metadata_json', {}).get('error', keyframe_id)}")
                     keyframe_asset_ids.append(keyframe_id)
-                pipeline.summarize_event(event["id"])
+                    keyframe_jobs.append((keyframe_id, event["id"]))
+            # 刀A:关键帧语义处理并发化(镜像app.py batch路径的ThreadPool用法)。
+            workers = max(1, int(os.getenv("SENTRIX_VIDEO_KEYFRAME_WORKERS", "2")))
+            if workers > 1 and len(keyframe_jobs) > 1:
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sentrix-video-kf") as executor:
+                    futures = {
+                        executor.submit(pipeline.process, kid, summarize_event=False, forced_event_id=eid): (kid, eid)
+                        for kid, eid in keyframe_jobs
+                    }
+                    for future in as_completed(futures):
+                        kid, _ = futures[future]
+                        processed = future.result()
+                        if processed.get("status") != "processed":
+                            raise RuntimeError(f"keyframe semantic processing failed: {processed.get('metadata_json', {}).get('error', kid)}")
+            else:
+                for kid, eid in keyframe_jobs:
+                    processed = pipeline.process(kid, summarize_event=False, forced_event_id=eid)
+                    if processed.get("status") != "processed":
+                        raise RuntimeError(f"keyframe semantic processing failed: {processed.get('metadata_json', {}).get('error', kid)}")
+            for event_id in scene_ids:
+                pipeline.summarize_event(event_id)
 
             elapsed = round(time.perf_counter() - started, 3)
             return store.update_asset(asset_id, "processed", {
@@ -201,7 +221,7 @@ class VideoMemoryAdapter:
                 "worldmm_selected_keyframe_count": result.selected_keyframe_count,
                 "video_scene_event_ids": scene_ids,
                 "derived_keyframe_asset_ids": keyframe_asset_ids, "video_processing_seconds": elapsed,
-                "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "cpu"),
+                "worldmm_device": profile.video_device(),
                 "vlm_device": os.getenv("SENTRIX_QWEN3_VL_DEVICE", "cpu"),
                 "error_stage": None, "error": None, "retryable": True,
             })
@@ -412,6 +432,6 @@ class VideoMemoryAdapter:
             "event_vlm_seconds": round(event_vlm_seconds, 3),
             "transient_vlm_frame_count": transient_vlm_frame_count,
             "persistent_keyframe_count": len(keyframe_asset_ids),
-            "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "0"), "vlm_device": "per-keyframe-pipeline",
+            "worldmm_device": profile.video_device(), "vlm_device": "per-keyframe-pipeline",
             "error_stage": None, "error": None, "retryable": True,
         })

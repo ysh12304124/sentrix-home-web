@@ -1,7 +1,8 @@
 import importlib.util
 import json
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 
@@ -10,6 +11,145 @@ SPEC = importlib.util.spec_from_file_location("benchmark_orchestrator", MODULE_P
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+
+
+class RuntimeFrameworkTests(unittest.TestCase):
+    @patch.object(MODULE, "request_text", return_value="# HELP vllm:num_requests_running\nvllm:num_requests_running 0\n")
+    def test_metrics_probe_identifies_unmanaged_vllm(self, _request):
+        self.assertEqual(MODULE.detect_runtime_framework("", "http://127.0.0.1:9100/v1"), "vllm")
+
+    @patch.object(MODULE, "is_jetson_host", return_value=False)
+    def test_port_8100_is_not_automatically_llamacpp_on_discrete_gpu(self, _jetson):
+        self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.153:8100/v1"), "generic")
+        self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.118:8100/v1"), "llama.cpp")
+
+    @patch.object(MODULE, "is_jetson_host", return_value=True)
+    def test_jetson_local_llamacpp_and_explicit_framework(self, _jetson):
+        self.assertEqual(MODULE.resolve_runtime_framework("", "http://127.0.0.1:8100/v1"), "llama.cpp")
+        self.assertEqual(MODULE.resolve_runtime_framework("vllm", "http://127.0.0.1:8100/v1"), "vllm")
+
+    @patch.object(MODULE, "local_lan_ip", return_value="192.168.0.118")
+    @patch.object(MODULE, "is_jetson_host", return_value=True)
+    def test_jetson_uses_local_pss_without_ssh_or_nvidia_smi(self, _jetson, _ip):
+        _, provider, source = MODULE.select_runtime_providers(
+            "", "http://192.168.0.118:8100/v1", "llama.cpp")
+        self.assertIsInstance(provider, MODULE.LocalJetsonLlamaCppTelemetryProvider)
+        self.assertEqual(source, "jetson_local_pss")
+
+    @patch.object(MODULE, "local_lan_ip", return_value="192.168.0.153")
+    @patch.object(MODULE, "is_jetson_host", return_value=False)
+    def test_discrete_gpu_and_remote_host_are_distinct(self, _jetson, _ip):
+        _, provider, source = MODULE.select_runtime_providers(
+            "", "http://192.168.0.153:8100/v1", "generic")
+        self.assertIsInstance(provider, MODULE.HostNvidiaTelemetryProvider)
+        self.assertEqual(source, "host_nvidia_smi")
+        _, provider, source = MODULE.select_runtime_providers(
+            "", "http://192.168.0.119:8100/v1", "llama.cpp")
+        self.assertIsInstance(provider, MODULE.UnavailableTelemetryProvider)
+        self.assertEqual(source, "unavailable")
+
+    def test_hardware_snapshot_samples_external_provider_without_manager(self):
+        run = MODULE.BenchmarkRun.__new__(MODULE.BenchmarkRun)
+        run.use_cloud_model = False
+        run.telemetry_source = "jetson_local_pss"
+        run.lifecycle_provider = Mock(state=Mock(return_value={"status": "not_applicable"}))
+        run.telemetry_provider = Mock(
+            gpu_stats=Mock(return_value={"status": "available", "data": {"gpus": [{"index": 0}]}}),
+            process_memory=Mock(return_value={"status": "available", "data": {"process_memory_used_mib": 512}}),
+        )
+        snapshot = run._hardware_snapshot()
+        self.assertEqual(snapshot["source"], "jetson_local_pss")
+        self.assertEqual(snapshot["process_memory"]["process_memory_used_mib"], 512)
+
+    @patch.object(MODULE, "request_json", return_value={"id": "scope-1", "name": "ok"})
+    def test_long_model_path_is_bounded_in_scope_name(self, request):
+        run = MODULE.BenchmarkRun.__new__(MODULE.BenchmarkRun)
+        run.album_id = "album3-14"
+        run.model_profile = "/some/long/path/" + "very-long-model-name-" * 12
+        run.sentrix_url = "http://127.0.0.1:11001"
+        run.state = {}
+        run._phase_start = Mock()
+        run._phase_done = Mock()
+        run._phase_scope_setup()
+        self.assertLessEqual(len(request.call_args.args[1]["name"]), 100)
+
+
+class RunListLoadingTests(unittest.TestCase):
+    def test_run_list_entry_drops_large_detail_only_fields(self):
+        state = {
+            "run_id": "run-1", "model_profile": "model", "album_id": "album",
+            "scope_id": "scope-1", "status": "completed", "qa_count": 10,
+            "started_at": "2026-09-15T00:00:00+08:00",
+            "items": [{
+                "retrieval_recall": 1.0, "media_retrieval_recall": 0.9,
+                "retrieval_media_refs": [{"media_type": "image", "media_id": "a.jpg"}],
+                "predicted_media_refs": [{"media_type": "image", "media_id": "a.jpg"}],
+                "media_retrieval_counts": {"matched": 9, "predicted": 10, "gt": 10},
+                "image_retrieval_counts": {"matched": 9, "predicted": 10, "gt": 10},
+                "video_retrieval_counts": {"matched": 0, "predicted": 0, "gt": 0},
+                "judge": {"score": 2},
+            }],
+            "summary": {
+                "media_retrieval_recall_macro": 0.9,
+                "agent2_trace": {"large": "x" * 100000},
+            },
+            "phases": {
+                "qa_eval": {"status": "done", "progress": {"completed": 1, "total": 10}},
+                "aggregate": {"agent2_trace": {"large": "x" * 100000}},
+            },
+        }
+        row = MODULE.OrchestratorRepository._run_list_entry(state)
+        self.assertEqual(row["scope_id"], "scope-1")
+        self.assertEqual(row["summary"]["media_retrieval_recall_macro"], 0.9)
+        self.assertNotIn("agent2_trace", row["summary"])
+        self.assertNotIn("aggregate", row.get("phases", {}))
+        self.assertLess(len(json.dumps(row)), 3000)
+
+    def test_run_list_pagination_is_bounded(self):
+        payload = MODULE.paginate_rows(list(range(205)), page=2, page_size=500)
+        self.assertEqual(payload["page_size"], 100)
+        self.assertEqual(payload["page"], 2)
+        self.assertEqual(payload["total"], 205)
+        self.assertEqual(len(payload["runs"]), 100)
+        self.assertTrue(payload["has_previous"])
+        self.assertTrue(payload["has_next"])
+
+    @patch.object(MODULE, "request_json", side_effect=RuntimeError("HTTP 404 Not Found: missing"))
+    def test_missing_arbiter_endpoint_is_reported_as_unsupported(self, _request):
+        result = MODULE.arbiter_status_snapshot("http://127.0.0.1:11001")
+        self.assertFalse(result["supported"])
+        self.assertEqual(result["reason"], "endpoint_not_supported")
+
+    def test_live_telemetry_snapshot_keeps_latest_peak_and_phase(self):
+        run = MODULE.BenchmarkRun.__new__(MODULE.BenchmarkRun)
+        run.lock = MODULE.threading.RLock()
+        run.telemetry_source = "host_nvidia_smi"
+        run._current_phase = "qa_eval"
+        run.state = {}
+        run.persist = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            run.results_root = Path(directory)
+            run.run_id = "run-1"
+            run.run_dir.mkdir(parents=True)
+            run._persist_gpu_sample({
+                "gpu_utilization_pct": 40, "memory_used_mib": 1000,
+                "model_process_memory_used_mib": 800, "temperature_c": 50,
+                "system_memory_used_mib": 4000, "all_processes_memory_mib": 900,
+                "other_processes_memory_mib": 100, "system_memory_scope": "host_all_processes",
+            })
+            run._persist_gpu_sample({
+                "gpu_utilization_pct": 90, "memory_used_mib": 1200,
+                "model_process_memory_used_mib": 900, "temperature_c": 55,
+                "system_memory_used_mib": 4200, "all_processes_memory_mib": 1000,
+                "other_processes_memory_mib": 100, "system_memory_scope": "host_all_processes",
+            })
+            live = run.state["telemetry_live"]
+            self.assertEqual(live["samples_count"], 2)
+            self.assertEqual(live["latest"]["gpu_utilization_pct"], 90)
+            self.assertEqual(live["peak"]["memory_used_mib"], 1200)
+            self.assertEqual(live["peak"]["system_memory_used_mib"], 4200)
+            self.assertEqual(live["peak"]["all_processes_memory_mib"], 1000)
+            self.assertEqual(live["phase_snapshots"]["qa_eval"]["samples_count"], 2)
 
 
 class ExtractImageIdsTests(unittest.TestCase):
@@ -409,6 +549,56 @@ class ExtractImageIdsTests(unittest.TestCase):
         stability = MODULE.BenchmarkRun._agent_stability(item)
         self.assertIsNone(stability["json_parse_total"])
         self.assertIsNone(stability["json_parse_rate"])
+
+    def test_trace_action_reads_raw_and_markdown_fenced_json(self):
+        parse = MODULE.BenchmarkRun._trace_action
+        self.assertEqual(
+            parse({"raw": '{"action":"tool_call","tool":"search_memories"}'})["tool"],
+            "search_memories",
+        )
+        fenced = "```json\n{\n  \"action\": \"declare\",\n  \"declaration\": {\"goal\": \"x\"}\n}\n```"
+        self.assertEqual(parse({"raw": fenced, "detail": None})["action"], "declare")
+        self.assertIsNone(parse({"prompt": '{"action":"tool_call"}'}))
+        self.assertEqual(
+            parse({"detail": '{"action":"final","answer":"ok"}'})["action"],
+            "final",
+        )
+
+    def test_agent_stability_counts_raw_payload_without_detail(self):
+        item = {
+            "answer": "保定市易县",
+            "agent_status": "complete",
+            "termination_reason": "complete",
+            "turn_outcome": "final_answer",
+            "execution_trace": [
+                {"type": "model", "call_type": "agent", "raw": '{"action":"tool_call","tool":"search_memories"}'},
+                {
+                    "type": "model",
+                    "call_type": "agent",
+                    "raw": "```json\n{\"action\":\"final\",\"answer\":\"保定市易县\"}\n```",
+                },
+            ],
+        }
+        stability = MODULE.BenchmarkRun._agent_stability(item)
+        self.assertEqual(stability["json_parse_total"], 2)
+        self.assertEqual(stability["json_parse_success"], 2)
+        self.assertEqual(stability["json_parse_rate"], 1.0)
+
+    def test_hydration_recomputes_parse_rate_from_raw_trace(self):
+        repository = MODULE.OrchestratorRepository.__new__(MODULE.OrchestratorRepository)
+        repository.qa_metadata = {}
+        hydrated = repository._hydrate_qa_metadata({
+            "qa_id": "raw-trace",
+            "answer": "ok",
+            "agent_status": "complete",
+            "turn_outcome": "final_answer",
+            "agent_stability": {"json_parse_total": 1, "json_parse_success": 0, "json_parse_rate": 0.0},
+            "execution_trace": [
+                {"type": "model", "call_type": "agent", "raw": '{"action":"final","answer":"ok"}'},
+            ],
+        })
+        self.assertEqual(hydrated["agent_stability"]["json_parse_success"], 1)
+        self.assertEqual(hydrated["agent_stability"]["json_parse_rate"], 1.0)
 
     def test_json_parse_rate_trusts_runtime_failed_status_over_embedded_json(self):
         item = {

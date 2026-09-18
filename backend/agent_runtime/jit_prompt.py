@@ -19,7 +19,7 @@ BASE_SYSTEM_PROMPT = """你是 Sentrix 家庭记忆助手。根据当前待确�
 1. 每次只输出一个标准 JSON 对象，不要输出 markdown 代码块或解释；
 2. 调用工具格式：{"action":"tool_call","tool":"<工具名>","arguments":{...},"public_status":"<简短状态>"}
 3. 结论输出格式：{"action":"final","answer":"<直接回答用户问题>","evidence_refs":["tool_call_1"],"selected_image_handles":["photo_1"]}；只有确实要给用户看的图片才填写 selected_image_handles，最多 6 张。
-4. 未检索相册前禁止猜测或回答；已有足够事实时直接输出 final。
+4. 未调用能满足当前证据需求的工具前不得猜测；已有足够事实，或已确认当前条件无法统计时，直接输出 final。
 5. selected_image_handles 只能填写当前照片预览中出现的 handle；搜索候选不等于要展示的图片。
 6. 不要重复调用相同工具和参数；只使用工具返回的事实回答，不编造数字或细节。
 7. 内部检索词汇（query_satisfaction、candidate_only、检索结果、匹配程度等）不得原样出现在回答里，用自然语言转译；不确定性用四级：确定→直接给答案、较可能→"看起来是…"、不确定→"可能…还不能完全确定"、无依据→"现有记录里看不出来"。
@@ -28,6 +28,12 @@ BASE_SYSTEM_PROMPT = """你是 Sentrix 家庭记忆助手。根据当前待确�
 
 # 工具极简契约定义（每个工具仅保留最精简输入格式，<40 tokens）
 LITE_TOOL_SCHEMAS = {
+    "query_memory_facts": (
+        "- query_memory_facts: 精确统计当前相册的原始图片/视频、已命名人物出现或处理状态。"
+        "不支持颜色、物体、场景、活动、关系、金额或桌数；不要把检索候选数当总数。\n"
+        '  输入: {"operation":"count|exists|first|last|group","subject":"asset|person_appearance|processing",'
+        '"group_by":"month|place|media|status","filters":{"time":"","media":"image|video","place":"","person":""}}'
+    ),
     "search_memories": (
         "- search_memories: 检索照片，每轮只调一次（返回最多 18 张候选，预览每张含地点/时间/描述/handle）。"
         "问'哪些/几种/所有不同场地或对象'等枚举聚合类问题时直接看预览描述+翻页批量判断，不要逐张 inspect；"
@@ -35,7 +41,7 @@ LITE_TOOL_SCHEMAS = {
         '  输入: {"query": "关键词", "filters": {"time": "<问题时间，缺省省略>", "person": "人物", "place": "地点"}}'
     ),
     "query_photo_people": (
-        "- query_photo_people: 读取当前预览中一张照片自己的已确认人物和未确认同行者。\n"
+        "- query_photo_people: 读取当前预览中一张照片的人脸绑定人物及其家庭归属；没有稳定绑定的同行者明确标为未知。\n"
         '  输入: {"asset_handle": "photo_1", "result_set_id": "..."}'
     ),
     "inspect_photo": (
@@ -64,10 +70,74 @@ LITE_TOOL_SCHEMAS = {
         '  输入: {"subject": "人物名", "topic": "话题"}'
     ),
     "get_person_profile": (
-        "- get_person_profile: 读取人物高维画像（家庭角色/关系/行为规律/近期事件）。\n"
+        "- get_person_profile: 读取人物高维画像（家庭归属/关系/行为规律/近期事件）；关系来源会标注模型或用户确认。\n"
         '  输入: {"person": "人物名"}'
     ),
 }
+
+
+def select_jit_tool_specs(
+    *,
+    task_state: TaskState | None,
+    preview_handles: list[str] | None = None,
+    allowed_tool_names: set[str] | tuple[str, ...] | list[str] | None = None,
+) -> list[ToolSpec]:
+    """The one authoritative JIT candidate selector used by prompt and runtime."""
+    if task_state is None:
+        return []
+    preview_handles = preview_handles or []
+    open_types = {
+        state.requirement.evidence_type
+        for state in task_state.requirements.values()
+        if state.status in ("open", "running", "partially_supported")
+        and state.requirement.required
+    }
+    allowed = set(allowed_tool_names) if allowed_tool_names is not None else None
+    ready_specs = [
+        spec for spec in list_tools(readiness="ready")
+        if allowed is None or spec.name in allowed
+    ]
+    satisfied_types = {
+        state.requirement.evidence_type
+        for state in task_state.requirements.values()
+        if state.status == "satisfied"
+    }
+    missing_prerequisites: set[str] = set()
+    for spec in ready_specs:
+        if not any(spec.can_satisfy(kind) for kind in open_types):
+            continue
+        if "asset_handle_in_current_preview" in spec.preconditions and not preview_handles:
+            missing_prerequisites.update(
+                kind for kind in spec.prerequisite_evidence_types
+                if kind not in satisfied_types
+            )
+    selected: list[ToolSpec] = []
+    for spec in ready_specs:
+        direct = any(spec.can_satisfy(kind) for kind in open_types)
+        prerequisite_provider = any(
+            spec.can_satisfy(kind) for kind in missing_prerequisites
+        )
+        if not direct and not prerequisite_provider:
+            continue
+        if "asset_handle_in_current_preview" in spec.preconditions and not preview_handles:
+            continue
+        selected.append(spec)
+    return selected
+
+
+def _render_tool_spec(spec: ToolSpec) -> str:
+    from .runtime_contract import tool_contract
+    contract = tool_contract(spec.name, spec)
+    description = str(contract.get("description") or spec.description or "")
+    parameters = contract.get("parameters") or spec.input_schema or {"type": "object"}
+    return (
+        f"- {spec.name}: {description}\n"
+        f"  输入schema={json.dumps(parameters, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def _render_tool_specs(specs: list[ToolSpec]) -> str:
+    return "\n".join(_render_tool_spec(spec) for spec in specs)
 
 
 def build_jit_system_prompt(
@@ -89,14 +159,12 @@ def build_jit_system_prompt(
         parts.append(f"当前时间：{current_time_str}")
         
     if not is_candidate or task_state is None:
-        # Fallback 到包含所有常用工具的简版
-        tool_descriptions = "\n".join([
-            LITE_TOOL_SCHEMAS["search_memories"],
-            LITE_TOOL_SCHEMAS["query_photo_people"],
-            LITE_TOOL_SCHEMAS["inspect_photo"],
-            LITE_TOOL_SCHEMAS["read_photo_text"],
-        ])
-        parts.append(f"可用工具：\n{tool_descriptions}")
+        fallback_specs = [
+            spec for spec in list_tools(readiness="ready")
+            if spec.name in {"search_memories", "query_photo_people", "inspect_photo", "read_photo_text"}
+            and (allowed_tool_names is None or spec.name in set(allowed_tool_names))
+        ]
+        parts.append(f"可用工具：\n{_render_tool_specs(fallback_specs)}")
         return "\n\n".join(parts)
 
     # 2. 注入当前任务目标与未决状态
@@ -120,40 +188,11 @@ def build_jit_system_prompt(
 
     # 3. JIT 只依据统一注册表和未满足需求提供工具，不按问题关键词
     # 硬编码“先 search 再 inspect”的流程。模型仍然决定下一步调用哪个工具。
-    open_types = {
-        r.requirement.evidence_type for r in task_state.requirements.values()
-        if r.status in ("open", "running", "partially_supported")
-        and r.requirement.required
-    }
-    ready_specs = list_tools(readiness="ready")
-    if allowed_tool_names is not None:
-        allowed = set(allowed_tool_names)
-        ready_specs = [spec for spec in ready_specs if spec.name in allowed]
-    satisfied_types = {
-        state.requirement.evidence_type
-        for state in task_state.requirements.values()
-        if state.status == "satisfied"
-    }
-    missing_prerequisites = set()
-    for spec in ready_specs:
-        if not any(spec.can_satisfy(evidence_type) for evidence_type in open_types):
-            continue
-        if "asset_handle_in_current_preview" in spec.preconditions and not preview_handles:
-            missing_prerequisites.update(
-                item for item in spec.prerequisite_evidence_types
-                if item not in satisfied_types
-            )
-    selected_specs: list[ToolSpec] = []
-    for spec in ready_specs:
-        direct = any(spec.can_satisfy(evidence_type) for evidence_type in open_types)
-        prerequisite_provider = any(
-            spec.can_satisfy(evidence_type) for evidence_type in missing_prerequisites
-        )
-        if not direct and not prerequisite_provider:
-            continue
-        if "asset_handle_in_current_preview" in spec.preconditions and not preview_handles:
-            continue
-        selected_specs.append(spec)
+    selected_specs = select_jit_tool_specs(
+        task_state=task_state,
+        preview_handles=preview_handles,
+        allowed_tool_names=allowed_tool_names,
+    )
     selected_tools = [spec.name for spec in selected_specs]
 
     # 所有需求已满足 / 无需证据：有把握就直接 final；若需要核实相册记录（具体数字/金额/
@@ -162,17 +201,14 @@ def build_jit_system_prompt(
         parts.append("当前没有待确认的证据需求。可直接回答的问题请直接输出 final；"
                      "若答案需要从相册照片核实，请先调用 search_memories 检索，"
                      "再如实作答或说明无法确认，不要编造数字/细节。")
-        parts.append("本步骤可用工具（按需核实，也可直接 final）：\n"
-                     + LITE_TOOL_SCHEMAS["search_memories"])
+        search_spec = get_tool("search_memories")
+        if search_spec is not None:
+            parts.append("本步骤可用工具（按需核实，也可直接 final）：\n"
+                         + _render_tool_spec(search_spec))
     elif not selected_tools:
         # 有需求但暂无直接满足的工具：由模型按需调用已注册检索工具获取证据后再 final。
         parts.append("当前有待确认的证据需求，请按需调用合适的工具获取证据后再 final。")
     else:
-        # 去重并添加工具描述
-        tool_text_list = []
-        for tname in dict.fromkeys(selected_tools):
-            if tname in LITE_TOOL_SCHEMAS:
-                tool_text_list.append(LITE_TOOL_SCHEMAS[tname])
-        parts.append("本步骤可用工具（按需调用）：\n" + "\n".join(tool_text_list))
+        parts.append("本步骤可用工具（按需调用）：\n" + _render_tool_specs(selected_specs))
         
     return "\n\n".join(parts)

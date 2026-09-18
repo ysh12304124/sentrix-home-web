@@ -2,6 +2,7 @@ import base64
 from io import BytesIO
 import json
 import mimetypes
+import logging
 import os
 import re
 import threading
@@ -12,6 +13,7 @@ from .face_embeddings import FaceEmbeddingUnavailable, compute_face_quality
 from .geocoding import format_gps_prefix
 from .onnx_runtime import face_gpu_inference_gate, face_onnx_provider_options, face_onnx_providers
 from .runtime_providers import OpenAICompatibleInferenceProvider, normalize_openai_base_url
+from .platform_profile import profile
 
 
 def align_face_crop(image, bbox, landmarks=None):
@@ -258,7 +260,7 @@ def _openai_thinking_kwargs():
     return {"enable_thinking": value in {"1", "true", "yes", "on"}}
 
 
-def _cloud_thinking_kwargs(endpoint_base=None):
+def _cloud_thinking_kwargs(endpoint_base=None, model=None):
     """Disable provider-side reasoning for cloud APIs by default.
 
     Ark's OpenAI-compatible Doubao endpoint uses ``thinking.type`` rather
@@ -267,6 +269,11 @@ def _cloud_thinking_kwargs(endpoint_base=None):
     vLLM payloads.
     """
     endpoint = str(endpoint_base or "").lower()
+    model_name = str(model or "").lower()
+    if "kimi" in model_name:
+        # Kimi accepts the compatible chat-completions payload but rejects
+        # Ark/Doubao provider-specific thinking parameters.
+        return {}
     if "volces.com" in endpoint or "volcengine.com" in endpoint:
         return {"thinking": {"type": "disabled"}}
     return {"enable_thinking": False}
@@ -795,7 +802,7 @@ class GammaClient:
             "temperature": temperature,
         }
         if is_cloud_api:
-            payload.update(_cloud_thinking_kwargs(endpoint_base))
+            payload.update(_cloud_thinking_kwargs(endpoint_base, model))
         elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if max_tokens is not None:
@@ -967,7 +974,7 @@ class GammaClient:
             "temperature": 0,
         }
         if self.runtime_source == "cloud_api":
-            payload.update(_cloud_thinking_kwargs(endpoint_base))
+            payload.update(_cloud_thinking_kwargs(endpoint_base, model))
         elif self.api_mode != "generic":
             payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
@@ -1492,22 +1499,31 @@ class FunASRClient:
 
 
 class ClipAdapter:
-    """Optional local CLIP ViT-B/32 adapter for native visual memory."""
+    """Visual embedding adapter — uses Chinese-CLIP (ViT-L-14, 768d).
+
+    与 ``embeddings/scheme.py`` 的 IMAGE_MODEL 对齐：写入侧与查询侧必须是同一个
+    模型名和维度，否则视觉召回会静默为空。
+
+    为什么不再用 open_clip ViT-B-32：检索侧（``embeddings/router.py``）早已钉死
+    chinese_clip，而导入侧长期仍在写 ViT-B-32 的 512 维向量 —— 实测 153 库里因此
+    积累了大量检索永远用不到的向量（visual 8782 条，episodic 2766、semantic 1885
+    同样被污染），还逼得 ANN 构建必须做"挑主模型"的防御逻辑。两侧统一到 chinese-clip。
+    """
 
     def __init__(self):
         self.enabled = os.getenv("CLIP_ENABLED", "true").lower() in {"1", "true", "yes"}
-        self.model_name = os.getenv("CLIP_MODEL_NAME", "ViT-B-32")
-        configured_checkpoint = os.getenv("CLIP_CHECKPOINT", "")
-        project_checkpoint = Path(__file__).resolve().parents[1] / "data" / "models" / "clip" / f"{self.model_name}.bin"
-        self.checkpoint = configured_checkpoint or (str(project_checkpoint) if project_checkpoint.is_file() else "")
+        # 必须与 embeddings/scheme.py 的 IMAGE_MODEL 一致
+        self.model_name = "chinese-clip-ViT-L-14"
+        configured_checkpoint = os.getenv("CHINESE_CLIP_CHECKPOINT", os.getenv("CLIP_CHECKPOINT", ""))
+        default_checkpoint = str(Path.home() / ".cache" / "clip" / "clip_cn_vit-l-14.pt")
+        self.checkpoint = configured_checkpoint or default_checkpoint
         self._model = None
         self._preprocess = None
-        self._tokenizer = None
         self._load_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
         self.error = None
-        self.device = os.getenv("CLIP_DEVICE", "auto")
-        # A randomly initialized model must never be used as retrieval evidence.
-        self.weights_ready = bool(self.checkpoint) or os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() in {"1", "true", "yes"}
+        self.device = profile.clip_device()
+        self.weights_ready = bool(self.checkpoint)
 
     @property
     def evidence_ready(self):
@@ -1515,15 +1531,7 @@ class ClipAdapter:
 
     @property
     def embedding_dimension(self):
-        configured = os.getenv("CLIP_EMBED_DIM")
-        if configured:
-            return int(configured)
-        normalized = str(self.model_name or "").lower().replace("_", "-")
-        if "vit-h-14" in normalized:
-            return 1024
-        if "vit-l-14" in normalized:
-            return 768
-        return 512
+        return 768  # chinese-clip-ViT-L-14
 
     def _device(self, torch):
         requested = str(self.device or "auto").strip().lower()
@@ -1539,22 +1547,26 @@ class ClipAdapter:
                 return self._model, self._preprocess
             if not self.enabled:
                 return None, None
-            if not self.checkpoint and os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() not in {"1", "true", "yes"}:
-                self.error = "CLIP_CHECKPOINT is not configured"
+            if not Path(self.checkpoint).is_file():
+                self.error = f"Chinese-CLIP checkpoint missing: {self.checkpoint}"
                 self.weights_ready = False
                 return None, None
             try:
-                import open_clip
-                import torch
-                kwargs = {"model_name": self.model_name, "pretrained": "openai" if not self.checkpoint else None, "load_weights": not bool(self.checkpoint)}
-                self._model, _, self._preprocess = open_clip.create_model_and_transforms(**kwargs)
-                if self.checkpoint:
-                    state = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
-                    self._model.load_state_dict(state, strict=False)
-                self._tokenizer = open_clip.get_tokenizer(self.model_name)
-                self.device = self._device(torch)
-                self._model.to(self.device)
-                self._model.eval()
+                # 复用 embeddings.chinese_clip_visual 的进程内单例，不要自己再 load_from_name。
+                # 两边是同一个 checkpoint、同一个模型名、同一个 device，各加载一份等于在
+                # 同一进程里存两份权重（实测 2.97G + 1.65G）。共用后省下约 1.7G ——
+                # 这在 16G 统一内存的 46 上是导入阶段 OOM 的直接来源。
+                from .embeddings.chinese_clip_visual import ChineseClipVisualEmbedder
+
+                shared = ChineseClipVisualEmbedder.shared()
+                model = shared._load()
+                if model is None:
+                    self.error = shared._error or "chinese_clip embedder unavailable"
+                    self.weights_ready = False
+                    return None, None
+                self._model = model
+                self._preprocess = shared._preprocess
+                self.error = None
                 return self._model, self._preprocess
             except Exception as error:
                 self.error = str(error)
@@ -1572,11 +1584,15 @@ class ClipAdapter:
 
             ensure_heif_support()
             image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(self.device)
-            with torch.no_grad():
+            with self._inference_lock, torch.no_grad():
                 embedding = model.encode_image(image)
             return embedding[0].cpu().tolist()
-        except Exception as error:
-            self.error = str(error)
+        except Exception:
+            # 裸 except 返回空向量时，调用方拿到 [] 仍会 upsert，整条链路不报错。
+            # 实测 numpy 2.x ABI 冲突期间 223 张图因此没有任何视觉向量，直到手工清点
+            # 才发现。必须留下痕迹。
+            logging.getLogger("sentrix.clip").exception(
+                "ClipAdapter.embed_image failed: path=%s", path)
             return []
 
     def embed_text(self, text):
@@ -1585,12 +1601,15 @@ class ClipAdapter:
             return []
         try:
             import torch
-            tokens = self._tokenizer([str(text)]).to(self.device)
-            with torch.no_grad():
+            from cn_clip.clip import tokenize
+
+            tokens = tokenize([str(text)]).to(self.device)
+            with self._inference_lock, torch.no_grad():
                 embedding = model.encode_text(tokens)
             return embedding[0].cpu().tolist()
-        except Exception as error:
-            self.error = str(error)
+        except Exception:
+            logging.getLogger("sentrix.clip").exception(
+                "ClipAdapter.embed_text failed: text=%r", str(text)[:80])
             return []
 
 

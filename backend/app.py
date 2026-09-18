@@ -1,10 +1,13 @@
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import shutil
 import hashlib
 import tempfile
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -38,7 +41,10 @@ from .runtime_providers import (
     normalize_openai_base_url,
     normalize_service_url,
 )
+from .platform_profile import profile
 
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("SENTRIX_DATA_DIR", ROOT / "data"))
@@ -63,8 +69,8 @@ runtime_lock = threading.Lock()
 batch_worker_lock = threading.Lock()
 db_write_lock = threading.RLock()
 active_batch_workers = set()
-VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/asus/sentrix-vllm/bin/sentrix_vllm_manager.py"))
-VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/asus/sentrix-vllm/registry.json"))
+VLLM_MANAGER = Path(os.getenv("SENTRIX_VLLM_MANAGER", "/home/realmagic/sentrix-vllm/bin/sentrix_vllm_manager.py"))
+VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/realmagic/sentrix-vllm/registry.json"))
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
 RUNTIME_VLLM_API_URL = None
 RUNTIME_VLLM_BASE_URL = None
@@ -178,9 +184,9 @@ def _allowed_import_roots():
     defaults = [
         DATA_DIR / "imports",
         ROOT / "data" / "imports",
-        Path("/home/asus/data"),
-        Path("/home/asus/datasets"),
-        Path("/home/asus/benchmarks"),
+        Path("/home/realmagic/data"),
+        Path("/home/realmagic/datasets"),
+        Path("/home/realmagic/benchmarks"),
     ]
     values = configured.split(":") if configured else [str(item) for item in defaults]
     roots = []
@@ -234,10 +240,20 @@ def process_asset(asset_id):
     )
     try:
         asset = task_store.get_asset(asset_id) or {}
-        if asset.get("media_type") != "image":
-            task_pipeline.process(asset_id)
+        if not asset:
+            # 后台任务队列里可能残留已删除的资产（相册被删、scope 被清理）。
+            # 直接跳过即可，不要让一个陈旧任务把整批后台处理带崩。
+            log.warning("process_asset: asset %s no longer exists, skipped", asset_id)
             return
-        fast = task_pipeline.process_fast_image(asset_id)
+        if asset.get("media_type") != "image":
+            try:
+                task_pipeline.process(asset_id)
+            except KeyError:
+                # get_asset 与 process 之间资产被删掉的竞态，同上处理。
+                log.warning("process_asset: asset %s deleted mid-flight, skipped", asset_id)
+            return
+        # process_fast_image 对已删资产返回 None；直接 .get 会抛 AttributeError。
+        fast = task_pipeline.process_fast_image(asset_id) or {}
         if fast.get("status") == "semantic_enriching":
             # Finish the semantic observation and summarize its event in the
             # same background pipeline; imports must not require maintenance UI.
@@ -246,11 +262,60 @@ def process_asset(asset_id):
         task_store.close()
 
 
+def _finalize_scope_async(scope_id: str) -> None:
+    """导入收尾：补该 scope 的 chinese-clip 视觉向量 + 重建 FTS。
+
+    为什么必须做：新相册导入只写了文本向量（bge-m3），**视觉侧 chinese-clip 没有落库**；
+    而查询侧由 scheme.py 锁死 chinese-clip 768 维，库里缺该模型的向量时 visual_ann 会
+    静默 no_candidates —— 表现为图片检索全空、agent 从不调用 inspect_photo、
+    image_retrieval_recall = 0（实测多批评测就栽在这里）。
+
+    scope_finalize 的契约本就写着"补向量 + 重建 FTS + 供调用方同步索引"，
+    此前全仓库没有调用方，所以 import 路径一直漏了这一步。这里补上那个调用方。
+    store.upsert_vector 会自动同步 Qdrant，故 SQLite 与 Qdrant 一次写齐。
+
+    跑后台线程：视觉向量重嵌是分钟级（数百张图），不能挡住批次收尾。
+    """
+    def _work():
+        try:
+            from . import scope_finalize
+            finalize_store = MemoryStore(store.path)
+            try:
+                scope_finalize.run(finalize_store, scope_id)
+            finally:
+                finalize_store.close()
+            # 向量后端决定要不要重建 ANN：
+            #   qdrant   —— 写入即生效，没有派生索引这一步；
+            #   hnswlib  —— 检索读的是**派生文件** .hnsw，光写向量不够，必须重建。
+            # 这是 153 与 Orin 侧之间的一处真实架构差异，按能力档案判断，不靠启动参数。
+            if profile.vector_backend() != "qdrant":
+                # 刻意**不传** --visual-embedder：那一支会绕开数据库、给全库图片
+                # 重跑一遍 chinese-clip，而 scope_finalize 刚刚才算过完全相同的向量。
+                # rebuild_ann_indices.build() 的默认分支本来就从 memory_vectors 读
+                # （semantic/episodic 一直如此），visual 没有理由例外。
+                # 实测代价：465 张图重算 ≈ 20 分钟 + 2.3GB RSS，且与上面的
+                # scope_finalize 串在同一线程里 —— 46 上 00:47 那次 OOM 就出在这里。
+                subprocess.run(
+                    [sys.executable,
+                     str(ROOT / "scripts" / "maintenance" / "rebuild_ann_indices.py"),
+                     "--db", store.path, "--ann-dir", str(DATA_DIR / "ann"), "--apply"],
+                    cwd=str(ROOT), capture_output=True, timeout=7200, check=False,
+                )
+        except Exception:
+            import logging
+            logging.getLogger("sentrix.scope_finalize").exception(
+                "scope finalize failed: scope=%s", scope_id)
+
+    threading.Thread(target=_work, daemon=True, name="sentrix-scope-finalize").start()
+
+
 def _pipeline_worker_limits():
-    configured = max(1, int(os.getenv("SENTRIX_PIPELINE_MAX_WORKERS", "2")))
+    configured = max(1, int(profile.pipeline_workers()))
     state = _load_vllm_state() or {}
-    service_limit = max(1, int(state.get("max_num_seqs") or 1))
-    summary_configured = max(1, int(os.getenv("SENTRIX_EVENT_SUMMARY_MAX_WORKERS", "2")))
+    # vLLM 托管时有 manager 公布的值；llama.cpp 走 openai-compatible 外部端点时
+    # 没有 manager，此时由能力档案（或 SENTRIX_SERVICE_MAX_SEQS）给出槽位数。
+    service_limit = max(1, int(state.get("max_num_seqs") or profile.service_parallel()))
+    summary_configured = max(1, int(profile.event_summary_workers()))
     return {
         "configured_workers": configured,
         "vllm_max_num_seqs": service_limit,
@@ -606,13 +671,23 @@ def process_ingest_batch(asset_ids, batch_id):
             with ThreadPoolExecutor(max_workers=limits["event_summary_workers"], thread_name_prefix="sentrix-event-summary") as executor:
                 event_results = list(executor.map(_summarize_event_worker, event_ids))
             summary_wall_seconds = round(time.perf_counter() - summary_started, 4)
+            from .scope_finalize import finalize_ingest_scope
+            retrieval_finalize = finalize_ingest_scope(task_store, batch.get("scope_id"))
             with db_write_guard("ingest-batch-finish"):
                 task_store.finish_ingest_batch(batch_id)
+            # 收尾后补该 scope 的视觉向量与 FTS：不补则新相册图片检索全空
+            for row in task_store._rows(
+                "SELECT DISTINCT scope_id FROM assets WHERE batch_id = ?", (batch_id,)
+            ):
+                if row["scope_id"]:
+                    _finalize_scope_async(row["scope_id"])
+                    pipeline._trigger_family_analysis(row["scope_id"])
             metrics = {
                 **limits, "status": "completed", "asset_count": len(all_asset_ids),
                 "image_count": len(all_asset_ids), "event_count": len(event_ids),
                 "event_summary_call_count": len(event_results),
                 "event_summary_wall_seconds": summary_wall_seconds,
+                "retrieval_finalize": retrieval_finalize,
                 "event_summaries": event_results,
                 "failed_count": len(task_store._rows(
                     "SELECT id FROM assets WHERE batch_id = ? AND status = 'failed'", (batch_id,)
@@ -684,7 +759,7 @@ def _load_vllm_state(registry=None):
     if VLLM_API_URL:
         return _vllm_api("/state")
     registry = registry or _load_vllm_registry()
-    state_file = Path(registry.get("state_file") or "/home/asus/sentrix-vllm/state/current.json")
+    state_file = Path(registry.get("state_file") or "/home/realmagic/sentrix-vllm/state/current.json")
     return _read_json_file(state_file, None) if state_file.exists() else None
 
 
@@ -763,7 +838,7 @@ def _apply_vllm_profile_to_runtime(profile_id, profile=None, state=None):
     port = int(state.get("port") or profile.get("port") or registry.get("default_port") or 8100)
     served_name = state.get("served_model_name") or profile.get("served_model_name") or profile_id
     with runtime_lock:
-        base_url = (state.get("external_url_hint") if state else None) or gamma.base_url
+        base_url = RUNTIME_VLLM_BASE_URL or (state.get("external_url_hint") if state else None) or gamma.base_url
         new_gamma = GammaClient(base_url=base_url, model=served_name, backend="openai", manager_url=RUNTIME_VLLM_API_URL or VLLM_API_URL)
         gamma = new_gamma
         pipeline = IngestionPipeline(store, gamma=gamma, asr=pipeline.asr, face=pipeline.face, clip=pipeline.clip)
@@ -821,6 +896,9 @@ def _run_vllm_switch(request: ModelSwitchRequest):
 @app.on_event("startup")
 def _sync_vllm_state_on_startup():
     """Sync gamma client with remote vLLM state on startup."""
+    # 把这台机器实际生效的能力打出来。46 上曾因为少一个环境变量而静默切到
+    # 另一条视频链路，排查花了很久——留痕后这类问题一眼可见。
+    profile.log_summary()
     try:
         state = _load_vllm_state()
         if state and state.get("pid"):
@@ -829,7 +907,7 @@ def _sync_vllm_state_on_startup():
         pass
 
 def _video_extraction_status():
-    algorithm = os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm").strip().lower()
+    algorithm = profile.video_keyframe_algorithm()
     if algorithm == "hybrid_webp":
         return {
             "adapter": "hybrid_webp_memory", "algorithm": algorithm, "status": "available",
@@ -1581,6 +1659,106 @@ def rename_person_api(person_id: str, payload: dict):
     return {"ok": True, "name": updated["entity"]["canonical_name"]}
 
 
+def _execute_family_analysis_run(run_id: str, scope_id: str):
+    from .family_graph_service import FamilyGraphService
+
+    FamilyGraphService(store, gamma).run(run_id, scope_id)
+
+
+@app.get("/api/family-graph")
+def family_graph(scope_id: str):
+    scope_ids = store.family_graph_scope_ids(scope_id)
+    return {
+        "scope_id": scope_id,
+        "run": store.latest_family_analysis_run(scope_id),
+        "people": store.family_graph_people(scope_ids),
+        "scope_ids": scope_ids,
+        "relationships": [rel for item_scope_id in scope_ids for rel in store.list_effective_family_relationships(item_scope_id)],
+    }
+
+
+@app.patch("/api/family-graph/people/{person_id}/membership")
+def update_family_membership(person_id: str, payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    membership = str((payload or {}).get("membership") or "").strip()
+    if not scope_id or not membership:
+        raise HTTPException(status_code=400, detail="scope_id and membership are required")
+    try:
+        value = store.set_family_membership(
+            scope_id, person_id, membership, source="user_override", confidence=1.0,
+            evidence_refs=(payload or {}).get("evidence_refs") or [],
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "membership": value}
+
+
+@app.put("/api/family-graph/relationships")
+def update_family_relationship(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    try:
+        rows = store.set_family_relationship(
+            scope_id,
+            str((payload or {}).get("subject_entity_id") or ""),
+            str((payload or {}).get("predicate") or ""),
+            str((payload or {}).get("object_entity_id") or ""),
+            str((payload or {}).get("inverse_predicate") or ""),
+            source="user_override", confidence=1.0,
+            evidence_refs=(payload or {}).get("evidence_refs") or [],
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "relationships": rows}
+
+
+@app.delete("/api/family-graph/relationships")
+def retract_family_relationship(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    subject_entity_id = str((payload or {}).get("subject_entity_id") or "").strip()
+    object_entity_id = str((payload or {}).get("object_entity_id") or "").strip()
+    if not scope_id or not subject_entity_id or not object_entity_id:
+        raise HTTPException(status_code=400, detail="scope_id, subject_entity_id and object_entity_id are required")
+    try:
+        rows = store.retract_family_relationship(scope_id, subject_entity_id, object_entity_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "retracted": rows}
+
+
+@app.post("/api/family-graph/runs")
+def start_family_analysis_run(payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    if not scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    latest = store.latest_family_analysis_run(scope_id)
+    if latest and latest.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail="family analysis run already in progress")
+    run = store.create_family_analysis_run(scope_id, {
+        "trigger_type": "user_rerun", "input_mode": "semantic_text_only",
+    })
+    threading.Thread(target=_execute_family_analysis_run, args=(run["id"], scope_id), daemon=True).start()
+    return {"status": 202, "run": run}
+
+
+@app.post("/api/family-graph/scopes/merge")
+def merge_family_graph_scopes(payload: dict):
+    try:
+        return store.merge_family_scopes((payload or {}).get("scope_ids") or [])
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.patch("/api/family-graph/people/{person_id}/portrait")
+def update_family_portrait(person_id: str, payload: dict):
+    scope_id = str((payload or {}).get("scope_id") or "").strip()
+    text = str((payload or {}).get("portrait_text") or "").strip()
+    if not scope_id or not text:
+        raise HTTPException(status_code=400, detail="scope_id and portrait_text are required")
+    return {"ok": True, "portrait": store.write_family_portrait(scope_id, person_id, text, source="user_override", evidence_refs=(payload or {}).get("evidence_refs") or [])}
+
+
 @app.post("/api/relationship-hypotheses/{hypothesis_id}/decision")
 def relationship_hypothesis_decision(hypothesis_id: str, payload: dict):
     decision = str((payload or {}).get("decision") or "").strip()
@@ -2138,16 +2316,28 @@ def _seed_face_detect(path: str) -> list[dict]:
     # Step 3: whole-image fallback for pre-cropped face photos
     try:
         _crop = align_face_crop(_img, [0, 0, _w, _h])
-        _emb = pipeline.face.identity_adapter.embed(_crop)
+        _identity_adapter = getattr(pipeline.face, "identity_adapter", None)
+        if _identity_adapter is not None:
+            _emb = _identity_adapter.embed(_crop)
+            embedding = _emb.embedding
+            embedding_model = pipeline.face.identity_model
+            embedding_version = _emb.model_version
+            quality_signal = _emb.quality_signal
+        else:
+            # identity_adapter未配置(legacy模式):用CLIP embedding兜底
+            embedding = []
+            embedding_model = "legacy"
+            embedding_version = "no_identity_adapter"
+            quality_signal = 0.5
         return [{
             "bbox": [0, 0, float(_w), float(_h)],
             "confidence": 0.99, "quality": 0.8,
             "area_ratio": 1.0, "sharpness": 0.0, "pose": [],
-            "landmarks": [], "embedding": _emb.embedding,
-            "embedding_model": pipeline.face.identity_model,
-            "embedding_version": _emb.model_version,
-            "quality_signal": _emb.quality_signal,
-            "pose_bucket": "frontal", "identity_ready": True,
+            "landmarks": [], "embedding": embedding,
+            "embedding_model": embedding_model,
+            "embedding_version": embedding_version,
+            "quality_signal": quality_signal,
+            "pose_bucket": "frontal", "identity_ready": _identity_adapter is not None,
         }]
     except Exception:
         return []
@@ -2188,7 +2378,7 @@ async def seed_person_identity(
     if not face_photos:
         raise HTTPException(status_code=422, detail="no detectable faces in uploaded photos")
     result = store.seed_person_identity(scope, name, (familyRole or "").strip() or None, alias_list, face_photos)
-    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": m_role, "aliases": result["aliases"]}
+    return {"entity_id": result["entity"]["id"], "cluster_id": result["cluster_id"], "name": result["name"], "face_count": result["face_count"], "family_role": (familyRole or "").strip() or None, "aliases": result["aliases"]}
 
 
 @app.post("/api/people/seed-batch", status_code=201)
@@ -3166,13 +3356,31 @@ def assistant_response(result):
         projected = []
         for item in evidence_media[:3]:
             asset_id = str(item.get("asset_id"))
-            asset = None
-            if not item.get("media_type"):
-                try:
-                    asset = store.get_asset(asset_id)
-                except Exception:
-                    pass
+            try:
+                asset = store.get_asset(asset_id)
+            except Exception:
+                asset = None
             media_type = str(item.get("media_type") or (asset or {}).get("media_type") or "image")
+            source_asset = None
+            parent_asset_id = str((asset or {}).get("parent_asset_id") or "")
+            derived_kind = str((asset or {}).get("derived_kind") or "")
+            if derived_kind in {"video_keyframe", "video_keyframe_webp"} and parent_asset_id:
+                try:
+                    source_asset = store.get_asset(parent_asset_id)
+                except Exception:
+                    source_asset = None
+            if source_asset and source_asset.get("media_type") == "video":
+                projected.append({
+                    "asset_id": str(source_asset.get("id") or parent_asset_id),
+                    "file_name": source_asset.get("file_name") or "",
+                    "media_type": "video",
+                    "media_url": f"/api/assets/{source_asset.get('id') or parent_asset_id}/file",
+                    "display_handle": item.get("handle") or "源视频关键帧",
+                    "captured_at": item.get("captured_at") or (asset or {}).get("captured_at") or "",
+                    "source_timestamp_sec": (asset or {}).get("source_timestamp_sec"),
+                    "source_keyframe_asset_id": asset_id,
+                })
+                continue
             projected.append({
                 "asset_id": asset_id,
                 "file_name": item.get("file_name") or (asset or {}).get("file_name") or "",

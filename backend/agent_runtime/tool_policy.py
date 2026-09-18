@@ -72,6 +72,10 @@ class ToolPolicy:
         "_model_call_metrics",
     }
     _TOOL_ALLOWED = {
+        "query_memory_facts": _DEFAULT_ALLOWED | {
+            "fact_type", "subject", "value", "unit", "rows", "samples",
+            "filters_applied", "total",
+        },
         "query_photo_people": _DEFAULT_ALLOWED | {
             "result_set_id", "asset_id", "people", "unconfirmed_people",
             "unconfirmed_people_count", "source_asset_ids", "source_handles",

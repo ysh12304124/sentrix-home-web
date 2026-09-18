@@ -25,7 +25,7 @@ class ProfileConfig:
 PROFILES = {
     "goal_driven_candidate": ProfileConfig(
         name="goal_driven_candidate",
-        tools=("query_photo_people",
+        tools=("query_memory_facts", "query_photo_people",
                "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history",
                "get_core_memory", "get_person_profile"),
@@ -42,7 +42,7 @@ PROFILES = {
     ),
     "goal_driven_shadow": ProfileConfig(
         name="goal_driven_shadow",
-        tools=("query_photo_people",
+        tools=("query_memory_facts", "query_photo_people",
                "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history",
                "get_core_memory", "get_person_profile"),
@@ -56,7 +56,7 @@ PROFILES = {
     ),
     "tool_loop_shadow": ProfileConfig(
         name="tool_loop_shadow",
-        tools=("query_photo_people",
+        tools=("query_memory_facts", "query_photo_people",
                "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history",
                "get_core_memory", "get_person_profile"),
@@ -69,7 +69,7 @@ PROFILES = {
     ),
     "tool_loop": ProfileConfig(
         name="tool_loop",
-        tools=("query_photo_people",
+        tools=("query_memory_facts", "query_photo_people",
                "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history",
                "get_core_memory", "get_person_profile"),
