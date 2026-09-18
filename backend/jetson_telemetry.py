@@ -291,6 +291,7 @@ class LocalJetsonLlamaCppTelemetryProvider:
         self._last_device_probe = 0.0
         self._device_sample: dict = {}
         self._last_pid = None
+        self._system_baseline_mib = None
         self._last_memory = {"status": "unavailable", "reason": "not_sampled"}
 
     def _pid_from_proc(self, pid: int) -> int:
@@ -334,6 +335,32 @@ class LocalJetsonLlamaCppTelemetryProvider:
                 if line.startswith("Pss:"):
                     return round(int(line.split()[1]) / 1024, 2)
         raise ValueError("Pss not found in smaps_rollup")
+
+    @staticmethod
+    def _rss_mib(pid: int) -> float:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines():
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 1024, 2)
+        raise ValueError("VmRSS not found")
+
+    def _llama_args(self, pid: int) -> dict:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        args = [os.fsdecode(item) for item in raw if item]
+        def flag(*names):
+            for name in names:
+                if name in args:
+                    index = args.index(name)
+                    if index + 1 < len(args):
+                        return args[index + 1]
+            return None
+        return {
+            "ctx_size": flag("--ctx-size", "-c"),
+            "parallel": flag("--parallel", "-np"),
+            "n_gpu_layers": flag("--n-gpu-layers", "-ngl"),
+            "cache_ram": flag("--cache-ram"),
+            "model": flag("--model", "-m"),
+            "cmdline": " ".join(args)[:2000],
+        }
 
     def _metrics(self) -> dict:
         data = {}
@@ -383,12 +410,27 @@ class LocalJetsonLlamaCppTelemetryProvider:
                 self._last_probe = 0.0
                 data.pop("process_memory_used_mib", None)
             data["root_pid"] = pid
+            if pid != getattr(self, "_baseline_pid", None):
+                self._baseline_pid = pid
+                self._system_baseline_mib = None
             if time.monotonic() - self._last_probe >= self.pss_interval:
                 self._last_probe = time.monotonic()
                 data["process_memory_used_mib"] = self._pss_mib(pid)
                 data["process_memory_scope"] = "llama_server_pss"
+                try:
+                    data["process_rss_mib"] = self._rss_mib(pid)
+                    data["llama_server_args"] = self._llama_args(pid)
+                except (OSError, ValueError, IndexError):
+                    pass
                 data["pss_sampled_at_monotonic"] = time.monotonic()
                 data.pop("pss_error", None)
+            device = self._device()
+            used = device.get("system_memory_used_mib")
+            if self._system_baseline_mib is None and isinstance(used, (int, float)):
+                self._system_baseline_mib = float(used)
+            if self._system_baseline_mib is not None and isinstance(used, (int, float)):
+                data["system_memory_baseline_mib"] = round(self._system_baseline_mib, 2)
+                data["system_memory_delta_mib"] = round(float(used) - self._system_baseline_mib, 2)
         except (OSError, ValueError, IndexError) as exc:
             data.pop("process_memory_used_mib", None)
             data["pss_error"] = str(exc)

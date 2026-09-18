@@ -1607,6 +1607,11 @@ class GpuSampler:
                     sample["system_memory_total_mib"] = system_memory.get("system_memory_total_mib", process_memory.get("system_memory_total_mib"))
                     sample["system_memory_available_mib"] = system_memory.get("system_memory_available_mib", process_memory.get("system_memory_available_mib"))
                     sample["system_memory_scope"] = system_memory.get("system_memory_scope", process_memory.get("system_memory_scope"))
+                    sample["system_memory_delta_mib"] = process_memory.get("system_memory_delta_mib")
+                    sample["system_memory_baseline_mib"] = process_memory.get("system_memory_baseline_mib")
+                    sample["llama_server_args"] = process_memory.get("llama_server_args")
+                    if sample.get("model_process_system_memory_used_mib") is None and process_memory.get("process_rss_mib") is not None:
+                        sample["model_process_system_memory_used_mib"] = process_memory.get("process_rss_mib")
                     sample["memory_scope"] = process_memory.get("memory_scope") or sample.get("memory_scope")
                     sample["process_memory_scope"] = process_memory.get("process_memory_scope")
                     sample["model_process_system_memory_scope"] = process_memory.get("model_process_system_memory_scope")
@@ -1655,6 +1660,7 @@ class GpuSampler:
             "model_process_memory_used_mib", "kv_cache_usage_pct", "kv_cache_used_tokens",
             "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
             "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
+            "model_process_system_memory_used_mib", "system_memory_delta_mib",
         ):
             values = [
                 s[key] for s in self.samples
@@ -1995,6 +2001,8 @@ class BenchmarkRun:
                 live["peak"] = {}
             if not isinstance(live.get("phase_snapshots"), dict):
                 live["phase_snapshots"] = {}
+            if sample.get("llama_server_args") and not self.state.get("llama_server_args"):
+                self.state["llama_server_args"] = sample.get("llama_server_args")
             live["status"] = "running"
             live["source"] = sample.get("source") or self.telemetry_source
             live["samples_count"] = int(live.get("samples_count") or 0) + 1
@@ -2005,6 +2013,7 @@ class BenchmarkRun:
                 "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
                 "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
                 "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
+                "system_memory_delta_mib",
             )
             live["latest"] = {key: sample.get(key) for key in fields if sample.get(key) is not None}
             live["model_processes"] = sample.get("model_processes") or []
@@ -2070,6 +2079,7 @@ class BenchmarkRun:
             "partial": True,
             "started_at": existing.get("started_at") or now_iso(),
             "updated_at": now_iso(),
+            "llama_server_args": self.state.get("llama_server_args"),
         })
         self.state.setdefault("phases", {})["gpu_metrics"] = partial
 
@@ -2816,15 +2826,19 @@ class BenchmarkRun:
             for asset in assets:
                 status = str(asset.get("status") or "unknown")
                 status_counts[status] = status_counts.get(status, 0) + 1
-            # Compare each asset's state instead of only aggregate counts. Two assets
-            # can transition in opposite directions during one poll and leave the
-            # counts unchanged even though the pipeline is making progress.
-            asset_status_signature = tuple(sorted(
+            # Track progress with a *stable* signature: aggregate counts plus
+            # the set of (id, terminal-status) pairs for assets that have left
+            # pending states. Per-asset status flapping inside the pending set
+            # (e.g. video-keyframe-extracting ↔ video-queued during a retry
+            # loop) must NOT reset the stall timer — otherwise the detector is
+            # defeated and the pipeline hangs forever.
+            non_pending_signature = tuple(sorted(
                 (str(asset.get("id") or asset.get("asset_id") or asset.get("path") or index),
                  str(asset.get("status") or "unknown"))
                 for index, asset in enumerate(assets)
+                if asset.get("status") not in PIPELINE_PENDING_STATUSES
             ))
-            progress_signature = (asset_status_signature, batch_status)
+            progress_signature = (len(pending), processed, failed, non_pending_signature, batch_status)
             now = time.monotonic()
             if getattr(self, "_pipeline_progress_signature", None) != progress_signature:
                 self._pipeline_progress_signature = progress_signature
@@ -4276,6 +4290,16 @@ class BenchmarkRun:
                 return response, attempt
             except Exception as exc:
                 last_error = exc
+                # 4xx 是请求本身的问题（订阅失效 / key 失效 / 路径错），重试改变不了
+                # 任何事，只会把 0.2 秒的失败拖成几分钟。直接抛，让问题立刻可见。
+                # 实测：豆包 AgentPlan 订阅失效时每次 0.2s 返回 400，被 6 次退避
+                # 拖成约 195 秒/题，487 题判分空转 8.6 小时。
+                client_code = self._judge_client_error(exc)
+                if client_code is not None:
+                    raise RuntimeError(
+                        f"judge request rejected with HTTP {client_code} "
+                        f"(client error, not retryable): {exc}"
+                    ) from exc
                 if attempt >= JUDGE_RETRY_ATTEMPTS:
                     break
                 delay = self._judge_retry_delay(exc, attempt)
@@ -4301,6 +4325,29 @@ class BenchmarkRun:
             ) + JUDGE_REQUEST_INTERVAL_SECONDS
         if wait_seconds and self._cancel.wait(wait_seconds):
             raise RunCancelledError("cancelled while waiting for Judge rate limit")
+
+    @staticmethod
+    def _judge_client_error(error: BaseException) -> int | None:
+        """返回**不可重试**的 4xx 状态码（400/401/403/404/422…）；否则 None。
+
+        408（超时）与 429（限流）刻意排除：它们重试是对的，而且
+        _judge_retry_delay 读的 Retry-After 就是给它们用的。
+
+        request_json 把 urllib 的 HTTPError 包装成 RuntimeError，原异常挂在
+        __cause__ 上，所以这里沿异常链找带 .code 的那一层（与 _judge_retry_delay
+        找 Retry-After 的做法一致）。
+        """
+        current: BaseException | None = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            code = getattr(current, "code", None)
+            # 4xx 里有两类**必须**重试：429 限流、408 请求超时 —— 重试正是对症下药，
+            # 而且 _judge_retry_delay 读的 Retry-After 就是给它们用的。
+            if isinstance(code, int) and 400 <= code < 500 and code not in (408, 429):
+                return code
+            current = current.__cause__ or current.__context__
+        return None
 
     @staticmethod
     def _judge_retry_delay(error: Exception, attempt: int) -> float:
