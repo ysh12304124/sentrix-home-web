@@ -1610,6 +1610,8 @@ class GpuSampler:
                     sample["system_memory_delta_mib"] = process_memory.get("system_memory_delta_mib")
                     sample["system_memory_baseline_mib"] = process_memory.get("system_memory_baseline_mib")
                     sample["llama_server_args"] = process_memory.get("llama_server_args")
+                    sample["sentrix_stack_pss_mib"] = process_memory.get("sentrix_stack_pss_mib")
+                    sample["product_stack_memory_mib"] = process_memory.get("product_stack_memory_mib")
                     if sample.get("model_process_system_memory_used_mib") is None and process_memory.get("process_rss_mib") is not None:
                         sample["model_process_system_memory_used_mib"] = process_memory.get("process_rss_mib")
                     sample["memory_scope"] = process_memory.get("memory_scope") or sample.get("memory_scope")
@@ -1661,6 +1663,7 @@ class GpuSampler:
             "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
             "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
             "model_process_system_memory_used_mib", "system_memory_delta_mib",
+            "sentrix_stack_pss_mib", "product_stack_memory_mib",
         ):
             values = [
                 s[key] for s in self.samples
@@ -2013,7 +2016,7 @@ class BenchmarkRun:
                 "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
                 "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
                 "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
-                "system_memory_delta_mib",
+                "system_memory_delta_mib", "sentrix_stack_pss_mib", "product_stack_memory_mib",
             )
             live["latest"] = {key: sample.get(key) for key in fields if sample.get(key) is not None}
             live["model_processes"] = sample.get("model_processes") or []

@@ -131,33 +131,67 @@ def _sum_mib(rows: list[dict], key: str) -> float | None:
     return round(sum(values), 2) if values else None
 
 
+def _process_pss_mib(pid: int) -> float | None:
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
+            for line in file:
+                if line.startswith("Pss:"):
+                    return round(int(line.split()[1]) / 1024, 2)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _is_model_process(row: dict, *, model_pid: int | None, endpoint_port: str) -> bool:
+    identity = str(row.get("identity") or "")
+    return (
+        (model_pid is not None and row.get("pid") == model_pid)
+        or "llama-server" in identity
+        or f"--port {endpoint_port}" in identity
+        or f"--port {endpoint_port} " in identity
+    )
+
+
 def _augment_local_process_memory(data: dict | None, *, model_pid: int | None, endpoint_port: str) -> dict:
+    """Product occupancy = Sentrix-side PSS sum + llama VmRSS.
+
+    RSS sums double-count shared libraries. PSS sums do not. Llama CUDA UMA is
+    often missing from PSS, so the model term uses VmRSS.
+    """
     data = dict(data or {})
     try:
         rows = _host_process_rows()
     except Exception:
         rows = []
-    model_rows = [
-        row for row in rows
-        if row["pid"] == model_pid or "llama-server" in str(row.get("identity") or "")
-        or str(endpoint_port) in str(row.get("identity") or "")
-    ]
-    system_rows = [row for row in rows if _is_system_related_process(row)]
+    model_rows = [row for row in rows if _is_model_process(row, model_pid=model_pid, endpoint_port=str(endpoint_port))]
+    product_rows = [row for row in rows if _is_system_related_process(row)]
+    sentrix_rows = [row for row in product_rows if row.get("pid") not in {item.get("pid") for item in model_rows}]
+    for row in sentrix_rows + model_rows:
+        row["pss_mib"] = _process_pss_mib(int(row["pid"]))
     model_rss = _sum_mib(model_rows, "rss_mib")
-    system_rss = _sum_mib(system_rows, "rss_mib")
+    sentrix_pss = _sum_mib(sentrix_rows, "pss_mib")
     if model_rss is not None:
         data["model_process_system_memory_used_mib"] = model_rss
-        data["model_process_system_memory_scope"] = "host_process_rss"
+        data["model_process_system_memory_scope"] = "host_process_vmrss"
         data["model_system_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in model_rows[:20]
         ]
-    if system_rss is not None:
-        data["benchmark_process_memory_used_mib"] = system_rss
-        data["benchmark_process_memory_scope"] = "photobench_related_host_process_rss"
+    if sentrix_pss is not None:
+        data["sentrix_stack_pss_mib"] = sentrix_pss
+        data["sentrix_stack_pss_scope"] = "sentrix_related_pss_excluding_llama"
+        data["sentrix_processes"] = [
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
+            for row in sentrix_rows[:50]
+        ]
+    if sentrix_pss is not None or model_rss is not None:
+        product = round((sentrix_pss or 0.0) + (model_rss or 0.0), 2)
+        data["product_stack_memory_mib"] = product
+        data["benchmark_process_memory_used_mib"] = product
+        data["benchmark_process_memory_scope"] = "sentrix_pss_plus_llama_vmrss"
         data["benchmark_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
-            for row in system_rows[:50]
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
+            for row in (sentrix_rows + model_rows)[:50]
         ]
     return data
 

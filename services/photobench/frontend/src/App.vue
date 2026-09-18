@@ -905,7 +905,8 @@ function liveTelemetryRows(run) {
     ["当前阶段", ["completed", "failed", "cancelled"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
     ["主模型 RAM", fmtGiB(latest.model_process_system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_system_memory_used_mib)} · 进程系统内存，不代表权重又完整占一份`],
     [`主模型 GPU ${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · 仅可归因到模型的 GPU/UMA 进程`],
-    ["测评系统 RAM", fmtGiB(latest.benchmark_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_memory_used_mib)} · 8771/8091/8500/8100/Qdrant 等相关进程`],
+    ["整套产品占用", fmtGiB(latest.product_stack_memory_mib ?? latest.benchmark_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.product_stack_memory_mib ?? effectivePeak.benchmark_process_memory_used_mib)} · Sentrix周边PSS + llama VmRSS`],
+    ["Sentrix 周边 PSS", fmtGiB(latest.sentrix_stack_pss_mib), `峰值 ${fmtGiB(effectivePeak.sentrix_stack_pss_mib)} · 不含 llama-server，PSS 加总不重叠共享库`],
     ["测评系统 GPU 显存", fmtGiB(latest.benchmark_process_gpu_memory_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_gpu_memory_mib)} · 相关 GPU compute 进程合计`],
     ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(effectivePeak.memory_used_mib)} · NVIDIA GPU 总占用`],
     ["整机 RAM", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.system_memory_used_mib)} · ${latest.system_memory_scope === "host_all_processes" ? "宿主机全部进程" : "未标注范围"}`],
@@ -970,7 +971,8 @@ function renderTelemetryChart() {
   const definitions = [
     ...(isOrin
       ? [{ key: "system_memory_used_mib", name: "整机 RAM（Orin UMA）", color: "#20a36a" },
-         { key: "benchmark_process_memory_used_mib", name: "测评系统进程内存（Orin UMA/RSS）", color: "#d9488b" },
+         { key: "product_stack_memory_mib", name: "整套产品占用（周边PSS+模型VmRSS）", color: "#d9488b" },
+         { key: "sentrix_stack_pss_mib", name: "Sentrix 周边 PSS（不含模型）", color: "#8b6de8" },
          { key: "model_process_system_memory_used_mib", name: "主模型进程 VmRSS（更接近占用）", color: "#f2b84b" },
          { key: "model_process_memory_used_mib", name: "主模型页表 PSS（常漏 GPU）", color: "#ef8a4b" }]
       : [{ key: "memory_used_mib", name: "整卡 GPU 显存", color: "#4f7cff" },
@@ -3103,7 +3105,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
     <strong>主模型 RAM</strong><span><b>计算式：</b>主模型相关进程的 RSS/PSS 采样；153 目前为 Linux RSS，Orin 主模型另有 PSS 曲线。</span><span><b>含义：</b>包含 Python/vLLM 或 llama.cpp runtime、tokenizer、调度结构、mmap 页、共享库和 CUDA 用户态开销等；不表示模型权重在 RAM 里又完整复制了一份。</span>
   </div>
   <div class="metric-definition-row">
-    <strong>测评系统 RAM / GPU</strong><span><b>范围：</b>默认按 8771、8091、8500/8501、8100/8101、6333 端口，以及 photobench、sentrix、vllm、qdrant、llama-server、ollama 等进程关键词归因。</span><span><b>判读：</b>它是 PhotoBench/Sentrix 相关进程组的资源占用，用来和“整机/整卡”区分；如果系统上有同名无关进程，可能被归入该组。</span>
+    <strong>整套产品占用</strong><span><b>算法：</b>Sentrix/8771/Qdrant 等周边进程 PSS 之和（不含 llama）加上主模型 VmRSS。共享库按 PSS 摊开，llama 的 GPU 统一内存走 VmRSS。</span><span><b>判读：</b>独立设备选型看这条；专机部署时应接近整机 RAM 减去操作系统底噪。旧 RSS 加总会虚高。</span>
   </div>
   <div class="metric-definition-row">
     <strong>vLLM 与 llama.cpp</strong><span><b>vLLM：</b>GPU 显存包含权重、预分配 KV 池和运行时 buffer，受 gpu_memory_utilization 影响，可能高于请求时真实活跃 KV。</span><span><b>llama.cpp/Ollama：</b>独显环境可按进程采 GPU 显存；Orin 是统一内存平台，不显示独立 GPU 显存。</span>
