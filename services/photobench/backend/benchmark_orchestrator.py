@@ -5226,6 +5226,7 @@ class OrchestratorRepository:
                         "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
                         "other_processes_memory_mib", "all_processes_memory_mib",
                         "system_memory_used_mib", "system_memory_total_mib",
+                        "system_memory_delta_mib", "sentrix_stack_pss_mib", "product_stack_memory_mib",
                     )
                     lines = samples_path.read_text(encoding="utf-8").splitlines() if samples_path.is_file() else []
                     for line in lines:

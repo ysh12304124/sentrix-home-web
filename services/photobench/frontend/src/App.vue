@@ -971,7 +971,7 @@ function renderTelemetryChart() {
   const definitions = [
     ...(isOrin
       ? [{ key: "system_memory_used_mib", name: "整机 RAM（Orin UMA）", color: "#20a36a" },
-         { key: "product_stack_memory_mib", name: "整套产品占用（周边PSS+模型VmRSS）", color: "#d9488b" },
+         { key: "product_stack_memory_mib", alt: "benchmark_process_memory_used_mib", name: "整套产品占用（周边PSS+模型VmRSS）", color: "#d9488b" },
          { key: "sentrix_stack_pss_mib", name: "Sentrix 周边 PSS（不含模型）", color: "#8b6de8" },
          { key: "model_process_system_memory_used_mib", name: "主模型进程 VmRSS（更接近占用）", color: "#f2b84b" },
          { key: "model_process_memory_used_mib", name: "主模型页表 PSS（常漏 GPU）", color: "#ef8a4b" }]
@@ -982,7 +982,16 @@ function renderTelemetryChart() {
          { key: "model_process_memory_used_mib", name: "主模型 GPU 显存", color: "#ef8a4b" },
          { key: "model_process_system_memory_used_mib", name: "主模型 RAM（进程 RSS）", color: "#f2b84b" }]),
   ];
-  const available = definitions.filter((definition) => history.some((item) => Number.isFinite(Number(item[definition.key]))));
+  const seriesValue = (item, definition) => {
+    const primary = Number(item[definition.key]);
+    if (Number.isFinite(primary)) return primary;
+    if (definition.alt) {
+      const fallback = Number(item[definition.alt]);
+      if (Number.isFinite(fallback)) return fallback;
+    }
+    return null;
+  };
+  const available = definitions.filter((definition) => history.some((item) => seriesValue(item, definition) != null));
   const firstTimestamp = Number(history[0]?.t);
   const labels = history.map((item, index) => {
     const elapsed = Number(item?.t) - firstTimestamp;
@@ -1030,7 +1039,7 @@ function renderTelemetryChart() {
       connectNulls: false,
       lineStyle: { width: 2.5 },
       emphasis: { focus: "series", lineStyle: { width: 4 } },
-      data: history.map((item) => Number.isFinite(Number(item[definition.key])) ? Number(item[definition.key]) / 1024 : null),
+      data: history.map((item) => { const value = seriesValue(item, definition); return value == null ? null : value / 1024; }),
       markArea: definition === available[0] && phaseAreas.length ? {
         silent: true,
         label: { show: true, position: "insideTop", color: "#59627c", fontSize: 10 },
