@@ -192,6 +192,18 @@ def _query_compute_apps() -> list[dict]:
     return rows
 
 
+
+def _process_pss_mib(pid: int) -> float | None:
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
+            for line in file:
+                if line.startswith("Pss:"):
+                    return round(int(line.split()[1]) / 1024, 2)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def _sum_mib(rows: list[dict], key: str) -> float | None:
     values = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
     return round(sum(values), 2) if values else None
@@ -239,21 +251,30 @@ def _augment_host_process_memory(
     system_pids = {row["pid"] for row in system_rows}
     system_gpu_rows = [row for row in compute_apps if row.get("pid") in system_pids]
 
+    model_pids = {row["pid"] for row in model_rows}
+    sentrix_rows = [row for row in system_rows if row["pid"] not in model_pids]
+    for row in system_rows:
+        row["pss_mib"] = _process_pss_mib(int(row["pid"]))
     model_rss = _sum_mib(model_rows, "rss_mib")
-    system_rss = _sum_mib(system_rows, "rss_mib")
+    sentrix_pss = _sum_mib(sentrix_rows, "pss_mib")
+    product_pss = _sum_mib(system_rows, "pss_mib")
     system_gpu = _sum_mib(system_gpu_rows, "used_memory_mib")
     if model_rss is not None:
         data["model_process_system_memory_used_mib"] = model_rss
         data["model_process_system_memory_scope"] = "host_process_rss"
         data["model_system_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in model_rows[:20]
         ]
-    if system_rss is not None:
-        data["benchmark_process_memory_used_mib"] = system_rss
-        data["benchmark_process_memory_scope"] = "photobench_related_host_process_rss"
+    if sentrix_pss is not None:
+        data["sentrix_stack_pss_mib"] = sentrix_pss
+        data["sentrix_stack_pss_scope"] = "sentrix_related_pss_excluding_model"
+    if product_pss is not None:
+        data["product_stack_memory_mib"] = product_pss
+        data["benchmark_process_memory_used_mib"] = product_pss
+        data["benchmark_process_memory_scope"] = "photobench_related_host_process_pss"
         data["benchmark_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in system_rows[:50]
         ]
     if system_gpu is not None:

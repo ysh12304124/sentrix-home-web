@@ -1004,7 +1004,8 @@ function renderTelemetryChart() {
       : [{ key: "memory_used_mib", name: "整卡 GPU 显存", color: "#4f7cff" },
          { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" },
          { key: "benchmark_process_gpu_memory_mib", name: "测评系统 GPU 显存", color: "#d9488b" },
-         { key: "benchmark_process_memory_used_mib", name: "测评系统 RAM（进程 RSS）", color: "#8b6de8" },
+         { key: "product_stack_memory_mib", alt: "benchmark_process_memory_used_mib", name: "整套产品 RAM（相关进程 PSS 加总）", color: "#8b6de8" },
+         { key: "sentrix_stack_pss_mib", name: "Sentrix 周边 PSS（不含模型）", color: "#a78bfa" },
          { key: "model_process_memory_used_mib", name: "主模型 GPU 显存", color: "#ef8a4b" },
          { key: "model_process_system_memory_used_mib", name: "主模型 RAM（进程 RSS）", color: "#f2b84b" }]),
   ];

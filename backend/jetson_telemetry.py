@@ -131,15 +131,19 @@ def _sum_mib(rows: list[dict], key: str) -> float | None:
     return round(sum(values), 2) if values else None
 
 
-def _process_pss_mib(pid: int) -> float | None:
+def _process_smaps_field_mib(pid: int, field: str) -> float | None:
     try:
         with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
             for line in file:
-                if line.startswith("Pss:"):
+                if line.startswith(field):
                     return round(int(line.split()[1]) / 1024, 2)
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def _process_pss_mib(pid: int) -> float | None:
+    return _process_smaps_field_mib(pid, "Pss:")
 
 
 def _is_model_process(row: dict, *, model_pid: int | None, endpoint_port: str) -> bool:
@@ -167,8 +171,12 @@ def _augment_local_process_memory(data: dict | None, *, model_pid: int | None, e
     product_rows = [row for row in rows if _is_system_related_process(row)]
     sentrix_rows = [row for row in product_rows if row.get("pid") not in {item.get("pid") for item in model_rows}]
     for row in sentrix_rows + model_rows:
-        row["pss_mib"] = _process_pss_mib(int(row["pid"]))
+        pid = int(row["pid"])
+        row["pss_mib"] = _process_pss_mib(pid)
+        row["smaps_rss_mib"] = _process_smaps_field_mib(pid, "Rss:")
     model_rss = _sum_mib(model_rows, "rss_mib")
+    model_pss = _sum_mib(model_rows, "pss_mib")
+    model_smaps_rss = _sum_mib(model_rows, "smaps_rss_mib")
     sentrix_pss = _sum_mib(sentrix_rows, "pss_mib")
     if model_rss is not None:
         data["model_process_system_memory_used_mib"] = model_rss
@@ -184,11 +192,15 @@ def _augment_local_process_memory(data: dict | None, *, model_pid: int | None, e
             {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in sentrix_rows[:50]
         ]
-    if sentrix_pss is not None or model_rss is not None:
-        product = round((sentrix_pss or 0.0) + (model_rss or 0.0), 2)
+    if sentrix_pss is not None or model_pss is not None or model_rss is not None:
+        # PSS sums do not double-count shared CPU pages. VmRSS-smapsRss is the
+        # Jetson UMA/CUDA hole that PSS misses.
+        cpu_pages = (sentrix_pss or 0.0) + (model_pss or 0.0)
+        uma_extra = max(0.0, (model_rss or 0.0) - (model_smaps_rss if model_smaps_rss is not None else (model_pss or 0.0)))
+        product = round(cpu_pages + uma_extra, 2)
         data["product_stack_memory_mib"] = product
         data["benchmark_process_memory_used_mib"] = product
-        data["benchmark_process_memory_scope"] = "sentrix_pss_plus_llama_vmrss"
+        data["benchmark_process_memory_scope"] = "sentrix_pss_plus_llama_pss_plus_uma_extra"
         data["benchmark_processes"] = [
             {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in (sentrix_rows + model_rows)[:50]
