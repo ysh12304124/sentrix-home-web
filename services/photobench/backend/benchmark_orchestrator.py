@@ -71,7 +71,7 @@ RUNTIME_CONNECTION_CONFIG = _load_runtime_connection_config()
 DEFAULT_SENTRIX_URL = (
     os.environ.get("BENCH_SENTRIX_URL")
     or str(RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or "")
-    or "http://192.168.0.153:8091"
+    or "http://127.0.0.1:8091"
 )
 
 
@@ -179,7 +179,7 @@ DEFAULT_JUDGE_URL = (
 DEFAULT_VLLM_API_URL = (
     os.environ.get("BENCH_VLLM_API_URL")
     or (str(RUNTIME_CONNECTION_CONFIG.get("vllm_manager_url"))
-        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://192.168.0.153:8500")
+        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://127.0.0.1:8500")
 )
 DEFAULT_VLLM_BASE_URL = (
     os.environ.get("BENCH_VLLM_BASE_URL")
@@ -2015,7 +2015,7 @@ class BenchmarkRun:
                     return exc
             served_names = {state.get("profile"), state.get("served_model_name")}
             if self.model_profile in served_names:
-                base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
+                base = self.vllm_model_base_url or state.get("external_url_hint") or f"http://127.0.0.1:{state.get('port', 8100)}/v1"
                 root = base.rstrip("/").removesuffix("/v1")
                 probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
                 if probe is None:
@@ -2119,7 +2119,7 @@ class BenchmarkRun:
         # 3. Health check (cancel-aware)
         state = self.lifecycle_provider.state()
         port = state.get("port", 8105)
-        base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
+        base = self.vllm_model_base_url or state.get("external_url_hint") or f"http://127.0.0.1:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
         t_health0 = time.perf_counter()
         health_error = self._probe_model_endpoint(state, model_api_root)

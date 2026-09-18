@@ -368,6 +368,25 @@ def _process_image_stages(image_ids, task_store, task_pipeline, limits):
             prepared = future.result()
             with db_write_guard("ingest-commit-semantic"):
                 task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
+            # Also write to FTS for retrieval
+            caption = prepared.get("caption", "") or ""
+            activity = prepared.get("activity", "") or ""
+            place = prepared.get("place", "") or ""
+            text = f"{caption} {activity} {place}".strip()
+            if text:
+                import uuid, re
+                tokens = set()
+                words = re.split(r"[\\s，。、！？；：\"\(\)\[\]]+", text)
+                for word in words:
+                    word = word.strip()
+                    if word:
+                        tokens.add(word)
+                        for i in range(len(word)-1):
+                            tokens.add(word[i:i+2])
+                tokens_str = ' '.join(tokens)
+                with db_write_guard("fts-write"):
+                    cur.execute("INSERT OR IGNORE INTO observation_search_fts (tokens, scope_id, field_type, asset_id, observation_id) SELECT ?, ?, ?, ?, o.id FROM observations o WHERE o.asset_id=?", (tokens_str, scope_id, 'caption', asset_id, asset_id))
+                    conn.commit()
         except Exception as error:
             mark_semantic_failed(asset_id, error)
 
@@ -1090,7 +1109,8 @@ def bind_model_runtime(request: RuntimeBindRequest):
     manager_url = normalize_service_url(request.manager_url)
     model_base_url = normalize_openai_base_url(request.model_base_url)
     if not manager_url:
-        raise HTTPException(status_code=400, detail="invalid vLLM manager URL")
+        # Allow direct model URL (llama-server) without manager
+        manager_url = model_base_url or ""
     if request.model_base_url and not model_base_url:
         raise HTTPException(status_code=400, detail="invalid vLLM model URL")
     previous = (RUNTIME_VLLM_API_URL, RUNTIME_VLLM_BASE_URL)
