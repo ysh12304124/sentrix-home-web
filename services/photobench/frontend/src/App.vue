@@ -1076,14 +1076,27 @@ function renderTelemetryChart() {
   telemetryChartInstance.resize();
 }
 function liveTelemetryPhaseRows(run) {
+  const source = telemetryLiveState(run).source || run?.telemetry_source || run?.phases?.gpu_metrics?.source || "";
+  const isOrin = ["orin_ssh_pss", "jetson_local_pss"].includes(source);
+  const modelKey = isOrin ? "model_process_system_memory_used_mib" : "model_process_memory_used_mib";
+  const modelLabel = isOrin ? "主模型 VmRSS" : "主模型 GPU";
+  const history = telemetryHistory(run);
   const phases = run?.telemetry_live?.phase_snapshots || {};
+  const peakFromHistory = (phaseKey) => {
+    const values = history
+      .filter((item) => (item.phase || "unassigned") === phaseKey)
+      .map((item) => Number(item[modelKey]))
+      .filter((value) => Number.isFinite(value));
+    return values.length ? Math.max(...values) : null;
+  };
   return Object.entries(phases).map(([key, value]) => {
     const label = EXECUTION_PHASES.find((item) => item.key === key)?.label || key;
     const peak = value?.peak || {};
-    const model = peak.model_process_memory_used_mib == null ? "-" : `${(Number(peak.model_process_memory_used_mib) / 1024).toFixed(2)} GiB`;
+    const modelPeak = peak[modelKey] ?? peakFromHistory(key);
+    const model = modelPeak == null ? "-" : `${(Number(modelPeak) / 1024).toFixed(2)} GiB`;
     const card = peak.memory_used_mib == null ? "-" : `${(Number(peak.memory_used_mib) / 1024).toFixed(2)} GiB`;
     const host = peak.system_memory_used_mib == null ? "-" : `${(Number(peak.system_memory_used_mib) / 1024).toFixed(2)} GiB`;
-    return [label, model, `模型进程峰值 · 整卡 ${card} · 整机 RAM ${host} · ${value?.samples_count || 0} 次`];
+    return [label, model, `${modelLabel}峰值 · 整卡 ${card} · 整机 RAM ${host} · ${value?.samples_count || 0} 次`];
   });
 }
 function comparableMemoryProfile(run) {
