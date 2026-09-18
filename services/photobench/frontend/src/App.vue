@@ -844,17 +844,6 @@ function gpuMetricsView(run) {
   const live = telemetryLiveState(run);
   const history = telemetryHistory(run);
   const finished = ["completed", "completed_with_errors", "failed", "cancelled", "interrupted"].includes(run?.status);
-  if (phase.status === "done" || phase.status === "skipped" || (phase.samples_count && !phase.partial)) {
-    return { ...phase, partial: false };
-  }
-  if (phase.samples_count) {
-    return {
-      ...phase,
-      status: finished ? (phase.status || "partial") : "running",
-      partial: !finished,
-    };
-  }
-  if (!history.length && !live.samples_count) return phase;
   const stats = (key) => {
     const values = history.map((item) => Number(item?.[key])).filter((value) => Number.isFinite(value));
     if (!values.length) {
@@ -872,7 +861,44 @@ function gpuMetricsView(run) {
       p95: count >= 20 ? sorted[Math.floor(count * 0.95)] : sorted[count - 1],
     };
   };
-  return {
+  const fill = (phaseObj) => {
+    const keys = [
+      "model_process_memory_used_mib",
+      "model_process_system_memory_used_mib",
+      "system_memory_delta_mib",
+      "sentrix_stack_pss_mib",
+      "product_stack_memory_mib",
+      "system_memory_used_mib",
+      "temperature_c",
+      "gpu_utilization_pct",
+      "power_draw_w",
+      "kv_cache_usage_pct",
+      "kv_cache_used_tokens",
+    ];
+    const out = { ...phaseObj };
+    for (const key of keys) {
+      const current = out[key];
+      const hasPeak = current && typeof current === "object" && current.peak != null;
+      if (!hasPeak) {
+        const computed = stats(key);
+        if (computed.peak != null) out[key] = computed;
+      }
+    }
+    if (!out.llama_server_args) out.llama_server_args = run?.llama_server_args || {};
+    return out;
+  };
+  if (phase.status === "done" || phase.status === "skipped" || (phase.samples_count && !phase.partial)) {
+    return fill({ ...phase, partial: false });
+  }
+  if (phase.samples_count) {
+    return fill({
+      ...phase,
+      status: finished ? (phase.status || "partial") : "running",
+      partial: !finished,
+    });
+  }
+  if (!history.length && !live.samples_count) return fill(phase);
+  return fill({
     status: finished ? "partial" : "running",
     partial: !finished,
     source: live.source || run?.telemetry_source || phase.source,
@@ -881,11 +907,13 @@ function gpuMetricsView(run) {
     gpu_utilization_pct: stats("gpu_utilization_pct"),
     memory_used_mib: stats("memory_used_mib"),
     model_process_memory_used_mib: stats("model_process_memory_used_mib"),
+    model_process_system_memory_used_mib: stats("model_process_system_memory_used_mib"),
+    system_memory_delta_mib: stats("system_memory_delta_mib"),
     kv_cache_usage_pct: stats("kv_cache_usage_pct"),
     kv_cache_used_tokens: stats("kv_cache_used_tokens"),
     power_draw_w: stats("power_draw_w"),
     sm_clock_mhz: stats("sm_clock_mhz"),
-  };
+  });
 }
 function gpuMetricsStatusLabel(run) {
   const phase = gpuMetricsView(run);
