@@ -15,6 +15,7 @@ The original MAGMA node types are reused:
 """
 
 import logging
+import hashlib
 import os
 import re
 import time
@@ -81,12 +82,17 @@ class KeyframeMemoryBuilder:
         self.frame_ids = []
         self.clip_nodes = {}
         self.video_nodes = {}
+        self.event_summary_nodes = {}
         self.clip_to_video = {}
         self.object_hubs = {}
         self.relation_hubs = {}
         # frame -> set(object_label) and frame -> set(relation_label) for edges
         self.frame_objects = {}
         self.frame_relations = {}
+        # Physical scope/video context for preventing relation/object edges
+        # from linking visually unrelated videos merely because they share a
+        # generic label such as "person" or "at".
+        self.frame_context = {}
         self.frame_vectors = {}
         self.structured_index = StructuredIndex()
         self.label_matcher = None
@@ -530,6 +536,131 @@ class KeyframeMemoryBuilder:
     #  Edge creation
     # ------------------------------------------------------------------ #
 
+    def create_event_summary_nodes(self, frame_points):
+        """Create stable event parents and attach their physical frames.
+
+        The existing EVENT nodes remain the frame-level evidence units.  A
+        SESSION node with ``subtype=event_summary`` is added only as a graph
+        conduit, keyed by the source event identity (or a deterministic
+        fallback), so rebuilding the same scope cannot create random event
+        duplicates.
+        """
+        groups = defaultdict(list)
+        for fp in frame_points:
+            payload = fp.get("payload") or {}
+            event_id = str(payload.get("event_id") or "").strip()
+            if not event_id:
+                event_id = "|".join(str(payload.get(key) or "").strip()
+                                     for key in ("video_uid", "clip_uid", "event_title", "event_summary"))
+            if not event_id.strip("|"):
+                event_id = "frame:" + str(payload.get("frame_uid") or fp.get("id"))
+            groups[(str(payload.get("scope_id") or "home-default"), event_id)].append(fp)
+
+        created = 0
+        links = 0
+        for (scope_id, event_id), points in sorted(groups.items(), key=lambda item: item[0]):
+            frame_ids = [str((point.get("payload") or {}).get("source_asset_id")
+                             or point.get("id")) for point in points]
+            frame_ids = list(dict.fromkeys(frame_ids))
+            payloads = [point.get("payload") or {} for point in points]
+            title = next((str(p.get("event_title") or "").strip() for p in payloads
+                          if str(p.get("event_title") or "").strip()), "")
+            summary = next((str(p.get("event_summary") or "").strip() for p in payloads
+                            if str(p.get("event_summary") or "").strip()), "")
+            video_uid = next((str(p.get("video_uid") or "") for p in payloads
+                              if p.get("video_uid")), "")
+            captured_values = sorted({str(p.get("captured_at") or "").strip()
+                                     for p in payloads if str(p.get("captured_at") or "").strip()})
+            place_values = sorted({str(p.get("place") or p.get("captured_location") or "").strip()
+                                   for p in payloads
+                                   if str(p.get("place") or p.get("captured_location") or "").strip()})
+            video_times = []
+            for p in payloads:
+                raw_time = p.get("video_time_sec")
+                if raw_time is None:
+                    raw_time = p.get("clip_time_sec")
+                try:
+                    video_times.append(float(raw_time))
+                except (TypeError, ValueError):
+                    pass
+            key = f"{scope_id}|{event_id}"
+            node_id = "event_summary_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+            node = SessionNode(
+                node_id=node_id,
+                session_id=0,
+                summary=summary or title or f"Event {event_id}",
+                date_time=event_id,
+                attributes={
+                    "subtype": "event_summary",
+                    "event_id": event_id,
+                    "event_title": title,
+                    "event_summary": summary,
+                    "scope_id": scope_id,
+                    "video_uid": video_uid,
+                    "captured_at": captured_values[0] if len(captured_values) == 1 else captured_values,
+                    "place": place_values[0] if len(place_values) == 1 else place_values,
+                    "video_time_start_sec": min(video_times) if video_times else None,
+                    "video_time_end_sec": max(video_times) if video_times else None,
+                    "frame_ids": frame_ids,
+                    "frame_count": len(frame_ids),
+                    "source": "stable_event_identity",
+                },
+                event_node_ids=frame_ids,
+            )
+            self.graph_db.add_node(node)
+            self.event_summary_nodes[(scope_id, event_id)] = node_id
+            created += 1
+            for frame_id in frame_ids:
+                if not self.graph_db.get_node(frame_id):
+                    continue
+                self.graph_db.add_link(Link(
+                    source_node_id=node_id, target_node_id=frame_id,
+                    link_type=LinkType.SEMANTIC,
+                    properties={"sub_type": "EVENT_CONTAINS_FRAME",
+                                "event_id": event_id, "confidence": 1.0,
+                                "confidence_score": 1.0,
+                                "evidence_tier": "confirmed"},
+                ))
+                links += 1
+
+        # One directed temporal edge between adjacent event summaries in a
+        # video. Query traversal can use incoming edges for the reverse
+        # direction; no duplicate BEFORE/AFTER copy is stored.
+        by_video = defaultdict(list)
+        for (scope_id, event_id), node_id in self.event_summary_nodes.items():
+            node = self.graph_db.get_node(node_id)
+            attrs = node.attributes if node else {}
+            if attrs.get("video_uid"):
+                times = []
+                for fid in attrs.get("frame_ids") or []:
+                    frame = self.graph_db.get_node(fid)
+                    if frame:
+                        raw = (frame.attributes or {}).get("video_time_sec")
+                        try:
+                            times.append(float(raw if raw is not None else
+                                               (frame.attributes or {}).get("clip_time_sec") or 0.0))
+                        except (TypeError, ValueError):
+                            pass
+                by_video[(scope_id, attrs["video_uid"])].append(
+                    (min(times) if times else 0.0, node_id, event_id))
+        temporal = 0
+        for entries in by_video.values():
+            entries.sort(key=lambda row: (row[0], row[2]))
+            for left, right in zip(entries, entries[1:]):
+                self.graph_db.add_link(Link(
+                    source_node_id=left[1], target_node_id=right[1],
+                    link_type=LinkType.TEMPORAL,
+                    properties={"sub_type": "TIME_PRECEDES",
+                                "event_level": True,
+                                "delta_seconds": max(0.0, right[0] - left[0]),
+                                "confidence": 1.0, "confidence_score": 1.0,
+                                "evidence_tier": "confirmed"},
+                ))
+                temporal += 1
+        return {"event_summaries": created,
+                "event_summary_frame_links": links,
+                "event_summary_temporal_links": temporal}
+
     def create_temporal_links(self, frame_ids, bidirectional=False):
         """Adjacent frames within a clip: TIME_PRECEDES.
 
@@ -667,10 +798,16 @@ class KeyframeMemoryBuilder:
         created = 0
         obj_to_frames = defaultdict(list)
         for fid, objs in self.frame_objects.items():
+            context = self.frame_context.get(fid) or {}
+            scope_id = str(context.get("scope_id") or "")
+            video_uid = str(context.get("video_uid") or "")
             for o in objs:
-                obj_to_frames[o].append(fid)
+                # Hub semantics remain global within the built scope, but
+                # pairwise links are constrained to one video. This removes
+                # accidental cross-video identity-like links.
+                obj_to_frames[(o, scope_id, video_uid)].append(fid)
 
-        for obj, fids in obj_to_frames.items():
+        for (obj, _scope_id, _video_uid), fids in obj_to_frames.items():
             if not fids:
                 continue
             if obj in object_hubs:
@@ -721,10 +858,16 @@ class KeyframeMemoryBuilder:
         relation_hubs = relation_hubs or {}
         rel_to_frames = defaultdict(list)
         for fid, rels in self.frame_relations.items():
+            context = self.frame_context.get(fid) or {}
+            scope_id = str(context.get("scope_id") or "")
+            video_uid = str(context.get("video_uid") or "")
             for r in rels:
-                rel_to_frames[r].append(fid)
+                # A relation such as "person beside person" is only useful
+                # as a graph edge inside the same video timeline. Cross-video
+                # relation hubs were a major source of broad false neighbours.
+                rel_to_frames[(r, scope_id, video_uid)].append(fid)
 
-        for rel, fids in rel_to_frames.items():
+        for (rel, _scope_id, _video_uid), fids in rel_to_frames.items():
             if len(fids) < 2:
                 continue
             if rel in relation_hubs:
@@ -873,6 +1016,11 @@ class KeyframeMemoryBuilder:
                     )
                 )
                 self.frame_relations[node.node_id] = set(node.attributes.get("relation_labels") or [])
+                self.frame_context[node.node_id] = {
+                    "scope_id": node.attributes.get("scope_id") or "home-default",
+                    "video_uid": node.attributes.get("video_uid") or "",
+                    "clip_uid": node.attributes.get("clip_uid") or "",
+                }
                 self.index_frame(node.node_id, node.content_narrative, node.attributes)
                 stats_frames += 1
 
@@ -884,6 +1032,7 @@ class KeyframeMemoryBuilder:
             clip_hierarchy_links += self.create_clip_hierarchy_links(
                 clip_node, frame_ids_in_clip)
 
+        event_summary_stats = self.create_event_summary_nodes(frame_points)
         node_build_seconds = round(time.perf_counter() - node_started, 3)
 
         # Entity hubs are derived after frame nodes so frequency is based on
@@ -896,7 +1045,9 @@ class KeyframeMemoryBuilder:
         for obj, cnt in sorted(obj_freq.items()):
             if cnt >= self.HUB_OBJECT_THRESHOLD:
                 hub = EventNode(
-                    node_id="obj_" + uuid.uuid4().hex[:8],
+                    node_id="obj_" + hashlib.sha256(
+                        f"object|{obj}".encode("utf-8")
+                    ).hexdigest()[:16],
                     node_type=NodeType.ENTITY,
                     timestamp=datetime.now(),
                     content_narrative="Object hub: %s (in %d frames)" % (obj, cnt),
@@ -915,7 +1066,7 @@ class KeyframeMemoryBuilder:
         for rel, cnt in sorted(rel_freq.items()):
             if cnt >= self.RELATION_HUB_THRESHOLD:
                 hub = EventNode(
-                    node_id="rel_" + uuid.uuid4().hex[:8],
+                    node_id="rel_" + hashlib.sha256(rel.encode("utf-8")).hexdigest()[:16],
                     node_type=NodeType.ENTITY,
                     timestamp=datetime.now(),
                     content_narrative="Relation hub: %s (in %d frames)" % (rel, cnt),
@@ -935,6 +1086,7 @@ class KeyframeMemoryBuilder:
             "videos": 0,
             "objects_hubs": len(object_hubs),
             "relation_hubs": len(relation_hubs),
+            **event_summary_stats,
         }
 
         vid_clips = defaultdict(list)
@@ -964,6 +1116,7 @@ class KeyframeMemoryBuilder:
             "video_hierarchy": video_hierarchy_links,
             "object_links": self.create_object_links(object_hubs),
             "relation_links": self.create_relation_links(relation_hubs),
+            "event_summary": event_summary_stats,
         }
         link_build_seconds = round(time.perf_counter() - link_started, 3)
         visual_started = time.perf_counter()
