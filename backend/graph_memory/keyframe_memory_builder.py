@@ -21,6 +21,7 @@ import re
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -40,6 +41,29 @@ from .keyword_enrichment import tokenize_text, contains_cjk
 from .structured_index import filter_objects, filter_relations, StructuredIndex
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class VerifiedEventDraft:
+    """Two-phase event projection used by the graph builder.
+
+    Frames are observations; this record is the draft/verification boundary.
+    Only verified drafts are committed as event-summary nodes, so a partial
+    or cross-video grouping cannot become a graph retrieval anchor.
+    """
+
+    scope_id: str
+    video_uid: str
+    event_id: str
+    frame_points: list
+    title: str
+    summary: str
+    captured_values: list
+    place_values: list
+    video_times: list
+    confidence: float
+    verified: bool
+    verification_reasons: list
 
 
 class KeyframeMemoryBuilder:
@@ -536,39 +560,39 @@ class KeyframeMemoryBuilder:
     #  Edge creation
     # ------------------------------------------------------------------ #
 
-    def create_event_summary_nodes(self, frame_points):
-        """Create stable event parents and attach their physical frames.
+    @staticmethod
+    def _event_identity(payload: dict, point_id) -> str:
+        event_id = str(payload.get("event_id") or "").strip()
+        if event_id:
+            return event_id
+        fallback = "|".join(str(payload.get(key) or "").strip()
+                             for key in ("clip_uid", "event_title", "event_summary"))
+        return fallback or ("frame:" + str(payload.get("frame_uid") or point_id))
 
-        The existing EVENT nodes remain the frame-level evidence units.  A
-        SESSION node with ``subtype=event_summary`` is added only as a graph
-        conduit, keyed by the source event identity (or a deterministic
-        fallback), so rebuilding the same scope cannot create random event
-        duplicates.
+    def _build_verified_event_drafts(self, frame_points):
+        """Build Observation -> Draft -> VerifiedEvent records.
+
+        Verification is deliberately deterministic and evidence-based: all
+        observations must belong to one scope/video, and a draft must expose
+        either an event identity, event text, or a concrete frame observation.
+        This keeps the graph from manufacturing event parents by merging the
+        same generic event id across videos.
         """
         groups = defaultdict(list)
         for fp in frame_points:
             payload = fp.get("payload") or {}
-            event_id = str(payload.get("event_id") or "").strip()
-            if not event_id:
-                event_id = "|".join(str(payload.get(key) or "").strip()
-                                     for key in ("video_uid", "clip_uid", "event_title", "event_summary"))
-            if not event_id.strip("|"):
-                event_id = "frame:" + str(payload.get("frame_uid") or fp.get("id"))
-            groups[(str(payload.get("scope_id") or "home-default"), event_id)].append(fp)
+            scope_id = str(payload.get("scope_id") or "home-default")
+            video_uid = str(payload.get("video_uid") or "")
+            event_id = self._event_identity(payload, fp.get("id"))
+            groups[(scope_id, video_uid, event_id)].append(fp)
 
-        created = 0
-        links = 0
-        for (scope_id, event_id), points in sorted(groups.items(), key=lambda item: item[0]):
-            frame_ids = [str((point.get("payload") or {}).get("source_asset_id")
-                             or point.get("id")) for point in points]
-            frame_ids = list(dict.fromkeys(frame_ids))
+        drafts = []
+        for (scope_id, video_uid, event_id), points in sorted(groups.items(), key=lambda item: item[0]):
             payloads = [point.get("payload") or {} for point in points]
             title = next((str(p.get("event_title") or "").strip() for p in payloads
                           if str(p.get("event_title") or "").strip()), "")
             summary = next((str(p.get("event_summary") or "").strip() for p in payloads
                             if str(p.get("event_summary") or "").strip()), "")
-            video_uid = next((str(p.get("video_uid") or "") for p in payloads
-                              if p.get("video_uid")), "")
             captured_values = sorted({str(p.get("captured_at") or "").strip()
                                      for p in payloads if str(p.get("captured_at") or "").strip()})
             place_values = sorted({str(p.get("place") or p.get("captured_location") or "").strip()
@@ -583,32 +607,77 @@ class KeyframeMemoryBuilder:
                     video_times.append(float(raw_time))
                 except (TypeError, ValueError):
                     pass
-            key = f"{scope_id}|{event_id}"
+            reasons = []
+            if not video_uid:
+                reasons.append("missing_video_identity")
+            if not any((title, summary, event_id, points)):
+                reasons.append("missing_event_observation")
+            confidence = 1.0
+            if not title and not summary:
+                confidence -= 0.15
+            if not captured_values and not place_values:
+                confidence -= 0.10
+            drafts.append(VerifiedEventDraft(
+                scope_id=scope_id, video_uid=video_uid, event_id=event_id,
+                frame_points=points, title=title, summary=summary,
+                captured_values=captured_values, place_values=place_values,
+                video_times=video_times, confidence=max(0.0, confidence),
+                verified=not reasons, verification_reasons=reasons,
+            ))
+        return drafts
+
+    def create_event_summary_nodes(self, frame_points):
+        """Create stable event parents and attach their physical frames.
+
+        The existing EVENT nodes remain the frame-level evidence units.  A
+        SESSION node with ``subtype=event_summary`` is added only as a graph
+        conduit, keyed by the source event identity (or a deterministic
+        fallback), so rebuilding the same scope cannot create random event
+        duplicates.
+        """
+        drafts = self._build_verified_event_drafts(frame_points)
+
+        created = 0
+        links = 0
+        rejected = 0
+        for draft in drafts:
+            if not draft.verified:
+                rejected += 1
+                continue
+            scope_id, event_id, points = draft.scope_id, draft.event_id, draft.frame_points
+            video_uid = draft.video_uid
+            frame_ids = [str((point.get("payload") or {}).get("source_asset_id")
+                             or point.get("id")) for point in points]
+            frame_ids = list(dict.fromkeys(frame_ids))
+            key = f"{scope_id}|{video_uid}|{event_id}"
             node_id = "event_summary_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
             node = SessionNode(
                 node_id=node_id,
                 session_id=0,
-                summary=summary or title or f"Event {event_id}",
+                summary=draft.summary or draft.title or f"Event {event_id}",
                 date_time=event_id,
                 attributes={
                     "subtype": "event_summary",
                     "event_id": event_id,
-                    "event_title": title,
-                    "event_summary": summary,
+                    "event_title": draft.title,
+                    "event_summary": draft.summary,
                     "scope_id": scope_id,
                     "video_uid": video_uid,
-                    "captured_at": captured_values[0] if len(captured_values) == 1 else captured_values,
-                    "place": place_values[0] if len(place_values) == 1 else place_values,
-                    "video_time_start_sec": min(video_times) if video_times else None,
-                    "video_time_end_sec": max(video_times) if video_times else None,
+                    "captured_at": draft.captured_values[0] if len(draft.captured_values) == 1 else draft.captured_values,
+                    "place": draft.place_values[0] if len(draft.place_values) == 1 else draft.place_values,
+                    "video_time_start_sec": min(draft.video_times) if draft.video_times else None,
+                    "video_time_end_sec": max(draft.video_times) if draft.video_times else None,
                     "frame_ids": frame_ids,
                     "frame_count": len(frame_ids),
-                    "source": "stable_event_identity",
+                    "source": "verified_event_draft",
+                    "verification": "verified",
+                    "verification_confidence": draft.confidence,
+                    "evidence_frame_count": len(frame_ids),
                 },
                 event_node_ids=frame_ids,
             )
             self.graph_db.add_node(node)
-            self.event_summary_nodes[(scope_id, event_id)] = node_id
+            self.event_summary_nodes[(scope_id, video_uid, event_id)] = node_id
             created += 1
             for frame_id in frame_ids:
                 if not self.graph_db.get_node(frame_id):
@@ -617,9 +686,9 @@ class KeyframeMemoryBuilder:
                     source_node_id=node_id, target_node_id=frame_id,
                     link_type=LinkType.SEMANTIC,
                     properties={"sub_type": "EVENT_CONTAINS_FRAME",
-                                "event_id": event_id, "confidence": 1.0,
-                                "confidence_score": 1.0,
-                                "evidence_tier": "confirmed"},
+                                "event_id": event_id, "confidence": draft.confidence,
+                                "confidence_score": draft.confidence,
+                                "evidence_tier": "verified"},
                 ))
                 links += 1
 
@@ -627,7 +696,7 @@ class KeyframeMemoryBuilder:
         # video. Query traversal can use incoming edges for the reverse
         # direction; no duplicate BEFORE/AFTER copy is stored.
         by_video = defaultdict(list)
-        for (scope_id, event_id), node_id in self.event_summary_nodes.items():
+        for (scope_id, video_uid, event_id), node_id in self.event_summary_nodes.items():
             node = self.graph_db.get_node(node_id)
             attrs = node.attributes if node else {}
             if attrs.get("video_uid"):
@@ -657,7 +726,11 @@ class KeyframeMemoryBuilder:
                                 "evidence_tier": "confirmed"},
                 ))
                 temporal += 1
-        return {"event_summaries": created,
+        return {"event_observations": len(frame_points),
+                "event_drafts": len(drafts),
+                "verified_events": created,
+                "rejected_event_drafts": rejected,
+                "event_summaries": created,
                 "event_summary_frame_links": links,
                 "event_summary_temporal_links": temporal}
 
