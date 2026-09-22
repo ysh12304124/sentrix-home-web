@@ -141,19 +141,21 @@ def detect_runtime_framework(value: str, model_base_url: str) -> str:
 def select_runtime_providers(manager_url: str, endpoint_url: str,
                              framework: str, *, cloud: bool = False):
     """Choose the model lifecycle and local telemetry by runtime and host."""
+    endpoint = urlparse(endpoint_url)
+    host = (endpoint.hostname or "").strip().lower()
+    local_hosts = {"127.0.0.1", "localhost", "::1", local_lan_ip()}
+    is_local_endpoint = host in local_hosts
     # A Manager URL is only authoritative for managed vLLM. External
     # OpenAI-compatible llama.cpp/Ollama endpoints may still carry a stale
-    # Manager setting in the UI; never let that hide their host telemetry.
+    # Manager setting in the UI; never let that hide the endpoint host check.
     if manager_url and framework in {"generic", "vllm", "vllm_manager"}:
+        if not is_local_endpoint:
+            return ManagerLifecycleProvider(manager_url), UnavailableTelemetryProvider(), "unavailable"
         return ManagerLifecycleProvider(manager_url), ManagerTelemetryProvider(manager_url), "vllm_manager"
     lifecycle = UnavailableLifecycleProvider()
-    host = urlparse(endpoint_url).hostname
-    local_hosts = {"127.0.0.1", "localhost", local_lan_ip()}
     jetson = is_jetson_host()
     if not cloud and framework in {"llama.cpp", "llamacpp"} and jetson and host in local_hosts:
         return lifecycle, LocalJetsonLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "jetson_local_pss"
-    if not cloud and framework in {"llama.cpp", "llamacpp"} and _is_orin_telemetry_host(host) and urlparse(endpoint_url).port == 8100:
-        return lifecycle, OrinLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "orin_ssh_pss"
     if not cloud and not jetson and host in local_hosts:
         telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider,
                            "ollama": OllamaTelemetryProvider, "vllm": VllmTelemetryProvider}.get(framework, HostNvidiaTelemetryProvider)
@@ -1603,17 +1605,15 @@ class GpuSampler:
                     sample["benchmark_process_gpu_memory_mib"] = process_memory.get("benchmark_process_gpu_memory_mib")
                     sample["other_processes_memory_mib"] = process_memory.get("other_processes_memory_mib")
                     sample["all_processes_memory_mib"] = process_memory.get("all_processes_memory_mib")
-                    sample["system_memory_used_mib"] = system_memory.get("system_memory_used_mib", process_memory.get("system_memory_used_mib"))
-                    sample["system_memory_total_mib"] = system_memory.get("system_memory_total_mib", process_memory.get("system_memory_total_mib"))
-                    sample["system_memory_available_mib"] = system_memory.get("system_memory_available_mib", process_memory.get("system_memory_available_mib"))
-                    sample["system_memory_scope"] = system_memory.get("system_memory_scope", process_memory.get("system_memory_scope"))
+                    sample["system_memory_used_mib"] = system_memory.get("system_memory_used_mib")
+                    sample["system_memory_total_mib"] = system_memory.get("system_memory_total_mib")
+                    sample["system_memory_available_mib"] = system_memory.get("system_memory_available_mib")
+                    sample["system_memory_scope"] = system_memory.get("system_memory_scope")
                     sample["system_memory_delta_mib"] = process_memory.get("system_memory_delta_mib")
                     sample["system_memory_baseline_mib"] = process_memory.get("system_memory_baseline_mib")
                     sample["llama_server_args"] = process_memory.get("llama_server_args")
                     sample["sentrix_stack_pss_mib"] = process_memory.get("sentrix_stack_pss_mib")
                     sample["product_stack_memory_mib"] = process_memory.get("product_stack_memory_mib")
-                    if sample.get("model_process_system_memory_used_mib") is None and process_memory.get("process_rss_mib") is not None:
-                        sample["model_process_system_memory_used_mib"] = process_memory.get("process_rss_mib")
                     sample["memory_scope"] = process_memory.get("memory_scope") or sample.get("memory_scope")
                     sample["process_memory_scope"] = process_memory.get("process_memory_scope")
                     sample["model_process_system_memory_scope"] = process_memory.get("model_process_system_memory_scope")

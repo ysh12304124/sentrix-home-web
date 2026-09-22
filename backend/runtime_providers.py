@@ -194,13 +194,52 @@ def _query_compute_apps() -> list[dict]:
 
 
 def _process_pss_mib(pid: int) -> float | None:
+    """Read proportional set size, with a slower smaps fallback.
+
+    A missing value is not a zero and is never replaced with RSS. Some kernels
+    expose smaps_rollup only partially, while the per-map smaps file remains
+    readable.
+    """
     try:
         with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
             for line in file:
                 if line.startswith("Pss:"):
                     return round(int(line.split()[1]) / 1024, 2)
     except (OSError, ValueError, IndexError):
+        pass
+    total_kib = 0
+    found = False
+    try:
+        with open(f"/proc/{pid}/smaps", encoding="ascii") as file:
+            for line in file:
+                if line.startswith("Pss:"):
+                    total_kib += int(line.split()[1])
+                    found = True
+    except (OSError, ValueError, IndexError):
         return None
+    return round(total_kib / 1024, 2) if found else None
+
+
+def _process_smaps_field_mib(pid: int, field: str) -> float | None:
+    """Read one smaps_rollup field, then fall back to summing smaps."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
+            for line in file:
+                if line.startswith(field):
+                    return round(int(line.split()[1]) / 1024, 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    total_kib = 0
+    found = False
+    try:
+        with open(f"/proc/{pid}/smaps", encoding="ascii") as file:
+            for line in file:
+                if line.startswith(field):
+                    total_kib += int(line.split()[1])
+                    found = True
+    except (OSError, ValueError, IndexError):
+        return None
+    return round(total_kib / 1024, 2) if found else None
     return None
 
 
@@ -219,6 +258,10 @@ def _augment_host_process_memory(
     expose them. Missing values must not be interpreted as 0.
     """
     data = dict(data or {})
+    for key in ("product_stack_memory_mib", "benchmark_process_memory_used_mib",
+                "benchmark_process_memory_scope", "sentrix_stack_pss_mib",
+                "sentrix_stack_pss_scope"):
+        data.pop(key, None)
     try:
         process_rows = _host_process_rows()
     except Exception:
@@ -244,20 +287,29 @@ def _augment_host_process_memory(
     model_rows = []
     for row in process_rows:
         identity = str(row.get("identity") or "")
-        if row["pid"] in known_model_pids or (hint and hint in identity) or (port and port in identity):
+        if known_model_pids:
+            is_model = row["pid"] in known_model_pids
+        else:
+            is_model = (hint and hint in identity) or (port and port in identity)
+        if is_model:
             model_rows.append(row)
 
     system_rows = [row for row in process_rows if _is_system_related_process(row)]
     system_pids = {row["pid"] for row in system_rows}
     system_gpu_rows = [row for row in compute_apps if row.get("pid") in system_pids]
 
+    # Preserve the caller's exact model PID attribution. Do not broaden a
+    # PID-selected model into every process matching a generic runtime hint.
     model_pids = {row["pid"] for row in model_rows}
     sentrix_rows = [row for row in system_rows if row["pid"] not in model_pids]
     for row in system_rows:
         row["pss_mib"] = _process_pss_mib(int(row["pid"]))
+        row["smaps_rss_mib"] = _process_smaps_field_mib(int(row["pid"]), "Rss:")
     model_rss = _sum_mib(model_rows, "rss_mib")
+    system_rss = _sum_mib(system_rows, "rss_mib")
     sentrix_pss = _sum_mib(sentrix_rows, "pss_mib")
     product_pss = _sum_mib(system_rows, "pss_mib")
+    model_smaps_rss = _sum_mib(model_rows, "smaps_rss_mib")
     system_gpu = _sum_mib(system_gpu_rows, "used_memory_mib")
     if model_rss is not None:
         data["model_process_system_memory_used_mib"] = model_rss
@@ -269,10 +321,20 @@ def _augment_host_process_memory(
     if sentrix_pss is not None:
         data["sentrix_stack_pss_mib"] = sentrix_pss
         data["sentrix_stack_pss_scope"] = "sentrix_related_pss_excluding_model"
-    if product_pss is not None:
-        data["product_stack_memory_mib"] = product_pss
-        data["benchmark_process_memory_used_mib"] = product_pss
-        data["benchmark_process_memory_scope"] = "photobench_related_host_process_pss"
+    # Product attribution is only valid when every related process has PSS and
+    # the model's VmRSS/smaps-Rss compensation inputs are both available.
+    # RSS remains available for the separate model VmRSS metric, but must not
+    # silently become a product total.
+    pss_complete = bool(system_rows) and all(row.get("pss_mib") is not None for row in system_rows)
+    model_pss_complete = bool(model_rows) and all(row.get("pss_mib") is not None for row in model_rows)
+    if (product_pss is not None and pss_complete and model_rss is not None
+            and model_smaps_rss is not None and model_pss_complete):
+        uma_extra = max(0.0, model_rss - model_smaps_rss)
+        product_memory = round(product_pss + uma_extra, 2)
+        data["product_stack_memory_mib"] = product_memory
+        data["benchmark_process_memory_used_mib"] = product_memory
+        data["benchmark_process_memory_scope"] = "all_related_pss_plus_model_uma_extra"
+        data["model_uma_extra_mib"] = round(uma_extra, 2)
         data["benchmark_processes"] = [
             {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in system_rows[:50]
@@ -559,7 +621,18 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
         return self._read_system_memory()
     def process_memory(self) -> dict:
         try:
-            candidates = _query_compute_apps()
+            candidates = []
+            for row in self._query("compute-apps=pid,process_name,used_memory"):
+                if len(row) < 3:
+                    continue
+                try:
+                    candidates.append({
+                        "pid": int(float(row[0])),
+                        "process_name": row[1],
+                        "used_memory_mib": float(row[2]),
+                    })
+                except (ValueError, TypeError):
+                    continue
             hints = [self.process_hint]
             matches = []
             for item in candidates:
@@ -593,8 +666,9 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                 return {"status": "unavailable", "source": "host_nvidia_smi",
                         "reason": "matching_model_process_not_found", "data": data}
             others = [item for item in candidates if item not in matches]
+            model_gpu_memory_mib = sum(x["used_memory_mib"] for x in matches)
             data = _augment_host_process_memory({
-                "process_memory_used_mib": sum(x["used_memory_mib"] for x in matches),
+                "process_memory_used_mib": model_gpu_memory_mib,
                 "processes": matches, "model_processes": matches,
                 "model_process_scope": "gpu_compute_processes",
                 "other_processes_memory_mib": sum(x["used_memory_mib"] for x in others),
@@ -602,6 +676,9 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                 "all_processes": candidates, "all_processes_scope": "gpu_compute_processes",
             }, process_hint=self.process_hint, endpoint_port=self.endpoint_port,
                 model_pids={item["pid"] for item in matches}, compute_apps=candidates)
+            # _augment_host_process_memory may add RAM attribution, but the
+            # model GPU metric remains the exact nvidia-smi PID sum above.
+            data["process_memory_used_mib"] = model_gpu_memory_mib
             return {"status": "available", "source": "host_nvidia_smi", "data": data}
         except Exception as exc:
             return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
@@ -667,9 +744,12 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
         command = (
             f'pid=$(cat {self.pid_file}) || exit 1; '
             'case "$pid" in *[!0-9]*|"") exit 2;; esac; '
-            'ps -p "$pid" -o args= | grep -Fq "/llama-server --model " || exit 3; '
+            'ps -p "$pid" -o comm= | grep -Fxq "llama-server" || exit 3; '
             'ps -p "$pid" -o args= | grep -Fq -- "--port 8100" || exit 3; '
-            'awk \'/^Pss:/{print $2}\' "/proc/$pid/smaps_rollup"; '
+            'pss=$(awk \'/^Pss:/{print $2}\' "/proc/$pid/smaps_rollup" 2>/dev/null); '
+            'if [ -z "$pss" ]; then pss=$(awk \'/^Pss:/{s+=$2} END{if(s) print s}\' "/proc/$pid/smaps" 2>/dev/null); fi; '
+            '[ -n "$pss" ] || exit 4; printf "%s\\n" "$pss"; '
+            'awk \'/^VmRSS:/{print $2}\' "/proc/$pid/status"; '
             'printf "pid=%s\\n" "$pid"'
         )
         try:
@@ -680,9 +760,12 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
             )
             lines = completed.stdout.strip().splitlines()
             pss_mib = int(lines[0]) / 1024
-            pid = int(lines[1].removeprefix("pid="))
+            rss_mib = int(lines[1]) / 1024
+            pid = int(lines[2].removeprefix("pid="))
             data["root_pid"] = pid
             data["process_memory_used_mib"] = round(pss_mib, 2)
+            data["model_process_system_memory_used_mib"] = round(rss_mib, 2)
+            data["model_process_system_memory_scope"] = "remote_host_process_vmrss"
             data["pss_sampled_at_monotonic"] = time.monotonic()
             self._last_memory = {"status": "available", "source": "orin_ssh_pss", "data": data}
             return {"status": "available", "source": "orin_ssh_pss", "data": {"gpus": [{"index": 0, "memory_unit": "process_pss_uma_mib"}]}}
@@ -694,15 +777,38 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
 
     def process_memory(self) -> dict:
         if self._last_memory.get("status") == "available":
-            data = _augment_host_process_memory(
-                self._last_memory.get("data") or {},
-                process_hint="llama-server", endpoint_port="8100",
-                model_pids={
-                    int((self._last_memory.get("data") or {}).get("root_pid"))
-                } if str((self._last_memory.get("data") or {}).get("root_pid") or "").isdigit() else set(),
-            )
-            return {**self._last_memory, "data": data}
+            # This provider executes on 153 but the model process lives on
+            # 118. Never scan 153 /proc and label those processes as Orin.
+            return self._last_memory
         return self._last_memory
+
+    def system_memory(self) -> dict:
+        """Read total/available RAM from the remote Orin host.
+
+        The provider runs on 153 while the model runs on 118, so reading the
+        local /proc would report the wrong machine. MemAvailable is the Linux
+        kernel's reclaimable-memory estimate and gives a host-wide used value
+        without pretending it is model-specific memory.
+        """
+        command = "awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t && a) printf \"%.3f %.3f\\n\", t/1024, a/1024}' /proc/meminfo"
+        try:
+            completed = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                 "-o", "ConnectionAttempts=1", self.remote, command],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            total_text, available_text = completed.stdout.strip().split()
+            total = float(total_text)
+            available = float(available_text)
+            return {"status": "available", "source": "orin_remote_proc_meminfo", "data": {
+                "system_memory_used_mib": round(max(0.0, total - available), 3),
+                "system_memory_total_mib": round(total, 3),
+                "system_memory_available_mib": round(max(0.0, available), 3),
+                "system_memory_scope": "host_all_processes",
+            }}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return {"status": "unavailable", "source": "orin_remote_proc_meminfo",
+                    "reason": "remote_meminfo_unavailable"}
 
     def kv_cache(self) -> dict:
         data = self._last_memory.get("data") or {}

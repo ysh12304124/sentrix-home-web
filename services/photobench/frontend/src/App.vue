@@ -928,14 +928,19 @@ function liveTelemetryRows(run) {
   const unit = live.source === "jetson_local_pss" || live.source === "orin_ssh_pss" ? "PSS" : "显存";
   const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(2)}${suffix}`;
   const fmtGiB = (value) => value == null ? "-" : `${(Number(value) / 1024).toFixed(2)} GiB`;
+  const productFormulaReady = latest.benchmark_process_memory_scope === "all_related_pss_plus_model_uma_extra"
+    || effectivePeak.benchmark_process_memory_scope === "all_related_pss_plus_model_uma_extra";
+  const productFormulaNote = productFormulaReady
+    ? "所有相关进程 PSS 加总 + max(0, 主模型 VmRSS - 主模型 smaps Rss)"
+    : "历史记录未标记新公式 scope；该值不能按当前公式解释，需重跑";
   return [
     ["当前阶段", ["completed", "failed", "cancelled"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
     ["主模型 RAM", fmtGiB(latest.model_process_system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_system_memory_used_mib)} · 进程系统内存，不代表权重又完整占一份`],
-    [`主模型 GPU ${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · 仅可归因到模型的 GPU/UMA 进程`],
-    ["整套产品占用", fmtGiB(latest.product_stack_memory_mib ?? latest.benchmark_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.product_stack_memory_mib ?? effectivePeak.benchmark_process_memory_used_mib)} · Sentrix周边PSS + llama VmRSS`],
+    [unit === "PSS" ? "主模型 PSS（Orin UMA）" : "主模型 GPU 显存", fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · ${unit === "PSS" ? "主模型进程的比例分摊物理内存，不是独立显存" : "nvidia-smi 按主模型 PID 归因"}`],
+    ["整套产品 RAM", fmtGiB(latest.product_stack_memory_mib), `峰值 ${fmtGiB(effectivePeak.product_stack_memory_mib)} · ${productFormulaNote}；输入缺失则不记录`],
     ["Sentrix 周边 PSS", fmtGiB(latest.sentrix_stack_pss_mib), `峰值 ${fmtGiB(effectivePeak.sentrix_stack_pss_mib)} · 不含 llama-server，PSS 加总不重叠共享库`],
-    ["测评系统 GPU 显存", fmtGiB(latest.benchmark_process_gpu_memory_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_gpu_memory_mib)} · 相关 GPU compute 进程合计`],
-    ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(effectivePeak.memory_used_mib)} · NVIDIA GPU 总占用`],
+    ["测评系统 GPU 显存", fmtGiB(latest.benchmark_process_gpu_memory_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_gpu_memory_mib)} · nvidia-smi 按 PhotoBench/Sentrix 相关 GPU 进程 PID 汇总；不等于主模型显存`],
+    ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(effectivePeak.memory_used_mib)} · nvidia-smi device memory.used，包含整卡所有进程及驱动/上下文`],
     ["整机 RAM", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.system_memory_used_mib)} · ${latest.system_memory_scope === "host_all_processes" ? "宿主机全部进程" : "未标注范围"}`],
     ["全部 GPU 进程", fmtGiB(latest.all_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.all_processes_memory_mib)} · nvidia-smi 可见进程总和`],
     ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_used_mib ?? latest.other_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.other_processes_memory_mib)} · 除模型进程外`],
@@ -998,24 +1003,20 @@ function renderTelemetryChart() {
   const definitions = [
     ...(isOrin
       ? [{ key: "system_memory_used_mib", name: "整机 RAM（Orin UMA）", color: "#20a36a" },
-         { key: "product_stack_memory_mib", alt: "benchmark_process_memory_used_mib", name: "整套产品占用（周边PSS+模型VmRSS）", color: "#d9488b" },
+         { key: "product_stack_memory_mib", name: "整套产品 RAM（相关进程 PSS + 主模型 UMA 补偿）", color: "#d9488b" },
          { key: "sentrix_stack_pss_mib", name: "Sentrix 周边 PSS（不含模型）", color: "#8b6de8" },
          { key: "model_process_system_memory_used_mib", name: "主模型进程 VmRSS", color: "#f2b84b" }]
       : [{ key: "memory_used_mib", name: "整卡 GPU 显存", color: "#4f7cff" },
          { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" },
          { key: "benchmark_process_gpu_memory_mib", name: "测评系统 GPU 显存", color: "#d9488b" },
-         { key: "product_stack_memory_mib", alt: "benchmark_process_memory_used_mib", name: "整套产品 RAM（相关进程 PSS 加总）", color: "#8b6de8" },
+         { key: "product_stack_memory_mib", name: "整套产品 RAM（相关进程 PSS + 主模型 UMA 补偿）", color: "#8b6de8" },
          { key: "sentrix_stack_pss_mib", name: "Sentrix 周边 PSS（不含模型）", color: "#a78bfa" },
-         { key: "model_process_memory_used_mib", name: "主模型 GPU 显存", color: "#ef8a4b" },
-         { key: "model_process_system_memory_used_mib", name: "主模型 RAM（进程 RSS）", color: "#f2b84b" }]),
+         { key: "model_process_memory_used_mib", name: "主模型 GPU 显存（nvidia-smi 按 PID）", color: "#ef8a4b" },
+         { key: "model_process_system_memory_used_mib", name: "主模型 RAM（进程 VmRSS）", color: "#f2b84b" }]),
   ];
   const seriesValue = (item, definition) => {
     const primary = Number(item[definition.key]);
     if (Number.isFinite(primary)) return primary;
-    if (definition.alt) {
-      const fallback = Number(item[definition.alt]);
-      if (Number.isFinite(fallback)) return fallback;
-    }
     return null;
   };
   const available = definitions.filter((definition) => history.some((item) => seriesValue(item, definition) != null));
@@ -3148,19 +3149,25 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <details class="metric-definition-panel telemetry-definition-panel">
   <summary>资源曲线口径说明</summary>
   <div class="metric-definition-row">
-    <strong>RAM 与 GPU 显存</strong><span><b>口径：</b>RAM 是 Linux 主机系统内存；GPU 显存是 NVIDIA 独立显卡 VRAM。两者是不同资源，不能直接相加成“模型总占用”。</span><span><b>判读：</b>153 独显环境下，模型权重、预分配 KV Cache 和 CUDA buffer 主要看“主模型 GPU 显存”；“主模型 RAM”只是模型服务进程在主机内存里的运行时占用。</span>
+    <strong>RAM 与 GPU 显存</strong><span><b>口径：</b>RAM 是 Linux 主机系统内存；153 的 GPU 显存是 NVIDIA 独立显卡 VRAM；118 Orin 是 CPU/GPU 共用的 UMA，不显示独立 GPU 显存。两者不能直接相加成“模型总占用”。</span><span><b>判读：</b>153 主要看按模型 PID 归因的 GPU 显存；118 主要看主模型 VmRSS、PSS 和产品栈 RAM。任一指标无法按自身口径采集时留空，不用其它指标替代。</span>
   </div>
   <div class="metric-definition-row">
-    <strong>主模型 RAM</strong><span><b>计算式：</b>主模型相关进程的 RSS/PSS 采样；153 目前为 Linux RSS，Orin 主模型另有 PSS 曲线。</span><span><b>含义：</b>包含 Python/vLLM 或 llama.cpp runtime、tokenizer、调度结构、mmap 页、共享库和 CUDA 用户态开销等；不表示模型权重在 RAM 里又完整复制了一份。</span>
+    <strong>整机 RAM</strong><span><b>计算式：</b>主机 MemTotal - MemAvailable，范围是整台运行模型服务主机的全部进程和内核可用内存。</span><span><b>判读：</b>它不是主模型或产品栈归因值，不能用来替代主模型 RAM、PSS 或 GPU 显存。</span>
   </div>
   <div class="metric-definition-row">
-    <strong>整套产品占用</strong><span><b>算法：</b>Sentrix/8771/Qdrant 等周边进程 PSS 之和（不含 llama）加上主模型 VmRSS。共享库按 PSS 摊开，llama 的 GPU 统一内存走 VmRSS。</span><span><b>判读：</b>独立设备选型看这条；专机部署时应接近整机 RAM 减去操作系统底噪。旧 RSS 加总会虚高。</span>
+    <strong>主模型 RAM</strong><span><b>计算式：</b>主模型服务进程的 Linux VmRSS；主模型 PSS 是独立指标，不替代 VmRSS。</span><span><b>含义：</b>包含 Python/vLLM 或 llama.cpp runtime、tokenizer、调度结构、mmap 页、共享库和 CUDA 用户态开销等；不表示模型权重在 RAM 里又完整复制了一份。VmRSS 缺失时不改用 PSS 或其它字段补写。</span>
   </div>
   <div class="metric-definition-row">
-    <strong>vLLM 与 llama.cpp</strong><span><b>vLLM：</b>GPU 显存包含权重、预分配 KV 池和运行时 buffer，受 gpu_memory_utilization 影响，可能高于请求时真实活跃 KV。</span><span><b>llama.cpp/Ollama：</b>独显环境可按进程采 GPU 显存；Orin 是统一内存平台，不显示独立 GPU 显存。</span>
+    <strong>整套产品 RAM</strong><span><b>算法：</b>所有相关进程（周边进程 + 主模型服务）的 PSS 加总，再加 max(0, 主模型 VmRSS - 主模型 smaps Rss) 的 UMA 补偿；任一输入缺失则不记录。</span><span><b>判读：</b>PSS 用于避免共享页重复归因，补偿项只补回主模型 VmRSS 与 smaps Rss 的差额；该值不是整机 RAM，也不能与整卡显存相加。只有记录 scope 为 <code>all_related_pss_plus_model_uma_extra</code> 时才按此公式解释；历史 run 缺少该 scope 时必须重跑。</span>
   </div>
   <div class="metric-definition-row">
-    <strong>Orin UMA</strong><span><b>口径：</b>Orin 的 CPU/GPU 共用物理内存，没有可与 153 VRAM 直接对应的独立显存曲线。</span><span><b>判读：</b>页面只展示真实能采到的整机 RAM、测评系统进程内存、主模型进程 RAM/PSS；不要把 Orin PSS 和 153 的 NVIDIA 显存做数值横比。</span>
+    <strong>GPU 三层口径（仅 153）</strong><span><b>主模型 GPU 显存：</b>nvidia-smi 按主模型 PID 汇总；无法归因则留空。<b>测评系统 GPU 显存：</b>按 PhotoBench/Sentrix 相关 GPU compute 进程 PID 汇总，不等于主模型 GPU 显存，也不能与其简单相加。<b>整卡显存：</b>nvidia-smi 的 device memory.used，包含整卡所有进程、驱动和 CUDA 上下文。</span><span><b>vLLM：</b>主模型 GPU 显存通常包含权重、预分配 KV 池和运行时 buffer，受 gpu_memory_utilization 影响，可能高于请求时真实活跃 KV。llama.cpp/Ollama 独显环境同样按进程 PID 采集。</span>
+  </div>
+  <div class="metric-definition-row">
+    <strong>Orin UMA</strong><span><b>口径：</b>Orin 的 CPU/GPU 共用物理内存，没有可与 153 VRAM 直接对应的独立显存曲线。</span><span><b>判读：</b>页面只展示真实能采到的整机 RAM、整套产品 RAM、Sentrix 周边 PSS、主模型 VmRSS/PSS；不要把 Orin PSS 和 153 的 NVIDIA 显存做数值横比。</span>
+  </div>
+  <div class="metric-definition-row">
+    <strong>远程模型服务</strong><span><b>口径：</b>如果模型 endpoint 不是当前主机的 127.0.0.1、localhost、::1 或本机局域网地址，不记录当前主机的实时 RAM/GPU 遥测来代表远程模型。</span><span><b>判读：</b>请求时延和 token 指标仍可记录；硬件指标必须来自模型实际运行主机，否则留空。</span>
   </div>
 </details>
 <div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>

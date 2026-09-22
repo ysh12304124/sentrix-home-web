@@ -21,7 +21,7 @@ class RuntimeFrameworkTests(unittest.TestCase):
     @patch.object(MODULE, "is_jetson_host", return_value=False)
     def test_port_8100_is_not_automatically_llamacpp_on_discrete_gpu(self, _jetson):
         self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.153:8100/v1"), "generic")
-        self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.118:8100/v1"), "llama.cpp")
+        self.assertEqual(MODULE.resolve_runtime_framework("", "http://192.168.0.118:8100/v1"), "generic")
 
     @patch.object(MODULE, "is_jetson_host", return_value=True)
     def test_jetson_local_llamacpp_and_explicit_framework(self, _jetson):
@@ -45,6 +45,22 @@ class RuntimeFrameworkTests(unittest.TestCase):
         self.assertEqual(source, "host_nvidia_smi")
         _, provider, source = MODULE.select_runtime_providers(
             "", "http://192.168.0.119:8100/v1", "llama.cpp")
+        self.assertIsInstance(provider, MODULE.UnavailableTelemetryProvider)
+        self.assertEqual(source, "unavailable")
+
+    @patch.object(MODULE, "local_lan_ip", return_value="192.168.0.153")
+    @patch.object(MODULE, "is_jetson_host", return_value=False)
+    def test_remote_model_never_uses_local_telemetry(self, _jetson, _ip):
+        _, provider, source = MODULE.select_runtime_providers(
+            "http://192.168.0.153:8500", "http://192.168.0.118:8100", "llama.cpp")
+        self.assertIsInstance(provider, MODULE.UnavailableTelemetryProvider)
+        self.assertEqual(source, "unavailable")
+
+    @patch.object(MODULE, "local_lan_ip", return_value="192.168.0.153")
+    @patch.object(MODULE, "is_jetson_host", return_value=False)
+    def test_remote_manager_model_never_uses_manager_host_telemetry(self, _jetson, _ip):
+        _, provider, source = MODULE.select_runtime_providers(
+            "http://192.168.0.153:8500", "http://192.168.0.118:8100", "vllm")
         self.assertIsInstance(provider, MODULE.UnavailableTelemetryProvider)
         self.assertEqual(source, "unavailable")
 
