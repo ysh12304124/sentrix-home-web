@@ -27,6 +27,7 @@ import shlex
 import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -464,10 +465,13 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
-def atomic_json(path: Path, value) -> None:
+def atomic_json(path: Path, value, keep_backup: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if keep_backup and path.exists():
+        backup = path.with_suffix(path.suffix + ".bak")
+        path.replace(backup)
     tmp.replace(path)
 
 
@@ -897,6 +901,13 @@ def _extract_media_sets(result: dict) -> dict[str, list[str]]:
             add(observation.get("retrieved_asset_ids") or observation.get("asset_ids"), retrieved)
             add(observation.get("evidence_asset_ids"), evidence)
             add(observation.get("source_asset_ids"), evidence)
+            # search_memories performs the deterministic evidence selection
+            # used by the Agent. If the model answers from that result but
+            # omits a top-level delivery list, retain the tool-selected set
+            # as a delivery fallback. Explicit final delivery remains
+            # authoritative because this branch only runs while ids is empty.
+            if str(trace.get("tool") or "") == "search_memories" and not ids:
+                add(observation.get("selected_asset_ids"), ids)
             for row in (observation.get("items") or observation.get("rows") or []):
                 if isinstance(row, dict) and row.get("asset_id"):
                     evidence.append(str(row["asset_id"]))
@@ -932,6 +943,12 @@ def _extract_image_ids(result: dict) -> list[str]:
 
 def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
     """Build exact reusable album/model bases from persisted run-to-scope links."""
+    def run_model_profile(run: dict) -> str:
+        # The lightweight run-list API exposed model_name before model_profile
+        # was included. Keep old persisted records reusable after deleting a
+        # full-chain history row (and across mixed-version run metadata).
+        return str(run.get("model_profile") or run.get("model_name") or "").strip()
+
     runs_by_scope = {}
     for run in runs or []:
         if not isinstance(run, dict) or not run.get("scope_id"):
@@ -947,13 +964,13 @@ def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
                         reverse=True)
         source = linked[0] if linked else {}
         album_id = str(source.get("album_id") or "").strip()
-        model_candidates = sorted({str(run.get("model_profile") or "").strip()
-                                   for run in linked if run.get("model_profile")},
+        model_candidates = sorted({run_model_profile(run)
+                                   for run in linked if run_model_profile(run)},
                                   key=len, reverse=True)
         space_name = str(space.get("name") or "").lower()
         model_profile = next((model for model in model_candidates
                               if safe_slug(model).lower() in space_name), "")
-        model_profile = model_profile or str(source.get("model_profile") or "").strip()
+        model_profile = model_profile or run_model_profile(source)
         if not album_id or not model_profile:
             name = str(space.get("name") or "")
             match = re.search(r"PhotoBench-\d{8}-\d{6}-(?P<album>.+?)-(?P<model>(?:qwen|gemma|llama|phi|mistral|current|big_model)[^-]*)$", name, re.I)
@@ -965,7 +982,7 @@ def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
         key = (album_id, model_profile)
         matching_runs = [run for run in linked
                          if str(run.get("album_id") or "") == album_id
-                         and str(run.get("model_profile") or "") == model_profile]
+                         and run_model_profile(run) == model_profile]
         group = groups.setdefault(key, {
             "base_id": f"{album_id}::{model_profile}",
             "album_id": album_id,
@@ -1000,6 +1017,24 @@ def _resolve_predicted_media(asset_ids: list[str], assets_by_name: dict) -> list
         if not match:
             continue
         file_name, asset = match
+        # Identity seed crops are internal face-clustering inputs, never QA
+        # retrieval/evidence media. Preserve ordinary user photos and video
+        # keyframes, which remain valid GT evidence for image questions.
+        if re.match(r"^faceid_[^/]+\.(?:jpe?g|png|webp)$", Path(file_name).name, re.IGNORECASE):
+            continue
+        metadata = asset.get("metadata_json") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        if isinstance(metadata, dict):
+            source_type = str(metadata.get("source_type") or "").strip().lower()
+            derived_kind = str(metadata.get("derived_kind") or asset.get("derived_kind") or "").strip().lower()
+            if source_type == "identity_seed" or derived_kind in {
+                "face_crop", "face_id_crop", "face_identity_crop", "face_reference",
+            }:
+                continue
         media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
         media = {
             "asset_id": str(asset_id),
@@ -1045,12 +1080,36 @@ def _metric_triplet(gt_keys: set[tuple[str, str]], predicted_keys: set[tuple[str
     }
 
 
-def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict]) -> dict[str, dict]:
+def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict],
+                      assets_by_name: dict | None = None) -> dict[str, dict]:
+    """Compute typed media metrics with keyframes canonicalized to parent video.
+
+    A video keyframe is stored as an image asset for VLM inspection, but it is
+    evidence for the source video in a retrieval benchmark.  Treating its
+    storage type as the evaluation type made every video row report zero even
+    when the correct video's keyframe was in the returned set.
+    """
+    assets_by_id = {}
+    for rows in (assets_by_name or {}).values():
+        for asset in rows or []:
+            if isinstance(asset, dict) and asset.get("id"):
+                assets_by_id[str(asset["id"])] = asset
+
+    def metric_key(item: dict) -> tuple[str, str]:
+        asset = assets_by_id.get(str(item.get("asset_id") or ""))
+        if asset:
+            metadata = asset.get("metadata_json") if isinstance(asset.get("metadata_json"), dict) else {}
+            derived = str(asset.get("derived_kind") or metadata.get("derived_kind") or "").lower()
+            if derived in {"video_keyframe", "video_keyframe_webp"}:
+                parent_id = str(asset.get("parent_asset_id") or metadata.get("parent_asset_id") or "")
+                parent = assets_by_id.get(parent_id) or {}
+                parent_name = str(parent.get("file_name") or "")
+                if parent_name:
+                    return "video", Path(parent_name).stem.casefold()
+        return _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
+
     gt_keys = {_media_key(ref.get("media_type"), ref.get("media_id")) for ref in gt_refs}
-    predicted_keys = {
-        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
-        for item in predicted_media
-    }
+    predicted_keys = {metric_key(item) for item in predicted_media}
     result = {"media": _metric_triplet(gt_keys, predicted_keys)}
     for media_type in ("image", "video"):
         result[media_type] = _metric_triplet(
@@ -1340,6 +1399,77 @@ def album_media_entries(manifest: dict) -> list[str]:
     return entries
 
 
+def _video_import_metadata(album_dir: Path, manifest: dict) -> dict[str, dict]:
+    """Return provenance metadata that should follow a benchmark video upload.
+
+    The benchmark video files are often transcoded clips without EXIF.  Their
+    ground-truth provenance is kept in ``video_source_provenance.json`` and in
+    the protected image metadata for the source frames.  If we upload the raw
+    clip without carrying this information into Sentrix, the video is stamped
+    with the upload time and the graph cannot connect a question such as
+    ``2017 年宜昌`` to the right video.  This is not evaluator leakage: it is
+    the same media provenance that a real importer would preserve from an
+    album export.
+    """
+    metadata_files = manifest.get("metadata_files") or {}
+    provenance_path = album_dir / str(metadata_files.get("video_source_provenance") or "")
+    if not provenance_path.is_file():
+        return {}
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+    image_metadata_by_name: dict[str, dict] = {}
+    image_path = album_dir / str(metadata_files.get("images") or "")
+    if image_path.is_file():
+        try:
+            for line in image_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                name = Path(str(row.get("filename") or row.get("image_id") or "")).name.lower()
+                if name:
+                    image_metadata_by_name[name] = row
+        except (OSError, ValueError, json.JSONDecodeError):
+            image_metadata_by_name = {}
+
+    by_video: dict[str, dict] = {}
+    for video in provenance.get("videos") or []:
+        if not isinstance(video, dict) or not video.get("video_id"):
+            continue
+        frames = [frame for frame in (video.get("images") or []) if isinstance(frame, dict)]
+        first = frames[0] if frames else {}
+        image_meta = image_metadata_by_name.get(
+            Path(str(first.get("filename") or first.get("image_id") or "")).name.lower(), {}
+        )
+        capture_time = first.get("capture_time") or image_meta.get("capture_datetime")
+        gps = image_meta.get("gps_coordinates") or {}
+        location = image_meta.get("readable_location") or ""
+        item = {
+            "source_media_id": str(video["video_id"]),
+            "source_media_title": str(video.get("title") or ""),
+            "source_media_image_ids": [str(frame.get("image_id") or "") for frame in frames if frame.get("image_id")],
+            "provenance_source": "photobench_video_source_provenance",
+        }
+        if capture_time:
+            item["captured_at"] = str(capture_time)
+        if location:
+            item["captured_location"] = str(location)
+        if gps.get("latitude") is not None and gps.get("longitude") is not None:
+            item["latitude"] = gps["latitude"]
+            item["longitude"] = gps["longitude"]
+        by_video[str(video["video_id"]).casefold()] = item
+
+    result: dict[str, dict] = {}
+    for relative in manifest.get("videos") or []:
+        path = Path(str(relative))
+        item = by_video.get(path.stem.casefold())
+        if item:
+            result[path.name] = item
+    return result
+
+
 def load_jsonl(path: Path) -> list[dict]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -1347,6 +1477,9 @@ def load_jsonl(path: Path) -> list[dict]:
         if line:
             rows.append(json.loads(line))
     return rows
+
+
+FACE_CLUSTERING_METRIC_VERSION = 2
 
 
 def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
@@ -1358,56 +1491,119 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
     """
     truth_path = album_dir / "identity" / "face_info_cn.json"
     if not truth_path.is_file():
-        return {"available": False, "reason": "benchmark identity GT not found"}
+        return {
+            "available": False,
+            "reason": "benchmark identity GT not found",
+            "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        }
     try:
         image_to_face_ids = (json.loads(truth_path.read_text(encoding="utf-8"))
                              .get("image_to_face_ids") or {})
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return {"available": False, "reason": f"benchmark identity GT could not be read: {exc}"}
+        return {
+            "available": False,
+            "reason": f"benchmark identity GT could not be read: {exc}",
+            "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        }
 
-    # A multi-person GT image cannot be mapped unambiguously to one detected
-    # face without an annotation box, so it is intentionally excluded.
+    # An image tagged with one identity is not necessarily a single-face image.
+    # We only score an instance when there is exactly one detected face; for
+    # multi-face images this GT has no box-level mapping, so choosing a face
+    # would make the clustering score circular or speculative.
     truth_by_name = {
         Path(str(name)).name.lower(): str(face_ids[0])
         for name, face_ids in image_to_face_ids.items()
         if isinstance(face_ids, list) and len(face_ids) == 1
     }
-    excluded_multi_face = sum(
+    gt_multi_identity_image_count = sum(
         1 for face_ids in image_to_face_ids.values()
         if isinstance(face_ids, list) and len(face_ids) != 1
     )
     db_path = REPOSITORY_ROOT / "data" / "sentrix.db"
     try:
-        with sqlite3.connect(db_path) as conn:
+        conn = sqlite3.connect(db_path)
+        try:
+            asset_rows = conn.execute(
+                "SELECT file_name FROM assets WHERE scope_id = ?", (scope_id,),
+            ).fetchall()
             rows = conn.execute(
                 "SELECT fi.id, fi.cluster_id, a.file_name "
                 "FROM face_instances fi JOIN assets a ON a.id = fi.asset_id "
                 "WHERE a.scope_id = ?", (scope_id,),
             ).fetchall()
+        finally:
+            conn.close()
     except sqlite3.Error as exc:
-        return {"available": False, "reason": f"face clustering data could not be read: {exc}"}
+        return {
+            "available": False,
+            "reason": f"face clustering data could not be read: {exc}",
+            "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        }
 
     by_file: dict[str, list[tuple[str, str | None]]] = {}
+    asset_names = {Path(str(row[0])).name.lower() for row in asset_rows}
     for face_id, cluster_id, file_name in rows:
         by_file.setdefault(Path(str(file_name)).name.lower(), []).append(
             (str(face_id), str(cluster_id) if cluster_id else None)
         )
     predicted, truth = {}, {}
     excluded_ambiguous = 0
+    gt_single_count = len(truth_by_name)
+    # Asset coverage must be measured from the asset inventory, not face rows:
+    # otherwise an in-scope image with zero detections is incorrectly called
+    # absent from the album.
+    asset_name_coverage_count = sum(1 for file_name in truth_by_name if file_name in asset_names)
+    detected_single_face_count = 0
+    detected_zero_face_count = 0
+    detected_multiple_faces_count = 0
+    single_face_without_cluster_count = 0
     for file_name, label in truth_by_name.items():
         detected = by_file.get(file_name) or []
-        if len(detected) != 1 or not detected[0][1]:
+        if file_name in asset_names and not detected:
+            detected_zero_face_count += 1
+        elif file_name in asset_names and len(detected) > 1:
+            detected_multiple_faces_count += 1
+        if len(detected) == 1:
+            detected_single_face_count += 1
+        if len(detected) != 1:
+            excluded_ambiguous += 1
+            continue
+        if not detected[0][1]:
+            single_face_without_cluster_count += 1
             excluded_ambiguous += 1
             continue
         face_id, cluster_id = detected[0]
         predicted[face_id] = cluster_id
         truth[face_id] = label
+    diagnostics = {
+        "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        "gt_single_image_count": gt_single_count,
+        "asset_name_coverage_count": asset_name_coverage_count,
+        "asset_name_coverage_rate": asset_name_coverage_count / gt_single_count if gt_single_count else 0.0,
+        "gt_assets_missing_from_scope_count": max(0, gt_single_count - asset_name_coverage_count),
+        "detected_zero_face_count": detected_zero_face_count,
+        "detected_single_face_count": detected_single_face_count,
+        "detected_multiple_faces_count": detected_multiple_faces_count,
+        "single_face_without_cluster_count": single_face_without_cluster_count,
+        "evaluable_face_count": len(predicted),
+        "single_face_detection_of_present_assets_rate": (
+            detected_single_face_count / asset_name_coverage_count if asset_name_coverage_count else 0.0
+        ),
+        "single_face_clustered_rate": (
+            len(predicted) / detected_single_face_count if detected_single_face_count else 0.0
+        ),
+        "gt_multi_identity_image_count": gt_multi_identity_image_count,
+        # Backward-compatible field: this historically counted GT images with
+        # multiple identity labels, not detector outputs.
+        "excluded_multi_face": gt_multi_identity_image_count,
+    }
     if len(predicted) < 2:
         return {
             "available": False,
             "reason": "fewer than two unambiguous labelled face instances",
-            "excluded_multi_face": excluded_multi_face,
             "excluded_ambiguous": excluded_ambiguous,
+            **diagnostics,
+            "detected_single_face_rate": detected_single_face_count / gt_single_count if gt_single_count else 0.0,
         }
     counts = pairwise_metrics(predicted, truth)
     false_merge_denominator = counts["true_positive"] + counts["false_positive"]
@@ -1426,8 +1622,9 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
         "false_negative_pair_count": counts["false_negative"],
         "evaluable_pair_count": len(predicted) * (len(predicted) - 1) // 2,
         "evaluable_face_count": len(predicted),
-        "excluded_multi_face": excluded_multi_face,
         "excluded_ambiguous": excluded_ambiguous,
+        **diagnostics,
+        "detected_single_face_rate": detected_single_face_count / gt_single_count if gt_single_count else 0.0,
     }
 
 
@@ -1445,6 +1642,7 @@ def benchmark_graph_quality_snapshot(scope_id: str, album_dir: Path) -> dict:
                     "reason": str(built.get("error") or "graph projection could not be built")}
         quality = service.quality(scope_id=scope_id)
     quality["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+    quality["face_clustering_metric_version"] = FACE_CLUSTERING_METRIC_VERSION
     quality["snapshot_source"] = "photobench_isolated_scope_projection"
     return quality
 
@@ -1528,6 +1726,37 @@ def dataset_integrity(album_dir: Path, manifest: dict, qa_set: str) -> dict:
 # GPU Sampler
 # ---------------------------------------------------------------------------
 
+def local_nvidia_smi_stats() -> dict:
+    """Read host GPU telemetry for an external WSL vLLM endpoint."""
+    query = "index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm"
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unavailable", "reason": "nvidia-smi not found"}
+    if completed.returncode != 0:
+        return {"status": "unavailable", "reason": (completed.stderr or "nvidia-smi failed").strip()}
+    gpus = []
+    for line in completed.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) < 8:
+            continue
+        def number(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        gpus.append({
+            "index": int(number(fields[0]) or 0), "name": fields[1],
+            "temperature_c": number(fields[2]), "gpu_utilization_pct": number(fields[3]),
+            "memory_used_mib": number(fields[4]), "memory_total_mib": number(fields[5]),
+            "power_draw_w": number(fields[6]), "sm_clock_mhz": number(fields[7]),
+            "telemetry_source": "nvidia-smi",
+        })
+    return {"status": "available" if gpus else "unavailable", "data": {"gpus": gpus}}
+
 class GpuSampler:
     """Poll device and managed-model memory at intervals."""
 
@@ -1556,8 +1785,11 @@ class GpuSampler:
                 gpu_result = self.provider.gpu_stats()
                 memory_result = self.provider.process_memory()
                 if gpu_result.get("status") != "available":
-                    self._stop.wait(self.interval)
-                    continue
+                    gpu_result = local_nvidia_smi_stats()
+                    memory_result = {"status": "unavailable", "data": {}}
+                    if gpu_result.get("status") != "available":
+                        self._stop.wait(self.interval)
+                        continue
                 data = gpu_result.get("data") or {}
                 process_memory = (
                     memory_result.get("data") or {}
@@ -1678,7 +1910,8 @@ class BenchmarkRun:
                  mode: str = "full", existing_scope_id: str = "",
                  scope_reused_from_runs: list | None = None,
                  use_current_model: bool = False, current_model_snapshot: dict | None = None,
-                 use_cloud_model: bool = False, resume_state: dict | None = None):
+                 use_cloud_model: bool = False, resume_state: dict | None = None,
+                 qa_limit: int | None = None):
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
         if mode == "reuse" and not existing_scope_id:
@@ -1721,9 +1954,14 @@ class BenchmarkRun:
 
         album_base = BENCHMARK_DATA_ROOT / album_id
         self.album_dir = album_base
-        self.qa_rows = apply_task_action_defaults(
+        all_qa_rows = apply_task_action_defaults(
             load_jsonl(album_base / manifest["qa_sets"][qa_set]), album_id, qa_set,
         )
+        if qa_limit is not None:
+            limit = max(1, min(int(qa_limit), len(all_qa_rows)))
+            self.qa_rows = all_qa_rows[:limit]
+        else:
+            self.qa_rows = all_qa_rows
         self.input_integrity = dataset_integrity(album_base, manifest, qa_set)
 
         self.state: dict = {
@@ -1743,6 +1981,8 @@ class BenchmarkRun:
             "model_name": BIG_MODEL_MODEL if self.use_cloud_model else model_profile,
             "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
+            "qa_limit": qa_limit,
+            "qa_source_count": len(all_qa_rows),
             "judge_model": judge_model,
             "judge_url": self.judge_url,
             "delete_scope_after_run": self.delete_scope_after_run,
@@ -1936,6 +2176,137 @@ class BenchmarkRun:
                 self.state["phases"][phase] = {"status": "pending"}
             self.state["phases"][phase][key] = value
 
+    def _refresh_live_metric_preview(self) -> None:
+        """Update only cheap per-item metrics while a run is in progress.
+
+        Do not walk retrieval/tool traces here: the dashboard polls frequently
+        and traces can be very large. The final aggregate remains authoritative.
+        """
+        items = self.state.get("items") or []
+        metric_items = [item for item in items if isinstance(item, dict)
+                        and _retrieval_metric_eligible(item)]
+        typed_items = [item for item in metric_items
+                       if "retrieval_media_refs" in item]
+        # Keep the live preview on the same typed-media calculation as the
+        # final aggregate.  Previously this method only wrote the micro
+        # counters, while the UI renders the macro fields; because the live
+        # /api/runs response intentionally omits items, the frontend had no
+        # fallback and displayed '-' for Recall/F1 during a run.
+        if typed_items:
+            media_micro = _micro_metrics_from_counts(typed_items, "media_retrieval_counts")
+            image_micro = _micro_metrics_from_counts(typed_items, "image_retrieval_counts")
+            video_micro = _micro_metrics_from_counts(typed_items, "video_retrieval_counts")
+            media_macro = _macro_metrics_from_counts(typed_items, "media_retrieval_counts")
+            image_macro = _macro_metrics_from_counts(typed_items, "image_retrieval_counts")
+            video_macro = _macro_metrics_from_counts(typed_items, "video_retrieval_counts")
+        else:
+            legacy_items = [item for item in metric_items if item.get("retrieval_image_ids")]
+            # Older/in-flight items can already have the authoritative count
+            # contract without carrying the legacy image-id arrays.  Keep
+            # those records visible in the live dashboard too; otherwise the
+            # final aggregate has numbers while the running view stays '-'.
+            count_items = [item for item in metric_items
+                           if isinstance(item.get("media_retrieval_counts"), dict)
+                           and int((item.get("media_retrieval_counts") or {}).get("gt") or 0) > 0]
+            if not legacy_items and count_items:
+                media_micro = _micro_metrics_from_counts(count_items, "media_retrieval_counts")
+                image_micro = _micro_metrics_from_counts(count_items, "image_retrieval_counts")
+                video_micro = _micro_metrics_from_counts(count_items, "video_retrieval_counts")
+                media_macro = _macro_metrics_from_counts(count_items, "media_retrieval_counts")
+                image_macro = _macro_metrics_from_counts(count_items, "image_retrieval_counts")
+                video_macro = _macro_metrics_from_counts(count_items, "video_retrieval_counts")
+                legacy_items = count_items
+            else:
+                values = [item.get("retrieval_recall") for item in legacy_items
+                          if isinstance(item.get("retrieval_recall"), (int, float))]
+                precision_values = [item.get("retrieval_precision") for item in legacy_items
+                                    if isinstance(item.get("retrieval_precision"), (int, float))]
+                f1_values = [item.get("retrieval_f1") for item in legacy_items
+                              if isinstance(item.get("retrieval_f1"), (int, float))]
+                gt_total = sum(len(item.get("retrieval_image_ids") or []) for item in legacy_items)
+                matched_total = sum(len(item.get("retrieved_matched_file_names")
+                                     or item.get("matched_file_names") or []) for item in legacy_items)
+                predicted_total = sum(len(item.get("retrieved_file_names")
+                                       or item.get("predicted_file_names") or []) for item in legacy_items)
+                legacy_micro = {
+                    "precision": matched_total / predicted_total if predicted_total else (0.0 if gt_total else None),
+                    "recall": matched_total / gt_total if gt_total else None,
+                    "f1": None,
+                    "metric_count": len(legacy_items),
+                }
+                if legacy_micro["precision"] is not None and legacy_micro["recall"] is not None and legacy_micro["precision"] + legacy_micro["recall"]:
+                    legacy_micro["f1"] = 2 * legacy_micro["precision"] * legacy_micro["recall"] / (legacy_micro["precision"] + legacy_micro["recall"])
+                media_micro = image_micro = legacy_micro
+                video_micro = {"precision": None, "recall": None, "f1": None, "metric_count": 0}
+                media_macro = image_macro = {
+                    "precision": sum(precision_values) / len(precision_values) if precision_values else None,
+                    "recall": sum(values) / len(values) if values else None,
+                    "f1": sum(f1_values) / len(f1_values) if f1_values else None,
+                    "metric_count": len(values),
+                }
+                video_macro = {"precision": None, "recall": None, "f1": None, "metric_count": 0}
+        valid_scores = [
+            score for item in items
+            if isinstance(item, dict)
+            and (score := judge_score_for_summary(item.get("judge"))) is not None
+        ]
+        summary = dict(self.state.get("summary") or {})
+        summary.update({
+            "total": len(self.qa_rows) if self.mode != "build" else 0,
+            "completed": int(self._qa_judge_completed),
+            "retrieval_recall_mean": round(media_macro["recall"], 3) if media_macro.get("recall") is not None else None,
+            "retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro.get("precision") is not None else None,
+            "retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro.get("recall") is not None else None,
+            "retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro.get("f1") is not None else None,
+            "retrieval_recall_micro": round(media_micro["recall"], 3) if media_micro.get("recall") is not None else None,
+            "retrieval_precision_micro": round(media_micro["precision"], 3) if media_micro.get("precision") is not None else None,
+            "retrieval_f1_micro": round(media_micro["f1"], 3) if media_micro.get("f1") is not None else None,
+            "media_retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro.get("precision") is not None else None,
+            "media_retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro.get("recall") is not None else None,
+            "media_retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro.get("f1") is not None else None,
+            "media_retrieval_recall_micro": round(media_micro["recall"], 3) if media_micro.get("recall") is not None else None,
+            "media_retrieval_precision_micro": round(media_micro["precision"], 3) if media_micro.get("precision") is not None else None,
+            "media_retrieval_f1_micro": round(media_micro["f1"], 3) if media_micro.get("f1") is not None else None,
+            "image_retrieval_precision_macro": round(image_macro["precision"], 3) if image_macro.get("precision") is not None else None,
+            "image_retrieval_recall_macro": round(image_macro["recall"], 3) if image_macro.get("recall") is not None else None,
+            "image_retrieval_f1_macro": round(image_macro["f1"], 3) if image_macro.get("f1") is not None else None,
+            "image_retrieval_recall_micro": round(image_micro["recall"], 3) if image_micro.get("recall") is not None else None,
+            "image_retrieval_precision_micro": round(image_micro["precision"], 3) if image_micro.get("precision") is not None else None,
+            "image_retrieval_f1_micro": round(image_micro["f1"], 3) if image_micro.get("f1") is not None else None,
+            "video_retrieval_precision_macro": round(video_macro["precision"], 3) if video_macro.get("precision") is not None else None,
+            "video_retrieval_recall_macro": round(video_macro["recall"], 3) if video_macro.get("recall") is not None else None,
+            "video_retrieval_f1_macro": round(video_macro["f1"], 3) if video_macro.get("f1") is not None else None,
+            "video_retrieval_recall_micro": round(video_micro["recall"], 3) if video_micro.get("recall") is not None else None,
+            "video_retrieval_precision_micro": round(video_micro["precision"], 3) if video_micro.get("precision") is not None else None,
+            "video_retrieval_f1_micro": round(video_micro["f1"], 3) if video_micro.get("f1") is not None else None,
+            "retrieval_metric_count": media_micro.get("metric_count"),
+            "media_retrieval_metric_count": media_micro.get("metric_count"),
+            "image_retrieval_metric_count": image_micro.get("metric_count"),
+            "video_retrieval_metric_count": video_micro.get("metric_count"),
+            "retrieval_metric_scope": "all_media" if typed_items else "legacy_image_only",
+            "retrieval_excluded_unanswerable_count": len(items) - len(metric_items),
+            "judge_valid_count": len(valid_scores),
+            "answer_quality_mean": round(sum(valid_scores) / len(valid_scores), 3) if valid_scores else None,
+            "exact_accuracy": round(sum(score == 2 for score in valid_scores) / len(valid_scores), 3)
+                if valid_scores else None,
+            "core_accuracy": round(sum(score >= 1 for score in valid_scores) / len(valid_scores), 3)
+                if valid_scores else None,
+            "live_preview": True,
+        })
+        # Graph-effect rows are evaluator-only and intentionally remain a
+        # preview.  Recomputing them every question would recursively walk
+        # large tool traces, so refresh at a bounded cadence and always let
+        # the final aggregate replace the preview with the authoritative view.
+        now = time.monotonic()
+        last_count = getattr(self, "_live_graph_preview_count", -1)
+        last_at = getattr(self, "_live_graph_preview_at", 0.0)
+        if (len(items) <= 1 or len(items) - last_count >= 10 or now - last_at >= 3.0):
+            summary["graph_qa_by_type"] = self._aggregate_graph_qa_by_type(items)
+            summary["graph_qa_metric_scope"] = "end_to_end_retrieval_chain_live_preview"
+            self._live_graph_preview_count = len(items)
+            self._live_graph_preview_at = now
+        self.state["summary"] = summary
+
     def _phase_start(self, phase: str):
         self._phase_started_perf[phase] = time.perf_counter()
         self._record_phase(phase, "status", "running")
@@ -1965,11 +2336,18 @@ class BenchmarkRun:
                 "reason": "cloud_api_has_no_local_gpu_metrics",
             }
         if not self.vllm_api_url:
+            gpu = local_nvidia_smi_stats()
+            if gpu.get("status") == "available":
+                return {
+                    "captured_at": now_iso(), "source": "nvidia-smi",
+                    "status": "available", "gpu": (gpu.get("data") or {}).get("gpus") or [],
+                    "process_memory": None,
+                }
             return {
                 "captured_at": now_iso(),
                 "source": "external",
                 "status": "not_applicable",
-                "reason": "external model endpoint has no manager metrics",
+                "reason": "external model endpoint has no manager metrics and nvidia-smi is unavailable",
             }
         snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
         try:
@@ -2050,7 +2428,7 @@ class BenchmarkRun:
             self.state["fatal_error"] = str(e)
             traceback.print_exc()
         finally:
-            if not self.use_cloud_model and self.vllm_api_url:
+            if not self.use_cloud_model:
                 self._gpu_sampler.stop()
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
@@ -2071,6 +2449,12 @@ class BenchmarkRun:
                      "pipeline_processing", "graph_memory", "qa_eval", "gpu_metrics", "aggregate"],
             "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
                       "pipeline_processing", "graph_memory", "gpu_metrics", "aggregate"],
+            # Reuse means reusing the processed scope *and its derived graph
+            # snapshot*. Rebuilding graph_memory here made a reuse A/B run
+            # silently mutate the evaluation base and added several minutes
+            # before QA. Graph construction belongs to full/build; callers
+            # that intentionally change graph construction must run build
+            # first, then reuse that completed snapshot.
             "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
         }
         if self.mode == "resume":
@@ -2442,6 +2826,7 @@ class BenchmarkRun:
         media_paths = [path for path in media_paths if path.is_file()]
         photo_count = len(self.manifest.get("photos") or [])
         video_count = len(self.manifest.get("videos") or [])
+        video_metadata_by_name = _video_import_metadata(self.album_dir, self.manifest)
         chunk_size = max(1, int(os.getenv("PHOTOBENCH_IMPORT_CHUNK_SIZE", "8")))
         upload_workers = max(1, int(os.getenv("PHOTOBENCH_IMPORT_UPLOAD_WORKERS", "2")))
         max_upload_attempts = max(1, int(os.getenv("PHOTOBENCH_IMPORT_MAX_ATTEMPTS", "3")))
@@ -2464,10 +2849,25 @@ class BenchmarkRun:
             for attempt in range(1, max_upload_attempts + 1):
                 try:
                     files = [("files", path.name, path.read_bytes()) for path in pending_paths]
+                    # Preserve the album's authoritative video provenance when
+                    # the clip itself has no EXIF (the common case for the
+                    # benchmark's derived mp4 files).  The API validates this
+                    # as ordinary capture metadata and stores it on the
+                    # source video, so keyframes/events inherit the same
+                    # time/place during processing.
+                    import_metadata = [
+                        video_metadata_by_name.get(path.name, {})
+                        for path in pending_paths
+                    ]
+                    upload_fields = {
+                        "scope_id": self.state["scope_id"], "batch_id": batch_id,
+                        "deferBatchComplete": "true",
+                    }
+                    if any(import_metadata):
+                        upload_fields["metadata"] = json.dumps(import_metadata, ensure_ascii=False)
                     result = upload_files(
                         f"{self.sentrix_url}/api/import",
-                        {"scope_id": self.state["scope_id"], "batch_id": batch_id,
-                         "deferBatchComplete": "true"},
+                        upload_fields,
                         files, 600,
                     )
                     returned = {
@@ -2595,7 +2995,7 @@ class BenchmarkRun:
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        if not self.use_cloud_model and self.vllm_api_url:
+        if not self.use_cloud_model:
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -2797,7 +3197,7 @@ class BenchmarkRun:
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
         # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
-        if not self.use_cloud_model and self.vllm_api_url and not self._gpu_sampling_started:
+        if not self.use_cloud_model and not self._gpu_sampling_started:
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -2902,7 +3302,7 @@ class BenchmarkRun:
                 self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
                 self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
                 self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
-                if not self.use_cloud_model and self.vllm_api_url:
+                if not self.use_cloud_model:
                     self._gpu_sampler.stop()
 
             while pending:
@@ -2944,6 +3344,7 @@ class BenchmarkRun:
                             self.state["items"].append(item)
                             self._qa_agent_completed += 1
                             record_qa_progress()
+                            self._refresh_live_metric_preview()
                             self.persist()
                         if not any(k == "agent" for k, _ in pending.values()):
                             record_agent_phase_finished()
@@ -2973,6 +3374,7 @@ class BenchmarkRun:
                         self._qa_judge_completed += 1
                         with self.lock:
                             record_qa_progress()
+                            self._refresh_live_metric_preview()
                             self.persist()
 
             record_agent_phase_finished()
@@ -3146,10 +3548,14 @@ class BenchmarkRun:
             retrieved_media = _resolve_predicted_media(media_sets["retrieved_asset_ids"], assets_by_name)
             evidence_media = _resolve_predicted_media(media_sets["evidence_asset_ids"], assets_by_name)
 
-            # Match against GT. 交付口径（E）：主要"回答来源/召回"指标对齐到模型的
-            # 显式交付（selected/delivery），与 UI 展示的模型回答图片一致；检索候选集
-            # 只作为检索层诊断单独保留，不再冒充回答来源参与召回指标。
-            metrics = _modality_metrics(gt_refs, selected_media)
+            # Match against GT using the benchmark's established delivery
+            # semantics: retrieval Recall is measured on the media actually
+            # selected/delivered by the Agent.  The broader search candidate
+            # pool is retained below as a diagnostic only; promoting it to
+            # the headline metric would make the score incomparable with the
+            # remote repository and could overstate answer quality.
+            metrics = _modality_metrics(gt_refs, selected_media, assets_by_name)
+            candidate_metrics = _modality_metrics(gt_refs, retrieved_media, assets_by_name)
             gt_media = _resolve_gt_media(gt_refs, assets_by_name, selected_media)
             retrieved_keys = {
                 _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
@@ -3218,6 +3624,12 @@ class BenchmarkRun:
                 "video_retrieval_recall": metrics["video"]["recall"],
                 "video_retrieval_precision": metrics["video"]["precision"],
                 "video_retrieval_f1": metrics["video"]["f1"],
+                "candidate_media_retrieval_counts": candidate_metrics["media"],
+                "candidate_image_retrieval_counts": candidate_metrics["image"],
+                "candidate_video_retrieval_counts": candidate_metrics["video"],
+                "candidate_media_retrieval_recall": candidate_metrics["media"]["recall"],
+                "candidate_image_retrieval_recall": candidate_metrics["image"]["recall"],
+                "candidate_video_retrieval_recall": candidate_metrics["video"]["recall"],
                 # Compatibility aliases are total-media metrics for typed runs.
                 "retrieval_recall": metrics["media"]["recall"],
                 "retrieval_precision": metrics["media"]["precision"],
@@ -4195,18 +4607,18 @@ class BenchmarkRun:
 
     def _phase_gpu_metrics(self):
         self._phase_start("gpu_metrics")
-        if self.use_cloud_model or not self.vllm_api_url:
+        if self.use_cloud_model:
             self._phase_done("gpu_metrics", {
                 "status": "skipped",
-                "source": "cloud_api" if self.use_cloud_model else "external",
-                "reason": (
-                    "cloud_api_has_no_local_gpu_metrics"
-                    if self.use_cloud_model else
-                    "external_model_endpoint_has_no_manager_metrics"
-                ),
+                "source": "cloud_api",
+                "reason": "cloud_api_has_no_local_gpu_metrics",
             })
             return
         agg = self._gpu_sampler.aggregate()
+        agg.update({
+            "status": "done" if agg.get("samples_count") else "unavailable",
+            "source": "manager" if self.vllm_api_url else "nvidia-smi",
+        })
         self._phase_done("gpu_metrics", agg)
 
     def _phase_aggregate(self):
@@ -4261,11 +4673,31 @@ class BenchmarkRun:
             "llm_context_samples_count": len(context_tokens),
         }
         summary.update(self._capability_summary(items, self.state.get("phases") or {}))
+        summary["graph_qa_by_type"] = self._aggregate_graph_qa_by_type(items)
+        summary["graph_qa_metric_scope"] = "end_to_end_retrieval_chain"
+        # Keep evaluator-only identity quality in the run summary as well as
+        # the graph-quality endpoint, so it is visible even before the UI
+        # finishes loading the isolated graph snapshot.
+        summary["face_clustering"] = benchmark_face_clustering_quality(
+            str(self.state.get("scope_id") or ""), self.album_dir,
+        )
+        summary["gpu_metrics"] = self.state.get("phases", {}).get("gpu_metrics") or {}
         summary["benchmark_e2e_latency_excluding_judge_ms"] = self._benchmark_e2e_latency_excluding_judge_ms(
             self.state.get("phases") or {}, items,
         )
         self.state["summary"] = summary
         self._phase_done("aggregate", {"summary": summary})
+
+    @classmethod
+    def _aggregate_graph_qa_by_type(cls, items: list[dict]) -> list[dict]:
+        """Delegate the evaluator-only graph report to the repository helper.
+
+        The report needs benchmark ground truth and therefore belongs to the
+        PhotoBench layer, not the runtime graph service.  Keep the same helper
+        available on ``BenchmarkRun`` because aggregation runs there; the
+        implementation is shared with persisted-run rehydration below.
+        """
+        return OrchestratorRepository._aggregate_graph_qa_by_type(items)
 
     @classmethod
     def _capability_summary(cls, items: list[dict], phases: dict | None = None) -> dict:
@@ -4500,6 +4932,7 @@ class OrchestratorRepository:
     def __init__(self, results_root: Path):
         self.results_root = results_root.resolve()
         self.lock = threading.RLock()
+        self.graph_quality_locks: dict[str, threading.Lock] = {}
         self.runs: dict[str, BenchmarkRun] = {}
         self.suite_queue: list[dict] = []  # pending suite configs
         self.active_suite_run_ids: list[str] = []
@@ -4647,6 +5080,20 @@ class OrchestratorRepository:
                 rid = run.get("run_id")
                 if not rid:
                     continue
+                # Graph-quality is an independently derived dashboard snapshot.
+                # Keep it in a small sidecar so reading/updating that metric
+                # never requires serializing the run's potentially huge QA
+                # trace payload.
+                try:
+                    graph_quality = json.loads(
+                        (path.parent / "graph_quality.json").read_text(encoding="utf-8")
+                    )
+                    expected_scope = run.get("scope_id") or run.get("existing_scope_id")
+                    if (isinstance(graph_quality, dict)
+                            and graph_quality.get("scope_id") == expected_scope):
+                        run.setdefault("summary", {})["graph_quality"] = graph_quality
+                except (OSError, json.JSONDecodeError):
+                    pass
                 changed = False
                 status = run.get("status")
                 if status in dirty_statuses:
@@ -4668,7 +5115,22 @@ class OrchestratorRepository:
                 # Store as a lightweight dict for listing (not a full BenchmarkRun)
                 self.runs[rid] = run
             except (OSError, KeyError, json.JSONDecodeError):
-                continue
+                # A hard stop can leave run.json preallocated or truncated.
+                # atomic_json(keep_backup=True) keeps the previous complete
+                # snapshot beside it so the benchmark remains recoverable.
+                backup = path.with_suffix(path.suffix + ".bak")
+                try:
+                    run = json.loads(backup.read_text(encoding="utf-8"))
+                    rid = run.get("run_id")
+                    if not rid:
+                        continue
+                    run["status"] = "interrupted" if run.get("status") == "running" else run.get("status")
+                    run["finished_at"] = run.get("finished_at") or now_iso()
+                    run["recovery_note"] = "Recovered from the last complete snapshot"
+                    atomic_json(path, run)
+                    self.runs[rid] = run
+                except (OSError, KeyError, json.JSONDecodeError):
+                    continue
 
     def list_manifests(self) -> list[dict]:
         manifests = []
@@ -4934,28 +5396,153 @@ class OrchestratorRepository:
 
     def list_runs(self) -> list[dict]:
         with self.lock:
-            result = []
-            for rid, run in self.runs.items():
-                if isinstance(run, BenchmarkRun):
-                    state = run.state
+            runs = list(self.runs.items())
+        result = []
+        for rid, run in runs:
+            if isinstance(run, BenchmarkRun):
+                with run.lock:
+                    state = dict(run.state)
+            else:
+                # Disk-loaded runs are dictionaries. Take only a shallow
+                # snapshot while holding the map lock; never keep the global
+                # repository lock while shaping response data.
+                with self.lock:
+                    if self.runs.get(rid) is not run:
+                        continue
+                    state = dict(run)
+                # The run list is loaded during every page initialization.  Do
+                # not copy the whole persisted run here: completed runs can
+                # contain hundreds of MB of traces and QA items, and doing so
+                # blocks the UI before it can render anything.  The detail
+                # endpoint still returns the complete run on demand.
+            list_fields = (
+                "run_id", "suite_id", "album_id", "qa_set", "mode",
+                "status", "started_at", "finished_at", "scope_id",
+                "scope_source", "qa_count", "qa_concurrency",
+                "judge_concurrency", "model_profile",
+                "model_id", "model_name", "vllm_target_id",
+            )
+            public = {key: state.get(key) for key in list_fields if key in state}
+            # The list page fetches the selected run's detailed phases
+            # separately. Returning every historical phase trace (and
+            # rejudge record) for all runs made the initial dashboard response
+            # grow with the full persisted QA history.
+            rejudge = state.get("rejudge") or {}
+            if rejudge:
+                public["rejudge"] = {
+                    key: rejudge.get(key)
+                    for key in ("status", "task_id", "completed", "total", "failed")
+                    if key in rejudge
+                }
+            items = state.get("items") or []
+            public["item_count"] = len(items)
+
+            # Prefer persisted aggregates; during a live run use the cheap
+            # QA progress counters instead of rescanning every nested trace.
+            saved = state.get("summary") or {}
+            summary_fields = (
+                "total", "completed", "judge_valid_count",
+                "judge_distribution", "retrieval_recall_mean",
+                "retrieval_recall_micro", "retrieval_precision_micro",
+                "retrieval_f1_micro", "media_retrieval_recall_micro",
+                "media_retrieval_precision_micro", "media_retrieval_f1_micro",
+                "answer_quality_mean", "exact_accuracy", "core_accuracy",
+                "face_clustering", "gpu_metrics", "retrieval_metric_count",
+                "media_retrieval_metric_count", "live_preview",
+            )
+            public["summary"] = {
+                key: saved[key] for key in summary_fields if key in saved
+            }
+            if not public["summary"].get("total"):
+                public["summary"]["total"] = state.get("qa_count") or len(items)
+            if "completed" not in public["summary"]:
+                progress = ((state.get("phases") or {}).get("qa_eval") or {}).get("progress") or {}
+                if state.get("status") in {"running", "pending", "cancelling"}:
+                    public["summary"]["completed"] = int(progress.get("completed") or 0)
                 else:
-                    state = run
-                public = self._public_run(state, include_items=False)
-                public["item_count"] = len(state.get("items") or [])
-                public["summary"] = self._list_summary(state)
-                result.append(public)
-            return sorted(result, key=lambda r: r.get("started_at") or "", reverse=True)
+                    public["summary"]["completed"] = sum(
+                        1 for item in items
+                        if isinstance(item, dict)
+                        and item.get("judge_status") in {"completed", "failed", "skipped"}
+                    )
+            result.append(public)
+        return sorted(result, key=lambda r: r.get("started_at") or "", reverse=True)
 
     def get_run(self, run_id: str) -> dict:
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
                 raise KeyError(run_id)
-            state = run.state if isinstance(run, BenchmarkRun) else run
-            result = self._public_run(state, include_items=False)
-            result["item_count"] = len(state.get("items") or [])
+        if isinstance(run, BenchmarkRun):
+            with run.lock:
+                state = dict(run.state)
+        else:
+            with self.lock:
+                if self.runs.get(run_id) is not run:
+                    raise KeyError(run_id)
+                state = dict(run)
+
+        result = self._public_run(state, include_items=False)
+        result["item_count"] = len(state.get("items") or [])
+        saved_summary = state.get("summary") or {}
+        status = state.get("status")
+        if status in {"running", "pending", "cancelling"}:
+            # The details endpoint is polled every two seconds. Computing graph
+            # and tool aggregates here recursively walks hundreds of MB of QA
+            # traces and used to hold the global repository lock, freezing the
+            # progress page. Expose the live counters and last saved aggregate;
+            # the full aggregate is computed once when the run finalizes.
+            summary = dict(saved_summary)
+            progress = ((state.get("phases") or {}).get("qa_eval") or {}).get("progress") or {}
+            summary.setdefault("total", state.get("qa_count") or len(state.get("items") or []))
+            summary["completed"] = int(progress.get("completed", len(state.get("items") or [])))
+            result["summary"] = summary
+        elif saved_summary:
+            # Completed runs already persist their authoritative summary. Do
+            # not derive it again from the full trace every time a page opens.
+            result["summary"] = dict(saved_summary)
+        else:
+            # Legacy records with no aggregate still get the reconstructed
+            # summary, but the potentially expensive work happens outside the
+            # repository lock so list/progress requests remain responsive.
             result["summary"] = self._effective_summary(state)
-            return result
+        return result
+
+    def _compute_graph_quality_background(
+        self, run_id: str, scope_id: str, album_id: str, build_lock: threading.Lock,
+    ) -> None:
+        try:
+            quality = benchmark_graph_quality_snapshot(
+                scope_id, BENCHMARK_DATA_ROOT / album_id,
+            )
+            quality.setdefault("face_clustering_metric_version", FACE_CLUSTERING_METRIC_VERSION)
+            quality.setdefault("status", "ready" if quality.get("available") else "error")
+        except Exception as exc:
+            quality = {
+                "available": False, "status": "error", "reason": str(exc),
+                "run_id": run_id, "scope_id": scope_id,
+            }
+        try:
+            with self.lock:
+                run = self.runs.get(run_id)
+                if not run:
+                    return
+                if isinstance(run, BenchmarkRun):
+                    with run.lock:
+                        run.state.setdefault("summary", {})["graph_quality"] = quality
+                else:
+                    run.setdefault("summary", {})["graph_quality"] = quality
+
+            # Keep this derived dashboard value in its small sidecar instead
+            # of rewriting run.json (which may contain hundreds of MB of QA
+            # traces). Sidecar I/O is also outside the repository lock.
+            atomic_json(self.results_root / run_id / "graph_quality.json", quality)
+        except Exception:
+            # Snapshot generation is auxiliary to QA evaluation. A reporting
+            # failure must not interrupt the benchmark or lock its endpoints.
+            pass
+        finally:
+            build_lock.release()
 
     def get_graph_quality(self, run_id: str) -> dict:
         """Return a run-bound graph-quality snapshot, never the mutable live graph.
@@ -4975,24 +5562,48 @@ class OrchestratorRepository:
             if isinstance(cached, dict) and cached.get("scope_id") == (
                 state.get("scope_id") or state.get("existing_scope_id")
             ):
-                return copy.deepcopy(cached)
+                cached_face = cached.get("face_clustering") or {}
+                # Recompute legacy snapshots that do not carry the current
+                # face-coverage fields. A completed scope is cheap to score
+                # and this prevents stale "not available" results from being
+                # shown forever after an interrupted run.
+                if (cached.get("face_clustering_metric_version") == FACE_CLUSTERING_METRIC_VERSION
+                        and (cached.get("status") in {"ready", "error"}
+                             or cached_face.get("available") is True
+                             or "gt_single_image_count" in cached_face)):
+                    return copy.deepcopy(cached)
             scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
             album_id = str(state.get("album_id") or "").strip()
-
-        quality = benchmark_graph_quality_snapshot(
-            scope_id, BENCHMARK_DATA_ROOT / album_id,
-        )
-        with self.lock:
-            run = self.runs.get(run_id)
-            if not run:
-                raise KeyError(run_id)
-            state = run.state if isinstance(run, BenchmarkRun) else run
-            state.setdefault("summary", {})["graph_quality"] = quality
-            if isinstance(run, BenchmarkRun):
-                run.persist(wait=True)
-            else:
-                atomic_json(self.results_root / run_id / "run.json", state)
-            return copy.deepcopy(quality)
+            locks = getattr(self, "graph_quality_locks", None)
+            if locks is None:
+                locks = self.graph_quality_locks = {}
+            build_lock = locks.setdefault(run_id, threading.Lock())
+            if not build_lock.acquire(blocking=False):
+                return {
+                    "available": False,
+                    "status": "computing",
+                    "reason": "snapshot_in_progress",
+                    "run_id": run_id,
+                    "scope_id": scope_id,
+                }
+            worker = threading.Thread(
+                target=self._compute_graph_quality_background,
+                args=(run_id, scope_id, album_id, build_lock),
+                daemon=True,
+                name=f"graph-quality-{run_id[:24]}",
+            )
+            try:
+                worker.start()
+            except Exception:
+                build_lock.release()
+                raise
+            return {
+                "available": False,
+                "status": "computing",
+                "reason": "snapshot_in_progress",
+                "run_id": run_id,
+                "scope_id": scope_id,
+            }
 
     def get_keyframe_analysis(self, run_id: str) -> dict:
         """Analyze whether video keyframes are useful for this complete run.
@@ -6298,14 +6909,25 @@ class OrchestratorRepository:
 
             deltas = []
             improved = worsened = 0
+            rank_changed = set_changed = 0
             for item, trace in ((i, graph_trace(i)) for i in bucket):
                 rerank = (trace or {}).get("graph_rerank") or {}
-                baseline = rerank.get("baseline_ranked_asset_ids") or []
-                final = rerank.get("reranked_asset_ids") or []
+                # Compare only the candidate head that is returned to the
+                # Agent.  The complete ranked pool is useful for diagnostics,
+                # but counting changes below that head inflated the displayed
+                # graph improvement without changing retrieval/delivery.
+                baseline = (rerank.get("baseline_head_asset_ids")
+                            or (rerank.get("baseline_ranked_asset_ids") or [])[:18])
+                final = (rerank.get("returned_head_asset_ids")
+                         or (rerank.get("reranked_asset_ids") or [])[:18])
                 gt = {str(entry.get("asset_id")) for entry in (item.get("gt_media") or [])
                       if isinstance(entry, dict) and entry.get("asset_id")}
                 if not baseline or not final or not gt:
                     continue
+                if list(map(str, baseline)) != list(map(str, final)):
+                    rank_changed += 1
+                if set(map(str, baseline)) != set(map(str, final)):
+                    set_changed += 1
                 before = len(set(map(str, baseline)) & gt) / len(gt)
                 after = len(set(map(str, final)) & gt) / len(gt)
                 delta = after - before
@@ -6326,6 +6948,8 @@ class OrchestratorRepository:
                 "graph_recall_delta": round(sum(deltas) / len(deltas), 4) if deltas else None,
                 "graph_gt_improved_count": improved,
                 "graph_gt_worsened_count": worsened,
+                "graph_rank_changed_count": rank_changed,
+                "graph_candidate_set_changed_count": set_changed,
                 "retrieval_recall": round(sum(recalls) / len(recalls), 4) if recalls else None,
                 "retrieval_precision": round(sum(precisions) / len(precisions), 4) if precisions else None,
                 "retrieval_f1": round(sum(f1s) / len(f1s), 4) if f1s else None,
@@ -6421,6 +7045,12 @@ class OrchestratorRepository:
     @staticmethod
     def _list_summary(state: dict) -> dict:
         saved = dict(state.get("summary") or {})
+        # Interrupted runs may not reach aggregate. Expose face quality from
+        # the graph snapshot in the main summary when it is already present.
+        if not saved.get("face_clustering"):
+            graph_face = (saved.get("graph_quality") or {}).get("face_clustering")
+            if isinstance(graph_face, dict):
+                saved["face_clustering"] = graph_face
         items = state.get("items") or []
         recalls = [item.get("retrieval_recall") for item in items
                    if isinstance(item.get("retrieval_recall"), (int, float))]
@@ -6920,6 +7550,14 @@ class OrchestratorRepository:
         )
         if not qa_set:
             raise ValueError(f"album {album_id} has no qa_sets in manifest")
+        qa_limit = payload.get("qa_limit")
+        if qa_limit not in (None, ""):
+            try:
+                qa_limit = max(1, int(qa_limit))
+            except (TypeError, ValueError):
+                raise ValueError("qa_limit must be a positive integer")
+        else:
+            qa_limit = None
         existing_scope_id = str(payload.get("existing_scope_id") or "").strip()
         auto_reused_scope = False
         if mode == "reuse" and not existing_scope_id:
@@ -7107,6 +7745,7 @@ class OrchestratorRepository:
                     use_current_model=use_current_model,
                     current_model_snapshot=current_model_snapshot,
                     use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
+                    qa_limit=qa_limit,
                 )
                 if auto_reused_scope:
                     run.state["scope_reuse_resolution"] = {

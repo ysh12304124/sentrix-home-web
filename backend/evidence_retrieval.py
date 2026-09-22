@@ -1,6 +1,7 @@
 """Correctness-first Asset-level Evidence Retrieval Kernel."""
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -8,6 +9,124 @@ import time
 
 from .geocoding import place_text_matches
 from .query_contracts import HARD, SEMANTIC, QueryFacet, QuerySpec, parse_time_expression
+from .retrieval.temporal import trusted_captured_at
+
+
+def _graph_head_quota(candidate_limit: int, intent: str, pool_size: int) -> int:
+    """Reserve a bounded tail for graph-recovered candidates."""
+    try:
+        configured = os.getenv("SENTRIX_GRAPH_HEAD_QUOTA", "").strip()
+        requested = int(configured) if configured else (
+            6 if intent in {"multi_hop", "causal", "cross_media", "temporal", "relationship"}
+            else 4
+        )
+    except (TypeError, ValueError):
+        requested = 4
+    head_budget = max(1, int(candidate_limit) // 5)
+    return min(max(0, requested), head_budget, max(0, int(pool_size)))
+
+
+def _merge_graph_head(baseline_items, graph_items, candidate_limit: int,
+                      graph_quota: int, *, all_relevant: bool = False,
+                      allow_replacement: bool = True):
+    """Add verified graph candidates without globally perturbing baseline rank.
+
+    The baseline head stays in its original order. Graph results fill unused
+    head slots first, then may replace only the baseline tail slots reserved
+    by ``graph_quota`` when ``allow_replacement`` is enabled. The event-memory
+    route disables replacement because its broad temporal/relationship
+    neighbours are useful auxiliary evidence but are not reliable enough to
+    evict a baseline visual/semantic hit.
+    """
+    def asset_id(item):
+        return str((item or {}).get("asset_id") or "")
+
+    baseline = []
+    baseline_ids = set()
+    for item in baseline_items or []:
+        key = asset_id(item)
+        if not key or key in baseline_ids:
+            continue
+        baseline.append(item)
+        baseline_ids.add(key)
+
+    limit = max(0, int(candidate_limit))
+    baseline_head = baseline[:limit]
+    head_ids = {asset_id(item) for item in baseline_head}
+    graph_options = []
+    seen = set()
+    for item in graph_items or []:
+        key = asset_id(item)
+        if not key or key in head_ids or key in seen:
+            continue
+        graph_options.append(item)
+        seen.add(key)
+
+    if all_relevant:
+        selected = graph_options[:max(0, int(graph_quota))]
+        return baseline + [item for item in selected if asset_id(item) not in baseline_ids], {
+            "promoted_ids": [asset_id(item) for item in selected],
+            "displaced_ids": [],
+        }
+
+    selected = graph_options[:max(0, int(graph_quota))]
+    if not selected or limit == 0:
+        return baseline, {"promoted_ids": [], "displaced_ids": []}
+
+    free_slots = max(0, limit - len(baseline_head))
+    if not allow_replacement:
+        # Monotonic graph fusion: only use genuine empty head slots. In the
+        # normal case the baseline already fills candidate_limit, so graph
+        # retrieval becomes an additive provenance channel and cannot lower
+        # the question's baseline recall/precision.
+        selected = selected[:free_slots]
+        if not selected:
+            return baseline, {"promoted_ids": [], "displaced_ids": []}
+        merged = baseline + selected
+        return merged, {
+            "promoted_ids": [asset_id(item) for item in selected],
+            "displaced_ids": [],
+        }
+    replace_count = min(max(0, len(selected) - free_slots), len(baseline_head))
+    kept_head = baseline_head[:-replace_count] if replace_count else list(baseline_head)
+    displaced = baseline_head[len(kept_head):]
+    final_head = kept_head + selected
+    merged = final_head
+    return merged, {
+        "promoted_ids": [asset_id(item) for item in selected],
+        "displaced_ids": [asset_id(item) for item in displaced],
+    }
+
+
+def _filter_graph_candidates_by_source_score(candidates, hit_by_asset, relative_floor):
+    """Apply relative score floors within each graph source, not across sources.
+
+    Traversal, event-summary projection, and global graph search have different
+    score distributions. A strong traversal anchor must not set the cutoff for
+    an independently-scored global semantic result.
+    """
+    best_by_source: dict[str, float] = {}
+    for candidate in candidates:
+        hit = hit_by_asset.get(candidate.asset_id)
+        if hit is None:
+            continue
+        metadata = hit.metadata if isinstance(hit.metadata, dict) else {}
+        source = str(metadata.get("graph_source") or "graph")
+        score = float(hit.raw_score or 0.0)
+        best_by_source[source] = max(best_by_source.get(source, 0.0), score)
+
+    kept = []
+    for candidate in candidates:
+        hit = hit_by_asset.get(candidate.asset_id)
+        if hit is None:
+            continue
+        metadata = hit.metadata if isinstance(hit.metadata, dict) else {}
+        source = str(metadata.get("graph_source") or "graph")
+        score = float(hit.raw_score or 0.0)
+        best = best_by_source.get(source, 0.0)
+        if best <= 0.0 or score >= best * relative_floor:
+            kept.append(candidate)
+    return kept
 
 
 def build_verifier_evidence_bundle(packet, claim_id):
@@ -192,7 +311,10 @@ class EvidenceRetrievalKernel:
         total_started = time.monotonic()
         from .retrieval import HardFilterContext, RetrievalQuery
         from .retrieval.config import RetrievalConfig
-        from .retrieval.fusion import DEFAULT_CHANNEL_WEIGHTS
+        from .retrieval.fusion import (
+            DEFAULT_CHANNEL_WEIGHTS, FusedCandidate, evidence_class_for,
+            weighted_rrf_score,
+        )
         from .retrieval.ranking import VISUAL_ONLY, rank
 
         query_started = time.monotonic()
@@ -224,16 +346,15 @@ class EvidenceRetrievalKernel:
         # asset recall from 0.971 to 0.893, while rank top-50 kept 0.971).
         import os
         candidate_limit = max(1, int(os.getenv("SENTRIX_SEARCH_CANDIDATE_TOP_K", "30")))
-        # Structured anchors (calendar/place/media) are cheap, deterministic
-        # recall channels.  Let their complete scope reach the condition pass;
-        # otherwise a valid metadata hit at rank 200+ is discarded before it
-        # can be fused with visual/text evidence.  Pure semantic searches keep
-        # the bounded head for latency.
-        if (filters.time_bounds or filters.annual_time_window
-                or filters.place or filters.media_types):
-            candidate_limit = max(candidate_limit, min(authorized_count, 1000))
         strategy = config.ranking_strategy
         all_relevant = spec.result_requirement.get("mode") == "all_relevant"
+        # Structured constraints should enrich the recall pool, not turn the
+        # entire album into the answer-facing head.  The old exception made a
+        # place/time query's baseline head 300+ assets, so graph expansion
+        # could not promote a relevant candidate ranked below that list.
+        # Preserve complete-list semantics only for explicit enumeration.
+        if all_relevant:
+            candidate_limit = max(candidate_limit, authorized_count, requested_limit)
         min_retrieval_score = 0.0
 
         channel_hits = {}
@@ -282,9 +403,8 @@ class EvidenceRetrievalKernel:
         packet.channel_hits = {name: [hit.asset_id for hit in hits] for name, hits in channel_hits.items()}
 
         primary_fusion_started = time.monotonic()
-        # Keep this baseline order only for selecting graph seeds and for
-        # explaining the later graph-induced ranking delta.  It is *not* the
-        # final order once an expander has returned graph evidence.
+        # The baseline order is authoritative for the visible head. Graph
+        # results may enter only through a bounded, verified tail replacement.
         baseline_fused = rank(
             channel_hits, strategy, candidate_limit,
             fusion_weights=DEFAULT_CHANNEL_WEIGHTS,
@@ -374,114 +494,184 @@ class EvidenceRetrievalKernel:
                 channel_trace[expander.name] = adjacency_trace
             packet.channel_hits[expander.name] = [hit.asset_id for hit in channel_hits.get(expander.name, [])]
 
-        # This is the actual graph re-rank.  The old implementation ranked
-        # graph hits in isolation and appended them after the ordinary list;
-        # graph evidence could therefore never move an existing candidate.
-        # Fuse every channel together so a path hit boosts an existing seed
-        # and a newly reached node competes in the same candidate universe.
+        # Graph is a bounded recall channel. It can recover verified assets
+        # absent from, or ranked just below, the visible primary head, but it
+        # must not globally reorder the established retrieval results.
         adjacency_fusion_started = time.monotonic()
-        # Graph candidates are useful evidence, but their safe weight depends
-        # on the query intent.  A generic/ordinary query has no directional
-        # path requirement, so broad graph neighbours must not displace
-        # stronger visual/lexical hits.  Temporal, relation, causal and
-        # multi-hop queries explicitly ask for graph semantics and get a
-        # stronger graph contribution.  This keeps ``on`` useful for an
-        # ablation while making the ranking itself intent-aware.
+        # Graph candidates are auxiliary recall evidence, not a replacement
+        # for the visual/lexical baseline.  The previous implementation
+        # re-ranked the whole head with a large graph weight; the 500-QA audit
+        # showed that broad temporal/relationship neighbours frequently
+        # demoted a correct baseline asset (event_memory: 2 improvements vs
+        # 11 regressions).  Keep the baseline order stable and use graph only
+        # to add a small, high-confidence graph-only tail.
         graph_fusion_weights = dict(DEFAULT_CHANNEL_WEIGHTS)
         graph_intent = str((graph_policy_for_fusion or {}).get("intent") or "ordinary")
-        # A graph-semantic route must be able to introduce a candidate that
-        # no ordinary channel recalled.  With the old 1.35 weight, a rank-1
-        # graph-only hit contributed less than a rank-1 visual hit and almost
-        # never entered the final top-30, so telemetry showed many graph
-        # promotions but essentially no GT recall change.  Use a bounded
-        # intent-specific boost: explicit path questions get the strongest
-        # boost, while ordinary/on-mode queries remain conservative.
+        # These weights rank graph candidates against each other only; they
+        # never alter the score or relative order of a baseline candidate.
         graph_fusion_weights["graph"] = {
-            "multi_hop": 4.0,
-            "causal": 3.5,
-            "temporal": 3.0,
-            "relationship": 3.0,
-            "cross_media": 3.0,
-        }.get(graph_intent, 0.35)
-        # Rank a wider pool first, then reserve a small number of head slots
-        # for graph-only candidates.  Weighted RRF alone cannot do this: a
-        # graph hit that was absent from the visual/lexical channels gets one
-        # rank contribution and is routinely pushed below the 30-item head.
-        # That made graph telemetry look active while the returned candidate
-        # set was effectively unchanged.  The quota is bounded and only
-        # applies when graph retrieval is enabled; ordinary ``auto`` queries
-        # still have no graph channel at all.
-        graph_pool_limit = max(candidate_limit, candidate_limit * 3)
-        ranked_pool = rank(
-            channel_hits, strategy, graph_pool_limit,
-            fusion_weights=graph_fusion_weights,
-        )
+            "multi_hop": 2.20,
+            "causal": 2.00,
+            "cross_media": 1.80,
+            "temporal": 1.80,
+            "relationship": 1.60,
+        }.get(graph_intent, 1.80)
+        # Build graph-supported candidates independently of the baseline
+        # strategy. In particular, visual_only intentionally ignores graph;
+        # calling rank(..., visual_only) here used to silently discard every
+        # graph-only result. Preserve primary-channel ranks as support, but a
+        # candidate must have an actual graph hit to enter this pool.
         graph_hits = channel_hits.get("graph") or []
         graph_asset_ids = {hit.asset_id for hit in graph_hits}
         baseline_ids = set(baseline_rank_by_asset)
-        graph_only_pool = [candidate for candidate in ranked_pool
-                           if candidate.asset_id in graph_asset_ids
-                           and candidate.asset_id not in baseline_ids]
+        graph_hit_by_asset = {hit.asset_id: hit for hit in graph_hits}
+        primary_rank_by_asset: dict[str, dict[str, tuple[int, object]]] = {}
+        for channel, hits in channel_hits.items():
+            if channel == "graph":
+                continue
+            for rank_index, hit in enumerate(hits, 1):
+                primary_rank_by_asset.setdefault(hit.asset_id, {})[channel] = (
+                    int(hit.rank or rank_index), hit)
+
+        graph_only_pool = []
+        for hit in graph_hits:
+            if not hit.asset_id or hit.asset_id in baseline_ids:
+                continue
+            ranks = {"graph": int(hit.rank or 1)}
+            raw_scores = {"graph": hit.raw_score}
+            retriever_hits = [hit]
+            for channel, (rank_index, primary_hit) in primary_rank_by_asset.get(
+                    hit.asset_id, {}).items():
+                ranks[channel] = rank_index
+                raw_scores[channel] = primary_hit.raw_score
+                retriever_hits.append(primary_hit)
+            graph_only_pool.append(FusedCandidate(
+                asset_id=hit.asset_id,
+                channels=ranks,
+                rrf=weighted_rrf_score(ranks, graph_fusion_weights),
+                evidence_class=evidence_class_for("graph"),
+                raw_scores=raw_scores,
+                retriever_hits=retriever_hits,
+            ))
+        # Do not inject a near-zero graph result when the graph has a
+        # meaningful score head.  Such candidates changed the candidate set
+        # in the prior run without improving GT recall.
         try:
-            configured_graph_quota = int(os.getenv("SENTRIX_GRAPH_HEAD_QUOTA", "8"))
+            graph_score_floor = float(os.getenv("SENTRIX_GRAPH_MIN_RELATIVE_SCORE", "0.55"))
         except (TypeError, ValueError):
-            configured_graph_quota = 6
-        graph_quota = min(
-            max(0, configured_graph_quota),
-            candidate_limit // 3,
-            len(graph_only_pool),
+            graph_score_floor = 0.55
+        graph_score_floor = min(1.0, max(0.0, graph_score_floor))
+        qualified_graph_candidates = _filter_graph_candidates_by_source_score(
+            [FusedCandidate(asset_id=hit.asset_id) for hit in graph_hits if hit.asset_id],
+            graph_hit_by_asset, graph_score_floor,
         )
-        combined_fused = list(ranked_pool[:candidate_limit])
-        forced_graph_ids = []
-        if graph_quota:
-            current_graph_count = sum(
-                candidate.asset_id in graph_asset_ids for candidate in combined_fused)
-            missing_quota = max(0, graph_quota - current_graph_count)
-            if missing_quota:
-                forced = graph_only_pool[:missing_quota]
-                forced_graph_ids = [candidate.asset_id for candidate in forced]
-                forced_set = set(forced_graph_ids)
-                kept = [candidate for candidate in combined_fused
-                        if candidate.asset_id not in forced_set]
-                # Replace the weakest non-graph tail instead of prepending a
-                # broad graph result.  This preserves most of the baseline
-                # order while guaranteeing that graph recall is observable in
-                # the actual returned head.
-                combined_fused = (kept[:max(0, candidate_limit - len(forced))]
-                                  + forced)
-        combined_rank_by_asset = {
-            candidate.asset_id: position
-            for position, candidate in enumerate(combined_fused, 1)
+        qualified_graph_ids = {candidate.asset_id for candidate in qualified_graph_candidates}
+        graph_only_pool = [candidate for candidate in graph_only_pool
+                           if candidate.asset_id in qualified_graph_ids]
+        graph_only_pool.sort(key=lambda candidate: (
+            -float(graph_hit_by_asset[candidate.asset_id].raw_score or 0.0),
+            (graph_hit_by_asset[candidate.asset_id].metadata or {}).get(
+                "graph_source") != "global_fallback",
+            int(graph_hit_by_asset[candidate.asset_id].rank or 10**9),
+            -float(candidate.rrf or 0.0),
+            candidate.asset_id,
+        ))
+        # Spend the graph head only on candidates that survive the same
+        # evidence/constraint verifier as ordinary retrieval. Otherwise a
+        # loose graph neighbour can evict a valid baseline candidate and then
+        # be rejected immediately afterwards.
+        graph_verified_ids: set[str] = set()
+        if graph_only_pool:
+            graph_probe_packet = EvidencePacket(spec.query_id, scope_id, spec.answer_target)
+            graph_verified = self._evaluate_fused(
+                graph_only_pool, spec, graph_probe_packet, filters,
+                all_authorized, scope_id, skip_assets=set(),
+            )
+            graph_verified_ids = {str(item.get("asset_id")) for item in graph_verified}
+            graph_only_pool = [candidate for candidate in graph_only_pool
+                               if candidate.asset_id in graph_verified_ids]
+        baseline_visible = sorted(primary_items, key=lambda item: (
+            {"exact": 0, "strong": 1, "approximate": 2}[item["level"]],
+            -float(item.get("fusion_score") or 0.0), item["asset_id"],
+        ))
+        baseline_visible_rank = {
+            str(item["asset_id"]): position
+            for position, item in enumerate(baseline_visible, 1)
         }
-        graph_supported_top = [
-            candidate.asset_id for candidate in combined_fused[:candidate_limit]
-            if candidate.asset_id in graph_asset_ids
-        ]
+        graph_verified_ids.update(baseline_visible_rank)
+        # The graph may recover assets just below the baseline head, as well
+        # as assets absent from every primary channel.  It must not globally
+        # re-score primary candidates: that lets generic graph neighbours
+        # demote the whole baseline list.  Only verified graph-supported
+        # candidates outside the head compete for a small reserved tail.
+        baseline_head_ids = set(
+            str(item["asset_id"]) for item in baseline_visible[:candidate_limit]
+        )
+        baseline_fused_by_id = {candidate.asset_id: candidate for candidate in baseline_fused}
+        baseline_visible_by_id = {str(item["asset_id"]): item for item in baseline_visible}
+        graph_only_by_id = {candidate.asset_id: candidate for candidate in graph_only_pool}
+        graph_options = []
+        for asset_id in qualified_graph_ids:
+            if asset_id in baseline_head_ids:
+                continue
+            if asset_id in baseline_visible_by_id:
+                candidate = baseline_fused_by_id.get(asset_id)
+                item = baseline_visible_by_id[asset_id]
+                if candidate is not None:
+                    graph_options.append((asset_id, candidate, item))
+            elif asset_id in graph_only_by_id:
+                graph_options.append((asset_id, graph_only_by_id[asset_id], None))
+        graph_options.sort(key=lambda row: (
+            -float(graph_hit_by_asset[row[0]].raw_score or 0.0),
+            (graph_hit_by_asset[row[0]].metadata or {}).get("graph_source") == "global_fallback",
+            int(graph_hit_by_asset[row[0]].rank or 10**9), row[0],
+        ))
+        graph_quota = _graph_head_quota(
+            candidate_limit, graph_intent, len(graph_options))
+        selected_graph_options = graph_options[:graph_quota]
+        selected_graph_ids = [row[0] for row in selected_graph_options]
+        forced = [row[1] for row in selected_graph_options if row[2] is None]
+        forced_graph_ids = [candidate.asset_id for candidate in forced]
+        # Keep baseline channel scores/order untouched. Attach graph
+        # attribution only; the explicit head merge below controls promotion.
+        for asset_id in qualified_graph_ids & set(baseline_fused_by_id):
+            candidate = baseline_fused_by_id[asset_id]
+            graph_hit = graph_hit_by_asset.get(asset_id)
+            if graph_hit is not None and all(
+                    hit.retriever != "graph" for hit in candidate.retriever_hits):
+                candidate.retriever_hits.append(graph_hit)
+        combined_fused = list(baseline_fused) + forced
         graph_rerank = {
             "applied": bool(graph_hits),
             "baseline_candidate_count": len(baseline_fused),
             "combined_candidate_count": len(combined_fused),
             "graph_candidate_count": len(graph_hits),
-            "graph_supported_top_count": len(graph_supported_top),
+            "graph_supported_top_count": 0,
             "new_candidate_count": sum(
                 asset_id not in baseline_rank_by_asset for asset_id in graph_asset_ids),
             "promoted_count": sum(
-                1 for asset_id, position in combined_rank_by_asset.items()
-                if asset_id in baseline_rank_by_asset
-                and position < baseline_rank_by_asset[asset_id]),
-            "demoted_count": sum(
-                1 for asset_id, position in combined_rank_by_asset.items()
-                if asset_id in baseline_rank_by_asset
-                and position > baseline_rank_by_asset[asset_id]),
-            "graph_fusion_weight": graph_fusion_weights["graph"],
+                1 for asset_id in selected_graph_ids
+                if baseline_visible_rank.get(asset_id, 0) > candidate_limit),
+            "demoted_count": 0,
+            "graph_fusion_weight": 0.0,
             "graph_intent": graph_intent,
             "graph_head_quota": graph_quota,
             "graph_forced_head_count": len(forced_graph_ids),
+            "graph_only_selected_count": sum(
+                1 for asset_id in selected_graph_ids
+                if asset_id not in baseline_rank_by_asset),
+            "graph_min_relative_score": graph_score_floor,
+            "baseline_order_preserved": True,
             # Raw IDs stay in the sanitized-out debug observation only.  The
             # evaluator resolves them to media names and measures whether the
             # graph changed GT recall/precision for this exact question.
             "baseline_ranked_asset_ids": [candidate.asset_id for candidate in baseline_fused],
-            "reranked_asset_ids": [candidate.asset_id for candidate in combined_fused],
+            "reranked_asset_ids": [],
+            # The benchmark's graph-effect panel must compare the candidate
+            # head that can actually reach the Agent, not the full authorized
+            # pool kept for diagnostics.  Preserve both views explicitly.
+            "baseline_head_asset_ids": [item["asset_id"] for item in baseline_visible[:candidate_limit]],
+            "returned_head_asset_ids": [],
         }
         combined_items = self._evaluate_fused(
             combined_fused, spec, packet, filters, all_authorized, scope_id,
@@ -490,7 +680,55 @@ class EvidenceRetrievalKernel:
         adjacency_fusion_ms = round((time.monotonic() - adjacency_fusion_started) * 1000, 1)
 
         postprocess_started = time.monotonic()
-        packet.assets = combined_items
+        combined_items_by_id = {
+            str(item.get("asset_id")): item for item in combined_items
+            if item.get("asset_id")
+        }
+        baseline_visible = [
+            combined_items_by_id.get(str(item["asset_id"]), item)
+            for item in baseline_visible
+        ]
+        baseline_visible_by_id = {
+            str(item["asset_id"]): item for item in baseline_visible
+        }
+        graph_head_items = [combined_items_by_id[asset_id]
+                            for asset_id in selected_graph_ids
+                            if asset_id in combined_items_by_id]
+        # Graph neighbours are currently broad and can be semantically
+        # adjacent rather than question-identical.  A QA's event-memory
+        # label is not available at this layer; the same event questions can
+        # be routed as event, ordinary, relationship, or temporal.  Therefore
+        # the safety rule must cover the whole graph fusion layer, otherwise
+        # only intent=event is protected and the event-memory aggregate can
+        # still show matching improvements and regressions.
+        #
+        # An explicit opt-in keeps risky replacement available for controlled
+        # experiments, while the benchmark default is monotonic: graph can
+        # fill an empty slot but never evict a baseline candidate.
+        allow_graph_replacement = str(
+            os.getenv("SENTRIX_GRAPH_ALLOW_REPLACEMENT", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        packet.assets, graph_head_merge = _merge_graph_head(
+            baseline_visible, graph_head_items, candidate_limit, graph_quota,
+            all_relevant=all_relevant,
+            allow_replacement=allow_graph_replacement,
+        )
+        returned_head_ids = [str(item["asset_id"])
+                             for item in packet.assets[:candidate_limit]]
+        returned_head_set = set(returned_head_ids)
+        graph_rerank.update({
+            "reranked_asset_ids": [str(item["asset_id"]) for item in packet.assets],
+            "returned_head_asset_ids": returned_head_ids,
+            "graph_supported_top_count": sum(
+                1 for asset_id in returned_head_set if asset_id in qualified_graph_ids),
+            "graph_only_selected_count": sum(
+                1 for asset_id in returned_head_set
+                if asset_id not in baseline_visible_by_id and asset_id in qualified_graph_ids),
+            "demoted_count": len(graph_head_merge["displaced_ids"]),
+            "head_displaced_asset_ids": graph_head_merge["displaced_ids"],
+            "baseline_order_preserved": True,
+            "graph_replacement_allowed": allow_graph_replacement,
+        })
         for item in packet.assets:
             if item["level"] == "exact":
                 packet.exact_results.append(item)
@@ -499,14 +737,55 @@ class EvidenceRetrievalKernel:
             else:
                 packet.approximate_results.append(item)
 
-        # Evidence level remains a safety boundary; within a level preserve
-        # the unified multi-channel fusion order rather than comparing raw
-        # graph-path and ANN scores that live on incompatible scales.
-        packet.assets.sort(key=lambda item: (
-            {"exact": 0, "strong": 1, "approximate": 2}[item["level"]],
-            -float(item.get("fusion_score") or 0.0),
-            item["asset_id"],
-        ))
+        # Keep graph-effect telemetry bounded to the candidate set actually
+        # exposed to the Agent. The benchmark's existing metric formula is
+        # unchanged; this prevents the full authorized recall pool from being
+        # mistaken for the returned search head.
+        actual_baseline = baseline_visible
+        graph_rerank["baseline_ranked_asset_ids"] = [
+            item["asset_id"] for item in actual_baseline[:candidate_limit]
+        ]
+        graph_rerank["reranked_asset_ids"] = [
+            item["asset_id"] for item in packet.assets[:candidate_limit]
+        ]
+        graph_rerank["baseline_head_asset_ids"] = list(
+            graph_rerank["baseline_ranked_asset_ids"]
+        )
+        graph_rerank["returned_head_asset_ids"] = list(
+            graph_rerank["reranked_asset_ids"]
+        )
+        actual_baseline_positions = {
+            asset_id: position for position, asset_id in enumerate(
+                graph_rerank["baseline_ranked_asset_ids"], 1)
+        }
+        actual_returned_positions = {
+            asset_id: position for position, asset_id in enumerate(
+                graph_rerank["returned_head_asset_ids"], 1)
+        }
+        graph_rerank["graph_supported_top_count"] = sum(
+            1 for asset_id in actual_returned_positions
+            if asset_id in qualified_graph_ids
+        )
+        graph_rerank["graph_only_selected_count"] = sum(
+            1 for asset_id in actual_returned_positions
+            if asset_id in qualified_graph_ids and asset_id not in actual_baseline_positions
+        )
+        graph_rerank["promoted_count"] = sum(
+            1 for asset_id, position in actual_returned_positions.items()
+            if asset_id in qualified_graph_ids
+            and asset_id in actual_baseline_positions
+            and position < actual_baseline_positions[asset_id]
+        )
+        graph_rerank["demoted_count"] = sum(
+            1 for asset_id, position in actual_returned_positions.items()
+            if asset_id in actual_baseline_positions
+            and position > actual_baseline_positions[asset_id]
+        )
+        common = [asset_id for asset_id in graph_rerank["baseline_ranked_asset_ids"]
+                  if asset_id in actual_returned_positions]
+        graph_rerank["baseline_order_preserved"] = common == sorted(
+            common, key=lambda asset_id: actual_returned_positions[asset_id])
+        graph_rerank["returned_head_count"] = len(graph_rerank["reranked_asset_ids"])
         # Optional confidence gate. It is disabled by default because score
         # scales differ by retriever. When calibrated, this threshold is the
         # only reduction mechanism; there is no fixed candidate Top-K.
@@ -707,7 +986,7 @@ class EvidenceRetrievalKernel:
                 # authoritative, conflicting geocode is a hard contradiction.
                 # The slot reranker applies the explicit place score when it
                 # is available and the event-text score when it is not.
-                if not (constraint.dimension == "place" and status == "unknown"):
+                if not (constraint.dimension in {"place", "time"} and status == "unknown"):
                     excluded = True
             if constraint.strictness == SEMANTIC and status == "contradicted":
                 excluded = True
@@ -744,7 +1023,11 @@ class EvidenceRetrievalKernel:
         value = constraint.value
         if constraint.dimension == "time":
             bounds = parse_time_expression(value)
-            captured = _parse_datetime(asset.get("captured_at") or observation.get("captured_at"))
+            captured = _parse_datetime(trusted_captured_at(asset, observation, store=self.store))
+            if captured is None:
+                # Missing or filesystem-derived timestamps are unknown, not
+                # proof that the asset contradicts the requested time.
+                return "unknown", None, None, 0.0
             if bounds:
                 matched = bool(captured and bounds[0] <= captured < bounds[1])
             else:
