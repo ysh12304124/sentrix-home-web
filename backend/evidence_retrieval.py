@@ -694,20 +694,14 @@ class EvidenceRetrievalKernel:
         graph_head_items = [combined_items_by_id[asset_id]
                             for asset_id in selected_graph_ids
                             if asset_id in combined_items_by_id]
-        # Graph neighbours are currently broad and can be semantically
-        # adjacent rather than question-identical.  A QA's event-memory
-        # label is not available at this layer; the same event questions can
-        # be routed as event, ordinary, relationship, or temporal.  Therefore
-        # the safety rule must cover the whole graph fusion layer, otherwise
-        # only intent=event is protected and the event-memory aggregate can
-        # still show matching improvements and regressions.
-        #
-        # An explicit opt-in keeps risky replacement available for controlled
-        # experiments, while the benchmark default is monotonic: graph can
-        # fill an empty slot but never evict a baseline candidate.
-        allow_graph_replacement = str(
-            os.getenv("SENTRIX_GRAPH_ALLOW_REPLACEMENT", "false")
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        # Keep the earlier behaviour for non-event graph routes: they are
+        # allowed to promote verified graph candidates so graph-effect gains
+        # remain measurable.  Only the explicit event route uses the
+        # monotonic guard while event-node construction is still pending.
+        # This restores the pre-global-guard experiment rather than masking
+        # all graph improvements.
+        event_graph_monotonic = graph_intent == "event"
+        allow_graph_replacement = not event_graph_monotonic
         packet.assets, graph_head_merge = _merge_graph_head(
             baseline_visible, graph_head_items, candidate_limit, graph_quota,
             all_relevant=all_relevant,
