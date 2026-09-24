@@ -130,7 +130,9 @@ class ResultSetContractTests(unittest.TestCase):
         asset_ids = ["noise_1", "answer", "noise_2"]
         summaries = {
             "noise_1": "婚礼现场；舞台；装饰灯光",
-            "answer": "户外站立；广告牌；文字：结婚这里的幸福",
+            # 图像管线常把迎宾展架描述为“横幅、支架”，而不会使用
+            # “广告牌”或“欢迎牌”这个同义词；预览排序必须覆盖该表达。
+            "answer": "户外站立；横幅、支架；文字：结婚这里的幸福",
             "noise_2": "婚礼现场；宾客",
         }
         with patch.object(runtime_tools, "_observation_summary",
