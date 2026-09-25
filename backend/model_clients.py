@@ -1066,37 +1066,163 @@ class GammaClient:
             images.append({"base64": encoded, "mime_type": mime_type})
         if not images:
             raise ValueError("video event analysis requires at least one evidence image")
-        prompt = """你是家庭视频事件观察器。输入是同一连续事件中按时间顺序排列的3至5张临时证据图。
+        prompt = """你是家庭视频事件观察器。输入是同一连续事件中按时间顺序排列的1至5张临时证据图。
 综合全部图片和YOLO时间序列语义，描述事件期间可验证的人物、物品、环境与活动变化；不能只描述第一张或最后一张，不能猜测姓名或关系。忽略单纯的站立、坐着、抬手等低信息动作，除非它们对事件变化不可缺少。
-caption 和 activity 必须由选中的证据图片直接支持，不得描述已经离开画面的活动。返回 representative_indices：能够覆盖 caption、activity 和事件中不同阶段的最小图片序号集合，从0开始，最多3张。单一活动或相似画面只能选1张；只有出现不同地点、不同活动阶段且单图无法覆盖时才选2至3张，例如“泳池环境”和“烧烤操作”应各选一张。禁止选择重复画面。
-严格返回简体中文 JSON：caption（20字内）、activity（15字内）、place（10字内）、scene_type、semantic、people（最多4项）、objects（最多8项）、clothing（最多4项）、emotions（最多4项）、spatial_relations（最多6项）、ocr_text（40字内）、event_type、facts（最多2项）、representative_indices（整数数组，1至3项）。
+caption 和 activity 必须由选中的证据图片直接支持，不得描述已经离开画面的活动。先输出 distinct_states，每项只能包含 activity_class（2至6个汉字的规范语义状态类别）和 representative_index。相同人物组合下的相同动作必须使用完全相同的 activity_class 并合并为一项。行走前后、镜头移动、远近变化、构图变化、同一人物的位置变化都不是新状态；但第二个人进入画面、可见人物组合明确变化，或出现新的高信息活动时，必须作为不同状态保留。
+另输出 state_transitions。只有按时间先后真实发生了“前一种活动结束、后一种不同活动开始”时才允许填写，每项为 from_activity_class、to_activity_class、from_index、to_index。多个人在同一时刻做不同动作不属于状态转换；同一动作的不同阶段不属于状态转换；不确定时必须返回空数组。
+representative_indices 最多3张，选择覆盖 distinct_states 或 state_transitions 所需的最少图片。同一场景、同一人物组合、同一连续动作必须只选1张；即使 state_transitions 为空，只要存在不同的高信息语义状态、可见人物组合变化或地点变化，也应保留2至3张，例如第二个小孩进入画面、“喝水”结束后变为“讲话”、或“泳池游玩”结束后变为“烧烤操作”。禁止把镜头远近、平移或重复画面误判为新状态。
+严格返回简体中文 JSON：caption（160字内）、activity（60字内）、place（40字内）、scene_type、semantic、people（最多20项）、objects（最多60项）、clothing（最多20项）、emotions（最多20项）、spatial_relations（最多60项）、ocr_text（1000字内）、event_type、facts（最多12项）、detail（visible_details/regions/text_blocks/uncertainties）、distinct_states（数组）、state_transitions（数组）、representative_indices（整数数组，1至3项）。
 图片顺序和事件上下文：""" + json.dumps({
             "metadata": metadata or {}, "yolo_timeline": yolo_semantics or {},
-        }, ensure_ascii=False)
-        parsed = parse_json_response(self.chat(prompt, images, self._core_vision_options()))
+        }, ensure_ascii=False) + "\n图片索引必须使用当前实际输入顺序的从0开始整数：第一张为0，第二张为1，依此类推。"
+        evidence_indices = list(range(len(images)))
+        active_images = images
+        fallback_reason = None
+        try:
+            response = self.chat(prompt, images, self._core_vision_options())
+        except ModelError as error:
+            match = re.search(r"At most\s+(\d+)\s+image(?:\(s\))?", str(error), flags=re.IGNORECASE)
+            image_limit = int(match.group(1)) if match else 0
+            if image_limit < 1 or image_limit >= len(images):
+                raise
+            if image_limit == 1:
+                evidence_indices = [0]
+            else:
+                evidence_indices = [
+                    round(index * (len(images) - 1) / (image_limit - 1))
+                    for index in range(image_limit)
+                ]
+            limited_images = [images[index] for index in evidence_indices]
+            active_images = limited_images
+            retry_prompt = (
+                prompt
+                + "\n当前模型图片上限较低，本次实际输入按时间均匀抽取了 "
+                + str(len(limited_images))
+                + " 张证据图。当前图片索引仍从0开始连续编号；它们对应原候选索引为："
+                + json.dumps(evidence_indices, ensure_ascii=False)
+                + "。输出的 representative_index/from_index/to_index 必须使用当前图片的0开始索引，"
+                  "不得直接填写原候选索引。"
+            )
+            response = self.chat(retry_prompt, limited_images, self._core_vision_options())
+        parsed = parse_json_response(response)
+        meaningful = any(parsed.get(key) not in (None, "", []) for key in (
+            "caption", "activity", "people", "objects", "facts", "detail",
+        ))
+        if not meaningful and len(active_images) > 1:
+            if len(active_images) > 3:
+                selected_positions = [0, len(active_images) // 2, len(active_images) - 1]
+                evidence_indices = [evidence_indices[index] for index in selected_positions]
+                active_images = [active_images[index] for index in selected_positions]
+            retry_prompt = """你是家庭视频事件观察器。以下图片按时间排序，索引严格从0开始。
+只描述图片直接可见的信息。识别真正不同的地点、人物组合或高信息活动状态；镜头移动、远近变化和同一动作的连续阶段不是新状态。
+严格只返回一个简体中文 JSON，不要 Markdown，不要解释：
+{"caption":"160字内完整事件描述","activity":"60字内","place":"40字内","people":[],"objects":[],"facts":[],"distinct_states":[{"activity_class":"2至8字","representative_index":0}],"state_transitions":[],"representative_indices":[0]}
+representative_indices 选择覆盖不同语义状态所需的最少图片，最多3张；所有索引必须是当前实际输入图片的0开始索引。当前输入对应原候选索引：""" + json.dumps(evidence_indices, ensure_ascii=False)
+            response = self.chat(retry_prompt, active_images, self._core_vision_options())
+            parsed = parse_json_response(response)
+            fallback_reason = "unparseable_multi_image_response"
         parsed["people"] = as_list(parsed.get("people"))
         parsed["objects"] = as_list(parsed.get("objects"))
         parsed["clothing"] = as_list(parsed.get("clothing"))
         parsed["emotions"] = as_list(parsed.get("emotions"))
         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
+        detail = parsed.get("detail") if isinstance(parsed.get("detail"), dict) else {}
+        parsed["detail"] = {
+            "schema_version": 1,
+            "visible_details": as_list(detail.get("visible_details")),
+            "regions": as_list(detail.get("regions")),
+            "text_blocks": as_list(detail.get("text_blocks")),
+            "uncertainties": as_list(detail.get("uncertainties")),
+            **{key: value for key, value in detail.items()
+               if key not in {"visible_details", "regions", "text_blocks", "uncertainties"}},
+        }
         normalize_analysis_fields(parsed)
         parsed = normalize_semantic_analysis(parsed)
-        raw_indices = parsed.get("representative_indices")
+        distinct_states = []
+        state_keys = set()
+        for item in parsed.get("distinct_states") or []:
+            if not isinstance(item, dict):
+                continue
+            activity_class = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(item.get("activity_class") or "").lower())
+            if not activity_class or activity_class in state_keys:
+                continue
+            try:
+                position = max(0, min(len(evidence_indices) - 1, int(item.get("representative_index", 0))))
+            except (TypeError, ValueError):
+                continue
+            state_keys.add(activity_class)
+            distinct_states.append({
+                "activity_class": activity_class,
+                "representative_index": evidence_indices[position],
+            })
+        parsed["distinct_states"] = distinct_states[:3]
+        state_transitions = []
+        transition_indices = []
+        low_information_actions = {
+            "站立", "坐着", "行走", "走路", "移动", "注视", "观看", "旁观",
+            "抬手", "挥手", "举手", "转身", "姿势调整", "调整站姿", "闭眼配合", "站立配合",
+            "standing", "sitting", "walking", "moving", "watching", "looking",
+        }
+        for item in parsed.get("state_transitions") or []:
+            if not isinstance(item, dict):
+                continue
+            before = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(item.get("from_activity_class") or "").lower())
+            after = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(item.get("to_activity_class") or "").lower())
+            low_information_transition = any(
+                token == before or token == after or token in before or token in after
+                for token in low_information_actions
+            )
+            if (not before or not after or before == after or before in after or after in before
+                    or low_information_transition):
+                continue
+            try:
+                before_position = max(0, min(len(evidence_indices) - 1, int(item.get("from_index", 0))))
+                after_position = max(0, min(len(evidence_indices) - 1, int(item.get("to_index", 0))))
+            except (TypeError, ValueError):
+                continue
+            before_index = evidence_indices[before_position]
+            after_index = evidence_indices[after_position]
+            if before_index == after_index:
+                continue
+            state_transitions.append({
+                "from_activity_class": before, "to_activity_class": after,
+                "from_index": before_index, "to_index": after_index,
+            })
+            for index in (before_index, after_index):
+                if index not in transition_indices:
+                    transition_indices.append(index)
+        parsed["state_transitions"] = state_transitions[:2]
+        raw_indices = transition_indices[:3]
+        indices_are_source = bool(raw_indices)
+        if not raw_indices:
+            raw_indices = [
+                item["representative_index"] for item in distinct_states
+                if isinstance(item, dict) and item.get("representative_index") is not None
+            ][:3]
+            indices_are_source = bool(raw_indices)
+        if not raw_indices:
+            raw_indices = parsed.get("representative_indices")
         if not isinstance(raw_indices, list):
             raw_indices = [parsed.get("representative_index", 0)]
         representative_indices = []
         for value in raw_indices:
             try:
-                index = max(0, min(len(images) - 1, int(value)))
+                upper_bound = (len(images) - 1) if indices_are_source else (len(evidence_indices) - 1)
+                index = max(0, min(upper_bound, int(value)))
             except (TypeError, ValueError):
                 continue
-            if index not in representative_indices:
-                representative_indices.append(index)
-        parsed["representative_indices"] = (representative_indices or [0])[:3]
+            source_index = index if indices_are_source else evidence_indices[index]
+            if source_index not in representative_indices:
+                representative_indices.append(source_index)
+        parsed["representative_indices"] = (representative_indices or [evidence_indices[0]])[:3]
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
         parsed["model"] = self.model
-        parsed["video_event_evidence_count"] = len(images)
+        parsed["video_event_evidence_count"] = len(evidence_indices)
+        parsed["video_event_source_evidence_count"] = len(images)
+        parsed["video_event_evidence_indices"] = evidence_indices
+        if fallback_reason:
+            parsed["video_event_fallback_reason"] = fallback_reason
         return parsed
 
     def analyze_image_focus(self, path, dimension, metadata=None):

@@ -1,0 +1,27 @@
+# SVD/eSVD candidate generation with required CUDA YOLO semantic events.
+sample_fps: 10.0
+resize: [160, 90]
+window_seconds: 8.0
+stride_seconds: 2.0
+energy_threshold: 0.90
+fold_resize: [64, 36]
+fold_similarity_threshold: 0.985
+fold_residual_floor: 0.18
+min_rank: 1
+max_rank: 64
+min_event_seconds: 2.0
+boundary_quantile: 0.78
+dedup_similarity: 0.985
+candidate_dedup_similarity: 0.998
+yolo_events:
+  enabled: true
+  required: true
+  scan_fps: 1.0
+  width: 1280
+  batch_size: 4
+  timeout_seconds: 7200
+score_weights:
+  reconstruction: 0.40
+  subspace: 0.30
+  spectrum: 0.20
+  coverage: 0.10

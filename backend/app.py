@@ -689,6 +689,31 @@ def health():
     active_vlm_backend = getattr(gamma, "backend", "vllm")
     if not isinstance(active_vlm_backend, str):
         active_vlm_backend = "vllm"
+    video_algorithm = os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "hybrid_webp").strip().lower()
+    if video_algorithm == "svd_lowrank":
+        video_extraction = {
+            "adapter": "svd_lowrank_yolo_two_pass",
+            "algorithm": video_algorithm,
+            "status": "available",
+            "package": "backend/video/svd_keyframe.py",
+            "sampleFps": 10,
+            "yoloDevice": os.getenv("SENTRIX_VIDEO_DEVICE", "0"),
+            "svdPasses": 2,
+            "memoryMerge": True,
+            "duplicateFrameRemoval": True,
+        }
+    else:
+        video_extraction = {
+            "adapter": "hybrid_webp_memory",
+            "algorithm": video_algorithm,
+            "status": "available",
+            "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
+            "sampleFps": 10,
+            "yoloBatch": 16,
+            "targetDecode": "NVDEC",
+            "memoryMerge": True,
+            "duplicateFrameRemoval": True,
+        }
     return {
         "status": "ok",
         "mode": "sentrix-local-backend",
@@ -718,12 +743,7 @@ def health():
             "vectorSpaces": ["episodic", "semantic", "visual"],
             "vectorIndex": store.vector_search_status(),
         },
-        "videoExtraction": {
-            "adapter": "hybrid_webp_memory", "status": "available",
-            "package": "tools/video_keyframe/katna/run_yolo_prefilter_event_webp.py",
-            "sampleFps": 10, "yoloBatch": 16, "targetDecode": "NVDEC",
-            "memoryMerge": True, "duplicateFrameRemoval": True,
-        },
+        "videoExtraction": video_extraction,
         "database": store.path,
     }
 
