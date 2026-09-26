@@ -1598,6 +1598,8 @@ class GpuSampler:
                 ts = time.perf_counter()
                 for gpu in data.get("gpus", []):
                     sample = dict(gpu)
+                    if sample.get("cpu_temperature_c") is None and data.get("cpu_temperature_c") is not None:
+                        sample["cpu_temperature_c"] = data["cpu_temperature_c"]
                     sample["_t"] = ts
                     sample["model_process_memory_used_mib"] = process_memory.get("process_memory_used_mib")
                     sample["model_process_system_memory_used_mib"] = process_memory.get("model_process_system_memory_used_mib")
@@ -1658,7 +1660,7 @@ class GpuSampler:
             return {"samples_count": 0}
         metrics = {}
         for key in (
-            "temperature_c", "gpu_utilization_pct", "memory_used_mib",
+            "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
             "model_process_memory_used_mib", "kv_cache_usage_pct", "kv_cache_used_tokens",
             "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
             "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
@@ -2010,7 +2012,7 @@ class BenchmarkRun:
             live["source"] = sample.get("source") or self.telemetry_source
             live["samples_count"] = int(live.get("samples_count") or 0) + 1
             fields = (
-                "temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
                 "model_process_memory_used_mib", "kv_cache_usage_pct",
                 "model_process_system_memory_used_mib",
                 "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
@@ -5203,63 +5205,132 @@ class OrchestratorRepository:
             result = self._public_run(state, include_items=False)
             result["item_count"] = len(state.get("items") or [])
             result["summary"] = self._effective_summary(state)
-            # Backfill live history for runs sampled by an older build or
-            # interrupted during persistence.  The JSONL sampler is the
-            # authoritative append-only source and remains available on
-            # failures/cancellation.  Always prefer the complete JSONL series;
-            # the UI must not silently fall back to a recent-point window.
+            # Peaks and samples_count use every JSONL sample. The plotted
+            # series is uniformly reduced: a 487-question history gzips past
+            # the LAN window that stalls after about 42KB and blanks the panel.
             live = result.get("telemetry_live")
+            samples_path = self.results_root / run_id / "gpu_samples.jsonl"
             if isinstance(live, dict):
                 # _public_run intentionally avoids a deep copy for normal
                 # responses.  Do not mutate the in-memory run while rebuilding
                 # a large response from JSONL.
-                live = copy.deepcopy(live)
-                result["telemetry_live"] = live
-                samples_path = self.results_root / run_id / "gpu_samples.jsonl"
-                history, latest, peak = [], {}, {}
+                result["telemetry_live"] = copy.deepcopy(live)
+        live = result.get("telemetry_live")
+        if isinstance(live, dict):
+            self._attach_gpu_sample_history(live, samples_path)
+            self._publish_full_sample_phase_stats(result, live)
+        return result
+
+    @staticmethod
+    def _series_stats(history: list, key: str) -> dict:
+        values = [float(point[key]) for point in history if isinstance(point.get(key), (int, float))]
+        if not values:
+            return {}
+        ordered = sorted(values)
+        count = len(ordered)
+        return {
+            "peak": ordered[-1],
+            "mean": round(sum(values) / count, 1),
+            "p50": ordered[count // 2],
+            "p95": ordered[min(count - 1, int(count * 0.95))],
+        }
+
+    @staticmethod
+    def _downsample_history(history: list, limit: int = 240) -> list:
+        count = len(history)
+        if count <= limit:
+            return history
+        chosen = {0, count - 1}
+        previous = history[0].get("phase")
+        for index, point in enumerate(history):
+            phase = point.get("phase")
+            if phase != previous:
+                chosen.add(index)
+                previous = phase
+        step = (count - 1) / (limit - 1)
+        for index in range(limit):
+            chosen.add(min(count - 1, int(round(index * step))))
+        if len(chosen) > limit:
+            chosen = {min(count - 1, int(round(index * step))) for index in range(limit)}
+            chosen.add(count - 1)
+        return [history[index] for index in sorted(chosen)]
+
+    @staticmethod
+    def _publish_full_sample_phase_stats(result: dict, live: dict) -> None:
+        stats = live.pop("_full_sample_stats", None) or {}
+        phases = result.get("phases")
+        if not isinstance(phases, dict) or not stats:
+            return
+        gpu = phases.get("gpu_metrics")
+        if not isinstance(gpu, dict):
+            return
+        phases = dict(phases)
+        gpu = dict(gpu)
+        for key, value in stats.items():
+            if value:
+                gpu[key] = value
+        phases["gpu_metrics"] = gpu
+        result["phases"] = phases
+
+    @staticmethod
+    def _attach_gpu_sample_history(live: dict, samples_path: Path) -> None:
+        history, latest, peak = [], {}, {}
+        try:
+            fields = (
+                "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                "model_process_memory_used_mib", "kv_cache_usage_pct",
+                "model_process_system_memory_used_mib",
+                "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
+                "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
+                "other_processes_memory_mib", "all_processes_memory_mib",
+                "system_memory_used_mib", "system_memory_total_mib",
+                "system_memory_delta_mib", "sentrix_stack_pss_mib", "product_stack_memory_mib",
+            )
+            lines = samples_path.read_text(encoding="utf-8").splitlines() if samples_path.is_file() else []
+            for line in lines:
                 try:
-                    fields = (
-                        "temperature_c", "gpu_utilization_pct", "memory_used_mib",
-                        "model_process_memory_used_mib", "kv_cache_usage_pct",
-                        "model_process_system_memory_used_mib",
-                        "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
-                        "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
-                        "other_processes_memory_mib", "all_processes_memory_mib",
-                        "system_memory_used_mib", "system_memory_total_mib",
-                        "system_memory_delta_mib", "sentrix_stack_pss_mib", "product_stack_memory_mib",
-                    )
-                    lines = samples_path.read_text(encoding="utf-8").splitlines() if samples_path.is_file() else []
-                    for line in lines:
-                        try:
-                            item = json.loads(line)
-                        except (TypeError, ValueError, json.JSONDecodeError):
-                            # A sampler may append while this response is
-                            # reading the file; ignore only a partial/malformed
-                            # line instead of dropping the whole curve.
-                            continue
-                        point = {k: item[k] for k in fields if item.get(k) is not None}
-                        if point:
-                            history.append({
-                                "t": item.get("_t", time.time()),
-                                "phase": item.get("phase", "unassigned"),
-                                "phase_label": item.get("phase_label", "未分配阶段"),
-                                **point,
-                            })
-                            latest = point
-                            for key, value in point.items():
-                                if isinstance(value, (int, float)):
-                                    peak[key] = max(float(peak.get(key, value)), float(value))
-                    if history:
-                        live["history"] = history
-                        live["latest"] = latest
-                        live["peak"] = peak
-                        live["samples_count"] = max(int(live.get("samples_count") or 0), len(history))
-                    elif not isinstance(live.get("history"), list):
-                        live["history"] = []
-                except Exception:
-                    if not isinstance(live.get("history"), list):
-                        live["history"] = []
-            return result
+                    item = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                point = {k: item[k] for k in fields if item.get(k) is not None}
+                if point:
+                    history.append({
+                        "t": item.get("_t", time.time()),
+                        "phase": item.get("phase", "unassigned"),
+                        "phase_label": item.get("phase_label", "未分配阶段"),
+                        **point,
+                    })
+                    latest = point
+                    for key, value in point.items():
+                        if isinstance(value, (int, float)):
+                            peak[key] = max(float(peak.get(key, value)), float(value))
+            if history:
+                scopes = live.get("scopes") if isinstance(live.get("scopes"), dict) else {}
+                if scopes.get("system_memory"):
+                    latest.setdefault("system_memory_scope", scopes["system_memory"])
+                    peak.setdefault("system_memory_scope", scopes["system_memory"])
+                if scopes.get("benchmark_process_ram"):
+                    latest.setdefault("benchmark_process_memory_scope", scopes["benchmark_process_ram"])
+                    peak.setdefault("benchmark_process_memory_scope", scopes["benchmark_process_ram"])
+                live["_full_sample_stats"] = {
+                    "model_process_system_memory_used_mib": OrchestratorRepository._series_stats(
+                        history, "model_process_system_memory_used_mib"),
+                    "system_memory_delta_mib": OrchestratorRepository._series_stats(
+                        history, "system_memory_delta_mib"),
+                    "cpu_temperature_c": OrchestratorRepository._series_stats(
+                        history, "cpu_temperature_c"),
+                    "temperature_c": OrchestratorRepository._series_stats(
+                        history, "temperature_c"),
+                }
+                live["history"] = OrchestratorRepository._downsample_history(history, limit=240)
+                live["latest"] = latest
+                live["peak"] = peak
+                live["samples_count"] = max(int(live.get("samples_count") or 0), len(history))
+            elif not isinstance(live.get("history"), list):
+                live["history"] = []
+        except Exception:
+            if not isinstance(live.get("history"), list):
+                live["history"] = []
 
     def get_keyframe_analysis(self, run_id: str) -> dict:
         """Analyze whether video keyframes are useful for this complete run.
@@ -7249,15 +7320,25 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _write_body(self, body: bytes):
+        # 16KiB writes plus a 10s socket timeout aborted large run details
+        # after the first TCP window and left the hardware panel blank.
+        sock = self.connection
         try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        try:
+            sock.settimeout(120)
             self.wfile.flush()
-            self.connection.settimeout(10)
-            for offset in range(0, len(body), 16 * 1024):
-                self.connection.sendall(body[offset:offset + 16 * 1024])
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except TimeoutError:
-            pass
+            view = memoryview(body)
+            step = 256 * 1024
+            for offset in range(0, len(view), step):
+                sock.sendall(view[offset:offset + step])
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def _json(self, value, status: int = 200):
         body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()

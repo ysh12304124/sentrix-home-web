@@ -185,22 +185,26 @@ def _augment_local_process_memory(data: dict | None, *, model_pid: int | None, e
             {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in model_rows[:20]
         ]
-    if sentrix_pss is not None:
+    sentrix_pss_complete = bool(sentrix_rows) and all(row.get("pss_mib") is not None for row in sentrix_rows)
+    model_pss_complete = bool(model_rows) and all(row.get("pss_mib") is not None for row in model_rows)
+    if sentrix_pss is not None and sentrix_pss_complete:
         data["sentrix_stack_pss_mib"] = sentrix_pss
         data["sentrix_stack_pss_scope"] = "sentrix_related_pss_excluding_llama"
         data["sentrix_processes"] = [
             {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in sentrix_rows[:50]
         ]
-    if sentrix_pss is not None or model_pss is not None or model_rss is not None:
-        # PSS sums do not double-count shared CPU pages. VmRSS-smapsRss is the
-        # Jetson UMA/CUDA hole that PSS misses.
-        cpu_pages = (sentrix_pss or 0.0) + (model_pss or 0.0)
-        uma_extra = max(0.0, (model_rss or 0.0) - (model_smaps_rss if model_smaps_rss is not None else (model_pss or 0.0)))
+    # Product total is recorded only when every related PSS is present.
+    # Missing PSS must not be replaced with 0 or with VmRSS.
+    if (sentrix_pss is not None and sentrix_pss_complete and model_pss is not None
+            and model_pss_complete and model_rss is not None and model_smaps_rss is not None):
+        cpu_pages = sentrix_pss + model_pss
+        uma_extra = max(0.0, model_rss - model_smaps_rss)
         product = round(cpu_pages + uma_extra, 2)
         data["product_stack_memory_mib"] = product
         data["benchmark_process_memory_used_mib"] = product
-        data["benchmark_process_memory_scope"] = "sentrix_pss_plus_llama_pss_plus_uma_extra"
+        data["benchmark_process_memory_scope"] = "all_related_pss_plus_model_uma_extra"
+        data["model_uma_extra_mib"] = round(uma_extra, 2)
         data["benchmark_processes"] = [
             {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in (sentrix_rows + model_rows)[:50]
@@ -259,6 +263,9 @@ def _parse_tegrastats_line(line: str) -> dict:
                 max(0.0, sample["system_memory_total_mib"] - sample[key]), 3
             )
             sample["system_memory_scope"] = "host_all_processes"
+    cpu = re.search(r"cpu@([\d.]+)C", line)
+    if cpu:
+        sample["cpu_temperature_c"] = round(float(cpu.group(1)), 3)
     return sample
 
 

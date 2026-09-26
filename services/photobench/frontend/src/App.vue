@@ -824,6 +824,8 @@ function gpuMetricRows(phase = {}) {
     ["KV Cache 使用率", fmtNumber(kvCache.mean, "%"), `峰值 ${fmtNumber(kvCache.peak, "%")}`],
     ["GPU 利用率", fmtNumber(util.mean, "%"), `tegrastats GR3D 峰值 ${fmtNumber(util.peak, "%")}`],
     ["GPU/SOC 功耗", fmtNumber(power.mean, "W"), `VDD_GPU_SOC 峰值 ${fmtNumber(power.peak, "W")}（非纯 GPU）`],
+    ["CPU 温度", fmtNumber((phase.cpu_temperature_c || {}).mean, "°C"), `峰值 ${fmtNumber((phase.cpu_temperature_c || {}).peak, "°C")} · tegrastats cpu@`],
+    ["GPU 温度", fmtNumber(temp.mean, "°C"), `峰值 ${fmtNumber(temp.peak, "°C")} · tegrastats gpu@`],
     ["采样数量", phase.samples_count == null ? "-" : `${phase.samples_count} 次`, `PSS 与主循环同频 0.5 秒；独立 PSS 点 ${phase.pss_samples_count ?? 0} 次；KV 随主循环，未暴露则为 -`],
   ];
   return [
@@ -833,7 +835,8 @@ function gpuMetricRows(phase = {}) {
     ["整卡显存", fmtMemory(memory.mean), `峰值 ${fmtMemory(memory.peak)} · P95 ${fmtMemory(memory.p95)}`],
     [processLimitLabel, phase.model_process_over_limit_samples == null ? "-" : `${phase.model_process_over_limit_samples} 次`, processLimit == null ? "Manager 未返回告警阈值" : `模型进程 NVML 占用超过 ${fmtMemory(processLimit)} 的采样次数`],
     ["KV Cache 使用率", fmtNumber(kvCache.mean, "%"), `峰值 ${fmtNumber(kvCache.peak, "%")} · P95 ${fmtNumber(kvCache.p95, "%")}`],
-    ["GPU 温度", fmtNumber(temp.mean, "°C"), `峰值 ${fmtNumber(temp.peak, "°C")} · P95 ${fmtNumber(temp.p95, "°C")}`],
+    ["GPU 温度", fmtNumber(temp.mean, "°C"), `峰值 ${fmtNumber(temp.peak, "°C")} · P95 ${fmtNumber(temp.p95, "°C")} · nvidia-smi temperature.gpu`],
+    ["CPU 温度", fmtNumber((phase.cpu_temperature_c || {}).mean, "°C"), `峰值 ${fmtNumber((phase.cpu_temperature_c || {}).peak, "°C")} · k10temp/coretemp，不是显卡温度`],
     ["GPU 功耗", fmtNumber(power.mean, "W"), `峰值 ${fmtNumber(power.peak, "W")} · P95 ${fmtNumber(power.p95, "W")}`],
     ["SM 时钟", fmtNumber(clock.mean, "MHz"), `峰值 ${fmtNumber(clock.peak, "MHz")} · P95 ${fmtNumber(clock.p95, "MHz")}`],
   ];
@@ -934,7 +937,7 @@ function liveTelemetryRows(run) {
     ? "所有相关进程 PSS 加总 + max(0, 主模型 VmRSS - 主模型 smaps Rss)"
     : "历史记录未标记新公式 scope；该值不能按当前公式解释，需重跑";
   return [
-    ["当前阶段", ["completed", "failed", "cancelled"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
+    ["当前阶段", ["completed", "completed_with_errors", "failed", "cancelled", "interrupted"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
     ["主模型 RAM", fmtGiB(latest.model_process_system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_system_memory_used_mib)} · 进程系统内存，不代表权重又完整占一份`],
     [unit === "PSS" ? "主模型 PSS（Orin UMA）" : "主模型 GPU 显存", fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · ${unit === "PSS" ? "主模型进程的比例分摊物理内存，不是独立显存" : "nvidia-smi 按主模型 PID 归因"}`],
     ["整套产品 RAM", fmtGiB(latest.product_stack_memory_mib), `峰值 ${fmtGiB(effectivePeak.product_stack_memory_mib)} · ${productFormulaNote}；输入缺失则不记录`],
@@ -945,7 +948,9 @@ function liveTelemetryRows(run) {
     ["全部 GPU 进程", fmtGiB(latest.all_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.all_processes_memory_mib)} · nvidia-smi 可见进程总和`],
     ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_used_mib ?? latest.other_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.other_processes_memory_mib)} · 除模型进程外`],
     ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(effectivePeak.gpu_utilization_pct, "%")}`],
-    ["温度 / 功耗", `${fmtLive(latest.temperature_c, " °C")} / ${fmtLive(latest.power_draw_w, " W")}`, `峰值功耗 ${fmtLive(effectivePeak.power_draw_w, " W")}`],
+    ["GPU 温度", fmtLive(latest.temperature_c, " °C"), `峰值 ${fmtLive(effectivePeak.temperature_c, " °C")} · 153 为独显温度，118 为 tegrastats gpu@`],
+    ["CPU 温度", fmtLive(latest.cpu_temperature_c, " °C"), `峰值 ${fmtLive(effectivePeak.cpu_temperature_c, " °C")} · 153 为 k10temp Tctl，118 为 tegrastats cpu@`],
+    ["功耗", fmtLive(latest.power_draw_w, " W"), `峰值 ${fmtLive(effectivePeak.power_draw_w, " W")}`],
     ["KV Cache", latest.kv_cache_usage_pct == null ? "未提供" : fmtLive(latest.kv_cache_usage_pct, "%"), latest.kv_cache_used_tokens == null ? "当前框架未暴露运行时 KV 指标" : `峰值 token ${fmtLive(peak.kv_cache_used_tokens)}`],
   ];
 }
@@ -2193,7 +2198,7 @@ async function loadMemoryEffectiveness(runId) {
 async function loadActiveRun({ resetPage = false } = {}) {
   if (!activeRunId.value) return;
   const runId = activeRunId.value;
-  const payload = await api(`/api/runs/${encodeURIComponent(runId)}`);
+  const payload = await api(`/api/runs/${encodeURIComponent(runId)}`, { timeoutMs: 60000 });
   if (activeRunId.value !== runId) return;
   activeRun.value = payload;
   const fallbackSummary = effectiveRunSummary(activeRun.value);
@@ -3145,7 +3150,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status" :class="telemetryLiveState(activeRun).status === 'running' ? 'running' : 'completed'">{{ telemetryLiveState(activeRun).status === 'running' ? '实时更新中' : '已停止' }}</span></div>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ ['jetson_local_pss', 'orin_ssh_pss'].includes(telemetryLiveState(activeRun).source) ? ' Orin 无独立显存。主指标看黄线 VmRSS（进程驻留）。' : ' 153 使用 NVIDIA GPU 显存；整机 RAM 为宿主机全部进程。' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
-<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">完整测评过程，共 {{ telemetryHistory(activeRun).length }} 个采样点；悬浮查看时间、阶段和各项 GiB，图例可隐藏曲线，底部可缩放。曲线只绘制实际采集到的数据，不用 0 填充缺失指标。</small></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">完整测评过程，共 {{ telemetrySampleCount(activeRun) }} 个采样点；曲线按全时段抽稀绘制，峰值来自全部采样。悬浮查看时间、阶段和各项 GiB，图例可隐藏曲线，底部可缩放。曲线只绘制实际采集到的数据，不用 0 填充缺失指标。</small></div>
 <details class="metric-definition-panel telemetry-definition-panel">
   <summary>资源曲线口径说明</summary>
   <div class="metric-definition-row">

@@ -59,6 +59,14 @@ class JetsonTelemetryTests(unittest.TestCase):
         self.assertEqual(sample["gpu_utilization_pct"], 41.0)
         self.assertEqual(sample["power_draw_w"], 1.234)
         self.assertEqual(sample["temperature_c"], 52.5)
+        self.assertNotIn("cpu_temperature_c", sample)
+
+    def test_parse_tegrastats_cpu_temperature_separately(self):
+        sample = _parse_tegrastats_line(
+            "cpu@71.562C soc2@68.125C gpu@66.812C tj@71.562C"
+        )
+        self.assertEqual(sample["temperature_c"], 66.812)
+        self.assertEqual(sample["cpu_temperature_c"], 71.562)
 
     @patch.object(LocalJetsonLlamaCppTelemetryProvider, "_device", return_value={
         "system_memory_used_mib": 6000,

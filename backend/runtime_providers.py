@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from backend.hardware import read_cpu_temperature_c
 from backend.jetson_telemetry import LocalJetsonLlamaCppTelemetryProvider, is_jetson_host
 
 
@@ -606,10 +607,11 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                 if len(row) < 7: continue
                 v = [float(x) for x in row[1:]]
                 gpus.append({"index": int(float(row[0])), "gpu_utilization_pct": v[0], "memory_used_mib": v[1], "memory_total_mib": v[2], "temperature_c": v[3], "power_draw_w": v[4], "sm_clock_mhz": v[5]})
-            return {"status": "available", "source": "host_nvidia_smi", "data": {
-                "gpus": gpus,
-                "memory_scope": "gpu_device",
-            }}
+            data = {"gpus": gpus, "memory_scope": "gpu_device"}
+            cpu_temperature_c = read_cpu_temperature_c()
+            if cpu_temperature_c is not None:
+                data["cpu_temperature_c"] = cpu_temperature_c
+            return {"status": "available", "source": "host_nvidia_smi", "data": data}
         except Exception as exc:
             return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
 
