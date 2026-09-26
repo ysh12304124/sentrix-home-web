@@ -183,6 +183,22 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
     # date/first/last 结果会进入 Nucleus，导致“哪一年/哪天”问题明明有
     # 时间戳却被 Writer/Judge 当成没有硬证据。按预览中的多数值提取，
     # 只回答用户明确询问的时间粒度，不把时间戳泛化成事件事实。
+    required_evidence_types = {
+        str(req.get("evidence_type") or "")
+        for req in (task_state.get("requirements") or [])
+        if isinstance(req, dict) and req.get("required", True)
+        and str(req.get("status") or "open") in {"open", "running", "partially_supported"}
+    }
+    date_requested = bool(
+        _Q_DATE.search(question or "")
+        or _Q_YEAR.search(question or "")
+        or "temporal_metadata" in required_evidence_types
+    )
+    place_requested = bool(
+        _Q_WHERE.search(question or "")
+        or "location_metadata" in required_evidence_types
+    )
+
     if any((tr or {}).get("tool") == "search_memories"
            for tr in task_state.get("tool_results") or []):
         preview_times = []
@@ -202,7 +218,7 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                 nucleus.values.append(NucleusValue(
                     kind="year", value=year, certainty="confirmed",
                     source="search_memories.captured_at", display=year))
-        elif preview_times and _Q_DATE.search(question or ""):
+        elif preview_times and date_requested:
             dates = []
             for value in preview_times:
                 m = re.match(r"(\d{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})", value)
@@ -214,23 +230,20 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                     kind="date", value=date, certainty="confirmed",
                     source="search_memories.captured_at", display=date))
 
-    # 地点（GPS 反编码，条件匹配）；where 题把匹配照片地点绑为硬值防编造
-        _place_counter: dict[str, int] = {}
-        if tr.get("tool") == "search_memories":
-            for p in (tr.get("preview") or []) or []:
-                place = str(p.get("place") or "").strip()
-                cond = (p.get("condition_summary") or {}).get("place") or {}
-                matched = cond == "matched" if isinstance(cond, str) else True
-                if len(place) >= 2 and matched \
-                        and place not in [v.display for v in nucleus.all("place")]:
-                    nucleus.values.append(NucleusValue(
-                        kind="place", value=place, certainty="confirmed",
-                        source="search_memories", display=place))
-                if len(place) >= 2:
-                    _place_counter[place] = _place_counter.get(place, 0) + 1
-        if _Q_WHERE.search(question) and _place_counter:
-            top_place, top_n = max(_place_counter.items(), key=lambda kv: kv[1])
-            if top_n >= 2 and top_place not in [v.display for v in nucleus.all("place")]:
+    # 地点（GPS 反编码，条件匹配）；只在问题/规划需求明确要求地点时
+    # 选择预览中出现频次最高的结构化地点，避免把候选照片的所有地点都
+    # 注入答案约束。
+        if place_requested:
+            place_counter: Counter[str] = Counter()
+            for tr in task_state.get("tool_results") or []:
+                if tr.get("tool") != "search_memories":
+                    continue
+                for p in (tr.get("preview") or []) or []:
+                    place = str(p.get("place") or "").strip()
+                    if len(place) >= 2:
+                        place_counter[place] += 1
+            if place_counter:
+                top_place, _ = place_counter.most_common(1)[0]
                 nucleus.values.append(NucleusValue(
                     kind="place", value=top_place, certainty="confirmed",
                     source="search_memories_majority", display=top_place))

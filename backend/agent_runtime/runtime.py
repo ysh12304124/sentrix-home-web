@@ -667,6 +667,12 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             "asset": (asset_ids[index] if index < len(asset_ids)
                       else str(item.get("asset_id") or "")),
         } for index, item in enumerate(preview) if isinstance(item, dict)]
+        required_evidence_types = {
+            state.requirement.evidence_type
+            for state in task_state.requirements.values()
+            if state.requirement.required
+            and state.status in {"open", "running", "partially_supported"}
+        }
         if assets or asset_ids:
             evidence_rows.append({
                 "evidence_type": "memory_asset",
@@ -766,8 +772,15 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                              else ""),
                 "certainty": "supported",
             })
-        location_question = (not question_text or bool(re.search(
-            r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text)))
+        # Metadata is already a first-class field on every asset.  Do not rely
+        # only on the natural-language regex here: planner-declared
+        # location_metadata/temporal_metadata requirements are authoritative,
+        # and this also survives garbled or abbreviated question text.
+        location_question = (
+            "location_metadata" in required_evidence_types
+            or not question_text
+            or bool(re.search(r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text))
+        )
         places = [item for item in assets if item.get("place")]
         # GPS/reverse-geocode is a direct structured field.  For a location
         # question the highest-ranked preview may therefore be used as a
@@ -785,8 +798,11 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 "subject": "照片地点",
                 "asset_id": places[0].get("asset_id") or places[0].get("asset") or "",
             })
-        date_question = (not question_text or bool(re.search(
-            r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text)))
+        date_question = (
+            "temporal_metadata" in required_evidence_types
+            or not question_text
+            or bool(re.search(r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text))
+        )
         dates = [item for item in assets if item.get("captured_at")]
         if dates and not preview_evidence_allowed and date_question:
             dates = dates[:1]
