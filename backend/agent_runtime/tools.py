@@ -1675,6 +1675,105 @@ def _build_semantic_routes(primary_query: str, *, query_core: str = "",
     return routes
 
 
+def _lexical_anchor_surfaces(*, query: str, user_query: str,
+                             query_core: str = "", event: str = "",
+                             object_terms=None, filters: dict | None = None,
+                             year=None) -> list[str]:
+    """Build small, deterministic lexical probes for the retrieval merge.
+
+    The ANN/graph kernel is still the source of the ordinary candidate order.
+    This helper only recovers assets whose observation text contains an
+    explicit clue from the question (object, scene, OCR, place, or time).  It
+    deliberately does not use the answer, benchmark GT, or image pixels.
+    Keeping probes short matters for Chinese FTS: a whole natural-language
+    question is too broad, while a salient two-to-eight character phrase is a
+    useful independent recall channel.
+    """
+    text = " ".join(str(value or "") for value in (
+        user_query, query, query_core, event, *(object_terms or []),
+        (filters or {}).get("place"), (filters or {}).get("time"), year,
+    )).strip()
+    surfaces: list[str] = []
+    seen: set[str] = set()
+
+    def add(value) -> None:
+        value = re.sub(r"\s+", " ", str(value or "").strip())
+        if len(value) < 2:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        surfaces.append(value)
+
+    # Parsed facets have priority because they are already bounded by the
+    # semantic-slot contract.  The full user wording remains below so a
+    # parser omission cannot erase an explicit object/scene cue.
+    for value in (object_terms or []):
+        add(value)
+    add(event)
+    add(query_core)
+    # Two-character generic words (“婚礼/照片/朋友”) are poor rescue keys;
+    # keep longer terms here and let the explicit alias block below handle
+    # short but meaningful scene cues such as “舞台/桥/紫色”.
+    generic_terms = {"婚礼", "亲友", "参加", "朋友", "同行", "照片", "图片",
+                     "事情", "活动", "时候", "地方", "现场"}
+    for term in _preview_query_terms(text):
+        if term not in generic_terms and (len(term) >= 3 or term.isascii()):
+            add(term)
+    # Reuse only the generic visual equivalences already used by the preview
+    # scorer.  They are lexical alternatives, not claims that two scenes are
+    # semantically identical (e.g. “展架” may be described as “横幅”).
+    for term, aliases in _PREVIEW_QUERY_ALIASES.items():
+        if term in text:
+            add(term)
+            for alias in aliases:
+                add(alias)
+    add((filters or {}).get("place"))
+    if year:
+        add(str(year))
+    # A bounded number of probes keeps the rescue channel cheap on the
+    # 1,167-QA run and prevents generic words from becoming a second full scan.
+    return surfaces[:16]
+
+
+def _lexical_anchor_ranks(store, surfaces: list[str], scope_id: str,
+                          *, limit: int = 200) -> dict[str, list[int]]:
+    """Return FTS ranks for explicit query anchors without touching graph code."""
+    if store is None or not surfaces:
+        return {}
+    try:
+        from ..retrieval_indexes import RetrievalIndex
+        index_store = _RUNTIME.get("lexical_index_store")
+        lexical_index = _RUNTIME.get("lexical_index")
+        if lexical_index is None or index_store is not store:
+            lexical_index = RetrievalIndex(store)
+            _RUNTIME["lexical_index"] = lexical_index
+            _RUNTIME["lexical_index_store"] = store
+    except Exception:
+        return {}
+    ranks: dict[str, list[int]] = {}
+    lock = getattr(store, "_connection_lock", None)
+    try:
+        if lock is None:
+            rows_by_surface = [list(lexical_index.search_fts(
+                surface, scope_id=scope_id or None, limit=limit))
+                for surface in surfaces]
+        else:
+            with lock:
+                rows_by_surface = [list(lexical_index.search_fts(
+                    surface, scope_id=scope_id or None, limit=limit))
+                    for surface in surfaces]
+    except Exception:
+        return {}
+    for rows in rows_by_surface:
+        for rank, row in enumerate(rows, 1):
+            asset_id = str((row or {}).get("asset_id") or "")
+            if asset_id:
+                ranks.setdefault(asset_id, []).append(rank)
+    return ranks
+
+
 class _SlotRetrievalPacket:
     """多路召回结果的轻量包，兼容 result set 构建对 packet 的引用。"""
 
@@ -1968,6 +2067,53 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             return _in_time_bounds(cap, time_bounds)
         return True
 
+    # The normal route merge is intentionally unchanged, including the graph
+    # telemetry and graph candidate policy.  Add a separate deterministic FTS
+    # rescue channel for explicit question anchors.  This fixes the common
+    # failure where the visual/text ANN routes return a broad event head while
+    # the exact observation phrase (OCR/object/place) sits just below it.
+    # It is a rank signal only: no answer text, GT, or image inspection enters
+    # this path, and graph candidates are neither re-ranked nor filtered here.
+    lexical_anchor_surfaces = _lexical_anchor_surfaces(
+        query=query_for_retrieval,
+        user_query=user_goal,
+        query_core=_slot_query_core,
+        event=_slot_event,
+        object_terms=_slot_objects,
+        filters=filters,
+        year=_slot_year,
+    )
+    lexical_anchor_ranks = _lexical_anchor_ranks(
+        store, lexical_anchor_surfaces, scope_id,
+        limit=max(20, int(os.getenv("SENTRIX_LEXICAL_ANCHOR_LIMIT", "80"))),
+    )
+    lexical_anchor_valid: dict[str, list[int]] = {}
+    lexical_anchor_added = 0
+    media_constraint = str(filters.get("media") or "").strip().lower()
+    for _aid, _ranks in lexical_anchor_ranks.items():
+        try:
+            _asset = store.get_asset(_aid) or {}
+            if (_is_face_reference_asset({"asset_id": _aid}, store)
+                    or _is_synthetic_event_asset({"asset_id": _aid}, store)):
+                continue
+            if media_constraint and str(_asset.get("media_type") or "").lower() != media_constraint:
+                continue
+            if (time_comps is not None or time_bounds) and not _time_ok(
+                    _asset_captured(_aid)):
+                continue
+        except Exception:
+            continue
+        lexical_anchor_valid[_aid] = _ranks
+        if _aid not in scores:
+            scores[_aid] = 0.0
+            lexical_anchor_added += 1
+
+    _slot_lexical_anchor_w = float(
+        os.getenv("SENTRIX_SLOT_LEXICAL_ANCHOR_WEIGHT", "3.0"))
+    for _aid, _ranks in lexical_anchor_valid.items():
+        scores[_aid] += _slot_lexical_anchor_w * sum(
+            1.0 / (_slot_rrf_k + rank) for rank in _ranks[:8])
+
     # Unknown GPS/geocode remains open-world in the retrieval kernel, so it
     # cannot erase a plausible image or video frame. Among retained candidates,
     # a verified place match should overcome a weak ANN rank. The boost is
@@ -2022,6 +2168,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "media_filter_source": media_filter_source,
             "place_matched_candidate_count": len(place_matched_ids),
             "place_boost": round(place_boost, 6),
+            "lexical_anchor_surface_count": len(lexical_anchor_surfaces),
+            "lexical_anchor_candidate_count": len(lexical_anchor_valid),
+            "lexical_anchor_added_count": lexical_anchor_added,
             "post_anchor_candidate_count": len(kept),
             "returned_candidate_count": len(final_ids),
         }
