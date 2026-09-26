@@ -777,10 +777,24 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, c
     if not turn_id or response.get("status") not in {"running", "pending"}:
         return response
 
+    def cancel_remote_turn() -> None:
+        # A timed-out turn must be cancelled at the API as well as locally.  Otherwise
+        # the backend keeps consuming a model slot after the QA worker has been freed.
+        try:
+            request_json(
+                f"{base_url.rstrip('/')}/api/assistant/turn/{quote(str(turn_id))}/cancel",
+                method="POST",
+                timeout=10,
+            )
+        except Exception:
+            # The original timeout is the useful error; cancellation is best effort.
+            pass
+
     deadline = time.monotonic() + timeout
     poll_url = f"{base_url.rstrip('/')}/api/assistant/turn/{quote(str(turn_id))}"
     while time.monotonic() < deadline:
         if cancelled is not None and cancelled():
+            cancel_remote_turn()
             raise RunCancelledError(f"run cancelled while waiting for assistant turn {turn_id}")
         state = request_json(poll_url, timeout=min(30, max(1, int(deadline - time.monotonic()))))
         status = str(state.get("status") or "").lower()
@@ -792,6 +806,7 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, c
         if status in {"failed", "error", "cancelled", "canceled"}:
             raise RuntimeError(f"assistant turn {turn_id} {status}: {state.get('error') or state.get('reason') or state}")
         time.sleep(0.5)
+    cancel_remote_turn()
     raise TimeoutError(f"assistant turn {turn_id} did not complete within {timeout}s")
 
 
@@ -3511,6 +3526,11 @@ class BenchmarkRun:
             if str(item.get("qa_id") or "") in completed_qa_ids
             and item.get("judge_status") == "skipped"
         )
+        # These counters describe actual executor activity.  The old progress
+        # calculation treated every not-yet-completed sample as "in flight",
+        # including samples still waiting in an executor queue.
+        qa_activity_lock = threading.Lock()
+        qa_activity = {"agent_active": 0, "judge_active": 0}
         self._record_phase("qa_eval", "agent_phase_started_at", now_iso())
         self._record_phase("qa_eval", "agent_phase_started_at_epoch", agent_phase_started_epoch)
         self._record_phase("qa_eval", "agent_total", total_qa)
@@ -3519,6 +3539,9 @@ class BenchmarkRun:
         def record_qa_progress():
             agent_done = getattr(self, "_qa_agent_completed", 0)
             judge_done = getattr(self, "_qa_judge_completed", 0)
+            with qa_activity_lock:
+                agent_active = qa_activity["agent_active"]
+                judge_active = qa_activity["judge_active"]
             judge_submitted = getattr(self, "_qa_judge_submitted", 0)
             self._record_phase("qa_eval", "progress", {
                 "total": total_qa,
@@ -3526,12 +3549,15 @@ class BenchmarkRun:
                 "completed": judge_done,
                 "agent_completed": agent_done,
                 "agent_total": total_qa,
-                "agent_in_flight": max(0, total_qa - agent_done),
+                "agent_submitted": getattr(self, "_qa_agent_submitted", agent_done),
+                "agent_in_flight": agent_active,
+                "agent_queued": max(0, total_qa - agent_done - agent_active),
                 "judge_completed": judge_done,
                 "judge_total": total_qa,
                 "judge_submitted": judge_submitted,
                 "judge_skipped": getattr(self, "_qa_judge_skipped", 0),
-                "judge_in_flight": max(0, judge_submitted - (judge_done - getattr(self, "_qa_judge_skipped", 0))),
+                "judge_in_flight": judge_active,
+                "judge_queued": max(0, judge_submitted - judge_done - judge_active),
                 "qa_concurrency": qa_concurrency,
                 "judge_concurrency": judge_concurrency,
             })
@@ -3540,7 +3566,6 @@ class BenchmarkRun:
             (index, row) for index, row in enumerate(self.qa_rows)
             if str(row.get("qa_id") or "") not in completed_qa_ids
         ]
-        agent_futures = {}
         judge_futures = {}
         judge_phase_started_perf = None
         judge_phase_started_epoch = None
@@ -3553,17 +3578,46 @@ class BenchmarkRun:
         ) as agent_executor, concurrent.futures.ThreadPoolExecutor(
             max_workers=judge_concurrency, thread_name_prefix="qa-judge"
         ) as judge_executor:
-            agent_futures = {
-                agent_executor.submit(self._evaluate_one, row, assets_by_name): index
-                for index, row in pool_rows
-            }
-            self._qa_submitted = total_qa
-            record_qa_progress()
-
             # One completion loop services both pools.  This keeps Agent and
             # Judge truly pipelined: a finished Judge is merged immediately,
             # even while other Agent futures are still running.
-            pending = {future: ("agent", index) for future, index in agent_futures.items()}
+            pending = {}
+            pool_row_iter = iter(pool_rows)
+
+            def run_agent(row):
+                with qa_activity_lock:
+                    qa_activity["agent_active"] += 1
+                try:
+                    return self._evaluate_one(row, assets_by_name)
+                finally:
+                    with qa_activity_lock:
+                        qa_activity["agent_active"] = max(0, qa_activity["agent_active"] - 1)
+
+            def run_judge(judge_item, row):
+                with qa_activity_lock:
+                    qa_activity["judge_active"] += 1
+                try:
+                    return self._judge_item(judge_item, row, assets_by_name)
+                finally:
+                    with qa_activity_lock:
+                        qa_activity["judge_active"] = max(0, qa_activity["judge_active"] - 1)
+
+            def submit_next_agent() -> bool:
+                try:
+                    index, row = next(pool_row_iter)
+                except StopIteration:
+                    return False
+                future = agent_executor.submit(run_agent, row)
+                pending[future] = ("agent", index)
+                self._qa_agent_submitted += 1
+                self._qa_submitted = self._qa_agent_submitted
+                return True
+
+            self._qa_agent_submitted = len(completed_qa_ids)
+            self._qa_submitted = self._qa_agent_submitted
+            for _ in range(min(qa_concurrency, len(pool_rows))):
+                submit_next_agent()
+            record_qa_progress()
             agent_phase_recorded = False
 
             def record_agent_phase_finished() -> None:
@@ -3615,7 +3669,7 @@ class BenchmarkRun:
                             self._qa_judge_submitted += 1
                             judge_item = copy.deepcopy(item)
                             judge_future = judge_executor.submit(
-                                self._judge_item, judge_item, self.qa_rows[index], assets_by_name,
+                                run_judge, judge_item, self.qa_rows[index],
                             )
                             judge_futures[judge_future] = index
                             pending[judge_future] = ("judge", index)
@@ -3625,6 +3679,11 @@ class BenchmarkRun:
                             record_qa_progress()
                             self._refresh_live_metric_preview()
                             self.persist()
+                        # Keep only a bounded number of Agent futures submitted.
+                        # This makes cancellation responsive and prevents a large
+                        # queued backlog from being mistaken for active work.
+                        if kind == "agent":
+                            submit_next_agent()
                         if not any(k == "agent" for k, _ in pending.values()):
                             record_agent_phase_finished()
                     else:
@@ -3765,12 +3824,19 @@ class BenchmarkRun:
             all_call_metrics, all_execution_trace, all_tool_trace = [], [], []
             all_tool_observations = []
             tool_trace_present = False
+            try:
+                agent_turn_timeout = max(
+                    60,
+                    int(os.getenv("PHOTOBENCH_AGENT_TURN_TIMEOUT_SECONDS") or "240"),
+                )
+            except ValueError:
+                agent_turn_timeout = 240
             for turn_index, message in enumerate(messages or [query]):
                 initial_resp = request_json(f"{self.sentrix_url}/api/assistant/turn", {
                     "message": message, "scope_id": self.state["scope_id"],
                     "conversation_id": conversation_id, "viewer_id": "owner", "include_debug": True,
                 }, "POST", 300)
-                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900,
+                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=agent_turn_timeout,
                                                cancelled=self._cancel.is_set)
                 turn_metrics, turn_trace, turn_tools = self._normalize_turn_traces(resp)
                 _, turn_observations = self._extract_tool_perf(resp.get("task_state") or {})
