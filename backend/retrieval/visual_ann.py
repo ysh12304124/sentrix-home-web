@@ -74,7 +74,11 @@ class VisualAnnRetriever:
             self._status = "embedder_unavailable"
             return []
         if os.getenv("SENTRIX_VECTOR_BACKEND", "sqlite").strip().lower() == "qdrant":
-            return self._retrieve_qdrant(query, filters, limit)
+            qdrant_hits = self._retrieve_qdrant(query, filters, limit)
+            if qdrant_hits:
+                return qdrant_hits
+            # Qdrant is an acceleration mirror; preserve main's fallback to
+            # local HNSW when the mirror has no usable visual candidates.
         if not self.embedding_router.visual_available:
             self._status = "embedder_unavailable"
             return []

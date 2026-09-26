@@ -9,12 +9,14 @@ from dataclasses import dataclass, field
 from .face_embeddings import normalize_embedding
 
 
-# Cosine similarity is computed on L2-normalized buffalo_l embeddings.  The
-# previous 0.30 default was permissive enough to merge visually similar but
-# different people.  Online ingestion keeps more recall; global reclustering
-# is a cleanup pass with stricter matching plus a quality filter.
-DEFAULT_FACE_MATCH_THRESHOLD = 0.42
-DEFAULT_FACE_RECLUSTER_THRESHOLD = 0.48
+# Cosine similarity is computed on L2-normalized buffalo_l embeddings.  A
+# recall-oriented initial threshold follows an exploratory replay of the
+# available identity-labelled PhotoBench scope, where 0.42 fragmented many
+# same-person views.  The labelled subset is small, so deployments should
+# monitor precision after reprocessing and can override this independently.
+# Batch reclustering also checks all members, so it is tuned separately.
+DEFAULT_FACE_MATCH_THRESHOLD = 0.20
+DEFAULT_FACE_RECLUSTER_THRESHOLD = 0.28
 
 
 def _resolve_threshold(value, env_name, default):

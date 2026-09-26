@@ -7,11 +7,25 @@ import tempfile
 import httpx
 from PIL import Image
 
-from backend.model_clients import ContextBudgetExceeded, GammaClient, as_text, build_image_prompt, normalize_confidence, parse_json_response
+from backend.model_clients import (
+    ContextBudgetExceeded,
+    GammaClient,
+    as_text,
+    build_image_prompt,
+    cap_output_tokens_for_estimated_room,
+    normalize_confidence,
+    parse_json_response,
+)
 from backend.agent_runtime.tool_policy import ToolPolicy
 
 
 class ModelClientTests(unittest.TestCase):
+    def test_heuristic_context_estimate_does_not_starve_json_generation(self):
+        self.assertEqual(cap_output_tokens_for_estimated_room(384, 1), 128)
+        self.assertEqual(cap_output_tokens_for_estimated_room(384, 200), 200)
+        self.assertEqual(cap_output_tokens_for_estimated_room(384, 900), 384)
+        self.assertEqual(cap_output_tokens_for_estimated_room(64, 1), 64)
+
     def test_tool_policy_preserves_private_model_metrics_for_runtime_extraction(self):
         payload = {
             "summary": "done",
@@ -83,8 +97,109 @@ class ModelClientTests(unittest.TestCase):
 
         self.assertEqual(result, "ok")
         payload = stream.call_args.args[1]
-        self.assertEqual(payload["max_tokens"], 100)
-        self.assertEqual(stream.call_args.kwargs["budget_metrics"]["estimated_total_tokens"], 4501)
+        self.assertEqual(payload["max_tokens"], 84)
+        self.assertEqual(stream.call_args.kwargs["budget_metrics"]["estimated_total_tokens"], 4485)
+
+    def test_vllm_context_error_with_one_token_overflow_gets_safe_retry_budget(self):
+        request = httpx.Request("POST", "http://sentrix-vllm/v1/chat/completions")
+        response = httpx.Response(
+            400, request=request,
+            text=("This model's maximum context length is 4096 tokens. However, you requested "
+                  "64 output tokens and your prompt contains at least 4033 input tokens for a "
+                  "total of at least 4097 tokens."),
+        )
+        error = httpx.HTTPStatusError("400 Bad Request", request=request, response=response)
+        self.assertEqual(GammaClient._vllm_available_output_tokens(error), 47)
+        self.assertEqual(GammaClient._vllm_input_overflow_tokens(error), 1)
+
+    def test_chat_messages_retries_when_server_template_is_one_token_over_context(self):
+        request = httpx.Request("POST", "http://sentrix-vllm/v1/chat/completions")
+        response = httpx.Response(
+            400, request=request,
+            text=("This model's maximum context length is 4096 tokens. However, you requested "
+                  "64 output tokens and your prompt contains at least 4033 input tokens for a "
+                  "total of at least 4097 tokens."),
+        )
+        overflow = httpx.HTTPStatusError("400 Bad Request", request=request, response=response)
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        with patch.object(client, "_tokenize_for_budget", return_value={
+            "prompt_tokens": 4000, "max_model_len": 4096,
+        }), patch.object(client, "_chat_openai_stream", side_effect=[overflow, "recovered"]) as stream:
+            result = client.chat_messages(
+                [{"role": "user", "content": "test"}],
+                role="tool_loop", max_tokens=64,
+            )
+
+        self.assertEqual(result, "recovered")
+        self.assertEqual(stream.call_count, 2)
+        self.assertEqual(stream.call_args.args[1]["max_tokens"], 47)
+        self.assertEqual(stream.call_args.kwargs["budget_metrics"]["preflight_status"],
+                         "vllm_context_retry")
+
+    def test_chat_messages_compacts_prior_tool_context_after_safe_retry_still_overflows(self):
+        request = httpx.Request("POST", "http://sentrix-vllm/v1/chat/completions")
+        first = httpx.HTTPStatusError("400 first", request=request, response=httpx.Response(
+            400, request=request,
+            text=("This model's maximum context length is 4096 tokens. However, you requested "
+                  "64 output tokens and your prompt contains at least 4033 input tokens, for a "
+                  "total of at least 4097 tokens."),
+        ))
+        second = httpx.HTTPStatusError("400 retry", request=request, response=httpx.Response(
+            400, request=request,
+            text=("This model's maximum context length is 4096 tokens. However, you requested "
+                  "47 output tokens and your prompt contains at least 4050 input tokens, for a "
+                  "total of at least 4097 tokens."),
+        ))
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        messages = [
+            {"role": "system", "content": "keep the system prompt"},
+            {"role": "user", "content": "older tool observation " + "x" * 2800},
+            {"role": "assistant", "content": "tool call"},
+            {"role": "user", "content": "latest evidence stays intact"},
+        ]
+        with patch.object(client, "_tokenize_for_budget", return_value=None), \
+                patch.object(client, "_chat_openai_stream", side_effect=[first, second, "recovered"]) as stream:
+            result = client.chat_messages(messages, role="tool_loop", max_tokens=64)
+
+        self.assertEqual(result, "recovered")
+        self.assertEqual(stream.call_count, 3)
+        compacted_payload = stream.call_args.args[1]
+        self.assertEqual(compacted_payload["max_tokens"], 47)
+        self.assertEqual(compacted_payload["messages"][0]["content"], "keep the system prompt")
+        self.assertLess(len(compacted_payload["messages"][1]["content"]),
+                        len(messages[1]["content"]))
+        self.assertEqual(compacted_payload["messages"][-1]["content"], "latest evidence stays intact")
+        self.assertEqual(stream.call_args.kwargs["budget_metrics"]["preflight_status"],
+                         "vllm_context_compaction_retry")
+
+    def test_context_compaction_reduces_tool_history_but_keeps_latest_question(self):
+        messages = [
+            {"role": "system", "content": "system rules"},
+            {"role": "user", "content": "工具 search_memories 返回：\n" + "旧候选" * 700},
+            {"role": "assistant", "content": "tool call"},
+            {"role": "user", "content": "帮我找刚才那场活动的照片"},
+        ]
+
+        compacted = GammaClient._compact_messages_for_vllm_context(messages, 1)
+
+        self.assertIsNotNone(compacted)
+        self.assertEqual(compacted[0]["content"], messages[0]["content"])
+        self.assertLess(len(compacted[1]["content"]), len(messages[1]["content"]))
+        self.assertEqual(compacted[-1]["content"], messages[-1]["content"])
+
+    def test_context_compaction_can_shrink_latest_large_tool_observation(self):
+        messages = [
+            {"role": "system", "content": "system rules"},
+            {"role": "assistant", "content": "tool call"},
+            {"role": "user", "content": "工具 inspect_photo 返回：\n" + "当前观察" * 900 + "\nEND"},
+        ]
+
+        compacted = GammaClient._compact_messages_for_vllm_context(messages, 1)
+
+        self.assertIsNotNone(compacted)
+        self.assertLess(len(compacted[-1]["content"]), len(messages[-1]["content"]))
+        self.assertTrue(compacted[-1]["content"].startswith("工具 inspect_photo 返回："))
+        self.assertTrue(compacted[-1]["content"].endswith("END"))
 
     def test_chat_messages_blocks_prompt_that_fills_context(self):
         client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")

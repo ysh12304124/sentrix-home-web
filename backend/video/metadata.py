@@ -5,6 +5,7 @@ import re
 import os
 import shutil
 import subprocess
+import importlib.util
 from pathlib import Path
 
 from .contracts import VideoMetadata
@@ -49,6 +50,17 @@ def resolve_ffmpeg_binary(name: str) -> str:
         if packages.is_dir():
             # WinGet package layout is <package>/<archive>/bin/<binary>.exe.
             candidates.extend(packages.glob(f"*/*/bin/{name}.exe"))
+        # Keep the project runnable on a clean Windows host.  The lightweight
+        # imageio-ffmpeg wheel bundles a tested FFmpeg executable even when
+        # ffmpeg/ffprobe were not installed system-wide.
+        if name == "ffmpeg":
+            try:
+                spec = importlib.util.find_spec("imageio_ffmpeg")
+                if spec and spec.submodule_search_locations:
+                    binaries = Path(next(iter(spec.submodule_search_locations))) / "binaries"
+                    candidates.extend(binaries.glob("ffmpeg-*.exe"))
+            except (ImportError, OSError, StopIteration):
+                pass
     for candidate in candidates:
         try:
             if candidate.is_file():
@@ -85,15 +97,50 @@ def _normalized_datetime(value):
     return value[:-1] + "+00:00" if value.endswith("Z") else value
 
 
-def probe_video_metadata(path: str | Path) -> VideoMetadata:
-    path = Path(path).resolve()
+def _probe_with_ffmpeg(path: Path) -> dict:
+    """Best-effort metadata fallback when a separate ffprobe binary is absent."""
     process = subprocess.run(
-        [resolve_ffmpeg_binary("ffprobe"), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        [resolve_ffmpeg_binary("ffmpeg"), "-hide_banner", "-i", str(path)],
         check=False, capture_output=True, text=True, timeout=60,
     )
-    if process.returncode:
-        raise RuntimeError(f"ffprobe failed: {process.stderr.strip()[-1000:]}")
-    payload = json.loads(process.stdout)
+    diagnostic = process.stderr or process.stdout or ""
+    duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", diagnostic)
+    duration = 0.0
+    if duration_match:
+        hours, minutes, seconds = duration_match.groups()
+        duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    stream_match = re.search(
+        r"Stream #\S+(?:\([^)]*\))?:\s*Video:\s*([^,\s]+).*?(\d{2,5})x(\d{2,5})",
+        diagnostic,
+    )
+    if not stream_match:
+        raise RuntimeError(f"ffmpeg metadata probe failed: {diagnostic.strip()[-1000:]}")
+    codec, width, height = stream_match.groups()
+    fps_match = re.search(r"(\d+(?:\.\d+)?)\s*fps", diagnostic)
+    return {
+        "format": {"duration": str(duration)},
+        "streams": [{
+            "codec_type": "video", "codec_name": codec,
+            "width": int(width), "height": int(height),
+            "avg_frame_rate": f"{fps_match.group(1)}/1" if fps_match else "0/1",
+        }],
+        "_probe_backend": "ffmpeg-fallback",
+    }
+
+
+def probe_video_metadata(path: str | Path) -> VideoMetadata:
+    path = Path(path).resolve()
+    ffprobe = resolve_ffmpeg_binary("ffprobe")
+    if ffprobe == "ffprobe":
+        payload = _probe_with_ffmpeg(path)
+    else:
+        process = subprocess.run(
+            [ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+            check=False, capture_output=True, text=True, timeout=60,
+        )
+        if process.returncode:
+            raise RuntimeError(f"ffprobe failed: {process.stderr.strip()[-1000:]}")
+        payload = json.loads(process.stdout)
     format_info = payload.get("format") or {}
     format_tags = format_info.get("tags") or {}
     video = next((item for item in payload.get("streams") or [] if item.get("codec_type") == "video"), None)

@@ -29,9 +29,12 @@ PROFILES = {
                "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history",
                "get_core_memory", "get_person_profile"),
-        max_model_steps=8,
-        max_tool_calls=6,
-        max_inspections=3,
+        # Keep enough room for one bounded recovery after the last tool
+        # rejection plus the final writer turn.  Without this reserve, a
+        # useful search could end at the model-step ceiling as partial.
+        max_model_steps=12,
+        max_tool_calls=8,
+        max_inspections=4,
         # search_memories may perform several bounded 12B validation batches
         # before the Agent gets a final Writer turn.  Keep a dedicated reserve
         # instead of falling into the emergency renderer after validation.

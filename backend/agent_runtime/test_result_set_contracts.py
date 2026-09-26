@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from backend.db import MemoryStore
 from backend.agent_runtime import tools as runtime_tools
+from backend.agent_runtime.result_set import TaskState as RuntimeTaskState
 from backend.agent_runtime.result_set import debug_asset_projection
 from backend.agent_runtime.intent import visual_intent
 from backend.agent_runtime.completion import (
@@ -54,6 +55,24 @@ class ResultSetContractTests(unittest.TestCase):
         )
         self.assertEqual(page["page_size"], 6)
         self.assertEqual(len(page["preview"]), 6)
+
+    def test_task_state_advances_current_preview_to_the_returned_page(self):
+        state = RuntimeTaskState()
+        state.update_from_tool("search_memories", {}, {
+            "result_set_id": "rs_page_test", "total": 18,
+            "has_more": True, "remaining": 12,
+            "preview": [{"handle": f"photo_{i}"} for i in range(1, 7)],
+        })
+        state.update_from_tool("get_result_page", {"page": 2}, {
+            "result_set_id": "rs_page_test", "total": 18,
+            "has_more": True, "remaining": 6,
+            "preview": [{"handle": f"photo_{i}"} for i in range(7, 13)],
+        })
+
+        self.assertEqual(state.current_result_set, "rs_page_test")
+        self.assertEqual(state.result_preview, [f"photo_{i}" for i in range(7, 13)])
+        self.assertTrue(state.has_more)
+        self.assertEqual(state.result_remaining, 6)
 
     def test_preview_carries_bounded_observation_detail(self):
         asset = self.store.create_asset(

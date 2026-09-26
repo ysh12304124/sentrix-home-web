@@ -34,6 +34,24 @@ from ..person_appearance import expanded_person_crop
 _RUNTIME: dict = {}
 
 
+def _store_fetchone(store, query: str, params=()):
+    """Serialize direct read queries on the shared SQLite connection."""
+    lock = getattr(store, "_connection_lock", None)
+    if lock is None:
+        return store.connection.execute(query, params).fetchone()
+    with lock:
+        return store.connection.execute(query, params).fetchone()
+
+
+def _store_fetchall(store, query: str, params=()):
+    """Serialize direct read queries on the shared SQLite connection."""
+    lock = getattr(store, "_connection_lock", None)
+    if lock is None:
+        return store.connection.execute(query, params).fetchall()
+    with lock:
+        return store.connection.execute(query, params).fetchall()
+
+
 def bind_runtime(store, *, gamma=None, embedding_router=None, retrieval_config=None):
     from .result_set import ResultSetStore
     _RUNTIME["store"] = store
@@ -180,6 +198,13 @@ def _resolve_entity(name, scope_id):
 # ---- Tool 2: search_memories ----
 _RESULT_PREVIEW_LIMIT = 6
 _RESULT_PAGE_SIZE = 6
+# The remote main retrieval contract keeps at most 18 slot candidates. The
+# Agent must be able to inspect that same complete top-k window; otherwise a
+# correct candidate at ranks 7-18 exists in retrieval diagnostics but cannot
+# be selected as delivered evidence. This changes exposure only: the evaluator
+# still scores the media explicitly selected by the Agent, and page pagination
+# remains six items for ordinary result browsing.
+_SLOT_PREVIEW_LIMIT = 18
 
 
 def _public_candidate_limit() -> int:
@@ -226,7 +251,79 @@ _PREVIEW_QUERY_ALIASES = {
     "舞台": ("舞台", "仪式", "典礼"),
     "户外": ("户外", "室外", "露天"),
     "夜晚": ("夜晚", "夜间", "夜景", "灯光"),
+    "晚上": ("晚上", "夜晚", "夜间", "夜景", "灯光"),
+    "夜间": ("晚上", "夜晚", "夜间", "夜景", "灯光"),
+    "紫色": ("紫色", "紫", "紫布", "紫色布景", "紫色纱幔"),
+    "紫": ("紫色", "紫", "紫布", "紫色布景", "紫色纱幔"),
+    "室外": ("室外", "户外", "露天"),
 }
+
+_PREVIEW_QUERY_STOPWORDS = {
+    "我", "我们", "你", "帮我", "找一下", "找我", "记得", "有次", "那次", "这次",
+    "当时", "那个", "这个", "照片", "图片", "留影", "拍照", "拍了", "拍摄", "前面",
+    "附近", "具体", "哪里", "哪儿", "什么", "时候", "发生", "经历", "帮忙", "一下",
+}
+
+
+def _preview_query_terms(query: str) -> list[str]:
+    """Extract bounded query concepts for caption-aware preview ordering."""
+    text = str(query or "").strip()
+    if not text:
+        return []
+    try:
+        import jieba
+        raw_terms = jieba.lcut(text, cut_all=False)
+    except Exception:
+        raw_terms = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]+", text)
+    terms = []
+    for raw in raw_terms:
+        term = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", str(raw)).strip()
+        if len(term) < 2 or term in _PREVIEW_QUERY_STOPWORDS or term in terms:
+            continue
+        terms.append(term)
+        if len(terms) >= 16:
+            break
+    return terms
+
+
+def _preview_text_score(query: str, summary: str,
+                        term_weights: dict[str, float] | None = None) -> float:
+    """Score only query-to-observation overlap; never consult QA answers or GT."""
+    text = str(query or "")
+    desc = str(summary or "")
+    if not desc:
+        return 0.0
+    weights = term_weights or {}
+    score = sum(2.0 * weights.get(term, 1.0)
+                for term, aliases in _PREVIEW_QUERY_ALIASES.items()
+                if term in text and any(alias in desc for alias in aliases))
+    terms = _preview_query_terms(text)
+    if terms:
+        cue_terms = {term for term in _PREVIEW_QUERY_ALIASES if term in text}
+        score += sum((min(3, len(term)) / 3) * weights.get(term, 1.0)
+                     for term in terms if term in desc and term not in cue_terms)
+    return score
+
+
+def _preview_query_term_weights(query: str, summaries: list[str]) -> dict[str, float]:
+    """Weight rare query anchors more than concepts shared by the whole result pool."""
+    text = str(query or "")
+    terms = set(_preview_query_terms(text))
+    terms.update(term for term in _PREVIEW_QUERY_ALIASES if term in text)
+    if not terms or not summaries:
+        return {}
+    total = len(summaries)
+    weights = {}
+    for term in terms:
+        aliases = _PREVIEW_QUERY_ALIASES.get(term, (term,))
+        document_frequency = sum(
+            1 for summary in summaries
+            if any(alias in summary for alias in aliases)
+        )
+        # Smooth so ubiquitous terms keep a small positive weight while a
+        # discriminative village/object cue can influence the visible head.
+        weights[term] = 1.0 + math.log((total + 1) / (document_frequency + 1))
+    return weights
 
 
 def _observation_summary(store, asset_id: str) -> str:
@@ -310,12 +407,14 @@ def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
                 requested_count = int(raw)
             except ValueError:
                 requested_count = None
-    if not cues and requested_count is None:
+    terms = _preview_query_terms(text)
+    if not cues and not terms and requested_count is None:
         return list(range(len(asset_ids)))
+    summaries = [_observation_summary(store, asset_id) for asset_id in asset_ids]
+    term_weights = _preview_query_term_weights(text, summaries)
     scored = []
-    for index, asset_id in enumerate(asset_ids):
-        summary = _observation_summary(store, asset_id)
-        score = sum(1 for _, aliases in cues if any(alias in summary for alias in aliases))
+    for index, (asset_id, summary) in enumerate(zip(asset_ids, summaries)):
+        score = _preview_text_score(text, summary, term_weights)
         if requested_count is not None and store is not None:
             try:
                 face_count = int(store.connection.execute(
@@ -338,7 +437,8 @@ def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
     return [index for _, index in scored]
 
 
-def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "") -> list[int]:
+def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "",
+                     *, limit: int | None = None) -> list[int]:
     """Select bounded indices under an explicit candidate-window policy.
 
     The full ResultSet remains server-side.  ``SENTRIX_CANDIDATE_STRATEGY`` is
@@ -347,20 +447,21 @@ def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "") ->
     ``head_only`` keeps retrieval order, ``event_diversity`` maximizes event
     diversity, and the default keeps a relevance head before diversity.
     """
+    preview_limit = max(1, int(limit or _RESULT_PREVIEW_LIMIT))
     # The retrieval order is the only ranking signal guaranteed to have been
     # produced by the complete candidate search.  Event-diversity is still
     # available as an explicit opt-in, but must not silently hide the sixth
     # ranked source image from the user/evidence window.
     strategy = os.getenv("SENTRIX_CANDIDATE_STRATEGY", "head_only").strip().lower()
-    if len(asset_ids) <= _RESULT_PREVIEW_LIMIT:
+    if len(asset_ids) <= preview_limit:
         return (_preview_query_order(asset_ids, query, store)
                 if mode != "representative" else list(range(len(asset_ids))))
     if mode == "representative":
-        candidates = _even_indices(len(asset_ids), _RESULT_PREVIEW_LIMIT)
+        candidates = _even_indices(len(asset_ids), preview_limit)
     else:
         candidates = _preview_query_order(asset_ids, query, store)
     if strategy in {"head_only", "relevance_head_only"}:
-        return candidates[:_RESULT_PREVIEW_LIMIT]
+        return candidates[:preview_limit]
     if strategy in {"event_diversity", "diversity_only"}:
         relevance_head = 0
     else:
@@ -373,15 +474,15 @@ def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "") ->
     for index in candidates[:relevance_head]:
         selected.append(index)
         seen_groups.add(_asset_group_key(store, asset_ids[index]))
-    if len(selected) >= _RESULT_PREVIEW_LIMIT:
-        return selected[:_RESULT_PREVIEW_LIMIT]
+    if len(selected) >= preview_limit:
+        return selected[:preview_limit]
     for index in candidates[relevance_head:]:
         group = _asset_group_key(store, asset_ids[index])
         if group in seen_groups:
             continue
         selected.append(index)
         seen_groups.add(group)
-        if len(selected) >= _RESULT_PREVIEW_LIMIT:
+        if len(selected) >= preview_limit:
             return selected
     # With explicit scene cues, never pad the visible window with an arbitrary
     # head item that failed the cue match. Such padding let the model inspect
@@ -392,9 +493,29 @@ def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "") ->
     for index in range(len(asset_ids)):
         if index not in selected:
             selected.append(index)
-        if len(selected) >= _RESULT_PREVIEW_LIMIT:
+        if len(selected) >= preview_limit:
             break
     return selected
+
+
+def _build_preview_entries(store, asset_ids: list[str], indices: list[int]) -> list[dict]:
+    """Build the model-visible preview from the selected candidate indices.
+
+    Handles retain their original ResultSet rank (``photo_N``), while
+    ``priority_rank`` describes their order in this preview. Keeping those
+    concepts separate lets query-aware preview ranking expose a relevant
+    candidate without breaking subsequent inspect_photo handle resolution.
+    """
+    preview = []
+    for priority_rank, index in enumerate(indices, 1):
+        if index < 0 or index >= len(asset_ids):
+            continue
+        preview.append(_preview_entry(
+            store, asset_ids[index], f"photo_{index + 1}",
+            priority_rank=priority_rank,
+            selection_reason="相关性最高" if priority_rank == 1 else "候选补充",
+        ))
+    return [item for item in preview if item]
 
 
 def _candidate_window_summary(asset_ids: list[str], indices: list[int], store) -> dict:
@@ -739,6 +860,23 @@ def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
             term = match.group(0)
             if term not in ignored and not any(token in term for token in ignored):
                 terms.append((term, length))
+    # These aliases are for event-level candidate discovery only; they do not
+    # assert that two visible objects are the same. For example, an event
+    # observation may call a wedding welcome display a "宣传横幅", while the
+    # user remembers it as an "迎宾展架". The event still remains a soft
+    # candidate and the actual asset must pass the normal retrieval verifier.
+    event_context_aliases = (
+        ("迎宾展架", ("宣传横幅", "迎宾牌", "横幅")),
+        ("迎宾架", ("宣传横幅", "迎宾牌", "横幅")),
+        ("展示架", ("宣传横幅", "横幅")),
+        ("展架", ("宣传横幅", "横幅", "迎宾牌")),
+        ("留影", ("合影", "摆拍", "合照")),
+        ("拍照", ("合影", "摆拍")),
+        ("同行亲友", ("宾客合影", "多人合影", "亲友合影")),
+    )
+    for source, aliases in event_context_aliases:
+        if source in q_text:
+            terms.extend((alias, len(alias)) for alias in aliases)
     terms = list(dict.fromkeys(terms))
     if not terms:
         return None
@@ -748,6 +886,15 @@ def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
             (scope_id,)).fetchall()
     except Exception:
         return None
+    # Event-category words are weak identity signals: they may be used to add
+    # a unique matching event as a *soft* candidate source, but never to
+    # replace the normal semantic candidate pool. This matters for paraphrases
+    # such as "亲友婚礼/迎宾展架" whose event member observations say
+    # "婚礼现场合影/宣传横幅" and therefore share no long literal n-gram.
+    event_type_anchors = {
+        "婚礼", "婚宴", "婚庆", "生日", "聚餐", "旅行", "出游", "春游",
+        "毕业", "演出", "演唱会", "展览", "运动会", "节日", "搬家",
+    }
     scored = []
     for raw in rows:
         row = dict(raw)
@@ -780,7 +927,8 @@ def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
         if matched:
             scored.append((len(set(term for term, _ in matched)),
                            sum(1 for _, length in matched if length >= 4),
-                           row.get("id"), row.get("title") or ""))
+                           row.get("id"), row.get("title") or "",
+                           {term for term, _ in matched}))
     scored.sort(key=lambda item: (-item[0], item[2]))
     if not scored or scored[0][0] < 1:
         return None
@@ -788,7 +936,12 @@ def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
     # result. For example, “婚礼照片” or “水利工程” can occur in several
     # unrelated events. Keep this fallback conservative; the normal ANN and
     # metadata channels remain responsible for broad candidate recall.
-    if scored[0][0] < 2 or scored[0][1] < 1:
+    unique_event_type_hit = (
+        scored[0][0] == 1
+        and bool(scored[0][4] & event_type_anchors)
+        and any(term in str(scored[0][3] or "") for term in scored[0][4] & event_type_anchors)
+    )
+    if not unique_event_type_hit and (scored[0][0] < 2 or scored[0][1] < 1):
         return None
     if len(scored) > 1 and scored[0][0] == scored[1][0]:
         return None
@@ -803,7 +956,7 @@ def _event_keyword_anchor(question: str, store, scope_id: str) -> dict | None:
     except Exception:
         return None
     asset_ids = [dict(row).get("asset_id") for row in asset_rows if dict(row).get("asset_id")]
-    return ({"event_id": event_id, "event_title": scored[0][2],
+    return ({"event_id": event_id, "event_title": scored[0][3],
              "asset_ids": asset_ids[:50]} if asset_ids else None)
 
 def _time_matches_event(time_expr: str | None, ts: str | None) -> int:
@@ -902,13 +1055,56 @@ def _is_referent_query(query: str) -> bool:
     return any(m in q for m in _REFERENT_MARKERS)
 
 
+def _is_face_reference_asset(item: dict, store=None) -> bool:
+    """Identity-reference crops are not user photo/video evidence candidates."""
+    file_name = Path(str((item or {}).get("file_name") or "").replace("\\", "/")).name
+    if re.match(r"^faceid_[^/]+\.(?:jpe?g|png|webp)$", file_name, re.IGNORECASE):
+        return True
+    asset_id = str((item or {}).get("asset_id") or "")
+    if store is None or not asset_id:
+        return False
+    try:
+        asset = store.get_asset(asset_id) or {}
+        metadata = asset.get("metadata_json") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        if not isinstance(metadata, dict):
+            return False
+        source_type = str(metadata.get("source_type") or "").strip().lower()
+        derived_kind = str(metadata.get("derived_kind") or asset.get("derived_kind") or "").strip().lower()
+        return source_type == "identity_seed" or derived_kind in {
+            "face_crop", "face_id_crop", "face_identity_crop", "face_reference",
+        }
+    except Exception:
+        return False
+
+
+def _is_synthetic_event_asset(item: dict, store=None) -> bool:
+    """Event-summary renderings are graph context, not retrievable evidence media."""
+    file_name = Path(str((item or {}).get("file_name") or "").replace("\\", "/")).name
+    if re.match(r"^event_event_[^/]+\.(?:jpe?g|png|webp)$", file_name, re.IGNORECASE):
+        return True
+    asset_id = str((item or {}).get("asset_id") or "")
+    if store is None or not asset_id:
+        return False
+    try:
+        asset = store.get_asset(asset_id) or {}
+        file_name = Path(str(asset.get("file_name") or "").replace("\\", "/")).name
+        return bool(re.match(r"^event_event_[^/]+\.(?:jpe?g|png|webp)$", file_name,
+                             re.IGNORECASE))
+    except Exception:
+        return False
+
+
 def _search_from_prior_result_set(prior_rs, scope_id: str, *, query: str = "",
                                   user_goal: str = "") -> dict | None:
     """W2.3：基于已有 ResultSet 构建检索响应（不重新全库搜索）。"""
     if prior_rs is None:
         return None
-    asset_ids = list(prior_rs.asset_ids or [])
     store = _RUNTIME.get("store")
+    asset_ids = [asset_id for asset_id in (prior_rs.asset_ids or [])
+                 if not _is_face_reference_asset({"asset_id": asset_id}, store)
+                 and not _is_synthetic_event_asset({"asset_id": asset_id}, store)]
     preview = []
     indices = _preview_indices(
         asset_ids, "best", store, query=query or getattr(prior_rs, "query", "") or user_goal)
@@ -1036,8 +1232,10 @@ def _bounded_event_result(prior_rs, scope_id: str, *, query: str = "",
     databases may lack one optional event/observation column; that must not
     turn a valid event anchor into a tool error or a broad ANN fallback.
     """
-    asset_ids = list(prior_rs.asset_ids or [])
     store = _RUNTIME.get("store")
+    asset_ids = [asset_id for asset_id in (prior_rs.asset_ids or [])
+                 if not _is_face_reference_asset({"asset_id": asset_id}, store)
+                 and not _is_synthetic_event_asset({"asset_id": asset_id}, store)]
     indices = _preview_indices(asset_ids, "best", store, query=query or user_goal)
     preview = []
     for rank, index in enumerate(indices, 1):
@@ -1098,6 +1296,20 @@ def _relaxed_retrieve(query: str, filters: dict, scope_id: str, viewer_id: str, 
     # 模型完全无法回答（比返回需复核的候选更糟）。place 检索为空时放宽用语义。
     if base.get("place"):
         steps.append({k: v for k, v in base.items() if k != "place"})
+    def without_face_reference_assets(packet):
+        if packet is None:
+            return packet
+        packet.assets = [item for item in (packet.assets or [])
+                         if not _is_face_reference_asset(item, _RUNTIME.get("store"))
+                         and not _is_synthetic_event_asset(item, _RUNTIME.get("store"))]
+        allowed = {str(item.get("asset_id") or "") for item in packet.assets}
+        for field in ("exact_results", "strong_results", "approximate_results"):
+            rows = getattr(packet, field, None)
+            if isinstance(rows, list):
+                setattr(packet, field, [row for row in rows
+                                        if str(row.get("asset_id") or "") in allowed])
+        return packet
+
     last = None
     for level, f in enumerate(steps):
         draft = _draft_from_filters({**f, "query": query}, answer_type="asset_set")
@@ -1114,15 +1326,18 @@ def _relaxed_retrieve(query: str, filters: dict, scope_id: str, viewer_id: str, 
         draft.result_requirement["top_k"] = max(
             1, int(os.getenv("SENTRIX_SEARCH_RETRIEVAL_TOP_K", "100")))
         spec = _spec_for(draft, scope_id, viewer_id)
-        last = _kernel().retrieve(spec)
-        # 身份种子图（faceid_*）不是用户照片，不得作为"有效候选"阻断放宽：
-        # 语义通道常把 faceid 人脸图召回（如 place=沙岭 严格返回 8 张 faceid），
-        # 若因此不再放宽，faceid 过滤后候选 0、问题完全不可答。
-        _real = [item for item in last.assets
-                 if not str(item.get("file_name") or "").lower().startswith("faceid")]
-        if _real:
+        last = without_face_reference_assets(_kernel().retrieve(spec))
+        if last and last.assets:
             return last, level
     return last, len(steps) - 1
+
+
+def _needs_place_semantic_fallback(filters: dict, assets: list[dict], store) -> bool:
+    """Broaden an unverified place anchor without displacing verified matches."""
+    place = str((filters or {}).get("place") or "").strip()
+    if not place:
+        return False
+    return not any(_place_matches(asset, place, store) for asset in (assets or []))
 
 
 def _parse_search_validation_response(raw) -> list[dict]:
@@ -1371,11 +1586,93 @@ def _place_matches(item, place_q: str, store) -> bool:
         return False
 
 
-# 拆槽多路召回：每路语义召回最多看前 30 名（排名>30 的 RRF 贡献≈0）；
-# 综合分排序后最多给 18 张候选（断层截断后可能更少）。候选上限是召回主导参数
-# （扫描：15→0.72 / 18→~0.80 / 30→0.89），18 为折中——召回足够、图数可控。
+# The latest 1,167-QA run put relevant assets at ranks 29–155, so the old
+# 30/18 cutoffs discarded them before the Agent could inspect them. Keep a
+# wider retrieval head and result set; the model-facing preview remains
+# independently bounded by _RESULT_PREVIEW_LIMIT.
 _SLOT_ROUTE_HEAD = 30
 _SLOT_MAX_CANDIDATES = 18
+
+
+_SEMANTIC_OBJECT_SYNONYMS = (
+    # Keep only lexical equivalents. A display stand and a banner are related
+    # but not interchangeable evidence, so do not rewrite one into the other.
+    ("迎宾牌", "迎宾标牌"),
+    ("横幅", "条幅"),
+    ("条幅", "横幅"),
+    ("展示架", "展架"),
+)
+
+
+def _semantic_route_text_key(text: str) -> str:
+    return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
+def _explicit_media_filter(text: str) -> str | None:
+    """Recover a clear image/video constraint omitted by the tool-call model.
+
+    Use only unambiguous modality words in the original user request. Mixed
+    image-and-video requests remain unfiltered so cross-media retrieval can
+    return both frames and source clips.
+    """
+    value = str(text or "").strip().casefold()
+    if not value:
+        return None
+    video_terms = ("视频", "录像", "录制的视频", "视频片段")
+    image_terms = ("照片", "相片", "图片", "图像", "留影", "合影", "合照", "拍照")
+    wants_video = any(term in value for term in video_terms)
+    wants_image = any(term in value for term in image_terms)
+    if wants_video == wants_image:
+        return None
+    return "video" if wants_video else "image"
+
+
+def _build_semantic_routes(primary_query: str, *, query_core: str = "",
+                            tool_query: str = "", object_terms=None,
+                            user_query: str = "", max_routes: int = 4) -> list[tuple[str, str]]:
+    """Retain planner, original-user, core and tool wording in bounded routes.
+
+    Planner goals are often useful semantic compressions, but can drop the
+    temporal, spatial, or relational clue that identifies an event. Always
+    give the uncompressed user wording its own route before slot/core routes.
+    """
+    object_terms = [str(term or "").strip() for term in (object_terms or [])]
+    candidates = [
+        ("primary", primary_query),
+        ("user_question", user_query),
+        ("slot_query_core", query_core),
+    ]
+    # The four-route budget previously consumed by primary/user/core/tool
+    # wording silently dropped every parsed object term. Fold those anchors
+    # into the final bounded route instead of making them compete for slots.
+    # Add only lexical aliases (not related concepts) so the query expands
+    # without asserting that different objects are interchangeable.
+    anchor_parts = [str(tool_query or "").strip(), *object_terms]
+    anchor_text = " ".join(dict.fromkeys(part for part in anchor_parts if part))
+    synonym_applied = False
+    for source_term, alias_term in _SEMANTIC_OBJECT_SYNONYMS:
+        if source_term in anchor_text:
+            anchor_text = anchor_text.replace(source_term, alias_term)
+            synonym_applied = True
+    if anchor_text:
+        candidates.append(("object_synonym" if synonym_applied else "tool_query_objects",
+                           anchor_text))
+    else:
+        candidates.append(("tool_query", tool_query))
+    candidates.extend(("object", term) for term in object_terms)
+
+    routes = []
+    seen = set()
+    for source, raw_text in candidates:
+        text = str(raw_text or "").strip()
+        key = _semantic_route_text_key(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        routes.append((source, text))
+        if len(routes) >= max(1, int(max_routes)):
+            break
+    return routes
 
 
 class _SlotRetrievalPacket:
@@ -1394,8 +1691,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     if mode not in {"best", "all", "representative"}:
         mode = "best"
     # Semantic conditions are soft hints for the reranker, never hard
-    # retrieval filters. Keep only an explicit media boundary here; scope
-    # authorization remains enforced by the runtime context.
+    # retrieval filters. Preserve an explicit media boundary from either the
+    # tool call or the original user wording; scope authorization remains
+    # enforced by the runtime context.
     raw_filters = dict(arguments.get("filters") or {})
     filters = {}
     media = str(raw_filters.get("media") or "").strip().lower()
@@ -1403,6 +1701,12 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         filters["media"] = media
     scope_id = (context or {}).get("scope_id") or ""
     user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
+    media_filter_source = "tool_arguments" if filters.get("media") else "none"
+    if not filters.get("media"):
+        inferred_media = _explicit_media_filter(user_goal or query)
+        if inferred_media:
+            filters["media"] = inferred_media
+            media_filter_source = "user_question"
     # Event summaries are intentionally not an early-return retrieval path.
     # They may be used later as an additional ranking signal, but must never
     # replace the multi-channel candidate universe.
@@ -1443,6 +1747,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     _slot_input = str(user_goal or "").strip() or query
     _slot_event = ""
     _slot_objects: list[str] = []
+    _slot_query_core = ""
+    _slots = None
+    _slot_place_source = "none"
     # 时间分量（year/months/days）可能由拆槽给出；无年份的节日/季节只约束月日，
     # 绝不能因模型"猜年份"把正确年份的照片筛成 0（qa012/013/017/018 根因）。
     _slot_year = None
@@ -1476,20 +1783,33 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                 filters["time"] = (f"{_slot_y}年{_slot_lo}月-{_slot_hi}月"
                                    if _slot_lo != _slot_hi else f"{_slot_y}年{_slot_lo}月")
             if _slots["place"].get("name"):
-                filters["place"] = _slots["place"].get("hint") or _slots["place"]["name"]
+                # Keep the most specific wording from the question. Replacing
+                # it with a broader normalized hint (e.g. “保定市易县” for
+                # “易县沙岭”) loses the village anchor needed to distinguish
+                # same-county events.
+                filters["place"] = _slots["place"].get("name")
+                _slot_place_source = "name"
+            elif _slots["place"].get("hint"):
+                filters["place"] = _slots["place"].get("hint")
+                _slot_place_source = "hint"
             if _slots.get("person"):
                 filters["person"] = "、".join(p["name"] for p in _slots["person"])
             _slot_event = _slots["event"].get("name") or ""
             _slot_objects = [str(o) for o in (_slots.get("object") or [])]
+            _slot_query_core = str(_slots.get("query_core") or "").strip()
     # 语义检索用完整语义目标（Planner declaration.goal / user_goal），而非模型
     # 传入的简化词序列 query（"亲戚婚房 兄弟 合影" 这类 embedding 质量差，实测
     # 候选 0）。槽位只做精确通道过滤（metadata time/place、entity person）。
     ts_ctx = (context or {}).get("task_state") or {}
     _decl = ts_ctx.get("declaration") or {}
     planner_goal = (context or {}).get("planner_goal") or ""
-    semantic_query = (planner_goal
-                      or (_decl.get("goal") if isinstance(_decl, dict) else "")
-                      or user_goal or query)
+    declaration_goal = (_decl.get("goal") if isinstance(_decl, dict) else "")
+    semantic_query = (planner_goal or declaration_goal or user_goal or query)
+    semantic_query_source = (
+        "planner_goal" if planner_goal else
+        "declaration_goal" if declaration_goal else
+        "user_goal" if user_goal else "tool_query"
+    )
     query_for_retrieval = semantic_query
     draft = _draft_from_filters({**filters, "query": query_for_retrieval}, answer_type="asset_set")
     draft.result_requirement = {"mode": mode}
@@ -1502,18 +1822,80 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # 语义召回列表：每个 object 词（拆槽输出）+ 完整问题（主语义）。object 数量
     # 由模型判断（可多可少、可没有）；每条独立召回，图在各路的排名参与评分。
     store = _RUNTIME.get("store")
-    semantic_routes = [str(o).strip() for o in (_slot_objects or []) if str(o).strip()]
-    if query_for_retrieval.strip():
-        semantic_routes.append(query_for_retrieval)
+    semantic_route_entries = _build_semantic_routes(
+        query_for_retrieval,
+        query_core=_slot_query_core,
+        tool_query=query,
+        object_terms=_slot_objects,
+        user_query=user_goal,
+    )
+    semantic_routes = [text for _, text in semantic_route_entries]
     per_asset_ranks: dict[str, list[int]] = {}
-    for _sq in semantic_routes:
+    place_fallback_ranks: dict[str, list[int]] = {}
+    # The slot-route adapter calls the retrieval kernel once per semantic
+    # route. Preserve the kernel's graph telemetry while doing the adapter's
+    # cross-route RRF merge; otherwise PhotoBench sees an empty
+    # ``retrieval_timing`` object and cannot report graph routing/effect.
+    slot_graph_traces = []
+    slot_route_trace = []
+    slot_route_levels = []
+    for _route_source, _sq in semantic_route_entries:
         try:
-            _pk, _ = _relaxed_retrieve(_sq, {}, scope_id, viewer_id, mode)
-            for _rank, _item in enumerate((_pk.assets or [])[:_SLOT_ROUTE_HEAD], 1):
+            # Keep the parsed hard media/time/place/person constraints on
+            # every semantic route. Passing an empty filter dict here made
+            # the slot adapter rank an unbounded semantic head first and only
+            # then filter it, which can discard the ground-truth asset before
+            # the cross-route merge (especially for the expanded QA set).
+            _pk, _relax_level = _relaxed_retrieve(_sq, filters, scope_id, viewer_id, mode)
+            if isinstance(getattr(_pk, "retrieval_timing", None), dict):
+                _graph_timing = _pk.retrieval_timing
+                if isinstance(_graph_timing.get("graph_policy"), dict):
+                    slot_graph_traces.append(_graph_timing)
+            _route_assets = (_pk.assets or [])
+            slot_route_trace.append({
+                "source": _route_source,
+                "candidate_count": len(_route_assets),
+                "relaxation_level": int(_relax_level or 0),
+            })
+            slot_route_levels.append(int(_relax_level or 0))
+            for _rank, _item in enumerate(_route_assets[:_SLOT_ROUTE_HEAD], 1):
                 _aid = _item.get("asset_id")
                 if _aid:
                     per_asset_ranks.setdefault(_aid, []).append(_rank)
-        except Exception:
+
+            # A non-empty strict place search is not proof that its results
+            # actually match the place. If none has a verified place match,
+            # also retrieve a semantic-only place fallback. Keep the strict
+            # route intact and score this fallback separately at lower weight,
+            # so sparse/ambiguous geocoding cannot erase the event candidates.
+            if (_route_assets and int(_relax_level or 0) == 0
+                    and _needs_place_semantic_fallback(filters, _route_assets, store)):
+                _fallback_filters = dict(filters)
+                _fallback_filters.pop("place", None)
+                _fallback, _fallback_level = _relaxed_retrieve(
+                    _sq, _fallback_filters, scope_id, viewer_id, mode,
+                )
+                _fallback_assets = (_fallback.assets or []) if _fallback else []
+                slot_route_trace.append({
+                    "source": f"{_route_source}_place_fallback",
+                    "candidate_count": len(_fallback_assets),
+                    "relaxation_level": int(_fallback_level or 0),
+                    "fallback_weight": 0.35,
+                })
+                if isinstance(getattr(_fallback, "retrieval_timing", None), dict):
+                    _fallback_timing = _fallback.retrieval_timing
+                    if isinstance(_fallback_timing.get("graph_policy"), dict):
+                        slot_graph_traces.append(_fallback_timing)
+                for _rank, _item in enumerate(_fallback_assets[:_SLOT_ROUTE_HEAD], 1):
+                    _aid = _item.get("asset_id")
+                    if _aid:
+                        place_fallback_ranks.setdefault(_aid, []).append(_rank)
+        except Exception as error:
+            slot_route_trace.append({
+                "source": _route_source,
+                "candidate_count": 0,
+                "error": type(error).__name__,
+            })
             continue
 
     # 事件成员：只做"重合 +1"（确定性弱验证，不参与排名）——事件可能划分不清、
@@ -1524,7 +1906,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             _ev = _event_resolution(user_goal or query, store, scope_id)
             if _ev is None:
                 _ev = _event_keyword_anchor(user_goal or query, store, scope_id)
-            event_member_ids = {str(a) for a in ((_ev or {}).get("asset_ids") or [])}
+            event_member_ids = {
+                str(a) for a in ((_ev or {}).get("asset_ids") or [])
+                if not _is_synthetic_event_asset({"asset_id": str(a)}, store)
+                and not _is_face_reference_asset({"asset_id": str(a)}, store)
+            }
         except Exception:
             event_member_ids = set()
 
@@ -1534,9 +1920,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     _slot_rrf_k = float(os.getenv("SENTRIX_SLOT_RRF_K", "10"))
     _slot_ev_w = float(os.getenv("SENTRIX_SLOT_EV_WEIGHT", "0.1"))
     scores: dict[str, float] = {}
-    for _aid in (set(per_asset_ranks) | event_member_ids):
+    for _aid in (set(per_asset_ranks) | set(place_fallback_ranks) | event_member_ids):
         _ranks = per_asset_ranks.get(_aid) or []
         _s = sum(1.0 / (_slot_rrf_k + r) for r in _ranks)
+        _fallback_ranks = place_fallback_ranks.get(_aid) or []
+        _s += 0.35 * sum(1.0 / (_slot_rrf_k + r) for r in _fallback_ranks)
         if _aid in event_member_ids:
             _s += _slot_ev_w
         scores[_aid] = _s
@@ -1564,36 +1952,44 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         try:
             _a = store.get_asset(aid) or {}
             _o = (store.list_observations(asset_id=aid, limit=1) or [{}])[0]
-            return _a.get("captured_at") or _o.get("captured_at")
+            from ..retrieval.temporal import trusted_captured_at
+            return trusted_captured_at(_a, _o, store=store)
         except Exception:
             return None
 
     def _time_ok(cap):
+        # An unknown/untrusted timestamp is not a contradiction; keep the
+        # semantic candidate and let ranking/evidence decide instead.
+        if not cap:
+            return True
         if time_comps is not None:
             return _in_time_components(cap, time_comps)
         if time_bounds is not None:
             return _in_time_bounds(cap, time_bounds)
         return True
 
-    kept = []
-    if time_comps is not None or time_bounds or place_q:
-        for _aid in scores:
-            if (time_comps is not None or time_bounds) and not _time_ok(_asset_captured(_aid)):
-                continue
-            if place_q and not _place_matches({"asset_id": _aid}, place_q, store):
-                continue
-            kept.append(_aid)
-        if not kept and (time_comps is not None or time_bounds):
-            kept = [a for a in scores if _time_ok(_asset_captured(a))]
-        elif not kept:
-            kept = list(scores)  # 地点全删（非标准地名）→ 保留靠语义排序
-    else:
-        kept = list(scores)
+    # Unknown GPS/geocode remains open-world in the retrieval kernel, so it
+    # cannot erase a plausible image or video frame. Among retained candidates,
+    # a verified place match should overcome a weak ANN rank. The boost is
+    # relative to this query's score scale and independent of the retriever's
+    # cosine/lexical/RRF score range.
+    place_matched_ids = set()
+    place_boost = 0.0
+    if place_q:
+        place_matched_ids = {
+            aid for aid in scores
+            if _place_matches({"asset_id": aid}, place_q, store)
+        }
+        place_boost = max(scores.values(), default=0.0) * 0.75
+        for aid in place_matched_ids:
+            scores[aid] = scores.get(aid, 0.0) + place_boost
+
+    kept = list(scores)
+    if time_comps is not None or time_bounds:
+        kept = [aid for aid in kept if _time_ok(_asset_captured(aid))]
     kept.sort(key=lambda a: -scores.get(a, 0))
 
-    # 断层截断（明显 gap 处截断，相对 gap > 45% 视为断层）+ 上限 15 + 保底 3。
-    # 45% 相对断层：多路重合的强候选与其后弱候选之间应有大 gap；单路语义召回时
-    # λ=0.3 下 rank1~6 分数（1→0.74→0.55→0.41→0.30→0.22）相邻差均 <45%，不误断。
+    # 断层截断（明显 gap 处截断）+ 有界候选上限 + 保底 3。
     final_ids = kept[:_SLOT_MAX_CANDIDATES]
     if len(final_ids) > 3:
         _top = scores.get(final_ids[0], 1) or 1.0
@@ -1606,6 +2002,30 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         final_ids = final_ids[:_cut]
     if len(final_ids) < 3 and len(kept) > len(final_ids):
         final_ids = kept[:3]  # 保底 3 张，避免模型无可选
+
+    slot_retrieval_timing = {
+        "semantic_retrieval": {
+            "primary_query_source": semantic_query_source,
+            "slot_parse_available": bool(_slots),
+            "slot_time_present": bool(_slot_year or _slot_months or _slot_days or
+                                       ((_slots or {}).get("time") or {}).get("expr")),
+            "slot_place_source": _slot_place_source,
+            "slot_query_core_used": any(source == "slot_query_core"
+                                         for source, _ in semantic_route_entries),
+            "route_head_limit": _SLOT_ROUTE_HEAD,
+            "candidate_limit": _SLOT_MAX_CANDIDATES,
+            "routes": slot_route_trace,
+            "merged_candidate_count": len(scores),
+            "time_filter_active": bool(time_comps is not None or time_bounds),
+            "place_filter_active": bool(place_q),
+            "media_filter": filters.get("media") or None,
+            "media_filter_source": media_filter_source,
+            "place_matched_candidate_count": len(place_matched_ids),
+            "place_boost": round(place_boost, 6),
+            "post_anchor_candidate_count": len(kept),
+            "returned_candidate_count": len(final_ids),
+        }
+    }
 
     # 组装候选 assets（供 result set / preview）
     assets = []
@@ -1630,14 +2050,102 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                               "score": scores.get(_aid, 0), "score_kind": "structured"}],
         })
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
-    packet = _SlotRetrievalPacket(assets, gaps=[], retrieval_timing={}, channel_trace={})
-    _relax_level = 0
+    if slot_graph_traces:
+        # Report one question-level graph comparison over the union of the
+        # route candidates. This describes the candidates actually entering
+        # the slot-route merge, without exposing internal asset IDs to the
+        # model-facing observation.
+        graph_policy = next(
+            (trace.get("graph_policy") for trace in slot_graph_traces
+             if (trace.get("graph_policy") or {}).get("enabled") is True),
+            slot_graph_traces[0].get("graph_policy") or {},
+        )
+        baseline_ids = list(dict.fromkeys(
+            str(asset_id)
+            for trace in slot_graph_traces
+            for asset_id in ((trace.get("graph_rerank") or {}).get("baseline_ranked_asset_ids") or [])
+        ))
+        reranked_ids = list(dict.fromkeys(
+            str(asset_id)
+            for trace in slot_graph_traces
+            for asset_id in ((trace.get("graph_rerank") or {}).get("reranked_asset_ids") or [])
+        ))
+        graph_candidates = sum(
+            int((trace.get("graph_rerank") or {}).get("graph_candidate_count") or 0)
+            for trace in slot_graph_traces
+        )
+        graph_reranks = [trace.get("graph_rerank") or {} for trace in slot_graph_traces]
+        baseline_head_ids = list(dict.fromkeys(
+            str(asset_id)
+            for trace in slot_graph_traces
+            for asset_id in ((trace.get("graph_rerank") or {}).get(
+                "baseline_head_asset_ids") or [])
+        ))
+        returned_head_ids = list(dict.fromkeys(
+            str(asset_id)
+            for trace in slot_graph_traces
+            for asset_id in ((trace.get("graph_rerank") or {}).get(
+                "returned_head_asset_ids") or [])
+        ))
+        slot_retrieval_timing.update({
+            "graph_policy": graph_policy,
+            "graph_invoked": any(bool(trace.get("graph_invoked")) for trace in slot_graph_traces),
+            "graph_candidate_count": graph_candidates,
+            "graph_rerank": {
+                "applied": bool(reranked_ids),
+                "baseline_ranked_asset_ids": baseline_ids,
+                "reranked_asset_ids": reranked_ids,
+                "baseline_candidate_count": len(baseline_ids),
+                "combined_candidate_count": len(reranked_ids),
+                "graph_candidate_count": graph_candidates,
+                # Preserve question-level graph-fusion telemetry.  The
+                # model-facing observation still hides asset IDs, but the
+                # evaluator needs to know whether graph actually introduced
+                # new event->frame candidates or merely reordered baseline
+                # results.
+                "new_candidate_count": sum(
+                    int(item.get("new_candidate_count") or 0)
+                    for item in graph_reranks),
+                "graph_head_quota": max(
+                    (int(item.get("graph_head_quota") or 0)
+                     for item in graph_reranks), default=0),
+                "graph_forced_head_count": sum(
+                    int(item.get("graph_forced_head_count") or 0)
+                    for item in graph_reranks),
+                # Preserve the exact candidate heads used for the question.
+                # The evaluator compares these against media GT; the full
+                # ranked lists above remain diagnostics only.
+                "baseline_head_asset_ids": baseline_head_ids,
+                "returned_head_asset_ids": returned_head_ids,
+                "baseline_order_preserved": all(
+                    item.get("baseline_order_preserved") is True
+                    for item in graph_reranks
+                    if "baseline_order_preserved" in item
+                ),
+                "promoted_count": sum(
+                    int(item.get("promoted_count") or 0)
+                    for item in graph_reranks),
+                "demoted_count": sum(
+                    int(item.get("demoted_count") or 0)
+                    for item in graph_reranks),
+                "graph_intent": graph_policy.get("intent") or "ordinary",
+            },
+        })
+    packet = _SlotRetrievalPacket(assets, gaps=[],
+                                  retrieval_timing=slot_retrieval_timing,
+                                  channel_trace={})
+    _relax_level = max(slot_route_levels, default=0)
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
     rs = _RUNTIME["result_sets"].new(
         scope_id=scope_id, query=query, asset_ids=asset_ids,
         unresolved=[g.get("reason") for g in (packet.gaps or [])],
     )
-    preview_indices = _preview_indices(asset_ids, mode, store, query=query)
+    # The compact tool query and planner goal may omit visual/time details
+    # present in the original user wording. Use that full wording when choosing
+    # the bounded preview that the Agent can actually inspect and deliver.
+    preview_query = user_goal or query_for_retrieval or query
+    preview_indices = _preview_indices(
+        asset_ids, mode, store, query=preview_query, limit=_SLOT_PREVIEW_LIMIT)
     # 删模型重排：候选即最终。代码融合排序 + gap 截断已保证强相关在前，
     # 不再逐批调用 12B 验证候选（省 ~5 批模型调用/题，避免上下文膨胀）。
     validated_ids = list(asset_ids)
@@ -1647,16 +2155,12 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     public_status = "candidate_only" if public_ids else "none"
     rs.set_public_view(public_ids)
     _RUNTIME["result_sets"].save(rs)
-    preview = [
-        _preview_entry(
-            store, asset_id, f"photo_{rank}",
-            level="exact", priority_rank=rank,
-            selection_reason=("验证通过的证据来源" if public_status == "validated"
-                              else "待复核相关候选"),
-        )
-        for rank, asset_id in enumerate(rs.visible_asset_ids()[:_RESULT_PREVIEW_LIMIT], 1)
-    ]
-    preview = [item for item in preview if item]
+    # Use the same query-aware indices for the actual Agent-visible evidence
+    # that candidate_window reports. Previously this block ignored
+    # ``preview_indices`` and always exposed the retrieval head, so visual/time
+    # cues could appear effective in telemetry while the Agent never saw the
+    # selected candidate. Handles still map to original ResultSet ranks.
+    preview = _build_preview_entries(store, asset_ids, preview_indices)
     preview_asset_ids = [item.get("asset_id") for item in preview if item.get("asset_id")]
     public_handles = {asset_id: f"photo_{index + 1}"
                       for index, asset_id in enumerate(rs.visible_asset_ids())}
@@ -1702,7 +2206,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         # 推荐最可能符合问题的 preview 图，避免模型默认 inspect photo_1 而错图
         # （实测候选含 GT 仍拒答的识别类题，多因 inspect 了错误的图）。
         "recommended_handle": _recommended_handle(
-            query_for_retrieval, preview),
+            preview_query, preview),
         "_retrieved_asset_ids": list(asset_ids),
         "retrieved_asset_ids": list(asset_ids),
         "_preview_asset_ids": preview_asset_ids,
@@ -1750,16 +2254,14 @@ def _recommended_handle(query: str, preview: list) -> str:
     q = str(query or "").strip()
     if not q:
         return str((preview[0] or {}).get("handle") or "")
-    q_terms = [t for t in re.split(r"[\s，。、？?！!的着了是和我与在到了对]", q) if len(t) >= 2]
-    if not q_terms:
+    if not _preview_query_terms(q):
         return str((preview[0] or {}).get("handle") or "")
     best_handle, best_score = "", 0.0
     for p in preview:
         desc = str(p.get("evidence_summary") or "")
         if not desc:
             continue
-        hits = sum(1 for t in q_terms if t in desc)
-        score = hits / len(q_terms)
+        score = _preview_text_score(q, desc)
         if score > best_score:
             best_score, best_handle = score, str(p.get("handle") or "")
     return best_handle or str((preview[0] or {}).get("handle") or "")
@@ -2018,8 +2520,8 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     if not asset_id or store is None:
         return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False,
                 "blocked": ["unknown_handle"]}
-    row = store.connection.execute(
-        "SELECT path, scope_id FROM assets WHERE id = ?", (asset_id,)).fetchone()
+    row = _store_fetchone(
+        store, "SELECT path, scope_id FROM assets WHERE id = ?", (asset_id,))
     if row and scope_id and row["scope_id"] != scope_id:
         return {"summary": "无法复核该照片（不在当前相册范围）。", "certainty": "uncertain",
                 "persisted": False, "blocked": ["scope_mismatch"]}
@@ -2096,10 +2598,11 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     # Keep the negative identity evidence visible as well: a multi-person
     # photo must distinguish confirmed people from remaining unconfirmed
     # companions instead of silently treating the named subset as complete.
-    observation_row = store.connection.execute(
+    observation_row = _store_fetchone(
+        store,
         "SELECT people_json FROM observations WHERE asset_id = ? ORDER BY updated_at DESC LIMIT 1",
         (asset_id,),
-    ).fetchone()
+    )
     try:
         people_values = json.loads(observation_row["people_json"] or "[]") if observation_row else []
         # The naming flow appends confirmed entity dictionaries to the
@@ -2149,7 +2652,7 @@ def _confirmed_photo_identities(store, asset_id: str) -> list[dict]:
     """Read existing confirmed face/entity links without mutating identity data."""
     if store is None or not asset_id:
         return []
-    rows = store.connection.execute(
+    rows = _store_fetchall(store,
         """
         SELECT fi.id AS face_instance_id, fi.asset_id, fi.observation_id,
                fi.cluster_id, fi.bbox_json, fi.detection_confidence, fi.quality,
@@ -2168,7 +2671,7 @@ def _confirmed_photo_identities(store, asset_id: str) -> list[dict]:
           AND e.status = 'confirmed'
         ORDER BY fi.quality DESC, fi.detection_confidence DESC
         """, (asset_id,)
-    ).fetchall()
+    )
     return [{
         "evidence_type": "photo_identity",
         "asset_id": str(row["asset_id"] or asset_id),
@@ -2192,7 +2695,7 @@ def _photo_face_manifest(store, asset_id: str) -> list[dict]:
     """
     if store is None or not asset_id:
         return []
-    rows = store.connection.execute(
+    rows = _store_fetchall(store,
         """
         SELECT fi.id AS face_instance_id, fi.asset_id, fi.bbox_json,
                fi.detection_confidence, fi.quality,
@@ -2204,7 +2707,7 @@ def _photo_face_manifest(store, asset_id: str) -> list[dict]:
         WHERE fi.asset_id = ?
         ORDER BY fi.quality DESC, fi.detection_confidence DESC, fi.id
         """, (asset_id,)
-    ).fetchall()
+    )
     faces = []
     for index, row in enumerate(rows, 1):
         confirmed = bool(
@@ -2441,10 +2944,11 @@ def _query_photo_people(arguments: dict, *, context: dict | None = None) -> dict
         return {"summary": "照片不在当前相册范围。", "blocked": ["scope_mismatch"],
                 "evidence_asset_ids": []}
     identities = _confirmed_photo_identities(store, asset_id)
-    observation = store.connection.execute(
+    observation = _store_fetchone(
+        store,
         "SELECT people_json FROM observations WHERE asset_id = ? ORDER BY updated_at DESC LIMIT 1",
         (asset_id,),
-    ).fetchone()
+    )
     try:
         people_values = json.loads(observation["people_json"] or "[]") if observation else []
         people_count = sum(1 for p in people_values

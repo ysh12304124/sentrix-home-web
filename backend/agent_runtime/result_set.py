@@ -398,6 +398,21 @@ class TaskState:
                     "sizes": observation.get("group_photo_sizes") or [],
                 }
                 self.fact_operation = "group"
+        if tool_name == "get_result_page" and observation.get("result_set_id"):
+            # The visible-handle gate is intentionally strict. Keep its
+            # authoritative preview in sync with pagination so a valid
+            # photo_7 from page 2 is not rejected against stale page-1 handles.
+            result_set_id = str(observation.get("result_set_id") or "")
+            if not self.current_result_set or result_set_id == self.current_result_set:
+                self.current_result_set = result_set_id
+                self.result_preview = [
+                    p.get("handle") for p in (observation.get("preview") or [])
+                    if isinstance(p, dict) and p.get("handle")
+                ][:20]
+                if observation.get("total") is not None:
+                    self.result_total = int(observation.get("total") or 0)
+                self.result_remaining = observation.get("remaining")
+                self.has_more = bool(observation.get("has_more"))
         if tool_name == "get_original_photos":
             self.delivery_state = "delivered"
             self.delivered_count = observation.get("delivered")

@@ -1924,6 +1924,8 @@ class AgentRuntime:
         tool_result_cache = {}
         dedup_retries = 0
         max_dedup_retries = 2
+        duplicate_final_nudge_used = False
+        cached_duplicate_reused = False
         search_has_preview = False
         inspect_called = False
         tool_call_seq = 0
@@ -1957,6 +1959,8 @@ class AgentRuntime:
         recent_tool_failures: list[tuple[str, str]] = []
         tool_repeat_rejections = 0
         max_tool_repeat_rejections = 2
+        budget_exhausted_nudge_used = False
+        preview_handle_nudges = 0
 
         def visual_gate_requested() -> bool:
             """Use only the planner requirement on the authoritative path.
@@ -2145,9 +2149,13 @@ class AgentRuntime:
         wants_ocr = ocr_intent(message)
         adaptive_inspections = self.profile.max_inspections
         if wants_multi:
-            adaptive_inspections = max(adaptive_inspections, 4)
+            adaptive_inspections = max(adaptive_inspections, 8)
+            turn.budget.max_tool_calls = max(turn.budget.max_tool_calls, 12)
+            turn.budget.max_model_steps = max(turn.budget.max_model_steps, 16)
         elif wants_ocr:
-            adaptive_inspections = max(adaptive_inspections, 2)
+            adaptive_inspections = max(adaptive_inspections, 4)
+            turn.budget.max_tool_calls = max(turn.budget.max_tool_calls, 8)
+            turn.budget.max_model_steps = max(turn.budget.max_model_steps, 12)
             # read_photo_text 需要整图 + 3x3 tile 多次图片推理，放宽总预算
             # （同图 OCR 结果已缓存，只有首次需要长预算）
             turn.budget.wall_time_s = max(turn.budget.wall_time_s, 240)
@@ -3024,6 +3032,71 @@ class AgentRuntime:
             if call_signature in seen_tool_calls:
                 cached_observation = tool_result_cache.get(call_signature)
                 if cached_observation is not None:
+                    if cached_duplicate_reused:
+                        # One cached replay is useful when the model repeats a
+                        # read-only request. Replaying it indefinitely bloats
+                        # the prompt until vLLM has no output room left (the
+                        # model then emits a truncated "{" and the QA fails).
+                        forced = self._force_final_once(turn, messages)
+                        if forced:
+                            forced_problems = guard.check(
+                                forced,
+                                task_state={
+                                    "scope_id": self.scope_id,
+                                    "viewer_id": self.viewer_id,
+                                    "user_query": message,
+                                    "history_text": history,
+                                    "result_mode": task.result_mode,
+                                    "has_more": task.has_more,
+                                    "delivery_state": task.delivery_state,
+                                    "fulfillment": task.fulfillment,
+                                    "fact_total": task.fact_total,
+                                    "fact_value": task.fact_value,
+                                    "fact_operation": task.fact_operation,
+                                    "fact_rows": task.fact_rows,
+                                    "fact_group_by": task.fact_group_by,
+                                    "last_tool": task.last_tool,
+                                    "tool_results": task.tool_results,
+                                    "evidence_refs": [],
+                                },
+                                delivered_count=task.delivered_count,
+                            )
+                            if forced_problems:
+                                turn.steps.append({
+                                    "type": "guard", "status": "fail",
+                                    "codes": list(forced_problems),
+                                    "attempt": 1,
+                                })
+                                if getattr(forced_problems, "severity", "truth") == "hard_block":
+                                    turn.status = "blocked_by_guard"
+                                    turn.reason = "hard_block:" + ";".join(
+                                        str(problem) for problem in forced_problems)
+                                    turn.final_answer = render_emergency_summary(
+                                        task.as_dict(), reason="回答未通过事实校验")
+                                    turn.termination_reason = "guard_recovery_exhausted"
+                                else:
+                                    turn.status = "partial"
+                                    turn.reason = "forced_final_guard:" + ";".join(
+                                        str(problem) for problem in forced_problems[:2])
+                                    turn.final_answer = _natural_partial(
+                                        task.as_dict(), list(forced_problems))
+                                    turn.termination_reason = "forced_final_guard_rejected"
+                            else:
+                                turn.steps.append({
+                                    "type": "guard", "status": "pass", "codes": [],
+                                    "attempt": 1,
+                                })
+                                turn.final_answer = forced
+                                turn.status = "complete"
+                                turn.reason = ""
+                                turn.termination_reason = "forced_final_after_duplicate_tool_call"
+                        else:
+                            turn.status = "partial" if turn.steps else "error"
+                            turn.reason = "duplicate_tool_call_reused"
+                            turn.termination_reason = "cached_tool_result_limit"
+                            turn.final_answer = render_emergency_summary(
+                                task.as_dict(), reason="重复调用已停止")
+                        break
                     if not turn.budget.can_model_step():
                         # No model step remains to consume the cached result.
                         # Still close honestly as a bounded partial instead of
@@ -3035,6 +3108,7 @@ class AgentRuntime:
                         turn.final_answer = render_emergency_summary(
                             task.as_dict(), reason="预算用尽")
                         break
+                    cached_duplicate_reused = True
                     dedup_retries += 1
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     messages.append({"role": "user", "content": (
@@ -3046,20 +3120,21 @@ class AgentRuntime:
                         "请直接基于该结果输出 final；如果证据仍不足，请明确说明无法确认。"
                     )})
                     continue
-                if dedup_retries < max_dedup_retries and turn.budget.can_model_step():
+                if (dedup_retries < max_dedup_retries or not duplicate_final_nudge_used) \
+                        and turn.budget.can_model_step():
                     dedup_retries += 1
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                    if dedup_retries >= max_dedup_retries:
+                    if dedup_retries >= max_dedup_retries and not duplicate_final_nudge_used:
+                        duplicate_final_nudge_used = True
                         messages.append({"role": "user", "content": (
-                            "你再次重复调用相同的工具和参数，被拒绝。"
-                            "你不能再重复调用该工具。请立即调用 inspect_photo（asset_handle=photo_1）复核预览照片，"
-                            "或直接输出 final 回答。"
+                            "该工具和参数已被重复调用并拒绝；不要再提交相同调用，也不要臆造句柄。"
+                            "请基于现有工具证据直接输出 final；若确实还需视觉核验，只能使用当前预览中"
+                            "尚未检查的句柄，否则明确说明缺少哪项证据。"
                         )})
                     else:
                         messages.append({"role": "user", "content": (
-                            "你刚用相同的工具和参数调用过，重复调用会被拒绝。"
-                            "请换一个动作：如果需要看照片细节请调用 inspect_photo（使用预览里的 handle），"
-                            "否则直接输出 final。"
+                            "你刚用相同工具和参数调用过，重复调用会被拒绝。请改用不同且当前有效的证据句柄，"
+                            "或基于已有证据直接输出 final；不得猜测不存在的句柄。"
                         )})
                     continue
                 turn.status = "partial" if turn.steps else "error"
@@ -3167,6 +3242,31 @@ class AgentRuntime:
                     failed_code = RESOLVE_VISUAL if tool_name == "inspect_photo" else RESOLVE_OCR
                     if _auto_retry_failed_resolution({"code": failed_code, "tool": tool_name}):
                         continue
+                if (decision.reason == "asset_handle_not_in_current_preview"
+                        and self.profile.features.get("agent2_authoritative")
+                        and preview_handle_nudges < 2
+                        and turn.budget.can_model_step()):
+                    preview_handle_nudges += 1
+                    messages.append({"role": "user", "content": (
+                        "你请求的图片句柄当前未展示，不能直接检查。请先用 get_result_page 翻到包含该候选的页面；"
+                        "如果没有更多候选，就改用当前已展示的图片或基于已有证据作答。"
+                    )})
+                    continue
+                # When the bounded tool budget is exhausted, give the model
+                # one final synthesis turn over the evidence already gathered.
+                # Returning immediately here made ordinary budget exhaustion
+                # look like an execution failure even when usable evidence was
+                # present; the safety/evidence gate still validates the final.
+                if (decision.reason == "budget exhausted"
+                        and self.profile.features.get("agent2_authoritative")
+                        and not budget_exhausted_nudge_used
+                        and turn.budget.can_model_step()):
+                    budget_exhausted_nudge_used = True
+                    messages.append({"role": "user", "content": (
+                        "本轮可用工具预算已经用完。不要再调用任何工具；请仅基于当前已获得的证据输出 final。"
+                        "如果现有证据不足以回答，明确说明无法确认，不要猜测或补造事实。"
+                    )})
+                    continue
                 # A late duplicate/stale inspection must not erase a complete
                 # structured answer. Preserve the model answer when no
                 # structured override exists; for event group counts use the

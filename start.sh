@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+.\vllm.ps1 start #!/usr/bin/env bash
 # Start this clone's Sentrix Web + API using .env.
 #
 # Usage:

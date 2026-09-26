@@ -1,6 +1,10 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 
+const graphQualityCache = new Map();
+const graphQualityRequests = new Map();
+const graphQualityRetryAt = new Map();
+
 const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
   { key: "scope_setup", label: "创建相册" },
@@ -94,28 +98,17 @@ const api = async (path, options = {}) => {
 };
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
 const esc = (value) => String(value ?? "");
-// vLLM's served ID is intentionally short, while the UI uses the product
-// model name.  Keep the raw value in <option value> and API requests.
-const modelDisplayName = (value) => (
-  /^qwen3-vl(?::|-)?4b(?:-instruct)?$/i.test(String(value || ""))
-    ? "qwen3-vl-4b-instruct"
-    : String(value || "")
-);
+// Display the endpoint's exact served ID.  The value is also sent unchanged
+// in API requests, so aliases such as qwen3-vl-4b and qwen3-vl-4b-instruct
+// remain distinguishable.
+const modelDisplayName = (value) => String(value || "");
 const modelName = (run) => {
-  const storedName = run?.model_profile || run?.model_name || run?.profile || "unknown";
-  const backend = String(run?.model_backend || "").toLowerCase();
-  const endpoint = String(
-    run?.model_base_url
-      || run?.vllm_model_base_url
-      || run?.current_model_snapshot?.model_base_url
-      || "",
-  ).toLowerCase();
-  const isVllmRun = backend === "openai_compatible" || endpoint.includes(":8000");
-  const legacyVllmName = /^qwen3-vl(?::|-)?4b(?:-instruct)?$/i.test(String(storedName));
-
-  // 旧评测记录曾把 vLLM 的 served model 写成 Ollama 的标签；仅在 vLLM
-  // 调用链下做显示层兼容，避免把真实 Ollama 记录误标为 vLLM。
-  return isVllmRun && legacyVllmName ? modelDisplayName(storedName) : storedName;
+  // 新记录保存了实际发送到 OpenAI-compatible endpoint 的 served alias。
+  // 优先展示它，不把 qwen3-vl-4b 和 qwen3-vl-4b-instruct 混成一个名称。
+  const actualName = run?.served_model_name
+    || run?.current_model_snapshot?.served_model_name;
+  if (actualName) return String(actualName);
+  return run?.model_profile || run?.model_name || run?.profile || "unknown";
 };
 const albumName = (run) => run?.scope_name || run?.album_id || run?.qa_name || "album";
 const qaName = (run) => run?.qa_set || run?.qa_name || "qa";
@@ -667,7 +660,7 @@ function aggregateMetricRows(phase = {}) {
       ? `历史记录按 Agent/Judge 时间线回退估算 · ${throughputSamples}/${throughputTotal} 题，不能视为实测`
       : "历史记录未保存 Agent 独立阶段墙钟";
   const typedMediaMetrics = summary.retrieval_metric_scope === "all_media";
-  return [
+  const rows = [
     [typedMediaMetrics ? "媒体检索 Precision" : "历史图片检索 Precision", fmtPct(summary.retrieval_precision_macro), `逐 QA 求值后平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT · 排除 ${summary.retrieval_excluded_unanswerable_count ?? 0} 道不可回答题`, true],
     [typedMediaMetrics ? "媒体检索 Recall" : "历史图片检索 Recall", fmtPct(summary.retrieval_recall_macro), typedMediaMetrics ? "每道 QA 的 Recall 等权平均；图视频按类型与稳定标识匹配" : "每道 QA 的 Recall 等权平均；历史 run 无法补算视频指标", true],
     ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
@@ -693,6 +686,39 @@ function aggregateMetricRows(phase = {}) {
     ["LLM TTFT 均值", fmtMs(summary.llm_ttft_ms_mean), "首 token 响应时间"],
     ["LLM 生成速度", summary.llm_tokens_per_second_mean == null ? "-" : `${Number(summary.llm_tokens_per_second_mean).toFixed(1)} token/s`, "主 Agent 平均生成速度"],
   ];
+  const face = summary.face_clustering;
+  if (face?.available) {
+    const gallery = face.identity_gallery_available === true;
+    const inclusive = gallery || face.image_identity_link_available === true;
+    const f1 = gallery ? face.identity_gallery_f1 : face.image_identity_link_f1;
+    const precision = gallery ? face.identity_gallery_precision : face.image_identity_link_precision;
+    const recall = gallery ? face.identity_gallery_recall : face.image_identity_link_recall;
+    rows.push([gallery ? "人脸聚类 F1（身份库对齐）" : (inclusive ? "人脸聚类 F1（图像级身份关联）" : "人脸聚类 F1"), fmtPct(inclusive ? f1 : face.same_person_pair_f1), gallery
+      ? `身份库命中 ${face.identity_gallery_true_positive_count ?? 0} · 可评估图像 ${face.identity_gallery_evaluable_image_count ?? 0}`
+      : inclusive
+        ? `同身份图像对 ${face.image_identity_link_true_positive_count ?? 0} · 可评估图像 ${face.image_identity_link_evaluable_image_count ?? 0}`
+      : `同人脸对 ${face.true_positive_pair_count ?? 0} · 可评估人脸 ${face.evaluable_face_count ?? 0}`, true]);
+    rows.push([gallery ? "人脸聚类 P / R（身份库对齐）" : (inclusive ? "人脸聚类 P / R（图像级）" : "人脸聚类 P / R"), `${fmtPct(inclusive ? precision : face.same_person_pair_precision)} / ${fmtPct(inclusive ? recall : face.same_person_pair_recall)}`, gallery
+      ? "每张多脸图逐人检测，检测框通过 seeded confirmed cluster 对齐身份库后与 GT 身份集合比较"
+      : inclusive
+        ? "多脸图按 GT 身份集合与跨图共享 cluster 的一致性计算；不猜测框与身份的对应关系"
+      : "仅纳入身份标注与检测脸可无歧义对应的样本", true]);
+    if (inclusive && face.same_person_pair_f1 != null) {
+      rows.push(["严格单脸 pairwise F1", fmtPct(face.same_person_pair_f1), `严格可评估人脸 ${face.evaluable_face_count ?? 0}；多脸图不纳入此项`]);
+    }
+  } else if (face?.reason) {
+    rows.push(["人脸聚类质量", "未评分", face.reason]);
+  } else if (activeRun.value?.status === "running") {
+    // Face-clustering quality is computed during aggregate after QA finishes.
+    // Keep a visible placeholder while the run is active instead of silently
+    // hiding the metric and making the dashboard look incomplete.
+    rows.push(["人脸聚类质量", "待汇总", "QA 测评完成后计算同人脸对 P / R / F1；当前批次仍在运行"]);
+  }
+  const gpu = summary.gpu_metrics;
+  if (gpu?.samples_count) {
+    rows.push(["GPU 采样", `${gpu.samples_count} 次`, `来源 ${gpu.source || "local"} · 显存峰值 ${gpu.memory_used_mib?.peak ?? "-"} MiB`]);
+  }
+  return rows;
 }
 function tokenDistributionRows() {
   const summary = effectiveRunSummary(activeRun.value);
@@ -738,14 +764,40 @@ function graphQualityDiagnosticRows() {
 function graphIdentityRows() {
   const identity = graphQuality.value?.face_clustering;
   if (!identity?.available) return [];
+  const gallery = identity.identity_gallery_available === true;
+  const inclusive = identity.image_identity_link_available === true;
+  const diagnostics = Number(identity.metric_definition_version) >= 2
+    ? [
+      [gallery ? "身份库 GT 图像覆盖率" : (inclusive ? "GT 标注图像资产覆盖率" : "单身份 GT 图片资产覆盖率"), fmtPct(gallery ? (identity.identity_gallery_gt_asset_count / Math.max(1, identity.gt_single_image_count + identity.gt_multi_identity_image_count)) : (inclusive ? identity.image_identity_link_asset_coverage_rate : identity.asset_name_coverage_rate)),
+        gallery
+          ? `${identity.identity_gallery_gt_asset_count ?? 0}/${(identity.gt_single_image_count ?? 0) + (identity.gt_multi_identity_image_count ?? 0)} 张 GT 图像进入身份库评估`
+          : inclusive
+            ? `${identity.image_identity_link_gt_asset_count ?? 0}/${(identity.gt_single_image_count ?? 0) + (identity.gt_multi_identity_image_count ?? 0)} 张 GT 按文件名存在于当前 scope`
+          : `${identity.asset_name_coverage_count ?? 0}/${identity.gt_single_image_count ?? 0} 张标注图片按文件名存在于当前 scope；缺失 ${identity.gt_assets_missing_from_scope_count ?? 0} 张`],
+      ["scope 内 GT 图片恰好单脸率", fmtPct(identity.single_face_detection_of_present_assets_rate),
+        `${identity.detected_single_face_count ?? 0}/${identity.asset_name_coverage_count ?? 0} 张；多脸 ${identity.detected_multiple_faces_count ?? 0} 张、无脸记录 ${identity.detected_zero_face_count ?? 0} 张`],
+      ["单脸样本入簇率", fmtPct(identity.single_face_clustered_rate),
+        `${identity.evaluable_face_count ?? 0}/${identity.detected_single_face_count ?? 0} 张恰好单脸 GT 已有 cluster_id`],
+      ...(gallery ? [["身份库识别图像率", fmtPct(identity.identity_gallery_identified_image_rate),
+        `${identity.identity_gallery_identified_image_count ?? 0}/${identity.identity_gallery_evaluable_image_count ?? 0} 张有至少一个已知身份命中`]] : []),
+      ...(inclusive ? [["多脸图像入簇覆盖率", fmtPct(identity.image_identity_link_clustered_image_rate),
+        `${identity.image_identity_link_clustered_image_count ?? 0}/${identity.image_identity_link_detected_image_count ?? 0} 张有检测的 GT 图像包含 cluster_id`]] : []),
+    ]
+    : [["覆盖率诊断", "待刷新", "当前是旧版快照，尚未区分相册缺图、零脸检测和多脸图；重启 PhotoBench 后会自动重算"]];
   return [
-    ["同一人物聚类 F1", fmtPct(identity.same_person_pair_f1), "准确率和召回率的综合指标", true],
-    ["同一人物聚类准确率", fmtPct(identity.same_person_pair_precision),
-      "聚到一起的脸对中，真实同人的比例", true],
-    ["不同人物错误合并率", fmtPct(identity.false_merge_rate),
-      "聚到一起的脸对中，实际不同人的比例", true],
-    ["同一人物聚类召回率", fmtPct(identity.same_person_pair_recall),
-      "真实同人的脸对中，成功聚到一起的比例", true],
+    [gallery ? "同一人物聚类 F1（身份库对齐）" : (inclusive ? "同一人物聚类 F1（图像级身份关联）" : "同一人物聚类 F1"), fmtPct(gallery ? identity.identity_gallery_f1 : (inclusive ? identity.image_identity_link_f1 : identity.same_person_pair_f1)), gallery
+      ? "多脸图逐框经过 seeded confirmed identity cluster 对齐后，与 GT 身份集合计算 P/R/F1"
+      : inclusive
+        ? "多脸图通过 GT 身份集合与跨图共享 cluster 评估，不进行未经标注支持的逐框配对"
+      : "准确率和召回率的综合指标", true],
+    [gallery ? "同一人物聚类准确率（身份库）" : (inclusive ? "同一人物聚类准确率（图像级）" : "同一人物聚类准确率"), fmtPct(gallery ? identity.identity_gallery_precision : (inclusive ? identity.image_identity_link_precision : identity.same_person_pair_precision)),
+      gallery ? "身份库命中的身份中，属于该 GT 图片真实人物的比例" : (inclusive ? "预测共享 cluster 的图像对中，GT 确实共享人物的比例" : "聚到一起的脸对中，真实同人的比例"), true],
+    [gallery ? "不同人物识别错误率" : (inclusive ? "不同人物图像错误合并率" : "不同人物错误合并率"), fmtPct(gallery ? (identity.identity_gallery_false_positive_count / Math.max(1, identity.identity_gallery_true_positive_count + identity.identity_gallery_false_positive_count)) : (inclusive ? (identity.image_identity_link_false_positive_count / Math.max(1, identity.image_identity_link_true_positive_count + identity.image_identity_link_false_positive_count)) : identity.false_merge_rate)),
+      gallery ? "身份库命中的身份不在该 GT 图片身份集合中的比例" : (inclusive ? "GT 不共享人物但被同一 cluster 连接的图像对比例" : "聚到一起的脸对中，实际不同人的比例"), true],
+    [gallery ? "同一人物聚类召回率（身份库）" : (inclusive ? "同一人物聚类召回率（图像级）" : "同一人物聚类召回率"), fmtPct(gallery ? identity.identity_gallery_recall : (inclusive ? identity.image_identity_link_recall : identity.same_person_pair_recall)),
+      gallery ? "GT 身份集合中的人物被检测并正确落入身份库 cluster 的比例" : (inclusive ? "GT 共享人物的图像对中，成功通过 cluster 连接的比例" : "真实同人的脸对中，成功聚到一起的比例"), true],
+    ...(inclusive && identity.same_person_pair_f1 != null ? [["严格单脸 pairwise F1", fmtPct(identity.same_person_pair_f1), `仅 ${identity.evaluable_face_count ?? 0} 张无歧义单脸样本`]] : []),
+    ...diagnostics,
   ];
 }
 function graphQuestionTypeRows() {
@@ -767,20 +819,54 @@ function graphEvaluableEdgeSummary() {
   const entries = Object.entries(counts).filter(([, count]) => Number(count) > 0);
   return entries.length ? entries.map(([type, count]) => `${labels[type] || type} ${count}`).join(" · ") : "未记录";
 }
+function graphQualityUnavailableText() {
+  const quality = graphQuality.value;
+  if (graphQualityLoading.value || quality?.status === "computing" || quality?.reason === "snapshot_in_progress") {
+    return "图结构快照正在生成，完成后会自动显示统计。";
+  }
+  return quality?.reason ? `暂无可用图结构快照：${quality.reason}` : "该运行暂无可用图结构快照。";
+}
 async function loadGraphQuality() {
   const runId = activeRunId.value;
   if (!runId) { graphQuality.value = null; return; }
-  graphQualityLoading.value = true;
-  try {
-    // Graph memory is a mutable shared index.  Ask PhotoBench for the
-    // run-bound snapshot instead of auditing whichever scope was built last.
-    const payload = await api(`/api/runs/${encodeURIComponent(runId)}/graph-quality`);
-    if (activeRunId.value === runId) graphQuality.value = payload;
-  } catch (error) {
-    if (activeRunId.value === runId) graphQuality.value = { available: false, reason: error.message };
-  } finally {
-    if (activeRunId.value === runId) graphQualityLoading.value = false;
+  if (graphQualityCache.has(runId)) {
+    graphQuality.value = graphQualityCache.get(runId);
+    return;
   }
+  if (graphQualityRequests.has(runId)) return graphQualityRequests.get(runId);
+  if ((graphQualityRetryAt.get(runId) || 0) > Date.now()) return;
+  graphQualityLoading.value = true;
+  const request = (async () => {
+    try {
+      // Graph memory is a mutable shared index. Ask PhotoBench for the
+      // run-bound snapshot instead of auditing whichever scope was built last.
+      const payload = await api(`/api/runs/${encodeURIComponent(runId)}/graph-quality`);
+      if (payload?.status === "computing") {
+        // The backend single-flights this expensive snapshot. Avoid hammering
+        // it on every progress poll while the one calculation is in flight.
+        // A completed run does not keep the normal progress poll alive, so
+        // schedule one bounded retry here as well. Otherwise a first request
+        // that sees `snapshot_in_progress` leaves the graph QA and face
+        // quality panels permanently empty until the user reselects the run.
+        graphQualityRetryAt.set(runId, Date.now() + 5000);
+        window.setTimeout(() => {
+          if (!destroyed && activeRunId.value === runId) loadGraphQuality();
+        }, 5100);
+      } else {
+        graphQualityCache.set(runId, payload);
+        graphQualityRetryAt.delete(runId);
+      }
+      if (activeRunId.value === runId) graphQuality.value = payload;
+    } catch (error) {
+      graphQualityRetryAt.set(runId, Date.now() + 5000);
+      if (activeRunId.value === runId) graphQuality.value = { available: false, reason: error.message };
+    } finally {
+      graphQualityRequests.delete(runId);
+      if (activeRunId.value === runId) graphQualityLoading.value = false;
+    }
+  })();
+  graphQualityRequests.set(runId, request);
+  return request;
 }
 function itemCallMetrics(item) {
   return Array.isArray(item?.model_call_metrics)
@@ -1885,8 +1971,17 @@ async function init() {
     manifests.value = (await api("/api/manifests")).manifests || [];
     await loadRuns(); if (vllmManagerUrl.value.trim()) await loadProfiles();
     if (modelEndpoint.value.trim()) await loadCurrentModel({ openPopover: false });
-    const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
-    if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
+    // Open the newest completed run when nothing is active. Leaving the
+    // detail panel unselected after a finished evaluation makes all aggregate
+    // metric sections—including graph-by-QA-type and face clustering—appear
+    // absent even though the run already contains them.
+    const current = runs.value.find((run) => ["running", "pending"].includes(run.status))
+      || runs.value.find((run) => run.status === "completed");
+    if (current) {
+      activeRunId.value = current.run_id;
+      await loadActiveRun({ resetPage: true });
+      if (["running", "pending"].includes(current.status)) startPolling();
+    }
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
   loadArbiterStatus();
   arbiterTimer = setInterval(loadArbiterStatus, 3000);
@@ -2131,8 +2226,8 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
 <td>{{ runProgressLabel(run) }}</td>
-<td>{{ fmtPct(run.summary?.media_retrieval_recall_micro ?? run.summary?.retrieval_recall_micro) }}</td>
-<td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
+<td :title="run.status === 'running' && run.summary?.live_preview ? '阶段性指标：仅基于目前已完成的题目，任务结束后以最终汇总为准' : ''">{{ fmtPct(run.summary?.media_retrieval_recall_micro ?? run.summary?.retrieval_recall_micro) }}</td>
+<td :title="run.status === 'running' && run.summary?.live_preview ? '阶段性指标：仅统计目前已有 Judge 评分的题目，任务结束后以最终汇总为准' : ''">{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>
 </td>
@@ -2295,7 +2390,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="phase-title">
 <b>可验证边指标（规则参考 / 独立 GT）</b>
 <span class="muted small" v-if="graphQuality?.available">{{ graphQuality.total_nodes }} 节点 · {{ graphQuality.total_edges }} 条边</span>
-<span class="muted small" v-else>{{ graphQualityLoading ? '计算中…' : '未生成图结构' }}</span>
+<span class="muted small" v-else>{{ graphQualityLoading || graphQuality?.status === 'computing' ? '图结构快照生成中…' : '暂无可用快照' }}</span>
 </div>
 <p class="metric-calc-time">可验证边按确定性规则筛选；有独立人工/外部 GT 时显示真实 P/R/F1，否则显示源字段规则参考 P/R/F1，用于建图回归检查。</p>
 <div v-if="graphQuality?.available" class="graph-quality-group">
@@ -2319,7 +2414,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 <div v-if="graphQuality?.available && graphIdentityRows().length" class="graph-quality-group graph-quality-diagnostic-group">
-<div class="graph-quality-group-title"><b>人脸身份聚类质量</b><span>全量可对齐人脸对</span></div>
+<div class="graph-quality-group-title"><b>人脸身份聚类质量</b><span>{{ graphQuality.face_clustering.identity_gallery_available ? '身份库对齐 · 支持多脸' : (graphQuality.face_clustering.image_identity_link_available ? '多脸图像级身份关联 · pairwise' : (Number(graphQuality.face_clustering.metric_definition_version) >= 2 ? '严格单脸子集 · pairwise' : '旧版口径 · 等待刷新')) }}</span></div>
 <div class="token-distribution-grid graph-quality-primary-grid">
 <div v-for="row in graphIdentityRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
@@ -2327,7 +2422,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <small>{{ row[2] }}</small>
 </div>
 </div>
-<p class="metric-calc-time">仅纳入标注中单人且检测到单张人脸的记录；多人照片因无法无歧义对齐而排除 {{ graphQuality.face_clustering.excluded_multi_face ?? 0 }} 张，不猜测其身份。</p>
+<p class="metric-calc-time">{{ graphQuality.face_clustering.identity_gallery_available ? '当前主指标使用身份库对齐：检测框通过评测开始前 seeded 的 confirmed identity cluster 映射到身份 ID，再与每张图的 GT 身份集合计算多脸 P/R/F1；未知脸不计为已知身份，GT 不反向参与聚类。' : (graphQuality.face_clustering.image_identity_link_available ? '当前主指标使用图像级身份关联：GT 只提供每张图的身份集合，因此多脸图通过“GT 身份集合是否相交”与“检测 cluster 集合是否相交”计算跨图同人链接；不会伪造逐框对应。严格单脸 pairwise 作为辅助诊断，资产缺失、零脸、多脸和未入簇分别统计。' : (Number(graphQuality.face_clustering.metric_definition_version) >= 2 ? '当前是严格单脸口径：只纳入单身份标注、恰好一张检测脸且已入簇的可对齐样本；多脸图不猜测框与身份的对应关系。' : '当前是旧版缓存指标：请重启 PhotoBench 后自动重算。')) }}</p>
 </div>
 <p v-if="graphQuality?.available" class="metric-calc-time">参考关系 {{ graphQuality.reference_edge_count ?? 0 }} 条 · 已构建可验证边 {{ graphQuality.evaluable_predicted_edge_count ?? 0 }} 条（{{ graphEvaluableEdgeSummary() }}） · 未纳入 P/R/F1 {{ graphQuality.unverifiable_edge_count ?? 0 }} 条。</p>
 <div v-if="graphQuality?.available && graphQuestionTypeRows().length" class="graph-quality-type-wrap">
@@ -2344,7 +2439,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <td>{{ row.label }}</td>
 <td>{{ row.sample_count }}<span class="muted small">（{{ row.retrieval_metric_count }} 题有媒体 GT）</span></td>
 <td>{{ row.graph_routed_count ? `${row.graph_enabled_count}/${row.graph_routed_count}` : '-' }}<span class="muted small" v-if="row.graph_intents">{{ Object.keys(row.graph_intents).join('、') }}</span></td>
-<td v-if="row.graph_effect_count"><span :class="row.graph_gt_improved_count > row.graph_gt_worsened_count ? 'metric-good' : 'muted'">召回 {{ fmtSignedPct(row.graph_recall_delta) }}</span><span class="muted small"> · 提升 {{ row.graph_gt_improved_count }} 题<template v-if="row.graph_gt_worsened_count">，降低 {{ row.graph_gt_worsened_count }} 题</template></span></td>
+<td v-if="row.graph_effect_count"><span :class="row.graph_gt_improved_count > row.graph_gt_worsened_count ? 'metric-good' : 'muted'">召回 {{ fmtSignedPct(row.graph_recall_delta) }}</span><span class="muted small"> · 提升 {{ row.graph_gt_improved_count }} 题<template v-if="row.graph_gt_worsened_count">，降低 {{ row.graph_gt_worsened_count }} 题</template> · 重排 {{ row.graph_rank_changed_count ?? 0 }} 题<template v-if="row.graph_candidate_set_changed_count"> · 候选集变化 {{ row.graph_candidate_set_changed_count }} 题</template></span></td>
 <td v-else>-</td>
 <td>{{ fmtPct(row.retrieval_recall) }}</td>
 <td>{{ fmtPct(row.retrieval_precision) }}</td>
@@ -2356,7 +2451,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </table>
 </div>
 </div>
-<p v-if="!graphQuality?.available" class="qa-performance-empty">{{ graphQuality?.reason || '该运行暂无可用图结构快照。' }}</p>
+<p v-if="!graphQuality?.available" class="qa-performance-empty">{{ graphQualityUnavailableText() }}</p>
 </div>
 </article>
         <article v-if="deliveryBreakdown()" class="phase-card result-phase-card">

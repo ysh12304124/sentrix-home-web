@@ -1,9 +1,9 @@
 {
   "sentrix_url": "http://127.0.0.1:11001",
   "judge_url": "http://127.0.0.1:8000/v1",
-  "judge_model": "qwen3-vl-4b",
+  "judge_model": "qwen3-vl-4b-instruct",
   "vllm_manager_url": "",
   "model_base_url": "http://127.0.0.1:8000/v1",
-  "endpoint_model": "qwen3-vl-4b",
+  "endpoint_model": "qwen3-vl-4b-instruct",
   "judge_provider_id": "local-vllm-qwen3-vl"
 }

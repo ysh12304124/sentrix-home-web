@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import os
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -415,23 +416,110 @@ def place_text_matches(value, geocode):
     value = str(value or "").strip()
     if not value or not geocode:
         return False
+
+    # Event/photo imports often store a locality in reverse order and with
+    # separators ("沙岭, 易县, 保定市"), while the user says
+    # "易县沙岭". Compare normalized administrative components rather than
+    # requiring the complete phrase to be a contiguous substring.
+    def normalize(text):
+        return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+    query = normalize(value)
     label = " ".join(
         str(part) for part in (
             geocode.get("label"), geocode.get("name"), geocode.get("city"),
             geocode.get("province"), geocode.get("district"),
             geocode.get("admin1"), geocode.get("admin2"), geocode.get("country"),
-        ) if part
+    ) if part
     )
     if not label:
         return False
-    if value in label:
+    label_normalized = normalize(label)
+    if query and query in label_normalized:
         return True
+
+    # A query may specify multiple administrative levels. A conflicting
+    # county/district must not pass merely because its city also matches.
+    # Missing levels remain open-world (older GPS records may only have a
+    # city), but any level present on both sides must agree.
+    suffix_groups = (
+        (("特别行政区",), ("province", "admin1")),
+        (("自治州", "地区", "省"), ("province", "admin1")),
+        (("市",), ("city",)),
+        (("区", "县", "盟"), ("district", "admin2")),
+    )
+    higher_fields = []
+    matched_admin = False
+    for suffixes, fields in suffix_groups:
+        available = []
+        for key in fields:
+            part = str(geocode.get(key) or "").strip()
+            if part:
+                available.extend((normalize(part), normalize(_strip_admin_suffix(part))))
+        available = {part for part in available if part}
+        for suffix in suffixes:
+            for end_match in re.finditer(re.escape(suffix), value):
+                end = end_match.end()
+                # Enumerate possible tokens ending at this suffix. This handles
+                # concatenated forms such as “上海普陀区” without greedily
+                # treating “上海普陀区” as the district itself.
+                candidates = {
+                    normalize(value[start:end])
+                    for start in range(max(0, end - 12), end - 1)
+                }
+                if available and candidates.intersection(available):
+                    matched_admin = True
+                    continue
+
+                # When a broader known locality precedes this component, the
+                # remaining suffix is unambiguous (保定市 + 赵县). Reject only
+                # that explicit contradiction; otherwise keep missing/partial
+                # metadata open-world.
+                boundary = 0
+                for higher_key in higher_fields:
+                    higher = str(geocode.get(higher_key) or "").strip()
+                    variants = {normalize(higher), normalize(_strip_admin_suffix(higher))}
+                    for variant in variants:
+                        if len(variant) < 2:
+                            continue
+                        position = query.find(variant)
+                        if position >= 0:
+                            boundary = max(boundary, position + len(variant))
+                isolated = normalize(value[boundary:end]) if boundary < end else ""
+                if (available and boundary > 0 and len(isolated) >= 2
+                        and not any(isolated == part or
+                                    isolated == normalize(_strip_admin_suffix(part))
+                                    for part in available)):
+                    return False
+                # A short, explicit administrative token is itself a strong
+                # contradiction when the corresponding level is known.
+                if (available and suffix in {"市", "区", "县", "省"}
+                        and 2 <= len(isolated) <= 5
+                        and not any(isolated == part or
+                                    isolated == normalize(_strip_admin_suffix(part))
+                                    for part in available)):
+                    return False
+        higher_fields.extend(fields)
+    # If at least one explicitly named level matches, the place is compatible
+    # even if the query adds a street, venue or landmark name.
+    if matched_admin:
+        return True
+
+    # If the geocoder knows a village/POI name, an explicit mention is a
+    # strong match even when the administrative parts precede it in a
+    # different order in the query. This check follows administrative
+    # contradiction checks so "赵县沙岭" cannot match a record in 易县.
+    name = normalize(geocode.get("name"))
+    if name and len(name) >= 2 and name in query:
+        return True
+
     for key in ("province", "city", "district", "admin1", "admin2"):
-        part = _strip_admin_suffix(geocode.get(key))
-        if len(part) >= 2 and part in value:
+        raw_part = str(geocode.get(key) or "").strip()
+        part = _strip_admin_suffix(raw_part)
+        if ((raw_part and normalize(raw_part) in query)
+                or (len(part) >= 2 and normalize(part) in query)):
             return True
-    lower_label = label.lower()
     for alias in place_alias_names(value):
-        if alias.lower() in lower_label:
+        if normalize(alias) in label_normalized:
             return True
     return False

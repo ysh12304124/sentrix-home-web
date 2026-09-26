@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from .temporal import trusted_captured_at
 
 
 def _parse_datetime(value):
@@ -111,7 +112,7 @@ class AdjacencyRetriever:
         window = timedelta(minutes=minutes)
         assets = [asset for asset in self.store.list_assets(limit=100_000)
                   if asset.get("id") in set(seeds) or True]
-        seed_times = {asset["id"]: _parse_datetime(asset.get("captured_at"))
+        seed_times = {asset["id"]: _parse_datetime(trusted_captured_at(asset, store=self.store))
                       for asset in self.store.list_assets(limit=100_000) if asset.get("id") in set(seeds)}
         seed_times = {asset_id: t for asset_id, t in seed_times.items() if t is not None}
         if not seed_times:
@@ -120,7 +121,7 @@ class AdjacencyRetriever:
         for asset in assets:
             if asset.get("id") in set(seeds):
                 continue
-            captured = _parse_datetime(asset.get("captured_at"))
+            captured = _parse_datetime(trusted_captured_at(asset, store=self.store))
             if captured is None:
                 continue
             if any(abs((captured - seed_time).total_seconds()) <= window.total_seconds()
@@ -171,7 +172,7 @@ class AdjacencyRetriever:
         if media_type in filters.negated_media:
             return False
         if filters.time_bounds:
-            captured = _parse_datetime(asset_or_observation.get("captured_at"))
+            captured = _parse_datetime(trusted_captured_at(asset_or_observation, store=self.store))
             if captured is not None and not (filters.time_bounds[0] <= captured < filters.time_bounds[1]):
                 return False
         return True

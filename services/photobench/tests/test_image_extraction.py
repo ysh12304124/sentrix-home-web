@@ -121,6 +121,18 @@ class ExtractImageIdsTests(unittest.TestCase):
             ],
         )
 
+    def test_face_identity_seed_crops_are_not_qa_retrieved_media(self):
+        assets_by_name = {
+            "faceid_10.jpg": [{"id": "face-seed", "media_type": "image"}],
+            "derived-face.webp": [{"id": "derived-face", "media_type": "image",
+                                    "metadata_json": {"derived_kind": "face_crop"}}],
+            "2017-10-04 223242.jpg": [{"id": "real-photo", "media_type": "image"}],
+            "video-007.mp4": [{"id": "video-asset", "media_type": "video"}],
+        }
+        resolved = MODULE._resolve_predicted_media(
+            ["face-seed", "derived-face", "real-photo", "video-asset"], assets_by_name)
+        self.assertEqual([item["asset_id"] for item in resolved], ["real-photo", "video-asset"])
+
     def test_tool_binding_uses_conversation_turn_when_step_ids_repeat(self):
         calls = [
             {"conversation_turn": 0, "step_id": "model_call_1"},

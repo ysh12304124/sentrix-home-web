@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -43,7 +44,7 @@ def gpu_katna_candidates(
         duration = max(1.0 / max(float(fps), 0.1),
                        (end - start + 1) / max(float(fps), 0.1))
         command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            os.getenv("SENTRIX_FFMPEG_BINARY", "ffmpeg"), "-hide_banner", "-loglevel", "error",
             "-ss", f"{start / max(float(fps), 0.1):.6f}",
             "-t", f"{duration:.6f}",
             "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",

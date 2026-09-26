@@ -906,6 +906,19 @@ class GraphMemoryService:
                             0, len(merged_nodes) - len(strict_nodes))
                         result["stats"]["text_fallback_forced"] = min(
                             len(unique_fallback), len(merged_nodes))
+                projected = self._event_summary_projection(
+                    builder, engine, str(query), scope_id, set(), target_size)
+                if projected:
+                    existing_sources = {
+                        str((getattr(node, "attributes", {}) or {}).get("source_asset_id") or node.node_id)
+                        for node in result.get("nodes") or []
+                    }
+                    projected_nodes = [node for node, _, _ in projected
+                                       if str((node.attributes or {}).get("source_asset_id") or node.node_id)
+                                       not in existing_sources]
+                    result["nodes"] = (projected_nodes + list(result.get("nodes") or []))[:target_size]
+                    result["stats"] = dict(result.get("stats") or {})
+                    result["stats"]["event_summary_projection"] = len(projected_nodes)
             finally:
                 if not self._cache_builder:
                     self._dispose_builder()
@@ -973,21 +986,44 @@ class GraphMemoryService:
                     # neighbour would erase the path.
                     allow_unmatched_events=query_type in {"multi_hop", "temporal"},
                 )
-                return {"ok": True, "nodes": [
-                    {"asset_id": str((node.attributes or {}).get("source_asset_id") or node.node_id),
-                     "score": float(score), "event_id": (node.attributes or {}).get("event_id"),
-                     "node_id": node.node_id}
-                    for node, score in traversed if node.node_type.value == "EVENT"
-                ], "paths": paths, "query_type": query_type}
+                projected = self._event_summary_projection(
+                    builder, engine, str(query), scope_id, seeds, max(30, int(top_k or 30)))
+                merged = {}
+                for node, score in traversed:
+                    if node.node_type.value != "EVENT":
+                        continue
+                    asset = str((node.attributes or {}).get("source_asset_id") or node.node_id)
+                    merged[asset] = {"asset_id": asset, "score": float(score),
+                                     "event_id": (node.attributes or {}).get("event_id"),
+                                     "node_id": node.node_id, "graph_source": "traversal"}
+                for node, score, metadata in projected:
+                    asset = str((node.attributes or {}).get("source_asset_id") or node.node_id)
+                    current = merged.get(asset)
+                    if current is None or score > float(current.get("score") or 0):
+                        merged[asset] = {"asset_id": asset, "score": float(score),
+                                         "event_id": (node.attributes or {}).get("event_id"),
+                                         "node_id": node.node_id, **metadata}
+                nodes = sorted(merged.values(), key=lambda item: (-float(item.get("score") or 0), item["asset_id"]))
+                return {"ok": True, "nodes": nodes[:max(1, min(int(top_k or 30), 100))],
+                        "paths": paths, "query_type": query_type}
             finally:
                 if not self._cache_builder:
                     self._dispose_builder()
 
     def _refresh_if_stale(self, scope_id: str | None = None) -> None:
+        """Inspect freshness without rebuilding in a user retrieval request.
+
+        ``search`` and ``expand_from_assets`` are called by every concurrent
+        QA worker.  Rebuilding here turns a harmless metadata/version mismatch
+        into several competing full graph builds, which blocks the retrieval
+        lock (and therefore all first-batch QA turns).  Graph construction is
+        an explicit pipeline responsibility; request-time graph retrieval must
+        either use the last complete snapshot or fail open to the baseline
+        retrievers when no snapshot exists.
+        """
         include_images = _truthy(os.getenv("SENTRIX_GRAPH_INCLUDE_IMAGES"), True)
         causal_enabled = _truthy(os.getenv("GRAPH_CAUSAL_ENABLED"), True)
         if not self.graph_exists:
-            self.build(scope_id=scope_id, include_images=include_images)
             return
         try:
             graph_mtime = Path(self.graph_path).stat().st_mtime
@@ -1058,10 +1094,9 @@ class GraphMemoryService:
                                   or (include_images and not built_include_images)
                                   or (causal_enabled and not built_causal)
                                   or built_schema_version < self.GRAPH_SCHEMA_VERSION):
-                # Keep one complete derived graph and apply scope filtering at
-                # traversal time; rebuilding a scope-specific graph here
-                # would overwrite memories from other albums.
-                self.build(scope_id=None, include_images=include_images)
+                # A stale snapshot is still a valid *read-only* fallback for
+                # this request.  The next explicit full-chain build refreshes
+                # it; never make one QA search start a global rebuild.
                 return
             if latest:
                 try:
@@ -1069,7 +1104,10 @@ class GraphMemoryService:
                 except (TypeError, ValueError, OSError):
                     latest_ts = 0.0
                 if latest_ts > graph_mtime + 1.0:
-                    self.build(scope_id=None, include_images=include_images)
+                    # See the version/count branch above.  Assets arriving
+                    # while evaluation is running are picked up by the next
+                    # explicit graph build, not by an in-flight query.
+                    return
         except Exception:
             # A stale-check failure must never take down retrieval; the
             # existing graph remains a safe fallback.
@@ -1165,6 +1203,166 @@ class GraphMemoryService:
             scored.append((float(matched_terms), node))
         scored.sort(key=lambda item: (-item[0], str(item[1].node_id)))
         return [node for _, node in scored[:max(1, min(int(top_k or 10), 50))]]
+
+    @staticmethod
+    def _event_summary_projection(builder: KeyframeMemoryBuilder,
+                                  engine: KeyframeQueryEngine,
+                                  question: str, scope_id: str | None,
+                                  seed_asset_ids: set[str] | None = None,
+                                  top_k: int = 30) -> list[tuple[Any, float, dict]]:
+        """Project event-level graph evidence back to frame EVENT nodes.
+
+        Event summaries are SESSION nodes.  The query engine historically
+        returned EVENT nodes only, so the hierarchy was built but could not
+        change retrieval.  This adapter keeps the public retrieval contract
+        frame-based while making parent events and temporal neighbours real
+        candidates.
+        """
+        seeds = {str(value) for value in (seed_asset_ids or set()) if value}
+        semantic_terms: list[str] = []
+        try:
+            matched = engine.label_matcher.match(question) if engine.label_matcher else {}
+            semantic_terms.extend(
+                str(item).strip().lower()
+                for key in ("objects", "predicates", "all")
+                for item in (matched.get(key) or [])
+            )
+            semantic_terms.extend(
+                str(item).strip().lower()
+                for item in engine._extract_object_terms(question)
+            )
+        except Exception:
+            matched = {}
+        semantic_terms = list(dict.fromkeys(
+            term for term in semantic_terms if len(term) >= 2
+        ))
+        query_type = engine.detect_query_type(question, matched)
+        compact = re.sub(r"\s+", "", str(question or "")).lower()
+        fallback_terms = (
+            [compact[i:i + 2] for i in range(max(0, len(compact) - 1))]
+            if len(compact) <= 80 else []
+        )
+
+        summaries = []
+        for node in builder.graph_db.nodes.values():
+            if node.node_type.value != "SESSION":
+                continue
+            attrs = node.attributes or {}
+            if attrs.get("subtype") != "event_summary":
+                continue
+            if scope_id and str(attrs.get("scope_id") or "home-default") != str(scope_id):
+                continue
+            summaries.append(node)
+        if not summaries:
+            return []
+
+        frame_to_summary: dict[str, list[Any]] = defaultdict(list)
+        for summary in summaries:
+            attrs = summary.attributes or {}
+            for frame_id in attrs.get("frame_ids") or summary.event_node_ids or []:
+                frame_to_summary[str(frame_id)].append(summary)
+        anchored = {summary.node_id for asset_id in seeds
+                    for summary in frame_to_summary.get(asset_id, [])}
+        summary_ids = {summary.node_id for summary in summaries}
+        scored_summaries: dict[str, tuple[float, str]] = {}
+        for summary in summaries:
+            attrs = summary.attributes or {}
+            haystack = " ".join(str(value or "") for value in (
+                attrs.get("event_id"), attrs.get("event_title"), attrs.get("event_summary"),
+                attrs.get("video_uid"), attrs.get("place"),
+                attrs.get("sentrix_event_place"), attrs.get("captured_at"),
+                attrs.get("sentrix_event_time_start"), attrs.get("sentrix_event_time_end"),
+                getattr(summary, "summary", ""),
+            )).lower()
+            semantic_match = sum(1 for term in semantic_terms if term in haystack)
+            semantic_score = semantic_match / max(1, len(semantic_terms))
+            fallback_match = sum(1 for term in fallback_terms if term in haystack)
+            fallback_score = fallback_match / max(1, len(fallback_terms))
+            # Event metadata is often the only exact bridge for questions
+            # such as “which day/place was that wedding”.  Token overlap is
+            # too brittle for Chinese names and date strings, so add a small
+            # phrase/metadata channel without making it a replacement for
+            # semantic evidence.
+            compact_question = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(question or "").lower())
+            compact_haystack = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", haystack)
+            phrase_match = 1.0 if (
+                compact_question and len(compact_question) >= 4
+                and (compact_question in compact_haystack
+                     or any(len(term) >= 4 and term in compact_haystack
+                            for term in semantic_terms))
+            ) else 0.0
+            metadata_match = 1.0 if any(
+                token and token in compact_question
+                for token in (
+                    re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(attrs.get("sentrix_event_place") or "").lower()),
+                    re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(attrs.get("sentrix_event_time_start") or "").lower()),
+                    re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(attrs.get("captured_at") or "").lower()),
+                ) if len(token) >= 4
+            ) else 0.0
+            # Label/object matches are primary. Character bigrams are used
+            # only when the graph labeler could not extract semantic terms;
+            # mixing them into an already grounded query created accidental
+            # matches on generic character pairs.
+            score = semantic_score if semantic_terms else fallback_score * 0.2
+            score = min(1.0, score + phrase_match * 0.22 + metadata_match * 0.16)
+            if summary.node_id in anchored and score > 0:
+                # Parent membership corroborates a query match; it is not
+                # query relevance by itself. The former 0.75 floor made every
+                # frame under any retrieved seed event look highly relevant.
+                score = min(1.0, score + 0.08)
+            elif summary.node_id in anchored and query_type in {"event", "temporal", "relationship", "multi_hop"}:
+                # A verified seed-to-event membership is useful evidence even
+                # when the event text is a paraphrase of the question.  Keep
+                # the floor deliberately below textual matches so an anchor
+                # cannot turn an unrelated event into a top result.
+                score = 0.12
+            if score > 0:
+                scored_summaries[summary.node_id] = (score, "event_summary")
+
+        # The temporal event layer is useful even when the adjacent event
+        # shares no query words (e.g. "what happened after ...").
+        if anchored and query_type in {"multi_hop", "temporal"}:
+            for link in list(builder.graph_db.links.values()):
+                props = getattr(link, "properties", {}) or {}
+                if props.get("sub_type") != "TIME_PRECEDES":
+                    continue
+                source, target = str(link.source_node_id), str(link.target_node_id)
+                if source in anchored or target in anchored:
+                    for neighbour in (source, target):
+                        if neighbour in summary_ids and neighbour not in scored_summaries:
+                            scored_summaries[neighbour] = (0.42, "event_summary_temporal")
+
+        event_nodes = {}
+        for node in builder.graph_db.nodes.values():
+            if node.node_type.value != "EVENT":
+                continue
+            attrs = node.attributes or {}
+            source = str(attrs.get("source_asset_id") or attrs.get("frame_uid") or node.node_id)
+            event_nodes.setdefault(source, node)
+            event_nodes.setdefault(str(node.node_id), node)
+
+        projected: dict[str, tuple[Any, float, dict]] = {}
+        for summary in summaries:
+            scored = scored_summaries.get(summary.node_id)
+            if not scored:
+                continue
+            score, source_kind = scored
+            attrs = summary.attributes or {}
+            for frame_id in attrs.get("frame_ids") or summary.event_node_ids or []:
+                node = event_nodes.get(str(frame_id))
+                if node is None:
+                    continue
+                asset_id = str((node.attributes or {}).get("source_asset_id")
+                               or (node.attributes or {}).get("frame_uid") or node.node_id)
+                previous = projected.get(asset_id)
+                if previous is None or score > previous[1]:
+                    node.similarity_score = float(score)
+                    projected[asset_id] = (node, float(score), {
+                        "graph_source": source_kind,
+                        "event_summary_node_id": summary.node_id,
+                        "event_id": attrs.get("event_id"),
+                    })
+        return sorted(projected.values(), key=lambda item: (-item[1], str(item[0].node_id)))[:max(1, min(int(top_k or 30), 100))]
 
     @staticmethod
     def _serializable(value: Any) -> Any:

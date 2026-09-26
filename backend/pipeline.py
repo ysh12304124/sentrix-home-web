@@ -20,6 +20,9 @@ IMPORT_METADATA_KEYS = {
     "content_sha256", "sha256", "exif", "captured_at", "captured_location",
     "source_owner_id", "source_owner_label", "source_device_id", "source_album_id",
     "source_confidence", "scope_id", "batch_id", "gps", "import_timings",
+    # Optional album-export provenance for media whose container has no EXIF.
+    "source_media_id", "source_media_title", "source_media_image_ids",
+    "provenance_source",
 }
 
 
@@ -70,13 +73,34 @@ class IngestionPipeline:
         """
         from .embeddings import scheme
         import httpx
+        import time
         url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
-        resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=20)
-        resp.raise_for_status()
-        vec = (resp.json() or {}).get("vector")
-        if not vec:
-            raise RuntimeError("bge sidecar returned empty vector")
-        return vec, scheme.TEXT_MODEL
+        try:
+            retry_count = max(0, min(5, int(os.getenv("SENTRIX_TEXT_EMBED_RETRY_COUNT", "3"))))
+        except (TypeError, ValueError):
+            retry_count = 3
+        last_error = None
+        for attempt in range(retry_count + 1):
+            try:
+                resp = httpx.post(
+                    f"{url}/embed", json={"text": str(text)}, timeout=20,
+                    trust_env=False,
+                )
+                resp.raise_for_status()
+                vec = (resp.json() or {}).get("vector")
+                if not vec:
+                    raise RuntimeError("bge sidecar returned empty vector")
+                return vec, scheme.TEXT_MODEL
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
+                    httpx.ReadTimeout, httpx.RemoteProtocolError,
+                    httpx.PoolTimeout, httpx.WriteError, httpx.WriteTimeout) as error:
+                last_error = error
+                if attempt >= retry_count:
+                    break
+                time.sleep(min(8.0, 0.75 * (2 ** attempt)))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("bge sidecar request failed")
 
     def _field_desc_text(self, analysis: dict) -> str:
         """完整描述文本：caption + place + objects + event_type + ocr_text（observations 字段）。
@@ -395,11 +419,14 @@ class IngestionPipeline:
             step_started = time.perf_counter()
             return callable_(), time.perf_counter() - step_started
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sentrix-fast") as executor:
-            face_future = executor.submit(timed, lambda: self.face.detect(path))
-            clip_future = executor.submit(timed, lambda: self.clip.embed_image(path))
-            faces, face_seconds = face_future.result()
-            clip_embedding, clip_seconds = clip_future.result()
+        # InsightFace/onnxruntime and OpenCLIP both use native runtimes.  On
+        # Windows, initializing or invoking them concurrently from the same
+        # ingestion process can raise an access violation (the process then
+        # leaves assets stuck in ``processing``).  Keep this boundary
+        # deterministic and let the outer pipeline worker provide the only
+        # supported concurrency level.
+        faces, face_seconds = timed(lambda: self.face.detect(path))
+        clip_embedding, clip_seconds = timed(lambda: self.clip.embed_image(path))
         return {
             "captured_at": asset.get("captured_at") or file_time(path),
             "faces": faces,

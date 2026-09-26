@@ -16,6 +16,7 @@ from typing import Any
 import re
 
 from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from .temporal import trusted_captured_at
 
 
 @dataclass
@@ -58,11 +59,11 @@ class MetadataRetriever:
             if media_type in filters.negated_media:
                 continue
             if filters.time_bounds:
-                captured = _parse_datetime(asset.get("captured_at"))
+                captured = _parse_datetime(trusted_captured_at(asset, store=self.store))
                 if captured is not None and not (filters.time_bounds[0] <= captured < filters.time_bounds[1]):
                     continue
             if filters.annual_time_window:
-                captured = _parse_datetime(asset.get("captured_at"))
+                captured = _parse_datetime(trusted_captured_at(asset, store=self.store))
                 if captured is not None and not _in_annual_window(captured, filters.annual_time_window):
                     continue
             # place 预筛（镜像 kernel 判定：geocode 匹配或缺失保留，不匹配剔除）

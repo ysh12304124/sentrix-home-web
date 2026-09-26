@@ -10,10 +10,12 @@ param(
   [ValidateSet("ollama", "vllm")]
   [string]$LlmBackend = "vllm",
   [string]$VllmBaseUrl = "http://127.0.0.1:8000/v1",
-  [string]$VllmModel = "qwen3-vl-4b",
+  [string]$VllmModel = "qwen3-vl-4b-instruct",
   [string]$VllmManagerUrl = "",
   [ValidateSet("auto", "on", "off")]
-  [string]$GraphRetrievalMode = "auto"
+  # Benchmark and the local app exercise the event-centric graph by default.
+  # Use -GraphRetrievalMode off for an explicit baseline.
+  [string]$GraphRetrievalMode = "on"
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Split-Path -Parent $MyInvocation.MyCommand.Path)).Path
@@ -46,8 +48,12 @@ $env:PORT              = "11000"
 $env:NO_PROXY = "127.0.0.1,localhost"
 $env:no_proxy = "127.0.0.1,localhost"
 
-# Qdrant realtime vector chain
-$env:SENTRIX_VECTOR_BACKEND = "qdrant"
+# SQLite remains the source of truth for benchmark ingestion and retrieval.
+# The local Qdrant mirror is derived/rebuildable; enabling synchronous Qdrant
+# upserts here can block the single-worker memory pipeline on Windows. Keep
+# benchmark runs fail-safe and exact with SQLite until the mirror writer is
+# made asynchronous and bounded.
+$env:SENTRIX_VECTOR_BACKEND = "sqlite"
 $env:SENTRIX_QDRANT_PATH    = Join-Path $env:SENTRIX_DATA_DIR "qdrant"
 
 # CLIP embedding.  The project Python has CUDA support on this host; keeping
@@ -55,14 +61,38 @@ $env:SENTRIX_QDRANT_PATH    = Join-Path $env:SENTRIX_DATA_DIR "qdrant"
 # and video extraction.  Face ONNX remains CPU below until a CUDA execution
 # provider is installed, which preserves the existing clustering behaviour.
 $env:CLIP_ENABLED        = "true"
-$env:CLIP_DEVICE         = "cuda:0"
-$env:CLIP_ALLOW_DOWNLOAD = "true"
+# vLLM owns the CUDA context and most of the VRAM.  Keeping the auxiliary
+# OpenCLIP encoder on CPU avoids CUDA initialization/resource contention during
+# full ingest; the OpenAI-compatible VLM remains on the GPU in WSL.
+$env:CLIP_DEVICE         = "cpu"
+# Do not block a full ingest on an OpenCLIP checkpoint download.  If a local
+# checkpoint is provided later, CLIP will be used automatically; otherwise
+# the adapter returns no visual vector and the VLM/text/graph channels remain
+# available.
+$env:CLIP_ALLOW_DOWNLOAD = "false"
 $env:CLIP_MODEL_NAME     = "ViT-B-32"
 $env:SENTRIX_IMAGE_EMBEDDER = "clip"
-$env:SENTRIX_TEXT_EMBEDDER  = "clip"
+$env:SENTRIX_TEXT_EMBEDDER  = "bge"
+$env:SENTRIX_TEXT_EMBEDDER_URL = "http://127.0.0.1:8101"
+
+# Video helpers invoke ffmpeg as a child process. Expose the executable
+# bundled in the project venv so Windows does not require a system install.
+$bundledFfmpegDir = Join-Path $root ".venv\Lib\site-packages\imageio_ffmpeg\binaries"
+if (Test-Path $bundledFfmpegDir) {
+  $env:PATH = "$bundledFfmpegDir;" + $env:PATH
+  $ffmpegCandidate = Get-ChildItem $bundledFfmpegDir -Filter "ffmpeg-*.exe" | Select-Object -First 1
+  if ($ffmpegCandidate) { $env:SENTRIX_FFMPEG_BINARY = $ffmpegCandidate.FullName }
+}
 
 # Face recognition (CPU; models auto-download to data/face-models)
+# The bundled Python 3.13 + onnxruntime/insightface combination can raise a
+# native access violation while lazily loading buffalo_l on Windows.  Keep
+# the optional face channel disabled for this runtime so full graph builds
+# remain recoverable; the rest of the memory pipeline is unchanged.  Face
+# clustering can be re-enabled in a Python 3.12/compatible ONNX environment.
 $env:FACE_ENABLED      = "true"
+$env:FACE_SIDECAR_URL  = "http://127.0.0.1:8102"
+$env:FACE_SIDECAR_TIMEOUT = "120"
 $env:FACE_MODEL_ROOT   = Join-Path $env:SENTRIX_DATA_DIR "face-models"
 $env:FACE_MODEL_NAME   = "buffalo_l"
 $env:FACE_PROVIDERS    = "CPUExecutionProvider"
@@ -81,15 +111,31 @@ if ($LlmBackend -eq "vllm") {
   $env:SENTRIX_VLLM_MANAGER_API = $VllmManagerUrl.TrimEnd('/')
   $env:BENCH_VLLM_BASE_URL = $env:SENTRIX_VLLM_BASE_URL
   $env:BENCH_VLLM_API_URL = $env:SENTRIX_VLLM_MANAGER_API
+  # Bound a stalled multimodal request so one bad image cannot block the
+  # single-asset ingest stage until the general model timeout expires.
+  # A timed-out vLLM vision request keeps decoding briefly on the server even
+  # after the client has disconnected.  Retrying it submits a duplicate and
+  # can poison the single-worker memory build.  Let the pipeline circuit
+  # breaker stop a bad run instead of replaying the request.
+  $env:SENTRIX_VISION_TIMEOUT_SECONDS = "60"
+  $env:SENTRIX_VISION_RETRY_COUNT = "0"
+  $env:SENTRIX_VISION_FAILURE_THRESHOLD = "2"
+  $env:VISION_CORE_NUM_PREDICT = "384"
+  $env:VISION_CORE_MAX_DIMENSION = "768"
   # The local Qwen3-VL 4B WSL server advertises max_num_seqs=16, but that is
   # the scheduler ceiling, not a safe Windows-client burst size.  A 16-way
   # PhotoBench burst leaves half of the requests queued until the 180 s HTTP
   # timeout (measured on this host), which produces planner_call_error and
   # makes retrieval recall appear as 0.  Four workers keep the GPU saturated
   # without starving requests; callers may still override these after launch.
-  $env:PHOTOBENCH_QA_CONCURRENCY = "4"
-  $env:PHOTOBENCH_JUDGE_CONCURRENCY = "2"
-  $env:SENTRIX_ASSISTANT_TURN_WORKERS = "4"
+  $env:PHOTOBENCH_QA_CONCURRENCY = "8"
+  $env:PHOTOBENCH_JUDGE_CONCURRENCY = "4"
+  $env:SENTRIX_ASSISTANT_TURN_WORKERS = "8"
+  # Qwen3-VL is served with max_model_len=4096.  Keep tool-loop output
+  # bounded so long graph evidence prompts cannot cross the hard limit.
+  # Keep local Qwen3-VL tool turns inside its 4096-token context.  The API
+  # also applies a dynamic safety margin for long evidence prompts.
+  $env:SENTRIX_TOOL_LOOP_MAX_TOKENS = "384"
 } else {
   # Local Ollama model available on this Windows host.
   $env:SENTRIX_LLM_BACKEND = "ollama"
@@ -128,7 +174,7 @@ $env:SENTRIX_GRAPH_RETRIEVAL_MODE = $GraphRetrievalMode
 $env:SENTRIX_VIDEO_KEYFRAME_ALGORITHM = "hybrid_webp"
 # Hybrid event analysis sends up to three evidence images plus the temporal
 # detector trace; 4096 is just below the prompt size accepted by Ollama.
-$env:VISION_CORE_NUM_CTX = "8192"
+$env:VISION_CORE_NUM_CTX = "4096"
 
 # Enable the existing incremental person-insight trigger for the default
 # household space after an ingest batch completes.  This only enables the
@@ -161,8 +207,7 @@ if ($ffmpegBin) {
 # crashed inside python313.dll under a long QA run (Windows APPCRASH
 # 0xc0000005).  Use the project-compatible 3.11 environment when present;
 # dependencies are installed there as well.  Keep .venv as a portable fallback.
-$python = "E:\anaconda\envs\magma\python.exe"
-if (-not (Test-Path $python)) { $python = Join-Path $root ".venv\Scripts\python.exe" }
+$python = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $python)) { Write-Error "python not found: $python" }
 $env:PHOTOBENCH_PYTHON = $python
 $env:PYTHONFAULTHANDLER = "1"
@@ -172,15 +217,18 @@ $env:PYTHONFAULTHANDLER = "1"
 if (-not $Status -and $LlmBackend -eq "vllm" -and $VllmBaseUrl -match "127\.0\.0\.1:8000") {
   try {
     # Do not send the local WSL loopback probe through a corporate proxy.
-    Invoke-RestMethod -Uri "$($env:SENTRIX_VLLM_BASE_URL)/models" -NoProxy -TimeoutSec 3 | Out-Null
+    $probe = Invoke-WebRequest -Uri "$($env:SENTRIX_VLLM_BASE_URL)/models" `
+      -UseBasicParsing -TimeoutSec 5
+    if ($probe.StatusCode -ne 200) { throw "HTTP $($probe.StatusCode)" }
   } catch {
     Write-Warning "Local WSL vLLM is not ready. Start it separately: D:\vllm-runtime\start-gemma-vllm.ps1"
   }
 }
 $node = $null
 try { $node = (Get-Command node -ErrorAction Stop).Source } catch { }
-if (-not $node -and (Test-Path "C:\Users\VCC\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")) {
-  $node = "C:\Users\VCC\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
+if (-not $node) {
+  $codexNode = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
+  if (Test-Path $codexNode) { $node = $codexNode }
 }
 if (-not $node) { Write-Error "node not found. Install Node.js or use the Codex runtime." }
 
@@ -196,6 +244,38 @@ function Test-Port($port) {
 function Stop-Port($port) {
   Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
     ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+}
+function Ensure-TextEmbedder {
+  if (Test-Port 8101) { return }
+  $sidecar = Join-Path $root "scripts\maintenance\text_embedder_sidecar.py"
+  if (-not (Test-Path $sidecar)) { Write-Warning "BGE sidecar script not found: $sidecar"; return }
+  $sideLog = Join-Path $logDir "text-embedder-8101.log"
+  $sideErr = Join-Path $logDir "text-embedder-8101.err.log"
+  Start-Process -FilePath $python -ArgumentList @($sidecar) -WorkingDirectory $root `
+    -WindowStyle Hidden -RedirectStandardOutput $sideLog -RedirectStandardError $sideErr | Out-Null
+  for ($i = 0; $i -lt 60; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-Port 8101) { return }
+  }
+  Write-Warning "BGE text embedder did not become ready on http://127.0.0.1:8101; semantic ingest will fail"
+}
+function Ensure-FaceSidecar {
+  if (Test-Port 8102) { return }
+  $facePython = Join-Path $root ".venv-face\Scripts\python.exe"
+  $sidecar = Join-Path $root "scripts\maintenance\face_sidecar.py"
+  if (-not (Test-Path $facePython)) { Write-Warning "Face Python 3.12 runtime not found: $facePython"; return }
+  if (-not (Test-Path $sidecar)) { Write-Warning "Face sidecar script not found: $sidecar"; return }
+  $faceLog = Join-Path $logDir "face-sidecar-8102.log"
+  $faceErr = Join-Path $logDir "face-sidecar-8102.err.log"
+  $env:PYTHONPATH = $root
+  $env:FACE_MODEL_ROOT = Join-Path $env:SENTRIX_DATA_DIR "face-models"
+  Start-Process -FilePath $facePython -ArgumentList @($sidecar) -WorkingDirectory $root `
+    -WindowStyle Hidden -RedirectStandardOutput $faceLog -RedirectStandardError $faceErr | Out-Null
+  for ($i = 0; $i -lt 60; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-Port 8102) { return }
+  }
+  Write-Warning "Face sidecar did not become ready on http://127.0.0.1:8102; face identity will be unavailable"
 }
 function Test-Ollama {
   try {
@@ -234,9 +314,16 @@ if ($Restart) {
   Stop-Port $apiPort
   Stop-Port $webPort
   Stop-Port $photobenchPort
+  # Reload sidecars as well; otherwise a restart of the main API keeps an old
+  # face detector process bound to 8102 and silently ignores detector changes.
+  Stop-Port 8101
+  Stop-Port 8102
   if ($LlmBackend -eq "ollama") { Restart-OllamaWithScheduler }
   Start-Sleep -Seconds 1
 }
+Ensure-TextEmbedder
+Ensure-FaceSidecar
+
 if (Test-Port $apiPort) { Write-Warning "API port $apiPort in use; use -r to restart"; exit 1 }
 if (Test-Port $webPort) { Write-Warning "Web port $webPort in use; use -r to restart"; exit 1 }
 

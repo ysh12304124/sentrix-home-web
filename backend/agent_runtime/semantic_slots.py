@@ -125,6 +125,52 @@ _RELATIVE_TIME_MARKERS = (
     "近一年", "最近一年", "最近两年",
 )
 
+# Scene/setting words are often misclassified by slot extraction as named
+# locations (e.g. “天台婚礼” -> place=天台). They may help semantic search, but
+# must not become a geographic retrieval hint/boost.
+_SCENE_ONLY_PLACES = frozenset({
+    "天台", "屋顶", "室内", "户外", "室外", "家里", "家中", "房间",
+    "客厅", "卧室", "厨房", "舞台", "展架旁", "门口", "路边",
+})
+
+
+def _grounded_place_name(value: str, question: str) -> bool:
+    place = re.sub(r"[\s，。！？、,.!?]", "", str(value or ""))
+    text = re.sub(r"[\s，。！？、,.!?]", "", str(question or ""))
+    if not place or place not in text:
+        return False
+    if place in _SCENE_ONLY_PLACES:
+        return False
+    # A short phrase can still be a real place if explicitly named as a
+    # venue/location; avoid converting a visual scene into a geo constraint.
+    return True
+
+
+def _time_is_grounded(question: str, expr: str, year, months, days) -> bool:
+    """A model may normalize a time phrase, but may not invent one."""
+    text = str(question or "")
+    expression = str(expr or "")
+    # Relative periods must occur in the user's wording. Keep longer phrases
+    # first so a partial marker cannot make an unrelated expression pass.
+    markers = sorted(_RELATIVE_TIME_MARKERS, key=len, reverse=True)
+    if any(marker in expression for marker in markers):
+        return any(marker in text for marker in markers)
+    if any(marker in text for marker in markers):
+        return True
+    # A normalized year/month/day must have an explicit textual anchor.
+    if year is not None and re.search(rf"(?<!\d){int(year)}\s*年?", text):
+        return True
+    if re.search(r"20\d{2}\s*年", text):
+        return True
+    if re.search(r"\d{1,2}\s*月|[一二三四五六七八九十两]{1,3}\s*月", text):
+        return True
+    if re.search(r"\d{1,2}\s*[日号号]", text):
+        return True
+    if any(token in text for token in ("春天", "春季", "夏天", "夏季", "秋天", "秋季",
+                                       "冬天", "冬季", "国庆", "春节", "元旦")):
+        return True
+    return False
+
 
 def _expand_time_components(year, months, days, expr: str):
     """用 expr 里的季节/节日/显式月日做确定性补全（绝不补年份）。
@@ -184,6 +230,20 @@ def _normalize_slots(payload: dict, question: str) -> dict | None:
         raw_days = [raw_days] if raw_days else []
     year, months, days = _expand_time_components(model_year, raw_months, raw_days, expr)
 
+    # The model occasionally turns an event word such as “婚礼时” into a
+    # relative-time filter (“去年”). Only permit time constraints grounded in
+    # the actual user utterance; otherwise preserve the broad semantic recall.
+    if not _time_is_grounded(question, expr, year, months, days):
+        expr, year, months, days = "", None, set(), set()
+
+    place_name = str(p.get("name") or "") if isinstance(p, dict) else ""
+    place_hint = str(p.get("hint") or "") if isinstance(p, dict) else ""
+    # Model-generated normalized hints need not literally occur in the query,
+    # but they are only trusted when the source name is explicitly grounded.
+    if not _grounded_place_name(place_name, question):
+        place_name = ""
+        place_hint = ""
+
     slots = {
         "time": {
             "expr": expr,
@@ -194,8 +254,8 @@ def _normalize_slots(payload: dict, question: str) -> dict | None:
             "certainty": str(t.get("certainty") or "low") if isinstance(t, dict) else "low",
         },
         "place": {
-            "name": str(p.get("name") or "") if isinstance(p, dict) else "",
-            "hint": str(p.get("hint") or "") if isinstance(p, dict) else "",
+            "name": place_name,
+            "hint": place_hint,
             "certainty": str(p.get("certainty") or "low") if isinstance(p, dict) else "low",
         },
         "person": persons,

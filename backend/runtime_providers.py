@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import threading
+import time
 import urllib.request
 
 import httpx
@@ -165,12 +167,54 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         if self.api_mode == "generic":
             body.pop("chat_template_kwargs", None)
             body = {key: value for key, value in body.items() if value is not None}
-        response = self._client.post(
-            f"{self.base_url}/chat/completions", json=body, headers=self.headers,
-            timeout=timeout or self.timeout,
+        # A stuck multimodal request must not occupy a pipeline worker for the
+        # full text-model timeout (and then be retried three more times).  This
+        # is especially important for a local vLLM server: a malformed or
+        # pathological image can leave one vision request pending while the
+        # rest of the benchmark is still healthy.  Keep the normal text
+        # timeout/retry policy unchanged, but bound image calls separately.
+        has_image = any(
+            isinstance(message, dict)
+            and isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict)
+                and part.get("type") in {"image_url", "input_image"}
+                for part in message.get("content") or []
+            )
+            for message in body.get("messages") or []
         )
-        response.raise_for_status()
-        return response
+        request_timeout = timeout or self.timeout
+        try:
+            retry_env = "SENTRIX_VISION_RETRY_COUNT" if has_image else "SENTRIX_OPENAI_RETRY_COUNT"
+            retry_default = "1" if has_image else "3"
+            retry_count = max(0, min(5, int(os.getenv(retry_env, retry_default))))
+        except (TypeError, ValueError):
+            retry_count = 1 if has_image else 3
+        if has_image:
+            try:
+                vision_timeout = max(30.0, float(os.getenv("SENTRIX_VISION_TIMEOUT_SECONDS", "90")))
+                request_timeout = min(float(request_timeout), vision_timeout)
+            except (TypeError, ValueError):
+                request_timeout = min(float(request_timeout), 90.0)
+        last_error = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = self._client.post(
+                    f"{self.base_url}/chat/completions", json=body, headers=self.headers,
+                    timeout=request_timeout,
+                )
+                response.raise_for_status()
+                return response
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
+                    httpx.ReadTimeout, httpx.RemoteProtocolError,
+                    httpx.PoolTimeout, httpx.WriteError, httpx.WriteTimeout) as error:
+                last_error = error
+                if attempt >= retry_count:
+                    break
+                time.sleep(min(8.0, 0.75 * (2 ** attempt)))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenAI-compatible model request failed")
 
     def chat_stream(self, payload: dict, *, timeout: float | None = None):
         body = dict(payload or {})

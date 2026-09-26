@@ -16,6 +16,9 @@ GEO_SJZ = {"source": "tianditu", "label": "河北省石家庄市桥西区",
            "country": "CN", "confidence": 0.9}
 GEO_CM = {"source": "geonames", "label": "Chiang Mai, Chiang Mai, TH",
           "name": "Chiang Mai", "city": "Chiang Mai", "country": "TH"}
+GEO_SALING = {"label": "沙岭, 易县, 保定市, 河北省, 中国", "name": "沙岭",
+              "city": "保定市", "district": "易县", "province": "河北省",
+              "admin1": "河北省", "admin2": "易县"}
 
 
 class PlaceTextMatchTest(unittest.TestCase):
@@ -29,6 +32,11 @@ class PlaceTextMatchTest(unittest.TestCase):
 
     def test_label_substring(self):
         self.assertTrue(place_text_matches("昌黎", GEO_QHD))
+
+    def test_reordered_village_and_county_match_without_accepting_wrong_county(self):
+        self.assertTrue(place_text_matches("易县沙岭", GEO_SALING))
+        self.assertTrue(place_text_matches("河北省保定市易县沙岭", GEO_SALING))
+        self.assertFalse(place_text_matches("河北省保定市赵县沙岭", GEO_SALING))
 
     def test_alias_international(self):
         self.assertTrue(place_text_matches("清迈", GEO_CM))

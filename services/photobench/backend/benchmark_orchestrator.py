@@ -15,6 +15,7 @@ import copy
 import concurrent.futures
 import base64
 import hashlib
+import itertools
 from io import BytesIO
 import json
 import math
@@ -1479,7 +1480,147 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-FACE_CLUSTERING_METRIC_VERSION = 2
+FACE_CLUSTERING_METRIC_VERSION = 4
+
+
+def _image_identity_link_metrics(
+    image_to_face_ids: dict,
+    predicted_clusters_by_file: dict[str, set[str]],
+    asset_names: set[str],
+) -> dict:
+    """Score identity links at image level when GT has no face boxes.
+
+    ``face_info_cn.json`` supplies identity *sets* per image, but it does not
+    say which detected box belongs to which identity.  Assigning every box to
+    every GT identity would inflate recall, while dropping all multi-face
+    images makes the face metric almost always unavailable.  The safe middle
+    ground is to evaluate an identity link between two images: a GT link
+    exists when their identity sets intersect, and a predicted link exists
+    when their detected cluster sets intersect.  This uses multi-face images
+    without inventing box-level correspondence.
+    """
+    samples = []
+    gt_asset_count = 0
+    detected_image_count = 0
+    clustered_image_count = 0
+    for name, labels in image_to_face_ids.items():
+        file_name = Path(str(name)).name.lower()
+        if file_name not in asset_names:
+            continue
+        if not isinstance(labels, list) or not labels:
+            continue
+        gt_asset_count += 1
+        clusters = {
+            str(cluster_id)
+            for cluster_id in (predicted_clusters_by_file.get(file_name) or set())
+            if cluster_id
+        }
+        # The caller builds this map from verified face rows.  An empty set is
+        # retained: it is a real no-cluster observation and contributes a false
+        # negative for a same-identity image pair rather than disappearing from
+        # the denominator.
+        if file_name in predicted_clusters_by_file:
+            detected_image_count += 1
+            if clusters:
+                clustered_image_count += 1
+            samples.append((set(map(str, labels)), clusters))
+
+    counts = {
+        "true_positive": 0,
+        "false_positive": 0,
+        "false_negative": 0,
+        "true_negative": 0,
+    }
+    for left, right in itertools.combinations(samples, 2):
+        gt_same = bool(left[0] & right[0])
+        predicted_same = bool(left[1] & right[1])
+        if gt_same and predicted_same:
+            counts["true_positive"] += 1
+        elif not gt_same and predicted_same:
+            counts["false_positive"] += 1
+        elif gt_same and not predicted_same:
+            counts["false_negative"] += 1
+        else:
+            counts["true_negative"] += 1
+    p_denominator = counts["true_positive"] + counts["false_positive"]
+    r_denominator = counts["true_positive"] + counts["false_negative"]
+    precision = counts["true_positive"] / p_denominator if p_denominator else 0.0
+    recall = counts["true_positive"] / r_denominator if r_denominator else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "available": len(samples) >= 2 and r_denominator > 0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "true_positive": counts["true_positive"],
+        "false_positive": counts["false_positive"],
+        "false_negative": counts["false_negative"],
+        "true_negative": counts["true_negative"],
+        "evaluable_pair_count": len(samples) * (len(samples) - 1) // 2,
+        "evaluable_image_count": len(samples),
+        "gt_asset_count": gt_asset_count,
+        "detected_image_count": detected_image_count,
+        "clustered_image_count": clustered_image_count,
+    }
+
+
+def _identity_gallery_metrics(
+    image_to_face_ids: dict,
+    predicted_identities_by_file: dict[str, set[str]],
+    asset_names: set[str],
+) -> dict:
+    """Evaluate multi-face identification against seeded identity clusters.
+
+    The benchmark seeds one confirmed face cluster per known identity before
+    album processing.  A detected face assigned to one of those confirmed
+    clusters is therefore an identity-gallery prediction.  Because the GT
+    sidecar provides an identity set per image (not face boxes), score the
+    deduplicated identity sets per image: this supports multi-person photos
+    without claiming that an arbitrary detection box is a particular GT box.
+    """
+    samples = []
+    gt_asset_count = 0
+    identified_image_count = 0
+    for name, labels in image_to_face_ids.items():
+        file_name = Path(str(name)).name.lower()
+        if file_name not in asset_names:
+            continue
+        if not isinstance(labels, list) or not labels:
+            continue
+        gt_asset_count += 1
+        predicted = {
+            str(identity)
+            for identity in (predicted_identities_by_file.get(file_name) or set())
+            if identity
+        }
+        if predicted:
+            identified_image_count += 1
+        # The map is populated for every image with verified detections, even
+        # when all detected faces are unknown/unclustered.  Retaining an empty
+        # prediction makes missed known identities count as false negatives.
+        if file_name in predicted_identities_by_file:
+            samples.append((set(map(str, labels)), predicted))
+
+    true_positive = sum(len(gt & predicted) for gt, predicted in samples)
+    false_positive = sum(len(predicted - gt) for gt, predicted in samples)
+    false_negative = sum(len(gt - predicted) for gt, predicted in samples)
+    precision_denominator = true_positive + false_positive
+    recall_denominator = true_positive + false_negative
+    precision = true_positive / precision_denominator if precision_denominator else 0.0
+    recall = true_positive / recall_denominator if recall_denominator else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "available": bool(samples) and recall_denominator > 0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+        "evaluable_image_count": len(samples),
+        "gt_asset_count": gt_asset_count,
+        "identified_image_count": identified_image_count,
+    }
 
 
 def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
@@ -1507,9 +1648,13 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
         }
 
     # An image tagged with one identity is not necessarily a single-face image.
-    # We only score an instance when there is exactly one detected face; for
-    # multi-face images this GT has no box-level mapping, so choosing a face
-    # would make the clustering score circular or speculative.
+    # We only score an instance when there is exactly one *verified* detected
+    # face.  ``uncertain`` candidates are deliberately retained by production
+    # as visual evidence, but cannot seed an identity cluster; allowing one of
+    # those candidates to turn a single-person image into a "multi face" image
+    # made the clustering score depend on detector noise rather than clustering
+    # quality.  The GT has no face boxes, so multi-face images remain a
+    # detection-coverage diagnostic, not speculative pairwise identity labels.
     truth_by_name = {
         Path(str(name)).name.lower(): str(face_ids[0])
         for name, face_ids in image_to_face_ids.items()
@@ -1526,8 +1671,13 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
             asset_rows = conn.execute(
                 "SELECT file_name FROM assets WHERE scope_id = ?", (scope_id,),
             ).fetchall()
+            face_columns = {
+                str(item[1]).lower()
+                for item in conn.execute("PRAGMA table_info(face_instances)").fetchall()
+            }
+            validity_sql = "fi.validity" if "validity" in face_columns else "'verified'"
             rows = conn.execute(
-                "SELECT fi.id, fi.cluster_id, a.file_name "
+                "SELECT fi.id, fi.cluster_id, a.file_name, " + validity_sql + " AS validity "
                 "FROM face_instances fi JOIN assets a ON a.id = fi.asset_id "
                 "WHERE a.scope_id = ?", (scope_id,),
             ).fetchall()
@@ -1540,12 +1690,54 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
             "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
         }
 
-    by_file: dict[str, list[tuple[str, str | None]]] = {}
+    raw_by_file: dict[str, list[tuple[str, str | None]]] = {}
+    verified_by_file: dict[str, list[tuple[str, str | None]]] = {}
     asset_names = {Path(str(row[0])).name.lower() for row in asset_rows}
-    for face_id, cluster_id, file_name in rows:
-        by_file.setdefault(Path(str(file_name)).name.lower(), []).append(
-            (str(face_id), str(cluster_id) if cluster_id else None)
-        )
+    for face_id, cluster_id, file_name, validity in rows:
+        item = (str(face_id), str(cluster_id) if cluster_id else None)
+        normalized_name = Path(str(file_name)).name.lower()
+        raw_by_file.setdefault(normalized_name, []).append(item)
+        if str(validity or "").strip().lower() == "verified":
+            verified_by_file.setdefault(normalized_name, []).append(item)
+    # Identity seed assets are the independent gallery: faceid_N.jpg is
+    # uploaded before album photos and belongs to the confirmed cluster for
+    # GT identity N.  Only these confirmed seed clusters are used for the
+    # identification metric; pending clusters remain ordinary clustering
+    # diagnostics and cannot be treated as named identities.
+    seed_cluster_by_identity: dict[str, str] = {}
+    # Seed crops are intentionally stored as ``uncertain`` evidence because
+    # they are reference inputs rather than album detections, so inspect the
+    # raw rows for the gallery mapping.  Album predictions below still require
+    # verified detections.
+    for file_name, detected in raw_by_file.items():
+        match = re.match(r"^faceid_([^./]+)\.(?:jpe?g|png|webp)$", file_name, re.IGNORECASE)
+        if not match:
+            continue
+        cluster_ids = {cluster_id for _face_id, cluster_id in detected if cluster_id}
+        if len(cluster_ids) == 1:
+            seed_cluster_by_identity[match.group(1)] = next(iter(cluster_ids))
+    identity_by_seed_cluster = {
+        cluster_id: identity
+        for identity, cluster_id in seed_cluster_by_identity.items()
+    }
+    predicted_identities_by_file = {
+        file_name: {
+            identity_by_seed_cluster[cluster_id]
+            for _face_id, cluster_id in detected
+            if cluster_id in identity_by_seed_cluster
+        }
+        for file_name, detected in verified_by_file.items()
+    }
+    # Keep every GT image that has a verified detection, including multi-face
+    # images and faces that have not received a cluster id.  This is used by
+    # the image-level metric below; the strict single-face metric remains
+    # unchanged and is reported as a diagnostic.
+    verified_clusters_by_file = {
+        file_name: {
+            cluster_id for _face_id, cluster_id in detected if cluster_id
+        }
+        for file_name, detected in verified_by_file.items()
+    }
     predicted, truth = {}, {}
     excluded_ambiguous = 0
     gt_single_count = len(truth_by_name)
@@ -1556,15 +1748,25 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
     detected_single_face_count = 0
     detected_zero_face_count = 0
     detected_multiple_faces_count = 0
+    raw_detected_single_face_count = 0
+    raw_detected_zero_face_count = 0
+    raw_detected_multiple_faces_count = 0
     single_face_without_cluster_count = 0
     for file_name, label in truth_by_name.items():
-        detected = by_file.get(file_name) or []
+        raw_detected = raw_by_file.get(file_name) or []
+        detected = verified_by_file.get(file_name) or []
+        if file_name in asset_names and not raw_detected:
+            raw_detected_zero_face_count += 1
+        elif file_name in asset_names and len(raw_detected) == 1:
+            raw_detected_single_face_count += 1
+        elif file_name in asset_names and len(raw_detected) > 1:
+            raw_detected_multiple_faces_count += 1
         if file_name in asset_names and not detected:
             detected_zero_face_count += 1
+        elif file_name in asset_names and len(detected) == 1:
+            detected_single_face_count += 1
         elif file_name in asset_names and len(detected) > 1:
             detected_multiple_faces_count += 1
-        if len(detected) == 1:
-            detected_single_face_count += 1
         if len(detected) != 1:
             excluded_ambiguous += 1
             continue
@@ -1581,9 +1783,13 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
         "asset_name_coverage_count": asset_name_coverage_count,
         "asset_name_coverage_rate": asset_name_coverage_count / gt_single_count if gt_single_count else 0.0,
         "gt_assets_missing_from_scope_count": max(0, gt_single_count - asset_name_coverage_count),
+        "strict_metric_face_source": "verified detections only; exactly one face per single-identity GT image",
         "detected_zero_face_count": detected_zero_face_count,
         "detected_single_face_count": detected_single_face_count,
         "detected_multiple_faces_count": detected_multiple_faces_count,
+        "raw_detected_zero_face_count": raw_detected_zero_face_count,
+        "raw_detected_single_face_count": raw_detected_single_face_count,
+        "raw_detected_multiple_faces_count": raw_detected_multiple_faces_count,
         "single_face_without_cluster_count": single_face_without_cluster_count,
         "evaluable_face_count": len(predicted),
         "single_face_detection_of_present_assets_rate": (
@@ -1597,9 +1803,60 @@ def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
         # multiple identity labels, not detector outputs.
         "excluded_multi_face": gt_multi_identity_image_count,
     }
+    image_links = _image_identity_link_metrics(
+        image_to_face_ids,
+        verified_clusters_by_file,
+        asset_names,
+    )
+    gallery = _identity_gallery_metrics(
+        image_to_face_ids,
+        predicted_identities_by_file,
+        asset_names,
+    )
+    diagnostics.update({
+        "identity_gallery_metric": "verified detections assigned to seeded confirmed identity clusters vs GT identity set",
+        "identity_gallery_available": gallery["available"],
+        "identity_gallery_identity_count": len(seed_cluster_by_identity),
+        "identity_gallery_precision": gallery["precision"],
+        "identity_gallery_recall": gallery["recall"],
+        "identity_gallery_f1": gallery["f1"],
+        "identity_gallery_true_positive_count": gallery["true_positive"],
+        "identity_gallery_false_positive_count": gallery["false_positive"],
+        "identity_gallery_false_negative_count": gallery["false_negative"],
+        "identity_gallery_evaluable_image_count": gallery["evaluable_image_count"],
+        "identity_gallery_gt_asset_count": gallery["gt_asset_count"],
+        "identity_gallery_identified_image_count": gallery["identified_image_count"],
+        "identity_gallery_identified_image_rate": (
+            gallery["identified_image_count"] / gallery["evaluable_image_count"]
+            if gallery["evaluable_image_count"] else 0.0
+        ),
+        "image_identity_link_metric": "GT identity-set intersection vs detected cluster-set intersection",
+        "image_identity_link_available": image_links["available"],
+        "image_identity_link_precision": image_links["precision"],
+        "image_identity_link_recall": image_links["recall"],
+        "image_identity_link_f1": image_links["f1"],
+        "image_identity_link_true_positive_count": image_links["true_positive"],
+        "image_identity_link_false_positive_count": image_links["false_positive"],
+        "image_identity_link_false_negative_count": image_links["false_negative"],
+        "image_identity_link_evaluable_pair_count": image_links["evaluable_pair_count"],
+        "image_identity_link_evaluable_image_count": image_links["evaluable_image_count"],
+        "image_identity_link_gt_asset_count": image_links["gt_asset_count"],
+        "image_identity_link_detected_image_count": image_links["detected_image_count"],
+        "image_identity_link_clustered_image_count": image_links["clustered_image_count"],
+        "image_identity_link_asset_coverage_rate": (
+            image_links["gt_asset_count"] / len(image_to_face_ids)
+            if image_to_face_ids else 0.0
+        ),
+        "image_identity_link_clustered_image_rate": (
+            image_links["clustered_image_count"] / image_links["detected_image_count"]
+            if image_links["detected_image_count"] else 0.0
+        ),
+    })
     if len(predicted) < 2:
         return {
-            "available": False,
+            # The inclusive image-level metric is still valid when strict
+            # face-pair scoring has too few unambiguous samples.
+            "available": gallery["available"] or image_links["available"],
             "reason": "fewer than two unambiguous labelled face instances",
             "excluded_ambiguous": excluded_ambiguous,
             **diagnostics,
@@ -1979,6 +2236,14 @@ class BenchmarkRun:
                 "vllm"
             ),
             "model_name": BIG_MODEL_MODEL if self.use_cloud_model else model_profile,
+            # Persist the exact ID sent to the OpenAI-compatible endpoint.
+            # Current-model runs know it before starting; managed profiles
+            # begin with their profile ID and are overwritten after deploy.
+            "served_model_name": (
+                self.current_model_snapshot.get("served_model_name")
+                if self.use_current_model else
+                BIG_MODEL_MODEL if self.use_cloud_model else model_profile
+            ),
             "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
             "qa_limit": qa_limit,
@@ -2034,6 +2299,11 @@ class BenchmarkRun:
                 "model_source": self.state["model_source"],
                 "model_backend": self.state["model_backend"],
                 "model_name": self.state["model_name"],
+                "served_model_name": (
+                    self.current_model_snapshot.get("served_model_name")
+                    if self.current_model_snapshot
+                    else restored.get("served_model_name") or self.state.get("served_model_name")
+                ),
                 "current_model_snapshot": self.current_model_snapshot or restored.get("current_model_snapshot"),
                 "judge_model": judge_model,
                 "judge_url": self.judge_url,
@@ -2700,6 +2970,15 @@ class BenchmarkRun:
         except Exception as e:
             probe = {"error": str(e)}
         t_probe = time.perf_counter() - t_probe0
+
+        # Persist the exact model alias served by the endpoint.  The profile
+        # identifies the configuration, while this value identifies what was
+        # actually sent in the OpenAI-compatible request and is what the UI
+        # should display for a run.
+        self.state["served_model_name"] = str(
+            state.get("served_model_name") or self.model_profile
+        )
+        self.persist(wait=True)
 
         self._phase_done("model_deploy", {
             "unload_seconds": round(t_stop, 1),
@@ -5420,7 +5699,9 @@ class OrchestratorRepository:
                 "status", "started_at", "finished_at", "scope_id",
                 "scope_source", "qa_count", "qa_concurrency",
                 "judge_concurrency", "model_profile",
-                "model_id", "model_name", "vllm_target_id",
+                "model_id", "model_name", "model_backend",
+                "served_model_name", "vllm_target_id", "vllm_model_base_url",
+                "current_model_snapshot",
             )
             public = {key: state.get(key) for key in list_fields if key in state}
             # The list page fetches the selected run's detailed phases
@@ -5439,7 +5720,21 @@ class OrchestratorRepository:
 
             # Prefer persisted aggregates; during a live run use the cheap
             # QA progress counters instead of rescanning every nested trace.
-            saved = state.get("summary") or {}
+            saved = dict(state.get("summary") or {})
+            saved_face = saved.get("face_clustering")
+            try:
+                saved_face_version = int((saved_face or {}).get("metric_definition_version") or 0)
+            except (TypeError, ValueError):
+                saved_face_version = 0
+            if saved_face_version < FACE_CLUSTERING_METRIC_VERSION:
+                scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+                album_id = str(state.get("album_id") or "").strip()
+                album_dir = BENCHMARK_DATA_ROOT / album_id
+                if scope_id and album_id and album_dir.is_dir():
+                    try:
+                        saved["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+                    except Exception:
+                        pass
             summary_fields = (
                 "total", "completed", "judge_valid_count",
                 "judge_distribution", "retrieval_recall_mean",
@@ -5501,6 +5796,20 @@ class OrchestratorRepository:
             # Completed runs already persist their authoritative summary. Do
             # not derive it again from the full trace every time a page opens.
             result["summary"] = dict(saved_summary)
+            face = result["summary"].get("face_clustering")
+            try:
+                face_version = int((face or {}).get("metric_definition_version") or 0)
+            except (TypeError, ValueError):
+                face_version = 0
+            if face_version < FACE_CLUSTERING_METRIC_VERSION:
+                scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+                album_id = str(state.get("album_id") or "").strip()
+                album_dir = BENCHMARK_DATA_ROOT / album_id
+                if scope_id and album_id and album_dir.is_dir():
+                    try:
+                        result["summary"]["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+                    except Exception:
+                        pass
         else:
             # Legacy records with no aggregate still get the reconstructed
             # summary, but the potentially expensive work happens outside the
@@ -5530,8 +5839,14 @@ class OrchestratorRepository:
                 if isinstance(run, BenchmarkRun):
                     with run.lock:
                         run.state.setdefault("summary", {})["graph_quality"] = quality
+                        graph_face = quality.get("face_clustering")
+                        if isinstance(graph_face, dict):
+                            run.state["summary"]["face_clustering"] = graph_face
                 else:
                     run.setdefault("summary", {})["graph_quality"] = quality
+                    graph_face = quality.get("face_clustering")
+                    if isinstance(graph_face, dict):
+                        run["summary"]["face_clustering"] = graph_face
 
             # Keep this derived dashboard value in its small sidecar instead
             # of rewriting run.json (which may contain hundreds of MB of QA
@@ -7045,12 +7360,39 @@ class OrchestratorRepository:
     @staticmethod
     def _list_summary(state: dict) -> dict:
         saved = dict(state.get("summary") or {})
+        saved_face = saved.get("face_clustering")
+        try:
+            saved_face_version = int((saved_face or {}).get("metric_definition_version") or 0)
+        except (TypeError, ValueError):
+            saved_face_version = 0
+        if saved_face_version < FACE_CLUSTERING_METRIC_VERSION:
+            scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+            album_id = str(state.get("album_id") or "").strip()
+            album_dir = BENCHMARK_DATA_ROOT / album_id
+            if scope_id and album_id and album_dir.is_dir():
+                try:
+                    saved["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+                except Exception:
+                    # A reporting repair must never make the run list fail.
+                    pass
         # Interrupted runs may not reach aggregate. Expose face quality from
         # the graph snapshot in the main summary when it is already present.
-        if not saved.get("face_clustering"):
-            graph_face = (saved.get("graph_quality") or {}).get("face_clustering")
-            if isinstance(graph_face, dict):
-                saved["face_clustering"] = graph_face
+        graph_face = (saved.get("graph_quality") or {}).get("face_clustering")
+        saved_face = saved.get("face_clustering")
+        # A completed run may have been written before the evaluator metric
+        # version changed. Prefer the graph snapshot when it contains the
+        # current multi-face-aware fields; otherwise the list page keeps the
+        # old strict pairwise result forever and appears to show zeroes.
+        try:
+            saved_face_version = int((saved_face or {}).get("metric_definition_version") or 0)
+        except (TypeError, ValueError):
+            saved_face_version = 0
+        if isinstance(graph_face, dict) and (
+            not isinstance(saved_face, dict)
+            or saved_face_version < FACE_CLUSTERING_METRIC_VERSION
+            or "identity_gallery_f1" not in saved_face
+        ):
+            saved["face_clustering"] = graph_face
         items = state.get("items") or []
         recalls = [item.get("retrieval_recall") for item in items
                    if isinstance(item.get("retrieval_recall"), (int, float))]

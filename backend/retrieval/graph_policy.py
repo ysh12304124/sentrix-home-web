@@ -31,14 +31,29 @@ _PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
         r"(?:relationship|together|with whom|related|attended)",
     )),
     ("cross_media", (
-        r"(?:视频.*照片|照片.*视频|图.*视频|视频.*图|片段)",
+        r"(?:视频.*照片|照片.*视频|图.*视频|视频.*图|片段|视频记录|录像|视频)",
         r"(?:video.*photo|photo.*video|cross.?media|clip)",
+    )),
+    # Event-centric lookup is useful even when the question asks for one
+    # attribute (place/date) rather than an explicit multi-hop path. Without
+    # this route, a short planner query such as "天台婚礼迎宾展架" is treated
+    # as ordinary visual search and the event's member assets are never used.
+    ("event", (
+        # Natural questions often put location, scene, and action between
+        # the event name and the requested attribute (e.g. "参加婚礼时，
+        # 在户外仪式舞台前拍的那张留影"). A 8–12 character window misses
+        # these ordinary paraphrases and bypasses the event-member route.
+        r"(?:婚礼|婚宴|婚庆|生日|聚会|聚餐|出游|旅行|活动)[^。！？?]{0,40}(?:在哪里|哪儿|地点|在哪|办的|留影|合影|合照|照片|图片|展架|迎宾)",
+        r"(?:那次|这次|当时)[^。！？?]{0,20}(?:婚礼|婚宴|聚会|聚餐|旅行|活动)",
+        r"(?:展架|迎宾|留影|合影|合照|照片|图片)[^。！？?]{0,40}(?:婚礼|婚宴|婚庆|生日|聚会|聚餐|出游|旅行)",
     )),
 )
 
 
 def _mode() -> str:
-    value = str(os.getenv("SENTRIX_GRAPH_RETRIEVAL_MODE", "auto")).strip().lower()
+    # The local benchmark is graph-first; callers can opt into conservative
+    # routing explicitly with SENTRIX_GRAPH_RETRIEVAL_MODE=auto.
+    value = str(os.getenv("SENTRIX_GRAPH_RETRIEVAL_MODE", "on")).strip().lower()
     return value if value in {"off", "auto", "on"} else "auto"
 
 
@@ -74,6 +89,8 @@ def graph_retrieval_policy(question: str, *, filters: Any | None = None,
         or getattr(filters, "annual_time_window", None) is not None
     ):
         intent, matched_signal = "temporal", "hard_time_filter"
+    if intent == "ordinary" and filters is not None and "video" in (getattr(filters, "media_types", None) or ()):
+        intent, matched_signal = "cross_media", "hard_video_filter"
 
     enabled = mode == "on" or (mode == "auto" and intent != "ordinary")
     if mode == "off":
@@ -88,5 +105,5 @@ def graph_retrieval_policy(question: str, *, filters: Any | None = None,
         "intent": intent,
         "reason": reason,
         "matched_signal": matched_signal or None,
-        "policy_version": "graph-route-v2",
+        "policy_version": "graph-route-v3",
     }

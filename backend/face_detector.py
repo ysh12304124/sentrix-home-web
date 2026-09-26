@@ -14,6 +14,7 @@ priors (min_sizes) + variance, not InsightFace's SCRFD format.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import threading
 
 import numpy as np
@@ -25,7 +26,9 @@ MIN_SIZES = [[16, 32], [64, 128], [256, 512]]
 INPUT_SIZE = (640, 640)
 VARIANCES = (0.1, 0.2)
 
-DEFAULT_MODEL_PATH = "/home/asus/benchmarks/retinaface/retinaface_r50.onnx"
+# Keep the fallback portable; deployments can still override it with
+# RETINAFACE_MODEL_PATH (the Windows launcher does so explicitly).
+DEFAULT_MODEL_PATH = str(Path.home() / "benchmarks" / "retinaface" / "retinaface_r50.onnx")
 
 
 def _generate_priors(input_size):
@@ -169,7 +172,7 @@ class RetinaFaceTiledDetector:
         ]
 
     def detect(self, image, threshold=0.3):
-        """Two-pass tiled detection: coarse 1024px, then fine 640px only if empty."""
+        """Two-pass tiled detection: coarse, then fine only if empty."""
         self._load()
         faces = self._detect_tiled(image, tile=1024, overlap=128, threshold=threshold)
         if not faces:

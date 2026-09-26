@@ -2,6 +2,7 @@
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from backend.db import MemoryStore
@@ -13,6 +14,9 @@ from backend.retrieval_ann import create_index
 
 class StubClip:
     model_name = "ViT-B-32"
+    model_id = "ViT-B-32"
+    dimension = 2
+    available = True
     evidence_ready = True
 
     def __init__(self, ready=True):
@@ -21,6 +25,9 @@ class StubClip:
     def embed_text(self, text):
         # deterministic: single feature = hash of first char
         return [float((ord(str(text)[0]) % 97) / 97.0), 0.0]
+
+    def embed_query(self, text):
+        return self.embed_text(text)
 
 
 def _build_index(tmp, dim=2, model="ViT-B-32", scope="album1"):
@@ -38,7 +45,7 @@ def _build_index(tmp, dim=2, model="ViT-B-32", scope="album1"):
 
 def _router():
     clip = StubClip()
-    return EmbeddingRouter.from_clip(clip), clip
+    return EmbeddingRouter(visual=clip), clip
 
 
 class VisualAnnRetrieverTests(unittest.TestCase):
@@ -55,6 +62,20 @@ class VisualAnnRetrieverTests(unittest.TestCase):
             self.assertTrue(hits)
             self.assertEqual(hits[0].asset_id, "asset_0")
             self.assertEqual(hits[0].score_kind, "cosine_similarity")
+
+    def test_empty_qdrant_falls_back_to_hnsw(self):
+        with tempfile.TemporaryDirectory(prefix="vann-") as tmp:
+            _build_index(tmp)
+            router, _ = _router()
+            store = MemoryStore(":memory:")
+            retriever = VisualAnnRetriever(store, embedding_router=router, ann_dir=tmp)
+            with patch.dict("os.environ", {"SENTRIX_VECTOR_BACKEND": "qdrant"}), \
+                    patch.object(retriever, "_retrieve_qdrant", return_value=[]):
+                hits = retriever.retrieve(RetrievalQuery(whole_query="A"),
+                                          HardFilterContext(scope_ids=("album1",)), 5)
+            store.close()
+            self.assertTrue(hits)
+            self.assertEqual(hits[0].asset_id, "asset_0")
 
     def test_scope_filtered_candidates(self):
         with tempfile.TemporaryDirectory(prefix="vann-") as tmp:

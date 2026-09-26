@@ -71,7 +71,7 @@ def main():
     ))
     encoded_path = args.output / "selected_frames.hevc.mp4"
     command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        os.getenv("SENTRIX_FFMPEG_BINARY", "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{info['width']}x{info['height']}",
         "-r", "25", "-i", "pipe:0", "-an", "-vf", "format=nv12,hwupload_cuda",
         "-c:v", "hevc_nvenc", "-preset", "fast", "-rc", "constqp", "-qp", "23",

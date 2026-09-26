@@ -329,7 +329,7 @@ def _decode_one_target(video, frame_index, fps, width, height):
     timestamp = max(0.0, float(frame_index) / max(float(fps), 0.1))
     frame_bytes = int(width) * int(height) * 3
     gpu_command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        os.getenv("SENTRIX_FFMPEG_BINARY", "ffmpeg"), "-hide_banner", "-loglevel", "error",
         "-ss", f"{timestamp:.6f}",
         "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
         "-i", str(video), "-an", "-frames:v", "1",
@@ -346,7 +346,7 @@ def _decode_one_target(video, frame_index, fps, width, height):
     # but decode this target frame on CPU instead of failing the whole video.
     gpu_error = gpu_result.stderr.decode("utf-8", errors="replace")[-800:]
     cpu_command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        os.getenv("SENTRIX_FFMPEG_BINARY", "ffmpeg"), "-hide_banner", "-loglevel", "error",
         "-ss", f"{timestamp:.6f}", "-i", str(video), "-an", "-frames:v", "1",
         "-vf", "format=bgr24", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]

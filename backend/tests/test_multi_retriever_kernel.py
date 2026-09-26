@@ -1,6 +1,7 @@
 """Phase R R2 — multi-retriever Kernel integration (channel trace + attributions)."""
 
 import unittest
+from unittest.mock import patch
 
 from backend.db import MemoryStore
 from backend.evidence_retrieval import EvidenceRetrievalKernel
@@ -62,6 +63,28 @@ class _ConditionRejectingGraph(_SeedAwareGraph):
     def expand(self, seeds, filters, limit, query=None):
         self.seen_seeds = list(seeds)
         return super().expand(seeds, filters, limit, query=query)
+
+
+class _RankedPrimary:
+    kind = "primary"
+    name = "visual_ann"
+
+    def __init__(self, asset_ids):
+        self.asset_ids = list(asset_ids)
+
+    def retrieve(self, query, filters, limit):
+        return [CandidateHit(
+            asset_id=asset_id, retriever=self.name, raw_score=1.0 / rank,
+            score_kind="cosine", higher_is_better=True, rank=rank,
+        ) for rank, asset_id in enumerate(self.asset_ids[:limit], 1)]
+
+
+class _NewGraphCandidate(_SeedAwareGraph):
+    def expand(self, seeds, filters, limit, query=None):
+        return [CandidateHit(
+            asset_id="asset_4", retriever=self.name, raw_score=0.99,
+            score_kind="graph_path", higher_is_better=True, rank=1,
+        )]
 
 
 def _seed_store():
@@ -172,6 +195,39 @@ class MultiRetrieverKernelTests(unittest.TestCase):
             # asset_2 does not satisfy the clothing condition, therefore it
             # is absent from primary_items but must remain a graph anchor.
             self.assertIn("asset_2", graph.seen_seeds)
+        finally:
+            store.close()
+
+    def test_graph_retrieval_promotes_graph_only_candidate_even_with_visual_only_baseline(self):
+        store = _seed_store()
+        try:
+            for index in (3, 4):
+                store.create_asset(
+                    f"asset_{index}", f"IMG_{index}.JPG", "image",
+                    f"/tmp/{index}", "image/jpeg", 1, {"scope_id": "album1"},
+                )
+            draft = QueryParseDraft(intent="search", answer_target="general")
+            spec = build_query_spec(draft, scope_id="album1", viewer_id="owner",
+                                    conversation_id="c", query_id="q")
+            kernel = EvidenceRetrievalKernel(
+                store,
+                retrievers=[
+                    _RankedPrimary(["asset_1", "asset_2", "asset_3"]),
+                    _NewGraphCandidate(),
+                ],
+                embedding_router=StubEmbedderRouter(),
+            )
+            with patch.dict("os.environ", {"SENTRIX_SEARCH_CANDIDATE_TOP_K": "2"}):
+                packet = kernel._retrieve_multi(spec)
+            ids = [item["asset_id"] for item in packet.assets]
+            self.assertEqual(len(ids), 2)
+            self.assertIn("asset_1", ids)
+            self.assertIn("asset_4", ids)
+            rerank = packet.retrieval_timing["graph_rerank"]
+            self.assertEqual(len(rerank["baseline_ranked_asset_ids"]), 2)
+            self.assertEqual(len(rerank["reranked_asset_ids"]), 2)
+            graph_item = next(item for item in packet.assets if item["asset_id"] == "asset_4")
+            self.assertTrue(any(hit["retriever"] == "graph" for hit in graph_item["attributions"]))
         finally:
             store.close()
 

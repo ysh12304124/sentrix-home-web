@@ -75,7 +75,13 @@ class TextAnnRetriever:
             return []
         scope = filters.scope_ids[0] if filters.scope_ids and not filters.all_authorized else None
         if os.getenv("SENTRIX_VECTOR_BACKEND", "sqlite").strip().lower() == "qdrant":
-            return self._retrieve_qdrant(vector, scope, limit)
+            qdrant_hits = self._retrieve_qdrant(vector, scope, limit)
+            if qdrant_hits:
+                return qdrant_hits
+            # Qdrant is an acceleration mirror, not the only source of truth.
+            # Match main: empty/unavailable/mismatched Qdrant results must
+            # fall through to the static HNSW index rather than silently
+            # disabling the text retrieval channel.
         candidates: dict[str, tuple[float, int, dict]] = {}
         for space in self.spaces:
             index = self._load_index(space)

@@ -6,7 +6,7 @@ pydantic-ai-slim>=1.0,<2
 Pillow>=10,<12
 pillow-heif>=0.16,<1
 insightface>=1.0,<2
-onnxruntime-gpu>=1.23,<2
+onnxruntime-gpu[cuda,cudnn]>=1.23,<2
 funasr>=1.2,<2
 torch>=2.2,<3
 transformers>=5,<6
@@ -24,6 +24,8 @@ pandas>=2.0,<3
 # Vendored WorldMM-a keyframe / DMD / Scene pipeline.
 numpy>=1.26,<3
 opencv-python-headless>=4.10,<5
+# Bundled Windows FFmpeg fallback when a system ffmpeg/ffprobe is unavailable.
+imageio-ffmpeg>=0.6,<1
 ultralytics>=8.3,<9
 scikit-image>=0.24,<1
 qdrant-client>=1.12,<2
