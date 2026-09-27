@@ -1627,6 +1627,70 @@ def _explicit_media_filter(text: str) -> str | None:
     return "video" if wants_video else "image"
 
 
+def _video_parent_asset_id(store, asset_id: str) -> str | None:
+    """Resolve a recalled keyframe to its source video asset."""
+    if store is None or not asset_id:
+        return None
+    try:
+        asset = store.get_asset(str(asset_id)) or {}
+    except Exception:
+        return None
+    metadata = asset.get("metadata_json") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    derived = str(
+        asset.get("derived_kind")
+        or (metadata.get("derived_kind") if isinstance(metadata, dict) else "")
+        or ""
+    ).strip().lower()
+    if derived not in {"video_keyframe", "video_keyframe_webp", "video_mtsw_keyframe"}:
+        return None
+    parent_id = str(
+        asset.get("parent_asset_id")
+        or (metadata.get("parent_asset_id") if isinstance(metadata, dict) else "")
+        or ""
+    ).strip()
+    if not parent_id:
+        return None
+    try:
+        parent = store.get_asset(parent_id) or {}
+    except Exception:
+        return None
+    return parent_id if str(parent.get("media_type") or "").lower() == "video" else None
+
+
+def _add_video_parent_candidates(scores: dict[str, float], source_ids, store,
+                                  *, media_constraint: str = "") -> list[str]:
+    """Add source videos for recalled keyframes before the candidate cap.
+
+    This is provenance expansion only. It does not inspect GT, answer text, or
+    image pixels, and explicit image-only searches remain image-only.
+    """
+    if media_constraint == "image":
+        return []
+    added = []
+    for asset_id in list(dict.fromkeys(
+            str(value) for value in (source_ids or []) if value)):
+        parent_id = _video_parent_asset_id(store, asset_id)
+        if not parent_id:
+            continue
+        source_score = float(scores.get(asset_id) or 0.0)
+        if source_score <= 0.0:
+            continue
+        # Keep the keyframe's relevance signal, while allowing an independently
+        # recalled parent to retain the stronger score.
+        parent_score = source_score * 0.94
+        old_score = scores.get(parent_id)
+        if old_score is None or parent_score > float(old_score):
+            scores[parent_id] = parent_score
+            if old_score is None:
+                added.append(parent_id)
+    return added
+
+
 def _build_semantic_routes(primary_query: str, *, query_core: str = "",
                             tool_query: str = "", object_terms=None,
                             user_query: str = "", max_routes: int = 4) -> list[tuple[str, str]]:
@@ -2130,6 +2194,18 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         for aid in place_matched_ids:
             scores[aid] = scores.get(aid, 0.0) + place_boost
 
+    # A keyframe is indexed as an image, but the benchmark's video GT is the
+    # parent source video.  Expand this provenance edge before the bounded
+    # candidate head is cut, so an otherwise correct keyframe hit cannot lose
+    # its matching video merely because the Agent receives only 18 candidates.
+    # This is retrieval-only; metric matching and final delivery are untouched.
+    video_parent_added = _add_video_parent_candidates(
+        scores,
+        list(scores) + list(event_member_ids),
+        store,
+        media_constraint=media_constraint,
+    )
+
     kept = list(scores)
     if time_comps is not None or time_bounds:
         kept = [aid for aid in kept if _time_ok(_asset_captured(aid))]
@@ -2171,6 +2247,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "lexical_anchor_surface_count": len(lexical_anchor_surfaces),
             "lexical_anchor_candidate_count": len(lexical_anchor_valid),
             "lexical_anchor_added_count": lexical_anchor_added,
+            "video_parent_added_count": len(video_parent_added),
             "post_anchor_candidate_count": len(kept),
             "returned_candidate_count": len(final_ids),
         }

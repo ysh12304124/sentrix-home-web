@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 import re
 
-from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from .base import CandidateHit, HardFilterContext, RetrievalQuery, effective_media_type
 from .temporal import trusted_captured_at
 
 
@@ -54,9 +54,10 @@ class MetadataRetriever:
             if not filters.all_authorized and filters.scope_ids and asset_scope not in filters.scope_ids:
                 continue
             media_type = asset.get("media_type")
-            if filters.media_types and media_type not in filters.media_types:
+            retrieval_media_type = effective_media_type(asset)
+            if filters.media_types and retrieval_media_type not in filters.media_types:
                 continue
-            if media_type in filters.negated_media:
+            if retrieval_media_type in filters.negated_media:
                 continue
             if filters.time_bounds:
                 captured = _parse_datetime(trusted_captured_at(asset, store=self.store))

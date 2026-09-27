@@ -1030,7 +1030,8 @@ class EvidenceRetrievalKernel:
                 matched = bool(captured and window and _in_annual_window(captured, window))
             return ("matched", "asset_metadata", asset.get("id"), 1.0) if matched else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
         if constraint.dimension == "media":
-            return ("matched", "asset_metadata", asset.get("id"), 1.0) if asset.get("media_type") == value else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
+            from .retrieval.base import effective_media_type
+            return ("matched", "asset_metadata", asset.get("id"), 1.0) if effective_media_type(asset) == value else ("contradicted", "asset_metadata", asset.get("id"), 1.0)
         if constraint.dimension == "person":
             # people entries may be plain names OR confirmed-entity dicts
             # ({entity_id, name, status}).  A confirmed bridge must match both,

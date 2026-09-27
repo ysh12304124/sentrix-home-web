@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from .base import CandidateHit, HardFilterContext, RetrievalQuery, effective_media_type
 from .temporal import trusted_captured_at
 
 
@@ -167,9 +167,9 @@ class AdjacencyRetriever:
         if not filters.all_authorized and filters.scope_ids and scope_id not in filters.scope_ids:
             return False
         media_type = asset_or_observation.get("media_type")
-        if filters.media_types and media_type not in filters.media_types:
+        if filters.media_types and effective_media_type(asset_or_observation) not in filters.media_types:
             return False
-        if media_type in filters.negated_media:
+        if effective_media_type(asset_or_observation) in filters.negated_media:
             return False
         if filters.time_bounds:
             captured = _parse_datetime(trusted_captured_at(asset_or_observation, store=self.store))

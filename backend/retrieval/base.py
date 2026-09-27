@@ -19,6 +19,33 @@ from typing import Any, Protocol
 from ..query_contracts import Constraint, QueryFacet
 
 
+VIDEO_DERIVED_KINDS = frozenset({
+    "video_keyframe",
+    "video_keyframe_webp",
+    "video_mtsw_keyframe",
+})
+
+
+def effective_media_type(asset: dict | None) -> str:
+    """Normalize keyframes to the video modality for retrieval filters."""
+    asset = asset or {}
+    metadata = asset.get("metadata_json") or {}
+    if isinstance(metadata, str):
+        try:
+            import json
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    derived = str(
+        asset.get("derived_kind")
+        or (metadata.get("derived_kind") if isinstance(metadata, dict) else "")
+        or ""
+    ).strip().lower()
+    if derived in VIDEO_DERIVED_KINDS:
+        return "video"
+    return str(asset.get("media_type") or "").strip().lower()
+
+
 @dataclass(frozen=True)
 class HardFilterContext:
     scope_ids: tuple[str, ...]

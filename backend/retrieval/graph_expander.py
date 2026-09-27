@@ -7,7 +7,7 @@ import re
 import threading
 from dataclasses import replace
 
-from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from .base import CandidateHit, HardFilterContext, RetrievalQuery, effective_media_type
 from .graph_policy import graph_retrieval_policy
 
 
@@ -172,7 +172,7 @@ class GraphExpander:
             except Exception:
                 asset = {}
             media_type = str(asset.get("media_type") or "")
-            if filters.media_types and media_type not in filters.media_types:
+            if filters.media_types and effective_media_type(asset) not in filters.media_types:
                 continue
             if self._prefers_still_images(query, filters) and self._is_video_evidence(asset_id):
                 continue
