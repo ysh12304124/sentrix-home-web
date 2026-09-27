@@ -729,6 +729,95 @@ def _extract_time_from_query(query: str) -> str | None:
     return None
 
 
+_MODEL_FILTER_NOISE = frozenset({
+    "未知", "不明", "unknown", "none", "null", "无", "没有",
+    # These are useful semantic concepts, but not geographic hard filters.
+    "天台", "屋顶", "室内", "户外", "室外", "家里", "家中", "房间",
+    "客厅", "卧室", "厨房", "舞台", "门口", "路边", "聚餐", "婚礼",
+    "活动", "旅行", "展架", "迎宾展架", "餐厅", "海洋馆", "景区",
+})
+
+
+def _compact_filter_text(value: str) -> str:
+    return re.sub(r"[\s，。！？、,.!?；;：:]", "", str(value or "")).strip()
+
+
+def _literal_in_text(value: str, text: str) -> bool:
+    value = _compact_filter_text(value)
+    text = _compact_filter_text(text)
+    return bool(value and text and value in text)
+
+
+def _looks_like_scene_place(value: str) -> bool:
+    compact = _compact_filter_text(value).lower()
+    if not compact:
+        return True
+    if compact in _MODEL_FILTER_NOISE:
+        return True
+    return any(token in compact for token in _MODEL_FILTER_NOISE
+               if len(token) >= 2 and token not in {"unknown", "null"})
+
+
+def _trusted_query_constraints(text: str, store=None, scope_id: str = "") -> dict:
+    """Extract structured constraints from user wording, not planner output."""
+    from .canonical_intent import extract_time
+
+    text = str(text or "")
+    constraints = {"time": extract_time(text), "place": None, "person": None}
+    if store is not None and scope_id:
+        try:
+            from .canonical_intent import extract_constraints
+            parsed = extract_constraints(text, store, scope_id) or {}
+            for key in ("time", "place", "person"):
+                if parsed.get(key):
+                    constraints[key] = parsed[key]
+        except Exception:
+            pass
+    return constraints
+
+
+def _sanitize_model_filters(raw_filters: dict | None, *, query: str = "",
+                            user_goal: str = "", store=None,
+                            scope_id: str = "", trusted_constraints: dict | None = None) -> dict:
+    """Prevent hallucinated planner slots from becoming hard filters.
+
+    Media remains an explicit tool contract.  Time/place/person are accepted
+    only when grounded in the user's wording or trusted scope metadata; an
+    ambiguous value is dropped so it cannot remove the correct asset before
+    semantic or graph ranking runs.
+    """
+    raw = dict(raw_filters or {})
+    text = str(user_goal or query or "")
+    trusted = trusted_constraints or _trusted_query_constraints(text, store, scope_id)
+    sanitized: dict = {}
+
+    media = str(raw.get("media") or "").strip().lower()
+    if media in {"image", "video"}:
+        sanitized["media"] = media
+
+    if trusted.get("time"):
+        sanitized["time"] = trusted["time"]
+    else:
+        raw_time = str(raw.get("time") or "").strip()
+        if raw_time and _literal_in_text(raw_time, text):
+            sanitized["time"] = raw_time
+
+    trusted_place = str(trusted.get("place") or "").strip()
+    raw_place = str(raw.get("place") or "").strip()
+    if trusted_place:
+        sanitized["place"] = trusted_place
+    elif (raw_place and _literal_in_text(raw_place, text)
+          and not _looks_like_scene_place(raw_place)):
+        sanitized["place"] = raw_place
+
+    # Only confirmed scope entities become person hard filters.  This avoids
+    # treating “我和同事/兄弟们” as an entity name and shrinking recall.
+    trusted_person = str(trusted.get("person") or "").strip()
+    if trusted_person:
+        sanitized["person"] = trusted_person
+    return sanitized
+
+
 def _event_resolution(question: str, store, scope_id: str) -> dict | None:
     """W2.4：多轮引用解析到 Event（turn-0 无结果集时的二级锚）。
 
@@ -1913,12 +2002,32 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # tool call or the original user wording; scope authorization remains
     # enforced by the runtime context.
     raw_filters = dict(arguments.get("filters") or {})
-    filters = {}
-    media = str(raw_filters.get("media") or "").strip().lower()
-    if media in {"image", "video"}:
-        filters["media"] = media
     scope_id = (context or {}).get("scope_id") or ""
     user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
+    store = _RUNTIME.get("store")
+    trusted_constraints = _trusted_query_constraints(
+        user_goal or query, store=store, scope_id=scope_id)
+    filters = _sanitize_model_filters(
+        raw_filters,
+        query=query,
+        user_goal=user_goal,
+        store=store,
+        scope_id=scope_id,
+        trusted_constraints=trusted_constraints,
+    )
+    media = str(filters.get("media") or "").strip().lower()
+    model_filter_drops = {
+        key: str(raw_filters.get(key) or "")
+        for key in ("time", "place", "person")
+        if raw_filters.get(key) and not filters.get(key)
+    }
+    model_filter_rewrites = {
+        key: {"from": str(raw_filters.get(key) or ""),
+              "to": str(filters.get(key) or "")}
+        for key in ("time", "place", "person")
+        if raw_filters.get(key) and filters.get(key)
+        and str(raw_filters.get(key)) != str(filters.get(key))
+    }
     media_filter_source = "tool_arguments" if filters.get("media") else "none"
     if not filters.get("media"):
         inferred_media = _explicit_media_filter(user_goal or query)
@@ -1987,6 +2096,24 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             _slot_days = sorted({int(d) for d in (_st.get("days") or [])
                                  if str(d).isdigit()})
             _slot_expr = str(_st.get("expr") or "")
+            _trusted_time = str(trusted_constraints.get("time") or "")
+            _trusted_time_year = None
+            _year_match = re.search(r"(?:19|20)\d{2}", _trusted_time)
+            if _year_match:
+                _trusted_time_year = int(_year_match.group(0))
+            # Slot output is a ranking aid, never a source of new hard
+            # constraints.  A model-produced year that conflicts with the
+            # user's wording is discarded; no explicit user time means no
+            # time filter at all.
+            if not _trusted_time:
+                _slot_year, _slot_months, _slot_days = None, [], []
+                _slot_expr = ""
+            elif (_trusted_time_year is not None and _slot_year is not None
+                  and int(_slot_year) != _trusted_time_year):
+                _slot_year, _slot_months, _slot_days = None, [], []
+                _slot_expr = _trusted_time
+            if _trusted_time:
+                filters["time"] = _trusted_time
             # 相对时间（去年/今年/上个月/这两年…）模型不推年份，只给 expr，
             # 这里用确定性换算成绝对表达式走原有 bounds 路径。
             if not (_slot_year or _slot_months or _slot_days) and _slot_expr:
@@ -2000,17 +2127,27 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                 _slot_lo, _slot_hi = min(_slot_months), max(_slot_months)
                 filters["time"] = (f"{_slot_y}年{_slot_lo}月-{_slot_hi}月"
                                    if _slot_lo != _slot_hi else f"{_slot_y}年{_slot_lo}月")
-            if _slots["place"].get("name"):
+            if trusted_constraints.get("place"):
+                filters["place"] = str(trusted_constraints["place"])
+                _slot_place_source = "canonical_user"
+            elif (_slots["place"].get("name")
+                  and filters.get("place")
+                  and _literal_in_text(_slots["place"].get("name"), _slot_input)
+                  and not _looks_like_scene_place(_slots["place"].get("name"))):
                 # Keep the most specific wording from the question. Replacing
                 # it with a broader normalized hint (e.g. “保定市易县” for
                 # “易县沙岭”) loses the village anchor needed to distinguish
                 # same-county events.
                 filters["place"] = _slots["place"].get("name")
                 _slot_place_source = "name"
-            elif _slots["place"].get("hint"):
+            elif (_slots["place"].get("hint")
+                  and filters.get("place")
+                  and _literal_in_text(_slots["place"].get("hint"), _slot_input)):
                 filters["place"] = _slots["place"].get("hint")
                 _slot_place_source = "hint"
-            if _slots.get("person"):
+            if trusted_constraints.get("person"):
+                filters["person"] = str(trusted_constraints["person"])
+            elif _slots.get("person") and filters.get("person"):
                 filters["person"] = "、".join(p["name"] for p in _slots["person"])
             _slot_event = _slots["event"].get("name") or ""
             _slot_objects = [str(o) for o in (_slots.get("object") or [])]
@@ -2039,7 +2176,6 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # ===== 新多路召回：按维度独立召回 + 跨召回重合评分 =====
     # 语义召回列表：每个 object 词（拆槽输出）+ 完整问题（主语义）。object 数量
     # 由模型判断（可多可少、可没有）；每条独立召回，图在各路的排名参与评分。
-    store = _RUNTIME.get("store")
     semantic_route_entries = _build_semantic_routes(
         query_for_retrieval,
         query_core=_slot_query_core,
@@ -2327,6 +2463,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "place_filter_active": bool(place_q),
             "media_filter": filters.get("media") or None,
             "media_filter_source": media_filter_source,
+            "model_filter_drops": model_filter_drops,
+            "model_filter_rewrites": model_filter_rewrites,
+            "trusted_time": str(trusted_constraints.get("time") or ""),
+            "trusted_place": str(trusted_constraints.get("place") or ""),
             "place_matched_candidate_count": len(place_matched_ids),
             "place_boost": round(place_boost, 6),
             "event_anchor_enabled": event_anchor_enabled,

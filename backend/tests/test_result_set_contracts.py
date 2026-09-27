@@ -209,6 +209,19 @@ class ResultSetContractTests(unittest.TestCase):
         )
         self.assertNotIn("time", no_time)
 
+    def test_model_scene_place_and_collective_person_do_not_become_hard_filters(self):
+        sanitized = runtime_tools._sanitize_model_filters(
+            {"place": "迎宾展架", "person": "我和同事", "time": "去年"},
+            query="婚礼现场照片", user_goal="帮我找婚礼现场的照片",
+        )
+        self.assertNotIn("place", sanitized)
+        self.assertNotIn("person", sanitized)
+        self.assertNotIn("time", sanitized)
+
+    def test_short_year_is_canonicalized_without_using_current_year(self):
+        from backend.agent_runtime.canonical_intent import extract_time
+        self.assertEqual(extract_time("我记得17年国庆拍的照片"), "2017年")
+
     def test_pending_resolution_reads_flattened_tool_recommendation(self):
         task = type("Task", (), {"tool_results": [{
             "tool": "search_memories",

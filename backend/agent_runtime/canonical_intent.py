@@ -13,6 +13,9 @@ import os
 _RELATIVE = ("这两年", "近两年", "最近两年", "最近一年", "今年", "去年", "前年",
              "上上个月", "上个月", "去年春天", "去年夏天", "去年秋天", "去年冬天")
 
+_CALENDAR_WORDS = ("国庆节", "国庆", "春节", "元旦", "中秋", "端午",
+                   "春天", "春季", "夏天", "夏季", "秋天", "秋季", "冬天", "冬季")
+
 # 场景/语义噪声词：不作为 canonical 地点（observation.place 的场景类型，非检索地点）
 _PLACE_NOISE = ("户外", "户外公共场所", "餐厅", "厨房", "室内", "沙滩", "街道",
                 "快餐店", "奶茶店", "咖啡", "室内厨房", "餐厅内部", "天花板", "墙面")
@@ -27,11 +30,21 @@ def canonical_enabled() -> bool:
 def extract_time(question: str) -> str | None:
     """返回问题中的时间片段（优先完整日期，其次年月，其次年）或相对时间词。"""
     q = re.sub(r"\s+", "", question or "")
-    for pattern in (r"20\d{2}年\d{1,2}月\d{1,2}日", r"20\d{2}年\d{1,2}月", r"20\d{2}年"):
+    for pattern in (r"(?:19|20)\d{2}年\d{1,2}月\d{1,2}日",
+                    r"(?:19|20)\d{2}年\d{1,2}月",
+                    r"(?:19|20)\d{2}年"):
         m = re.search(pattern, q)
         if m:
             return m.group(0)
+    m = re.search(r"(?<!\d)(\d{2})年", q)
+    if m:
+        short_year = int(m.group(1))
+        full_year = 2000 + short_year if short_year < 70 else 1900 + short_year
+        return f"{full_year}年"
     for expr in _RELATIVE:
+        if expr in q:
+            return expr
+    for expr in _CALENDAR_WORDS:
         if expr in q:
             return expr
     return None
