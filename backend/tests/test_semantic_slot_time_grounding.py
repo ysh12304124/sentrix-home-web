@@ -15,6 +15,26 @@ from backend.agent_runtime.tools import (
 
 
 class SemanticSlotTimeGroundingTests(unittest.TestCase):
+    def test_single_leave_photo_promotes_semantic_single_person_frame(self):
+        class Store:
+            def __init__(self):
+                self.rows = {
+                    "group": {"caption": "四名男子在紫色纱幔前室内合影。",
+                              "activity": "合影", "place": "室内空间",
+                              "people": ["男子1", "男子2", "男子3", "男子4"]},
+                    "target": {"caption": "男子站在紫色与白色帷幕前。",
+                                "activity": "站立拍照", "place": "室内空间",
+                                "people": ["男子"]},
+                }
+
+            def list_observations(self, asset_id=None, limit=1):
+                return [self.rows[asset_id]]
+
+        store = Store()
+        question = "国庆节我在河北婚礼仪式舞台拍了留影，记得有紫色的布，地点是哪里？"
+        order = _preview_query_order(["group", "target"], question, store)
+        self.assertEqual(order, [1, 0])
+
     def test_explicit_user_media_type_survives_missing_tool_filter(self):
         self.assertEqual(
             _explicit_media_filter("我想找全家去正定游玩时拍的那段视频。"),

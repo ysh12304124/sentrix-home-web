@@ -248,6 +248,11 @@ _PREVIEW_QUERY_ALIASES = {
     "三人": ("三人", "三个人", "三人合影"),
     "三个人": ("三人", "三个人", "三人合影"),
     "合影": ("合影", "自拍", "合照"),
+    # “留影/拍照”通常指用户要找一张具体的摆拍图，不等同于多人合影。
+    # 保留为独立 cue，避免事件内的合影因为同时出现“婚礼/紫色”等泛词而压过
+    # 真正的单人留影关键帧。
+    "留影": ("留影", "拍照", "站立拍照", "摆拍", "个人照"),
+    "拍照": ("拍照", "站立拍照", "摆拍", "留影", "个人照"),
     "舞台": ("舞台", "仪式", "典礼"),
     "户外": ("户外", "室外", "露天"),
     "夜晚": ("夜晚", "夜间", "夜景", "灯光"),
@@ -324,6 +329,47 @@ def _preview_query_term_weights(query: str, summaries: list[str]) -> dict[str, f
         # discriminative village/object cue can influence the visible head.
         weights[term] = 1.0 + math.log((total + 1) / (document_frequency + 1))
     return weights
+
+
+def _query_prefers_single_evidence(query: str) -> bool:
+    """Whether the wording asks for one concrete photo rather than a group set.
+
+    This is a retrieval intent, not a benchmark/GT rule.  A scene question such
+    as “拍了留影” is commonly answered by one posed frame, while “合影/和朋友”
+    explicitly asks for a group image.  Keeping the distinction here prevents
+    the event's generic cover photo from winning solely because it has more
+    detected faces.
+    """
+    text = str(query or "")
+    single_cues = ("留影", "拍照", "拍了照", "一张", "这张", "那张", "个人照")
+    group_cues = ("合影", "合照", "多人", "和朋友", "跟朋友", "兄弟们", "全家",
+                  "一家人", "几张", "哪些照片", "一共")
+    return any(cue in text for cue in single_cues) and not any(
+        cue in text for cue in group_cues
+    )
+
+
+def _semantic_people_count(store, asset_id: str) -> int | None:
+    """Return the count from the stored semantic people list, when available.
+
+    Face-instance counts are deliberately not used: one image can contain
+    duplicate/low-quality detections, which made face count a noisy proxy for
+    “single photo vs group photo”.
+    """
+    if store is None or not asset_id:
+        return None
+    try:
+        rows = store.list_observations(asset_id=asset_id, limit=1) or []
+        row = rows[0] if rows else {}
+        values = row.get("people") or row.get("people_json") or []
+        if isinstance(values, str):
+            values = json.loads(values)
+        if not isinstance(values, list):
+            return None
+        values = [str(value).strip() for value in values if str(value).strip()]
+        return len(values) if values else None
+    except Exception:
+        return None
 
 
 def _observation_summary(store, asset_id: str) -> str:
@@ -408,7 +454,8 @@ def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
             except ValueError:
                 requested_count = None
     terms = _preview_query_terms(text)
-    if not cues and not terms and requested_count is None:
+    single_evidence = _query_prefers_single_evidence(text)
+    if not cues and not terms and requested_count is None and not single_evidence:
         return list(range(len(asset_ids)))
     summaries = [_observation_summary(store, asset_id) for asset_id in asset_ids]
     term_weights = _preview_query_term_weights(text, summaries)
@@ -432,6 +479,14 @@ def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
                            3: ("三个", "三名", "三人"), 4: ("四个", "四名", "四人")}
             if any(word in summary for word in count_words.get(requested_count, ())):
                 score += 3
+        if single_evidence:
+            # Semantic people labels are more stable than raw face detections.
+            # The latter can count duplicate boxes or background faces.
+            people_count = _semantic_people_count(store, asset_id)
+            if people_count == 1:
+                score += 4.0
+            elif people_count and people_count > 1:
+                score -= min(4.0, 1.5 * (people_count - 1))
         scored.append((-score, index))
     scored.sort()
     return [index for _, index in scored]
@@ -2061,14 +2116,31 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             })
             continue
 
-    # 事件成员：只做"重合 +1"（确定性弱验证，不参与排名）——事件可能划分不清、
-    # 属于事件不代表与问题相关，不特殊对待；没有成员/没找到事件则跳过。
+    # 事件成员：只做“重合 +1”（确定性弱验证，不参与排名）——事件可能划分不清、
+    # 属于事件不代表与问题相关，不特殊对待。除了显式 event 槽，再给有明确
+    # 时间/地点/媒体或场景线索的问题一次保守的事件锚尝试；槽位模型偶尔漏掉
+    # “婚礼/留影”等事件词时，不能因此把整组真实资产从候选宇宙中删掉。
     event_member_ids: set[str] = set()
-    if _slot_event:
+    event_anchor_query = str(user_goal or query or "")
+    task_answerability = str(
+        ts_ctx.get("answerability") or ts_ctx.get("expected_action") or ""
+    ).strip().lower()
+    event_anchor_enabled = bool(
+        _slot_event or filters.get("time") or filters.get("place")
+        or filters.get("person") or filters.get("media")
+        or any(term in event_anchor_query for term in (
+            "照片", "图片", "留影", "拍照", "合影", "合照", "视频", "哪天",
+            "日期", "地点", "哪里", "场景", "舞台", "婚礼", "旅行",
+        ))
+    ) and task_answerability not in {"unanswerable", "refuse", "refusal"}
+    event_anchor_source = "none"
+    if event_anchor_enabled:
         try:
-            _ev = _event_resolution(user_goal or query, store, scope_id)
+            _ev = _event_resolution(event_anchor_query, store, scope_id)
+            event_anchor_source = "resolution" if _ev else "none"
             if _ev is None:
-                _ev = _event_keyword_anchor(user_goal or query, store, scope_id)
+                _ev = _event_keyword_anchor(event_anchor_query, store, scope_id)
+                event_anchor_source = "keyword" if _ev else "none"
             event_member_ids = {
                 str(a) for a in ((_ev or {}).get("asset_ids") or [])
                 if not _is_synthetic_event_asset({"asset_id": str(a)}, store)
@@ -2225,6 +2297,19 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     if len(final_ids) < 3 and len(kept) > len(final_ids):
         final_ids = kept[:3]  # 保底 3 张，避免模型无可选
 
+    # The candidate set above is still the graph/semantic union.  Only reorder
+    # the bounded head by the original user wording before exposing stable
+    # photo_N handles.  This is important because the Agent commonly selects
+    # photo_1: a correct frame at rank 4 was counted as a miss even though it
+    # was already in the retrieved set.  The reordering is local to the
+    # candidate head; it neither adds GT/answer information nor changes graph
+    # candidate membership or metric calculation.
+    candidate_order_query = user_goal or query_for_retrieval or query
+    if final_ids and mode != "representative":
+        order = _preview_query_order(final_ids, candidate_order_query, store)
+        final_ids = [final_ids[index] for index in order
+                     if 0 <= index < len(final_ids)]
+
     slot_retrieval_timing = {
         "semantic_retrieval": {
             "primary_query_source": semantic_query_source,
@@ -2244,6 +2329,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "media_filter_source": media_filter_source,
             "place_matched_candidate_count": len(place_matched_ids),
             "place_boost": round(place_boost, 6),
+            "event_anchor_enabled": event_anchor_enabled,
+            "event_anchor_source": event_anchor_source,
+            "event_anchor_candidate_count": len(event_member_ids),
             "lexical_anchor_surface_count": len(lexical_anchor_surfaces),
             "lexical_anchor_candidate_count": len(lexical_anchor_valid),
             "lexical_anchor_added_count": lexical_anchor_added,
