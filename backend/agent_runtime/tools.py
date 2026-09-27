@@ -2152,17 +2152,13 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             _slot_event = _slots["event"].get("name") or ""
             _slot_objects = [str(o) for o in (_slots.get("object") or [])]
             _slot_query_core = str(_slots.get("query_core") or "").strip()
-    # 语义检索用完整语义目标（Planner declaration.goal / user_goal），而非模型
-    # 传入的简化词序列 query（"亲戚婚房 兄弟 合影" 这类 embedding 质量差，实测
-    # 候选 0）。槽位只做精确通道过滤（metadata time/place、entity person）。
+    # The original user wording is the canonical semantic query. Planner
+    # declarations are model paraphrases and regularly omit an anchor
+    # (time/place/event) from long QA questions. Letting one become the primary
+    # embedding query caused recall to deteriorate across question families.
     ts_ctx = (context or {}).get("task_state") or {}
-    _decl = ts_ctx.get("declaration") or {}
-    planner_goal = (context or {}).get("planner_goal") or ""
-    declaration_goal = (_decl.get("goal") if isinstance(_decl, dict) else "")
-    semantic_query = (planner_goal or declaration_goal or user_goal or query)
+    semantic_query = (user_goal or query)
     semantic_query_source = (
-        "planner_goal" if planner_goal else
-        "declaration_goal" if declaration_goal else
         "user_goal" if user_goal else "tool_query"
     )
     query_for_retrieval = semantic_query
