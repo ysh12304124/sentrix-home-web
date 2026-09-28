@@ -2667,10 +2667,22 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     public_handles = {asset_id: f"photo_{index + 1}"
                       for index, asset_id in enumerate(rs.visible_asset_ids())}
     validation_rows = []
-    cond, satisfaction, answerability = _truth_contract(packet, rs.total)
-    evidence_status = public_status
-    satisfaction = "candidate_only" if asset_ids else "no_direct_support"
-    answerability = "full" if asset_ids else "limited"
+    # Preserve conservative visual/document handling, but make direct capture
+    # metadata usable when the leading record independently matches the event
+    # context. This is retrieval evidence, not a benchmark-specific answer.
+    cond = _retrieval_support_conditions(preview_query, preview)
+    _packet_cond, _packet_satisfaction, _packet_answerability = _truth_contract(packet, rs.total)
+    if cond:
+        satisfaction = ("full_support" if all(
+            value.get("status") == "matched" for value in cond.values()
+        ) else "partial_support")
+        answerability = "full" if satisfaction == "full_support" else "partial"
+        evidence_status = "validated"
+    else:
+        cond = _packet_cond
+        satisfaction = "candidate_only" if asset_ids else "no_direct_support"
+        answerability = "full" if asset_ids else "limited"
+        evidence_status = public_status
     return {
         "result_set_id": rs.result_set_id,
         "query": query,
@@ -2799,6 +2811,47 @@ def _recommended_resolution(query: str, preview: list, satisfaction: str,
         return {"needed": True, "tool": "inspect_photo",
                 "reason": "问题需要查看照片中的视觉细节，请用 inspect_photo 复核 preview 里的照片"}
     return {"needed": False, "tool": None, "reason": ""}
+
+
+def _retrieval_support_conditions(query: str, preview: list[dict]) -> dict:
+    """Derive a conservative support contract from returned evidence.
+
+    Semantic retrieval used to label every non-empty ResultSet
+    ``candidate_only``. That discarded capture date and geocoded place already
+    stored on a recalled asset, so the runtime correctly refused to answer
+    straightforward time/place questions. Upgrade only direct metadata
+    questions whose leading record matches multiple independent context
+    anchors; visual/OCR questions remain on the existing inspect/read path.
+    """
+    if not preview:
+        return {}
+    text = str(query or "")
+    leading = preview[0] or {}
+    summary = str(leading.get("evidence_summary") or "")
+    context_hits = [token for token in _preview_context_bigrams(text)
+                    if token in summary]
+    # A generic date/place overlap is not enough. Two anchors (for example
+    # "婚礼" + "舞台", or "菜单" + "炸鸡") establish that this asset belongs to
+    # the described event rather than merely sharing a broad context.
+    if len(context_hits) < 2:
+        return {}
+
+    conditions: dict[str, dict[str, str]] = {
+        "semantic_context": {"status": "matched"},
+    }
+    wants_time = bool(re.search(
+        r"哪(?:一)?天|哪一年|哪年|什么时候|什么时间|日期|几月|何时|哪日", text))
+    wants_place = bool(re.search(
+        r"在哪里|在哪儿|哪儿|哪里|什么地方|哪个城市|哪个区|哪举办|地点|位置", text))
+    if wants_time:
+        conditions["captured_at"] = {
+            "status": "matched" if leading.get("captured_at") else "unknown"
+        }
+    if wants_place:
+        conditions["place"] = {
+            "status": "matched" if leading.get("place") else "unknown"
+        }
+    return conditions
 
 
 def _truth_contract(packet, total: int) -> tuple[dict, str, str]:

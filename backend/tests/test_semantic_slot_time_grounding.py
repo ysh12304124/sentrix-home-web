@@ -10,6 +10,7 @@ from backend.agent_runtime.tools import (
     _preview_indices,
     _preview_query_order,
     _recommended_handle,
+    _retrieval_support_conditions,
     _needs_place_semantic_fallback,
 )
 
@@ -149,6 +150,27 @@ class SemanticSlotTimeGroundingTests(unittest.TestCase):
                    side_effect=lambda _store, aid: summaries[aid]):
             order = _preview_query_order(asset_ids, question, None)
         self.assertEqual(order[0], 1)
+
+    def test_direct_time_and_place_can_use_contextually_matched_metadata(self):
+        preview = [{
+            "captured_at": "2017-10-04 22:31:47",
+            "place": "保定市易县",
+            "evidence_summary": "夜间婚礼仪式舞台前的留影，紫色帷幕背景。",
+        }]
+        conditions = _retrieval_support_conditions(
+            "我在婚礼仪式舞台前拍的留影是哪一天、在哪里？", preview)
+        self.assertEqual(conditions["semantic_context"]["status"], "matched")
+        self.assertEqual(conditions["captured_at"]["status"], "matched")
+        self.assertEqual(conditions["place"]["status"], "matched")
+
+    def test_metadata_is_not_upgraded_for_a_generic_context_match(self):
+        preview = [{
+            "captured_at": "2017-10-04 22:31:47",
+            "place": "保定市易县",
+            "evidence_summary": "夜间儿童在气球旁拍照。",
+        }]
+        self.assertEqual(_retrieval_support_conditions(
+            "婚礼仪式舞台前的留影是哪一天？", preview), {})
 
     def test_visible_preview_uses_query_selected_indices_and_stable_handles(self):
         def make_entry(_store, asset_id, handle, *, priority_rank=None,
