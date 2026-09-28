@@ -269,6 +269,18 @@ _PREVIEW_QUERY_STOPWORDS = {
     "附近", "具体", "哪里", "哪儿", "什么", "时候", "发生", "经历", "帮忙", "一下",
 }
 
+# These are common grammatical/retrieval words rather than event-defining
+# visual facts.  They must not make an unrelated image look like a strong
+# match merely because both the question and its caption say "photo" or
+# "activity".  The list is intentionally domain-neutral: it applies equally
+# to trips, documents, family photos, products and videos.
+_PREVIEW_CONTEXT_STOP_BIGRAMS = {
+    "我们", "你们", "他们", "这个", "那个", "那次", "这次", "当时", "当天",
+    "照片", "图片", "拍照", "拍摄", "留影", "合影", "记录", "活动", "事情",
+    "哪里", "哪儿", "什么", "时候", "具体", "帮我", "一下", "一下", "一张",
+    "看到", "找到", "想找", "记得", "参加", "一起", "还有", "就是", "大概",
+}
+
 
 def _preview_query_terms(query: str) -> list[str]:
     """Extract bounded query concepts for caption-aware preview ordering."""
@@ -291,6 +303,31 @@ def _preview_query_terms(query: str) -> list[str]:
     return terms
 
 
+def _preview_context_bigrams(query: str) -> list[str]:
+    """Return discriminative CJK anchors for caption-aware candidate ranking.
+
+    Word segmentation is useful when it succeeds, but it can keep a compound
+    phrase such as ``婚礼仪式舞台`` intact.  Captions often describe the same
+    scene with only part of that phrase (``婚礼`` / ``仪式`` / ``舞台``), so a
+    strict word-only comparison loses the decisive context and lets generic
+    cues such as "night" or "photo" dominate.  CJK bigrams provide a bounded,
+    language-agnostic bridge without consulting answers, benchmark labels, or
+    image pixels.
+    """
+    text = re.sub(r"[^\u4e00-\u9fff]", "", str(query or ""))
+    if len(text) < 2:
+        return []
+    values: list[str] = []
+    for index in range(len(text) - 1):
+        token = text[index:index + 2]
+        if token in _PREVIEW_CONTEXT_STOP_BIGRAMS or token in values:
+            continue
+        values.append(token)
+        if len(values) >= 24:
+            break
+    return values
+
+
 def _preview_text_score(query: str, summary: str,
                         term_weights: dict[str, float] | None = None) -> float:
     """Score only query-to-observation overlap; never consult QA answers or GT."""
@@ -307,6 +344,17 @@ def _preview_text_score(query: str, summary: str,
         cue_terms = {term for term in _PREVIEW_QUERY_ALIASES if term in text}
         score += sum((min(3, len(term)) / 3) * weights.get(term, 1.0)
                      for term in terms if term in desc and term not in cue_terms)
+    # A single broad cue is useful for recall but weak evidence for ranking.
+    # Reward *conjunctions* of independent contextual anchors superlinearly:
+    # an image matching both "婚礼" and "舞台" should beat one that only shares
+    # the generic nighttime/photograph wording.  This is a local rerank of
+    # already-recalled assets, so it cannot expand scope or inject facts.
+    context_hits = [token for token in _preview_context_bigrams(text)
+                    if token in desc]
+    if context_hits:
+        score += min(2.0, 0.25 * len(context_hits))
+        if len(context_hits) >= 2:
+            score += min(4.0, 0.9 * (len(context_hits) - 1))
     return score
 
 

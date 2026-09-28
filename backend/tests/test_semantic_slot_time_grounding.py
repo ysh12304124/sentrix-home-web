@@ -132,6 +132,24 @@ class SemanticSlotTimeGroundingTests(unittest.TestCase):
         self.assertEqual(order[0], 1)
         self.assertEqual(_recommended_handle(question, preview), "photo_2")
 
+    def test_contextual_anchor_conjunction_beats_a_generic_scene_overlap(self):
+        """Event-defining anchors must outweigh a lone generic cue.
+
+        This is deliberately not tied to a benchmark filename or answer: any
+        query whose event phrase is split differently in the caption exercises
+        the same CJK context-coverage path.
+        """
+        asset_ids = ["generic_night_scene", "event_stage"]
+        summaries = {
+            "generic_night_scene": "夜间儿童在灯光和气球旁拍照。",
+            "event_stage": "夜间婚礼仪式舞台前的留影，背景有帷幕。",
+        }
+        question = "帮我找晚上在婚礼仪式舞台前拍的留影"
+        with patch("backend.agent_runtime.tools._observation_summary",
+                   side_effect=lambda _store, aid: summaries[aid]):
+            order = _preview_query_order(asset_ids, question, None)
+        self.assertEqual(order[0], 1)
+
     def test_visible_preview_uses_query_selected_indices_and_stable_handles(self):
         def make_entry(_store, asset_id, handle, *, priority_rank=None,
                        selection_reason="", **_kwargs):
