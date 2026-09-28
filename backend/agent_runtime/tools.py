@@ -2674,7 +2674,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     _packet_cond, _packet_satisfaction, _packet_answerability = _truth_contract(packet, rs.total)
     if cond:
         satisfaction = ("full_support" if all(
-            value.get("status") == "matched" for value in cond.values()
+            value == "matched" for value in cond.values()
         ) else "partial_support")
         answerability = "full" if satisfaction == "full_support" else "partial"
         evidence_status = "validated"
@@ -2836,21 +2836,20 @@ def _retrieval_support_conditions(query: str, preview: list[dict]) -> dict:
     if len(context_hits) < 2:
         return {}
 
-    conditions: dict[str, dict[str, str]] = {
-        "semantic_context": {"status": "matched"},
-    }
+    # ``condition_summary`` is a flat ``{name: status}`` contract consumed by
+    # runtime evidence extraction and the answer guard. Keep values as strings;
+    # nested dictionaries are not hashable in those status checks.
+    conditions: dict[str, str] = {"semantic_context": "matched"}
     wants_time = bool(re.search(
         r"哪(?:一)?天|哪一年|哪年|什么时候|什么时间|日期|几月|何时|哪日", text))
     wants_place = bool(re.search(
         r"在哪里|在哪儿|哪儿|哪里|什么地方|哪个城市|哪个区|哪举办|地点|位置", text))
     if wants_time:
-        conditions["captured_at"] = {
-            "status": "matched" if leading.get("captured_at") else "unknown"
-        }
+        conditions["captured_at"] = (
+            "matched" if leading.get("captured_at") else "unknown"
+        )
     if wants_place:
-        conditions["place"] = {
-            "status": "matched" if leading.get("place") else "unknown"
-        }
+        conditions["place"] = "matched" if leading.get("place") else "unknown"
     return conditions
 
 

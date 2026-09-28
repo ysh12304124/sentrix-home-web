@@ -159,9 +159,9 @@ class SemanticSlotTimeGroundingTests(unittest.TestCase):
         }]
         conditions = _retrieval_support_conditions(
             "我在婚礼仪式舞台前拍的留影是哪一天、在哪里？", preview)
-        self.assertEqual(conditions["semantic_context"]["status"], "matched")
-        self.assertEqual(conditions["captured_at"]["status"], "matched")
-        self.assertEqual(conditions["place"]["status"], "matched")
+        self.assertEqual(conditions["semantic_context"], "matched")
+        self.assertEqual(conditions["captured_at"], "matched")
+        self.assertEqual(conditions["place"], "matched")
 
     def test_metadata_is_not_upgraded_for_a_generic_context_match(self):
         preview = [{
