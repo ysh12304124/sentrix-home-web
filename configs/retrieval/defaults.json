@@ -9,7 +9,7 @@
     "text": true,
     "adjacency": false
   },
-  "ranking_strategy": "visual_backbone",
+  "ranking_strategy": "weighted_rrf",
   "fusion": "rrf",
   "recall": {
     "top_k": 20,

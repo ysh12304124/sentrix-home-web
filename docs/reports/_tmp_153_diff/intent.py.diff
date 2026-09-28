@@ -1,0 +1,15 @@
+diff --git a/backend/agent_runtime/intent.py b/backend/agent_runtime/intent.py
+index f9a88c91..0112cf43 100644
+--- a/backend/agent_runtime/intent.py
++++ b/backend/agent_runtime/intent.py
+@@ -24,7 +24,9 @@ _EVIDENCE_INTENT_RE = re.compile(
+ _VISUAL_RE = re.compile(
+     r"桌上|桌面|颜色|几个|多少人|招牌|文字|天气|外套|衣服|猫|雪|小孩|穿着|穿|"
+     r"在做什么|有没有|是什么|放着|写了|内容|细节|长什么样|什么颜色|什么动物|"
+-    r"拿着|道具|植物|场景|拍的什么|什么造型|什么样子|哪[一123]?张")
++    r"拿着|道具|植物|场景|拍的什么|什么造型|什么样子|哪[一123]?张|"
++    r"雕塑|石雕|景观|建筑|广场|公园|喷泉|河流|湖泊|桥|设施|装置|"
++    r"物体|物品|标志|牌子|雕像|纪念碑|布置|装饰|婚房|婚庆|床品|窗帘|花艺|展架|广告牌|展板")
+ 
+ # OCR 文字读取意图
+ _OCR_RE = re.compile(

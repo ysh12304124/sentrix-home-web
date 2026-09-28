@@ -13,7 +13,12 @@ from backend.video.processor import VideoMemoryAdapter
 
 class VideoSceneImportTests(unittest.TestCase):
     def test_three_scenes_create_19_assets_observations_and_three_events(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SENTRIX_DATA_DIR": directory}):
+        # 本文件专门验证 worldmm 链路，必须显式声明算法：
+        # SENTRIX_VIDEO_KEYFRAME_ALGORITHM 的默认值已改为 hybrid_webp。
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"SENTRIX_DATA_DIR": directory,
+                         "SENTRIX_VIDEO_KEYFRAME_ALGORITHM": "worldmm"},
+        ):
             root = Path(directory)
             video = root / "movie.mov"; video.write_bytes(b"video")
             store = MemoryStore(str(root / "memory.db"))

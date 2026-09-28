@@ -1,0 +1,11 @@
+{
+  "default_target_id": "local",
+  "targets": {
+    "local": {
+      "label": "本机 OpenAI-compatible 模型服务",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "Copy to vllm_targets.json and fill host-specific Manager/model URLs."
+    }
+  }
+}

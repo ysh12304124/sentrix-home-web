@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.db import MemoryStore
+from backend.db import MemoryStore, now_iso
 from backend.model_clients import FaceAdapter
 
 
@@ -133,6 +133,8 @@ def main():
 
     entities = {}
     linked = 0
+    affected_observations = set()
+    affected_clusters = set()
     for instance_id, item in labels.items():
         info = face_info.get(item["face_id"])
         if not info:
@@ -150,9 +152,35 @@ def main():
             if aliases:
                 store.set_person_aliases(entity["id"], aliases)
             entities[name] = entity
+        # A production cluster assignment is only a candidate.  Once the user
+        # has authorized the reference-face mapping, move the concrete face
+        # instance to that confirmed cluster and remove stale names attached
+        # by an earlier low-margin match (e.g. the child in album3v4-097).
+        target_cluster = store._row(
+            "SELECT id FROM face_clusters WHERE scope_id = ? AND entity_id = ? AND status = 'confirmed' ORDER BY updated_at DESC LIMIT 1",
+            (args.scope, entity["id"]),
+        )
+        if target_cluster:
+            current = store._row("SELECT cluster_id FROM face_instances WHERE id = ?", (instance_id,))
+            if current and current.get("cluster_id"):
+                affected_clusters.add(current["cluster_id"])
+            if current and current.get("cluster_id") != target_cluster["id"]:
+                store.connection.execute(
+                    "UPDATE face_instances SET cluster_id = ? WHERE id = ?",
+                    (target_cluster["id"], instance_id),
+                )
+            affected_clusters.add(target_cluster["id"])
+        store.connection.execute(
+            "DELETE FROM entity_mentions WHERE face_instance_id = ? AND entity_id != ?",
+            (instance_id, entity["id"]),
+        )
         store._link_confirmed_entity_mention(entities[name], item["observation_id"],
                                              instance_id, item["score"])
+        affected_observations.add(item["observation_id"])
         linked += 1
+
+    for cluster in affected_clusters:
+        store._refresh_face_prototypes(cluster)
 
     face_to_name = {str(f["face_id"]): f["canonical_name"] for f in faces}
     for name, entity in entities.items():
@@ -164,6 +192,67 @@ def main():
             store.resegment_events_for_confirmed_entity(entity["id"])
         except Exception as exc:
             print(f"[warn] resegment {name} failed: {exc}")
+
+    # Refreshing participants is intentionally additive in the general store
+    # API.  For an authorized reference mapping, however, a stale prior name
+    # on the same observation is an error, so remove only participants whose
+    # evidence is wholly within the reconciled observations.
+    for observation_id in affected_observations:
+        valid = {row["entity_id"] for row in store._rows(
+            "SELECT DISTINCT entity_id FROM entity_mentions WHERE observation_id = ?",
+            (observation_id,),
+        )}
+        event_rows = store._rows(
+            "SELECT event_id FROM event_observations WHERE observation_id = ?",
+            (observation_id,),
+        )
+        for event_row in event_rows:
+            event_id = event_row["event_id"]
+            for participant in store._rows(
+                "SELECT id, person_id, evidence_ids_json FROM event_participants WHERE event_id = ?",
+                (event_id,),
+            ):
+                try:
+                    evidence_ids = set(json.loads(participant.get("evidence_ids_json") or "[]"))
+                except (TypeError, ValueError):
+                    evidence_ids = set()
+                if observation_id in evidence_ids and evidence_ids.issubset(affected_observations) and participant["person_id"] not in valid:
+                    store.connection.execute("DELETE FROM event_participants WHERE id = ?", (participant["id"],))
+            event = store.get_event(event_id) or {}
+            participants = [
+                {"entity_id": row["person_id"], "name": (store.get_entity(row["person_id"]) or {}).get("canonical_name", ""), "status": "confirmed"}
+                for row in store._rows("SELECT person_id FROM event_participants WHERE event_id = ?", (event_id,))
+            ]
+            store.connection.execute(
+                "UPDATE events SET participants_json = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+                (json.dumps(participants, ensure_ascii=False), now_iso(), event_id),
+            )
+    # Final idempotent pass after event/person projections: those projections
+    # are allowed to merge events, but they must never undo the user-authorized
+    # face-to-entity binding above.
+    for instance_id, item in labels.items():
+        info = face_info.get(item["face_id"])
+        entity = entities.get(info.get("canonical_name")) if info else None
+        if not entity:
+            continue
+        target_cluster = store._row(
+            "SELECT id FROM face_clusters WHERE scope_id = ? AND entity_id = ? AND status = 'confirmed' ORDER BY updated_at DESC LIMIT 1",
+            (args.scope, entity["id"]),
+        )
+        if not target_cluster:
+            continue
+        store.connection.execute(
+            "UPDATE face_instances SET cluster_id = ? WHERE id = ?",
+            (target_cluster["id"], instance_id),
+        )
+        store.connection.execute(
+            "DELETE FROM entity_mentions WHERE face_instance_id = ? AND entity_id != ?",
+            (instance_id, entity["id"]),
+        )
+        store._link_confirmed_entity_mention(entity, item["observation_id"], instance_id, item["score"])
+        store._refresh_face_prototypes(target_cluster["id"])
+    store.connection.commit()
+    store.connection.commit()
 
     print(f"APPLIED: 绑定 {linked} 个实例 -> {len(entities)} 个已确认人物")
     for name, entity in entities.items():

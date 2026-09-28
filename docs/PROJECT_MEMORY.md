@@ -513,6 +513,18 @@ git diff --check
 5. **Product wrong 未下降**：final3 wrong 15 > Phase D 基线 11；V 层（招牌/小字）与
    S 层回避是主要贡献。
 
+## Benchmark 人物解析待办（2026-08-21）
+
+1. **P0 benchmark scope 下 Agent 人名→实体解析失效**：`backend/agent_runtime/tools.py` 的 `_resolve_entity`（约 159 行）依赖 `store.list_entities(status="confirmed")`，而 `db.py` 的 `list_entities`（约 3651 行）会排除 `memory_spaces.include_in_people = 0` 的 scope。benchmark 编排器创建的评测 scope（如 `album_06bd13b819ea`，album3-max 100qa run）默认标记 0，导致人名无法解析成实体，`query_memory_facts` 的人物查询拿不到结果。同文件 `_event_resolution`（约 605 行）已用 entities 表直查绕过该过滤（注释注明"benchmark scope 也能用"），`_resolve_entity` 属同类漏修。
+   - 实测证据（2026-08-21，data/sentrix.db）：`list_entities(status="confirmed", scope_id="album_06bd13b819ea")` 返回 0；SQL 直查同条件 person 实体返回 8（我/明明/张晓莉/乐乐/王建国/芳芳/雪儿/强子，均 confirmed）。8090 旧代码进程同库可见全部人物，8091（18:22 重启加载新代码）people/entities 均为空。
+   - 修复方案：`_resolve_entity` 改为与 `_event_resolution` 相同的 entities 表直查（按 scope_id + entity_type='person' + status='confirmed' 匹配 canonical_name）；或 `list_entities` 增加绕过 include_in_people 过滤的参数。
+   - 验收：修复后评测 scope 的人名解析返回 8 人；Agent 问答"明明参加过哪些活动"能解析实体并返回事实。
+   - 影响：run `20260821-184608-album3-max-gemma4-e2b-it-6da9f0`（100qa-full）人物题成绩受污染（部分"未明确记录"由此导致）；修复前跑其他模型的 100QA 会同样不公平。
+
+### 2026-08-21 变更记录（benchmark 侧维护）
+
+- `sentrix-vllm/bin/sentrix_vllm_api.py`（8500 Manager）新增 `GET /process-memory`，对齐 `services/vllm_manager/app.py` 的同名接口：state 文件取 root_pid，`_process_tree` 追踪 vLLM 进程树，nvidia-smi compute-apps 按 PID 汇总进程显存，limit 取 `gpu_memory_utilization * 整卡显存`，并从模型端口 `/metrics` 提取 kv_cache_usage/requests 指标。原文件备份 `sentrix_vllm_api.py.bak-process-memory-20260821`；8500 已重启（8100 模型进程为独立进程组不受影响），实测 qwen3.5-0.8b 启动时返回 19096 MiB / 上限 20398.1 MiB。修复 photobench 走 8500 链路时 GPU 面板"模型进程显存/KV Cache"为空的问题。
+
 ## 接手原则
 
 1. 先读取本文档、`README.md`、最新 Git 提交和实际 153 服务/数据库，再修改代码。
@@ -535,3 +547,26 @@ git diff --check
 - 项目记忆双层存储约定不变：153 本文档为完整权威来源，Project Memory MCP
   `projects/sentrix-home-web/` 保存精炼共享摘要、任务、决策与 handoff；重要提交后
   两边同时更新。
+
+## 8091 安全重启 SOP 与检索健康探测（2026-08-23 benchmark 侧部署）
+
+- 背景：2026-08-22 排查确认，重启 8091 若只按端口杀监听进程，进程树中持
+  qdrant 目录锁的进程会存活，导致新进程向量层降级 SQLite 全表扫（恒定
+  20-25s、无报错）。同日代码已补可观测性（`476f649b`：qdrant 锁失败打限流
+  ERROR、`/api/health` 的 `memory.vectorIndex` 暴露 degraded/按路 telemetry）。
+- 本机脚本（`scripts/`，由 benchmark 项目同名脚本改编，去 ssh 层）：
+  - `restart_sentrix_8091_153.sh`：安全重启 SOP——8771 活跃 run 拦截
+    （`--force` 跳过）→ 按完整命令行精确 pkill（`[b]ackend` 字符类防自匹配）
+    → pgrep 复核全灭（残留强杀）→ `scripts/runtime/start_sentrix_api_8091.sh`
+    拉起 → health 就绪 → 自动跑 Level 1 检索探测。重启 8091 一律用本脚本，
+    禁止 `lsof -ti :8091 | xargs kill`。
+  - `probe_sentrix_retrieval.py`：两级检索探测。Level 1 查 health 的
+    vectorIndex（qdrant 可用/未降级/锁无失败/p95，秒级、无需主模型）；
+    `--live` 追加 5 个固定问题走 assistant/turn 断言单次 search_memories
+    < 3s（需 8100 主模型在线）。改动 8091/向量库后必跑。
+- 用法（153 本机）：
+  `bash scripts/restart_sentrix_8091_153.sh`（常规）或 `--force`；
+  `python3 scripts/probe_sentrix_retrieval.py --host 127.0.0.1:8091 [--live]`。
+- 降级判断速查：`curl -s localhost:8091/api/health | python3 -m json.tool`
+  看 `memory.vectorIndex.degraded`；日志 `logs/sentrix-api-8091.log` 搜
+  "qdrant dir lock"。

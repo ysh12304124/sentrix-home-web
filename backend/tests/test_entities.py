@@ -824,6 +824,14 @@ class NativeEntityMemoryTests(unittest.TestCase):
         self.assertEqual(properties["scene_type"]["value"], "滨水空间")
         self.assertEqual(properties["visual_place_descriptions"]["value"], ["城市河流岸边"])
 
+    def test_enrich_observation_persists_people_json(self):
+        self.store.enrich_observation(self.obs1["id"], {
+            "people": [{"label": "一位成人", "confidence": 0.8}],
+        })
+
+        refreshed = self.store.get_observation(self.obs1["id"])
+        self.assertEqual(refreshed["people"], [{"label": "一位成人", "confidence": 0.8}])
+
     def test_semantic_group_uses_primary_property_and_aggregates_details(self):
         restaurant = self.store.create_entity("餐厅", "place", confidence=0.8)
         cafe = self.store.create_entity("咖啡馆", "place", confidence=0.8)

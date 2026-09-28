@@ -1,0 +1,46 @@
+diff --git a/backend/app.py b/backend/app.py
+index 53642467..6448eacb 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import BaseModel, Field
+ 
+ from .agent_conversation import ConversationStore
++from .agent_runtime.result_set import debug_asset_projection
+ from .db import MemoryStore, make_id
+ from .image_io import (
+     encode_jpeg_preview,
+@@ -2453,13 +2454,26 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
+                    "problems": list(s.get("problems") or [])}
+                   for s in turn.steps if s.get("type") == "judge"],
+     }
+-    tool_trace = [
+-        {"tool": s.get("tool", ""), "status": s.get("status", ""),
+-         "latency_s": s.get("latency_s"), "reason": s.get("reason") or "",
+-         "error": s.get("error") or "",
+-         "retrieval_timing": (s.get("observation") or {}).get("retrieval_timing")}
+-        for s in turn.steps if s.get("type") == "tool"
+-    ]
++    tool_trace = []
++    for step in turn.steps:
++        if step.get("type") != "tool":
++            continue
++        observation = step.get("observation") or {}
++        trace = {
++            "tool": step.get("tool", ""), "status": step.get("status", ""),
++            "latency_s": step.get("latency_s"), "reason": step.get("reason") or "",
++            "error": step.get("error") or "",
++            "retrieval_timing": observation.get("retrieval_timing"),
++        }
++        # Benchmark/debug consumers need to score returned handles, but model-facing
++        # observations must continue to hide internal asset IDs.
++        if include_debug and step.get("tool") in {"search_memories", "get_result_page"}:
++            result_set_id = observation.get("result_set_id")
++            result_sets = getattr(runtime_tools, "_RUNTIME", {}).get("result_sets")
++            result_set = result_sets.get(result_set_id) if result_sets and result_set_id else None
++            if result_set is not None:
++                trace.update(debug_asset_projection(result_set, observation.get("preview")))
++        tool_trace.append(trace)
+     return {
+         "answer": turn.final_answer,
+         "model_call_metrics": ordered_metrics,

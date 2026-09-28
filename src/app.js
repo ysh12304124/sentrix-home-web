@@ -1,36 +1,5 @@
 (function () {
   const app = document.getElementById("app");
-  const benchmarkModelProfiles = [
-    { id: "gemma4-12b-it", label: "Gemma-4-12B (默认)" },
-    { id: "gemma4-e2b-it", label: "Gemma-4-E2B 蒸馏前" },
-    { id: "gemma4-e2b-it-lora-v2", label: "Gemma-4-E2B 蒸馏后+LoRA" },
-    { id: "qwen3.5-0.8b-it", label: "Qwen-3.5-0.8B" },
-    { id: "qwen3-instruct", label: "Qwen-3-4B Instruct" },
-    { id: "qwen3-8b", label: "Qwen-3-8B" },
-  ];
-
-  function modelProfileOptions(payload) {
-    const profiles = new Map((payload?.profiles || []).map((profile) => [profile.id, profile]));
-    const current = payload?.current || {};
-    const candidate = String(current.profile || "");
-    const active = current.status === "running" && benchmarkModelProfiles.some((profile) => profile.id === candidate) ? candidate : "";
-    const models = Object.fromEntries(benchmarkModelProfiles.map(({ id, label }) => {
-      const profile = profiles.get(id);
-      return [id, {
-        available: Boolean(profile?.available),
-        loaded: id === active,
-        model: label,
-        url: id === active ? current.base_url : "vLLM profile",
-      }];
-    }));
-    return {
-      backend: active,
-      status: current.status || "unmanaged",
-      error: current.error || "",
-      available_backends: benchmarkModelProfiles.map((profile) => profile.id),
-      models,
-    };
-  }
 
   const state = {
     view: "overview",
@@ -42,6 +11,9 @@
     activeConversationSummary: "",
     searchLoading: false,
     liveProgress: [],
+    activeTurnId: "",
+    pendingMessage: "",
+    conversationDrawerOpen: false,
     selectedAsset: null,
     photoInspector: null,
     loading: true,
@@ -55,6 +27,8 @@
     events: [],
     assets: [],
     persons: [],
+    personInsights: null,
+    familyGraph: null,
     entities: [],
     entityGroups: [],
     geoPlaces: [],
@@ -66,7 +40,6 @@
     stories: [],
     trips: [],
     health: null,
-    vlmBackendOptions: null,
     ocrSettings: null,
     modal: null,
     modalHistory: [],
@@ -78,6 +51,12 @@
     assetFilter: "all",
     assetSort: "newest",
     personFilter: "all",
+    peopleGraphView: "graph",
+    peopleGraphSelection: "",
+    peopleGraphTransform: { x: 0, y: 0, scale: 1 },
+    peopleGraphLayout: {},
+    peopleGraphDraftEdge: null,
+    peopleGraphUndo: null,
     saving: false,
     expandedEntityTypes: {},
   };
@@ -285,22 +264,28 @@
     return `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">${escapeHtml(title)}</p><h3>${values.length} 项</h3></div></div><div class="evidence-list">${values.slice(0, 12).map(evidenceCard).join("")}</div></section>`;
   }
 
-  function imageResults(result) {
-    const images = result?.image_results || [];
-    if (!images.length) return "";
-    const rows = images.map((item) => {
-      const label = item.display_handle || "原始图片";
+  function mediaResults(result) {
+    const mediaSource = result?.media_results || result?.mediaResults || result?.image_results || [];
+    const media = Array.isArray(mediaSource) ? mediaSource : [];
+    if (!media.length) return "";
+    const rows = media.map((item) => {
+      const mediaType = item.media_type === "video" ? "video" : "image";
+      const label = item.display_handle || (mediaType === "video" ? "视频" : "照片");
       const aspects = [
         ...(item.supported_aspects || []).map((aspect) => `对上了：${aspect}`),
         ...(item.uncertain_aspects || []).map((aspect) => `还不能确认：${aspect}`),
       ];
       const caption = aspects.length
-        ? aspects.map(escapeHtml).join(" · ")
-        : (item.captured_at || item.caption || "可回看的原始证据");
-      const dup = item.near_duplicate_size > 1 ? `<small class="image-dup">另有 ${item.near_duplicate_size - 1} 张相似照片</small>` : "";
-      return `<button class="image-result" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small>${dup}</span></button>`;
+        ? aspects.join(" · ")
+        : (item.captured_at || item.caption || "本轮相关内容");
+      if (mediaType === "video") {
+        const timestamp = Number(item.source_timestamp_sec);
+        const frameTime = Number.isFinite(timestamp) && timestamp >= 0 ? ` data-evidence-timestamp="${timestamp}"` : "";
+        return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline${frameTime} aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
+      }
+      return `<button class="image-result" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url)}" data-image-label="${escapeHtml(label)}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || item.location || "")}" data-image-activity="${escapeHtml(item.caption || caption || "")}" title="查看照片"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /></button>`;
     }).join("");
-    return `<section class="evidence-layer image-results"><div class="section-head"><div><p class="section-kicker">相关图片</p><h3>${images.length} 张</h3></div></div><div class="image-result-grid">${rows}</div></section>`;
+    return `<section class="evidence-layer image-results"><div class="image-result-grid">${rows}</div></section>`;
   }
 
   function traceLabel(item) {
@@ -371,46 +356,79 @@
     return STAGE_LABELS[step.stage] || (step.stage ? String(step.stage) : "思考");
   }
 
-  function buildThinkingSteps(result, liveProgress = null) {
-    const progress = liveProgress || (result && (result.public_progress || [])) || [];
-    const tools = (result && (result.toolTrace || result.tool_trace)) || [];
-    const taskTools = (result && result.task_state && result.task_state.tool_results) || [];
-    let toolIndex = 0;
-    let taskIndex = 0;
-    return progress.map((item) => {
-      const stage = item.stage || "";
-      const status = item.status || "running";
-      if (stage === "tool_result" || stage === "tool_error") {
-        const tool = tools[toolIndex] || {};
-        const fallback = taskTools[taskIndex] || {};
-        toolIndex += 1;
-        taskIndex += 1;
-        const denied = tool.status === "denied" || stage === "tool_error";
-        return {
-          type: "tool",
-          tool: tool.tool || fallback.tool,
-          text: item.text || tool.reason || (denied ? "工具调用被拒绝" : "正在处理…"),
-          status: denied ? "blocked" : "complete",
-          latency: tool.latency_s,
-        };
-      }
-      return {
-        type: "stage",
-        stage,
-        text: item.text || "",
-        status: status === "ok" ? "complete" : status,
-      };
+  function timelineEvents(result, liveProgress = null) {
+    const source = liveProgress || (result && result.public_progress) || [];
+    const events = Array.isArray(source) ? source : [];
+    const byId = new Map();
+    events.forEach((event, index) => {
+      if (!event || typeof event !== "object") return;
+      const id = event.event_id || `${event.stage || "status"}-${event.step_index || index}`;
+      byId.set(id, { ...event, event_id: id });
     });
+    return [...byId.values()].sort((a, b) => (a.step_index || 0) - (b.step_index || 0));
   }
 
-  function agentStepHtml(step) {
-    const running = step.status === "running";
-    const blocked = step.status === "blocked" || step.status === "denied" || step.status === "error";
+  function timelineToolArtifact(event) {
+    const data = event?.payload && typeof event.payload === "object" ? event.payload : {};
+    if (data.tool === "search_memories") {
+      const conditions = data.condition_summary && typeof data.condition_summary === "object"
+        ? Object.values(data.condition_summary).filter(Boolean).join(" · ") : "";
+      const gaps = Array.isArray(data.gaps) ? data.gaps : [];
+      const meta = [data.query, conditions, data.total != null ? `找到 ${data.total} 张` : "", ...gaps].filter(Boolean);
+      return meta.length ? `<small class="timeline-artifact">${escapeHtml(meta.join(" · "))}</small>` : "";
+    }
+    if (data.tool === "inspect_photo") return data.observation ? `<p class="timeline-observation">${escapeHtml(data.observation)}</p>` : "";
+    if (data.tool === "read_photo_text") return (data.text || data.ocr_text) ? `<p class="timeline-observation">${escapeHtml(data.text || data.ocr_text)}</p>` : "";
+    if (data.summary) return `<small class="timeline-artifact">${escapeHtml(data.summary)}</small>`;
+    if (data.reason) return `<small class="timeline-artifact">${escapeHtml(data.reason)}</small>`;
+    return "";
+  }
+
+  function timelineCard(event) {
+    const status = event.status || "running";
+    const running = status === "running" || status === "cancelling";
+    const blocked = ["blocked", "denied", "error", "cancelled", "partial"].includes(status);
     const stateClass = running ? "running" : blocked ? "blocked" : "complete";
-    const mark = step.type === "tool" ? "🔧" : "💭";
-    const statusMark = running ? "…" : blocked ? "!" : "✓";
-    const latency = step.latency != null ? `<small>${escapeHtml(String(step.latency))}s</small>` : "";
-    return `<div class="agent-step ${stateClass}"><span class="agent-step-mark">${mark}</span><div class="agent-step-body"><strong>${escapeHtml(thinkingStepLabel(step))}</strong><span>${escapeHtml(step.text || "")}</span>${latency}</div><span class="agent-step-status">${statusMark}</span></div>`;
+    const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+    let heading = "记忆处理中";
+    let content = event.text || "";
+    let artifact = "";
+    if (event.kind === "plan" || event.kind === "plan_update") {
+      heading = "本轮记忆目标";
+      content = payload.goal || event.text || "";
+      const requirements = Array.isArray(payload.requirements) ? payload.requirements : [];
+      artifact = requirements.map((item) => `<li>${escapeHtml(item.description || item.evidence_type || "待确认的依据")} · ${escapeHtml(item.status || "open")}</li>`).join("");
+      artifact = artifact ? `<ul class="timeline-requirements">${artifact}</ul>` : "";
+    } else if (event.kind === "model_action") {
+      heading = "正在推进";
+    } else if (event.kind === "tool_result" || event.kind === "tool_error") {
+      heading = "找到的依据";
+      artifact = timelineToolArtifact(event);
+    } else if (event.kind === "evaluation") {
+      heading = "正在核对结论";
+    } else if (event.kind === "recovery") {
+      heading = "重新核对";
+    } else if (event.kind === "terminal") {
+      heading = status === "cancelled" ? "本轮已停止" : "本轮处理完成";
+    } else {
+      heading = STAGE_LABELS[event.stage] || "记忆处理中";
+    }
+    const eventId = event.event_id || `${event.stage || "status"}-${event.step_index || ""}`;
+    const signatureSource = `${status}|${content}|${JSON.stringify(payload)}`;
+    let signature = 0;
+    for (let index = 0; index < signatureSource.length; index += 1) signature = ((signature << 5) - signature) + signatureSource.charCodeAt(index) | 0;
+    return `<article class="timeline-card ${stateClass}" data-timeline-event-id="${escapeHtml(String(eventId))}" data-timeline-signature="${signature}"><span class="timeline-dot" aria-hidden="true"></span><div><strong>${escapeHtml(heading)}</strong>${content ? `<p>${escapeHtml(content)}</p>` : ""}${artifact}</div></article>`;
+  }
+
+  function recallCard(result) {
+    const event = timelineEvents(result).find((item) => item.kind === "tool_result" && item.payload && item.payload.tool === "search_memories");
+    if (!event) return "";
+    const data = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const previews = Array.isArray(data.preview) ? data.preview : [];
+    const gaps = Array.isArray(data.gaps) ? data.gaps : [];
+    const preview = previews.map((item) => `<button class="timeline-image" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url || "")}" data-image-label="${escapeHtml(item.evidence_summary || item.handle || "原始图片")}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || "")}" data-image-activity="${escapeHtml(item.activity || "")}" data-image-role="召回候选"><img src="${escapeHtml(item.media_url || "")}" alt="${escapeHtml(item.evidence_summary || item.handle || "召回图片")}" loading="lazy" /></button>`).join("");
+    const details = [data.query, data.total != null ? `${data.total} 张相关照片` : "", ...gaps].filter(Boolean).join(" · ");
+    return `<details class="recall-card"><summary>召回的照片${data.total != null ? ` · ${escapeHtml(String(data.total))} 张` : ""}</summary><p>${escapeHtml(details || "本轮召回依据")}</p>${preview ? `<div class="timeline-image-grid">${preview}</div>` : ""}</details>`;
   }
 
   function assistantAnswer(result) {
@@ -488,21 +506,22 @@
     const ordered = result.evidence_order || [];
     const order = ordered.length && isAdmin ? `<details class="algorithm-evidence admin-only"><summary>证据顺序与可信度</summary><div class="algorithm-evidence-body"><dl>${ordered.map((item, index) => `<div><dt>${String(index + 1).padStart(2, "0")} · ${escapeHtml(item.source_level)}</dt><dd>${escapeHtml(item.time || "时间未标注")} · 可信度 ${Math.round((item.confidence || 0) * 100)}%</dd></div>`).join("")}</dl></div></details>` : "";
     const directEvidence = Boolean(result.original_evidence_requested || presentation.direct_original_evidence);
-    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${imageResults(result) || evidence || gapContent}</section>` : "";
-    const optionalImages = directEvidence ? "" : imageResults(result);
+    const directOriginal = directEvidence ? `<section class="assistant-original-evidence"><div class="section-head"><div><p class="section-kicker">直接查看原始证据</p><h3>与本次回答相关的原始资料</h3></div></div>${evidence || gapContent}</section>` : "";
+    const optionalMedia = "";
     const debugBlock = isAdmin ? `${guardDebug(result)}${toolTrace(result)}${algorithmEvidence(result)}` : "";
     const toolSamples = toolLoopEvidence(result);
     const toolEvidence = toolSamples.length ? `<section class="evidence-layer"><div class="section-head"><div><p class="section-kicker">本次依据（工具结果）</p><h3>${toolSamples.length} 项</h3></div></div><div class="evidence-list">${toolSamples.map(evidenceCard).join("")}</div></section>` : "";
+    const resultMedia = result.media_results || result.mediaResults || result.image_results || [];
     const evidenceCount = grounding.evidence_count != null ? grounding.evidence_count
-      : (primary.length + (result.image_results || []).length + toolSamples.length);
+      : (primary.length + resultMedia.length + toolSamples.length);
     const hasToolEvidence = toolSamples.length > 0;
     const hasResultSet = Boolean((result.task_state || {}).current_result_set && (result.task_state || {}).result_total > 0);
     // RX-6: a chat turn (memory_used === false) never shows an evidence entry; tool-loop turns use task_state evidence.
     const requiresEvidence = (result.memory_used !== false && presentation.required !== false) || hasToolEvidence || hasResultSet;
     const hasGap = result.evidence_status === "gap" || (!evidenceCount && result.tool_loop_status === "complete");
-    const resultSetBlock = displayMode === "collapsed" ? resultSetCard(result) : "";
+    const resultSetBlock = "";
     const basisOpen = displayMode === "result_grid" || hasGap || (displayMode !== "collapsed" && evidenceCount > 0);
-    const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalImages}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
+    const basis = requiresEvidence ? `<details class="assistant-basis"${basisOpen ? " open" : ""}><summary>原始证据${evidenceCount ? ` · ${evidenceCount} 项` : ""}</summary><div class="assistant-basis-body">${resultSetBlock}${claimEvidence(result)}${optionalMedia}${toolEvidence}${evidence}${gapContent}${order}${debugBlock}</div></details>` : "";
     if (displayMode === "none") return `${followups}${gapContent}`;
     return `${followups}${proactiveRecall(result)}${directOriginal}${basis}`;
   }
@@ -528,21 +547,19 @@
     const hasMore = Boolean(ts.has_more) && remaining > 0;
     const head = totalKnown ? `共 ${total} 张${hasMore ? ` · 还有 ${remaining} 张` : ""}` : "找到一批相关结果";
     const handles = (ts.result_preview || []).slice(0, 6);
-    const selected = state.selectedAsset && state.selectedAsset.result_set_id === rid ? state.selectedAsset.handle : "";
     // C8：本轮的 inspect_photo 复核结果与 handle 对应展示（已复核徽标 + 复核观察）
     const inspectRows = (ts.tool_results || []).filter((tr) => tr.tool === "inspect_photo" && tr.inspect_handle);
     const inspected = new Set(inspectRows.map((tr) => tr.inspect_handle));
     const inspectedNotes = inspectRows.filter((tr) => tr.inspect_text)
       .map((tr) => `<span>${escapeHtml(tr.inspect_handle)} · 复核：${escapeHtml(tr.inspect_text)}</span>`).join("");
     const thumbs = handles.length ? `<div class="result-set-thumbs">${handles.map((h) => {
-      const active = h === selected ? " selected" : "";
       const checked = inspected.has(h) ? " inspected" : "";
-      return `<div class="result-set-thumb-wrap${active}${checked}"><button class="result-set-thumb" data-action="open-photo-inspector" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}" title="打开照片检查器"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button><button class="result-set-select" data-action="select-result-photo" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(h)}" title="在主对话中选中这张">${h === selected ? "✓" : "＋"}</button></div>`;
+      const originalUrl = window.sentrixApi.resultSetPhoto(rid, h, state.scopeId, true);
+      return `<div class="result-set-thumb-wrap${checked}"><button class="result-set-thumb" data-action="open-timeline-image" data-image-url="${escapeHtml(originalUrl)}" data-image-label="${escapeHtml(h)}" title="查看原图"><img src="${escapeHtml(window.sentrixApi.resultSetPhoto(rid, h, state.scopeId))}" alt="${escapeHtml(h)}" loading="lazy" />${inspected.has(h) ? `<span class="result-set-check inspected">已复核</span>` : ""}</button></div>`;
     }).join("")}</div>` : "";
     const inspectBlock = inspectedNotes ? `<div class="result-set-inspect-notes">${inspectedNotes}</div>` : "";
-    const originalButton = selected ? `<button class="text-button" data-action="open-selected-original" data-result-set-id="${escapeHtml(rid)}" data-handle="${escapeHtml(selected)}">查看原图 ${icon("→")}</button>` : "";
     const next = hasMore ? `<button class="text-button" data-action="result-next-page">还有 ${remaining} 张 · 看下一页 ${icon("→")}</button>` : "";
-    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${originalButton}${next}</section>`;
+    return `<section class="result-set-card"><div class="result-set-head"><span class="section-kicker">结果集</span><strong>${escapeHtml(head)}</strong></div>${thumbs}${inspectBlock}${next}</section>`;
   }
 
   function assistantMessage(message) {
@@ -553,17 +570,38 @@
     const agentPlan = result.agent_plan || {};
     const mode = plan.mode === "contextual_follow_up" ? "沿用上一段记忆" : plan.style === "narrative" ? "回忆叙事" : plan.style === "clarifying" ? "等待补充线索" : "事实回答";
     const failureStatus = ["partial", "timeout", "error", "blocked_by_guard"].includes(result.tool_loop_status || "");
-    const traceSteps = buildThinkingSteps(result);
-    const trace = traceSteps.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>思考过程 · ${traceSteps.length} 步</summary><div>${traceSteps.map(agentStepHtml).join("")}</div></details>` : "";
+    const timeline = timelineEvents(result);
+    const trace = timeline.length ? `<details class="agent-trace-box"${failureStatus ? " open" : ""}><summary>记忆推理 · ${timeline.length} 个节点</summary><div class="timeline-list">${timeline.map(timelineCard).join("")}</div></details>` : "";
     const grounding = result.answerGrounding || result.answer_grounding || {};
-    const gridVisible = ["result_grid", "inline_images"].includes(grounding.display_mode);
-    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble"><p>${assistantAnswer(result) || "我在。"}</p>${trace}${gridVisible ? resultSetCard(result) : ""}${assistantEvidence(result)}</div></article>`;
+    const selected = Boolean((grounding.selected_image_handles || grounding.selected_asset_ids || []).length);
+    return `<article class="assistant-message steward"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span>${status ? `<small>${escapeHtml(status)}</small>` : ""}</div><div class="assistant-bubble">${selected ? mediaResults(result) : ""}<p>${assistantAnswer(result) || "我在。"}</p>${trace}${recallCard(result)}</div></article>`;
   }
 
   function updateLiveProgress() {
     const host = document.querySelector("[data-live-progress]");
     if (!host) return;
-    host.innerHTML = buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("");
+    let list = host.querySelector(".timeline-list");
+    if (!list) {
+      host.innerHTML = '<div class="timeline-list"></div>';
+      list = host.querySelector(".timeline-list");
+    }
+    timelineEvents(null, state.liveProgress).forEach((event) => {
+      const eventId = String(event.event_id || `${event.stage || "status"}-${event.step_index || ""}`);
+      const existing = Array.from(list.querySelectorAll("[data-timeline-event-id]")).find((node) => node.dataset.timelineEventId === eventId);
+      const template = document.createElement("template");
+      template.innerHTML = timelineCard(event).trim();
+      const next = template.content.firstElementChild;
+      if (!next) return;
+      if (!existing) {
+        list.appendChild(next);
+        return;
+      }
+      if (existing.dataset.timelineSignature !== next.dataset.timelineSignature) {
+        existing.className = next.className;
+        existing.dataset.timelineSignature = next.dataset.timelineSignature;
+        existing.innerHTML = next.innerHTML;
+      }
+    });
   }
 
   function conversationRail() {
@@ -573,19 +611,16 @@
       const active = conv.conversation_id === state.conversationId;
       const when = conv.last_message_at || conv.updated_at || "";
       const whenLabel = when ? String(when).slice(5, 16).replace("T", " ") : "";
-      return `<div class="conversation-item${active ? " active" : ""}"><button class="conversation-open" data-action="open-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}"><span class="conversation-title">${escapeHtml(conv.title || "新对话")}</span><small>${escapeHtml(whenLabel)}</small></button><button class="conversation-delete" data-action="delete-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}" aria-label="删除对话" title="删除对话">✕</button></div>`;
+      return `<div class="conversation-item${active ? " active" : ""}"><button class="conversation-open" data-action="open-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}"><span class="conversation-title">${escapeHtml(conv.title || "新对话")}</span><small>${escapeHtml(whenLabel)}</small></button><details class="conversation-menu"><summary aria-label="更多操作">•••</summary><button data-action="rename-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}">重命名</button><button data-action="delete-conversation" data-conversation-id="${escapeHtml(conv.conversation_id)}">删除</button></details></div>`;
     }).join("") : `<div class="conversation-empty">还没有历史对话</div>`;
-    return `<aside class="conversation-rail"><div class="conversation-rail-head"><strong>对话</strong><button class="text-button" data-action="new-conversation">${icon("＋")}新对话</button></div><div class="conversation-list">${items}</div></aside>`;
+    return `<div class="conversation-drawer"><button class="conversation-drawer-toggle" data-action="toggle-conversation-drawer">对话</button><aside class="conversation-rail${state.conversationDrawerOpen ? " drawer-open" : ""}"><div class="conversation-rail-head"><strong>对话</strong><button class="text-button" data-action="new-conversation">${icon("＋")}新对话</button></div><div class="conversation-list">${items}</div></aside></div>`;
   }
 
   function searchView() {
     const messages = state.assistantMessages;
-    const introduction = `<section class="assistant-intro"><div><span class="assistant-mark">S</span><p class="section-kicker">FAMILY COMPANION</p><h2>家庭助手</h2><p>我记得这座家庭相册中整理出的成员、共同经历与生活细节。我们可以自然聊聊；谈到家里的往事时，我会在需要时调取记忆，并保留可查看的依据。</p></div><div class="assistant-scope"><span>当前相册</span><strong>${escapeHtml(albumLabel(state.scopeId))}</strong></div></section>`;
-    const suggestions = `<div class="assistant-suggestions"><button data-query="介绍一下明哥">介绍一位家人</button><button data-query="明哥的时间线">查看人物时间线</button><button data-query="推荐一些明哥的回忆">推荐有依据的回忆</button></div>`;
-    const summary = state.activeConversationSummary ? `<details class="conversation-summary"><summary>本会话摘要</summary><p>${escapeHtml(state.activeConversationSummary).replace(/\n/g, "<br />")}</p></details>` : "";
     const rail = conversationRail();
-    const inner = `${introduction}${summary}<section class="assistant-conversation">${messages.length ? messages.map(assistantMessage).join("") : `<div class="assistant-welcome"><p>今天想聊什么？</p>${suggestions}</div>`}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><p>我在想，正在整理这段记忆。</p><div class="agent-trace live" data-live-progress>${buildThinkingSteps(null, state.liveProgress).map(agentStepHtml).join("")}</div></div></article>` : ""}</section>${searchBar("和家庭助手聊聊，或问起家里的任何一段经历…")}`;
-    return `${pageHeader("家庭对话", "家庭助手", "一个中性的本地数字人，带着这座家庭相册形成的长期记忆。")}${rail ? `<div class="assistant-layout">${rail}<div class="assistant-main">${inner}</div></div>` : inner}`;
+    const inner = `<section class="assistant-conversation">${messages.map(assistantMessage).join("")}${state.searchLoading ? `<article class="assistant-message steward loading"><div class="assistant-ident"><span class="assistant-mark">S</span><span>家庭助手</span></div><div class="assistant-bubble"><div class="agent-trace live" data-live-progress><div class="timeline-list">${timelineEvents(null, state.liveProgress).map(timelineCard).join("")}</div></div><button class="text-button" data-action="cancel-assistant-turn">停止本轮回答</button></div></article>` : ""}</section>${searchBar("")}`;
+    return rail ? `<div class="assistant-layout">${rail}<div class="assistant-main">${inner}</div></div>` : inner;
   }
 
   function timelineView() {
@@ -611,9 +646,28 @@
   }
 
   function peopleView() {
-    const people = state.persons.filter((person) => state.personFilter === "all" || !person.confirmed);
-    const pending = state.persons.filter((person) => !person.confirmed);
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。单张样本会明确标注，仍可查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div><section class="people-grid">${people.length ? people.map((person, index) => { const name = person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`; const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : ""; return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.status)} · 置信度 ${Math.round((person.confidence || 0) * 100)}%</p>${caution}<div class="person-stats">${person.confirmed ? `<span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>✓</strong> 已确认</span>` : `<span><strong>${person.cluster_count || 0}</strong> 个人物簇</span><span>待确认</span>`}</div><div class="person-actions"><button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button>${person.confirmed ? "" : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`}</div></article>`; }).join("") : emptyState("还没有人物候选", "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>`;
+    const graph = window.SentrixPeopleGraph.toGraphModel(state.familyGraph || { people: [], relationships: [] });
+    const groups = window.SentrixPeopleGraph.partitionPeople(graph);
+    const visibleIds = new Set([...groups.family, ...groups.friends].map((person) => person.id));
+    const positions = { ...window.SentrixPeopleGraph.layoutPeopleGraph(graph, 1000, 640), ...state.peopleGraphLayout };
+    const peopleById = new Map(graph.people.map((person) => [person.id, person]));
+    const selected = peopleById.get(state.peopleGraphSelection);
+    const directlyRelated = new Set(graph.edges.filter((edge) => edge.subjectId === state.peopleGraphSelection || edge.objectId === state.peopleGraphSelection).flatMap((edge) => [edge.subjectId, edge.objectId]));
+    const dim = (id) => state.peopleGraphSelection && !directlyRelated.has(id) && id !== state.peopleGraphSelection ? "dim" : "";
+    const edgeSvg = graph.edges.filter((edge) => visibleIds.has(edge.subjectId) && visibleIds.has(edge.objectId)).map((edge) => {
+      const from = positions[edge.subjectId], to = positions[edge.objectId]; if (!from || !to) return "";
+      const label = edge.predicate === "朋友" || edge.predicate === "密友" ? `${peopleById.get(edge.subjectId)?.display_name || "待命名人物"}的朋友` : edge.predicate;
+      const isDim = state.peopleGraphSelection && edge.subjectId !== state.peopleGraphSelection && edge.objectId !== state.peopleGraphSelection;
+      return `<g class="people-graph-edge ${isDim ? "dim" : ""}" data-people-action="select-people-graph-edge" data-subject-id="${escapeHtml(edge.subjectId)}" data-object-id="${escapeHtml(edge.objectId)}" data-predicate="${escapeHtml(edge.predicate)}" data-inverse="${escapeHtml(edge.inversePredicate)}"><line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" marker-end="url(#people-graph-arrow)"/><text x="${(from.x + to.x) / 2}" y="${(from.y + to.y) / 2 - 8}">${escapeHtml(label)}</text></g>`;
+    }).join("");
+    const nodeSvg = [...groups.family, ...groups.friends].map((person) => { const point = positions[person.id]; if (!point) return ""; const avatar = person.avatar_face_instance_id ? `<image href="/api/face-instances/${encodeURIComponent(person.avatar_face_instance_id)}/crop" x="${point.x - 28}" y="${point.y - 28}" width="56" height="56" preserveAspectRatio="xMidYMid slice" clip-path="url(#people-avatar-${escapeHtml(person.id)})"/>` : `<text class="people-graph-initial" x="${point.x}" y="${point.y + 6}">${escapeHtml((person.display_name || "?").slice(0, 1))}</text>`; return `<g class="people-graph-node ${person.id === state.peopleGraphSelection ? "selected" : ""} ${dim(person.id)}" data-people-action="select-people-graph-person" data-person-id="${escapeHtml(person.id)}" tabindex="0" aria-label="查看${escapeHtml(person.display_name)}"><clipPath id="people-avatar-${escapeHtml(person.id)}"><circle cx="${point.x}" cy="${point.y}" r="28"/></clipPath><circle cx="${point.x}" cy="${point.y}" r="34"/>${avatar}<text class="people-graph-name" x="${point.x}" y="${point.y + 52}">${escapeHtml(person.display_name || "待命名人物")}</text><circle class="people-graph-handle" cx="${point.x + 37}" cy="${point.y - 25}" r="8" data-people-action="start-people-graph-edge" data-person-id="${escapeHtml(person.id)}" aria-label="从${escapeHtml(person.display_name)}添加关系">+</circle></g>`; }).join("");
+    const graphCanvas = `<section class="people-graph-canvas" data-people-graph-canvas><svg viewBox="0 0 1000 640" role="img" aria-label="家庭人物关系图谱"><defs><marker id="people-graph-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z"/></marker></defs><g data-people-graph-world transform="translate(${state.peopleGraphTransform.x} ${state.peopleGraphTransform.y}) scale(${state.peopleGraphTransform.scale})">${edgeSvg}${nodeSvg}</g></svg><div class="people-graph-zoom"><button data-action="people-graph-zoom-out">−</button><button data-action="people-graph-fit">适配全图</button><button data-action="people-graph-zoom-in">＋</button></div></section>`;
+    const pendingRows = groups.pending.sort((a, b) => (b.appearance_count || 0) - (a.appearance_count || 0)).map((person) => `<article class="people-pending-row">${faceAvatar(person.avatar_face_instance_id, person.display_name || "待命名人物", "gray")}<div><strong>${escapeHtml(person.display_name || "待命名人物")}</strong><small>出现 ${person.appearance_count || 0} 次</small></div><button class="button small ghost" data-action="select-people-graph-person" data-person-id="${escapeHtml(person.id)}">整理</button></article>`).join("");
+    const relationships = selected ? graph.edges.filter((edge) => edge.subjectId === selected.id || edge.objectId === selected.id).map((edge) => { const other = peopleById.get(edge.subjectId === selected.id ? edge.objectId : edge.subjectId); const relation = edge.subjectId === selected.id ? edge.predicate : edge.inversePredicate; return `<li>${escapeHtml(relation)}：${escapeHtml(other?.display_name || "待命名人物")}</li>`; }).join("") : "";
+    const media = (selected?.representative_media || []).map((item) => `<button class="people-media-thumb" data-action="open-asset" data-asset-id="${escapeHtml(item.id)}">${item.media_type === "video" ? `<video src="/api/assets/${encodeURIComponent(item.id)}/file" muted preload="metadata" aria-label="${escapeHtml(selected.display_name)}的代表视频"></video>` : `<img src="/api/assets/${encodeURIComponent(item.id)}/file" alt="${escapeHtml(selected.display_name)}的代表照片" loading="lazy"/>`}</button>`).join("");
+    const drawer = selected ? `<aside class="people-graph-drawer"><button class="people-drawer-close" data-action="close-people-graph-person">×</button>${faceAvatar(selected.avatar_face_instance_id, selected.display_name || "待命名人物", "green")}<h2>${escapeHtml(selected.display_name || "待命名人物")}</h2><p>${selected.membershipValue === "family" ? "家庭成员" : selected.membershipValue === "friend" ? "朋友" : "待整理人物"}</p><h3>相互关系</h3><ul>${relationships || "<li>尚未建立关系</li>"}</ul><h3>人物画像</h3><p>${escapeHtml(selected.portrait?.portrait_text || "暂未生成画像")}</p>${media ? `<h3>代表记忆</h3><div class="people-media-strip">${media}</div>` : ""}<div class="people-drawer-actions"><button class="button small ghost" data-action="rename-people-graph-person" data-person-id="${escapeHtml(selected.id)}">改名字</button><button class="button small ghost" data-action="set-people-graph-membership" data-person-id="${escapeHtml(selected.id)}" data-membership="family">设为家人</button><button class="button small ghost" data-action="set-people-graph-membership" data-person-id="${escapeHtml(selected.id)}" data-membership="friend">设为朋友</button></div></aside>` : "";
+    const chooser = state.peopleGraphDraftEdge ? `<div class="people-relation-chooser"><span>${state.peopleGraphDraftEdge.objectId ? "选择关系" : "再点击目标人物"}</span>${state.peopleGraphDraftEdge.objectId ? window.SentrixPeopleGraph.relationChoices().map((choice) => `<button data-action="save-people-graph-edge" data-predicate="${escapeHtml(choice.predicate)}" data-inverse="${escapeHtml(choice.inversePredicate)}">${escapeHtml(choice.label)}</button>`).join("") : ""}${state.peopleGraphDraftEdge.existing ? `<button class="danger" data-action="delete-people-graph-edge">删除关系</button>` : ""}<button data-action="cancel-people-graph-edge">取消</button></div>` : "";
+    return `${pageHeader("家庭人物", "把相册里的人，连成清楚的关系。", "关系默认来自模型判断；你的修改会直接写入数据库，并永久优先于后续推断。", `<button class="button ghost" data-action="merge-family-scopes">合并相册范围</button>`)}<div class="people-graph-tabs"><button class="${state.peopleGraphView === "graph" ? "active" : ""}" data-action="show-people-graph">关系图谱</button><button class="${state.peopleGraphView === "pending" ? "active" : ""}" data-action="show-people-pending">待整理人物 <b>${groups.pending.length}</b></button><button class="button small ghost" data-action="reload">↻ 刷新</button></div>${state.peopleGraphView === "graph" ? `<div class="people-graph-stage">${graphCanvas}${drawer}${chooser}</div>` : `<section class="people-pending-list">${pendingRows || emptyState("没有待整理人物", "模型尚未发现需要你确认身份或关系的人物。")}</section>`}`;
   }
 
   function knowledgeView() {
@@ -688,7 +742,7 @@
       ["场景图片语义理解", `${state.assets.filter((a) => a.derived_kind === "video_keyframe" && a.status === "processed").length} 张关键帧`, activeVideo ? "active" : "done"],
       ["事件记忆构建", `${stats().events} 个事件 · ${stats().facts} 条事实`, "done"],
     ];
-    return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "视频会在后台读取拍摄信息、提取关键画面并整理进家庭时间线。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择图片文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,audio/*,text/*,video/*" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.heic,.heif,image/jpeg,image/png,image/heic,image/heif" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或点击选择文件</strong><small>视频支持 MOV / MP4，并在后台构建场景记忆</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
+    return `${pageHeader("资料入口 / 本地导入", "把资料带回家，剩下的交给本地 AI。", "选择相册文件夹后，图片和视频会一起上传，并自动读取拍摄时间与地点。", `<button class="button ghost" data-action="open-folder">${icon("▦")}选择相册文件夹</button>`)}<section class="import-layout"><div><label class="dropzone" for="file-input"><input id="file-input" type="file" multiple accept="image/*,.heic,.heif,image/heic,image/heif,video/*,.mp4,.mov,.m4v,.avi,.mkv" /><input id="folder-input" type="file" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.webp,.heic,.heif,.bmp,.gif,.mp4,.mov,.m4v,.avi,.mkv,image/*,video/*" /><span class="drop-icon">↓</span><strong>拖入照片或视频，或选择整个相册文件夹</strong><small>支持 JPG / HEIC / PNG / MP4 / MOV，自动解析拍摄时间和地点</small><span class="button primary">选择资料</span></label><div class="import-notice"><span class="notice-mark">i</span><div><strong>原始资料不会被覆盖</strong><p>每张关键画面都能跳回原视频的准确时刻。</p></div></div></div><aside class="import-status"><div class="panel-title"><span>本地处理</span><span class="live-label"><i></i>真实状态</span></div><h2>当前处理</h2>${pipelineRows.map((row) => `<div class="pipeline-row"><span class="pipeline-state ${row[2]}">${row[2] === "done" ? "✓" : "•"}</span><div><strong>${row[0]}</strong><small>${row[1]}</small></div><em>${row[2] === "done" ? "完成" : "运行中"}</em></div>`).join("")}</aside></section>${renderUploadQueue()}<section class="content-section"><div class="section-head"><div><p class="section-kicker">导入记录</p><h2>最近处理任务</h2></div><button class="text-button" data-action="reload">刷新状态 ${icon("↻")}</button></div><div class="queue-list">${assets.length ? assets.map((asset) => `<div class="queue-row"><span class="queue-type ${asset.media_type}">${escapeHtml(mediaLabel(asset.media_type).slice(0, 3))}</span><div><strong>原始${escapeHtml(mediaLabel(asset.media_type))}资料</strong><small>${formatDateTime(asset.updated_at)} · ${escapeHtml(assetStatusLabel(asset.status))}</small></div><span class="queue-status ${asset.status.includes("failed") ? "reserved" : "queued"}">${escapeHtml(assetStatusLabel(asset.status))}</span></div>`).join("") : emptyState("没有待处理任务", "处理中的资料会显示在这里。")}</div></section>`;
   }
 
   function ocrSettingsCard() {
@@ -702,12 +756,10 @@
   function settingsView() {
     const facts = state.dashboard?.facts || [];
     const pending = facts.filter((fact) => fact.status === "pending");
-    const router = state.vlmBackendOptions || {};
-    const activeModel = router.models?.[router.backend];
-    const routerReady = router.status === "running" && Boolean(router.backend);
-    const routerStatus = modelSwitchInFlight ? "SWITCHING" : routerReady ? "RUNNING" : "UNMANAGED";
-    const routerStatusClass = routerReady || modelSwitchInFlight ? "" : "warn";
-    const unmanagedOption = router.backend ? "" : `<option value="" selected disabled>未托管模型</option>`;
+    const llm = state.health?.models?.llm || {};
+    const routerReady = llm.status === "running";
+    const routerStatus = routerReady ? "RUNNING" : "UNAVAILABLE";
+    const routerStatusClass = routerReady ? "" : "warn";
     const face = state.health.models?.face || {};
     const faceStatusText = face.identityFallback
       ? `人物检测已启用 · AdaFace 未加载，身份向量已回退为 ${escapeHtml(face.identityFallbackModel || "InsightFace buffalo_l")}`
@@ -716,7 +768,7 @@
         : face.detectionReady
           ? "人物检测已启用 · AdaFace 未加载，身份向量暂不可用"
           : "人物识别不可用";
-    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label ${routerStatusClass}">${routerStatus}</span></div><label class="model-switcher"><span>主推理</span><select data-action="switch-vlm" ${modelSwitchInFlight ? 'disabled' : ''}>${unmanagedOption}${(router.available_backends || []).map(id => { const info = router.models?.[id] || {}; return `<option value="${escapeHtml(id)}" ${id === router.backend ? 'selected' : ''} ${!info.available ? 'disabled' : ''}>${escapeHtml(info.model || id)}${info.available ? '' : ' · 离线'}${info.loaded ? ' · 当前运行' : ''}</option>` }).join('')}</select><small>${escapeHtml(modelSwitchInFlight ? `正在切换到 ${requestedModelProfile}` : activeModel?.url || router.error || '未托管模型')}</small></label><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${faceStatusText}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频场景记忆 <b>WorldMM</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}${ocrSettingsCard()}${`<section class="content-section fact-review">`}<div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频场景</span><b>本地 WorldMM 已启用</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div><div><button class="button small ghost" data-action="open-qa-dashboard">查看 QA 测评 Dashboard ${icon("▤")}</button><small>Agent 基准测评与历史 run 对比</small></div></div></div></section>`;
+    return `${pageHeader("系统 / 本地状态", "你的记忆，运行在自己的家里。", "服务、模型、存储和事实修订状态都来自当前本地后端。")}${state.health ? `<section class="health-grid"><article class="health-card dark"><div class="health-title"><span>Sentrix Home</span><span class="online-pill"><i></i>在线</span></div><strong>本地服务正常</strong><p>健康接口返回正常</p><div class="health-line"><span>数据资产</span><b>${stats().assets}</b></div><div class="health-bar"><i style="width:100%"></i></div></article><article class="health-card"><div class="health-title"><span>AI MODEL ROUTER</span><span class="ready-label ${routerStatusClass}">${routerStatus}</span></div><div class="model-row primary-model-row"><span>主推理</span><strong>${escapeHtml(llm.model || llm.profile || "未连接")}</strong><small>${escapeHtml(llm.base_url || "由部署配置提供，不在产品页面切换")}</small></div><div class="model-row"><span>语音转写</span><strong>FunASR</strong><small>${escapeHtml(state.health.models?.asr?.name || "未连接")}</small></div><div class="model-row"><span>人物识别</span><strong>InsightFace</strong><small>${faceStatusText}</small></div></article><article class="health-card"><div class="health-title"><span>MEMORY INDEX</span><span class="ready-label">LOCAL</span></div><strong>${stats().facts} <small>条事实</small></strong><p>SQLite 事实库 · 原生语义图与向量索引</p><div class="index-list"><span>${icon("●")}事件记忆 <b>${stats().events}</b></span><span>${icon("●")}观察证据 <b>${stats().observations}</b></span><span class="dim">${icon("—")}视频场景记忆 <b>WorldMM</b></span></div></article></section>` : emptyState("正在读取本地状态", "请稍候或刷新页面。")}${ocrSettingsCard()}${`<section class="content-section fact-review">`}<div class="section-head"><div><p class="section-kicker">语义记忆 / 版本维护</p><h2>需要确认的事实</h2></div><span class="result-count">${pending.length} 条</span></div>${pending.length ? `<div class="fact-review-list">${pending.map((fact) => `<div class="fact-review-row"><div><strong>${escapeHtml(fact.subject)} ${escapeHtml(fact.predicate)} ${escapeHtml(fact.object)}</strong><small>${escapeHtml(fact.id)} · 置信度 ${Math.round((fact.confidence || 0) * 100)}% · 证据 ${(fact.evidence_ids_json || []).join(", ")}</small></div><div class="review-actions"><button class="button small primary" data-action="confirm-fact" data-fact="${escapeHtml(fact.id)}">${icon("✓")}确认</button><button class="button small ghost" data-action="reject-fact" data-fact="${escapeHtml(fact.id)}">${icon("×")}驳回</button></div></div>`).join("")}</div>` : emptyState("没有待确认事实", "冲突事实出现后会进入这里，旧版本不会被删除。")}</section><section class="content-section two-column settings-lower"><div><div class="section-head"><div><p class="section-kicker">隐私边界</p><h2>数据只在本地流动</h2></div></div><div class="privacy-list"><div><span>原始媒体</span><b>本地存储</b></div><div><span>人物特征</span><b>本地处理</b></div><div><span>原生记忆索引</span><b>本地实体与向量检索</b></div><div><span>视频场景</span><b>本地 WorldMM 已启用</b></div></div></div><div><div class="section-head"><div><p class="section-kicker">审计入口</p><h2>可操作的系统动作</h2></div></div><div class="audit-list"><div><button class="button small ghost" data-action="reload">刷新服务状态 ${icon("↻")}</button><small>重新读取后端、模型和数据库状态</small></div><div><button class="button small ghost" data-action="recheck">重新检查失败任务 ${icon("→")}</button><small>只重试 queued 或 failed Asset</small></div><div><button class="button small ghost" data-action="open-help">查看接口与隐私说明 ${icon("?")}</button><small>当前部署边界和证据规则</small></div><div><button class="button small ghost" data-action="open-qa-dashboard">查看 QA 测评 Dashboard ${icon("▤")}</button><small>Agent 基准测评与历史 run 对比</small></div></div></div></section>`;
   }
 
   function semanticDetails(group) {
@@ -833,6 +885,7 @@
   function renderView() {
     const root = document.getElementById("view-root");
     const views = { overview, search: searchView, timeline: timelineView, people: peopleView, knowledge: semanticKnowledgeView, library: libraryView, stories: storiesView, imports: importsView, settings: settingsView };
+    root.classList.toggle("assistant-view", state.view === "search");
     root.innerHTML = state.loading ? emptyState("正在读取本地记忆", "正在加载 Asset、Observation、Event、Fact 和故事。") : views[state.view]();
     renderModal();
     bindViewEvents();
@@ -845,7 +898,10 @@
     const modal = state.modal;
     if (modal.type === "loading") { root.innerHTML = `<div class="modal-backdrop"><div class="modal-panel"><button class="modal-close" data-action="close-modal">×</button><div class="empty-search"><div class="empty-symbol">◌</div><h2>正在读取证据</h2></div></div></div>`; return; }
     let body = "";
-    if (modal.type === "event") {
+    if (modal.type === "timeline-image") {
+      const facts = [modal.time ? `时间 · ${escapeHtml(modal.time)}` : "", modal.place ? `地点 · ${escapeHtml(modal.place)}` : ""].filter(Boolean);
+      body = `<h2>照片详情</h2><div class="asset-modal-preview"><img src="${escapeHtml(modal.url || "")}" alt="${escapeHtml(modal.label || "照片")}" /></div>${facts.length ? `<div class="detail-facts">${facts.map((fact) => `<span>${fact}</span>`).join("")}</div>` : ""}${modal.activity ? `<p class="timeline-image-context">${escapeHtml(modal.activity)}</p>` : ""}`;
+    } else if (modal.type === "event") {
       const detail = modal.detail;
       const eventEntities = detail.entities || [];
       const coverSelection = detail.event.cover_selection || {};
@@ -874,6 +930,23 @@
     } else if (modal.type === "person") {
       const person = modal.person;
       body = `<form id="modal-form"><div class="modal-kicker">IDENTITY CONFIRMATION · ${escapeHtml(person.id)}</div><h2>确认人物身份</h2><p class="modal-lead">只在这里填写姓名和家庭角色。确认后会把该人物回写到相关事件、人物画像和语义记忆。</p><label>家庭成员名称<input name="name" value="" placeholder="确认时填写名称" required /></label><label>家庭角色<select name="family_role"><option value="">暂不确认</option><option>母亲</option><option>父亲</option><option>孩子</option><option>祖父母</option><option>其他家庭成员</option></select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">确认并更新记忆</button></div></form>`;
+    } else if (modal.type === "batch-person") {
+      const candidates = modal.candidates || [];
+      const batchRoleOptions = ["母亲", "父亲", "孩子", "祖父母", "其他家庭成员"].map((role) => `<option>${escapeHtml(role)}</option>`).join("");
+      const batchRelationPresets = ["配偶", "丈夫", "妻子", "父亲", "母亲", "儿子", "女儿", "兄弟", "姐妹", "祖父", "祖母", "外祖父", "外祖母", "本人"].map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join("");
+      const batchMemberOptions = candidates.map((candidate, index) => `<option value="${index}">成员 ${index + 1}</option>`).join("");
+      const batchRelationRow = `<div class="batch-relation-row"><select name="rel_subject"><option value="">成员 A</option>${batchMemberOptions}</select><select name="rel_predicate"><option value="">关系</option>${batchRelationPresets}</select><select name="rel_object"><option value="">成员 B</option>${batchMemberOptions}</select><button type="button" class="text-button" data-action="remove-batch-relation">×</button></div>`;
+      const batchCandidateRows = candidates.map((candidate, index) => `<div class="batch-person-row"><div class="batch-person-avatar">${faceAvatar(candidate.avatar_face_instance_id, `成员 ${index + 1}`)}</div><div class="batch-person-fields"><span class="batch-person-label">成员 ${index + 1} · 出现在 ${candidate.photo_count || 0} 张照片</span><div class="batch-person-inputs"><label>姓名或称呼<input name="name_${index}" placeholder="例如：妈妈" /></label><label>家庭角色<select name="role_${index}"><option value="">暂不确认</option>${batchRoleOptions}</select></label></div></div></div>`).join("");
+      body = `<form id="modal-form"><div class="modal-kicker">BATCH IDENTITY</div><h2>认识一下照片里的人</h2><p class="modal-lead">为每个常出现的人填姓名和家庭角色；留空则暂不确认。填完后可建立他们之间的关系。</p><div class="batch-person-list">${batchCandidateRows}</div><div class="section-head"><div><p class="section-kicker">人物关系</p><h3>他们之间是什么关系（可选）</h3></div><button type="button" class="button small ghost" data-action="add-batch-relation">${icon("＋")}添加关系</button></div><div class="batch-relation-list">${batchRelationRow}</div><div class="modal-actions"><button type="button" class="button ghost" data-action="close-modal">取消</button><button type="submit" class="button primary">批量确认并建立关系</button></div></form>`;
+    } else if (modal.type === "person-insight") {
+      const item = modal.item || {};
+      const roleOptions = ["本人", "父亲", "母亲", "配偶", "孩子", "祖父母", "兄弟姐妹", "其他亲属", "朋友", "同事", "同学", "邻居", "照护者", "老师", "亲友", "访客", "一次性人物", "无法判断"];
+      const roleSelect = `<select class="insight-role-select">${roleOptions.map((role) => `<option ${(item.family_role || "") === role ? "selected" : ""}>${escapeHtml(role)}</option>`).join("")}</select>`;
+      const candidateLine = (item.role_candidates || []).map((candidate) => `${escapeHtml(candidate.role)} ${Math.round((candidate.confidence || 0) * 100)}%`).join("、");
+      const portrait = item.portrait || {};
+      const portraitText = portrait.portrait_text || "还没有生成画像。";
+      const lockedBadge = portrait.status === "user_locked" ? `<span class="suggestion-badge">已锁定</span>` : "";
+      body = `<div class="modal-kicker">PERSON INSIGHT</div><h2>${escapeHtml(item.display_name || "未命名成员")}</h2><p class="modal-lead">${escapeHtml(item.role_state === "confirmed" ? (item.family_role || "角色已确认") : (candidateLine ? `系统建议角色：${candidateLine}` : "系统正在推断角色"))} · ${item.date_count || 0} 天 / ${item.event_count || 0} 个事件</p><div class="section-head"><div><p class="section-kicker">鲜活画像</p><h3>${lockedBadge}当前画像</h3></div></div><div class="profile-note">${escapeHtml(portraitText)}</div><div class="insight-actions"><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="like">像他</button><button class="button small ghost" data-action="portrait-feedback" data-person-id="${escapeHtml(item.person_id)}" data-verdict="dislike">不像他</button><button class="button small ghost" data-action="edit-portrait" data-person-id="${escapeHtml(item.person_id)}">编辑画像</button><button class="button small ghost" data-action="lock-portrait" data-person-id="${escapeHtml(item.person_id)}">锁定</button><button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(item.person_id)}">历史版本</button></div><div class="section-head"><div><p class="section-kicker">身份确认</p><h3>角色与姓名可独立维护</h3></div></div><div class="insight-field"><label>建议角色${roleSelect}</label></div><button class="button small primary" data-action="confirm-suggested-role" data-person-id="${escapeHtml(item.person_id)}">确认角色</button><div class="insight-field" style="margin-top:10px;"><label>姓名<input class="insight-name-input" value="${escapeHtml(item.name_state === "confirmed" ? (item.display_name || "") : "")}" placeholder="填写姓名（可不填）" /></label></div><button class="button small primary" data-action="save-person-name" data-person-id="${escapeHtml(item.person_id)}">保存姓名</button>`;
     } else if (modal.type === "person-evidence") {
       const detail = modal.detail;
       const entity = detail.entity;
@@ -907,7 +980,26 @@
       }).join("");
       const aliases = Array.isArray(entity.aliases) ? entity.aliases : [];
       const aliasLine = aliases.length ? `<div class="person-aliases"><strong>其他称呼</strong><span>${aliases.map(escapeHtml).join("、")}</span></div>` : "";
-      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(detail.profile?.summary_zh || entity.summary || "暂无人物画像") + "</p>" + aliasLine + "</div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div><div class=\"section-head\"><div><p class=\"section-kicker\">用户维护档案</p><h3>身份、关系与圈子</h3></div><button class=\"button small ghost\" data-action=\"edit-person-name\">编辑名字</button><button class=\"button small ghost\" data-action=\"edit-person-properties\">修正档案</button></div><div class=\"property-list\">" + (identityRows || emptyState("尚未维护身份属性", "这些字段只由你维护，模型不会覆盖。")) + "</div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
+      const profile = detail.profile || {};
+      const preference = profile.preference_summary_zh || "";
+      const relationshipRows = (detail.relationships || []).filter((r) => r.status === "active" || r.status === "pending").map((r) => {
+        const other = r.subject_entity_id === entity.id ? r.object_name : (r.object_entity_id === entity.id ? r.subject_name : (r.subject_name || r.object_name || ""));
+        return `<div class="property-row"><strong>${escapeHtml(other)} · ${escapeHtml(r.predicate || "关系")}</strong><small>${escapeHtml(r.status)} · 置信度 ${Math.round((r.confidence || 0) * 100)}%</small></div>`;
+      }).join("");
+      const patternGroups = {};
+      (detail.patterns || []).forEach((p) => { (patternGroups[p.pattern_type] = patternGroups[p.pattern_type] || []).push(p); });
+      const patternLabels = { activity: "常做活动", place: "常去地点", co_person: "常同行", clothing: "常穿" };
+      const patternRows = Object.keys(patternGroups).map((type) => {
+        const label = patternLabels[type] || type;
+        const items = patternGroups[type].map((p) => `${escapeHtml(p.value_text)}（${p.support_count || 0} 次）`).join("、");
+        return `<div class="property-row"><strong>${escapeHtml(label)}</strong><small>${items}</small></div>`;
+      }).join("");
+      const eventRows = (detail.event_memory || []).slice(0, 4).map((ev) => {
+        const time = ev.time_start ? String(ev.time_start).slice(0, 10) : "";
+        return `<div class="property-row"><strong>${escapeHtml(ev.activity_text || "家庭记录")}</strong><small>${escapeHtml(ev.place_text || "")}${time ? " · " + escapeHtml(time) : ""}</small></div>`;
+      }).join("");
+      const behaviorSection = (preference || patternRows || relationshipRows || eventRows) ? `<div class="section-head"><div><p class="section-kicker">高维画像</p><h3>行为规律与关系</h3></div><button class="button small ghost" data-action="relationship-graph">关系图</button></div>${preference ? `<div class="profile-note">${escapeHtml(preference)}</div>` : ""}${patternRows ? `<div class="property-list">${patternRows}</div>` : ""}${relationshipRows ? `<div class="section-head"><div><p class="section-kicker">人物关系</p><h3>家庭关系</h3></div></div><div class="property-list">${relationshipRows}</div>` : ""}${eventRows ? `<div class="section-head"><div><p class="section-kicker">近期事件</p><h3>人物近期经历</h3></div></div><div class="property-list">${eventRows}</div>` : ""}` : "";
+      body = "<div class=\"modal-kicker\">PERSON PROFILE · " + escapeHtml(entity.id) + "</div><div class=\"profile-heading\">" + faceAvatar(entity.avatar_face_instance_id, entity.canonical_name, "green") + "<div><h2>" + escapeHtml(entity.canonical_name) + "</h2><p class=\"modal-lead\">" + escapeHtml(profile.summary_zh || entity.summary || "暂无人物画像") + "</p>" + aliasLine + "</div></div><div class=\"detail-facts\"><span>家庭角色 · " + escapeHtml(entity.family_role || "未确认") + "</span><span>语义声明 · " + claims.length + "</span><span>人物簇 · " + detail.clusters.length + "</span></div>" + behaviorSection + "<div class=\"section-head\"><div><p class=\"section-kicker\">用户维护档案</p><h3>身份、关系与圈子</h3></div><button class=\"button small ghost\" data-action=\"edit-person-name\">编辑名字</button><button class=\"button small ghost\" data-action=\"edit-person-properties\">修正档案</button></div><div class=\"property-list\">" + (identityRows || emptyState("尚未维护身份属性", "这些字段只由你维护，模型不会覆盖。")) + "</div><div class=\"fact-review-list\">" + (claimRows || emptyState("暂无语义声明", "确认人物后，相关事件会持续维护人物画像。")) + "</div>";
     } else if (modal.type === "person-property-edit") {
       const detail = modal.detail;
       const properties = new Map((detail.properties || []).map((item) => [item.property_key, item]));
@@ -1004,7 +1096,7 @@
       const form = nodes.length >= 2 ? `<form id="modal-form" class="relation-form"><label>人物A<select name="person_a" required>${personOptions}</select></label><label>家庭关系<select name="relation">${relationSelect}</select><input name="relation_custom" placeholder="或自定义关系，如：养父" value="${editing && !relationOptions.includes(editing.predicate) ? escapeHtml(editing.predicate) : ""}" /></label><label>人物B<select name="person_b" required>${personOptions}</select></label><div class="modal-actions"><button type="button" class="button ghost" data-action="clear-relation-edit">取消</button><button type="submit" class="button primary">${editing ? "保存修改" : "添加关系"}</button></div></form>` : "";
       body = `<div class="modal-kicker">FAMILY GRAPH</div><h2>家庭关系图</h2><p class="modal-lead">这里只显示你已确认的人物与家庭关系。关系写入后会进入本地记忆，家庭助手也能回忆这些关系。</p>${graphBody}<div class="family-graph-toolbar"><div class="section-head"><div><p class="section-kicker">维护家庭关系</p><h3>${editing ? "编辑关系" : "添加关系"}</h3></div></div>${form}<div class="section-head" style="margin-top:18px"><div><p class="section-kicker">已建立的关系</p><h3>${(graph.relationships || []).filter((item) => item.status !== "retracted").length} 条</h3></div></div><div class="fact-review-list">${relationRows || emptyState("还没有家庭关系", "从上方选择两个人并填写家庭角色，关系会出现在这张图上。")}</div></div>`;
     } else if (modal.type === "import-picker") {
-      body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器原生选择器不能在同一个窗口同时选择文件和文件夹，请选择一种导入方式。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个文件夹</button></div>`;
+      body = `<div class="modal-kicker">IMPORT MEDIA</div><h2>选择导入方式</h2><p class="modal-lead">浏览器不能在同一个窗口同时选文件和文件夹。选择整个相册文件夹时，会导入其中的图片和视频。</p><div class="modal-actions"><button class="button primary" data-action="open-files">选择多个文件</button><button class="button ghost" data-action="open-folder">选择整个相册文件夹</button></div>`;
     } else if (modal.type === "space-manager") {
       const spaceRows = (state.spaces || []).map((sp) => {
         const isDefault = sp.id === "home-default";
@@ -1058,42 +1150,6 @@
   }
 
   let refreshInFlight = false;
-  let modelSwitchInFlight = false;
-  let requestedModelProfile = "";
-
-  async function handleModelProfileChange(select) {
-    if (modelSwitchInFlight) return;
-    const target = String(select.value || "");
-    if (!target) return;
-    modelSwitchInFlight = true;
-    requestedModelProfile = target;
-    select.disabled = true;
-    const selectedOption = select.selectedOptions[0];
-    if (selectedOption) selectedOption.textContent = `${selectedOption.textContent.replace(/ · 切换中$/, "")} · 切换中`;
-    try {
-      await window.sentrixApi.switchModelProfile(target);
-      const payload = await window.sentrixApi.getModelProfiles();
-      const current = payload.current || {};
-      if (current.profile !== target || current.status !== "running") {
-        throw new Error(`后端未确认目标模型运行，当前状态: ${current.status || "unknown"}`);
-      }
-      state.vlmBackendOptions = modelProfileOptions(payload);
-      state.backendError = "";
-      state.toast = `主模型已切换为 ${state.vlmBackendOptions.models?.[target]?.model || target}`;
-    } catch (error) {
-      state.backendError = `模型切换失败：${error.message || error}`;
-      try {
-        state.vlmBackendOptions = modelProfileOptions(await window.sentrixApi.getModelProfiles());
-      } catch (_) {
-        state.vlmBackendOptions = null;
-      }
-    } finally {
-      modelSwitchInFlight = false;
-      requestedModelProfile = "";
-      renderShellNavigation();
-    }
-  }
-
   async function refreshData(options = {}) {
     if (refreshInFlight) return;
     refreshInFlight = true;
@@ -1118,7 +1174,7 @@
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
           window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId), window.sentrixApi.entityGroups(scopeId),
-          window.sentrixApi.geoPlaces(scopeId),
+          window.sentrixApi.geoPlaces(scopeId), window.sentrixApi.personInsights(scopeId), window.sentrixApi.familyGraph(scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -1128,12 +1184,6 @@
     state.health = calls[5].status === "fulfilled" ? calls[5].value : null;
     loadConversations().catch(() => {});
     try {
-      const profilePayload = await window.sentrixApi.getModelProfiles();
-      if (!modelSwitchInFlight) state.vlmBackendOptions = modelProfileOptions(profilePayload);
-    } catch (err) {
-      state.vlmBackendOptions = null;
-    }
-    try {
       state.ocrSettings = await window.sentrixApi.getOcrSettings();
     } catch (err) {
       state.ocrSettings = null;
@@ -1141,6 +1191,8 @@
     state.entities = calls[6].status === "fulfilled" ? calls[6].value.entities || [] : [];
     state.clusters = calls[7].status === "fulfilled" ? calls[7].value.clusters || [] : [];
     state.relationships = calls[8].status === "fulfilled" ? calls[8].value.relationships || [] : [];
+    state.personInsights = calls[14].status === "fulfilled" ? calls[14].value : null;
+    state.familyGraph = calls[15].status === "fulfilled" ? calls[15].value : null;
         state.knowledge = calls[9].status === "fulfilled" ? calls[9].value : { profiles: [], claims: [] };
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
         state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
@@ -1205,6 +1257,14 @@
       submitPhotoInspector();
     });
     document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action, element)));
+    document.querySelectorAll("video[data-evidence-timestamp]").forEach((player) => player.addEventListener("loadedmetadata", () => {
+      const timestamp = Number(player.dataset.evidenceTimestamp);
+      if (!Number.isFinite(timestamp) || timestamp < 0) return;
+      player.pause();
+      player.currentTime = timestamp;
+    }, { once: true }));
+    document.querySelectorAll("[data-people-action]").forEach((element) => element.addEventListener("click", (event) => { event.stopPropagation(); handleAction(element.dataset.peopleAction, element); }));
+    bindPeopleGraphEvents();
     const fileInput = document.getElementById("file-input");
     if (fileInput) fileInput.addEventListener("change", handleFiles);
     if (state.view === "imports") document.querySelector('.page-heading [data-action="open-folder"]')?.remove();
@@ -1213,7 +1273,7 @@
     const dropzone = fileInput?.closest(".dropzone");
     if (dropzone) {
       const hint = dropzone.querySelector("small");
-      if (hint) hint.textContent = "选择文件或文件夹，系统会自动导入其中的 JPG/JPEG/PNG 图片";
+      if (hint) hint.textContent = "选择文件或整个相册文件夹，系统会自动导入图片和视频，并读取拍摄时间与地点";
       const chooseButton = dropzone.querySelector(".button.primary");
       if (chooseButton && chooseButton.tagName !== "BUTTON") {
         const unifiedButton = document.createElement("button");
@@ -1230,25 +1290,95 @@
     if (topUserLabel) topUserLabel.textContent = "相册管理";
   }
 
+  function bindPeopleGraphEvents() {
+    const canvas = document.querySelector("[data-people-graph-canvas]");
+    if (!canvas) return;
+    let gesture = null;
+    let frame = 0;
+    const renderGesture = () => { frame = 0; renderView(); };
+    canvas.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const scale = state.peopleGraphTransform.scale * (event.deltaY < 0 ? 1.12 : 1 / 1.12);
+      state.peopleGraphTransform.scale = Math.max(.45, Math.min(2.5, scale));
+      if (!frame) frame = requestAnimationFrame(renderGesture);
+    }, { passive: false });
+    canvas.addEventListener("pointerdown", (event) => {
+      const node = event.target.closest(".people-graph-node");
+      const handle = event.target.closest(".people-graph-handle");
+      if (handle) {
+        const sourceNode = handle.closest(".people-graph-node");
+        const sourceCircle = sourceNode?.querySelector("circle");
+        const draft = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        draft.setAttribute("class", "people-graph-draft-edge");
+        draft.setAttribute("x1", sourceCircle?.getAttribute("cx") || "0");
+        draft.setAttribute("y1", sourceCircle?.getAttribute("cy") || "0");
+        draft.setAttribute("x2", draft.getAttribute("x1")); draft.setAttribute("y2", draft.getAttribute("y1"));
+        canvas.querySelector("[data-people-graph-world]")?.appendChild(draft);
+        gesture = { type: "relation", personId: handle.dataset.personId, draft, rect: canvas.getBoundingClientRect() };
+        canvas.setPointerCapture(event.pointerId);
+        event.preventDefault();
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      gesture = { type: node ? "node" : "pan", personId: node?.dataset.personId || "", x: event.clientX, y: event.clientY, rect };
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!gesture) return;
+      if (gesture.type === "relation") {
+        const x = ((event.clientX - gesture.rect.left) * 1000 / gesture.rect.width - state.peopleGraphTransform.x) / state.peopleGraphTransform.scale;
+        const y = ((event.clientY - gesture.rect.top) * 640 / gesture.rect.height - state.peopleGraphTransform.y) / state.peopleGraphTransform.scale;
+        gesture.draft?.setAttribute("x2", String(x)); gesture.draft?.setAttribute("y2", String(y));
+        return;
+      }
+      const dx = (event.clientX - gesture.x) * 1000 / gesture.rect.width;
+      const dy = (event.clientY - gesture.y) * 640 / gesture.rect.height;
+      gesture.x = event.clientX; gesture.y = event.clientY;
+      if (gesture.type === "node") {
+        const current = state.peopleGraphLayout[gesture.personId] || window.SentrixPeopleGraph.layoutPeopleGraph(window.SentrixPeopleGraph.toGraphModel(state.familyGraph || {}), 1000, 640)[gesture.personId] || { x: 500, y: 320 };
+        state.peopleGraphLayout[gesture.personId] = { x: Math.max(40, Math.min(960, current.x + dx)), y: Math.max(40, Math.min(600, current.y + dy)) };
+      } else {
+        state.peopleGraphTransform.x += dx; state.peopleGraphTransform.y += dy;
+      }
+      if (!frame) frame = requestAnimationFrame(renderGesture);
+    });
+    canvas.addEventListener("pointerup", (event) => {
+      if (gesture?.type === "relation") {
+        const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(".people-graph-node");
+        if (target?.dataset.personId && target.dataset.personId !== gesture.personId) {
+          state.peopleGraphDraftEdge = { subjectId: gesture.personId, objectId: target.dataset.personId };
+          state.peopleGraphSelection = gesture.personId;
+        }
+        gesture.draft?.remove(); renderView();
+      }
+      gesture = null;
+    });
+    canvas.addEventListener("dblclick", (event) => {
+      if (!event.target.closest(".people-graph-node")) { state.peopleGraphTransform = { x: 0, y: 0, scale: 1 }; state.peopleGraphLayout = {}; renderView(); }
+    });
+  }
+
   async function submitSearch(event, selectedEntityId = "") {
     if (event?.preventDefault) event.preventDefault();
     const input = document.getElementById("search-input");
-    state.query = input ? input.value.trim() : state.query.trim();
-    if (!state.query) return;
+    const submittedMessage = input ? input.value.trim() : state.query.trim();
+    if (!submittedMessage || state.searchLoading) return;
+    state.query = "";
+    state.pendingMessage = submittedMessage;
     state.view = "search";
-    state.assistantMessages.push({ role: "user", text: state.query });
+    state.assistantMessages.push({ role: "user", text: submittedMessage });
     state.searchLoading = true;
     state.liveProgress = [];
     renderShellNavigation();
     try {
-      const { result, conversationId } = await runAssistantTurn(state.query, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
+      const { result, conversationId } = await runAssistantTurn(submittedMessage, state.conversationId, null, state.scopeId, selectedEntityId, state.selectedAsset);
       state.conversationId = conversationId;
       state.searchResult = result;
     } catch (error) {
       state.searchResult = { answer: "当前无法读取本地记忆，请稍后重试。", confidence: 0, evidence: [], retrievalTrace: [], error: error.message, insufficient_evidence: true };
     }
     state.assistantMessages.push({ role: "steward", result: state.searchResult });
-    state.query = "";
+    state.pendingMessage = "";
     state.searchLoading = false;
     state.liveProgress = [];
     loadConversations().catch(() => {});
@@ -1290,16 +1420,14 @@
       state.assistantMessages = (data.messages || []).map((msg) => {
         const text = (msg.content && (msg.content.text || msg.content.content)) || "";
         if (msg.role === "user") return { role: "user", text };
-        return { role: "steward", result: { answer: text, conversation_id: id, answer_grounding: { display_mode: "none" }, tool_loop_status: "complete" } };
+        const presentation = (msg.content && msg.content.presentation) || null;
+        return { role: "steward", result: presentation || { answer: text, conversation_id: id, answer_grounding: { display_mode: "none" }, tool_loop_status: "complete" } };
       });
     } catch { state.assistantMessages = []; }
     renderShellNavigation();
   }
 
   async function deleteConversationAction(id) {
-    const target = (state.conversations || []).find((conv) => conv.conversation_id === id);
-    const title = (target && target.title) || "这个对话";
-    if (!window.confirm(`删除「${title}」？\n这会删除聊天记录和处理过程，但不会删除已经保存的家庭照片和记忆。`)) return;
     try {
       await window.sentrixApi.deleteConversation(id);
       if (state.conversationId === id) {
@@ -1310,6 +1438,17 @@
       }
       await loadConversations();
     } catch (error) { state.toast = `删除失败：${error.message}`; }
+    renderShellNavigation();
+  }
+
+  async function renameConversationAction(id) {
+    const current = (state.conversations || []).find((item) => item.conversation_id === id);
+    const title = window.prompt("对话名称", (current && current.title) || "");
+    if (title == null || !title.trim()) return;
+    try {
+      await window.sentrixApi.renameConversation(id, title.trim());
+      await loadConversations();
+    } catch (error) { state.toast = `重命名失败：${error.message}`; }
     renderShellNavigation();
   }
 
@@ -1338,19 +1477,21 @@
   async function runAssistantTurn(message, conversationId = "", feedback = null, scopeId = "home-default", selectedEntityId = "", selectedAsset = null) {
     const start = await window.sentrixApi.assistantTurnAsync(message, conversationId, feedback, scopeId, selectedEntityId, "owner", selectedAsset);
     if (start && start.turn_id && start.status === "running") {
+      state.activeTurnId = start.turn_id;
       const nextConversationId = start.conversation_id || conversationId;
       // Phase C C13：优先 SSE 实时事件；EventSource 不可用时回退 700ms 轮询。
       let done = await subscribeTurnEvents(start.turn_id);
       if (!done) done = await pollTurnEvents(start.turn_id);
+      state.activeTurnId = "";
       return { result: done || { answer: "执行超时，请重试。", evidence_status: "error" }, conversationId: nextConversationId };
     }
     return { result: start, conversationId: (start && start.conversation_id) || conversationId };
   }
 
   function mergeLiveProgress(event) {
-    const idx = event && event.step_index != null ? event.step_index : null;
-    if (idx != null && Array.isArray(state.liveProgress)) {
-      const existing = state.liveProgress.findIndex((p) => p.step_index === idx);
+    const key = event && (event.event_id || event.step_index);
+    if (key != null && Array.isArray(state.liveProgress)) {
+      const existing = state.liveProgress.findIndex((p) => (p.event_id || p.step_index) === key);
       if (existing >= 0) state.liveProgress[existing] = event;
       else state.liveProgress.push(event);
     } else {
@@ -1385,7 +1526,7 @@
         const poll = await window.sentrixApi.assistantTurnPoll(turnId);
         if (Array.isArray(poll.public_progress)) state.liveProgress = poll.public_progress;
         updateLiveProgress();
-        if (poll.status === "complete") done = poll.result;
+        if (poll.status === "complete" || poll.status === "cancelled") done = poll.result;
         else if (poll.status === "error") done = { answer: "执行过程中出错。", error: poll.error, evidence_status: "error" };
       } catch (pollError) { /* 单次轮询失败继续等待 */ }
     }
@@ -1394,11 +1535,11 @@
 
   async function handleFiles(event) {
     let files = Array.from(event.target.files || []);
-    if (event.target.id === "folder-input") files = files.filter((file) => /\.(jpe?g|png)$/i.test(file.name || ""));
-    if (!files.length) { state.toast = "所选目录中没有 JPG/JPEG/PNG 图片"; renderShellNavigation(); return; }
+    files = files.filter((file) => window.sentrixImageMetadata?.isAlbumMediaFile(file));
+    if (!files.length) { state.toast = "所选内容中没有可导入的图片或视频"; renderShellNavigation(); return; }
     const queueEntries = files.map((file) => ({ fileName: file.name, status: "reading-metadata" }));
     state.queue.unshift(...queueEntries);
-    state.toast = `已读取 ${files.length} 张图片，正在解析元数据...`;
+    state.toast = `已读取 ${files.length} 个文件，正在解析元数据...`;
     renderShellNavigation();
     const items = [];
     for (let index = 0; index < files.length; index += 1) {
@@ -1413,7 +1554,7 @@
         queueEntries[index].error = error.message || String(error);
       }
       if ((index + 1) % 10 === 0 || index === files.length - 1) {
-        state.toast = `正在解析图片元数据：${index + 1}/${files.length}`;
+        state.toast = `正在解析拍摄信息：${index + 1}/${files.length}`;
         renderShellNavigation();
       }
     }
@@ -1431,7 +1572,7 @@
           entry.error = item.error || "";
           if (item.accepted) accepted += 1;
         });
-        state.toast = `正在上传图片：${Math.min(offset + chunk.length, items.length)}/${items.length}`;
+        state.toast = `正在上传相册文件：${Math.min(offset + chunk.length, items.length)}/${items.length}`;
         renderShellNavigation();
       }
     } catch (error) {
@@ -1439,7 +1580,7 @@
       state.toast = `上传失败：${error.message || error}`;
       renderShellNavigation();
     }
-    state.toast = `上传完成：${accepted}/${files.length} 张进入本地处理队列`;
+    state.toast = `上传完成：${accepted}/${files.length} 个文件进入本地处理队列`;
     await refreshData();
     state.view = "imports";
     renderShellNavigation();
@@ -1596,6 +1737,36 @@
           state.toast = `已确认${form.get("name")}，已更新 ${counts.events || 0} 个事件、${counts.patterns || 0} 个模式、${counts.claims || 0} 条语义声明`;
         }
       }
+      if (modal.type === "batch-person") {
+        const candidates = modal.candidates || [];
+        const items = [];
+        candidates.forEach((candidate, index) => {
+          const name = String(form.get(`name_${index}`) || "").trim();
+          if (!name) return;
+          items.push({ person_id: candidate.id, name, family_role: String(form.get(`role_${index}`) || "").trim() });
+        });
+        if (!items.length) { state.toast = "至少为一个成员填写姓名"; renderShellNavigation(); return; }
+        const batch = await window.sentrixApi.batchConfirmPeople(items);
+        const nameToEntity = {};
+        (batch.confirmed || []).forEach((row) => { nameToEntity[row.name] = row.entity_id; });
+        const relSubjects = form.getAll("rel_subject");
+        const relPredicates = form.getAll("rel_predicate");
+        const relObjects = form.getAll("rel_object");
+        for (let k = 0; k < relSubjects.length; k++) {
+          const subjectIdx = relSubjects[k];
+          const predicate = String(relPredicates[k] || "").trim();
+          const objectIdx = relObjects[k];
+          if (subjectIdx === "" || objectIdx === "" || !predicate || subjectIdx === objectIdx) continue;
+          const subjectName = String(form.get(`name_${subjectIdx}`) || "").trim();
+          const objectName = String(form.get(`name_${objectIdx}`) || "").trim();
+          const subjectEntity = nameToEntity[subjectName];
+          const objectEntity = nameToEntity[objectName];
+          if (!subjectEntity || !objectEntity) continue;
+          await window.sentrixApi.createRelationship({ subject_entity_id: subjectEntity, predicate, object_entity_id: objectEntity, confidence: 1, status: "active" });
+        }
+        const mergedCount = (batch.confirmed || []).filter((row) => row.merged).length;
+        state.toast = `已确认 ${batch.count || (batch.confirmed || []).length} 位家庭成员${mergedCount ? `，其中 ${mergedCount} 个名字与已有成员合并` : ""}`;
+      }
       if (modal.type === "cluster-merge") {
         await window.sentrixApi.mergeFaceClusters(form.get("target_cluster_id"), modal.cluster.id);
       }
@@ -1699,8 +1870,29 @@
     }
     if (action === "result-next-page") { state.query = "下一页"; state.view = "search"; renderShellNavigation(); submitSearch(); return; }
     if (action === "new-conversation") { await newConversation(); return; }
+    if (action === "toggle-conversation-drawer") { state.conversationDrawerOpen = !state.conversationDrawerOpen; renderShellNavigation(); return; }
     if (action === "open-conversation") { await openConversation(element.dataset.conversationId); return; }
+    if (action === "rename-conversation") { await renameConversationAction(element.dataset.conversationId); return; }
     if (action === "delete-conversation") { await deleteConversationAction(element.dataset.conversationId); return; }
+    if (action === "cancel-assistant-turn") {
+      const turnId = state.activeTurnId;
+      if (!turnId) return;
+      try { await window.sentrixApi.assistantTurnCancel(turnId); } catch (_) { state.toast = "停止请求未能发送"; }
+      state.query = state.pendingMessage || "";
+      state.toast = "正在停止本轮回答…";
+      renderShellNavigation();
+      return;
+    }
+    if (action === "open-timeline-image") {
+      const url = element.dataset.imageUrl;
+      if (url) openModal({ type: "timeline-image", url,
+        label: element.dataset.imageLabel || "原始图片",
+        time: element.dataset.imageTime || "",
+        place: element.dataset.imagePlace || "",
+        activity: element.dataset.imageActivity || "",
+        role: element.dataset.imageRole || "本轮图片" });
+      return;
+    }
     if (action === "open-photo-inspector") { await openPhotoInspector(element.dataset.resultSetId, element.dataset.handle); return; }
     if (action === "photo-inspector-quick") {
       if (state.photoInspector) state.photoInspector.draft = element.dataset.query || "";
@@ -1758,9 +1950,176 @@
     if (action === "delete-story") { await window.sentrixApi.deleteStory(element.dataset.storyId); state.toast = "故事草稿已删除"; return refreshData(); }
     if (action === "open-person") { openModal({ type: "loading" }, { push: true }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
     if (action === "open-person-profile") { openModal({ type: "loading" }, { push: true }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
+    if (action === "show-people-graph") { state.peopleGraphView = "graph"; return renderView(); }
+    if (action === "show-people-pending") { state.peopleGraphView = "pending"; return renderView(); }
+    if (action === "select-people-graph-person") {
+      const personId = element.dataset.personId;
+      if (state.peopleGraphDraftEdge?.subjectId && state.peopleGraphDraftEdge.subjectId !== personId) {
+        state.peopleGraphDraftEdge.objectId = personId;
+      }
+      state.peopleGraphSelection = personId;
+      state.peopleGraphView = "graph";
+      return renderView();
+    }
+    if (action === "close-people-graph-person") { state.peopleGraphSelection = ""; return renderView(); }
+    if (action === "start-people-graph-edge") { state.peopleGraphDraftEdge = { subjectId: element.dataset.personId }; return renderView(); }
+    if (action === "cancel-people-graph-edge") { state.peopleGraphDraftEdge = null; return renderView(); }
+    if (action === "select-people-graph-edge") {
+      state.peopleGraphDraftEdge = { subjectId: element.dataset.subjectId, objectId: element.dataset.objectId, existing: true };
+      return renderView();
+    }
+    if (action === "save-people-graph-edge") {
+      const edge = state.peopleGraphDraftEdge;
+      if (!edge?.subjectId || !edge?.objectId) { state.toast = "请先从一个人物连到另一个人物"; return renderShellNavigation(); }
+      try {
+        await window.sentrixApi.updateFamilyRelationship({ scope_id: state.scopeId, subject_entity_id: edge.subjectId, object_entity_id: edge.objectId, predicate: element.dataset.predicate, inverse_predicate: element.dataset.inverse });
+        state.peopleGraphUndo = { subjectId: edge.subjectId, objectId: edge.objectId, predicate: element.dataset.predicate, inversePredicate: element.dataset.inverse };
+        state.peopleGraphDraftEdge = null;
+        state.toast = "关系已保存；后续模型不会覆盖你的修改";
+        return refreshData();
+      } catch (error) { state.toast = `保存关系失败：${error.message}`; state.peopleGraphDraftEdge = null; return renderShellNavigation(); }
+    }
+    if (action === "delete-people-graph-edge") {
+      const edge = state.peopleGraphDraftEdge;
+      if (!edge?.subjectId || !edge?.objectId) return;
+      try {
+        await window.sentrixApi.retractFamilyRelationship({ scope_id: state.scopeId, subject_entity_id: edge.subjectId, object_entity_id: edge.objectId });
+        state.peopleGraphDraftEdge = null; state.toast = "关系已删除，模型不会重新建立它"; return refreshData();
+      } catch (error) { state.toast = `删除关系失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "people-graph-zoom-in" || action === "people-graph-zoom-out") { const amount = action.endsWith("in") ? 1.2 : 1 / 1.2; state.peopleGraphTransform.scale = Math.max(.45, Math.min(2.5, state.peopleGraphTransform.scale * amount)); return renderView(); }
+    if (action === "people-graph-fit") { state.peopleGraphTransform = { x: 0, y: 0, scale: 1 }; state.peopleGraphLayout = {}; return renderView(); }
+    if (action === "rename-people-graph-person") { openModal({ type: "loading" }, { push: true }); try { const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-name-edit", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物资料：${error.message}`; return renderShellNavigation(); } }
+    if (action === "set-people-graph-membership") { try { await window.sentrixApi.updateFamilyMembership(element.dataset.personId, { scope_id: state.scopeId, membership: element.dataset.membership }); state.toast = "归属已保存"; return refreshData(); } catch (error) { state.toast = `保存归属失败：${error.message}`; return renderShellNavigation(); } }
+    if (action === "edit-family-membership") {
+      const membership = window.prompt("家庭归属（family / friend / unknown）", element.dataset.membership || "unknown");
+      if (membership === null) return;
+      try {
+        await window.sentrixApi.updateFamilyMembership(element.dataset.personId, { scope_id: state.scopeId, membership: membership.trim() });
+        state.toast = "已保存你的家庭归属修正；后续模型推断不会覆盖它";
+        return refreshData();
+      } catch (error) { state.toast = `保存家庭归属失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "merge-family-scopes") {
+      const available = (state.spaces || []).map((space) => space.id).filter(Boolean).join(", ");
+      const raw = window.prompt(`输入需要合并的相册 scope_id（逗号分隔）。当前可选：${available}`, state.scopeId || "");
+      if (raw === null) return;
+      const scopeIds = raw.split(",").map((item) => item.trim()).filter(Boolean);
+      if (!scopeIds.includes(state.scopeId)) scopeIds.unshift(state.scopeId);
+      try {
+        await window.sentrixApi.mergeFamilyGraphScopes(scopeIds);
+        state.toast = "相册已合并为同一家庭图谱；原始照片和事件保持在各自相册中";
+        return refreshData();
+      } catch (error) { state.toast = `合并相册家庭失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "edit-family-relationship") {
+      const predicate = window.prompt("正向关系（例如：父亲、母亲、丈夫、妻子）", element.dataset.predicate || "");
+      if (predicate === null) return;
+      const inverse = window.prompt("反向关系（例如：女儿、儿子、妻子、丈夫）", element.dataset.inverse || "");
+      if (inverse === null) return;
+      try {
+        await window.sentrixApi.updateFamilyRelationship({
+          scope_id: state.scopeId,
+          subject_entity_id: element.dataset.subjectId,
+          object_entity_id: element.dataset.objectId,
+          predicate: predicate.trim(), inverse_predicate: inverse.trim(),
+        });
+        state.toast = "已保存你的关系修正；后续模型推断不会覆盖它";
+        return refreshData();
+      } catch (error) { state.toast = `保存家庭关系失败：${error.message}`; return renderShellNavigation(); }
+    }
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }
+    if (action === "open-person-insight") {
+      const personId = element.dataset.personId;
+      const insights = state.personInsights;
+      const tierItem = ((insights && insights.tiers && insights.tiers.core) || []).concat((insights && insights.tiers && insights.tiers.common) || [], (insights && insights.tiers && insights.tiers.incidental) || []).find((item) => item.person_id === personId);
+      if (!tierItem) { state.toast = "人物数据已变化，请刷新"; return renderShellNavigation(); }
+      return openModal({ type: "person-insight", item: tierItem });
+    }
+    if (action === "confirm-suggested-role") {
+      const card = element.closest(".modal-panel");
+      const role = card ? card.querySelector(".insight-role-select").value : "";
+      if (!role) { state.toast = "请选择角色"; return renderShellNavigation(); }
+      try {
+        const personId = element.dataset.personId;
+        const insights = state.personInsights;
+        const tierItem = ((insights && insights.tiers && insights.tiers.core) || []).concat((insights && insights.tiers && insights.tiers.common) || [], (insights && insights.tiers && insights.tiers.incidental) || []).find((item) => item.person_id === personId);
+        const hypothesisId = tierItem && tierItem.role_candidates && tierItem.role_candidates[0] ? tierItem.role_candidates[0].id : "";
+        await window.sentrixApi.decidePersonRole(personId, { hypothesis_id: hypothesisId, decision: "confirm", role, is_self: false });
+        state.toast = `已确认角色：${role}`;
+        return refreshData();
+      } catch (error) { state.toast = `角色确认失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "save-person-name") {
+      const card = element.closest(".modal-panel");
+      const name = card ? (card.querySelector(".insight-name-input").value || "").trim() : "";
+      if (!name) { state.toast = "请先填写姓名"; return renderShellNavigation(); }
+      try {
+        await window.sentrixApi.savePersonName(element.dataset.personId, name);
+        state.toast = `已保存姓名：${name}`;
+        return refreshData();
+      } catch (error) { state.toast = `姓名保存失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "portrait-feedback") {
+      try {
+        const portrait = await window.sentrixApi.personPortrait(element.dataset.personId);
+        const revisionId = portrait.active ? portrait.active.id : (portrait.revisions && portrait.revisions[0] && portrait.revisions[0].id);
+        const verdict = element.dataset.verdict === "like" ? "像他" : "不像他";
+        if (revisionId) await window.sentrixApi.sendPortraitFeedback(element.dataset.personId, { revision_id: revisionId, verdict, note: "" });
+        state.toast = verdict === "像他" ? "已标记：像他" : "已标记：不像他";
+        return refreshData();
+      } catch (error) { state.toast = `画像反馈失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "edit-portrait") {
+      const personId = element.dataset.personId;
+      const insights = state.personInsights;
+      const tierItem = ((insights && insights.tiers && insights.tiers.core) || []).concat((insights && insights.tiers && insights.tiers.common) || [], (insights && insights.tiers && insights.tiers.incidental) || []).find((item) => item.person_id === personId);
+      const currentText = tierItem && tierItem.portrait ? tierItem.portrait.portrait_text : "";
+      const edited = window.prompt("修订画像正文（保存为你的用户版本）", currentText);
+      if (edited === null) return;
+      try {
+        const portrait = await window.sentrixApi.personPortrait(personId);
+        await window.sentrixApi.updatePortrait(personId, { revision_id: portrait.active ? portrait.active.id : "", portrait_text: edited, locked: false });
+        state.toast = "画像已更新为你的版本";
+        return refreshData();
+      } catch (error) { state.toast = `画像修订失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "lock-portrait") {
+      try {
+        const portrait = await window.sentrixApi.personPortrait(element.dataset.personId);
+        if (!portrait.active) { state.toast = "还没有可锁定的画像"; return renderShellNavigation(); }
+        await window.sentrixApi.updatePortrait(element.dataset.personId, { revision_id: portrait.active.id, portrait_text: portrait.active.portrait_text, locked: true });
+        state.toast = "画像已锁定，后台刷新不会覆盖";
+        return refreshData();
+      } catch (error) { state.toast = `锁定失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "confirm-relationship-hypothesis") {
+      try {
+        await window.sentrixApi.decideRelationshipHypothesis(element.dataset.hypothesisId, { decision: "confirm" });
+        state.toast = "关系建议已确认并进入正式关系";
+        return refreshData();
+      } catch (error) { state.toast = `关系确认失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "reject-relationship-hypothesis") {
+      try {
+        await window.sentrixApi.decideRelationshipHypothesis(element.dataset.hypothesisId, { decision: "reject" });
+        state.toast = "已拒绝该关系建议";
+        return refreshData();
+      } catch (error) { state.toast = `关系拒绝失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "batch-confirm") { const candidates = state.persons.filter((person) => !person.confirmed && !person.single_sample).sort((a, b) => (b.photo_count || 0) - (a.photo_count || 0)); return openModal({ type: "batch-person", candidates }); }
+    if (action === "add-batch-relation") {
+      const list = document.querySelector(".batch-relation-list");
+      const candidates = (state.modal && state.modal.candidates) || [];
+      const memberOptions = candidates.map((candidate, index) => `<option value="${index}">成员 ${index + 1}</option>`).join("");
+      const relationPresets = ["配偶", "丈夫", "妻子", "父亲", "母亲", "儿子", "女儿", "兄弟", "姐妹", "祖父", "祖母", "外祖父", "外祖母", "本人"].map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join("");
+      const row = `<div class="batch-relation-row"><select name="rel_subject"><option value="">成员 A</option>${memberOptions}</select><select name="rel_predicate"><option value="">关系</option>${relationPresets}</select><select name="rel_object"><option value="">成员 B</option>${memberOptions}</select><button type="button" class="text-button" data-action="remove-batch-relation">×</button></div>`;
+      if (list) list.insertAdjacentHTML("beforeend", row);
+      return;
+    }
+    if (action === "remove-batch-relation") { element.closest(".batch-relation-row")?.remove(); return; }
     if (action === "confirm-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-confirm", cluster }); }
     if (action === "merge-cluster") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); return openModal({ type: "cluster-merge", cluster }); }
     if (action === "split-face") { const cluster = state.clusters.find((item) => item.id === element.dataset.clusterId); const sample = cluster?.samples?.find((item) => item.id === element.dataset.faceInstanceId); return openModal({ type: "cluster-split", cluster, sample }); }
@@ -1881,10 +2240,6 @@
     state.view = initialHash;
   }
   shell();
-  document.addEventListener("change", (event) => {
-    const select = event.target?.closest?.('[data-action="switch-vlm"]');
-    if (select) handleModelProfileChange(select);
-  });
   refreshData();
   window.addEventListener("hashchange", () => {
     const hashView = window.location.hash.replace(/^#\/?/, "");

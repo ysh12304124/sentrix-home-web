@@ -111,6 +111,23 @@ class ModelClientTests(unittest.TestCase):
         )
         self.assertEqual(client.manager_url, "http://manager-8500")
 
+    @patch("backend.model_clients.httpx.post")
+    def test_tokenizer_502_falls_back_to_local_estimate(self, post):
+        request = httpx.Request("POST", "http://manager-8500/tokenize-current")
+        response = httpx.Response(502, request=request, text="bad gateway")
+        error = httpx.HTTPStatusError("502 Bad Gateway", request=request, response=response)
+        post.return_value.raise_for_status.side_effect = error
+        client = GammaClient(
+            base_url="http://sentrix-vllm/v1", model="qwen3.5-0.8-lora-v2",
+            manager_url="http://manager-8500",
+        )
+        with patch.object(client, "_chat_openai_stream", return_value="ok") as stream:
+            self.assertEqual(client.chat_messages(
+                [{"role": "user", "content": "测试"}], role="tool_loop", max_tokens=64), "ok")
+        budget_metrics = stream.call_args.kwargs["budget_metrics"]
+        self.assertEqual(budget_metrics["token_count_source"], "local_estimate")
+        self.assertEqual(budget_metrics["preflight_status"], "fallback")
+
     def test_parses_json_inside_markdown_fence(self):
         result = parse_json_response('```json\n{"caption":"公园"}\n```')
         self.assertEqual(result["caption"], "公园")
@@ -220,6 +237,10 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(payload["options"]["num_ctx"], 4096)
         self.assertEqual(payload["options"]["num_predict"], 320)
 
+    def test_core_vision_default_budget_can_hold_full_observation_contract(self):
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="gemma4-12b-it")
+        self.assertEqual(client._core_vision_options()["num_predict"], 800)
+
     def test_image_prompt_uses_approved_place_taxonomy(self):
         client = GammaClient()
         with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
@@ -286,13 +307,21 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(result["semantic"]["objects"][0]["label"], "玩具")
         self.assertEqual(chat.call_count, 2)
 
-    def test_clip_uses_project_checkpoint_when_environment_is_unset(self):
-        checkpoint = Path(__file__).resolve().parents[2] / "data" / "models" / "clip" / "ViT-B-32.bin"
-        with patch.dict("os.environ", {"CLIP_CHECKPOINT": ""}, clear=False), patch.object(Path, "is_file", autospec=True) as is_file:
-            is_file.side_effect = lambda path: path == checkpoint
+    def test_clip_defaults_to_the_chinese_clip_checkpoint(self):
+        """ClipAdapter 必须与 embeddings/scheme.py 的 IMAGE_MODEL 对齐。
+
+        历史上导入侧用 open_clip ViT-B-32、检索侧钉死 chinese-clip，落库的视觉向量
+        检索侧一条都用不上（153 实测 visual 空间里积了 8782 条 ViT-B-32 向量，
+        episodic/semantic 同样被污染）。写入侧与查询侧必须是同一个模型。
+        """
+        from backend.embeddings.scheme import IMAGE_MODEL
+
+        with patch.dict("os.environ", {"CLIP_CHECKPOINT": "", "CHINESE_CLIP_CHECKPOINT": ""}, clear=False):
             adapter = __import__("backend.model_clients", fromlist=["ClipAdapter"]).ClipAdapter()
 
-        self.assertEqual(adapter.checkpoint, str(checkpoint))
+        self.assertEqual(adapter.model_name, IMAGE_MODEL)
+        self.assertEqual(adapter.embedding_dimension, 768)
+        self.assertTrue(adapter.checkpoint.endswith("clip_cn_vit-l-14.pt"), adapter.checkpoint)
 
     def test_person_appearance_analysis_returns_only_target_clothing(self):
         with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
@@ -328,6 +357,51 @@ class ModelClientTests(unittest.TestCase):
         self.assertIn("餐厅", prompt)
         self.assertNotRegex(result["summary"], r"30\.2458|120\.2989|坐标")
         self.assertIn("餐厅", result["summary"])
+
+    def test_analyze_person_moments_uses_verify_role_and_disables_thinking(self):
+        client = GammaClient(backend="vllm")
+        captured = {}
+
+        def fake_chat(prompt, images=None, vision_options=None, json_mode=True, role=None):
+            captured["role"] = role
+            captured["vision_options"] = vision_options
+            return json.dumps({"moments": [{
+                "label": "P1", "action_text": "抱着孩子", "interaction_labels": [],
+                "interaction_text": "", "participation_style": "照顾",
+                "visible_affect": "微笑", "social_role_cues": [],
+                "narrative_note": "", "confidence": 0.8,
+            }]})
+
+        with tempfile.TemporaryDirectory() as td:
+            image_path = f"{td}/preview.jpg"
+            Image.new("RGB", (100, 80), "white").save(image_path)
+            with patch.object(client, "chat", side_effect=fake_chat):
+                result = client.analyze_person_moments(
+                    image_path, ["P1"], {"asset_id": "a1"}
+                )
+        self.assertEqual(captured["role"], "verify")
+        self.assertFalse(captured["vision_options"]["think"])
+        self.assertEqual(result["moments"][0]["label"], "P1")
+        self.assertEqual(result["moments"][0]["action_text"], "抱着孩子")
+
+    def test_write_person_portrait_forwards_repair_role(self):
+        client = GammaClient(backend="vllm")
+        captured = {}
+
+        def fake_chat(prompt, images=None, vision_options=None, json_mode=True, role=None):
+            captured["role"] = role
+            return json.dumps({
+                "portrait_text": "从照片看，这位家庭成员常常把大家聚在一起，反复照顾孩子。",
+                "themes": [{
+                    "title": "把大家聚在一起", "summary": "常见于聚会",
+                    "evidence_refs": [{"kind": "person_moment", "id": "moment_x"}],
+                }],
+            })
+
+        with patch.object(client, "chat", side_effect=fake_chat):
+            result = client.write_person_portrait({"person": {"id": "p1"}}, role="repair")
+        self.assertEqual(captured["role"], "repair")
+        self.assertIn("portrait_text", result)
 
 
 if __name__ == "__main__":

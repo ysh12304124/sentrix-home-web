@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import * as echarts from "echarts";
 
 const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
@@ -13,15 +14,20 @@ const EXECUTION_PHASES = [
 const config = ref(null);
 const manifests = ref([]);
 const profiles = ref([]);
+const cloudModelProfile = computed(() => config.value?.cloud_model_profile || {
+  id: "big_model", label: "big_model（云端 API）", source: "cloud_api",
+  available: true, model: "deepseek-v4.1-flash",
+});
 const vllmTargets = ref({});
 const runs = ref([]);
+const runPage = ref({ page: 1, page_size: 20, total: 0, pages: 1, has_previous: false, has_next: false, active_count: 0 });
 const activeRunId = ref(null);
 const activeRun = ref(null);
 const keyframeAnalysis = ref(null);
 const keyframeAnalysisLoading = ref(false);
 const keyframeAnalysisError = ref("");
 const memoryEffectiveness = ref(null);
-const memoryAnswerAttribution = computed(() => memoryEffectiveness.value?.details?.memory_answer_attribution?.retrievable || null);
+const memoryAttribution = computed(() => memoryEffectiveness.value?.details?.memory_answer_attribution || null);
 const errorChainDiagnosis = computed(() => memoryEffectiveness.value?.details?.error_chain_diagnosis || null);
 const memoryValidityArchitecture = computed(() => {
   const levels = memoryEffectiveness.value?.levels || [];
@@ -43,7 +49,7 @@ const memoryValidityArchitecture = computed(() => {
       key: "L0", name: "原始媒体与检索", stage: "记忆库规模 → 测评检索结果",
       nodes: [
         { label: "原始媒体创建量", value: raw.created || 0, note: "记忆库输入规模，不代表测评有效" },
-        { label: "原始图片测评 Recall", value: runSummary.image_retrieval_recall_micro == null ? "未计算" : fmtPct(runSummary.image_retrieval_recall_micro), note: `${fmtPct(runSummary.image_retrieval_precision_micro)} Precision · 图片 GT 命中情况` },
+        { label: "原始图片交付 Recall", value: runSummary.image_retrieval_recall_micro == null ? "未计算" : fmtPct(runSummary.image_retrieval_recall_micro), note: `${fmtPct(runSummary.image_retrieval_precision_micro)} Precision · 按模型使用（交付）口径；工具召回维度见下方两列矩阵` },
         { label: "关键帧父级 Recall", value: analysis ? ratio(analysis.retrieval.video_gt_targets_hit_by_keyframe, analysis.retrieval.video_gt_targets) : "未计算", note: analysis ? `${analysis.retrieval.video_gt_targets_hit_by_keyframe || 0}/${analysis.retrieval.video_gt_targets || 0} 个 GT 源视频被覆盖` : "关键帧接口尚未返回" },
         { label: "关键帧返回 Precision", value: analysis ? ratio(analysis.retrieval.predicted_relevant_keyframes, analysis.retrieval.predicted_keyframes) : "未计算", note: analysis ? `${analysis.retrieval.predicted_relevant_keyframes || 0}/${analysis.retrieval.predicted_keyframes || 0} 个返回关键帧与 GT 父视频一致` : "关键帧接口尚未返回" },
       ],
@@ -79,79 +85,94 @@ const memoryValidityArchitecture = computed(() => {
     },
   ];
 });
-const memoryRecallArchitecture = computed(() => {
-  const attribution = memoryAnswerAttribution.value || {};
-  const matrix = attribution.matrix || {};
+const memoryRecallMatrices = computed(() => {
+  const attribution = memoryAttribution.value || {};
+  const evidenceBlocks = memoryEffectiveness.value?.details?.evidence_effectiveness || {};
   const correctness = memoryEffectiveness.value?.details?.answer_correctness || {};
-  const hit = Number(attribution.hit_items || 0);
-  const miss = Number(attribution.miss_items || 0);
-  const eligible = Number(attribution.eligible || 0);
-  const hitWrong = Number(matrix.hit_incorrect || 0);
-  const missWrong = Number(matrix.miss_incorrect || 0);
   const judgedTotal = Number(correctness.correct || 0) + Number(correctness.partial || 0) + Number(correctness.incorrect || 0);
-  const evidence = memoryEffectiveness.value?.details?.evidence_effectiveness || {};
-  const evidenceRow = (key) => evidence[key] || {};
-  const imageEvidence = evidenceRow("image");
-  const videoEvidence = evidenceRow("video_keyframe");
-  const eventEvidence = evidenceRow("event");
   const pct = (value, total) => total ? fmtPct(value / total) : "-";
-  return [
+  const DIMS = [
     {
-      key: "L0", name: "评测题目范围", stage: "回答结果与 GT 媒体对齐",
-      nodes: [
-        { label: "全量已评分题", value: pct(judgedTotal, judgedTotal), note: `${judgedTotal} 题；正确 ${correctness.correct || 0} · 部分 ${correctness.partial || 0} · 错误 ${correctness.incorrect || 0}` },
-        { label: "可归因题占比", value: pct(eligible, judgedTotal), note: `${eligible}/${judgedTotal} 题有 GT 媒体；不可回答题不进入记忆归因` },
-      ],
+      key: "tool", title: "工具召回命中矩阵",
+      note: "工具召回命中：GT 媒体进入检索 / 工具返回集合（视频按关键帧父级覆盖）",
+      hitLabel: "工具召回命中", missLabel: "工具召回未命中", stageL1: "GT 是否进入检索候选",
     },
     {
-      key: "L1", name: "记忆召回结果", stage: "GT 媒体是否进入本题检索结果",
-      nodes: [
-        { label: "召回命中", value: "已找到", note: `${hit}/${eligible} 题；GT 媒体进入本题检索结果` },
-        { label: "召回未命中", value: "未找到", note: `${miss}/${eligible} 题；GT 媒体未进入本题检索结果` },
-      ],
-    },
-    {
-      key: "L2", name: "回答评分结果", stage: "在命中 / 未命中分支内继续看 Judge",
-      nodes: [
-        { label: "命中 → 正确", value: matrix.hit_correct || 0, note: `${pct(matrix.hit_correct, eligible)} 总体 · ${pct(matrix.hit_correct, hit)} 命中分支` },
-        { label: "命中 → 部分", value: matrix.hit_partial || 0, note: `${pct(matrix.hit_partial, eligible)} 总体 · ${pct(matrix.hit_partial, hit)} 命中分支` },
-        { label: "命中 → 错误", value: hitWrong, note: `${pct(hitWrong, eligible)} 总体 · ${pct(hitWrong, hit)} 命中分支` },
-        { label: "未命中 → 正确", value: matrix.miss_correct || 0, note: `${pct(matrix.miss_correct, eligible)} 总体 · ${pct(matrix.miss_correct, miss)} 未命中分支` },
-        { label: "未命中 → 部分", value: matrix.miss_partial || 0, note: `${pct(matrix.miss_partial, eligible)} 总体 · ${pct(matrix.miss_partial, miss)} 未命中分支` },
-        { label: "未命中 → 错误", value: missWrong, note: `${pct(missWrong, eligible)} 总体 · ${pct(missWrong, miss)} 未命中分支` },
-      ],
-      groups: [
-        {
-          label: "召回命中",
-          total: hit,
-          note: "GT 媒体进入本题检索结果",
-          nodes: [
-            { label: "回答正确", value: pct(matrix.hit_correct, eligible), note: `${pct(matrix.hit_correct, hit)} 本分支；${matrix.hit_correct || 0}/${eligible} 全部` },
-            { label: "部分正确", value: pct(matrix.hit_partial, eligible), note: `${pct(matrix.hit_partial, hit)} 本分支；${matrix.hit_partial || 0}/${eligible} 全部` },
-            { label: "回答错误", value: pct(hitWrong, eligible), note: `${pct(hitWrong, hit)} 本分支；${hitWrong}/${eligible} 全部` },
-          ],
-        },
-        {
-          label: "召回未命中",
-          total: miss,
-          note: "GT 媒体未进入本题检索结果",
-          nodes: [
-            { label: "回答正确", value: pct(matrix.miss_correct, eligible), note: `${pct(matrix.miss_correct, miss)} 本分支；${matrix.miss_correct || 0}/${eligible} 全部` },
-            { label: "部分正确", value: pct(matrix.miss_partial, eligible), note: `${pct(matrix.miss_partial, miss)} 本分支；${matrix.miss_partial || 0}/${eligible} 全部` },
-            { label: "回答错误", value: pct(missWrong, eligible), note: `${pct(missWrong, miss)} 本分支；${missWrong}/${eligible} 全部` },
-          ],
-        },
-      ],
-    },
-    {
-      key: "L3", name: "证据有效性", stage: "事件 / 原图 / 关键帧 → Judge 验证",
-      nodes: [
-        { label: "原图片证据有效率", value: imageEvidence.effective_rate_on_returned == null ? "未计算" : fmtPct(imageEvidence.effective_rate_on_returned), note: `${imageEvidence.effective_items || 0}/${imageEvidence.returned_items || 0} 返回证据有效 · 无效 ${imageEvidence.ineffective_items || 0}` },
-        { label: "视频 / 关键帧有效率", value: videoEvidence.effective_rate_on_returned == null ? "未计算" : fmtPct(videoEvidence.effective_rate_on_returned), note: `${videoEvidence.effective_items || 0}/${videoEvidence.returned_items || 0} 返回证据有效 · 无效 ${videoEvidence.ineffective_items || 0}` },
-        { label: "事件上下文有效率", value: eventEvidence.effective_rate_on_returned == null ? "未计算" : fmtPct(eventEvidence.effective_rate_on_returned), note: `${eventEvidence.effective_items || 0}/${eventEvidence.returned_items || 0} 返回证据有效 · 无效 ${eventEvidence.ineffective_items || 0}` },
-      ],
+      key: "usage", title: "模型使用命中矩阵",
+      note: "模型使用命中：GT 媒体被模型显式用于回答（严格交付口径，与逐题指标一致）",
+      hitLabel: "模型使用命中", missLabel: "模型使用未命中", stageL1: "GT 是否被模型用于回答",
     },
   ];
+  return DIMS.map((dim) => {
+    const scope = attribution[dim.key] || {};
+    const matrix = scope.matrix || {};
+    const hit = Number(scope.hit_items || 0);
+    const miss = Number(scope.miss_items || 0);
+    const eligible = Number(scope.eligible || 0);
+    const evBlock = evidenceBlocks[dim.key] || {};
+    const evRow = (k) => evBlock[k] || {};
+    const imageEv = evRow("image");
+    const videoEv = evRow("video_keyframe");
+    const eventEv = evidenceBlocks.event || {};
+    const hitWrong = Number(matrix.hit_incorrect || 0);
+    const missWrong = Number(matrix.miss_incorrect || 0);
+    return {
+      key: dim.key, title: dim.title, note: dim.note, eligible, hit, miss,
+      layers: [
+        {
+          key: "L0", name: "评测题目范围", stage: "回答结果与 GT 媒体对齐",
+          nodes: [
+            { label: "全量已评分题", value: pct(judgedTotal, judgedTotal), note: `${judgedTotal} 题；正确 ${correctness.correct || 0} · 部分 ${correctness.partial || 0} · 错误 ${correctness.incorrect || 0}` },
+            { label: "可归因题占比", value: pct(eligible, judgedTotal), note: `${eligible}/${judgedTotal} 题有 GT 媒体；不可回答题不进归因` },
+          ],
+        },
+        {
+          key: "L1", name: "命中结果", stage: dim.stageL1,
+          nodes: [
+            { label: dim.hitLabel, value: "已找到", note: `${hit}/${eligible} 题` },
+            { label: dim.missLabel, value: "未找到", note: `${miss}/${eligible} 题` },
+          ],
+        },
+        {
+          key: "L2", name: "回答评分结果", stage: "在命中 / 未命中分支内看 Judge",
+          nodes: [
+            { label: "命中 → 正确", value: matrix.hit_correct || 0, note: `${pct(matrix.hit_correct, eligible)} 总体 · ${pct(matrix.hit_correct, hit)} 命中分支` },
+            { label: "命中 → 部分", value: matrix.hit_partial || 0, note: `${pct(matrix.hit_partial, eligible)} 总体 · ${pct(matrix.hit_partial, hit)} 命中分支` },
+            { label: "命中 → 错误", value: hitWrong, note: `${pct(hitWrong, eligible)} 总体 · ${pct(hitWrong, hit)} 命中分支` },
+            { label: "未命中 → 正确", value: matrix.miss_correct || 0, note: `${pct(matrix.miss_correct, eligible)} 总体 · ${pct(matrix.miss_correct, miss)} 未命中分支` },
+            { label: "未命中 → 部分", value: matrix.miss_partial || 0, note: `${pct(matrix.miss_partial, eligible)} 总体 · ${pct(matrix.miss_partial, miss)} 未命中分支` },
+            { label: "未命中 → 错误", value: missWrong, note: `${pct(missWrong, eligible)} 总体 · ${pct(missWrong, miss)} 未命中分支` },
+          ],
+          groups: [
+            {
+              label: dim.hitLabel, total: hit, note: "命中分支",
+              nodes: [
+                { label: "回答正确", value: pct(matrix.hit_correct, eligible), note: `${pct(matrix.hit_correct, hit)} 本分支；${matrix.hit_correct || 0}/${eligible} 全部` },
+                { label: "部分正确", value: pct(matrix.hit_partial, eligible), note: `${pct(matrix.hit_partial, hit)} 本分支；${matrix.hit_partial || 0}/${eligible} 全部` },
+                { label: "回答错误", value: pct(hitWrong, eligible), note: `${pct(hitWrong, hit)} 本分支；${hitWrong}/${eligible} 全部` },
+              ],
+            },
+            {
+              label: dim.missLabel, total: miss, note: "未命中分支",
+              nodes: [
+                { label: "回答正确", value: pct(matrix.miss_correct, eligible), note: `${pct(matrix.miss_correct, miss)} 本分支；${matrix.miss_correct || 0}/${eligible} 全部` },
+                { label: "部分正确", value: pct(matrix.miss_partial, eligible), note: `${pct(matrix.miss_partial, miss)} 本分支；${matrix.miss_partial || 0}/${eligible} 全部` },
+                { label: "回答错误", value: pct(missWrong, eligible), note: `${pct(missWrong, miss)} 本分支；${missWrong}/${eligible} 全部` },
+              ],
+            },
+          ],
+        },
+        {
+          key: "L3", name: "证据有效性", stage: "原图 / 关键帧 / 事件 → Judge 验证",
+          nodes: [
+            { label: "原图片证据有效率", value: imageEv.effective_rate_on_returned == null ? "未计算" : fmtPct(imageEv.effective_rate_on_returned), note: `${imageEv.effective_items || 0}/${imageEv.returned_items || 0} 有效 · 无效 ${imageEv.ineffective_items || 0}` },
+            { label: "视频 / 关键帧有效率", value: videoEv.effective_rate_on_returned == null ? "未计算" : fmtPct(videoEv.effective_rate_on_returned), note: `${videoEv.effective_items || 0}/${videoEv.returned_items || 0} 有效 · 无效 ${videoEv.ineffective_items || 0}` },
+            { label: "事件上下文有效率", value: eventEv.effective_rate_on_returned == null ? "未计算" : fmtPct(eventEv.effective_rate_on_returned), note: `${eventEv.effective_items || 0}/${eventEv.returned_items || 0} 有效 · 无效 ${eventEv.ineffective_items || 0}` },
+          ],
+        },
+      ],
+    };
+  });
 });
 function memoryLayerSpecialMetrics(level) {
   const analysis = keyframeAnalysis.value?.status === "ready" ? keyframeAnalysis.value : null;
@@ -260,12 +281,43 @@ const chainMode = ref("creation");
 const chainDetail = ref(null);
 let pollTimer = null;
 let destroyed = false;
+const telemetryChartEl = ref(null);
+let telemetryChartInstance = null;
 
 const api = async (path, options = {}) => {
-  const response = await fetch(path, { headers: { "content-type": "application/json", ...(options.headers || {}) }, ...options });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
+  const { timeoutMs = 10000, retries, ...requestOptions } = options;
+  const method = String(requestOptions.method || "GET").toUpperCase();
+  const retryCount = retries ?? (method === "GET" ? 1 : 0);
+  let lastError;
+  for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(path, {
+        headers: { "content-type": "application/json", ...(requestOptions.headers || {}) },
+        ...requestOptions,
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; }
+      catch { throw new Error(`响应不是有效 JSON：${path}`); }
+      if (!response.ok) {
+        const httpError = new Error(data.error || `HTTP ${response.status}`);
+        httpError.retryable = response.status >= 500;
+        throw httpError;
+      }
+      return data;
+    } catch (requestError) {
+      lastError = requestError;
+      const retryable = requestError?.name === "AbortError" || requestError instanceof TypeError || requestError?.retryable;
+      if (attempt >= retryCount || !retryable) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+  throw new Error(lastError?.name === "AbortError" ? `请求超时：${path}` : (lastError?.message || `请求失败：${path}`));
 };
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
 const esc = (value) => String(value ?? "");
@@ -297,7 +349,8 @@ function setModelSelected(modelId, checked) {
 }
 
 const qaOptions = computed(() => manifests.value.find((m) => m.album_id === selectedAlbum.value)?.qa_sets || ["compact-10q"]);
-const hasRunning = computed(() => runs.value.some((run) => ["running", "pending", "cancelling"].includes(run.status) || run.rejudge?.status === "running"));
+const hasRunning = computed(() => Number(runPage.value.active_count || 0) > 0
+  || runs.value.some((run) => ["running", "pending", "cancelling"].includes(run.status) || run.rejudge?.status === "running"));
 const activeRejudge = computed(() => activeRun.value?.rejudge || null);
 const visibleQaItems = computed(() => {
   const items = qaPage.value?.items || [];
@@ -498,7 +551,7 @@ function resultPhaseStatus(phase) {
 }
 
 function imageUrl(image) {
-  return image?.media_url || (image?.asset_id ? `${sentrixUrl.value.replace(/\/$/, "")}/api/assets/${image.asset_id}/file` : "");
+  return image?.asset_id ? `/api/assets/${encodeURIComponent(image.asset_id)}/file` : (image?.media_url || "");
 }
 function actionLabel(value) {
   return ({ answer: "回答", refuse: "拒答", clarify: "澄清", none: "无有效行为" })[value] || "未记录";
@@ -583,6 +636,13 @@ function isVideoMedia(image) {
     return /^video-\d+(?:\.mp4)?$/i.test(fileName) || /\.mp4(?:$|[?#])/i.test(text);
   });
 }
+function pauseVideoAtEvidenceFrame(media, event) {
+  const seconds = Number(media?.source_timestamp_sec);
+  const player = event?.target;
+  if (!player || !Number.isFinite(seconds) || seconds < 0) return;
+  player.pause();
+  player.currentTime = seconds;
+}
 function decorateMedia(list) {
   return (list || []).map((img) => {
     if (img?.media_url) return img;
@@ -606,16 +666,17 @@ function itemMedia(item, gt = false) {
       return { ...ref, file_name: fileName, matched: (item.matched_file_names || []).includes(fileName) };
     }));
   }
-  // Model recall is the upstream evidence projection, not only explicit delivery.
-  if (item.evidence_source_media?.length) return decorateMedia(item.evidence_source_media);
-  if (item.evidence_source_images?.length) return decorateMedia(item.evidence_source_images);
-  if (item.evidence_source_file_names?.length) {
-    return decorateMedia(item.evidence_source_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
-  }
+  // 交付口径（E）：模型"召回/回答来源"= 模型显式交付的图（selected/predicted），
+  // 不再把上游 evidence 全量候选冒充回答来源。历史 run 只有 evidence/retrieved 字段时再回退。
   if (item.predicted_media?.length) return decorateMedia(item.predicted_media);
   if (item.predicted_images?.length) return decorateMedia(item.predicted_images);
   if (item.predicted_file_names?.length) {
     return item.predicted_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
+  }
+  if (item.evidence_source_media?.length) return decorateMedia(item.evidence_source_media);
+  if (item.evidence_source_images?.length) return decorateMedia(item.evidence_source_images);
+  if (item.evidence_source_file_names?.length) {
+    return decorateMedia(item.evidence_source_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
   }
   // A validator may leave all candidates as candidate_only.  They are not
   // answer evidence, but hiding them makes a healthy retrieval look empty
@@ -630,11 +691,23 @@ function itemMedia(item, gt = false) {
   return (item.retrieved_file_names || []).slice(0, 6)
     .map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
 }
+function toolRecallMedia(item) {
+  // 工具召回图片 = search 等找图工具返回的检索候选集（retrieved），与"模型使用图片"严格区分。
+  if (item.retrieved_candidate_media?.length) return decorateMedia(item.retrieved_candidate_media);
+  if (item.retrieved_candidate_images?.length) return decorateMedia(item.retrieved_candidate_images);
+  if (item.retrieved_file_names?.length) {
+    return item.retrieved_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
+  }
+  return [];
+}
 function itemEvidenceMedia(item) {
-  const media = item?.evidence_source_media || item?.evidence_source_images || [];
+  // 模型使用图片 = 模型显式交付图（predicted/selected）；未显式交付 → 空（"回答依据图片为空"），
+  // 绝不回退到 evidence/retrieved 候选（否则又变成"回答来源==完整候选集"）。
+  const media = item?.predicted_media || item?.predicted_images || [];
   if (media.length) return decorateMedia(media);
-  const names = item?.evidence_source_file_names || [];
-  return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
+  const names = item?.predicted_file_names || [];
+  if (names.length) return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
+  return [];
 }
 function isDirectEvidence(item, media) {
   const ref = typeof media === "string" ? { media_id: media, media_type: inferMediaType(media) } : media;
@@ -744,6 +817,14 @@ function gpuMetricRows(phase = {}) {
   const clock = phase.sm_clock_mhz || {};
   const processLimit = phase.model_process_memory_limit_mib;
   const processLimitLabel = processLimit == null ? "模型进程显存上限" : `${fmtMemory(processLimit)} 上限告警`;
+  if (["orin_ssh_pss", "jetson_local_pss"].includes(phase.source)) return [
+    ["Orin 模型进程物理内存峰值（PSS）", fmtMemory(modelMemory.peak), `均值 ${fmtMemory(modelMemory.mean)} · P95 ${fmtMemory(modelMemory.p95)} · 统一物理内存，非独立显存`, true],
+    ["KV Cache 已用 token", fmtNumber(phase.kv_cache_used_tokens?.mean), `峰值 ${fmtNumber(phase.kv_cache_used_tokens?.peak)}`],
+    ["KV Cache 使用率", fmtNumber(kvCache.mean, "%"), `峰值 ${fmtNumber(kvCache.peak, "%")}`],
+    ["GPU 利用率", fmtNumber(util.mean, "%"), `tegrastats GR3D 峰值 ${fmtNumber(util.peak, "%")}`],
+    ["GPU/SOC 功耗", fmtNumber(power.mean, "W"), `VDD_GPU_SOC 峰值 ${fmtNumber(power.peak, "W")}（非纯 GPU）`],
+    ["采样数量", phase.samples_count == null ? "-" : `${phase.samples_count} 次`, `PSS 与主循环同频 0.5 秒；独立 PSS 点 ${phase.pss_samples_count ?? 0} 次；KV 随主循环，未暴露则为 -`],
+  ];
   return [
     ["模型进程显存", fmtMemory(modelMemory.mean), `峰值 ${fmtMemory(modelMemory.peak)} · P95 ${fmtMemory(modelMemory.p95)}`, true],
     ["采样数量", phase.samples_count == null ? "-" : `${phase.samples_count} 次`, "GPU 原始采样点"],
@@ -755,6 +836,216 @@ function gpuMetricRows(phase = {}) {
     ["GPU 功耗", fmtNumber(power.mean, "W"), `峰值 ${fmtNumber(power.peak, "W")} · P95 ${fmtNumber(power.p95, "W")}`],
     ["SM 时钟", fmtNumber(clock.mean, "MHz"), `峰值 ${fmtNumber(clock.peak, "MHz")} · P95 ${fmtNumber(clock.p95, "MHz")}`],
   ];
+}
+function gpuMetricsView(run) {
+  const phase = run?.phases?.gpu_metrics || {};
+  const live = telemetryLiveState(run);
+  const history = telemetryHistory(run);
+  const finished = ["completed", "completed_with_errors", "failed", "cancelled", "interrupted"].includes(run?.status);
+  if (phase.status === "done" || phase.status === "skipped" || (phase.samples_count && !phase.partial)) {
+    return { ...phase, partial: false };
+  }
+  if (phase.samples_count) {
+    return {
+      ...phase,
+      status: finished ? (phase.status || "partial") : "running",
+      partial: !finished,
+    };
+  }
+  if (!history.length && !live.samples_count) return phase;
+  const stats = (key) => {
+    const values = history.map((item) => Number(item?.[key])).filter((value) => Number.isFinite(value));
+    if (!values.length) {
+      const latest = live.latest?.[key];
+      const peak = live.peak?.[key];
+      if (latest == null && peak == null) return {};
+      const value = Number(latest ?? peak);
+      return { mean: value, peak: Number(peak ?? value), p95: Number(peak ?? value) };
+    }
+    const sorted = [...values].sort((left, right) => left - right);
+    const count = sorted.length;
+    return {
+      peak: sorted[count - 1],
+      mean: values.reduce((sum, value) => sum + value, 0) / count,
+      p95: count >= 20 ? sorted[Math.floor(count * 0.95)] : sorted[count - 1],
+    };
+  };
+  return {
+    status: finished ? "partial" : "running",
+    partial: !finished,
+    source: live.source || run?.telemetry_source || phase.source,
+    samples_count: live.samples_count || history.length,
+    temperature_c: stats("temperature_c"),
+    gpu_utilization_pct: stats("gpu_utilization_pct"),
+    memory_used_mib: stats("memory_used_mib"),
+    model_process_memory_used_mib: stats("model_process_memory_used_mib"),
+    kv_cache_usage_pct: stats("kv_cache_usage_pct"),
+    kv_cache_used_tokens: stats("kv_cache_used_tokens"),
+    power_draw_w: stats("power_draw_w"),
+    sm_clock_mhz: stats("sm_clock_mhz"),
+  };
+}
+function gpuMetricsStatusLabel(run) {
+  const phase = gpuMetricsView(run);
+  if (phase.partial && phase.status === "running") return "实时更新中";
+  return statusLabel(resultPhaseStatus(phase));
+}
+function liveTelemetryRows(run) {
+  const live = run?.telemetry_live || {};
+  const latest = live.latest || {};
+  const peak = live.peak || {};
+  // Older persisted runs may have latest values but no peak object.
+  const effectivePeak = Object.keys(peak).length ? peak : latest;
+  const unit = live.source === "jetson_local_pss" || live.source === "orin_ssh_pss" ? "PSS" : "显存";
+  const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(2)}${suffix}`;
+  const fmtGiB = (value) => value == null ? "-" : `${(Number(value) / 1024).toFixed(2)} GiB`;
+  return [
+    ["当前阶段", ["completed", "failed", "cancelled"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
+    ["主模型 RAM", fmtGiB(latest.model_process_system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_system_memory_used_mib)} · 进程系统内存，不代表权重又完整占一份`],
+    [`主模型 GPU ${unit}`, fmtGiB(latest.model_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_memory_used_mib)} · 仅可归因到模型的 GPU/UMA 进程`],
+    ["测评系统 RAM", fmtGiB(latest.benchmark_process_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_memory_used_mib)} · 8771/8091/8500/8100/Qdrant 等相关进程`],
+    ["测评系统 GPU 显存", fmtGiB(latest.benchmark_process_gpu_memory_mib), `峰值 ${fmtGiB(effectivePeak.benchmark_process_gpu_memory_mib)} · 相关 GPU compute 进程合计`],
+    ["整卡显存", fmtGiB(latest.memory_used_mib), `峰值 ${fmtGiB(effectivePeak.memory_used_mib)} · NVIDIA GPU 总占用`],
+    ["整机 RAM", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.system_memory_used_mib)} · ${latest.system_memory_scope === "host_all_processes" ? "宿主机全部进程" : "未标注范围"}`],
+    ["全部 GPU 进程", fmtGiB(latest.all_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.all_processes_memory_mib)} · nvidia-smi 可见进程总和`],
+    ["其他 GPU 进程", fmtGiB(latest.other_processes_memory_used_mib ?? latest.other_processes_memory_mib), `峰值 ${fmtGiB(effectivePeak.other_processes_memory_mib)} · 除模型进程外`],
+    ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(effectivePeak.gpu_utilization_pct, "%")}`],
+    ["温度 / 功耗", `${fmtLive(latest.temperature_c, " °C")} / ${fmtLive(latest.power_draw_w, " W")}`, `峰值功耗 ${fmtLive(effectivePeak.power_draw_w, " W")}`],
+    ["KV Cache", latest.kv_cache_usage_pct == null ? "未提供" : fmtLive(latest.kv_cache_usage_pct, "%"), latest.kv_cache_used_tokens == null ? "当前框架未暴露运行时 KV 指标" : `峰值 token ${fmtLive(peak.kv_cache_used_tokens)}`],
+  ];
+}
+function telemetryLiveState(run) {
+  const value = run?.telemetry_live;
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function telemetryHistory(run) {
+  const history = telemetryLiveState(run).history;
+  return Array.isArray(history) ? history : [];
+}
+function telemetryProcessList(run) {
+  const processes = telemetryLiveState(run).all_processes;
+  return Array.isArray(processes) ? processes : [];
+}
+function telemetrySampleCount(run) {
+  const value = Number(telemetryLiveState(run).samples_count);
+  return Math.max(
+    Number.isFinite(value) && value > 0 ? value : 0,
+    telemetryHistory(run).length,
+  );
+}
+function telemetryChart(run) {
+  let history = telemetryHistory(run);
+  // Legacy runs may only have phase snapshots. Render a compact phase trend
+  // instead of leaving the chart area blank.
+  if (history.length < 2) {
+    const phases = telemetryLiveState(run).phase_snapshots;
+    const phaseEntries = phases && typeof phases === "object" && !Array.isArray(phases) ? Object.entries(phases) : [];
+    history = phaseEntries.map(([phaseKey, phase], i) => ({
+      t: i,
+      phase: phaseKey,
+      ...(phase?.latest || phase?.peak || {}),
+    })).filter((item) => Object.keys(item).some((key) => key.endsWith("_mib")));
+  }
+  if (history.length < 2) return null;
+  return { history };
+}
+function renderTelemetryChart() {
+  const chartData = telemetryChart(activeRun.value);
+  if (!telemetryChartEl.value || !chartData) {
+    if (telemetryChartInstance) {
+      telemetryChartInstance.dispose();
+      telemetryChartInstance = null;
+    }
+    return;
+  }
+  telemetryChartInstance ||= echarts.init(telemetryChartEl.value);
+  const history = chartData.history;
+  const source = telemetryLiveState(activeRun.value).source
+    || activeRun.value?.telemetry_source
+    || activeRun.value?.phases?.gpu_metrics?.source
+    || "";
+  const isOrin = ["orin_ssh_pss", "jetson_local_pss"].includes(source);
+  const definitions = [
+    ...(isOrin
+      ? [{ key: "system_memory_used_mib", name: "整机 RAM（Orin UMA）", color: "#20a36a" },
+         { key: "benchmark_process_memory_used_mib", name: "测评系统进程内存（Orin UMA/RSS）", color: "#d9488b" },
+         { key: "model_process_system_memory_used_mib", name: "主模型进程 RAM（Orin UMA/RSS）", color: "#f2b84b" },
+         { key: "model_process_memory_used_mib", name: "主模型进程 PSS（Orin UMA）", color: "#ef8a4b" }]
+      : [{ key: "memory_used_mib", name: "整卡 GPU 显存", color: "#4f7cff" },
+         { key: "system_memory_used_mib", name: "整机 RAM", color: "#20a36a" },
+         { key: "benchmark_process_gpu_memory_mib", name: "测评系统 GPU 显存", color: "#d9488b" },
+         { key: "benchmark_process_memory_used_mib", name: "测评系统 RAM（进程 RSS）", color: "#8b6de8" },
+         { key: "model_process_memory_used_mib", name: "主模型 GPU 显存", color: "#ef8a4b" },
+         { key: "model_process_system_memory_used_mib", name: "主模型 RAM（进程 RSS）", color: "#f2b84b" }]),
+  ];
+  const available = definitions.filter((definition) => history.some((item) => Number.isFinite(Number(item[definition.key]))));
+  const firstTimestamp = Number(history[0]?.t);
+  const labels = history.map((item, index) => {
+    const elapsed = Number(item?.t) - firstTimestamp;
+    return Number.isFinite(elapsed) ? `+${(elapsed / 60).toFixed(1)} min` : `#${index + 1}`;
+  });
+  const phaseAreas = [];
+  let phaseStart = 0;
+  for (let index = 1; index <= history.length; index += 1) {
+    const previous = history[index - 1]?.phase || "unassigned";
+    const current = index < history.length ? (history[index]?.phase || "unassigned") : null;
+    if (current !== previous) {
+      const label = history[index - 1]?.phase_label
+        || EXECUTION_PHASES.find((item) => item.key === previous)?.label
+        || previous;
+      phaseAreas.push([
+        { xAxis: phaseStart, name: label, itemStyle: { color: `rgba(${["79,124,255", "32,163,106", "239,138,75", "217,72,139", "139,109,232"][phaseAreas.length % 5]},.07)` } },
+        { xAxis: Math.max(phaseStart, index - 1) },
+      ]);
+      phaseStart = index;
+    }
+  }
+  telemetryChartInstance.setOption({
+    animation: false,
+    color: available.map((item) => item.color),
+    grid: { left: 72, right: 28, top: 74, bottom: 64 },
+    legend: { top: 10, left: 12, right: 12, type: "scroll", selectedMode: "multiple", itemGap: 16, textStyle: { color: "#59627c", fontSize: 11 } },
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "cross", label: { backgroundColor: "#667085" } },
+      formatter(params) {
+        const rows = (Array.isArray(params) ? params : [params]).filter((item) => item.value != null);
+        const title = rows[0]?.axisValueLabel || "";
+        const phase = history[rows[0]?.dataIndex]?.phase_label || history[rows[0]?.dataIndex]?.phase;
+        return `<b>${title}</b>${phase ? `<br/><span>阶段：${phase}</span>` : ""}<br/>${rows.map((item) => `${item.marker}${item.seriesName}: <b>${Number(item.value).toFixed(2)} GiB</b>`).join("<br/>")}`;
+      },
+    },
+    xAxis: { type: "category", boundaryGap: false, data: labels, axisLabel: { color: "#7a849e", hideOverlap: true }, axisLine: { lineStyle: { color: "#d8deea" } } },
+    yAxis: { type: "value", name: "GiB", nameTextStyle: { color: "#7a849e", padding: [0, 0, 8, 0] }, min: 0, axisLabel: { color: "#7a849e", formatter: (value) => `${value} GiB` }, splitLine: { lineStyle: { color: "#edf0f5" } } },
+    dataZoom: [{ type: "inside", filterMode: "none" }, { type: "slider", height: 18, bottom: 14, borderColor: "#d8deea", fillerColor: "rgba(79,124,255,.14)", handleStyle: { color: "#4f7cff" } }],
+    series: available.map((definition) => ({
+      name: definition.name,
+      type: "line",
+      smooth: 0.18,
+      showSymbol: false,
+      connectNulls: false,
+      lineStyle: { width: 2.5 },
+      emphasis: { focus: "series", lineStyle: { width: 4 } },
+      data: history.map((item) => Number.isFinite(Number(item[definition.key])) ? Number(item[definition.key]) / 1024 : null),
+      markArea: definition === available[0] && phaseAreas.length ? {
+        silent: true,
+        label: { show: true, position: "insideTop", color: "#59627c", fontSize: 10 },
+        data: phaseAreas,
+      } : undefined,
+    })),
+  }, true);
+  telemetryChartInstance.resize();
+}
+function liveTelemetryPhaseRows(run) {
+  const phases = run?.telemetry_live?.phase_snapshots || {};
+  return Object.entries(phases).map(([key, value]) => {
+    const label = EXECUTION_PHASES.find((item) => item.key === key)?.label || key;
+    const peak = value?.peak || {};
+    const model = peak.model_process_memory_used_mib == null ? "-" : `${(Number(peak.model_process_memory_used_mib) / 1024).toFixed(2)} GiB`;
+    const card = peak.memory_used_mib == null ? "-" : `${(Number(peak.memory_used_mib) / 1024).toFixed(2)} GiB`;
+    const host = peak.system_memory_used_mib == null ? "-" : `${(Number(peak.system_memory_used_mib) / 1024).toFixed(2)} GiB`;
+    return [label, model, `模型进程峰值 · 整卡 ${card} · 整机 RAM ${host} · ${value?.samples_count || 0} 次`];
+  });
 }
 function comparableMemoryProfile(run) {
   if (!run) return null;
@@ -771,6 +1062,13 @@ function comparableMemoryProfile(run) {
     questions_total: run.summary?.total,
   };
 }
+function isOrinPssRun(run) {
+  return ["orin_ssh_pss", "jetson_local_pss"].includes(run?.telemetry_source)
+    || ["orin_ssh_pss", "jetson_local_pss"].includes(run?.telemetry_live?.source)
+    || ["orin_ssh_pss", "jetson_local_pss"].includes(run?.phases?.gpu_metrics?.source)
+    || run?.phases?.gpu_metrics?.memory_profile?.method === "orin_process_pss_uma_v1"
+    || comparableMemoryProfile(run)?.memory_profile?.method === "orin_process_pss_uma_v1";
+}
 function memoryProfileRows(profile = {}) {
   const memory = profile.memory_profile || {};
   const isBenchmarkGpuProfile = profile.source === "gpu_metrics";
@@ -785,8 +1083,15 @@ function memoryProfileRows(profile = {}) {
     ];
   }
   const processMemory = profile.model_process_memory_used_mib || {};
+  if (memory.method === "orin_process_pss_uma_v1") return [
+    ["进程物理内存峰值（PSS）", fmtMemory(processMemory.peak), "Orin 统一物理内存平台的进程峰值；不是独立显存，也不是工作负载估算", true],
+    ["工作负载内存估算", "不可计算", "当前 llama.cpp 未提供可靠的 KV Cache 实际使用量"],
+    ["KV Cache 已用峰值", memory.kv_cache_used_peak_tokens == null ? "-" : `${Number(memory.kv_cache_used_peak_tokens).toLocaleString("en-US")} token`, `使用率峰值 ${fmtNumber(memory.kv_cache_usage_peak_pct, "%")}`],
+    ["KV 实际字节数", "不可用", "未验证模型每 token KV 字节数；不以 token 数伪造 GiB"],
+    ["数据来源", "118 本机 PSS + tegrastats", "KV 仅在 llama.cpp metrics 确实提供时记录"],
+  ];
   return [
-    ["可比较工作负载显存", memory.comparable_workload_memory_gib == null ? "-" : `${Number(memory.comparable_workload_memory_gib).toFixed(2)} GiB`, "固定基础占用 + 本次 KV Cache 实际峰值", true],
+    ["估算工作负载显存", memory.comparable_workload_memory_gib == null ? "-" : `${Number(memory.comparable_workload_memory_gib).toFixed(2)} GiB`, "固定基础占用 + KV 逻辑使用峰值；非实测显存", true],
     ["固定基础占用", memory.fixed_base_memory_gib == null ? "-" : `${Number(memory.fixed_base_memory_gib).toFixed(2)} GiB`, "空载模型进程显存 - 预分配 KV Cache 容量", true],
     ["KV Cache 容量", memory.kv_cache_capacity_gib == null ? "-" : `${Number(memory.kv_cache_capacity_gib).toFixed(2)} GiB`, memory.kv_cache_capacity_tokens == null ? "未记录 token 容量" : `${Number(memory.kv_cache_capacity_tokens).toLocaleString("en-US")} token`],
     ["KV Cache 实际峰值", memory.kv_cache_used_peak_gib == null ? "-" : `${Number(memory.kv_cache_used_peak_gib).toFixed(3)} GiB`, `使用率峰值 ${fmtNumber(memory.kv_cache_usage_peak_pct, "%")}`],
@@ -1345,8 +1650,14 @@ function memoryLayerMetrics() {
   const requirementCounts = agent2.requirement_status_counts || {};
   const requirementTotal = Object.values(requirementCounts).reduce((sum, value) => sum + Number(value || 0), 0);
   const satisfiedRequirements = Number(requirementCounts.satisfied || 0);
-  const visual = memoryLayerToolMetric(summary, "inspect_photo");
-  const ocr = memoryLayerToolMetric(summary, "read_photo_text");
+  // 优先用 memory-effectiveness 接口实测的调用次数（新老 run 都有）；汇总缺 tool_performance 时回退 0。
+  const meCalls = (kind) => {
+    const row = memoryEffectiveness.value?.details?.[kind] || {};
+    const total = Number(row.total || 0);
+    return { calls: total, okRate: total ? (Number(row.effective || 0) / total) : null };
+  };
+  const visual = meCalls("visual_calls");
+  const ocr = meCalls("ocr_calls");
   const summaryCalls = memoryLayerToolMetric(summary, "get_core_memory");
   const analysis = keyframeAnalysis.value?.status === "ready" ? keyframeAnalysis.value : {};
   const analysisAssets = analysis.assets || {};
@@ -1748,7 +2059,26 @@ function pipelineMetricRows(phase = {}) {
   ].filter(Boolean);
 }
 
-async function loadRuns() { runs.value = (await api("/api/runs")).runs || []; }
+async function loadRuns(page = runPage.value.page || 1) {
+  const payload = await api(`/api/runs?page=${Math.max(1, Number(page) || 1)}&page_size=${runPage.value.page_size}`, {
+    timeoutMs: 8000,
+    retries: 2,
+  });
+  runs.value = payload.runs || [];
+  runPage.value = {
+    page: payload.page || 1,
+    page_size: payload.page_size || 20,
+    total: payload.total ?? runs.value.length,
+    pages: payload.pages || 1,
+    has_previous: Boolean(payload.has_previous),
+    has_next: Boolean(payload.has_next),
+    active_count: Number(payload.active_count || 0),
+  };
+}
+async function changeRunPage(page) {
+  await loadRuns(page);
+  document.querySelector("#runs-region")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 function runProgressLabel(run) {
   if (run?.mode === "build") return "—";
   const progress = run?.phases?.qa_eval?.progress;
@@ -1865,7 +2195,24 @@ async function changeQaPage(page) {
   document.querySelector("#qa-results")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 async function changeQaPageSize() { await loadQaPage(1); }
-async function selectRun(run) { activeRunId.value = run.run_id; await loadActiveRun({ resetPage: true }); document.querySelector("#detail-region")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
+function scrollToRunDetail() {
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      const target = document.querySelector("#qa-results");
+      if (!target) return;
+      const top = target.getBoundingClientRect().top + window.scrollY - 12;
+      window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+    });
+  });
+}
+function selectRun(run) {
+  activeRunId.value = run.run_id;
+  activeRun.value = { ...run };
+  scrollToRunDetail();
+  void loadActiveRun({ resetPage: true }).catch((err) => {
+    if (activeRunId.value === run.run_id) error.value = err.message || "读取评测详情失败";
+  });
+}
 async function loadProfiles() {
   if (!vllmManagerUrl.value.trim()) {
     profiles.value = [];
@@ -2036,20 +2383,22 @@ function onModeChange() {
 }
 const startDisabledReason = computed(() => {
   if (hasRunning.value || suiteRunning.value) return "已有任务运行中";
-  if (!modelEndpoint.value.trim()) return "请先填写模型服务地址";
   if (!selectedModels.size) return "请先选择模型";
-  if ([...selectedModels].some((modelId) => modelId !== "__current__") && !vllmManagerUrl.value.trim()) return "选择注册表模型需要模型管理器地址";
+  const cloudOnly = [...selectedModels].every((modelId) => modelId === "big_model");
+  if (!cloudOnly && !modelEndpoint.value.trim()) return "请先填写模型服务地址";
+  if ([...selectedModels].some((modelId) => !["__current__", "big_model"].includes(modelId)) && !vllmManagerUrl.value.trim()) return "选择注册表模型需要模型管理器地址";
   if (selectedModels.has("__current__") && !selectedEndpointModel.value) return "请先从模型服务中选择要复用的模型";
   if (runMode.value === "reuse" && !existingScopeId.value) return "请先选择要复用的相册";
   return "";
 });
 const modeLabel = (mode) => (({ full: "全链路", reuse: "复用测评", build: "构建相册" })[mode || "full"] || mode);
 const modeBadgeClass = (mode) => (({ full: "mode-full", reuse: "mode-reuse", build: "mode-build" })[mode || "full"] || "mode-full");
-function exportSftTraces() {
+function exportTraces() {
   if (!activeRunId.value) return;
   const scores = exportScores.value;
   if (!scores.length) { window.alert("请至少勾选一个评分再导出"); return; }
-  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft?scores=${scores.join(",")}`, "_blank");
+  // 每题只含两项：planner 完整输入/输出 + 完整轨迹
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-trace?scores=${scores.join(",")}`, "_blank");
 }
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
@@ -2082,7 +2431,7 @@ async function startRejudge() {
 async function loadCurrentModel({ openPopover = true } = {}) {
   const endpoint = modelEndpoint.value.trim();
   if (!endpoint) {
-    currentModelError.value = "请先填写模型服务地址，例如 192.168.0.153:8100";
+    currentModelError.value = "请先填写模型服务地址，例如 127.0.0.1:8100";
     return;
   }
   currentModelLoading.value = true;
@@ -2160,7 +2509,7 @@ async function startSuite() {
   try {
    const result = await post("/api/runs", { album_id: selectedAlbum.value, qa_set: runMode.value === "build" ? undefined : selectedQa.value, mode: runMode.value, existing_scope_id: runMode.value === "reuse" ? existingScopeId.value : undefined, models: [...selectedModels], sentrix_url: sentrixUrl.value.trim(), judge_url: judgeUrl.value.trim(), judge_model: judgeModel.value.trim(), judge_provider_id: judgeProviderId.value, ...(judgeApiKeyDirty.value ? { judge_api_key: judgeApiKey.value } : {}), vllm_target_id: vllmTargetId.value, vllm_manager_url: vllmManagerUrl.value.trim(), model_base_url: selectedModels.has("__current__") || modelEndpointUserEdited.value ? modelEndpoint.value.trim() : "", endpoint_model: selectedModels.has("__current__") ? selectedEndpointModel.value : "", delete_scope_after_run: runMode.value === "full" ? deleteScopeAfterRun.value : false });
     activeRunId.value = result.run_ids[0];
-    await loadRuns(); await loadActiveRun({ resetPage: true }); startPolling();
+    await loadRuns(1); await loadActiveRun({ resetPage: true }); startPolling();
   } catch (e) { error.value = e.message; } finally { suiteRunning.value = false; }
 }
 async function stopSuite() {
@@ -2189,11 +2538,18 @@ function startPolling() {
 const arbiterStatus = ref(null);
 let arbiterTimer = null;
 async function loadArbiterStatus() {
-  if (!sentrixUrl.value) return;
+  if (!sentrixUrl.value) return false;
   try {
-    const resp = await fetch(`${sentrixUrl.value.replace(/\/$/, "")}/api/arbiter/status`, { signal: AbortSignal.timeout(3000) });
-    if (resp.ok) arbiterStatus.value = await resp.json();
-  } catch (_) { /* backend 暂不可达时保持上次值 */ }
+    const payload = await api("/api/arbiter-status", { timeoutMs: 5000, retries: 0 });
+    if (payload.supported === false) {
+      arbiterStatus.value = null;
+      return false;
+    }
+    if (payload.status) arbiterStatus.value = payload.status;
+    return true;
+  } catch (_) {
+    return true; // transient failure: retain the previous value and retry later
+  }
 }
 function arbStateLabel(s) {
   return ({idle: "空闲", import_running: "导入运行中", agent_active: "Agent 活跃", preempting: "抢占中"})[s] || s || "-";
@@ -2202,6 +2558,7 @@ function thermalStateLabel(v) {
   return ({0: "nominal", 1: "fair", 2: "serious", 3: "critical"})[v] ?? "-";
 }
 async function init() {
+  let current = null;
   try {
     config.value = await api("/api/config");
     vllmTargets.value = config.value.vllm_targets || {};
@@ -2217,18 +2574,25 @@ async function init() {
     judgeApiKey.value = "";
     judgeApiKeyDirty.value = false;
     rejudgePrompt.value = config.value.custom_judge_prompt || config.value.judge_prompt || "";
-    await loadJudgePrompts();
     judgeProviderId.value = runtimeConfig.judge_provider_id || config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
     connectionConfigState.value = "saved";
     connectionConfigMessage.value = "已读取配置文件";
-    manifests.value = (await api("/api/manifests")).manifests || [];
-    await loadRuns(); if (vllmManagerUrl.value.trim()) await loadProfiles();
-    if (modelEndpoint.value.trim()) await loadCurrentModel({ openPopover: false });
-    const current = runs.value.find((run) => ["running", "pending"].includes(run.status));
-    if (current) { activeRunId.value = current.run_id; await loadActiveRun({ resetPage: true }); startPolling(); }
+    const [, manifestPayload] = await Promise.all([
+      loadJudgePrompts(),
+      api("/api/manifests"),
+      loadRuns(1),
+      vllmManagerUrl.value.trim() ? loadProfiles() : Promise.resolve(),
+    ]);
+    manifests.value = manifestPayload.manifests || [];
+    current = runs.value.find((run) => ["running", "pending"].includes(run.status));
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
-  loadArbiterStatus();
-  arbiterTimer = setInterval(loadArbiterStatus, 3000);
+  if (modelEndpoint.value.trim()) void loadCurrentModel({ openPopover: false });
+  if (current) {
+    activeRunId.value = current.run_id;
+    void loadActiveRun({ resetPage: true });
+    startPolling();
+  }
+  if (await loadArbiterStatus()) arbiterTimer = window.setInterval(loadArbiterStatus, 3000);
 }
 const qaBrowserOptions = computed(() => manifests.value.find((m) => m.album_id === qaBrowserAlbum.value)?.qa_sets || []);
 const qaBrowserTags = computed(() => [...new Set(qaBrowserItems.value.flatMap(item => Array.isArray(item.tags) ? item.tags : []))].sort());
@@ -2271,11 +2635,9 @@ function qaHasVideoEvidence(item) {
   return qaEvidenceRefs(item).some((ref) => ref.media_type === "video");
 }
 function qaMediaUrl(albumId, item, media) {
-  if (typeof media !== "string" && media?.media_url) return media.media_url;
   const assetId = typeof media === "string" ? "" : media?.asset_id;
-  return assetId && sentrixUrl.value
-    ? `${sentrixUrl.value.replace(/\/$/, "")}/api/assets/${encodeURIComponent(assetId)}/file`
-    : "";
+  return assetId ? `/api/assets/${encodeURIComponent(assetId)}/file`
+    : (typeof media === "string" ? "" : (media?.media_url || ""));
 }
 function qaClaimMediaRefs(claim) {
   return mediaRefs(claim, "evidence");
@@ -2289,7 +2651,8 @@ function qaReferenceLabel(turn) {
   return turn?.expected_action === "clarify" ? "参考澄清示例" : "参考回答";
 }
 onMounted(init);
-onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if (arbiterTimer) clearInterval(arbiterTimer); });
+watch(activeRun, async () => { await nextTick(); renderTelemetryChart(); }, { deep: true });
+onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if (arbiterTimer) clearInterval(arbiterTimer); if (telemetryChartInstance) telemetryChartInstance.dispose(); });
 </script>
 
 <template>
@@ -2354,7 +2717,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
         <div class="config-group">
           <div class="config-group-head"><div><strong>评测服务</strong><span>配置 Sentrix 后端、Judge 评分服务及认证信息</span></div></div>
           <div class="config-grid config-grid-judge">
-        <label>Sentrix 后端<input v-model="sentrixUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.0.153:8091" />
+        <label>Sentrix 后端<input v-model="sentrixUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 127.0.0.1:8091" />
 </label>
        <label>Judge 服务<input v-model="judgeUrl" type="text" @input="markConnectionConfigDirty" placeholder="例如 192.168.1.65:1234/v1" />
 </label>
@@ -2372,7 +2735,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <div class="config-model-endpoint">
         <label>模型服务地址
           <div class="endpoint-line">
-          <input v-model="modelEndpoint" type="text" @input="onModelEndpointInput" placeholder="例如 192.168.0.153:8100 或 http://192.168.0.153:8100/v1" />
+          <input v-model="modelEndpoint" type="text" @input="onModelEndpointInput" placeholder="例如 127.0.0.1:8100 或 http://127.0.0.1:8100/v1" />
           <div class="current-model-control">
             <button class="current-model-trigger" type="button" :class="{ active: currentModelPopoverOpen }" :disabled="currentModelLoading" @click="currentModelInfo ? currentModelPopoverOpen = !currentModelPopoverOpen : loadCurrentModel()">
               <span class="current-model-icon">{{ currentModelLoading ? '…' : '↗' }}</span>
@@ -2382,7 +2745,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <div v-if="currentModelInfo && currentModelPopoverOpen" class="current-model-popover" role="status" aria-live="polite">
               <span class="popover-arrow"></span>
               <div class="current-model-popover-head"><span>MODEL ENDPOINT</span><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></div>
-              <strong>{{ currentModelInfo.served_model_name || `${currentModelInfo.served_models.length} 个模型待选择` }}</strong>
+              <strong>{{ currentModelInfo.served_model_name || `${(currentModelInfo.served_models || []).length} 个模型待选择` }}</strong>
               <div class="current-model-status"><i></i>{{ currentModelInfo.manager_available ? '已读取 Manager 当前运行状态' : '已连接 OpenAI-compatible 端点' }}</div>
               <dl>
                 <div><dt>模型服务</dt><dd>{{ currentModelInfo.model_base_url }}</dd></div>
@@ -2400,7 +2763,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </div>
           <div class="config-model-manager">
             <label>模型管理器地址（可选）
-              <input v-model="vllmManagerUrl" type="text" @input="onModelManagerInput" @change="loadProfiles" placeholder="例如 192.168.0.153:8500；无管理器可留空" />
+              <input v-model="vllmManagerUrl" type="text" @input="onModelManagerInput" @change="loadProfiles" placeholder="例如 127.0.0.1:8500；无管理器可留空" />
               <span class="config-help">填写后从 Manager 的模型注册表自动扫描；留空时不显示普通模型选择。</span>
             </label>
             <button class="btn ghost compact model-registry-refresh" type="button" :disabled="!vllmManagerUrl.trim()" @click="loadProfiles">刷新模型注册表</button>
@@ -2417,6 +2780,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <label class="check endpoint-reuse-check" :class="{ active: selectedModels.has('__current__') }">
               <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ selectedEndpointModel }}，不启停）</span>
             </label>
+          </div>
+          <div class="model-picker cloud-model-picker">
+            <span class="field-label">云端模型</span>
+            <label class="check" :class="{ active: selectedModels.has(cloudModelProfile.id) }">
+              <input type="checkbox" :checked="selectedModels.has(cloudModelProfile.id)" :disabled="cloudModelProfile.available === false" @change="setModelSelected(cloudModelProfile.id, $event.target.checked)" />{{ cloudModelProfile.label || cloudModelProfile.id }}<span>（{{ cloudModelProfile.model }}）</span>
+            </label>
+            <span class="config-help">云端 API 直连；不启动/切换本地 Manager，不执行本地 token 预检和 GPU 指标采样。</span>
           </div>
           <div v-if="vllmManagerUrl.trim()" class="model-picker">
 <span class="field-label">模型注册表（可多选，串行测试）</span>
@@ -2436,11 +2806,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       <p v-if="error" class="error">{{ error }}</p>
     </section>
 
-    <section id="runs-region" class="section">
-      <div class="section-head">
-<h2>评测记录</h2>
-<span class="muted">{{ runs.length }} 条</span>
-</div>
+	    <section id="runs-region" class="section">
+	      <div class="section-head">
+	<h2>评测记录</h2>
+	<div class="pager" v-if="runPage.pages > 1">
+	  <button class="btn ghost compact" :disabled="!runPage.has_previous" @click="changeRunPage(runPage.page - 1)">上一页</button>
+	  <span>{{ runPage.page }} / {{ runPage.pages }}</span>
+	  <button class="btn ghost compact" :disabled="!runPage.has_next" @click="changeRunPage(runPage.page + 1)">下一页</button>
+	</div>
+	<span class="muted">共 {{ runPage.total }} 条</span>
+	</div>
       <div class="runs-list">
 <table>
 <thead>
@@ -2470,7 +2845,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
 <td>{{ runProgressLabel(run) }}</td>
-<td>{{ fmtPct(run.summary?.media_retrieval_recall_micro ?? run.summary?.retrieval_recall_micro) }}</td>
+<td>{{ fmtPct(run.summary?.media_retrieval_recall_macro ?? run.summary?.retrieval_recall_macro ?? run.summary?.retrieval_recall_mean) }}</td>
 <td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>
@@ -2495,7 +2870,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
               <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
             </span>
-            <button class="btn compact" @click="exportSftTraces">导出 SFT JSON</button>
+            <button class="btn compact" @click="exportTraces" title="每题导出 planner 完整输入/输出 + 完整轨迹">导出轨迹 JSON</button>
           </div>
         </div>
       </div>
@@ -2649,26 +3024,28 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       <p class="answer-layer-note">口径：L0 的创建量只是记忆库规模；原始图片用测评 Recall，关键帧用“父级视频 Recall / 返回关键帧 Precision”。L1–L3 是测评期间的解析、图谱和证据链覆盖代理，只有 L4+ 的 Exact Accuracy 才是最终回答正确率。</p>
             </div>
           </section>
-          <section v-if="memoryAnswerAttribution" class="memory-answer-attribution-panel">
-            <div class="answer-correctness-head"><strong>记忆召回 × 回答结果分层指标</strong><span>只统计有 GT 媒体的可归因题目（{{ memoryAnswerAttribution.eligible }} 题）</span></div>
-            <div class="answer-layer-architecture recall-layer-architecture">
-              <div class="answer-layer-title"><strong>记忆是否到达，以及到达后是否产生正确回答</strong><span>同一批题目逐层展开，不重复统计</span></div>
-              <div v-for="(layer, layerIndex) in memoryRecallArchitecture" :key="layer.key" class="answer-layer-row" :class="`answer-layer-${layer.key.toLowerCase().replace('+','')}`">
-                <div class="answer-layer-label"><b>{{ layer.key }}</b><strong>{{ layer.name }}</strong><small>{{ layer.stage }}</small></div>
-                <div v-if="layer.key === 'L2'" class="answer-layer-track answer-layer-branch-track">
-                  <div v-for="group in layer.groups" :key="group.label" class="answer-layer-branch-group">
-                    <div class="answer-layer-branch-head"><strong>{{ group.label }}</strong><b>{{ fmtPct(group.total / memoryAnswerAttribution.eligible) }}</b><small>{{ group.total }} 题 · {{ group.note }}</small></div>
-                    <div class="answer-layer-branch-nodes">
-                      <div v-for="node in group.nodes" :key="`${group.label}-${node.label}`" class="answer-layer-node"><small>{{ node.label }}</small><b>{{ node.value }}</b><span>{{ node.note }}</span></div>
+          <section v-if="memoryRecallMatrices.length" class="memory-answer-attribution-panel">
+            <div class="answer-correctness-head"><strong>命中 × 回答结果分层矩阵</strong><span>工具召回命中 / 模型使用命中分开统计；只统计有 GT 媒体的可归因题目（{{ memoryRecallMatrices[0].eligible }} 题），数字由当前 run 实时计算</span></div>
+            <div class="recall-matrices">
+              <div v-for="matrix in memoryRecallMatrices" :key="matrix.key" class="answer-layer-architecture recall-layer-architecture recall-matrix" :class="`recall-matrix-${matrix.key}`">
+                <div class="answer-layer-title"><strong>{{ matrix.title }}</strong><span>{{ matrix.note }}</span></div>
+                <div v-for="(layer, layerIndex) in matrix.layers" :key="`${matrix.key}-${layer.key}`" class="answer-layer-row" :class="`answer-layer-${layer.key.toLowerCase().replace('+','')}`">
+                  <div class="answer-layer-label"><b>{{ layer.key }}</b><strong>{{ layer.name }}</strong><small>{{ layer.stage }}</small></div>
+                  <div v-if="layer.key === 'L2'" class="answer-layer-track answer-layer-branch-track">
+                    <div v-for="group in layer.groups" :key="group.label" class="answer-layer-branch-group">
+                      <div class="answer-layer-branch-head"><strong>{{ group.label }}</strong><b>{{ fmtPct(group.total / matrix.eligible) }}</b><small>{{ group.total }} 题 · {{ group.note }}</small></div>
+                      <div class="answer-layer-branch-nodes">
+                        <div v-for="node in group.nodes" :key="`${matrix.key}-${group.label}-${node.label}`" class="answer-layer-node"><small>{{ node.label }}</small><b>{{ node.value }}</b><span>{{ node.note }}</span></div>
+                      </div>
                     </div>
                   </div>
+                  <div v-else class="answer-layer-track">
+                    <div v-for="node in layer.nodes" :key="`${matrix.key}-${layer.key}-${node.label}`" class="answer-layer-node"><small>{{ node.label }}</small><b>{{ node.value }}</b><span>{{ node.note }}</span></div>
+                  </div>
+                  <div v-if="layerIndex < matrix.layers.length - 1" class="answer-layer-bridge"><i>↓</i><span>{{ layerIndex === 0 ? '进入命中判定' : layerIndex === 1 ? '进入 Judge 评分' : '汇总为有效性指标' }}</span></div>
                 </div>
-                <div v-else class="answer-layer-track">
-                  <div v-for="node in layer.nodes" :key="`${layer.key}-${node.label}`" class="answer-layer-node"><small>{{ node.label }}</small><b>{{ node.value }}</b><span>{{ node.note }}</span></div>
-                </div>
-                <div v-if="layerIndex < memoryRecallArchitecture.length - 1" class="answer-layer-bridge"><i>↓</i><span>{{ layerIndex === 0 ? '进入检索' : layerIndex === 1 ? '进入 Judge 评分' : '汇总为有效性指标' }}</span></div>
+                <p class="answer-layer-note">口径：{{ matrix.note }}；命中后按 Judge 判定：2 或 1 的有效证据计有效、0 计无效，未命中单独计为未命中。样本量随当前 run 变化，不做预设。</p>
               </div>
-              <p class="answer-layer-note">口径：L1 的召回命中表示证据进入本题结果；L2 显示该证据对应的回答结果。L3 用 Judge 校验证据结果：Judge=2 或 1 的返回证据计有效，Judge=0 的返回证据计无效，未返回证据单独计为未命中；全量 299 个错误中，有 3 个不可归因题不进入这张 421 题矩阵。</p>
             </div>
           </section>
         </section>
@@ -2710,26 +3087,59 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
       </section>
       <h3 class="result-heading">结果指标</h3>
 <div class="result-phase-list">
+        <article v-if="telemetrySampleCount(activeRun)" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
+<div class="phase-title"><b>实时资源遥测</b><span class="phase-status" :class="telemetryLiveState(activeRun).status === 'running' ? 'running' : 'completed'">{{ telemetryLiveState(activeRun).status === 'running' ? '实时更新中' : '已停止' }}</span></div>
+<p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ ['jetson_local_pss', 'orin_ssh_pss'].includes(telemetryLiveState(activeRun).source) ? ' Orin 使用进程 PSS 表示统一物理内存，不显示独立 GPU 显存。' : ' 153 使用 NVIDIA GPU 显存；整机 RAM 为宿主机全部进程。' }}</p>
+<div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
+<div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">完整测评过程，共 {{ telemetryHistory(activeRun).length }} 个采样点；悬浮查看时间、阶段和各项 GiB，图例可隐藏曲线，底部可缩放。曲线只绘制实际采集到的数据，不用 0 填充缺失指标。</small></div>
+<details class="metric-definition-panel telemetry-definition-panel">
+  <summary>资源曲线口径说明</summary>
+  <div class="metric-definition-row">
+    <strong>RAM 与 GPU 显存</strong><span><b>口径：</b>RAM 是 Linux 主机系统内存；GPU 显存是 NVIDIA 独立显卡 VRAM。两者是不同资源，不能直接相加成“模型总占用”。</span><span><b>判读：</b>153 独显环境下，模型权重、预分配 KV Cache 和 CUDA buffer 主要看“主模型 GPU 显存”；“主模型 RAM”只是模型服务进程在主机内存里的运行时占用。</span>
+  </div>
+  <div class="metric-definition-row">
+    <strong>主模型 RAM</strong><span><b>计算式：</b>主模型相关进程的 RSS/PSS 采样；153 目前为 Linux RSS，Orin 主模型另有 PSS 曲线。</span><span><b>含义：</b>包含 Python/vLLM 或 llama.cpp runtime、tokenizer、调度结构、mmap 页、共享库和 CUDA 用户态开销等；不表示模型权重在 RAM 里又完整复制了一份。</span>
+  </div>
+  <div class="metric-definition-row">
+    <strong>测评系统 RAM / GPU</strong><span><b>范围：</b>默认按 8771、8091、8500/8501、8100/8101、6333 端口，以及 photobench、sentrix、vllm、qdrant、llama-server、ollama 等进程关键词归因。</span><span><b>判读：</b>它是 PhotoBench/Sentrix 相关进程组的资源占用，用来和“整机/整卡”区分；如果系统上有同名无关进程，可能被归入该组。</span>
+  </div>
+  <div class="metric-definition-row">
+    <strong>vLLM 与 llama.cpp</strong><span><b>vLLM：</b>GPU 显存包含权重、预分配 KV 池和运行时 buffer，受 gpu_memory_utilization 影响，可能高于请求时真实活跃 KV。</span><span><b>llama.cpp/Ollama：</b>独显环境可按进程采 GPU 显存；Orin 是统一内存平台，不显示独立 GPU 显存。</span>
+  </div>
+  <div class="metric-definition-row">
+    <strong>Orin UMA</strong><span><b>口径：</b>Orin 的 CPU/GPU 共用物理内存，没有可与 153 VRAM 直接对应的独立显存曲线。</span><span><b>判读：</b>页面只展示真实能采到的整机 RAM、测评系统进程内存、主模型进程 RAM/PSS；不要把 Orin PSS 和 153 的 NVIDIA 显存做数值横比。</span>
+  </div>
+</details>
+<div v-if="liveTelemetryPhaseRows(activeRun).length" class="phase-metrics"><div v-for="row in liveTelemetryPhaseRows(activeRun)" :key="`live-${row[0]}`" class="phase-metric"><span>{{ row[0] }}阶段峰值</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
+<details v-if="telemetryProcessList(activeRun).length" class="telemetry-processes">
+  <summary>GPU 进程明细（{{ telemetryProcessList(activeRun).length }} 个）</summary>
+  <div class="telemetry-process-grid">
+    <div v-for="process in telemetryProcessList(activeRun)" :key="`${process.pid}-${process.process_name}`" class="telemetry-process-row">
+      <span>{{ process.process_name || "未知进程" }}</span><small>PID {{ process.pid }}</small><b>{{ fmtMemory(process.used_memory_mib) }}</b>
+    </div>
+  </div>
+</details>
+</article>
         <article class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
 <b>GPU 指标</b>
-<span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.gpu_metrics)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.gpu_metrics)) }}</span>
+<span class="phase-status" :class="resultPhaseStatus(gpuMetricsView(activeRun))">{{ gpuMetricsStatusLabel(activeRun) }}</span>
 </div>
-<p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics)) }} · {{ activeRun.phases?.gpu_metrics?.memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
+<p class="metric-calc-time">{{ gpuMetricsView(activeRun).partial ? '已按当前已采样数据滚动汇总；全部阶段结束后更新为全程均值/峰值。' : ('指标计算耗时 ' + fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics))) }} · {{ ['orin_ssh_pss', 'jetson_local_pss'].includes(gpuMetricsView(activeRun).source) ? 'Orin：进程 PSS 是统一物理内存峰值，不是独立显存；工作负载内存和 KV 实际用量未拆分' : gpuMetricsView(activeRun).memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
 <div class="phase-metrics">
-<div v-for="row in gpuMetricRows(activeRun.phases?.gpu_metrics)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<div v-for="row in gpuMetricRows(gpuMetricsView(activeRun))" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>
 <strong>{{ row[1] }}</strong>
 <small>{{ row[2] }}</small>
 </div>
 </div>
 </article>
-        <article class="phase-card result-phase-card gpu-result-card">
+        <article v-if="!isOrinPssRun(activeRun)" class="phase-card result-phase-card gpu-result-card">
 <div class="phase-title">
 <b>{{ comparableMemoryProfile(activeRun)?.source === 'replay' ? '可比较显存复测' : '可比较显存' }}</b>
 <span class="phase-status" :class="comparableMemoryProfile(activeRun)?.status || 'pending'">{{ statusLabel(comparableMemoryProfile(activeRun)?.status || 'pending') }}</span>
 </div>
-<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun)?.source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : comparableMemoryProfile(activeRun)?.source === 'replay' ? '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' : '本次 run 的 GPU 采样结束后生成；' }}可比较显存 = 固定基础占用 + KV Cache 实际峰值。</p>
+<p class="metric-calc-time">{{ comparableMemoryProfile(activeRun)?.memory_profile?.method === 'orin_process_pss_uma_v1' ? 'Orin 统一内存按进程 PSS 记录；KV 字节数尚不可用，不与独立显存直接比较。' : (comparableMemoryProfile(activeRun)?.source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : comparableMemoryProfile(activeRun)?.source === 'replay' ? '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' : '本次 run 的 GPU 采样结束后生成；') + '工作负载显存为扣除预留 KV 后的估算值，不是硬件实测。' }}</p>
 <p v-if="comparableMemoryProfile(activeRun).error" class="error">{{ comparableMemoryProfile(activeRun).error }}</p>
 <div class="phase-metrics">
 <div v-for="row in memoryProfileRows(comparableMemoryProfile(activeRun) || {})" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
@@ -2905,16 +3315,16 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                     <span><small>JSON 解析</small><b>{{ itemParseRate(itemDetail(summary)) }}</b></span>
                     <span><small>步数内完成</small><b>{{ completionLabel(itemDetail(summary)) }}</b></span>
                   </div>
-                  <h4>模型召回媒体（{{ itemMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemMedia(itemDetail(summary)).length" class="muted small">模型没有返回可识别的媒体</span></div>
-                  <h4>回答来源媒体（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`evidence-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
-                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`evidence-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
+                  <h4>工具召回图片（{{ toolRecallMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in toolRecallMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!toolRecallMedia(itemDetail(summary)).length" class="muted small">检索未返回可识别媒体</span></div>
+                  <h4>模型使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`used-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">回答依据图片为空（模型未选择交付图）</span></div>
+                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`used-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>
                   <h4>检索 GT 媒体（{{ itemMedia(itemDetail(summary), true).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary), true)" :key="media.asset_id || `${media.media_type}-${media.media_id}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}<em v-if="media.matched === false"> · 未召回</em></span></div></div>
+                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary), true)" :key="media.asset_id || `${media.media_type}-${media.media_id}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}<em v-if="media.matched === false"> · 未召回</em></span></div></div>
                   <h4 v-if="judgeReason(itemDetail(summary).judge)">回答质量评分说明</h4><p v-if="judgeReason(itemDetail(summary).judge)" class="muted">{{ judgeReason(itemDetail(summary).judge) }}</p>
                   <h4 v-if="judgeReason(itemDetail(summary).task_judge)">任务判断说明</h4><p v-if="judgeReason(itemDetail(summary).task_judge)" class="muted">{{ judgeReason(itemDetail(summary).task_judge) }}</p>
                   <h4 v-if="judgeReason(itemDetail(summary).evidence_judge)">媒体证据评分说明</h4><p v-if="judgeReason(itemDetail(summary).evidence_judge)" class="muted">{{ judgeReason(itemDetail(summary).evidence_judge) }}</p>
@@ -3161,7 +3571,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <details v-for="(record, recordIndex) in chainDetail.records" :key="record.key" class="chain-record" :open="recordIndex === 0">
             <summary><b>QA {{ record.index + 1 }}</b><span>{{ record.question }}</span><em>{{ record.media.length }} 媒体 · {{ record.statements.length }} 语句 · {{ record.traceRows.length }} 调用</em></summary>
             <div class="chain-record-body">
-              <section class="chain-detail-section"><h4>图像 / 媒体证据 <small>{{ record.media.length }} 项</small></h4><div class="chain-detail-media-grid"><div v-for="media in record.media" :key="`${record.key}-${mediaKey(media)}`" class="chain-detail-media"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><button v-else-if="imageUrl(media)" type="button" @click="openImage(media)"><img :src="imageUrl(media)" :alt="media.file_name || media.media_id" loading="lazy" /></button><span v-else class="image-empty">媒体文件未能解析</span><small>{{ media.file_name || media.media_id || media.asset_id }}</small></div><p v-if="!record.media.length" class="muted small">该节点没有保存可展示的媒体引用。</p></div></section>
+              <section class="chain-detail-section"><h4>图像 / 媒体证据 <small>{{ record.media.length }} 项</small></h4><div class="chain-detail-media-grid"><div v-for="media in record.media" :key="`${record.key}-${mediaKey(media)}`" class="chain-detail-media"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><button v-else-if="imageUrl(media)" type="button" @click="openImage(media)"><img :src="imageUrl(media)" :alt="media.file_name || media.media_id" loading="lazy" /></button><span v-else class="image-empty">媒体文件未能解析</span><small>{{ media.file_name || media.media_id || media.asset_id }}</small></div><p v-if="!record.media.length" class="muted small">该节点没有保存可展示的媒体引用。</p></div></section>
               <section class="chain-detail-section"><h4>结构化语句 / 观察 <small>{{ record.statements.length }} 项</small></h4><div class="chain-detail-statements"><article v-for="statement in record.statements" :key="`${record.key}-${statement.label}-${statement.value}`"><b>{{ statement.label }}</b><p>{{ statement.value }}</p></article><p v-if="!record.statements.length" class="muted small">没有保存文字观察或回答声明。</p></div></section>
               <section class="chain-detail-section"><h4>工具调用与返回 <small>{{ record.traceRows.length }} 项</small></h4><details v-for="row in record.traceRows" :key="`${record.key}-${row.label}`" class="chain-trace-row"><summary>{{ row.label }}</summary><pre>{{ row.value }}</pre></details><p v-if="!record.traceRows.length" class="muted small">该节点没有保存工具调用轨迹。</p></section>
               <section class="chain-detail-section"><h4>已保存的执行过程 / 证据归因</h4><p class="chain-detail-disclaimer">以下只展示系统实际保存的 execution trace、Agent 证据账本和 grounding 信息，不把未保存的模型隐藏思维链伪装成可复现推理。</p><pre class="chain-reasoning-pre">{{ record.reasoning }}</pre></section>

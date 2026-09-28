@@ -1,0 +1,466 @@
+diff --git a/backend/agent_runtime/tools.py b/backend/agent_runtime/tools.py
+index c4a70998..9ac97726 100644
+--- a/backend/agent_runtime/tools.py
++++ b/backend/agent_runtime/tools.py
+@@ -486,6 +486,170 @@ def _query_meal_evidence(filters: dict, *, scope_id="home-default", viewer_id="o
+ 
+ 
+ # ---- Tool 2: search_memories ----
++_RESULT_PREVIEW_LIMIT = 6
++_RESULT_PAGE_SIZE = 6
++_RESULT_PREVIEW_RELEVANCE_HEAD = max(
++    0, min(_RESULT_PREVIEW_LIMIT, int(os.getenv("SENTRIX_RESULT_PREVIEW_RELEVANCE_HEAD", "3")))
++)
++_PREVIEW_QUERY_ALIASES = {
++    "布置": ("布置", "装饰", "花艺", "彩带", "气球", "窗帘", "床品", "家具"),
++    "装饰": ("装饰", "花艺", "彩带", "气球", "窗帘", "床品", "家具"),
++    "婚房": ("婚房", "室内", "房间", "床", "家具", "窗帘"),
++    "展架": ("展架", "广告牌", "展板", "婚纱照"),
++    "广告牌": ("广告牌", "展架", "展板", "婚纱照"),
++    "祝福": ("祝福", "幸福", "结婚", "新人"),
++    "文字": ("文字：", "文字", "写着", "标志"),
++    "雕塑": ("雕塑", "石雕", "雕像", "纪念碑"),
++    "石雕": ("石雕", "雕塑", "雕像", "纪念碑"),
++    "桥": ("桥", "桥上"),
++}
++
++
++def _observation_summary(store, asset_id: str) -> str:
++    """Expose bounded evidence text without exposing storage identifiers."""
++    if store is None:
++        return ""
++    try:
++        rows = store.list_observations(asset_id=asset_id, limit=1)
++    except Exception:
++        return ""
++    if not rows:
++        return ""
++    observation = rows[0] or {}
++    parts = []
++    for key in ("caption", "activity", "place"):
++        value = str(observation.get(key) or "").strip()
++        if value and value not in parts:
++            parts.append(value)
++    for key in ("objects", "clothing"):
++        values = observation.get(key) or []
++        labels = []
++        for value in values:
++            if isinstance(value, dict):
++                value = value.get("label") or value.get("primary") or ""
++            value = str(value or "").strip()
++            if value and value not in labels:
++                labels.append(value)
++        if labels:
++            parts.append("、".join(labels[:8]))
++    ocr = str(observation.get("ocr_text") or "").strip()
++    if ocr:
++        parts.append(f"文字：{ocr[:120]}")
++    detail = observation.get("detail") or {}
++    if isinstance(detail, dict):
++        details = []
++        for item in detail.get("visible_details") or []:
++            if isinstance(item, dict):
++                value = item.get("text") or item.get("label") or ""
++            else:
++                value = item
++            value = str(value or "").strip()
++            if value and value not in details:
++                details.append(value)
++        if details:
++            parts.append("；".join(details[:6]))
++    return "；".join(parts)[:300]
++
++
++def _asset_group_key(store, asset_id: str) -> str:
++    """Group video keyframes and event-near-duplicates for the initial preview."""
++    if store is None:
++        return asset_id
++    try:
++        asset = store.get_asset(asset_id) or {}
++        if asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
++            return ":".join(str(asset.get(key) or "") for key in (
++                "parent_asset_id", "source_scene_index")) or asset_id
++        row = store.connection.execute(
++            "SELECT event_id FROM event_observations WHERE observation_id IN "
++            "(SELECT id FROM observations WHERE asset_id = ?) ORDER BY event_id LIMIT 1",
++            (asset_id,),
++        ).fetchone()
++        return str(row["event_id"] if row else asset_id)
++    except Exception:
++        return asset_id
++
++
++def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
++    """Promote candidates whose stored visual detail matches explicit visual cues."""
++    text = str(query or "")
++    cues = [(term, aliases) for term, aliases in _PREVIEW_QUERY_ALIASES.items()
++            if term in text]
++    if not cues:
++        return list(range(len(asset_ids)))
++    scored = []
++    for index, asset_id in enumerate(asset_ids):
++        summary = _observation_summary(store, asset_id)
++        score = sum(1 for _, aliases in cues if any(alias in summary for alias in aliases))
++        scored.append((-score, index))
++    scored.sort()
++    return [index for _, index in scored]
++
++
++def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "") -> list[int]:
++    """Select bounded indices while preserving a relevance head before diversity."""
++    if len(asset_ids) <= _RESULT_PREVIEW_LIMIT:
++        return (_preview_query_order(asset_ids, query, store)
++                if mode != "representative" else list(range(len(asset_ids))))
++    if mode == "representative":
++        candidates = _even_indices(len(asset_ids), _RESULT_PREVIEW_LIMIT)
++    else:
++        candidates = _preview_query_order(asset_ids, query, store)
++    selected = []
++    seen_groups = set()
++    # Retrieval order is the strongest available relevance signal.  Preserve a
++    # small head even when those assets belong to one event; otherwise event
++    # diversity can discard the actual answer image before the model can inspect it.
++    relevance_head = min(_RESULT_PREVIEW_RELEVANCE_HEAD, len(candidates))
++    for index in candidates[:relevance_head]:
++        selected.append(index)
++        seen_groups.add(_asset_group_key(store, asset_ids[index]))
++    if len(selected) >= _RESULT_PREVIEW_LIMIT:
++        return selected[:_RESULT_PREVIEW_LIMIT]
++    for index in candidates[relevance_head:]:
++        group = _asset_group_key(store, asset_ids[index])
++        if group in seen_groups:
++            continue
++        selected.append(index)
++        seen_groups.add(group)
++        if len(selected) >= _RESULT_PREVIEW_LIMIT:
++            return selected
++    for index in range(len(asset_ids)):
++        if index not in selected:
++            selected.append(index)
++        if len(selected) >= _RESULT_PREVIEW_LIMIT:
++            break
++    return selected
++
++
++def _preview_entry(store, asset_id: str, handle: str, *, level="exact", condition_summary=None) -> dict:
++    asset = store.get_asset(asset_id) if store is not None else {}
++    asset = asset or {}
++    media_kind = "original_image"
++    source_video_asset_id = None
++    source_timestamp_sec = None
++    source_scene_index = None
++    source_video_file_name = None
++    if asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
++        media_kind = "video_keyframe"
++        source_video_asset_id = asset.get("parent_asset_id")
++        source_timestamp_sec = asset.get("source_timestamp_sec")
++        source_scene_index = asset.get("source_scene_index")
++        source_video = store.get_asset(source_video_asset_id) if store and source_video_asset_id else None
++        source_video_file_name = (source_video or {}).get("file_name")
++    return {
++        "handle": handle,
++        "captured_at": asset.get("captured_at"),
++        "level": level,
++        "place": _short_place_label(asset) if asset else "",
++        "media_kind": media_kind,
++        "source_video_asset_id": source_video_asset_id,
++        "source_timestamp_sec": source_timestamp_sec,
++        "source_scene_index": source_scene_index,
++        "source_video_file_name": source_video_file_name,
++        "evidence_summary": _observation_summary(store, asset_id),
++        "condition_summary": condition_summary or {},
++    }
+ def _even_indices(total: int, n: int) -> list[int]:
+     """在 [0, total) 内均匀取 n 个下标（representative 预览用，避免只展示最新几张），包含首尾。"""
+     if total <= n:
+@@ -504,52 +668,18 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
+     rs = _RUNTIME["result_sets"].new(
+         scope_id=scope_id, query=query or "(时间/地点筛选)", asset_ids=asset_ids,
+         unresolved=[])
+-    handles = rs.handles()
+-    _RUNTIME["last_handles"] = handles
+-    indices = _even_indices(len(asset_ids), 6) if mode == "representative" \
+-        else list(range(min(6, len(asset_ids))))
+-    preview = []
+     store = _RUNTIME.get("store")
+-    for i, idx in enumerate(indices):
+-        a = assets[idx]
+-        place = ""
+-        media_kind = "original_image"
+-        source_video_asset_id = None
+-        source_timestamp_sec = None
+-        source_scene_index = None
+-        source_video_file_name = None
+-        if store is not None:
+-            try:
+-                asset = store.get_asset(a.get("id")) or {}
+-                place = _short_place_label(asset)
+-                if asset.get("derived_kind") == "video_keyframe":
+-                    media_kind = "video_keyframe"
+-                    source_video_asset_id = asset.get("parent_asset_id")
+-                    source_timestamp_sec = asset.get("source_timestamp_sec")
+-                    source_scene_index = asset.get("source_scene_index")
+-                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+-                    source_video_file_name = (source_video or {}).get("file_name")
+-            except Exception:
+-                place = ""
+-        preview.append({
+-            "handle": f"photo_{idx + 1}",
+-            "captured_at": a.get("captured_at"),
+-            "level": "exact",
+-            "place": place,
+-            "media_kind": media_kind,
+-            "source_video_asset_id": source_video_asset_id,
+-            "source_timestamp_sec": source_timestamp_sec,
+-            "source_scene_index": source_scene_index,
+-            "source_video_file_name": source_video_file_name,
+-            "condition_summary": {},
+-        })
++    indices = _preview_indices(asset_ids, mode, store, query=user_goal or query)
++    preview = [
++        _preview_entry(store, assets[idx].get("id"), f"photo_{idx + 1}")
++        for idx in indices
++    ]
+     total = len(assets)
+     return {
+         "result_set_id": rs.result_set_id,
+         "query": query,
+         "mode": mode,
+         "total": total,
+-        "asset_ids": asset_ids[:50],
+         "evidence_count": len(asset_ids),
+         "preview": preview,
+         "has_more": total > len(preview),
+@@ -587,6 +717,19 @@ def _extract_time_from_query(query: str) -> str | None:
+     return None
+ 
+ 
++def _sanitize_model_filters(filters: dict, *, query: str, user_goal: str) -> dict:
++    """Keep model-generated time filters anchored to explicit user wording."""
++    sanitized = dict(filters or {})
++    explicit_time = _extract_time_from_query(f"{user_goal or ''} {query or ''}")
++    if explicit_time:
++        sanitized["time"] = explicit_time
++    else:
++        # The model sees current_time in its prompt and may hallucinate it as a
++        # photo date.  An unsupported time filter silently destroys recall.
++        sanitized.pop("time", None)
++    return sanitized
++
++
+ def _canonical_search_enabled() -> bool:
+     from .canonical_intent import canonical_enabled
+     return canonical_enabled()
+@@ -750,37 +893,26 @@ def _is_referent_query(query: str) -> bool:
+     return any(m in q for m in _REFERENT_MARKERS)
+ 
+ 
+-def _search_from_prior_result_set(prior_rs, scope_id: str) -> dict | None:
++def _search_from_prior_result_set(prior_rs, scope_id: str, *, query: str = "",
++                                  user_goal: str = "") -> dict | None:
+     """W2.3：基于已有 ResultSet 构建检索响应（不重新全库搜索）。"""
+     if prior_rs is None:
+         return None
+     asset_ids = list(prior_rs.asset_ids or [])
+     store = _RUNTIME.get("store")
+     preview = []
+-    handles = prior_rs.handles() if hasattr(prior_rs, "handles") else {}
+-    for i, aid in enumerate(asset_ids[:6]):
+-        handle = f"photo_{i + 1}"
+-        place = ""
+-        captured_at = None
+-        file_name = ""
+-        if store is not None:
+-            try:
+-                asset = store.get_asset(aid) or {}
+-                captured_at = asset.get("captured_at")
+-                place = _short_place_label(asset)
+-                file_name = asset.get("file_name") or ""
+-            except Exception:
+-                pass
+-        preview.append({"handle": handle, "captured_at": captured_at, "level": "exact",
+-                        "file_name": file_name, "place": place,
+-                        "media_kind": "original_image", "condition_summary": {}})
+-    _RUNTIME["last_handles"] = handles
++    indices = _preview_indices(
++        asset_ids, "best", store, query=query or getattr(prior_rs, "query", "") or user_goal)
++    preview = [
++        _preview_entry(store, asset_ids[index], f"photo_{index + 1}")
++        for index in indices
++    ]
++    display_query = query or getattr(prior_rs, "query", "") or f"(引用已有结果集 {prior_rs.result_set_id})"
+     return {
+         "result_set_id": prior_rs.result_set_id,
+-        "query": f"(引用已有结果集 {prior_rs.result_set_id})",
++        "query": display_query,
+         "mode": "best",
+         "total": len(asset_ids),
+-        "asset_ids": asset_ids[:50],
+         "evidence_count": len(asset_ids),
+         "preview": preview,
+         "has_more": len(asset_ids) > len(preview),
+@@ -792,8 +924,9 @@ def _search_from_prior_result_set(prior_rs, scope_id: str) -> dict | None:
+         "condition_summary": {},
+         "can_inspect": len(preview) > 0,
+         "inspect_hint": "preview 里的 handle（photo_1…）可直接用于 inspect_photo 复核视觉细节" if preview else "",
+-        "recommended_resolution": _recommended_resolution("(引用已有结果集)", preview,
+-                                                          "full_support" if asset_ids else "no_match"),
++        "recommended_resolution": _recommended_resolution(
++            display_query, preview, "full_support" if asset_ids else "no_match",
++            user_goal=user_goal),
+         "reference_resolution": True,
+     }
+ 
+@@ -834,11 +967,13 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+         if extracted:
+             filters["time"] = extracted
+     scope_id = (context or {}).get("scope_id") or ""
++    user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
++    filters = _sanitize_model_filters(filters, query=query, user_goal=user_goal)
+     # P2 v2: Canonical Retrieval Intent（fusion candidate）—— 从用户原问题确定性提取结构化
+     # 约束，强信号（时间+地点）时作为 filters 增强 hybrid 检索（保留语义 query），消除 paraphrase 漂移。
+     if _canonical_search_enabled():
+         from .canonical_intent import extract_constraints
+-        user_message = ((context or {}).get("task_state") or {}).get("user_goal") or arguments.get("query") or ""
++        user_message = user_goal or arguments.get("query") or ""
+ 
+         ci = extract_constraints(user_message, _RUNTIME.get("store"), scope_id)
+         # 防御：user_message 提取不到 time/place 时，再从 search query 提取并合并（覆盖边角）。
+@@ -856,7 +991,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+                 _ns = type("RS", (), {})()
+                 _ns.asset_ids = _ev["asset_ids"]
+                 _ns.result_set_id = "event_" + _ev["event_id"]
+-                return _search_from_prior_result_set(_ns, scope_id)
++                rs = _RUNTIME["result_sets"].new(
++                    scope_id=scope_id, query=query, asset_ids=_ev["asset_ids"])
++                return _search_from_prior_result_set(
++                    rs, scope_id, query=query, user_goal=user_message)
+         # canonical 结构化约束始终作为 filters 增强（覆盖 agent 的坏值如"所有时间"），
+         # 保留 hybrid 语义 query，避免 v1 空 query 走纯元数据路径丢失 OCR/关键词召回。
+         if ci.get("time"):
+@@ -878,7 +1016,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+                     prior_rs = rs_store.get(prior_rs_id)
+                 except Exception:
+                     prior_rs = None
+-        anchored = _search_from_prior_result_set(prior_rs, scope_id)
++        anchored = _search_from_prior_result_set(
++            prior_rs, scope_id, query=query, user_goal=_user_msg)
+         if anchored is not None:
+             return anchored
+         # W2.4：turn-0 无结果集时，引用解析到 Event（二级锚）
+@@ -887,7 +1026,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+             _ns = type("RS", (), {})()
+             _ns.asset_ids = ev["asset_ids"]
+             _ns.result_set_id = "event_" + ev["event_id"]
+-            return _search_from_prior_result_set(_ns, scope_id)
++            rs = _RUNTIME["result_sets"].new(
++                scope_id=scope_id, query=query, asset_ids=ev["asset_ids"])
++            return _search_from_prior_result_set(
++                rs, scope_id, query=query, user_goal=_user_msg)
+     viewer_id = (context or {}).get("viewer_id") or "owner"
+     draft = _draft_from_filters({**filters, "query": query}, answer_type="asset_set")
+     draft.result_requirement = {"mode": mode}
+@@ -904,49 +1046,24 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
+         unresolved=[g.get("reason") for g in (packet.gaps or [])],
+     )
+     preview = []
+-    handles = rs.handles()
+     store = _RUNTIME.get("store")
+-    for i, item in enumerate(assets[:6]):
+-        handle = f"photo_{i + 1}"
+-        place = ""
+-        media_kind = "original_image"
+-        source_video_asset_id = None
+-        source_timestamp_sec = None
+-        source_scene_index = None
+-        source_video_file_name = None
+-        if store is not None:
+-            try:
+-                asset = store.get_asset(item.get("asset_id")) or {}
+-                place = _short_place_label(asset)
+-                if asset.get("derived_kind") == "video_keyframe":
+-                    media_kind = "video_keyframe"
+-                    source_video_asset_id = asset.get("parent_asset_id")
+-                    source_timestamp_sec = asset.get("source_timestamp_sec")
+-                    source_scene_index = asset.get("source_scene_index")
+-                    source_video = store.get_asset(source_video_asset_id) if source_video_asset_id else None
+-                    source_video_file_name = (source_video or {}).get("file_name")
+-            except Exception:
+-                place = ""
+-        preview.append({
+-            "handle": handle,
+-            "captured_at": item.get("captured_at"),
+-            "level": item.get("level"),
+-            "place": place,
+-            "media_kind": media_kind,
+-            "source_video_asset_id": source_video_asset_id,
+-            "source_timestamp_sec": source_timestamp_sec,
+-            "source_scene_index": source_scene_index,
+-            "source_video_file_name": source_video_file_name,
+-            "condition_summary": _condition_summary(item),
+-        })
+-    _RUNTIME["last_handles"] = handles
++    preview_indices = _preview_indices(asset_ids, mode, store, query=query)
++    preview = [
++        _preview_entry(
++            store,
++            asset_ids[index],
++            f"photo_{index + 1}",
++            level=(assets[index].get("level") if index < len(assets) else "exact"),
++            condition_summary=_condition_summary(assets[index]),
++        )
++        for index in preview_indices
++    ]
+     cond, satisfaction, answerability = _truth_contract(packet, rs.total)
+     return {
+         "result_set_id": rs.result_set_id,
+         "query": query,
+         "mode": mode,
+         "total": rs.total,
+-        "asset_ids": asset_ids[:50],
+         "evidence_count": len(asset_ids),
+         "preview": preview,
+         "has_more": len(asset_ids) > len(preview),
+@@ -1151,8 +1268,15 @@ def _get_result_page(arguments: dict, *, context: dict | None = None) -> dict:
+         page_no = max(1, int(arguments.get("page") or 1))
+     except (TypeError, ValueError):
+         page_no = 1
++    if arguments.get("query") or arguments.get("filters"):
++        return {
++            "summary": "新的查询条件不能翻旧结果集，请重新调用 search_memories。",
++            "total": 0,
++            "requires_new_search": True,
++            "blocked": ["new_query_requires_search"],
++        }
+     try:
+-        page_size = min(20, max(1, int(arguments.get("page_size") or 6)))
++        page_size = min(_RESULT_PAGE_SIZE, max(1, int(arguments.get("page_size") or _RESULT_PAGE_SIZE)))
+     except (TypeError, ValueError):
+         page_size = 6
+     rs_store = _RUNTIME.get("result_sets")
+@@ -1193,10 +1317,14 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
+     asset_id = None
+     result_set_id = task_state.get("current_result_set")
+     rs_store = _RUNTIME.get("result_sets")
++    used_result_set = False
+     if result_set_id and rs_store is not None:
+         asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
+-    if not asset_id:
+-        asset_id = _handle_to_asset_id(asset_handle)
++        used_result_set = True
++    if not asset_id and not used_result_set:
++        return {"summary": "请先通过 search_memories 建立当前结果集。",
++                "certainty": "uncertain", "persisted": False,
++                "blocked": ["no_current_result_set"]}
+     store = _RUNTIME.get("store")
+     if not asset_id or store is None:
+         return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False,
+@@ -1680,7 +1808,7 @@ def register_tools():
+     ))
+     register(ToolSpec(
+         name="get_result_page",
+-        description="查看 search_memories 结果集的下一页/指定页。result_set_id 用 search_memories 返回的，page 从 1 开始。",
++        description="查看 search_memories 结果集的下一页/指定页（每页最多6张）。result_set_id 用 search_memories 返回的，page 从 1 开始。若要改变查询条件，重新调用 search_memories，不要把新条件传给本工具。",
+         input_schema={"result_set_id": "", "page": 1, "page_size": 6},
+         executor=_get_result_page, read_write="read", cost_class="cheap", readiness="ready",
+         produces_evidence=("memory_asset",),

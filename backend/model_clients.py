@@ -2,6 +2,7 @@ import base64
 from io import BytesIO
 import json
 import mimetypes
+import logging
 import os
 import re
 import threading
@@ -10,6 +11,9 @@ from pathlib import Path
 
 from .face_embeddings import FaceEmbeddingUnavailable, compute_face_quality
 from .geocoding import format_gps_prefix
+from .onnx_runtime import face_gpu_inference_gate, face_onnx_provider_options, face_onnx_providers
+from .runtime_providers import OpenAICompatibleInferenceProvider, normalize_openai_base_url
+from .platform_profile import profile
 
 
 def align_face_crop(image, bbox, landmarks=None):
@@ -235,6 +239,13 @@ def contains_latin_text(value):
 # answer and repair paths.
 ROLE_INFERENCE = {
     "parser": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
+    # Search validation is a bounded classification pass, not free-form
+    # reasoning. Keep the JSON response short so one vision batch does not
+    # consume the Agent wall-time budget.
+    # Validation emits one short JSON row per candidate. Keep the completion
+    # budget below the 12B server context ceiling; tools.py also splits a
+    # batch if a deployment reports a tighter prompt budget.
+    "search_validation": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 192},
     "answer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "writer": {"temperature": 0.3, "think": False, "num_ctx": 8192, "num_predict": 800},
     "verify": {"temperature": 0.0, "think": False, "num_ctx": 4096, "num_predict": 512},
@@ -247,6 +258,25 @@ def _openai_thinking_kwargs():
     """Return the vLLM chat-template switch; reasoning is disabled by default."""
     value = os.getenv("SENTRIX_ENABLE_THINKING", "0").strip().lower()
     return {"enable_thinking": value in {"1", "true", "yes", "on"}}
+
+
+def _cloud_thinking_kwargs(endpoint_base=None, model=None):
+    """Disable provider-side reasoning for cloud APIs by default.
+
+    Ark's OpenAI-compatible Doubao endpoint uses ``thinking.type`` rather
+    than the vLLM ``chat_template_kwargs`` switch.  Keep the fallback field
+    used by other OpenAI-compatible cloud providers without changing local
+    vLLM payloads.
+    """
+    endpoint = str(endpoint_base or "").lower()
+    model_name = str(model or "").lower()
+    if "kimi" in model_name:
+        # Kimi accepts the compatible chat-completions payload but rejects
+        # Ark/Doubao provider-specific thinking parameters.
+        return {}
+    if "volces.com" in endpoint or "volcengine.com" in endpoint:
+        return {"thinking": {"type": "disabled"}}
+    return {"enable_thinking": False}
 
 
 def build_image_prompt(metadata=None):
@@ -488,8 +518,15 @@ class GammaClient:
     def __init__(self, base_url=None, model=None, timeout=None, keep_alive=None,
                  parse_model=None, answer_model=None, verify_model=None,
                  parse_backend=None, parse_base_url=None, claim_model=None,
-                 repair_model=None, backend=None, api_key=None, manager_url=None):
+                 repair_model=None, backend=None, api_key=None, manager_url=None,
+                 runtime_source=None, api_mode=None):
         self.backend = self._normalize_backend(backend or os.getenv("SENTRIX_LLM_BACKEND", "vllm"))
+        self.runtime_source = str(
+            runtime_source or os.getenv("SENTRIX_RUNTIME_SOURCE", "managed")
+        ).strip().lower()
+        self.api_mode = str(
+            api_mode or os.getenv("SENTRIX_OPENAI_API_MODE", "vllm")
+        ).strip().lower()
         ollama_fallback_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
         if self.backend == "openai":
             self._base_url_setting = self._normalize_openai_base_url(
@@ -509,12 +546,13 @@ class GammaClient:
             self._base_url_setting = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
             self._model_setting = model or os.getenv("OLLAMA_MODEL", "gemma4:12b")
         self.api_key = api_key or os.getenv("SENTRIX_VLLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-        self.manager_url = (
-            manager_url
-            or os.getenv("SENTRIX_VLLM_MANAGER_API")
+        manager_setting = (
+            manager_url if manager_url is not None
+            else os.getenv("SENTRIX_VLLM_MANAGER_API")
             or os.getenv("SENTRIX_VLLM_API_URL")
             or ""
-        ).strip().rstrip("/")
+        )
+        self.manager_url = str(manager_setting or "").strip().rstrip("/")
         self._call_metrics_local = threading.local()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
@@ -571,6 +609,16 @@ class GammaClient:
         # Ollama expects numeric -1 for indefinite residency; the string "-1"
         # is rejected by its request schema.
         self.keep_alive = -1 if str(configured_keep_alive).strip() == "-1" else configured_keep_alive
+        self.inference_provider = (
+            OpenAICompatibleInferenceProvider(
+                self._base_url_setting,
+                api_key=self.api_key,
+                api_mode=self.api_mode,
+                manager_url=self.manager_url,
+                timeout=self.timeout,
+            )
+            if self.backend == "openai" else None
+        )
 
     @staticmethod
     def _normalize_backend(value):
@@ -585,8 +633,19 @@ class GammaClient:
 
     @staticmethod
     def _normalize_openai_base_url(value):
-        value = str(value or "http://127.0.0.1:8100/v1").rstrip("/")
-        return value if value.endswith("/v1") else f"{value}/v1"
+        return normalize_openai_base_url(value or "http://127.0.0.1:8100/v1")
+
+    def _inference_for(self, endpoint_base):
+        endpoint_base = normalize_openai_base_url(endpoint_base)
+        if self.inference_provider and self.inference_provider.base_url == endpoint_base:
+            return self.inference_provider
+        return OpenAICompatibleInferenceProvider(
+            endpoint_base,
+            api_key=self.api_key,
+            api_mode=self.api_mode,
+            manager_url=self.manager_url,
+            timeout=self.timeout,
+        )
 
     _CACHE_TTL_SECONDS = 5.0
 
@@ -693,7 +752,16 @@ class GammaClient:
 
         endpoint_base, model = self._endpoint_for(role)
         requested_max_tokens = int(max_tokens) if max_tokens is not None else None
-        budget = self._tokenize_for_budget(endpoint_base, messages)
+        is_cloud_api = self.runtime_source == "cloud_api"
+        budget = None if is_cloud_api else self._tokenize_for_budget(endpoint_base, messages)
+        if is_cloud_api:
+            budget_source = "provider_managed"
+            preflight_status = "not_requested"
+            preflight_reason = "cloud_api_context_managed_by_provider"
+        else:
+            budget_source = str((budget or {}).get("token_count_source") or "vllm_tokenize")
+            preflight_status = str((budget or {}).get("preflight_status") or "ok")
+            preflight_reason = str((budget or {}).get("preflight_fallback_reason") or "")
         if budget:
             prompt_tokens = int(budget["prompt_tokens"])
             max_model_len = int(budget["max_model_len"])
@@ -709,7 +777,9 @@ class GammaClient:
                     "available_output_tokens": max(0, available_output_tokens),
                     "max_model_len": max_model_len,
                     "estimated_total_tokens": prompt_tokens + (requested_max_tokens or 0),
-                    "token_count_source": "vllm_tokenize",
+                    "token_count_source": budget_source,
+                    "preflight_status": preflight_status,
+                    "preflight_fallback_reason": preflight_reason,
                     "ttft_ms": None,
                     "total_ms": None,
                     "tokens_per_second": None,
@@ -730,8 +800,11 @@ class GammaClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": temperature,
-            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
+        if is_cloud_api:
+            payload.update(_cloud_thinking_kwargs(endpoint_base, model))
+        elif self.api_mode != "generic":
+            payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
         headers = {}
@@ -754,7 +827,9 @@ class GammaClient:
                         int(budget["prompt_tokens"]) + int(max_tokens)
                         if budget and max_tokens is not None else None
                     ),
-                    "token_count_source": "vllm_tokenize" if budget else "response_usage",
+                    "token_count_source": budget_source if (budget or is_cloud_api) else "response_usage",
+                    "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
+                    "preflight_fallback_reason": preflight_reason,
                 })
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             error_detail = _http_error_detail(error)
@@ -770,30 +845,60 @@ class GammaClient:
                 "requested_max_tokens": requested_max_tokens,
                 "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
                 "max_model_len": int(budget["max_model_len"]) if budget else None,
-                "token_count_source": "vllm_tokenize" if budget else None,
+                "token_count_source": budget_source if (budget or is_cloud_api) else None,
+                "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
+                "preflight_fallback_reason": preflight_reason,
             })
             raise ModelError(f"model request failed: {error_detail}") from error
 
     def _tokenize_for_budget(self, endpoint_base, messages):
         """Ask the Manager bound to this endpoint to tokenize with the active model."""
-        manager_url = self.manager_url
-        if not manager_url:
+        provider = self._inference_for(endpoint_base)
+        if not provider.manager_url:
             return None
-        try:
-            response = httpx.post(
-                f"{manager_url}/tokenize-current",
-                json={"messages": messages, "add_generation_prompt": True},
-                timeout=min(15, self.timeout),
-            )
-            response.raise_for_status()
-            value = response.json()
-            if int(value.get("prompt_tokens") or 0) < 1 or int(value.get("max_model_len") or 0) < 1:
-                raise ValueError("invalid tokenizer budget response")
-            return value
-        except (httpx.HTTPError, ValueError, TypeError) as error:
-            if os.getenv("SENTRIX_TOKEN_BUDGET_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}:
-                raise ModelError(f"token budget preflight failed: {error}") from error
-            return None
+        last_error = None
+        for attempt in range(2):
+            try:
+                value = provider.token_count(messages, timeout=min(15, self.timeout))
+                if value is None:
+                    return None
+                value["token_count_source"] = "vllm_tokenize"
+                value["preflight_status"] = "ok"
+                return value
+            except (httpx.HTTPError, ValueError, TypeError) as error:
+                last_error = error
+                response = getattr(error, "response", None)
+                status = int(getattr(response, "status_code", 0) or 0)
+                transient = status >= 500 or status == 0
+                if transient and attempt == 0:
+                    time.sleep(0.1)
+                    continue
+                if transient:
+                    return self._local_token_budget(messages, reason=_http_error_detail(error))
+                if os.getenv("SENTRIX_TOKEN_BUDGET_REQUIRED", "1").strip().lower() in {"1", "true", "yes", "on"}:
+                    raise ModelError(f"token budget preflight failed: {error}") from error
+                return None
+        return self._local_token_budget(messages, reason=str(last_error or "manager_unavailable"))
+
+    @staticmethod
+    def _local_token_budget(messages, *, reason: str = "manager_unavailable"):
+        """Conservative fallback when the manager tokenizer is unavailable."""
+        text = json.dumps(messages or [], ensure_ascii=False, separators=(",", ":"))
+        chinese = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+        estimate = max(1, int(chinese * 0.7 + (len(text) - chinese) * 0.25) + 400)
+        max_model_len = int(
+            os.getenv("SENTRIX_TOKEN_BUDGET_MAX_MODEL_LEN")
+            or os.getenv("SENTRIX_MAX_MODEL_LEN")
+            or os.getenv("VLLM_MAX_MODEL_LEN")
+            or "4501"
+        )
+        return {
+            "prompt_tokens": estimate,
+            "max_model_len": max_model_len,
+            "token_count_source": "local_estimate",
+            "preflight_status": "fallback",
+            "preflight_fallback_reason": reason[:500],
+        }
 
     def _chat_ollama(self, endpoint_base, model, prompt, images=None, vision_options=None, json_mode=True, role=None):
         message = {"role": "user", "content": prompt}
@@ -867,8 +972,11 @@ class GammaClient:
             "stream": use_stream,
             "stream_options": {"include_usage": True} if use_stream else None,
             "temperature": 0,
-            "chat_template_kwargs": _openai_thinking_kwargs(),
         }
+        if self.runtime_source == "cloud_api":
+            payload.update(_cloud_thinking_kwargs(endpoint_base, model))
+        elif self.api_mode != "generic":
+            payload["chat_template_kwargs"] = _openai_thinking_kwargs()
         if json_mode and os.getenv("SENTRIX_OPENAI_RESPONSE_FORMAT", "1").strip().lower() in {"1", "true", "yes", "on"}:
             payload["response_format"] = {"type": "json_object"}
         params = ROLE_INFERENCE.get(role)
@@ -884,8 +992,7 @@ class GammaClient:
         try:
             if use_stream:
                 return self._chat_openai_stream(endpoint_base, payload, headers, role, model, json_mode)
-            response = httpx.post(f"{endpoint_base}/chat/completions", json=payload, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
+            response = self._inference_for(endpoint_base).chat(payload, timeout=self.timeout)
             data = response.json()
             text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
             if isinstance(text, list):
@@ -921,8 +1028,7 @@ class GammaClient:
         chunks = []
         prompt_tokens = None
         completion_tokens = None
-        with httpx.stream("POST", f"{endpoint_base}/chat/completions",
-                           json=payload, headers=headers, timeout=self.timeout) as response:
+        with self._inference_for(endpoint_base).chat_stream(payload, timeout=self.timeout) as response:
             if response.status_code >= 400:
                 try:
                     import sys as _sys
@@ -992,7 +1098,10 @@ class GammaClient:
         return {
             "think": False,
             "num_ctx": int(os.getenv("VISION_CORE_NUM_CTX", "4096")),
-            "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "320")),
+            # The full observation contract contains caption, people, objects,
+            # clothing, relations and detail arrays.  320 tokens truncates this
+            # JSON before it can be parsed, silently producing an empty memory.
+            "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "800")),
         }
 
     def encode_vision_image(self, path):
@@ -1022,8 +1131,8 @@ class GammaClient:
         file_path = Path(path)
         encoded, mime_type = self._encode_core_image(file_path)
         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
-严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过20字；activity、place、event_type 各不超过10字；people、objects、clothing、emotions、spatial_relations 各最多2项，每项不超过10字；facts 最多1项；ocr_text 不超过20字；确实看不清才用空数组或空字符串。
-字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
+严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过160字；activity、place、event_type 各不超过40字；people、objects、clothing、emotions、spatial_relations 尽量完整记录（分别最多12、40、12、12、40项），每项可包含不超过80字的可见细节；facts 最多8项；ocr_text 不超过1000字；确实看不清才用空数组或空字符串。
+字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts、detail。detail 用于保存不应被短摘要丢弃的可验证细节，包含 visible_details、regions、text_blocks、uncertainties 四个数组，每项写清可见内容和 confidence，不要猜测。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
 地点主类只能从："""
         prompt += "、".join(PLACE_PRIMARY_TYPES)
         prompt += "；物品主类只能从："
@@ -1035,14 +1144,14 @@ class GammaClient:
         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
         if not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text")) and not parsed.get("people") and not parsed.get("objects"):
             recovery_prompt = """首轮图片结果只有分类或为空，请补齐可验证的自然语言观察。只根据图片，不猜测姓名，不输出坐标。
-严格返回简体中文 JSON：caption（图片中看到什么，20字内）、activity（正在发生什么，10字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，10字内）、event_type（10字内）、people（最多2项）、objects（最多4项）、ocr_text（20字内）。画面确实看不清才留空；不要只返回分类字段。"""
+严格返回简体中文 JSON：caption（图片中看到什么，160字内）、activity（正在发生什么，40字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，40字内）、event_type（40字内）、people（最多12项）、objects（最多40项）、ocr_text（1000字内）、detail（visible_details/regions/text_blocks/uncertainties）。画面确实看不清才留空；不要只返回分类字段。"""
             recovered = parse_json_response(self.chat(recovery_prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
             for key in ("caption", "activity", "place", "event_type", "people", "objects", "ocr_text"):
                 if recovered.get(key) not in (None, "", []):
                     parsed[key] = recovered[key]
         scalar_text = " ".join(as_text(parsed.get(key)) for key in ("caption", "activity", "place", "event_type", "ocr_text"))
         if contains_latin_text(scalar_text):
-            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："
+            canonical_prompt = "把下面的家庭图片观察规范化为简体中文 JSON。只翻译和整理已有内容，不新增人物、物体、活动或事实，不猜测姓名。保留字段 caption、activity、place、scene_type、semantic、people、objects、clothing、spatial_relations、ocr_text、event_type、facts、detail。detail 必须保留 visible_details、regions、text_blocks、uncertainties。semantic 必须保留地点主类、地点细节、物品记录和可观察画面氛围。scene_type 必须保留为下列之一："
             canonical_prompt += "、".join(SCENE_TYPE_OPTIONS)
             canonical_prompt += "。\n原始观察：" + json.dumps(parsed, ensure_ascii=False)
             parsed = parse_json_response(self.chat(canonical_prompt))
@@ -1052,6 +1161,16 @@ class GammaClient:
         parsed["emotions"] = as_list(parsed.get("emotions"))
         parsed["spatial_relations"] = as_list(parsed.get("spatial_relations"))
         parsed["facts"] = normalize_fact_confidences(parsed.get("facts"), 0.65)
+        detail = parsed.get("detail") if isinstance(parsed.get("detail"), dict) else {}
+        parsed["detail"] = {
+            "schema_version": 1,
+            "visible_details": as_list(detail.get("visible_details")),
+            "regions": as_list(detail.get("regions")),
+            "text_blocks": as_list(detail.get("text_blocks")),
+            "uncertainties": as_list(detail.get("uncertainties")),
+            **{key: value for key, value in detail.items()
+               if key not in {"visible_details", "regions", "text_blocks", "uncertainties"}},
+        }
         normalize_analysis_fields(parsed)
         parsed = normalize_semantic_analysis(parsed)
         parsed["confidence"] = normalize_confidence(parsed.get("confidence"), 0.65)
@@ -1246,6 +1365,47 @@ metadata: {json.dumps(metadata or {}, ensure_ascii=False)}"""
         parsed["model"] = self.model
         return parsed
 
+    def write_person_portrait(self, pack, role="writer"):
+        """Generate a hedged, evidence-bound living portrait from a bounded pack."""
+        from .person_portraits import PERSON_PORTRAIT_PROMPT, normalize_writer_output
+
+        prompt = PERSON_PORTRAIT_PROMPT + "\n证据包：" + json.dumps(pack, ensure_ascii=False)
+        parsed = parse_json_response(self.chat(prompt, json_mode=True, role=role))
+        return normalize_writer_output(parsed)
+
+    def infer_person_graph(self, paths, graph_payload, role="verify"):
+        """Infer album owner, roles and relationships from anonymized person refs."""
+        from .person_graph import PERSON_GRAPH_PROMPT, normalize_person_graph
+
+        images = []
+        for path in list(paths or [])[:12]:
+            encoded, mime_type = self.encode_vision_image(Path(path))
+            images.append({"base64": encoded, "mime_type": mime_type})
+        prompt = PERSON_GRAPH_PROMPT + "\n匿名人物与证据：" + json.dumps(
+            graph_payload or {}, ensure_ascii=False
+        )
+        parsed = parse_json_response(self.chat(
+            prompt, images, self._core_vision_options(), role=role,
+        ))
+        people = list(graph_payload.get("people") or []) if isinstance(graph_payload, dict) else []
+        return normalize_person_graph(parsed, people)
+
+    def analyze_person_moments(self, path, labels, context=None):
+        """Extract evidence-bound person moments from a numbered preview image."""
+        from .person_moments import PERSON_MOMENT_PROMPT, normalize_person_moments
+
+        encoded, mime_type = self.encode_vision_image(path)
+        prompt = PERSON_MOMENT_PROMPT
+        if context:
+            prompt += "\n图片上下文：" + json.dumps(context, ensure_ascii=False)
+        parsed = parse_json_response(self.chat(
+            prompt,
+            [{"base64": encoded, "mime_type": mime_type}],
+            vision_options=self._core_vision_options(),
+            role="verify",
+        ))
+        return {"moments": normalize_person_moments(parsed, labels)}
+
     def analyze_person_appearance(self, path, metadata=None):
         """Extract clothing only for the person represented by a body crop."""
         file_path = Path(path)
@@ -1416,22 +1576,31 @@ class FunASRClient:
 
 
 class ClipAdapter:
-    """Optional local CLIP ViT-B/32 adapter for native visual memory."""
+    """Visual embedding adapter — uses Chinese-CLIP (ViT-L-14, 768d).
+
+    与 ``embeddings/scheme.py`` 的 IMAGE_MODEL 对齐：写入侧与查询侧必须是同一个
+    模型名和维度，否则视觉召回会静默为空。
+
+    为什么不再用 open_clip ViT-B-32：检索侧（``embeddings/router.py``）早已钉死
+    chinese_clip，而导入侧长期仍在写 ViT-B-32 的 512 维向量 —— 实测 153 库里因此
+    积累了大量检索永远用不到的向量（visual 8782 条，episodic 2766、semantic 1885
+    同样被污染），还逼得 ANN 构建必须做"挑主模型"的防御逻辑。两侧统一到 chinese-clip。
+    """
 
     def __init__(self):
         self.enabled = os.getenv("CLIP_ENABLED", "true").lower() in {"1", "true", "yes"}
-        self.model_name = os.getenv("CLIP_MODEL_NAME", "ViT-B-32")
-        configured_checkpoint = os.getenv("CLIP_CHECKPOINT", "")
-        project_checkpoint = Path(__file__).resolve().parents[1] / "data" / "models" / "clip" / f"{self.model_name}.bin"
-        self.checkpoint = configured_checkpoint or (str(project_checkpoint) if project_checkpoint.is_file() else "")
+        # 必须与 embeddings/scheme.py 的 IMAGE_MODEL 一致
+        self.model_name = "chinese-clip-ViT-L-14"
+        configured_checkpoint = os.getenv("CHINESE_CLIP_CHECKPOINT", os.getenv("CLIP_CHECKPOINT", ""))
+        default_checkpoint = str(Path.home() / ".cache" / "clip" / "clip_cn_vit-l-14.pt")
+        self.checkpoint = configured_checkpoint or default_checkpoint
         self._model = None
         self._preprocess = None
-        self._tokenizer = None
         self._load_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
         self.error = None
-        self.device = os.getenv("CLIP_DEVICE", "auto")
-        # A randomly initialized model must never be used as retrieval evidence.
-        self.weights_ready = bool(self.checkpoint) or os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() in {"1", "true", "yes"}
+        self.device = profile.clip_device()
+        self.weights_ready = bool(self.checkpoint)
 
     @property
     def evidence_ready(self):
@@ -1439,15 +1608,7 @@ class ClipAdapter:
 
     @property
     def embedding_dimension(self):
-        configured = os.getenv("CLIP_EMBED_DIM")
-        if configured:
-            return int(configured)
-        normalized = str(self.model_name or "").lower().replace("_", "-")
-        if "vit-h-14" in normalized:
-            return 1024
-        if "vit-l-14" in normalized:
-            return 768
-        return 512
+        return 768  # chinese-clip-ViT-L-14
 
     def _device(self, torch):
         requested = str(self.device or "auto").strip().lower()
@@ -1463,22 +1624,26 @@ class ClipAdapter:
                 return self._model, self._preprocess
             if not self.enabled:
                 return None, None
-            if not self.checkpoint and os.getenv("CLIP_ALLOW_DOWNLOAD", "false").lower() not in {"1", "true", "yes"}:
-                self.error = "CLIP_CHECKPOINT is not configured"
+            if not Path(self.checkpoint).is_file():
+                self.error = f"Chinese-CLIP checkpoint missing: {self.checkpoint}"
                 self.weights_ready = False
                 return None, None
             try:
-                import open_clip
-                import torch
-                kwargs = {"model_name": self.model_name, "pretrained": "openai" if not self.checkpoint else None, "load_weights": not bool(self.checkpoint)}
-                self._model, _, self._preprocess = open_clip.create_model_and_transforms(**kwargs)
-                if self.checkpoint:
-                    state = torch.load(self.checkpoint, map_location="cpu", weights_only=True)
-                    self._model.load_state_dict(state, strict=False)
-                self._tokenizer = open_clip.get_tokenizer(self.model_name)
-                self.device = self._device(torch)
-                self._model.to(self.device)
-                self._model.eval()
+                # 复用 embeddings.chinese_clip_visual 的进程内单例，不要自己再 load_from_name。
+                # 两边是同一个 checkpoint、同一个模型名、同一个 device，各加载一份等于在
+                # 同一进程里存两份权重（实测 2.97G + 1.65G）。共用后省下约 1.7G ——
+                # 这在 16G 统一内存的 46 上是导入阶段 OOM 的直接来源。
+                from .embeddings.chinese_clip_visual import ChineseClipVisualEmbedder
+
+                shared = ChineseClipVisualEmbedder.shared()
+                model = shared._load()
+                if model is None:
+                    self.error = shared._error or "chinese_clip embedder unavailable"
+                    self.weights_ready = False
+                    return None, None
+                self._model = model
+                self._preprocess = shared._preprocess
+                self.error = None
                 return self._model, self._preprocess
             except Exception as error:
                 self.error = str(error)
@@ -1496,11 +1661,15 @@ class ClipAdapter:
 
             ensure_heif_support()
             image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(self.device)
-            with torch.no_grad():
+            with self._inference_lock, torch.no_grad():
                 embedding = model.encode_image(image)
             return embedding[0].cpu().tolist()
-        except Exception as error:
-            self.error = str(error)
+        except Exception:
+            # 裸 except 返回空向量时，调用方拿到 [] 仍会 upsert，整条链路不报错。
+            # 实测 numpy 2.x ABI 冲突期间 223 张图因此没有任何视觉向量，直到手工清点
+            # 才发现。必须留下痕迹。
+            logging.getLogger("sentrix.clip").exception(
+                "ClipAdapter.embed_image failed: path=%s", path)
             return []
 
     def embed_text(self, text):
@@ -1509,12 +1678,15 @@ class ClipAdapter:
             return []
         try:
             import torch
-            tokens = self._tokenizer([str(text)]).to(self.device)
-            with torch.no_grad():
+            from cn_clip.clip import tokenize
+
+            tokens = tokenize([str(text)]).to(self.device)
+            with self._inference_lock, torch.no_grad():
                 embedding = model.encode_text(tokens)
             return embedding[0].cpu().tolist()
-        except Exception as error:
-            self.error = str(error)
+        except Exception:
+            logging.getLogger("sentrix.clip").exception(
+                "ClipAdapter.embed_text failed: text=%r", str(text)[:80])
             return []
 
 
@@ -1525,6 +1697,8 @@ class FaceAdapter:
         self.enabled = os.getenv("FACE_ENABLED", "true").lower() in {"1", "true", "yes"}
         self._app = None
         self._load_lock = threading.Lock()
+        self._face_analysis_lock = threading.Lock()
+        self._recognition_lock = threading.Lock()
         self._retina = None
         self._recognition_session = None
         self.error = None
@@ -1576,11 +1750,13 @@ class FaceAdapter:
             if image is None:
                 # Apple HEIC/HEIF and some PNGs are unreadable by OpenCV alone.
                 from .image_io import ensure_heif_support
-                from PIL import Image
+                from PIL import Image, ImageOps
 
                 ensure_heif_support()
                 with Image.open(path) as pil_image:
-                    image = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+                    # cv2.imread applies EXIF orientation on the JPEG path; transpose
+                    # here so HEIC/HEIF detections share the same oriented bbox space.
+                    image = cv2.cvtColor(np.array(ImageOps.exif_transpose(pil_image).convert("RGB")), cv2.COLOR_RGB2BGR)
             if image is None:
                 return []
             return self._detect_retina_tiled(image)
@@ -1596,7 +1772,7 @@ class FaceAdapter:
             model_path = os.path.join(model_root, os.getenv("FACE_MODEL_NAME", "buffalo_l"), "w600k_r50.onnx")
             if not os.path.isfile(model_path):
                 return None
-            providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
+            providers = face_onnx_providers("FACE_PROVIDERS")
             return onnxruntime.InferenceSession(model_path, providers=providers)
         except Exception:
             return None
@@ -1607,14 +1783,19 @@ class FaceAdapter:
             crop = crop.resize((112, 112))
             image = np.asarray(crop.convert("RGB"), dtype=np.float32)
             blob = ((image - 127.5) / 128.0).transpose(2, 0, 1)[None, ...]
-            output = self._recognition_session.run(
-                None, {self._recognition_session.get_inputs()[0].name: blob}
-            )[0]
+            with self._recognition_lock:
+                output = self._recognition_session.run(
+                    None, {self._recognition_session.get_inputs()[0].name: blob}
+                )[0]
             return [float(value) for value in output[0]]
         except Exception:
             return []
 
     def _detect_retina_tiled(self, image):
+        with face_gpu_inference_gate():
+            return self._detect_retina_tiled_unlocked(image)
+
+    def _detect_retina_tiled_unlocked(self, image):
         """RetinaFace tiled detection + SCRFD validity gate.
 
         RetinaFace finds face candidates (high recall), then buffalo_l SCRFD on
@@ -1648,7 +1829,8 @@ class FaceAdapter:
                 sub, sub_x, sub_y = self._expand_crop(image, bbox)
                 if sub is None:
                     continue
-                sub_faces = self._app.get(sub)
+                with self._face_analysis_lock:
+                    sub_faces = self._app.get(sub)
                 if not sub_faces:
                     # SCRFD finds no face here -> UNCERTAIN evidence only, never a
                     # cluster seed. RetinaFace landmark alignment is too unreliable
@@ -1794,14 +1976,20 @@ class FaceAdapter:
                 self._configure_onnx_runtime_libraries()
                 from insightface.app import FaceAnalysis
                 providers = [item for item in os.getenv("FACE_PROVIDERS", "CUDAExecutionProvider,CPUExecutionProvider").split(",") if item]
-                kwargs = {"name": os.getenv("FACE_MODEL_NAME", "buffalo_l"), "providers": providers}
-                if self.identity_model in {"adaface", "magface"}:
-                    kwargs["allowed_modules"] = ["detection", "landmark_2d_106", "recognition"]
+                kwargs = {
+                    "name": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
+                    "providers": providers,
+                    "provider_options": face_onnx_provider_options("FACE_PROVIDERS"),
+                    # This adapter only consumes SCRFD landmarks and ArcFace
+                    # embeddings; avoid loading unused 3D/106-point/gender models.
+                    "allowed_modules": ["detection", "recognition"],
+                }
                 if os.getenv("FACE_MODEL_ROOT"):
                     kwargs["root"] = os.getenv("FACE_MODEL_ROOT")
                 self._app = FaceAnalysis(**kwargs)
                 det_size = int(os.getenv("FACE_DET_SIZE", "640"))
-                self._app.prepare(ctx_id=-1, det_size=(det_size, det_size))
+                use_cuda = any(item.strip() == "CUDAExecutionProvider" for item in providers)
+                self._app.prepare(ctx_id=0 if use_cuda else -1, det_size=(det_size, det_size))
 
     @staticmethod
     def _expand_crop(image, bbox, margin=0.75, min_side=256):

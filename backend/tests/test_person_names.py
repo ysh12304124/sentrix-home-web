@@ -59,6 +59,8 @@ class PersonNamesAndMergeTests(unittest.TestCase):
         person_id = detail["entity"]["id"]
         renamed = self.store.rename_person(person_id, "大明")
         self.assertEqual(renamed["entity"]["canonical_name"], "大明")
+        self.assertEqual(renamed["entity"]["name_state"], "confirmed")
+        self.assertEqual(renamed["entity"]["role_state"], "unknown")
         aliases = self.store.person_aliases(person_id)
         self.assertIn("明哥", aliases)
         revisions = self.store._rows(

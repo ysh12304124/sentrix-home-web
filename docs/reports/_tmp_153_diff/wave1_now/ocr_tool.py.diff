@@ -1,0 +1,24 @@
+diff --git a/backend/agent_runtime/ocr_tool.py b/backend/agent_runtime/ocr_tool.py
+index b1a5289c..894c5978 100644
+--- a/backend/agent_runtime/ocr_tool.py
++++ b/backend/agent_runtime/ocr_tool.py
+@@ -24,10 +24,6 @@ def bind_ocr_runtime(runtime: dict) -> None:
+     _RUNTIME = runtime
+ 
+ 
+-def _handle_to_asset_id(handle: str) -> str | None:
+-    return (_RUNTIME.get("last_handles") or {}).get(handle)
+-
+-
+ # ---- Tool 4b: read_photo_text（Phase E：OCR 专用 Tool）----
+ _OCR_PROMPT = """请读出这张照片中的全部文字（招牌/菜单/价格/数字/电话/年份/小字）。只输出文字内容本身，不要描述图片、不要评价。如果完全看不清就输出空字符串。"""
+ _OCR_PROMPT_FULL = """观察这张照片，墙面上有哪些招牌、牌子或文字？请逐条列出文字内容本身（店名、电话、价格、年份、标语等），不要描述人物和场景。看不清的部分不要编造。"""
+@@ -480,7 +476,7 @@ def _ocr_single_asset(asset_handle: str, arguments: dict, context: dict | None)
+     if result_set_id and rs_store is not None:
+         asset_id = rs_store.resolve_handle(result_set_id, asset_handle)
+     if not asset_id:
+-        asset_id = _handle_to_asset_id(asset_handle)
++        return None
+     store = _RUNTIME.get("store")
+     if not asset_id or store is None:
+         return None

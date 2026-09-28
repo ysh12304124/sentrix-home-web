@@ -49,16 +49,20 @@ def build(store, ann_dir, backend="hnswlib", visual_embedder=None):
             dim = len(payload[0][1]) if payload else visual_embedder.dimension
             model = visual_embedder.model_id
         else:
-            # Visual ANN is asset retrieval space. Face-instance embeddings may
-            # share the table with a different model/dimension and must not mix.
+            # A space can contain vectors from several historical embedders
+            # (and visual also contains face-instance rows).  An ANN index is
+            # single-model/single-dimension; mixing rows silently drops the
+            # current album or makes the query channel incompatible.  For
+            # visual, prefer asset rows; for every space, keep the dominant
+            # model among the eligible rows.
             usable = rows
             if space == "visual":
                 asset_rows = [row for row in rows if row["source_type"] == "asset"]
                 usable = asset_rows or rows
-                by_model = {}
-                for row in usable:
-                    by_model.setdefault(row["model_name"], []).append(row)
-                usable = max(by_model.values(), key=len)
+            by_model = {}
+            for row in usable:
+                by_model.setdefault(row["model_name"], []).append(row)
+            usable = max(by_model.values(), key=len)
             dim = len(json.loads(usable[0]["vector_json"]))
             model = usable[0]["model_name"]
             payload = []

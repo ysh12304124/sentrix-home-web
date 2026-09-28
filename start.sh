@@ -23,8 +23,8 @@ fi
 export SENTRIX_DATA_DIR="${SENTRIX_DATA_DIR:-$root/data}"
 export SENTRIX_DB_PATH="${SENTRIX_DB_PATH:-$SENTRIX_DATA_DIR/sentrix.db}"
 export SENTRIX_ANN_DIR="${SENTRIX_ANN_DIR:-$SENTRIX_DATA_DIR/ann}"
-export SENTRIX_API_PORT="${SENTRIX_API_PORT:-11001}"
-export PORT="${PORT:-11000}"
+export SENTRIX_API_PORT="${SENTRIX_API_PORT:-8091}"
+export PORT="${PORT:-4174}"
 export SENTRIX_BACKEND_URL="${SENTRIX_BACKEND_URL:-http://127.0.0.1:${SENTRIX_API_PORT}}"
 export PYTHONPATH="${PYTHONPATH:-$root}"
 
@@ -127,7 +127,12 @@ else
 fi
 
 echo "Starting API on :$api_port ..."
-nohup bash "$root/scripts/runtime/start_sentrix_api.sh" >>"$api_log" 2>&1 &
+api_launcher="$root/scripts/runtime/start_sentrix_api.sh"
+if [[ "$api_port" == "8091" ]]; then
+  # Use the same production environment as manual/service restarts.
+  api_launcher="$root/scripts/runtime/start_sentrix_api_8091.sh"
+fi
+nohup bash "$api_launcher" >>"$api_log" 2>&1 &
 api_pid=$!
 
 echo "Starting Web on :$web_port ..."

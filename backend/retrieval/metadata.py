@@ -9,6 +9,7 @@ explicit and cheap by applying the same scope/time/media constraints up front.
 """
 
 from __future__ import annotations
+import os
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,8 +30,12 @@ class MetadataRetriever:
         # structured condition (time window / media type) to match.  Without
         # one it returns nothing, so a pure-semantic query does not get polluted
         # by "every asset in scope" becoming an anchor.
-        if not filters.time_bounds and not filters.media_types:
+        if not filters.time_bounds and not filters.media_types and not filters.place:
             return []
+        from ..geocoding import place_text_matches
+        import json as _json
+        internal_limit = max(int(limit or 20),
+                             int(os.environ.get("SENTRIX_METADATA_RECALL_LIMIT", "200")))
         hits = []
         assets = self.store.list_assets(limit=100_000)
         for asset in assets:
@@ -46,6 +51,23 @@ class MetadataRetriever:
                 captured = _parse_datetime(asset.get("captured_at"))
                 if captured is not None and not (filters.time_bounds[0] <= captured < filters.time_bounds[1]):
                     continue
+            # place 预筛（镜像 kernel 判定：geocode 匹配或缺失保留，不匹配剔除）
+            if filters.place:
+                # ``MemoryStore`` returns metadata_json as a JSON string.  The
+                # old code only handled a dict, so every asset with GPS was
+                # silently treated as having no geocode and passed the place
+                # prefilter.  That polluted the metadata channel with the
+                # whole scope and let insertion order displace exact places.
+                metadata = asset.get("metadata_json") or {}
+                if isinstance(metadata, str):
+                    try:
+                        import json
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                geo = metadata.get("reverse_geocode") if isinstance(metadata, dict) else None
+                if geo and not place_text_matches(filters.place, geo):
+                    continue
             hits.append(CandidateHit(
                 asset_id=asset["id"],
                 retriever=self.name,
@@ -58,7 +80,7 @@ class MetadataRetriever:
                 metadata={"scope_id": asset_scope, "media_type": media_type,
                           "captured_at": asset.get("captured_at")},
             ))
-            if len(hits) >= limit:
+            if len(hits) >= internal_limit:
                 break
         return hits
 

@@ -1,0 +1,37 @@
+diff --git a/backend/agent_runtime/final_writer.py b/backend/agent_runtime/final_writer.py
+index a2fa54ab..c2f191a5 100644
+--- a/backend/agent_runtime/final_writer.py
++++ b/backend/agent_runtime/final_writer.py
+@@ -27,6 +27,23 @@ _HEDGE_WHEN_CONFIRMED_RE = re.compile(r"还不能完全确认|无法完全确认
+ _PROMISE_RE = re.compile(r"我(?:可以|能|会)?(?:继续)?(?:帮你|为您)?(?:再)?(?:核对|确认|查看|找)")
+ _DENIES_FOUND_RE = re.compile(r"没有找到|没找到|未找到|没有获取到|找不到|不存在相关|没有相关")
+ 
++_INTERNAL_ID_RE = re.compile(
++    r"\b(?:asset_|obs_|entity_|mention_|claim_|turn_|conversation_|result_|evt_)[a-f0-9]{6,}\b",
++    re.I,
++)
++_INTERNAL_TABLE_RE = re.compile(
++    r"\b(?:assets|observations|entity_mentions|semantic_claims|agent_result_sets)\b",
++    re.I,
++)
++
++
++def sanitize_internal_refs(text: str) -> str:
++    """Remove internal identifiers and table names from user-visible text."""
++    text = str(text or "")
++    text = _INTERNAL_ID_RE.sub("[内部记录]", text)
++    text = _INTERNAL_TABLE_RE.sub("[内部记录]", text)
++    return text
++
+ # Phase G G7：空壳收尾/套话（自然化时删除，不引入新事实）
+ _BOILERPLATE_TAIL_RE = re.compile(
+     r"[。；]?(?:以上是我目前能确认的部分信息|以上是目前能确认的部分|以上是我能确认的内容|"
+@@ -247,7 +264,7 @@ def clean_writer_output(raw: str) -> str:
+             text = str(parsed["answer"]).strip()
+     except Exception:
+         pass
+-    return naturalize_answer(text.strip().strip('"'))
++    return naturalize_answer(sanitize_internal_refs(text.strip().strip('"')))
+ 
+ 
+ def rewrite_final(chat_fn, context: dict, draft: str, *, step_id: str | None = None,

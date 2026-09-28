@@ -1,0 +1,9 @@
+{
+  "sqlite_vectors": 75475,
+  "scope": null,
+  "qdrant_path": "/home/asus/Github/Sentrix-Home-Web/data/qdrant",
+  "qdrant": {
+    "available": false,
+    "reason": "qdrant_unavailable_or_locked"
+  }
+}

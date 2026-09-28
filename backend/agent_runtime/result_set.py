@@ -14,6 +14,60 @@ import uuid
 from dataclasses import dataclass, field
 
 RESULT_SET_TTL_S = 24 * 60 * 60  # D7：ResultSet TTL 延长到 24h（多轮/跨会话稳定）
+RESULT_SET_PAGE_SIZE = 6
+
+
+@dataclass(frozen=True)
+class ResultSetPublicView:
+    """A bounded public handle map that never leaks ResultSet global rank."""
+
+    asset_ids: tuple[str, ...]
+
+    def handles(self) -> dict[str, str]:
+        return {f"photo_{index + 1}": asset_id
+                for index, asset_id in enumerate(self.asset_ids)}
+
+    def preview(self, limit: int = RESULT_SET_PAGE_SIZE) -> list[dict]:
+        return [
+            {"handle": f"photo_{index + 1}", "asset_id": asset_id}
+            for index, asset_id in enumerate(self.asset_ids[:limit])
+        ]
+
+
+def debug_asset_projection(result_set: "ResultSet", preview: list[dict] | None) -> dict:
+    """Project full and model-visible evidence IDs for benchmark-only diagnostics.
+
+    The full ResultSet remains server-owned.  This projection is emitted only by
+    an include_debug response so offline evaluation can compare candidate recall
+    with the bounded preview without exposing IDs to the model.
+    """
+    full_ids = list(getattr(result_set, "asset_ids", None) or [])
+    preview_handles = []
+    preview_ids = []
+    for item in preview or []:
+        if not isinstance(item, dict):
+            continue
+        handle = str(item.get("handle") or "")
+        asset_id = ""
+        if item.get("asset_id"):
+            asset_id = str(item["asset_id"])
+        elif handle.startswith("photo_"):
+            try:
+                index = int(handle.removeprefix("photo_")) - 1
+            except ValueError:
+                index = -1
+            if 0 <= index < len(full_ids):
+                asset_id = str(full_ids[index])
+        if handle and handle not in preview_handles:
+            preview_handles.append(handle)
+        if asset_id and asset_id not in preview_ids:
+            preview_ids.append(asset_id)
+    return {
+        "debug_asset_ids": full_ids,
+        "debug_preview_asset_ids": preview_ids,
+        "debug_preview_handles": preview_handles,
+        "debug_result_total": len(full_ids),
+    }
 
 
 @dataclass
@@ -22,6 +76,7 @@ class ResultSet:
     scope_id: str
     query: str
     asset_ids: list
+    public_asset_ids: list | None = None
     total: int = 0
     ordering: list = field(default_factory=list)
     unresolved: list = field(default_factory=list)
@@ -29,27 +84,44 @@ class ResultSet:
     owner: str = ""
     expires_at: float = 0.0
     revision: str = ""
-    page_size: int = 6
+    page_size: int = RESULT_SET_PAGE_SIZE
     shown: int = 0
 
     def handles(self) -> dict[str, str]:
-        """全量稳定 handle 映射（photo_N 跨页一致，N 为结果集中全局序号）。"""
-        return {f"photo_{i + 1}": aid for i, aid in enumerate(self.asset_ids)}
+        """Return only the current model-visible handle map."""
+        return {f"photo_{i + 1}": aid
+                for i, aid in enumerate(self.visible_asset_ids())}
+
+    def visible_asset_ids(self) -> list:
+        """Public subset; full retrieval stays in the private asset_ids list."""
+        return list(self.public_asset_ids if self.public_asset_ids is not None
+                    else self.asset_ids)
+
+    def public_view(self, asset_ids: list[str] | tuple[str, ...]) -> ResultSetPublicView:
+        """Return a contiguous public handle map for an ordered subset."""
+        allowed = set(self.asset_ids)
+        visible = tuple(str(asset_id) for asset_id in asset_ids
+                        if asset_id and str(asset_id) in allowed)
+        return ResultSetPublicView(visible)
+
+    def set_public_view(self, asset_ids: list[str] | tuple[str, ...]) -> None:
+        self.public_asset_ids = list(self.public_view(asset_ids).asset_ids)
 
     def preview(self, limit: int = 6) -> list[dict]:
         return [
             {"handle": f"photo_{i + 1}", "asset_id": aid}
-            for i, aid in enumerate(self.asset_ids[:limit])
+            for i, aid in enumerate(self.visible_asset_ids()[:limit])
         ]
 
     def page(self, page_no: int, page_size: int | None = None) -> list[dict]:
         """返回第 page_no 页（1-based）的 handle 列表；handle 序号为全局序号。"""
-        size = page_size or self.page_size
+        size = min(RESULT_SET_PAGE_SIZE, max(1, int(page_size or self.page_size)))
         start = max(0, (int(page_no) - 1) * size)
         end = start + size
+        visible = self.visible_asset_ids()
         return [
             {"handle": f"photo_{start + i + 1}", "asset_id": aid}
-            for i, aid in enumerate(self.asset_ids[start:end])
+            for i, aid in enumerate(visible[start:end])
         ]
 
 
@@ -68,11 +140,20 @@ class ResultSetStore:
                     scope_id TEXT NOT NULL,
                     query TEXT NOT NULL DEFAULT '',
                     asset_ids_json TEXT NOT NULL DEFAULT '[]',
+                    public_asset_ids_json TEXT,
                     total INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     expires_at REAL NOT NULL DEFAULT 0
                 );""")
             self.store.connection.commit()
+            columns = {
+                row["name"] for row in self.store.connection.execute(
+                    "PRAGMA table_info(agent_result_sets)").fetchall()
+            }
+            if "public_asset_ids_json" not in columns:
+                self.store.connection.execute(
+                    "ALTER TABLE agent_result_sets ADD COLUMN public_asset_ids_json TEXT")
+                self.store.connection.commit()
         except Exception:
             pass
 
@@ -89,10 +170,13 @@ class ResultSetStore:
             import json as _json
             self.store.connection.execute(
                 """INSERT OR REPLACE INTO agent_result_sets
-                   (result_set_id, scope_id, query, asset_ids_json, total, created_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (result_set_id, scope_id, query, asset_ids_json, public_asset_ids_json,
+                    total, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (rs.result_set_id, rs.scope_id, rs.query or "",
                  _json.dumps(rs.asset_ids or [], ensure_ascii=False),
+                 _json.dumps(rs.public_asset_ids, ensure_ascii=False)
+                 if rs.public_asset_ids is not None else None,
                  rs.total, rs.created_at or "", rs.expires_at))
             self.store.connection.commit()
         except Exception:
@@ -110,9 +194,12 @@ class ResultSetStore:
             if row["expires_at"] and time.time() > row["expires_at"]:
                 return None
             asset_ids = _json.loads(row["asset_ids_json"] or "[]")
+            public_raw = row["public_asset_ids_json"] if "public_asset_ids_json" in row.keys() else None
+            public_asset_ids = _json.loads(public_raw) if public_raw else None
             rs = ResultSet(
                 result_set_id=row["result_set_id"], scope_id=row["scope_id"],
                 query=row["query"], asset_ids=list(asset_ids), total=row["total"],
+                public_asset_ids=list(public_asset_ids) if public_asset_ids is not None else None,
                 created_at=row["created_at"], expires_at=row["expires_at"],
                 shown=min(6, len(asset_ids)),
             )
@@ -201,12 +288,27 @@ class TaskState:
             "satisfaction": observation.get("query_satisfaction"),
             "blocked": observation.get("blocked"),
             "inspect_text": observation.get("observation") or observation.get("summary"),
+            "inspect_observation": observation.get("observation"),
             "inspect_handle": observation.get("asset_handle"),
+            "asset_id": observation.get("asset_id") or observation.get("_source_asset_id"),
+            "target_person": observation.get("target_person"),
+            "target_face_status": observation.get("target_face_status"),
+            "target_bbox": observation.get("target_bbox"),
+            "photo_identities": observation.get("photo_identities") or [],
             "confirms_visual_only": observation.get("confirms_visual_only", False),
             "certainty": observation.get("certainty"),
             "ocr_text": observation.get("full_text") or "",
+            "text_regions": observation.get("text_regions") or [],
             "asset_ids": observation.get("asset_ids"),
+            "retrieved_asset_ids": (observation.get("retrieved_asset_ids")
+                                     or observation.get("_retrieved_asset_ids")
+                                     or observation.get("asset_ids")),
+            "preview_asset_ids": observation.get("preview_asset_ids") or observation.get("_preview_asset_ids"),
+            "evidence_asset_ids": observation.get("evidence_asset_ids"),
+            "source_asset_ids": observation.get("source_asset_ids") or [],
+            "source_handles": observation.get("source_handles") or [],
             "operation": observation.get("operation"),
+            "metadata_operation": observation.get("metadata_operation"),
             "value": observation.get("value"),
             "rows": observation.get("rows"),
             "items": observation.get("items"),
@@ -214,13 +316,19 @@ class TaskState:
             "filters_applied": observation.get("filters_applied"),
             "samples": observation.get("samples"),
             "recommended_resolution": observation.get("recommended_resolution"),
+            "retrieval_channels": observation.get("retrieval_channels"),
             "preview": observation.get("preview"),
             "condition_summary": observation.get("condition_summary"),
+            "group_photo_count": observation.get("group_photo_count"),
+            "group_photo_sizes": observation.get("group_photo_sizes") or [],
+            "group_photo_rows": observation.get("group_photo_rows") or [],
             # Phase H H4：OCR 结构化硬值（供 nucleus 提取与 guard 校验）
             "exact_values": observation.get("exact_values") or [],
             "provider": observation.get("provider"),
             "confidence": observation.get("confidence"),
             "fallback_used": observation.get("fallback_used"),
+            "status": observation.get("status"),
+            "reason": observation.get("reason"),
         })
 
     def update_from_tool(self, tool_name: str, arguments: dict, observation: dict):
@@ -229,15 +337,42 @@ class TaskState:
             self.active_person = person
         if tool_name == "query_memory_facts":
             total = observation.get("total")
-            self.fact_total = int(total) if total is not None else None
+            self.fact_total = int(total) if total is not None else self.fact_total
             self.fact_value = observation.get("value")
             self.fact_operation = observation.get("operation")
             self.fact_rows = observation.get("rows")
             self.fact_group_by = arguments.get("group_by") or "month"
             self.last_tool = "query_memory_facts"
-            self.fulfillment = "empty" if total == 0 else ("fulfilled" if total else "pending")
+            if total is not None and int(total or 0) > 0:
+                # A structured fact result is a successful retrieval even when
+                # an earlier semantic search returned no candidates. Do not
+                # let that stale no_match state drive the final gate.
+                if self.result_total is None or int(self.result_total or 0) <= 0:
+                    self.result_total = int(total)
+                self.fulfillment = "fulfilled"
+                self.search_satisfaction = "full_support"
+            elif total == 0 and self.result_total in (None, 0):
+                self.fulfillment = "empty"
+                self.search_satisfaction = "no_match"
+        if tool_name == "query_memory_metadata":
+            total = observation.get("total")
+            self.last_tool = "query_memory_metadata"
+            if total is not None and int(total or 0) > 0:
+                if self.result_total is None or int(self.result_total or 0) <= 0:
+                    self.result_total = int(total)
+                self.fulfillment = "fulfilled"
+                self.search_satisfaction = "full_support"
+            elif total == 0 and self.result_total in (None, 0):
+                self.fulfillment = "empty"
+                self.search_satisfaction = "no_match"
         if tool_name == "search_memories" and observation.get("result_set_id"):
-            self.current_result_set = observation["result_set_id"]
+            # Preserve the last usable result set when a later search returns
+            # zero matches.  An empty result must not invalidate handles that
+            # were already shown and are still being resolved by the loop.
+            total = observation.get("total")
+            has_matches = total is None or int(total or 0) > 0
+            if has_matches or not self.current_result_set:
+                self.current_result_set = observation["result_set_id"]
             self.result_mode = arguments.get("mode") or "best"
             self.has_more = bool(observation.get("has_more"))
             self.delivery_state = "available" if observation.get("has_more") else "complete"
@@ -251,6 +386,18 @@ class TaskState:
                 self.fulfillment = "partial" if observation.get("gaps") else "fulfilled"
             self.search_satisfaction = observation.get("query_satisfaction")
             self.search_condition_summary = observation.get("condition_summary") or {}
+            # Event-anchored search may already contain a bounded structured
+            # count (for example two group photos of sizes 3 and 4). Promote
+            # that fact into the same nucleus fields used by query_memory_facts
+            # so deterministic rendering cannot fall back to candidate total.
+            if observation.get("group_photo_count") is not None:
+                self.fact_total = int(observation.get("group_photo_count") or 0)
+                self.fact_rows = observation.get("group_photo_rows") or []
+                self.fact_value = {
+                    "count": self.fact_total,
+                    "sizes": observation.get("group_photo_sizes") or [],
+                }
+                self.fact_operation = "group"
         if tool_name == "get_original_photos":
             self.delivery_state = "delivered"
             self.delivered_count = observation.get("delivered")

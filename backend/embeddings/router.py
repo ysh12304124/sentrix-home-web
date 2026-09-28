@@ -26,13 +26,18 @@ class EmbeddingRouter:
 
     @classmethod
     def from_clip(cls, clip):
-        """Build from a ClipAdapter with env-driven slot selection."""
-        image_kind = os.getenv("SENTRIX_IMAGE_EMBEDDER", "clip").strip().lower()
-        text_kind = os.getenv("SENTRIX_TEXT_EMBEDDER", "clip").strip().lower()
+        """Build with the LOCKED scheme (see embeddings/scheme.py).
+
+        历史上 IMAGE/TEXT 可被 env 切成 clip/chinese_clip/bge，导致向量/索引多套并存、
+        检索时好时坏。现钉死单一方案，不再读 env 选择：IMAGE=chinese_clip、TEXT=bge。
+        """
+        from . import scheme
+        image_kind = scheme.IMAGE_EMBEDDER
+        text_kind = scheme.TEXT_EMBEDDER
         visual = None
         if image_kind == "chinese_clip":
             from .chinese_clip_visual import ChineseClipVisualEmbedder
-            visual = ChineseClipVisualEmbedder()
+            visual = ChineseClipVisualEmbedder.shared()
         elif clip is not None:
             from .clip_visual import ClipVisualQueryEmbedder
             visual = ClipVisualQueryEmbedder(clip)
@@ -85,3 +90,35 @@ class EmbeddingRouter:
         events = list(self._timing_events)
         self._timing_events.clear()
         return events
+
+    @staticmethod
+    def _slot_status(slot):
+        if slot is None:
+            return {"configured": False, "available": False}
+        status_fn = getattr(slot, "status", None)
+        if callable(status_fn):
+            try:
+                value = status_fn()
+                if isinstance(value, dict):
+                    return dict(value)
+            except Exception as exc:
+                return {"configured": True, "available": False,
+                        "status_error": f"{type(exc).__name__}: {exc}"}
+        try:
+            available = bool(getattr(slot, "available", False))
+        except Exception as exc:
+            return {"configured": True, "available": False,
+                    "status_error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "configured": True,
+            "available": available,
+            "model_id": getattr(slot, "model_id", None),
+            "dimension": getattr(slot, "dimension", None),
+        }
+
+    def status(self) -> dict:
+        """Return observable slot health without exposing model internals."""
+        return {
+            "visual": self._slot_status(self.visual),
+            "text": self._slot_status(self.text),
+        }

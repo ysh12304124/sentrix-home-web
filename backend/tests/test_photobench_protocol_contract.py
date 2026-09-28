@@ -39,6 +39,8 @@ class PhotoBenchProtocolContractTests(unittest.TestCase):
     def test_app_keeps_runtime_binding_and_cancel_routes(self):
         paths = {route.path for route in app.app.routes}
         self.assertIn("/api/model-profiles/bind-runtime", paths)
+        self.assertIn("/api/model-profiles/bind-external-runtime", paths)
+        self.assertIn("/api/runtime-providers", paths)
         self.assertIn("/api/relationships/batch", paths)
 
 
