@@ -75,11 +75,45 @@ def _load_runtime_connection_config() -> dict:
         return {}
 
 
+def _load_dotenv_file(path: Path) -> None:
+    """Load KEY=VALUE lines. Values already in the process environment stay."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        try:
+            parsed = shlex.split(value, posix=True)
+        except ValueError:
+            parsed = []
+        if len(parsed) == 1:
+            value = parsed[0]
+        os.environ[key] = value
+
+
+def _configured_url(env_name: str, config_key: str, *, fallback: str = "") -> str:
+    """Resolve a host endpoint from the environment, then the local JSON.
+
+    An explicit empty environment value means the endpoint is unset and must
+    not fall through to another machine.
+    """
+    if env_name in os.environ:
+        return str(os.environ.get(env_name) or "").strip()
+    if config_key in RUNTIME_CONNECTION_CONFIG:
+        return str(RUNTIME_CONNECTION_CONFIG.get(config_key) or "").strip()
+    return fallback
+
+
+_load_dotenv_file(PROJECT_ROOT / ".env.local")
 RUNTIME_CONNECTION_CONFIG = _load_runtime_connection_config()
-DEFAULT_SENTRIX_URL = (
-    os.environ.get("BENCH_SENTRIX_URL")
-    or str(RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or "")
-    or "http://192.168.0.153:8091"
+DEFAULT_SENTRIX_URL = _configured_url(
+    "BENCH_SENTRIX_URL", "sentrix_url", fallback="http://127.0.0.1:8091"
 )
 
 
@@ -258,17 +292,8 @@ DEFAULT_JUDGE_URL = (
     or str(RUNTIME_CONNECTION_CONFIG.get("judge_url") or "")
     or _P_URL
 )
-DEFAULT_VLLM_API_URL = (
-    os.environ.get("BENCH_VLLM_API_URL")
-    or (str(RUNTIME_CONNECTION_CONFIG.get("vllm_manager_url"))
-        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://192.168.0.153:8500")
-)
-DEFAULT_VLLM_BASE_URL = (
-    os.environ.get("BENCH_VLLM_BASE_URL")
-    or (str(RUNTIME_CONNECTION_CONFIG.get("model_base_url"))
-        if "model_base_url" in RUNTIME_CONNECTION_CONFIG else "")
-    or ""
-)
+DEFAULT_VLLM_API_URL = _configured_url("BENCH_VLLM_API_URL", "vllm_manager_url")
+DEFAULT_VLLM_BASE_URL = _configured_url("BENCH_VLLM_BASE_URL", "model_base_url")
 BIG_MODEL_PROFILE_ID = "big_model"
 BIG_MODEL_BASE_URL = os.environ.get("BENCH_BIG_MODEL_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3")
 BIG_MODEL_MODEL = os.environ.get("BENCH_BIG_MODEL_MODEL", "doubao-seed-2.0-lite")

@@ -802,3 +802,51 @@ class ExtractImageIdsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class HostEndpointTests(unittest.TestCase):
+    def test_dotenv_load_does_not_override_process_environment(self):
+        directory = Path(tempfile.mkdtemp())
+        path = directory / ".env.local"
+        path.write_text(
+            'BENCH_DOTENV_TEST="http://127.0.0.1:1"\nBENCH_DOTENV_NEW=http://127.0.0.1:2\n',
+            encoding="utf-8",
+        )
+        MODULE.os.environ["BENCH_DOTENV_TEST"] = "keep"
+        MODULE.os.environ.pop("BENCH_DOTENV_NEW", None)
+        try:
+            MODULE._load_dotenv_file(path)
+            self.assertEqual(MODULE.os.environ["BENCH_DOTENV_TEST"], "keep")
+            self.assertEqual(MODULE.os.environ["BENCH_DOTENV_NEW"], "http://127.0.0.1:2")
+        finally:
+            MODULE.os.environ.pop("BENCH_DOTENV_TEST", None)
+            MODULE.os.environ.pop("BENCH_DOTENV_NEW", None)
+
+    def test_explicit_empty_manager_env_suppresses_fallback(self):
+        key = "BENCH_VLLM_API_URL_TEST_ONLY"
+        MODULE.os.environ[key] = ""
+        try:
+            self.assertEqual(
+                MODULE._configured_url(key, "missing_manager_key", fallback="http://192.168.0.153:8500"),
+                "",
+            )
+        finally:
+            MODULE.os.environ.pop(key, None)
+
+    def test_local_json_is_used_when_env_is_absent(self):
+        key = "BENCH_SENTRIX_URL_TEST_ONLY"
+        MODULE.os.environ.pop(key, None)
+        MODULE.RUNTIME_CONNECTION_CONFIG["sentrix_url_test_only"] = "http://127.0.0.1:11001"
+        try:
+            self.assertEqual(
+                MODULE._configured_url(key, "sentrix_url_test_only", fallback="http://127.0.0.1:8091"),
+                "http://127.0.0.1:11001",
+            )
+        finally:
+            MODULE.RUNTIME_CONNECTION_CONFIG.pop("sentrix_url_test_only", None)
+
+    def test_fallback_stays_on_localhost_when_host_config_is_absent(self):
+        self.assertEqual(
+            MODULE._configured_url("BENCH_ABSENT_TEST_ONLY", "no_such_key", fallback="http://127.0.0.1:8091"),
+            "http://127.0.0.1:8091",
+        )
+
