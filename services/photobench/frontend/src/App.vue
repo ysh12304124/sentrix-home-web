@@ -817,6 +817,17 @@ function gpuMetricRows(phase = {}) {
   const clock = phase.sm_clock_mhz || {};
   const processLimit = phase.model_process_memory_limit_mib;
   const processLimitLabel = processLimit == null ? "模型进程显存上限" : `${fmtMemory(processLimit)} 上限告警`;
+  if (phase.source === "apple_unified") return [
+    ["主模型 phys_footprint", fmtMemory((phase.model_process_system_memory_used_mib || {}).peak), `均值 ${fmtMemory((phase.model_process_system_memory_used_mib || {}).mean)} · 含统一内存里的 GPU 页，不用 RSS`, true],
+    ["整套产品内存", fmtMemory((phase.product_stack_memory_mib || {}).peak), `相关进程 phys_footprint 加总 · 不再加 UMA 补偿`],
+    ["Sentrix 周边", fmtMemory((phase.sentrix_stack_pss_mib || {}).peak), `不含主模型进程`],
+    ["整机内存", fmtMemory((phase.system_memory_used_mib || {}).peak), `App + Wired + Compressed，不含文件缓存`],
+    ["GPU 利用率", fmtNumber(util.mean, "%"), `片上 GPU Device Utilization 峰值 ${fmtNumber(util.peak, "%")}`],
+    ["GPU 温度", fmtNumber(temp.mean, "°C"), `峰值 ${fmtNumber(temp.peak, "°C")} · macmon，未安装时留空`],
+    ["CPU 温度", fmtNumber((phase.cpu_temperature_c || {}).mean, "°C"), `峰值 ${fmtNumber((phase.cpu_temperature_c || {}).peak, "°C")} · macmon，未安装时留空`],
+    ["封装功耗", fmtNumber(power.mean, "W"), `峰值 ${fmtNumber(power.peak, "W")} · macmon，未安装时留空`],
+    ["采样数量", phase.samples_count == null ? "-" : `${phase.samples_count} 次`, "统一内存采样；缺失项不补 0"],
+  ];
   if (["orin_ssh_pss", "jetson_local_pss"].includes(phase.source)) return [
     ["Orin 模型进程占用（VmRSS）", fmtMemory((phase.model_process_system_memory_used_mib || {}).peak), `均值 ${fmtMemory((phase.model_process_system_memory_used_mib || {}).mean)} · P95 ${fmtMemory((phase.model_process_system_memory_used_mib || {}).p95)} · 进程驻留，含部分统一内存`, true],
     ["整机 RAM 相对本 run 基线", fmtMemory((phase.system_memory_delta_mib || {}).peak), `首个采样为 0；测评中会掺其他进程`],
@@ -872,6 +883,7 @@ function gpuMetricsView(run) {
       "product_stack_memory_mib",
       "system_memory_used_mib",
       "temperature_c",
+      "cpu_temperature_c",
       "gpu_utilization_pct",
       "power_draw_w",
       "kv_cache_usage_pct",
@@ -931,9 +943,10 @@ function liveTelemetryRows(run) {
   const unit = live.source === "jetson_local_pss" || live.source === "orin_ssh_pss" ? "PSS" : "显存";
   const fmtLive = (value, suffix = "") => value == null ? "-" : `${Number(value).toFixed(2)}${suffix}`;
   const fmtGiB = (value) => value == null ? "-" : `${(Number(value) / 1024).toFixed(2)} GiB`;
-  const productFormulaReady = latest.benchmark_process_memory_scope === "all_related_pss_plus_model_uma_extra"
-    || effectivePeak.benchmark_process_memory_scope === "all_related_pss_plus_model_uma_extra";
-  const productFormulaNote = productFormulaReady
+  const scope = latest.benchmark_process_memory_scope || effectivePeak.benchmark_process_memory_scope;
+  const productFormulaNote = scope === "apple_phys_footprint_related"
+    ? "相关进程 phys_footprint 加总；已含统一内存中的 GPU 页，不再加 UMA 补偿"
+    : scope === "all_related_pss_plus_model_uma_extra"
     ? "所有相关进程 PSS 加总 + max(0, 主模型 VmRSS - 主模型 smaps Rss)"
     : "历史记录未标记新公式 scope；该值不能按当前公式解释，需重跑";
   return [
@@ -1004,9 +1017,15 @@ function renderTelemetryChart() {
     || activeRun.value?.telemetry_source
     || activeRun.value?.phases?.gpu_metrics?.source
     || "";
+  const isApple = source === "apple_unified";
   const isOrin = ["orin_ssh_pss", "jetson_local_pss"].includes(source);
   const definitions = [
-    ...(isOrin
+    ...(isApple
+      ? [{ key: "system_memory_used_mib", name: "整机内存（App+Wired+Compressed）", color: "#20a36a" },
+         { key: "product_stack_memory_mib", name: "整套产品内存（相关进程 phys_footprint）", color: "#d9488b" },
+         { key: "sentrix_stack_pss_mib", name: "Sentrix 周边（不含主模型，phys_footprint）", color: "#8b6de8" },
+         { key: "model_process_system_memory_used_mib", name: "主模型进程 phys_footprint", color: "#f2b84b" }]
+      : isOrin
       ? [{ key: "system_memory_used_mib", name: "整机 RAM（Orin UMA）", color: "#20a36a" },
          { key: "product_stack_memory_mib", name: "整套产品 RAM（相关进程 PSS + 主模型 UMA 补偿）", color: "#d9488b" },
          { key: "sentrix_stack_pss_mib", name: "Sentrix 周边 PSS（不含模型）", color: "#8b6de8" },
@@ -1084,9 +1103,10 @@ function renderTelemetryChart() {
 }
 function liveTelemetryPhaseRows(run) {
   const source = telemetryLiveState(run).source || run?.telemetry_source || run?.phases?.gpu_metrics?.source || "";
-  const isOrin = ["orin_ssh_pss", "jetson_local_pss"].includes(source);
+  const isApple = source === "apple_unified";
+  const isOrin = isApple || ["orin_ssh_pss", "jetson_local_pss"].includes(source);
   const modelKey = isOrin ? "model_process_system_memory_used_mib" : "model_process_memory_used_mib";
-  const modelLabel = isOrin ? "主模型 VmRSS" : "主模型 GPU";
+  const modelLabel = isApple ? "主模型 phys_footprint" : (isOrin ? "主模型 VmRSS" : "主模型 GPU");
   const history = telemetryHistory(run);
   const phases = run?.telemetry_live?.phase_snapshots || {};
   const peakFromHistory = (phaseKey) => {
@@ -1122,11 +1142,14 @@ function comparableMemoryProfile(run) {
   };
 }
 function isOrinPssRun(run) {
-  return ["orin_ssh_pss", "jetson_local_pss"].includes(run?.telemetry_source)
-    || ["orin_ssh_pss", "jetson_local_pss"].includes(run?.telemetry_live?.source)
-    || ["orin_ssh_pss", "jetson_local_pss"].includes(run?.phases?.gpu_metrics?.source)
-    || run?.phases?.gpu_metrics?.memory_profile?.method === "orin_process_pss_uma_v1"
-    || comparableMemoryProfile(run)?.memory_profile?.method === "orin_process_pss_uma_v1";
+  const sources = ["orin_ssh_pss", "jetson_local_pss", "apple_unified"];
+  const method = run?.phases?.gpu_metrics?.memory_profile?.method
+    || comparableMemoryProfile(run)?.memory_profile?.method;
+  return sources.includes(run?.telemetry_source)
+    || sources.includes(run?.telemetry_live?.source)
+    || sources.includes(run?.phases?.gpu_metrics?.source)
+    || method === "orin_process_pss_uma_v1"
+    || method === "apple_phys_footprint_v1";
 }
 function memoryProfileRows(profile = {}) {
   const memory = profile.memory_profile || {};
@@ -3148,7 +3171,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <div class="result-phase-list">
         <article v-if="telemetrySampleCount(activeRun)" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
 <div class="phase-title"><b>实时资源遥测</b><span class="phase-status" :class="telemetryLiveState(activeRun).status === 'running' ? 'running' : 'completed'">{{ telemetryLiveState(activeRun).status === 'running' ? '实时更新中' : '已停止' }}</span></div>
-<p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ ['jetson_local_pss', 'orin_ssh_pss'].includes(telemetryLiveState(activeRun).source) ? ' Orin 无独立显存。主指标看黄线 VmRSS（进程驻留）。' : ' 153 使用 NVIDIA GPU 显存；整机 RAM 为宿主机全部进程。' }}</p>
+<p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ telemetryLiveState(activeRun).source === 'apple_unified' ? ' Mac 统一内存。四条曲线是整机内存、整套产品 phys_footprint、Sentrix 周边、主模型 phys_footprint。' : ['jetson_local_pss', 'orin_ssh_pss'].includes(telemetryLiveState(activeRun).source) ? ' Orin 无独立显存。主指标看黄线 VmRSS（进程驻留）。' : ' 153 使用 NVIDIA GPU 显存；整机 RAM 为宿主机全部进程。' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">完整测评过程，共 {{ telemetrySampleCount(activeRun) }} 个采样点；曲线按全时段抽稀绘制，峰值来自全部采样。悬浮查看时间、阶段和各项 GiB，图例可隐藏曲线，底部可缩放。曲线只绘制实际采集到的数据，不用 0 填充缺失指标。</small></div>
 <details class="metric-definition-panel telemetry-definition-panel">
@@ -3190,7 +3213,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <b>GPU 指标</b>
 <span class="phase-status" :class="resultPhaseStatus(gpuMetricsView(activeRun))">{{ gpuMetricsStatusLabel(activeRun) }}</span>
 </div>
-<p class="metric-calc-time">{{ gpuMetricsView(activeRun).partial ? '已按当前已采样数据滚动汇总；全部阶段结束后更新为全程均值/峰值。' : ('指标计算耗时 ' + fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics))) }} · {{ ['orin_ssh_pss', 'jetson_local_pss'].includes(gpuMetricsView(activeRun).source) ? 'Orin：主指标是 llama-server 的 VmRSS' : gpuMetricsView(activeRun).memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
+<p class="metric-calc-time">{{ gpuMetricsView(activeRun).partial ? '已按当前已采样数据滚动汇总；全部阶段结束后更新为全程均值/峰值。' : ('指标计算耗时 ' + fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics))) }} · {{ gpuMetricsView(activeRun).source === 'apple_unified' ? 'Mac：主指标是主模型 phys_footprint' : ['orin_ssh_pss', 'jetson_local_pss'].includes(gpuMetricsView(activeRun).source) ? 'Orin：主指标是 llama-server 的 VmRSS' : gpuMetricsView(activeRun).memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
 <div class="phase-metrics">
 <div v-for="row in gpuMetricRows(gpuMetricsView(activeRun))" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
 <span>{{ row[0] }}</span>

@@ -58,6 +58,7 @@ from backend.runtime_providers import (
     UnavailableLifecycleProvider,
     UnavailableTelemetryProvider,
 )
+from backend.apple_telemetry import LocalAppleUnifiedTelemetryProvider, is_apple_silicon
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_DATA_ROOT = PROJECT_ROOT / "data"
@@ -190,6 +191,8 @@ def select_runtime_providers(manager_url: str, endpoint_url: str,
     jetson = is_jetson_host()
     if not cloud and framework in {"llama.cpp", "llamacpp"} and jetson and host in local_hosts:
         return lifecycle, LocalJetsonLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "jetson_local_pss"
+    if not cloud and is_apple_silicon() and is_local_endpoint:
+        return lifecycle, LocalAppleUnifiedTelemetryProvider(endpoint_url=endpoint_url), "apple_unified"
     if not cloud and not jetson and host in local_hosts:
         telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider,
                            "ollama": OllamaTelemetryProvider, "vllm": VllmTelemetryProvider}.get(framework, HostNvidiaTelemetryProvider)
