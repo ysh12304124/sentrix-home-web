@@ -949,6 +949,22 @@ function liveTelemetryRows(run) {
     : scope === "all_related_pss_plus_model_uma_extra"
     ? "所有相关进程 PSS 加总 + max(0, 主模型 VmRSS - 主模型 smaps Rss)"
     : "历史记录未标记新公式 scope；该值不能按当前公式解释，需重跑";
+  if (live.source === "apple_unified") {
+    const stage = ["completed", "completed_with_errors", "failed", "cancelled", "interrupted"].includes(run?.status)
+      ? statusLabel(run.status)
+      : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中");
+    return [
+      ["当前阶段", stage, `已采样 ${live.samples_count || 0} 次`],
+      ["主模型 phys_footprint", fmtGiB(latest.model_process_system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_system_memory_used_mib)} · 含统一内存中的 GPU 页，不用 RSS`],
+      ["整套产品内存", fmtGiB(latest.product_stack_memory_mib), `峰值 ${fmtGiB(effectivePeak.product_stack_memory_mib)} · ${productFormulaNote}；输入缺失则不记录`],
+      ["Sentrix 周边", fmtGiB(latest.sentrix_stack_pss_mib), `峰值 ${fmtGiB(effectivePeak.sentrix_stack_pss_mib)} · 不含主模型，phys_footprint 加总`],
+      ["整机内存", fmtGiB(latest.system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.system_memory_used_mib)} · App + Wired + Compressed，不含文件缓存`],
+      ["GPU 利用率", fmtLive(latest.gpu_utilization_pct, "%"), `峰值 ${fmtLive(effectivePeak.gpu_utilization_pct, "%")} · macmon gpu_active_ratio`],
+      ["GPU 温度", fmtLive(latest.temperature_c, " °C"), `峰值 ${fmtLive(effectivePeak.temperature_c, " °C")} · macmon gpu_temp_avg`],
+      ["CPU 温度", fmtLive(latest.cpu_temperature_c, " °C"), `峰值 ${fmtLive(effectivePeak.cpu_temperature_c, " °C")} · macmon cpu_temp_avg`],
+      ["系统功耗", fmtLive(latest.power_draw_w, " W"), `峰值 ${fmtLive(effectivePeak.power_draw_w, " W")} · macmon sys_power`],
+    ];
+  }
   return [
     ["当前阶段", ["completed", "completed_with_errors", "failed", "cancelled", "interrupted"].includes(run?.status) ? statusLabel(run.status) : (EXECUTION_PHASES.find((item) => item.key === (live.current_phase || run?.current_phase))?.label || "运行中"), `已采样 ${live.samples_count || 0} 次`],
     ["主模型 RAM", fmtGiB(latest.model_process_system_memory_used_mib), `峰值 ${fmtGiB(effectivePeak.model_process_system_memory_used_mib)} · 进程系统内存，不代表权重又完整占一份`],
@@ -3193,6 +3209,9 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
   </div>
   <div class="metric-definition-row">
     <strong>Orin UMA</strong><span><b>口径：</b>Orin 的 CPU/GPU 共用物理内存，没有可与 153 VRAM 直接对应的独立显存曲线。</span><span><b>判读：</b>页面只展示真实能采到的整机 RAM、整套产品 RAM、Sentrix 周边 PSS、主模型 VmRSS/PSS；不要把 Orin PSS 和 153 的 NVIDIA 显存做数值横比。</span>
+  </div>
+  <div class="metric-definition-row">
+    <strong>Mac 统一内存</strong><span><b>整机：</b>vm_stat 的 active + wired + compressor，不含文件缓存。<b>主模型 / Sentrix 周边 / 整套产品：</b>phys_footprint。整套产品是周边加主模型，不再加 UMA 补偿。</span><span><b>温度和功耗：</b>macmon pipe 的 cpu_temp_avg、gpu_temp_avg、sys_power。未安装 macmon 时留空，不补 0，也不用 RSS 代替 footprint。</span>
   </div>
   <div class="metric-definition-row">
     <strong>远程模型服务</strong><span><b>口径：</b>如果模型 endpoint 不是当前主机的 127.0.0.1、localhost、::1 或本机局域网地址，不记录当前主机的实时 RAM/GPU 遥测来代表远程模型。</span><span><b>判读：</b>请求时延和 token 指标仍可记录；硬件指标必须来自模型实际运行主机，否则留空。</span>

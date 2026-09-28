@@ -62,3 +62,7 @@
 - 8100 `/v1/models` 含 `gemma4-12b-it`；
 - 8771 `/api/runs/…/memory-effectiveness` 返回 `hit_match_source=使用 scope 资产清单…`；
 - 向量一致性：`ensure_visual_vectors.py`（只读）输出 `missing_scope_count: 0`。
+
+## macOS（Apple Silicon）
+
+`scripts/deploy/start_all_mac.sh` 在 Mac 上拉起 llama.cpp Metal、文本嵌入、Sentrix API 和 PhotoBench 8771。模型权重用仓库内相对路径 `models/llama/`，不写局域网地址。温度和功耗依赖 `brew install macmon`；没有 macmon 时占用曲线仍记录，温度和功耗留空。
