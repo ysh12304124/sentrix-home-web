@@ -185,10 +185,13 @@ class _RUsageInfoV0(ctypes.Structure):
         ("ri_wired_size", ctypes.c_uint64),
         ("ri_resident_size", ctypes.c_uint64),
         ("ri_phys_footprint", ctypes.c_uint64),
+        ("ri_proc_start_abstime", ctypes.c_uint64),
+        ("ri_proc_exit_abstime", ctypes.c_uint64),
     ]
 
 
 _LIBPROC = None
+_LIBPROC_LOCK = threading.Lock()
 
 
 def _libproc():
@@ -211,11 +214,12 @@ def _phys_footprint_bytes(pid: int) -> int | None:
     """
     try:
         info = _RUsageInfoV0()
-        if _libproc().proc_pid_rusage(int(pid), 0, ctypes.byref(info)) != 0:
+        with _LIBPROC_LOCK:
+            rc = _libproc().proc_pid_rusage(int(pid), 0, ctypes.byref(info))
+            footprint = int(info.ri_phys_footprint)
+        if rc != 0 or footprint <= 0:
             return None
-        if info.ri_phys_footprint <= 0:
-            return None
-        return int(info.ri_phys_footprint)
+        return footprint
     except (OSError, AttributeError, ValueError):
         return None
 
