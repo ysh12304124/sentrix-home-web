@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "gates": {
+    "new_scope_violations_max": 0,
+    "new_provenance_violations_max": 0,
+    "new_hard_value_violations_max": 0,
+    "score_regression_max_pp": 1.0,
+    "heldout_grounding_delta_min": 0.0,
+    "tool_call_limit_delta_max": 0.0,
+    "p95_latency_ratio_max": 1.1
+  }
+}

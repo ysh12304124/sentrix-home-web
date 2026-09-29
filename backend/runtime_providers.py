@@ -325,6 +325,8 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         self.api_mode = str(api_mode or "generic").strip().lower()
         self.manager_url = normalize_service_url(manager_url)
         self.timeout = float(timeout)
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=5, keepalive_expiry=300)
+        self._client = httpx.Client(limits=limits)
 
     @property
     def headers(self) -> dict:
@@ -338,7 +340,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
             root = self.base_url.removesuffix("/v1")
             for suffix in ("/health", "/api/health"):
                 try:
-                    response = httpx.get(f"{root}{suffix}", headers=self.headers, timeout=min(10, self.timeout))
+                    response = self._client.get(f"{root}{suffix}", headers=self.headers, timeout=min(10, self.timeout))
                     response.raise_for_status()
                     body = response.json() if response.content else {}
                     return {"status": "available", "source": suffix, "detail": body}
@@ -347,7 +349,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
             return {"status": "unavailable", "error": str(models_error)}
 
     def list_models(self) -> dict:
-        response = httpx.get(f"{self.base_url}/models", headers=self.headers, timeout=min(15, self.timeout))
+        response = self._client.get(f"{self.base_url}/models", headers=self.headers, timeout=min(15, self.timeout))
         response.raise_for_status()
         body = response.json()
         models = [
@@ -361,7 +363,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         if self.api_mode == "generic":
             body.pop("chat_template_kwargs", None)
             body = {key: value for key, value in body.items() if value is not None}
-        response = httpx.post(
+        response = self._client.post(
             f"{self.base_url}/chat/completions", json=body, headers=self.headers,
             timeout=timeout or self.timeout,
         )
@@ -373,7 +375,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         if self.api_mode == "generic":
             body.pop("chat_template_kwargs", None)
             body = {key: value for key, value in body.items() if value is not None}
-        return httpx.stream(
+        return self._client.stream(
             "POST", f"{self.base_url}/chat/completions", json=body,
             headers=self.headers, timeout=timeout or self.timeout,
         )
@@ -381,7 +383,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
     def token_count(self, messages: list[dict], *, timeout: float = 15) -> dict | None:
         if not self.manager_url:
             return None
-        response = httpx.post(
+        response = self._client.post(
             f"{self.manager_url}/tokenize-current",
             json={"messages": messages, "add_generation_prompt": True},
             timeout=min(timeout, self.timeout),
@@ -415,7 +417,7 @@ class ManagerLifecycleProvider(LifecycleProvider):
             raise ValueError("manager URL is required")
 
     def _request(self, path: str, *, payload=None, method="GET", timeout=30):
-        response = httpx.request(method, f"{self.base_url}{path}", json=payload, timeout=timeout)
+        response = self._client.request(method, f"{self.base_url}{path}", json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json() if response.content else {}
 
@@ -442,7 +444,7 @@ class ManagerTelemetryProvider(TelemetryProvider):
 
     def _optional(self, path: str) -> dict:
         try:
-            response = httpx.get(f"{self.base_url}{path}", timeout=10)
+            response = self._client.get(f"{self.base_url}{path}", timeout=10)
             response.raise_for_status()
             value = response.json() if response.content else {}
             return {"status": "available", "data": value}
@@ -605,13 +607,13 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
     The remote identity, PID file and command are fixed, not derived from a
     user-supplied URL. A missing/changed process must never be reported as 0 MB.
     """
-    endpoint = "http://192.168.0.118:8100"
-    remote = "orin@192.168.0.118"
+    endpoint = "http://127.0.0.1:8100"
+    remote = "orin@127.0.0.1"
     pid_file = "/home/orin/VLM/gemma4/results/orin/server_photobench_8100.pid"
 
     def __init__(self, endpoint_url: str = ""):
         parsed = urlparse(normalize_service_url(endpoint_url))
-        if parsed.hostname != "192.168.0.118" or parsed.port != 8100:
+        if parsed.hostname != "127.0.0.1" or parsed.port != 8100:
             raise ValueError("Orin telemetry is only configured for the 118:8100 endpoint")
         self._last_memory: dict = {"status": "unavailable", "reason": "not_sampled"}
         self._last_pss_probe = 0.0

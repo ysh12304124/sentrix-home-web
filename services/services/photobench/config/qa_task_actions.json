@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "description": "QA set-level expected task actions. Explicit expected_action in a QA row takes precedence.",
+  "defaults": [
+    {
+      "album_id": "album3",
+      "qa_set": "compact-10q",
+      "expected_action": "answer"
+    },
+    {
+      "album_id": "album3",
+      "qa_set": "full-album3-38q",
+      "expected_action": "answer"
+    },
+    {
+      "album_id": "album3-14",
+      "qa_set": "compact-10q",
+      "expected_action": "answer"
+    }
+  ]
+}

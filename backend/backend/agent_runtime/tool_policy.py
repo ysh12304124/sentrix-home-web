@@ -1,0 +1,130 @@
+"""ToolPolicy（v2 §11.2/§4.4）— 代码层唯一安全入口。
+
+所有 Tool 调用统一经过：validate -> authorize -> budget check -> execute -> sanitize observation。
+模型不能绕过。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class ToolDecision:
+    allowed: bool
+    reason: str = ""
+    observation: dict | None = None
+    error: str | None = None
+
+
+class ToolPolicy:
+    def __init__(self, *, scope_id="home-default", viewer_id="owner",
+                 budget=None, inspect_allowed=True, allowed_tools=None):
+        self.scope_id = scope_id
+        self.viewer_id = viewer_id
+        self.budget = budget
+        self.inspect_allowed = inspect_allowed
+        self.allowed_tools = set(allowed_tools) if allowed_tools else None
+
+    def authorize(self, spec, tool_name: str, arguments: dict) -> ToolDecision:
+        if self.allowed_tools is not None and tool_name not in self.allowed_tools:
+            return ToolDecision(False, f"tool not allowed in this context: {tool_name}")
+        if spec.read_write != "read":
+            return ToolDecision(False, f"write tool not allowed in read-only runtime: {tool_name}")
+        if spec.readiness == "blocked":
+            return ToolDecision(False, f"tool blocked: {tool_name}")
+        if self.budget is not None and not self.budget.can_tool_call(
+                inspection=spec.cost_class == "expensive"):
+            return ToolDecision(False, "budget exhausted")
+        return ToolDecision(True)
+
+    def execute(self, spec, arguments: dict, *, context: dict | None = None) -> ToolDecision:
+        decision = self.authorize(spec, spec.name, arguments)
+        if not decision.allowed:
+            return decision
+        context = context or {}
+        if "asset_handle_in_current_preview" in getattr(spec, "preconditions", ()):
+            task_state = context.get("task_state") or {}
+            preview = task_state.get("result_preview") or []
+            handles = {
+                item.get("handle") if isinstance(item, dict) else str(item)
+                for item in preview
+            }
+            handle = str(arguments.get("asset_handle") or "")
+            if not handle or handle not in handles:
+                return ToolDecision(False, "asset_handle_not_in_current_preview")
+        try:
+            payload = spec.executor(arguments, context=context)
+        except Exception as exc:
+            return ToolDecision(False, "tool_execution_error", error=str(exc))
+        if self.budget is not None:
+            self.budget.record_tool_call(inspection=spec.cost_class == "expensive")
+        observation = self._sanitize(payload, spec.name)
+        return ToolDecision(True, "ok", observation=observation)
+
+    _DEFAULT_ALLOWED = {
+        "summary", "result_set_id", "handle", "total", "preview", "has_more",
+        "remaining", "counts", "coverage", "facts", "items", "completeness",
+        "unresolved", "delivered", "blocked", "observation", "certainty",
+        "confirms_visual_only", "source", "persisted", "question", "asset_handle",
+        "reason", "url", "status", "family_role", "photo_identities",
+        "_model_call_metrics",
+    }
+    _TOOL_ALLOWED = {
+        "query_photo_people": _DEFAULT_ALLOWED | {
+            "result_set_id", "asset_id", "people", "unconfirmed_people",
+            "unconfirmed_people_count", "source_asset_ids", "source_handles",
+            "evidence_asset_ids", "evidence_kind", "summary",
+        },
+        "search_memories": _DEFAULT_ALLOWED | {
+            "query", "mode", "gaps", "query_satisfaction", "answerability",
+            "condition_summary", "can_inspect", "inspect_hint",
+            "recommended_resolution", "recommended_handle",
+            "asset_ids", "evidence_count", "place",
+            "retrieved_total", "evidence_total", "selected_total",
+            "raw_candidate_count", "validation_candidate_count",
+            "validation_batches", "validation_error", "validation_rows",
+            "ranked_asset_ids", "selected_asset_ids",
+            "candidate_window", "relaxation_level",
+            "retrieval_timing", "_preview_asset_ids", "_retrieved_asset_ids",
+            "retrieval_channels",
+            "retrieved_asset_ids", "evidence_asset_ids", "source_asset_ids",
+            "reference_resolution", "evidence_status", "validation_status",
+            "group_photo_count", "group_photo_sizes", "group_photo_rows",
+        },
+        "get_original_photos": _DEFAULT_ALLOWED | {"scope_id", "media_type",
+                                                  "source_timestamp_sec", "source_video_asset_id"},
+        "get_result_page": _DEFAULT_ALLOWED | {"page", "page_size", "shown", "query",
+                                               "asset_ids", "evidence_asset_ids",
+                                               "retrieved_asset_ids", "source_asset_ids",
+                                               "requires_new_search"},
+        "inspect_photo": _DEFAULT_ALLOWED | {"_source_asset_id", "face_candidates",
+                                             "selected_face_id", "target_bbox",
+                                             "target_face_id", "target_face_status",
+                                             "target_person", "unconfirmed_people",
+                                             "unconfirmed_people_count"},
+        "read_photo_text": _DEFAULT_ALLOWED | {
+            "full_text", "text_regions", "confidence", "exact_values", "fallback_used",
+            "provider", "cache_hit", "tiles", "vlm_calls",
+        },
+        "search_conversation_history": _DEFAULT_ALLOWED | {
+            "query", "scope", "matches", "note",
+        },
+        "get_core_memory": _DEFAULT_ALLOWED | {
+            "subject", "topic", "cards", "note",
+        },
+        "get_person_profile": _DEFAULT_ALLOWED | {
+            "person", "readiness", "insufficient_evidence", "note",
+            "preference_summary", "relationships", "patterns",
+            "recent_events", "claims", "profile_text",
+        },
+    }
+
+    @classmethod
+    def _sanitize(cls, payload: dict, tool_name: str = "") -> dict:
+        """Tool observation 只保留模型可安全看到的部分（隐藏内部 ID 由各 Tool 负责）。"""
+        if not isinstance(payload, dict):
+            return {"raw": payload}
+        allowed = cls._TOOL_ALLOWED.get(tool_name, cls._DEFAULT_ALLOWED)
+        return {k: v for k, v in payload.items() if k in allowed}

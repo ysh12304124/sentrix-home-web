@@ -1,9 +1,9 @@
 {
-  "sentrix_url": "http://127.0.0.1:9598",
+  "sentrix_url": "http://127.0.0.1:11001",
   "judge_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
   "judge_model": "doubao-seed-2.0-lite",
   "vllm_manager_url": "",
   "model_base_url": "http://127.0.0.1:8100/v1",
-  "judge_provider_id": "volcengine-doubao-seed-2.0-lite",
-  "default_sentrix_url": "http://127.0.0.1:9598"
+  "endpoint_model": "/home/orin/VLM/qwen3.5/weights/gguf/qwen35-q4km.gguf",
+  "judge_provider_id": "volcengine-doubao-seed-2.0-lite"
 }

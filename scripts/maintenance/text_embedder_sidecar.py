@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from sentence_transformers import SentenceTransformer
 
-MODEL = os.getenv("SENTRIX_TEXT_EMBED_MODEL", "BAAI/bge-m3")
+MODEL = "/home/orin/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181"
 DEVICE = os.getenv("SENTRIX_TEXT_EMBEDDER_DEVICE", "cpu")
 DIMENSION = 1024
 

@@ -1,0 +1,23 @@
+{
+  "default_target_id": "orin-trt",
+  "targets": {
+    "orin-tf": {
+      "label": "Orin Transformers (Gemma4 HF)",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "本机 Transformers 进程内推理 (Gemma4 HF 权重, 无需外部服务)"
+    },
+    "orin-llama": {
+      "label": "Orin llama.cpp (GGUF IQ3_XXS)",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "本机 llama-server (Gemma4 GGUF IQ3_XXS, :8100)"
+    },
+    "orin-trt": {
+      "label": "Orin TRT Edge-LLM (INT4+MTP)",
+      "manager_url": "",
+      "model_base_url": "http://127.0.0.1:8100/v1",
+      "description": "本机 TensorRT Edge-LLM (Gemma4 INT4+MTP, experimental.server :8100)"
+    }
+  }
+}
