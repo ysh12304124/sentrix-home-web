@@ -1,6 +1,9 @@
 import unittest
+from unittest.mock import patch
 
-from backend.apple_telemetry import parse_agx_performance, parse_macmon_sample, parse_vm_stat
+from backend.apple_telemetry import (
+    _listening_ports, parse_agx_performance, parse_macmon_sample, parse_vm_stat,
+)
 
 
 VM_STAT = """\
@@ -17,6 +20,30 @@ AGX = '"PerformanceStatistics" = {"Alloc system memory"=1048576,"Device Utilizat
 
 
 class AppleTelemetryParseTests(unittest.TestCase):
+    def test_listening_ports_uses_lsof_name_fields(self):
+        output = """\
+p44429
+f13
+n*:8091
+p21110
+f8
+n127.0.0.1:8101
+p47236
+f9
+n*:8100
+p12051
+f10
+n*:8771
+p999
+f3
+n*:9999
+"""
+        with patch("backend.apple_telemetry._run_text", return_value=output) as run:
+            found = _listening_ports({"8091", "8101", "8100", "8771"})
+        self.assertEqual(found, {44429: {"8091"}, 21110: {"8101"},
+                                 47236: {"8100"}, 12051: {"8771"}})
+        self.assertIn("-Fpn", run.call_args.args[0])
+
     def test_vm_stat_used_memory_is_active_wired_and_compressor(self):
         data = parse_vm_stat(VM_STAT, page_size=16384, total_bytes=200 * 16384)
         self.assertEqual(data["system_memory_scope"], "apple_app_wired_compressed")

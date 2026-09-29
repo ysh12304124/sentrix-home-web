@@ -1,10 +1,10 @@
 """Apple Silicon unified-memory telemetry for PhotoBench.
 
-Mac mini M4 has no discrete VRAM. ``ps`` RSS does not include Metal/GPU
-pages, so per-process occupancy is ``phys_footprint`` from
-``proc_pid_rusage``. That value already charges GPU allocations to the
-process. The product total is the sum of related footprints. Adding an
-Orin-style VmRSS-minus-Rss UMA term would count those pages twice.
+Mac mini M4 has no discrete VRAM. ``ps`` RSS may omit Metal/GPU allocations,
+so per-process occupancy uses ``phys_footprint`` from ``proc_pid_rusage``.
+This is process physical occupancy, not a measurement of GPU-only memory.
+The product total is the sum of related footprints; no Orin-style
+VmRSS-minus-Rss adjustment is applied.
 
 Host used memory follows Activity Monitor's used set: active + wired +
 pages occupied by the compressor. Inactive and speculative file cache
@@ -205,7 +205,7 @@ def _libproc():
 
 
 def _phys_footprint_bytes(pid: int) -> int | None:
-    """Activity Monitor footprint, including GPU pages charged to this process.
+    """Activity Monitor process footprint, not GPU-only memory.
 
     Flavor 0 is rusage_info_v0, which already contains phys_footprint. A newer
     flavor writes a larger struct and would overflow this buffer. The struct
@@ -269,19 +269,19 @@ def _process_rows() -> list[dict]:
 
 
 def _listening_ports(ports: set[str]) -> dict[int, set[str]]:
-    command = ["lsof", "-nP", "-sTCP:LISTEN"]
+    command = ["lsof", "-nP", "-sTCP:LISTEN", "-Fpn"]
     for port in sorted(ports):
         command.extend(["-iTCP:" + port])
     text = _run_text(command, timeout=4)
     found: dict[int, set[str]] = {}
-    for line in text.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) < 9 or not parts[1].isdigit():
-            continue
-        match = re.search(r":(\d+)$", parts[-1])
-        if not match:
-            continue
-        found.setdefault(int(parts[1]), set()).add(match.group(1))
+    pid: int | None = None
+    for line in text.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif pid is not None and line.startswith("n"):
+            match = re.search(r":(\d+)$", line[1:])
+            if match and match.group(1) in ports:
+                found.setdefault(pid, set()).add(match.group(1))
     return found
 
 

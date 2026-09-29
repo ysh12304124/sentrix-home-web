@@ -218,6 +218,26 @@ class SuiteControlTests(unittest.TestCase):
         self.assertEqual(result["comparable_workload_memory_gib"], 8.5)
         self.assertEqual(result["kv_cache_capacity_tokens"], 32000)
 
+    def test_gpu_sampler_keeps_apple_footprint_out_of_vllm_formula(self):
+        sampler = MODULE.GpuSampler("http://manager.invalid")
+        sampler.samples = [
+            {"memory_unit": "apple_phys_footprint_mib", "model_process_memory_used_mib": 2400.0,
+             "model_process_system_memory_used_mib": 2400.0, "system_memory_used_mib": 12000.0,
+             "gpu_in_use_unified_memory_mib": 4000.0},
+            {"memory_unit": "apple_phys_footprint_mib", "model_process_memory_used_mib": 2800.0,
+             "model_process_system_memory_used_mib": 2800.0, "system_memory_used_mib": 13000.0,
+             "gpu_in_use_unified_memory_mib": 5000.0},
+        ]
+
+        result = sampler.aggregate()
+
+        self.assertEqual(result["source"], "apple_unified")
+        self.assertEqual(result["model_process_system_memory_used_mib"]["peak"], 2800.0)
+        self.assertEqual(result["gpu_in_use_unified_memory_mib"]["peak"], 5000.0)
+        self.assertEqual(result["memory_profile"]["method"], "apple_phys_footprint_v1")
+        self.assertIsNone(result["memory_profile"]["comparable_workload_memory_gib"])
+        self.assertNotIn("fixed_base_memory_gib", result["memory_profile"])
+
 
 if __name__ == "__main__":
     unittest.main()

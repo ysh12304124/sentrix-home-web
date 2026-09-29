@@ -1689,6 +1689,7 @@ class GpuSampler:
         metrics = {}
         for key in (
             "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
+            "gpu_allocated_unified_memory_mib", "gpu_in_use_unified_memory_mib",
             "model_process_memory_used_mib", "kv_cache_usage_pct", "kv_cache_used_tokens",
             "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
             "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
@@ -1730,6 +1731,18 @@ class GpuSampler:
                     "comparable_workload_memory_gib": None,
                     "note": "PSS is shared physical RAM, not dedicated GPU VRAM; KV bytes unavailable without verified per-token allocation.",
                 }, **metrics,
+            }
+        if latest.get("memory_unit") == "apple_phys_footprint_mib":
+            return {
+                "samples_count": len(self.samples),
+                "source": "apple_unified",
+                "memory_profile": {
+                    "method": "apple_phys_footprint_v1",
+                    "memory_unit": "apple_phys_footprint_mib",
+                    "comparable_workload_memory_gib": None,
+                    "note": "Process physical footprint is not dedicated GPU VRAM; per-process GPU-only memory and KV bytes are unavailable.",
+                },
+                **metrics,
             }
         kv_capacity_gib = latest.get("kv_cache_capacity_gib")
         process_memory = metrics.get("model_process_memory_used_mib") or {}
@@ -2041,6 +2054,7 @@ class BenchmarkRun:
             live["samples_count"] = int(live.get("samples_count") or 0) + 1
             fields = (
                 "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                "gpu_allocated_unified_memory_mib", "gpu_in_use_unified_memory_mib",
                 "model_process_memory_used_mib", "kv_cache_usage_pct",
                 "model_process_system_memory_used_mib",
                 "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
@@ -5306,6 +5320,7 @@ class OrchestratorRepository:
         try:
             fields = (
                 "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                "gpu_allocated_unified_memory_mib", "gpu_in_use_unified_memory_mib",
                 "model_process_memory_used_mib", "kv_cache_usage_pct",
                 "model_process_system_memory_used_mib",
                 "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
