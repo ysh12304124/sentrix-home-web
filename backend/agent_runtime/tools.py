@@ -1778,12 +1778,12 @@ def _place_matches(item, place_q: str, store) -> bool:
         return False
 
 
-# The latest 1,167-QA run put relevant assets at ranks 29–155, so the old
-# 30/18 cutoffs discarded them before the Agent could inspect them. Keep a
-# wider retrieval head and result set; the model-facing preview remains
-# independently bounded by _RESULT_PREVIEW_LIMIT.
-_SLOT_ROUTE_HEAD = 30
-_SLOT_MAX_CANDIDATES = 18
+# The latest 1,167-QA traces show relevant assets can rank well below the
+# first page.  Keep a wider server-side union so query-aware preview ranking
+# can recover them; model-visible evidence remains independently bounded by
+# _SLOT_PREVIEW_LIMIT, so this does not inflate the prompt/context window.
+_SLOT_ROUTE_HEAD = 60
+_SLOT_MAX_CANDIDATES = 48
 
 
 _SEMANTIC_OBJECT_SYNONYMS = (

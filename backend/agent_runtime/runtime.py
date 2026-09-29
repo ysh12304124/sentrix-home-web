@@ -183,7 +183,12 @@ def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None
     if not isinstance(arguments, dict) or not preview_handles:
         return arguments, None
     normalized = dict(arguments)
-    requested = str(arguments.get("asset_handle") or "")
+    # Some local models emit the schema-equivalent ``handle`` key even though
+    # the public tool contract is ``asset_handle``.  Previously that request
+    # was treated as omitted and silently rebound to preview[0], so an intended
+    # inspection of photo_2 could inspect photo_1 instead.  Keep the canonical
+    # field authoritative when both are present; otherwise accept the alias.
+    requested = str(arguments.get("asset_handle") or arguments.get("handle") or "")
     # Older local-model prompts used image_id/query for visual inspection.  An
     # image_id is often a private ResultSet id (rs_...), not a public handle;
     # never pass it through as an asset handle or silently inspect a stale id.
@@ -196,6 +201,7 @@ def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None
     if not requested:
         normalized["asset_handle"] = preview_handles[0]
         return normalized, None
+    normalized["asset_handle"] = requested
     if requested not in preview_handles:
         if legacy_image_id and requested == legacy_image_id:
             # Legacy image_id values are private result-set references rather
