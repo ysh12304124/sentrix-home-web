@@ -875,3 +875,7 @@ details.qa-results-body > summary { padding:6px 0; color:var(--accent); font-siz
 details.qa-results-body > summary::-webkit-details-marker { display:none; }
 details.qa-results-body > summary::before { content:"▸ "; }
 details.qa-results-body[open] > summary::before { content:"▾ "; }
+
+/* 召回指标：关键指标卡只放主值 R@5，明细单独折叠在下方 */
+.recall-metric-card { margin-top:8px; }
+.recall-metric-card .phase-metrics { grid-template-columns:repeat(3,minmax(0,1fr)); }

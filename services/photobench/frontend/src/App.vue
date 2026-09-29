@@ -1288,15 +1288,7 @@ function keyMetricRows(run) {
       value: ranking.r_at_5 == null ? "未计算" : `R@5 ${pct(ranking.r_at_5)}`,
       note: ranking.question_count == null
         ? "该 run 未落盘候选顺序，无法补算；不补零、不用别的口径顶替"
-        : `R@1 ${pct(ranking.r_at_1)}（${ranking.r_at_1_question_count ?? 0} 题）· R@10 ${pct(ranking.r_at_10)}（${ranking.r_at_10_question_count ?? 0} 题）· 每个 K 只统计正样本数 ≤ K 的题，避免大正样本集把分母压变形`,
-      details: ranking.question_count == null ? [] : [
-        ["Hit@K（同口径）", `${pct(ranking.hit_at_1)} / ${pct(ranking.hit_at_5)} / ${pct(ranking.hit_at_10)}`, "Hit@1 / Hit@5 / Hit@10 · 与各自的 R@K 同一批题，只问有没有命中；多正样本题下与 R@K 不是一回事，两个都要看"],
-        ["mAP", pct(ranking.average_precision), "全部计分题 · 正样本张数不设限，多正样本场景的主指标"],
-        ["MRR", pct(ranking.mrr), "全部计分题 · 第一个正确结果位次的倒数，无命中记 0"],
-        ["P@5", pct(ranking.p_at_5), `仅正样本 ≤ 5 的 ${ranking.p_at_5_question_count ?? 0} 题 · 前 5 张里 GT 的占比`],
-        ["候选覆盖不足", `${ranking.coverage_short_count ?? 0} 题`, `R@5 口径内（${ranking.r_at_5_question_count ?? 0} 题）工具返回的候选少于该题 GT 张数，其中 ${ranking.no_candidate_count ?? 0} 题一张都没返回。这些题仍计入 R@5，不剔除——工具返回空就是检索失败，不是指标的锅`],
-        ["计分题数", `${ranking.question_count} 题`, `多正样本 ${ranking.multi_positive_count ?? 0} 题 · 候选不足 10 张的 ${ranking.short_candidate_count ?? 0} 题 · 已排除不可回答题`],
-      ],
+        : `工具召回的前 5 张里覆盖了该题 GT 的比例 · 统计 ${ranking.r_at_5_question_count ?? 0} 题（正样本 ≤ 5 张）· 明细见下方「召回指标」`,
     },
     {
       label: "模型申明图片准确率",
@@ -1308,6 +1300,22 @@ function keyMetricRows(run) {
       value: fmtMemory(processMemory),
       note: processMemoryNote,
     },
+  ];
+}
+function recallMetricRows(run) {
+  const ranking = (effectiveRunSummary(run) || {}).image_ranking || {};
+  if (ranking.question_count == null) return [];
+  const pct = (value) => value == null ? "未计算" : fmtPct(value);
+  return [
+    ["R@1", pct(ranking.r_at_1), `${ranking.r_at_1_question_count ?? 0} 题（GT 恰 1 张）· 单正样本口径，此时 R@1 与 Hit@1 必然相等`],
+    ["R@5", pct(ranking.r_at_5), `${ranking.r_at_5_question_count ?? 0} 题（GT ≤ 5 张）· 关键指标卡里的主值`],
+    ["R@10", pct(ranking.r_at_10), `${ranking.r_at_10_question_count ?? 0} 题（GT ≤ 10 张）`],
+    ["Hit@1 / 5 / 10", `${pct(ranking.hit_at_1)} / ${pct(ranking.hit_at_5)} / ${pct(ranking.hit_at_10)}`, "与各自 R@K 同一批题，只问「有没有命中」；多正样本题下与 R@K 不是一回事，两个都要看"],
+    ["mAP", pct(ranking.average_precision), `全部 ${ranking.question_count} 题 · 正样本张数不设限，多正样本场景的主指标`],
+    ["MRR", pct(ranking.mrr), `全部 ${ranking.question_count} 题 · 第一个正确结果位次的倒数，无命中记 0`],
+    ["P@5", pct(ranking.p_at_5), `仅正样本 ≤ 5 的 ${ranking.p_at_5_question_count ?? 0} 题 · 前 5 张里 GT 的占比`],
+    ["候选覆盖不足", `${ranking.coverage_short_count ?? 0} 题`, `R@5 口径内工具返回的候选少于该题 GT 张数，其中 ${ranking.no_candidate_count ?? 0} 题一张都没返回。这些题仍计入 R@5，不剔除——工具返回空就是检索失败，不是指标的锅`],
+    ["计分题数", `${ranking.question_count} 题`, `多正样本 ${ranking.multi_positive_count ?? 0} 题 · 候选不足 10 张的 ${ranking.short_candidate_count ?? 0} 题 · 已排除不可回答题`],
   ];
 }
 function tokenDistributionRows() {
@@ -3125,13 +3133,17 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <div class="phase-title"><b>{{ row.label }}</b></div>
           <p class="key-metric-value">{{ row.value }}</p>
           <p class="metric-calc-time">{{ row.note }}</p>
-          <div v-if="row.details?.length" class="phase-metrics">
-            <div v-for="detail in row.details" :key="detail[0]" class="phase-metric">
-              <span>{{ detail[0] }}</span><strong>{{ detail[1] }}</strong><small>{{ detail[2] }}</small>
-            </div>
-          </div>
         </article>
       </div>
+      <details v-if="recallMetricRows(activeRun).length" class="phase-card result-phase-card recall-metric-card">
+        <summary class="phase-title"><b>召回指标</b></summary>
+        <p class="metric-calc-time">候选 = 工具召回图片（search 等找图工具返回的检索候选集），按工具的返回顺序排序。R@K 只统计正样本数 ≤ K 的题——正样本多于 K 的题无论排得多好都到不了满分，混进来等于把两种任务平均成一个数。</p>
+        <div class="phase-metrics">
+          <div v-for="row in recallMetricRows(activeRun)" :key="row[0]" class="phase-metric">
+            <span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small>
+          </div>
+        </div>
+      </details>
       <details class="memory-layer-panel">
         <summary class="memory-layer-head">
           <div><h3>记忆层级与有效证据链</h3><p>分别查看“原始创建链路”和“测评时生效链路”。图中节点都绑定实际字段；点击节点可查看图片、语句、工具记录和已保存的执行轨迹。</p></div>
