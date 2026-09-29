@@ -1251,6 +1251,65 @@ function aggregateMetricRows(phase = {}) {
     ["LLM 生成速度", summary.llm_tokens_per_second_mean == null ? "-" : `${Number(summary.llm_tokens_per_second_mean).toFixed(1)} token/s`, "主 Agent 平均生成速度"],
   ];
 }
+function keyMetricRows(run) {
+  // 首屏只放五个能直接判读的结论值；其余明细留在各自折叠卡片里，避免
+  // 关键数字被二十多行同级指标稀释。
+  const summary = effectiveRunSummary(run) || {};
+  const dist = summary.judge_distribution || {};
+  const gpu = gpuMetricsView(run) || {};
+  const ranking = summary.image_ranking || {};
+  const pct = (value) => value == null ? "未计算" : fmtPct(value);
+  const isUnified = gpu.source === "apple_unified";
+  const isOrin = ["orin_ssh_pss", "jetson_local_pss"].includes(gpu.source);
+  const processMemory = isUnified || isOrin
+    ? (gpu.model_process_system_memory_used_mib || {}).peak
+    : (gpu.model_process_memory_used_mib || {}).peak;
+  const processMemoryNote = isUnified
+    ? "主模型 phys_footprint 峰值 · 统一内存的进程物理占用，不是 GPU 专属显存"
+    : isOrin
+      ? "主模型 VmRSS 峰值 · Orin 无独立显存，这是进程驻留"
+      : "主模型显存峰值 · NVML 按模型 PID 汇总";
+  const throughputNote = summary.agent_throughput_latency_mode === "measured_agent_phase"
+    ? `Agent 阶段实际墙钟 ÷ ${summary.agent_phase_completed_count ?? summary.total ?? 0} 题 · 并发 ${run?.qa_concurrency ?? "-"} · 不含 Judge（Judge 与 Agent 并行）`
+    : "历史记录按时间线回退估算，不是实测值";
+  return [
+    {
+      label: "回答质量均分",
+      value: summary.answer_quality_mean == null ? "未计算" : `${summary.answer_quality_mean} / 2`,
+      note: `Judge 有效 ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} 题 · 0 分 ${dist["0"] || 0} · 1 分 ${dist["1"] || 0} · 2 分 ${dist["2"] || 0}`,
+    },
+    {
+      label: "Agent 并发吞吐折算时延",
+      value: fmtMs(summary.agent_throughput_latency_ms),
+      note: throughputNote,
+    },
+    {
+      label: "工具图片召回率",
+      value: ranking.r_at_5 == null ? "未计算" : `R@5 ${pct(ranking.r_at_5)}`,
+      note: ranking.question_count == null
+        ? "该 run 未落盘候选顺序，无法补算；不补零、不用别的口径顶替"
+        : `R@1 ${pct(ranking.r_at_1)}（${ranking.r_at_1_question_count ?? 0} 题）· R@10 ${pct(ranking.r_at_10)}（${ranking.r_at_10_question_count ?? 0} 题）· 每个 K 只统计正样本数 ≤ K 的题，避免大正样本集把分母压变形`,
+      details: ranking.question_count == null ? [] : [
+        ["Hit@K（同口径）", `${pct(ranking.hit_at_1)} / ${pct(ranking.hit_at_5)} / ${pct(ranking.hit_at_10)}`, "Hit@1 / Hit@5 / Hit@10 · 与各自的 R@K 同一批题，只问有没有命中；多正样本题下与 R@K 不是一回事，两个都要看"],
+        ["mAP", pct(ranking.average_precision), "全部计分题 · 正样本张数不设限，多正样本场景的主指标"],
+        ["MRR", pct(ranking.mrr), "全部计分题 · 第一个正确结果位次的倒数，无命中记 0"],
+        ["P@5", pct(ranking.p_at_5), `仅正样本 ≤ 5 的 ${ranking.p_at_5_question_count ?? 0} 题 · 前 5 张里 GT 的占比`],
+        ["候选覆盖不足", `${ranking.coverage_short_count ?? 0} 题`, `工具返回的候选张数少于该题 GT 张数，其中 ${ranking.no_candidate_count ?? 0} 题工具一张都没返回。这类题仍计入 R@K，不剔除——检索确实失败了`],
+        ["计分题数", `${ranking.question_count} 题`, `多正样本 ${ranking.multi_positive_count ?? 0} 题 · 候选不足 10 张的 ${ranking.short_candidate_count ?? 0} 题 · 已排除不可回答题`],
+      ],
+    },
+    {
+      label: "模型申明图片准确率",
+      value: pct(summary.image_retrieval_precision_macro),
+      note: `模型显式交付的图片里属于 GT 的比例 · ${summary.image_retrieval_metric_count ?? 0} 题含图片 GT · 这是交付口径，与检索口径的 R@K 不可换算`,
+    },
+    {
+      label: "模型进程显存",
+      value: fmtMemory(processMemory),
+      note: processMemoryNote,
+    },
+  ];
+}
 function tokenDistributionRows() {
   const summary = effectiveRunSummary(activeRun.value);
   return [
@@ -2754,6 +2813,15 @@ function qaConversationTurns(item) {
 function qaReferenceLabel(turn) {
   return turn?.expected_action === "clarify" ? "参考澄清示例" : "参考回答";
 }
+function onResultCardToggle(event) {
+  // echarts 按容器尺寸初始化，而折叠状态下容器是 0×0。展开后必须重画并 resize，
+  // 否则曲线只画在左上角一小条里。
+  if (!event.target.open) return;
+  nextTick(() => {
+    renderTelemetryChart();
+    telemetryChartInstance?.resize();
+  });
+}
 onMounted(init);
 watch(activeRun, async () => { await nextTick(); renderTelemetryChart(); }, { deep: true });
 onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if (arbiterTimer) clearInterval(arbiterTimer); if (telemetryChartInstance) telemetryChartInstance.dispose(); });
@@ -3051,11 +3119,24 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </article>
 </div>
-      <section class="memory-layer-panel">
-        <div class="memory-layer-head">
+      <h3 class="result-heading">关键指标</h3>
+      <div class="phase-list key-metric-list">
+        <article v-for="row in keyMetricRows(activeRun)" :key="row.label" class="phase-card key-metric-card">
+          <div class="phase-title"><b>{{ row.label }}</b></div>
+          <p class="key-metric-value">{{ row.value }}</p>
+          <p class="metric-calc-time">{{ row.note }}</p>
+          <div v-if="row.details?.length" class="phase-metrics">
+            <div v-for="detail in row.details" :key="detail[0]" class="phase-metric">
+              <span>{{ detail[0] }}</span><strong>{{ detail[1] }}</strong><small>{{ detail[2] }}</small>
+            </div>
+          </div>
+        </article>
+      </div>
+      <details class="memory-layer-panel">
+        <summary class="memory-layer-head">
           <div><h3>记忆层级与有效证据链</h3><p>分别查看“原始创建链路”和“测评时生效链路”。图中节点都绑定实际字段；点击节点可查看图片、语句、工具记录和已保存的执行轨迹。</p></div>
           <span class="layer-scope-badge">通用层级 · 时间 / 事件 / 地点 / 人物 / 场景</span>
-        </div>
+        </summary>
         <div class="memory-chain-tabs" role="tablist" aria-label="证据链类型">
           <button type="button" role="tab" :aria-selected="chainMode === 'creation'" :class="{ active: chainMode === 'creation' }" @click="chainMode = 'creation'">原始创建链路</button>
           <button type="button" role="tab" :aria-selected="chainMode === 'effective'" :class="{ active: chainMode === 'effective' }" @click="chainMode = 'effective'">测评时生效链路</button>
@@ -3188,11 +3269,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           <p v-else-if="!keyframeAnalysisLoading" class="keyframe-analysis-note">尚未取得完整 run 轨迹，暂不能计算关键帧有效性。</p>
         </section>
         <p class="memory-layer-footnote">指标口径：运行级指标来自本次 run 的汇总轨迹；“已展开轨迹”只对当前打开的 QA 逐题核验。这样可以直接定位是 L0 媒体、L1 解析、L2 事件聚合、L3 目标分解还是 L4+ 回答阶段出了问题。</p>
-      </section>
+      </details>
       <h3 class="result-heading">结果指标</h3>
 <div class="result-phase-list">
-        <article v-if="telemetrySampleCount(activeRun)" class="phase-card result-phase-card gpu-result-card live-telemetry-card">
-<div class="phase-title"><b>实时资源遥测</b><span class="phase-status" :class="telemetryLiveState(activeRun).status === 'running' ? 'running' : 'completed'">{{ telemetryLiveState(activeRun).status === 'running' ? '实时更新中' : '已停止' }}</span></div>
+        <details v-if="telemetrySampleCount(activeRun)" class="phase-card result-phase-card gpu-result-card live-telemetry-card" @toggle="onResultCardToggle">
+<summary class="phase-title"><b>实时资源遥测</b><span class="phase-status" :class="telemetryLiveState(activeRun).status === 'running' ? 'running' : 'completed'">{{ telemetryLiveState(activeRun).status === 'running' ? '实时更新中' : '已停止' }}</span></summary>
 <p class="metric-calc-time">测评进行中持续采样；任务失败或取消时保留已采集的最后值与峰值。{{ telemetryLiveState(activeRun).source === 'apple_unified' ? ' Mac 统一内存。四条曲线是整机内存、整套产品 phys_footprint、Sentrix 周边、主模型 phys_footprint。' : ['jetson_local_pss', 'orin_ssh_pss'].includes(telemetryLiveState(activeRun).source) ? ' Orin 无独立显存。主指标看黄线 VmRSS（进程驻留）。' : ' 153 使用 NVIDIA GPU 显存；整机 RAM 为宿主机全部进程。' }}</p>
 <div class="phase-metrics live-telemetry-metrics"><div v-for="row in liveTelemetryRows(activeRun)" :key="row[0]" class="phase-metric"><span>{{ row[0] }}</span><strong>{{ row[1] }}</strong><small>{{ row[2] }}</small></div></div>
 <div v-if="telemetryChart(activeRun)" class="telemetry-chart"><div ref="telemetryChartEl" class="telemetry-chart-canvas" role="img" aria-label="资源占用趋势"></div><small class="muted">完整测评过程，共 {{ telemetrySampleCount(activeRun) }} 个采样点；曲线按全时段抽稀绘制，峰值来自全部采样。悬浮查看时间、阶段和各项 GiB，图例可隐藏曲线，底部可缩放。曲线只绘制实际采集到的数据，不用 0 填充缺失指标。</small></div>
@@ -3232,12 +3313,12 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
     </div>
   </div>
 </details>
-</article>
-        <article class="phase-card result-phase-card gpu-result-card">
-<div class="phase-title">
+</details>
+        <details class="phase-card result-phase-card gpu-result-card">
+<summary class="phase-title">
 <b>GPU 指标</b>
 <span class="phase-status" :class="resultPhaseStatus(gpuMetricsView(activeRun))">{{ gpuMetricsStatusLabel(activeRun) }}</span>
-</div>
+</summary>
 <p class="metric-calc-time">{{ gpuMetricsView(activeRun).partial ? '已按当前已采样数据滚动汇总；全部阶段结束后更新为全程均值/峰值。' : ('指标计算耗时 ' + fmtSeconds(phaseSeconds(activeRun.phases?.gpu_metrics))) }} · {{ gpuMetricsView(activeRun).source === 'apple_unified' ? 'Mac：主指标是主模型 phys_footprint' : ['orin_ssh_pss', 'jetson_local_pss'].includes(gpuMetricsView(activeRun).source) ? 'Orin：主指标是 llama-server 的 VmRSS' : gpuMetricsView(activeRun).memory_pressure ? "macOS 统一内存系统级采样（含模型 Metal 分配）" : "模型进程显存为 NVML 按 PID 汇总的实际占用，KV Cache 为 vLLM 逻辑使用率" }}{{ activeRun.qa_concurrency > 1 ? ` · QA 并发 ${activeRun.qa_concurrency}（时延含排队，勿与串行 run 直接对比）` : "" }}</p>
 <div class="phase-metrics">
 <div v-for="row in gpuMetricRows(gpuMetricsView(activeRun))" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
@@ -3246,12 +3327,12 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <small>{{ row[2] }}</small>
 </div>
 </div>
-</article>
-        <article v-if="!isOrinPssRun(activeRun)" class="phase-card result-phase-card gpu-result-card">
-<div class="phase-title">
+</details>
+        <details v-if="!isOrinPssRun(activeRun)" class="phase-card result-phase-card gpu-result-card">
+<summary class="phase-title">
 <b>{{ comparableMemoryProfile(activeRun)?.source === 'replay' ? '可比较显存复测' : '可比较显存' }}</b>
 <span class="phase-status" :class="comparableMemoryProfile(activeRun)?.status || 'pending'">{{ statusLabel(comparableMemoryProfile(activeRun)?.status || 'pending') }}</span>
-</div>
+</summary>
 <p class="metric-calc-time">{{ comparableMemoryProfile(activeRun)?.memory_profile?.method === 'orin_process_pss_uma_v1' ? 'Orin 统一内存按进程 PSS 记录；KV 字节数尚不可用，不与独立显存直接比较。' : (comparableMemoryProfile(activeRun)?.source === 'gpu_metrics' ? '来自本次正式评测 GPU 采样；' : comparableMemoryProfile(activeRun)?.source === 'replay' ? '复用现有相册与问题，不运行 Benchmark/Judge，不保存本次回答；' : '本次 run 的 GPU 采样结束后生成；') + '工作负载显存为扣除预留 KV 后的估算值，不是硬件实测。' }}</p>
 <p v-if="comparableMemoryProfile(activeRun).error" class="error">{{ comparableMemoryProfile(activeRun).error }}</p>
 <div class="phase-metrics">
@@ -3261,12 +3342,12 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <small>{{ row[2] }}</small>
 </div>
 </div>
-</article>
-        <article class="phase-card result-phase-card aggregate-result-card">
-<div class="phase-title">
+</details>
+        <details class="phase-card result-phase-card aggregate-result-card">
+<summary class="phase-title">
 <b>指标汇总</b>
 <span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.aggregate)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.aggregate)) }}</span>
-</div>
+</summary>
 <p class="metric-calc-time">指标计算耗时 {{ fmtSeconds(phaseSeconds(activeRun.phases?.aggregate)) }}</p>
 <div class="phase-metrics">
 <div v-for="row in aggregateMetricRows(activeRun.phases?.aggregate)" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
@@ -3289,12 +3370,12 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 </div>
-</article>
-        <article v-if="deliveryBreakdown()" class="phase-card result-phase-card">
-          <div class="phase-title">
+</details>
+        <details v-if="deliveryBreakdown()" class="phase-card result-phase-card">
+          <summary class="phase-title">
             <b>确定性交付与 OCR partial</b>
             <span class="muted small">结构层诊断</span>
-          </div>
+          </summary>
           <div class="tool-performance-grid">
             <div class="tool-performance-row" v-if="deliveryBreakdown().detCount">
               <strong>确定性渲染</strong>
@@ -3307,12 +3388,12 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               <span v-if="deliveryBreakdown().ocrReasons.length">原因 {{ deliveryBreakdown().ocrReasons.map(([k, v]) => `${k}×${v}`).join("、") }}</span>
             </div>
           </div>
-        </article>
-        <article class="phase-card result-phase-card tool-result-card">
-          <div class="phase-title">
+        </details>
+        <details class="phase-card result-phase-card tool-result-card">
+          <summary class="phase-title">
             <b>主 Agent 工具性能</b>
             <span class="muted small">{{ toolPerformanceRows().length }} 类工具</span>
-          </div>
+          </summary>
           <p class="metric-calc-time">按工具调用次数、成功率和耗时汇总；不展示具体后端实现与内部推理细节</p>
           <div v-if="toolPerformanceRows().length" class="tool-performance-grid">
             <div v-for="tool in toolPerformanceRows()" :key="tool.name" class="tool-performance-row">
@@ -3322,7 +3403,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             </div>
           </div>
           <p v-else class="qa-performance-empty">该运行没有记录工具调用。</p>
-        </article>
+        </details>
         <article class="phase-card result-phase-card traceability-card">
           <details>
             <summary><strong>运行可追溯信息</strong><span>数据集完整性与模型运行时起止快照</span></summary>
@@ -3346,6 +3427,8 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <select v-model.number="qaPageSize" @change="changeQaPageSize"><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option></select>
           </label>
         </div>
+        <details class="qa-results-body">
+        <summary>展开逐题结果（{{ qaPage.total }} 条）</summary>
         <form class="qa-filters" @submit.prevent="applyQaFilters">
           <input v-model="qaFilters.search" type="search" placeholder="搜索题号或问题" />
           <select v-model="qaFilters.score"><option value="">全部 Judge 分数</option><option value="2">2 分</option><option value="1">1 分</option><option value="0">0 分</option></select>
@@ -3570,6 +3653,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
           </div>
         </article>
         <div class="pager pager-bottom" v-if="qaPage.pages > 1"><button class="btn ghost compact" :disabled="!qaPage.has_previous" @click="changeQaPage(qaPage.page - 1)">上一页</button><span>第 {{ qaPage.page }} / {{ qaPage.pages }} 页</span><button class="btn ghost compact" :disabled="!qaPage.has_next" @click="changeQaPage(qaPage.page + 1)">下一页</button></div>
+        </details>
       </section>
     </section>
 </section>

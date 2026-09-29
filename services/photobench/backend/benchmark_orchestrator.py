@@ -1258,6 +1258,103 @@ def _macro_metrics_from_counts(items: list[dict], field: str) -> dict:
             for metric, samples in values.items()} | {"metric_count": len(rows)}
 
 
+RANKING_KS = (1, 5, 10)
+
+
+def _ranking_metrics(ranked_keys: list, gt_keys: set) -> dict:
+    """Ranking metrics over the ordered tool candidate list of one question.
+
+    The order is the tool's recall order, so these read the ranking the
+    set-based precision/recall/F1 above deliberately discards.  With several
+    positives per question R@K and Hit@K answer different things -- R@K is the
+    share of positives inside the first K, Hit@K only asks whether any positive
+    made it -- so both are reported rather than one standing in for the other.
+    """
+    if not gt_keys:
+        return {}
+    ranked = list(ranked_keys)
+    data = {"ranked_count": len(ranked), "gt_count": len(gt_keys)}
+    for k in RANKING_KS:
+        found = len(gt_keys & set(ranked[:k]))
+        data[f"r_at_{k}"] = round(found / len(gt_keys), 4)
+        data[f"hit_at_{k}"] = 1.0 if found else 0.0
+    first = next((index for index, key in enumerate(ranked, 1) if key in gt_keys), None)
+    data["mrr"] = round(1.0 / first, 4) if first else 0.0
+    hits = 0
+    total = 0.0
+    for index, key in enumerate(ranked, 1):
+        if key in gt_keys:
+            hits += 1
+            total += hits / index
+    data["average_precision"] = round(total / len(gt_keys), 4)
+    data["p_at_5"] = round(len(gt_keys & set(ranked[:5])) / min(5, len(ranked)), 4) if ranked else 0.0
+    return data
+
+
+def _mean_ranking_metrics(items: list[dict], field: str = "image_ranking") -> dict:
+    """Average the per-question ranking metrics into one run-level summary.
+
+    R@K is averaged only over questions whose positive count fits inside K.  A
+    question with 25 ground-truth images tops out at 5/25 however well it is
+    ranked, so including it would average a known-item search together with an
+    exhaustive set search and report neither.  Those questions still feed mAP,
+    which is defined for any number of positives.
+    """
+    rows = [item[field] for item in items
+            if isinstance(item.get(field), dict) and int(item[field].get("gt_count") or 0) > 0]
+    if not rows:
+        return {}
+    data: dict = {}
+    for k in RANKING_KS:
+        subset = [row for row in rows if int(row.get("gt_count") or 0) <= k]
+        data[f"r_at_{k}_question_count"] = len(subset)
+        if subset:
+            data[f"r_at_{k}"] = round(sum(row[f"r_at_{k}"] for row in subset) / len(subset), 4)
+            data[f"hit_at_{k}"] = round(sum(row[f"hit_at_{k}"] for row in subset) / len(subset), 4)
+        else:
+            data[f"r_at_{k}"] = None
+            data[f"hit_at_{k}"] = None
+    # With |GT| <= K the only thing left that can stop a question from reaching
+    # R@K = 1 is the tool returning fewer candidates than there are positives, so
+    # count those instead of reporting an averaged ceiling: 95% of questions sit
+    # at exactly 100% and the average only restates the shortage rate.
+    data["coverage_short_count"] = sum(
+        1 for row in rows if int(row.get("ranked_count") or 0) < int(row.get("gt_count") or 0))
+    data["no_candidate_count"] = sum(1 for row in rows if int(row.get("ranked_count") or 0) == 0)
+    # mAP and MRR are defined for any positive count, so they use every question.
+    data["mrr"] = round(sum(row["mrr"] for row in rows) / len(rows), 4)
+    data["average_precision"] = round(sum(row["average_precision"] for row in rows) / len(rows), 4)
+    p5 = [row for row in rows if int(row.get("gt_count") or 0) <= 5]
+    data["p_at_5"] = round(sum(row["p_at_5"] for row in p5) / len(p5), 4) if p5 else None
+    data["p_at_5_question_count"] = len(p5)
+    data["question_count"] = len(rows)
+    data["multi_positive_count"] = sum(1 for row in rows if int(row.get("gt_count") or 0) > 1)
+    data["short_candidate_count"] = sum(1 for row in rows if int(row.get("ranked_count") or 0) < 10)
+    return data
+
+
+def _ranking_from_item(item: dict) -> dict:
+    """Ranking metrics for one persisted question, rebuilt when not recorded.
+
+    Runs summarised before this metric existed stored the candidate order and
+    the GT sets but no per-question ranking result, so it is recomputed from
+    those fields rather than leaving the whole history blank.
+    """
+    recorded = item.get("image_ranking")
+    if isinstance(recorded, dict):
+        return recorded
+    gt_media = [entry for entry in (item.get("gt_images") or [])
+                if entry.get("media_type") == "image"]
+    if not gt_media:
+        return {}
+    candidates = item.get("retrieved_candidate_media") or item.get("retrieved_candidate_images") or []
+    return _ranking_metrics(
+        [_media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+         for value in candidates if value.get("media_type") == "image"],
+        {_media_key(entry.get("media_type"), entry.get("media_id")) for entry in gt_media},
+    )
+
+
 def _retrieval_metric_eligible(item: dict) -> bool:
     return str(item.get("answerability") or "").strip().lower() != "unanswerable"
 
@@ -3382,6 +3479,14 @@ class BenchmarkRun:
             retrieved_names = {value["file_name"] for value in retrieved_media}
             evidence_names = {value["file_name"] for value in evidence_media}
             gt_images = [value for value in gt_media if value["media_type"] == "image"]
+            # Ranking reads the tool candidate list in recall order.  Keys come
+            # from the same resolution the set metrics use, so a keyframe that
+            # resolves to its parent video is scored as that video here too.
+            ranking = _ranking_metrics(
+                [_media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                 for value in retrieved_media if value.get("media_type") == "image"],
+                {_media_key(entry["media_type"], entry["media_id"]) for entry in gt_images},
+            )
 
             # Agent phase ends before any Judge request starts.  Judge is queued
             # by _phase_qa_eval in a separate executor after this item returns.
@@ -3415,6 +3520,7 @@ class BenchmarkRun:
                 "selected_asset_ids": media_sets["selected_asset_ids"],
                 "media_retrieval_counts": metrics["media"],
                 "image_retrieval_counts": metrics["image"],
+                "image_ranking": ranking,
                 "video_retrieval_counts": metrics["video"],
                 "media_retrieval_recall": metrics["media"]["recall"],
                 "media_retrieval_precision": metrics["media"]["precision"],
@@ -4545,6 +4651,7 @@ class BenchmarkRun:
             media_macro = _macro_metrics_from_counts(typed_retrieval_items, "media_retrieval_counts")
             image_macro = _macro_metrics_from_counts(typed_retrieval_items, "image_retrieval_counts")
             video_macro = _macro_metrics_from_counts(typed_retrieval_items, "video_retrieval_counts")
+            image_ranking = _mean_ranking_metrics(typed_retrieval_items)
             precision, recall, f1 = (
                 media_metrics["precision"], media_metrics["recall"], media_metrics["f1"])
             retrieval_metric_count = media_metrics["metric_count"]
@@ -4562,6 +4669,9 @@ class BenchmarkRun:
             image_metrics = {"precision": precision, "recall": recall, "f1": f1,
                              "metric_count": retrieval_metric_count}
             video_metrics = None
+            # These runs never recorded a candidate order, so R@K/MRR/mAP would
+            # have to invent one.  Report nothing and let the panel say so.
+            image_ranking = _mean_ranking_metrics(metric_items)
             legacy_values = {
                 metric: [item.get(f"retrieval_{metric}") for item in retrieval_items
                          if isinstance(item.get(f"retrieval_{metric}"), (int, float))]
@@ -4681,6 +4791,7 @@ class BenchmarkRun:
             "image_retrieval_recall_macro": round(image_macro["recall"], 3) if image_macro["recall"] is not None else None,
             "image_retrieval_f1_macro": round(image_macro["f1"], 3) if image_macro["f1"] is not None else None,
             "image_retrieval_metric_count": image_metrics["metric_count"] if image_metrics else None,
+            "image_ranking": image_ranking or None,
             "video_retrieval_precision_micro": round(video_metrics["precision"], 3) if video_metrics and video_metrics["precision"] is not None else None,
             "video_retrieval_recall_micro": round(video_metrics["recall"], 3) if video_metrics and video_metrics["recall"] is not None else None,
             "video_retrieval_f1_micro": round(video_metrics["f1"], 3) if video_metrics and video_metrics["f1"] is not None else None,
@@ -6549,6 +6660,15 @@ class OrchestratorRepository:
     def _effective_summary(cls, state: dict) -> dict:
         saved = dict(state.get("summary") or {})
         items = state.get("items") or []
+        if not saved.get("image_ranking"):
+            # R@K/MRR/mAP are a pure function of the recorded candidate order and
+            # the per-question GT sets, so runs summarised by an older build are
+            # derived here rather than rewritten on disk.  Runs that never stored
+            # an order stay empty and the panel says so instead of showing a zero.
+            saved["image_ranking"] = _mean_ranking_metrics(
+                [{"image_ranking": _ranking_from_item(item)}
+                 for item in items
+                 if isinstance(item, dict) and _retrieval_metric_eligible(item)]) or None
         for item in items:
             if isinstance(item, dict) and item.get("execution_trace"):
                 item["agent_stability"] = BenchmarkRun._agent_stability(item)
