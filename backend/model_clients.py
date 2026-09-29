@@ -998,11 +998,15 @@ class GammaClient:
             if isinstance(text, list):
                 text = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in text)
             usage = data.get("usage") or {}
+            elapsed_s = time.perf_counter() - request_started
+            completion_tokens = usage.get("completion_tokens")
             self._record_call_metrics(role, model, endpoint_base, {
-                "ttft_ms": None, "total_ms": None,
+                "ttft_ms": None, "total_ms": round(elapsed_s * 1000, 1),
                 "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "tokens_per_second": None, "streamed": False,
+                "completion_tokens": completion_tokens,
+                "tokens_per_second": (round(completion_tokens / elapsed_s, 1)
+                                      if completion_tokens is not None and elapsed_s > 0 else None),
+                "streamed": False,
             })
             self._record_validation_call(role, endpoint_base, model, json_mode, text)
             return text

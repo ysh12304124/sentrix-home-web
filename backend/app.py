@@ -2810,6 +2810,8 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                     "label": "工具内部模型调用",
                     "purpose": (
                         "读取照片中的文字" if step.get("tool") == "read_photo_text"
+                        else "解析检索问题中的时间、地点、人物和事件条件"
+                        if step.get("tool") == "search_memories"
                         else "识别照片中的视觉细节"
                     ),
                     "trigger": f"工具 {step.get('tool')} 执行内部推理",
