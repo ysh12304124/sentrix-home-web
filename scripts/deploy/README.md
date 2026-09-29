@@ -56,6 +56,26 @@
 
 可覆盖变量：`SENTRIX_PORT` / `ORCH_PORT` / `TEXT_EMBED_PORT` / `SENTRIX_ENSURE_SCOPES` / `CHINESE_CLIP_CHECKPOINT`。
 
+## 重启 orchestrator（8771）
+
+```bash
+bash scripts/deploy/restart_photobench.sh          # 有进行中的 run 会拒绝
+bash scripts/deploy/restart_photobench.sh --force  # 强制
+```
+
+两个反直觉的点，脚本已经处理，手工重启时容易踩：
+
+1. **就绪要按进程判断，不能按端口。** 8771 启动时会扫 `results/` 下 200 多个 run，
+   实测约 55 秒才绑定端口。这期间 `ss | grep 8771` 和 curl 都会失败，很容易误判成
+   "没起来"然后反复重启，反而把端口拖进 TIME_WAIT。
+2. **必须等旧进程真正释放端口再起新的。** 旧进程收到 SIGTERM 后要几秒才关监听；
+   不等就起新进程会 `Address already in use` 直接退出——而旧进程也没了，服务彻底空窗。
+
+脚本默认**沿用当前正在跑的那个解释器**（从 `/proc/<pid>/cmdline` 读），不写死路径：
+换解释器可能改变依赖解析（8771 需要 httpx），重启不该顺带改运行时。
+
+可覆盖：`SENTRIX_HOME` / `ORCH_PORT` / `ORCH_PYTHON` / `ORCH_LOG` / `ORCH_PID_FILE` / `START_TIMEOUT`。
+
 ## 与 153 当前一致性的校验点
 - 8091 监听、`/api/assets?scope_id=…` 返回资产（含 keyframe `parent_asset_id`/`derived_kind`）；
 - 8101 `/embed` 返回 1024 维 bge-m3；
