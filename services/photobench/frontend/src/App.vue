@@ -1294,7 +1294,7 @@ function keyMetricRows(run) {
         ["mAP", pct(ranking.average_precision), "全部计分题 · 正样本张数不设限，多正样本场景的主指标"],
         ["MRR", pct(ranking.mrr), "全部计分题 · 第一个正确结果位次的倒数，无命中记 0"],
         ["P@5", pct(ranking.p_at_5), `仅正样本 ≤ 5 的 ${ranking.p_at_5_question_count ?? 0} 题 · 前 5 张里 GT 的占比`],
-        ["候选覆盖不足", `${ranking.coverage_short_count ?? 0} 题`, `工具返回的候选张数少于该题 GT 张数，其中 ${ranking.no_candidate_count ?? 0} 题工具一张都没返回。这类题仍计入 R@K，不剔除——检索确实失败了`],
+        ["候选覆盖不足", `${ranking.coverage_short_count ?? 0} 题`, `R@5 口径内（${ranking.r_at_5_question_count ?? 0} 题）工具返回的候选少于该题 GT 张数，其中 ${ranking.no_candidate_count ?? 0} 题一张都没返回。这些题仍计入 R@5，不剔除——工具返回空就是检索失败，不是指标的锅`],
         ["计分题数", `${ranking.question_count} 题`, `多正样本 ${ranking.multi_positive_count ?? 0} 题 · 候选不足 10 张的 ${ranking.short_candidate_count ?? 0} 题 · 已排除不可回答题`],
       ],
     },

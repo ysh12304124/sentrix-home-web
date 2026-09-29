@@ -1317,10 +1317,12 @@ def _mean_ranking_metrics(items: list[dict], field: str = "image_ranking") -> di
     # With |GT| <= K the only thing left that can stop a question from reaching
     # R@K = 1 is the tool returning fewer candidates than there are positives, so
     # count those instead of reporting an averaged ceiling: 95% of questions sit
-    # at exactly 100% and the average only restates the shortage rate.
+    # at exactly 100% and the average only restates the shortage rate.  Counted
+    # over the R@5 population because that is the number these annotate.
+    r5_rows = [row for row in rows if int(row.get("gt_count") or 0) <= 5]
     data["coverage_short_count"] = sum(
-        1 for row in rows if int(row.get("ranked_count") or 0) < int(row.get("gt_count") or 0))
-    data["no_candidate_count"] = sum(1 for row in rows if int(row.get("ranked_count") or 0) == 0)
+        1 for row in r5_rows if int(row.get("ranked_count") or 0) < int(row.get("gt_count") or 0))
+    data["no_candidate_count"] = sum(1 for row in r5_rows if int(row.get("ranked_count") or 0) == 0)
     # mAP and MRR are defined for any positive count, so they use every question.
     data["mrr"] = round(sum(row["mrr"] for row in rows) / len(rows), 4)
     data["average_precision"] = round(sum(row["average_precision"] for row in rows) / len(rows), 4)

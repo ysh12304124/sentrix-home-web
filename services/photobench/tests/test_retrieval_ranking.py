@@ -135,6 +135,19 @@ class MeanRankingMetricTests(unittest.TestCase):
         self.assertEqual(data["coverage_short_count"], 2)
         self.assertEqual(data["no_candidate_count"], 1)
 
+    def test_coverage_counts_use_the_recall_at_5_population(self):
+        # A question with 25 positives is outside the R@5 population, so its
+        # empty candidate list must not be counted against the R@5 number.
+        outsized = MODULE._ranking_metrics([], {f"g{i}" for i in range(25)})
+        small = self._perfect(2)
+        items = [{"image_ranking": outsized}, {"image_ranking": small}]
+
+        data = MODULE._mean_ranking_metrics(items)
+
+        self.assertEqual(data["question_count"], 2)
+        self.assertEqual(data["coverage_short_count"], 0)
+        self.assertEqual(data["no_candidate_count"], 0)
+
     def test_no_scored_rows_yields_no_metrics(self):
         self.assertEqual(MODULE._mean_ranking_metrics([{"no_ranking": True}]), {})
         self.assertEqual(MODULE._mean_ranking_metrics([]), {})
