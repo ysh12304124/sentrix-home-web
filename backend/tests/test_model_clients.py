@@ -12,6 +12,22 @@ from backend.agent_runtime.tool_policy import ToolPolicy
 
 
 class ModelClientTests(unittest.TestCase):
+    @patch("backend.model_clients.time.perf_counter", side_effect=[10.0, 12.0])
+    @patch("backend.model_clients.httpx.post")
+    def test_nonstream_call_records_elapsed_time_without_inventing_ttft(self, post, clock):
+        post.return_value.json.return_value = {
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 25, "completion_tokens": 10},
+        }
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        self.assertEqual(client.chat("test", json_mode=True), "{}")
+        metrics = client.get_and_clear_call_metrics()
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(metrics[0]["total_ms"], 2000.0)
+        self.assertEqual(metrics[0]["tokens_per_second"], 5.0)
+        self.assertIsNone(metrics[0]["ttft_ms"])
+        self.assertFalse(metrics[0]["streamed"])
+
     def test_tool_policy_preserves_private_model_metrics_for_runtime_extraction(self):
         payload = {
             "summary": "done",

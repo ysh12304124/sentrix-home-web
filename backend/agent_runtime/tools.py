@@ -1570,12 +1570,17 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     _slot_year = None
     _slot_months: list[int] = []
     _slot_days: list[int] = []
+    model_call_metrics = []
     if gamma is not None and _slot_input.strip():
         try:
             from .semantic_slots import parse_semantic_slots
             _slots = parse_semantic_slots(_slot_input, gamma.chat)
         except Exception:
             _slots = None
+        finally:
+            model_call_metrics = gamma.get_and_clear_call_metrics()
+            for metric in model_call_metrics:
+                metric["tool_subtask"] = "semantic_slots"
         if _slots:
             _st = _slots.get("time") or {}
             _slot_year = _st.get("year")
@@ -1619,7 +1624,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     if not (query_for_retrieval or "").strip():
         # 纯时间/地点/人物/媒体筛选：走确定性元数据路径，不依赖 ANN 语义召回（生产多检索器下空 query 会 0 召回）
         user_goal = ((context or {}).get("task_state") or {}).get("user_goal") or ""
-        return _search_metadata_only(draft, spec, scope_id, query_for_retrieval, mode, user_goal=user_goal)
+        result = _search_metadata_only(draft, spec, scope_id, query_for_retrieval, mode, user_goal=user_goal)
+        result["_model_call_metrics"] = model_call_metrics
+        return result
     # ===== 新多路召回：按维度独立召回 + 跨召回重合评分 =====
     # 语义召回列表：每个 object 词（拆槽输出）+ 完整问题（主语义）。object 数量
     # 由模型判断（可多可少、可没有）；每条独立召回，图在各路的排名参与评分。
@@ -1830,7 +1837,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         "_preview_asset_ids": preview_asset_ids,
         "evidence_asset_ids": list(asset_ids),
         "selected_asset_ids": list(preview_asset_ids),
-        "_model_call_metrics": [],
+        "_model_call_metrics": model_call_metrics,
     }
 
 

@@ -836,7 +836,6 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
   overflow-x: auto;
 }
 .telemetry-chart { margin-top:12px; padding:10px 12px 8px; border:1px solid #dfe4f0; border-radius:8px; background:#fff; }
-.live-telemetry-metrics { display:none; }
 .telemetry-chart-canvas { width:100%; height:430px; min-height:320px; }
 .telemetry-processes { margin-top:10px; padding-top:8px; border-top:1px solid #e6e9f1; }
 .telemetry-processes summary { cursor:pointer; color:#5267c6; font-size:10px; font-weight:700; }
@@ -848,3 +847,35 @@ label,.field-label { display:block; min-width:0; color:var(--muted); font-size:1
 @media (max-width: 1080px) {
   .recall-matrices { grid-template-columns: 1fr; }
 }
+
+/* 关键指标：首屏只放能直接判读的结论值，明细留在各自折叠卡里 */
+.key-metric-list { grid-template-columns:repeat(5,minmax(0,1fr)); }
+.key-metric-card { background:var(--surface); border-color:#c7d2fe; }
+.key-metric-value { margin:6px 0 2px; font-size:22px; font-weight:700; color:#1f2d6b; overflow-wrap:anywhere; }
+.key-metric-card .metric-calc-time { margin:0 0 6px; }
+.key-metric-card .phase-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); margin-top:8px; }
+@media (max-width:1100px) { .key-metric-list { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+
+/* 结果卡片折叠：标题本身就是开关，收起时每张卡只占一行 */
+details.result-phase-card > summary.phase-title { justify-content:flex-start; cursor:pointer; list-style:none; }
+details.result-phase-card > summary.phase-title::-webkit-details-marker { display:none; }
+details.result-phase-card > summary.phase-title::before { content:"▸"; flex:0 0 auto; color:var(--muted); font-size:11px; }
+details.result-phase-card[open] > summary.phase-title::before { content:"▾"; }
+details.result-phase-card > summary.phase-title .phase-status { margin-left:auto; }
+
+/* 记忆层级面板整体折叠 */
+details.memory-layer-panel > summary.memory-layer-head { justify-content:flex-start; cursor:pointer; list-style:none; }
+details.memory-layer-panel > summary.memory-layer-head::-webkit-details-marker { display:none; }
+details.memory-layer-panel > summary.memory-layer-head::before { content:"▸"; flex:0 0 auto; color:var(--muted); font-size:11px; }
+details.memory-layer-panel[open] > summary.memory-layer-head::before { content:"▾"; }
+details.memory-layer-panel > summary.memory-layer-head .layer-scope-badge { margin-left:auto; }
+
+/* QA 区标题行含分页控件，不能塞进 summary，只折叠结果体 */
+details.qa-results-body > summary { padding:6px 0; color:var(--accent); font-size:12px; font-weight:600; cursor:pointer; list-style:none; }
+details.qa-results-body > summary::-webkit-details-marker { display:none; }
+details.qa-results-body > summary::before { content:"▸ "; }
+details.qa-results-body[open] > summary::before { content:"▾ "; }
+
+/* 召回指标：关键指标卡只放主值 R@5，明细单独折叠在下方 */
+.recall-metric-card { margin-top:8px; }
+.recall-metric-card .phase-metrics { grid-template-columns:repeat(3,minmax(0,1fr)); }
