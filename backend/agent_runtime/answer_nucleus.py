@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -178,11 +177,9 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                         nucleus.values.append(NucleusValue(
                             kind="year", value=m.group(1), certainty="confirmed",
                             source="ocr", display=m.group(1)))
-    # 4) 时间/地点（来自搜索结果的结构化媒体元数据）。
-    # 搜索预览已经携带 captured_at，但此前只有 query_memory_facts 的
-    # date/first/last 结果会进入 Nucleus，导致“哪一年/哪天”问题明明有
-    # 时间戳却被 Writer/Judge 当成没有硬证据。按预览中的多数值提取，
-    # 只回答用户明确询问的时间粒度，不把时间戳泛化成事件事实。
+    # 4) 时间/地点（来自搜索结果的结构化媒体元数据）。 Bind these facts
+    # to the query-recommended photo. A majority over a mixed preview can
+    # confidently report another event's date/place.
     required_evidence_types = {
         str(req.get("evidence_type") or "")
         for req in (task_state.get("requirements") or [])
@@ -199,54 +196,50 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
         or "location_metadata" in required_evidence_types
     )
 
+    metadata_candidates = []
     if any((tr or {}).get("tool") == "search_memories"
            for tr in task_state.get("tool_results") or []):
-        preview_times = []
         for tr in task_state.get("tool_results") or []:
             if tr.get("tool") != "search_memories":
                 continue
-            preview_times.extend(
-                str(item.get("captured_at") or "").strip()
-                for item in (tr.get("preview") or [])
-                if isinstance(item, dict) and item.get("captured_at")
-            )
-        if preview_times and _Q_YEAR.search(question or ""):
-            years = [m.group(1) for value in preview_times
-                     for m in [_YEAR_RE.search(value)] if m]
-            if years:
-                year, _ = Counter(years).most_common(1)[0]
-                nucleus.values.append(NucleusValue(
-                    kind="year", value=year, certainty="confirmed",
-                    source="search_memories.captured_at", display=year))
-        elif preview_times and date_requested:
-            dates = []
-            for value in preview_times:
-                m = re.match(r"(\d{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})", value)
-                if m:
-                    dates.append(f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日")
-            if dates:
-                date, _ = Counter(dates).most_common(1)[0]
-                nucleus.values.append(NucleusValue(
-                    kind="date", value=date, certainty="confirmed",
-                    source="search_memories.captured_at", display=date))
+            preview = [item for item in (tr.get("preview") or [])
+                       if isinstance(item, dict)]
+            if not preview:
+                continue
+            recommended = str(tr.get("recommended_handle") or "")
+            selected = next((item for item in preview
+                             if recommended and item.get("handle") == recommended), None)
+            metadata_candidates.append(selected or preview[0])
+        if metadata_candidates:
+            selected = metadata_candidates[-1]
+            captured_at = str(selected.get("captured_at") or "").strip()
+            if captured_at and _Q_YEAR.search(question or ""):
+                year_match = _YEAR_RE.search(captured_at)
+                if year_match:
+                    year = year_match.group(1)
+                    nucleus.values.append(NucleusValue(
+                        kind="year", value=year, certainty="confirmed",
+                        source=f"search_memories.{selected.get('handle')}.captured_at",
+                        display=year))
+            elif captured_at and date_requested:
+                match = re.match(r"(\d{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})", captured_at)
+                if match:
+                    date = f"{match.group(1)}年{int(match.group(2))}月{int(match.group(3))}日"
+                    nucleus.values.append(NucleusValue(
+                        kind="date", value=date, certainty="confirmed",
+                        source=f"search_memories.{selected.get('handle')}.captured_at",
+                        display=date))
 
-    # 地点（GPS 反编码，条件匹配）；只在问题/规划需求明确要求地点时
-    # 选择预览中出现频次最高的结构化地点，避免把候选照片的所有地点都
-    # 注入答案约束。
+    # Place metadata must come from the same recommended photo, not the most
+    # frequent location among unrelated search candidates.
         if place_requested:
-            place_counter: Counter[str] = Counter()
-            for tr in task_state.get("tool_results") or []:
-                if tr.get("tool") != "search_memories":
-                    continue
-                for p in (tr.get("preview") or []) or []:
-                    place = str(p.get("place") or "").strip()
-                    if len(place) >= 2:
-                        place_counter[place] += 1
-            if place_counter:
-                top_place, _ = place_counter.most_common(1)[0]
+            selected = metadata_candidates[-1] if metadata_candidates else {}
+            top_place = str(selected.get("place") or "").strip()
+            if len(top_place) >= 2:
                 nucleus.values.append(NucleusValue(
                     kind="place", value=top_place, certainty="confirmed",
-                    source="search_memories_majority", display=top_place))
+                    source=f"search_memories.{selected.get('handle')}.place",
+                    display=top_place))
 
     # 5) 当前关注人物
     active = task_state.get("active_person")

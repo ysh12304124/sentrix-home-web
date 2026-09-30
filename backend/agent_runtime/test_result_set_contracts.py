@@ -10,6 +10,7 @@ from backend.agent_runtime import tools as runtime_tools
 from backend.agent_runtime.result_set import TaskState as RuntimeTaskState
 from backend.agent_runtime.result_set import debug_asset_projection
 from backend.agent_runtime.intent import visual_intent
+from backend.agent_runtime.answer_nucleus import build_nucleus
 from backend.agent_runtime.completion import (
     CompletionState, RESOLVE_OCR, RESOLVE_VISUAL,
 )
@@ -119,6 +120,39 @@ class ResultSetContractTests(unittest.TestCase):
         )
         self.assertEqual(out["query"], "婚礼伴娘穿什么")
         self.assertEqual(out["recommended_resolution"]["tool"], "inspect_photo")
+
+    def test_recommended_handle_uses_geocoded_place_for_metadata_questions(self):
+        preview = [
+            {"handle": "photo_1", "place": "邯郸市永年区",
+             "evidence_summary": "室内婚礼现场；宾客合影"},
+            {"handle": "photo_2", "place": "保定市易县",
+             "evidence_summary": "男子站在紫色布幔前拍照"},
+        ]
+        self.assertEqual(
+            runtime_tools._recommended_handle(
+                "我在易县沙岭的婚礼仪式舞台前拍留影是哪一天的事？", preview),
+            "photo_2",
+        )
+
+    def test_nucleus_binds_date_and_place_to_recommended_photo_not_preview_majority(self):
+        state = {"tool_results": [{
+            "tool": "search_memories", "recommended_handle": "photo_2",
+            "preview": [
+                {"handle": "photo_1", "captured_at": "2017-12-16 10:24:14",
+                 "place": "邯郸市永年区"},
+                {"handle": "photo_2", "captured_at": "2017-10-04 22:31:47",
+                 "place": "保定市易县"},
+                {"handle": "photo_3", "captured_at": "2017-12-16 11:00:00",
+                 "place": "邯郸市永年区"},
+            ],
+        }]}
+        nucleus = build_nucleus(state, "这张照片是哪一天拍的？在哪里拍的？")
+        date = next(value for value in nucleus.values if value.kind == "date")
+        place = next(value for value in nucleus.values if value.kind == "place")
+        self.assertEqual(date.display, "2017年10月4日")
+        self.assertEqual(place.display, "保定市易县")
+        self.assertIn("photo_2", date.source)
+        self.assertIn("photo_2", place.source)
 
     def test_debug_projection_separates_full_candidates_from_preview(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(

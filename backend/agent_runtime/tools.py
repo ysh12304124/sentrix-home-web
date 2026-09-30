@@ -2770,12 +2770,34 @@ def _recommended_handle(query: str, preview: list) -> str:
         return str((preview[0] or {}).get("handle") or "")
     if not _preview_query_terms(q):
         return str((preview[0] or {}).get("handle") or "")
-    best_handle, best_score = "", 0.0
+    summaries = [str(p.get("evidence_summary") or "") for p in preview]
+    term_weights = _preview_query_term_weights(q, summaries)
+    query_terms = _preview_query_terms(q)
+    best_handle, best_score = "", -1.0
     for p in preview:
         desc = str(p.get("evidence_summary") or "")
-        if not desc:
-            continue
-        score = _preview_text_score(q, desc)
+        score = _preview_text_score(q, desc, term_weights)
+        # Geocoded place can be absent from the generated visual caption.
+        # Let explicit location anchors participate in candidate selection.
+        place = str(p.get("place") or "")
+        score += sum(1.5 * term_weights.get(term, 1.0)
+                     for term in query_terms
+                     if len(term) >= 2 and term in place)
+        # Captions often omit the named county/city, while reverse-geocoded
+        # place metadata preserves it. Match meaningful place substrings
+        # against the full query so an explicit geographic anchor can break
+        # otherwise-close semantic ties (e.g. 易县沙岭 -> 保定市易县).
+        compact_query = _compact_filter_text(q)
+        compact_place = _compact_filter_text(place)
+        common_place_anchor = max(
+            (len(compact_place[i:j])
+             for i in range(len(compact_place))
+             for j in range(i + 2, min(len(compact_place), i + 6) + 1)
+             if compact_place[i:j] in compact_query),
+            default=0,
+        )
+        if common_place_anchor >= 2:
+            score += min(9.0, 3.0 * common_place_anchor)
         if score > best_score:
             best_score, best_handle = score, str(p.get("handle") or "")
     return best_handle or str((preview[0] or {}).get("handle") or "")
