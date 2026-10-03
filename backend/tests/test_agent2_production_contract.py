@@ -11,7 +11,9 @@ from backend.agent_runtime.tool_registry import list_tools
 from backend.agent_runtime.tools import _confirmed_photo_identities, register_tools
 from backend.embeddings.router import EmbeddingRouter
 from backend.agent_runtime.goal_planner import GoalPlanner
-from backend.agent_runtime.runtime import AgentRuntime, _normalize_selected_image_handles
+from backend.agent_runtime.runtime import (
+    AgentRuntime, _normalize_delivery_image_handles, _normalize_selected_image_handles,
+)
 
 
 class Agent2ProductionContractTests(unittest.TestCase):
@@ -58,6 +60,25 @@ class Agent2ProductionContractTests(unittest.TestCase):
                 ["photo_1", "photo_2", "photo_3", "photo_4", "photo_5"],
             ),
             ["photo_2", "photo_1", "photo_3", "photo_4", "photo_5"],
+        )
+
+    def test_selected_image_handles_accept_earlier_shown_pages_but_not_unseen_candidates(self):
+        self.assertEqual(
+            _normalize_selected_image_handles(
+                ["photo_1", "photo_7", "photo_20"],
+                ["photo_1", "photo_7", "photo_8"],
+            ),
+            ["photo_1", "photo_7"],
+        )
+
+    def test_delivery_gate_uses_accumulated_shown_pages_not_only_current_page(self):
+        task = SimpleNamespace(
+            result_preview=["photo_7", "photo_8"],
+            delivery_visible_handles=["photo_1", "photo_2", "photo_7", "photo_8"],
+        )
+        self.assertEqual(
+            _normalize_delivery_image_handles(["photo_1", "photo_7", "photo_99"], task),
+            ["photo_1", "photo_7"],
         )
 
     def test_confirmed_identity_query_is_read_only(self):

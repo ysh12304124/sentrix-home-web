@@ -232,6 +232,14 @@ def _normalize_selected_image_handles(handles, preview_handles, limit: int = 6) 
     return selected
 
 
+def _normalize_delivery_image_handles(handles, task_state, limit: int = 6) -> list[str]:
+    """Allow delivery from any preview already exposed in the active result set."""
+    visible = getattr(task_state, "delivery_visible_handles", None)
+    if not visible:
+        visible = getattr(task_state, "result_preview", None)
+    return _normalize_selected_image_handles(handles, visible, limit=limit)
+
+
 def _model_visible_action(action: dict) -> str:
     """Feed the parsed action back without model reasoning or prose."""
     return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
@@ -292,7 +300,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   不要编造 preview 之外的 handle。
 - search_memories 若返回 recommended_handle，inspect_photo / read_photo_text 默认优先使用该 handle；
   不要因为示例中的 photo_1 文本而改选其它照片。
-- selected_image_handles 只填写最终确实要展示给用户的图片，必须来自当前 preview，最多 6 张；搜索返回的全部候选不能直接当作展示图片。
+- selected_image_handles 只填写最终确实要展示给用户的图片，必须来自当前结果集已向你展示过的 preview（包括已翻阅的前几页），最多 6 张；搜索返回但从未展示的候选不能直接当作展示图片。
 - 当用户询问照片里的视觉细节（桌上物品、衣服颜色、人数、文字/招牌、天气、穿什么、有没有某物）时，
   如果 search_memories 返回了 preview 候选（有 photo_1 等 handle），你必须调用 inspect_photo 复核 preview 里的照片，
   不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
@@ -2475,9 +2483,9 @@ class AgentRuntime:
                 break
             if action.get("action") == "final":
                 last_model_final_answer = str(action.get("answer") or "").strip()
-                selected_image_handles = _normalize_selected_image_handles(
+                selected_image_handles = _normalize_delivery_image_handles(
                     action.get("selected_image_handles") or action.get("image_handles"),
-                    task.result_preview,
+                    task,
                 )
                 # Authoritative Agent2 gate: evidence sufficiency is decided by
                 # the single TaskState, never by intent heuristics or a model

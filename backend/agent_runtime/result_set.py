@@ -274,6 +274,9 @@ class TaskState:
     result_total: int | None = None
     result_remaining: int | None = None
     result_preview: list = field(default_factory=list)
+    # Handles already shown from the active result set. Unlike result_preview,
+    # this survives pagination so final delivery can cite an earlier page.
+    delivery_visible_handles: list = field(default_factory=list)
     # D3：active references（跨轮持续状态）
     active_person: str | None = None
     active_event: str | None = None
@@ -371,6 +374,7 @@ class TaskState:
             # were already shown and are still being resolved by the loop.
             total = observation.get("total")
             has_matches = total is None or int(total or 0) > 0
+            previous_result_set = self.current_result_set
             if has_matches or not self.current_result_set:
                 self.current_result_set = observation["result_set_id"]
             self.result_mode = arguments.get("mode") or "best"
@@ -380,6 +384,10 @@ class TaskState:
             self.result_total = int(total) if total is not None else None
             self.result_remaining = observation.get("remaining")
             self.result_preview = [p.get("handle") for p in (observation.get("preview") or [])][:20]
+            if self.current_result_set == observation["result_set_id"]:
+                if previous_result_set != self.current_result_set:
+                    self.delivery_visible_handles = []
+                self._remember_delivery_handles(self.result_preview)
             if total == 0:
                 self.fulfillment = "empty"
             else:
@@ -409,6 +417,7 @@ class TaskState:
                     p.get("handle") for p in (observation.get("preview") or [])
                     if isinstance(p, dict) and p.get("handle")
                 ][:20]
+                self._remember_delivery_handles(self.result_preview)
                 if observation.get("total") is not None:
                     self.result_total = int(observation.get("total") or 0)
                 self.result_remaining = observation.get("remaining")
@@ -416,6 +425,15 @@ class TaskState:
         if tool_name == "get_original_photos":
             self.delivery_state = "delivered"
             self.delivered_count = observation.get("delivered")
+
+    def _remember_delivery_handles(self, handles):
+        """Accumulate only handles actually exposed for the active result set."""
+        known = set(self.delivery_visible_handles)
+        for handle in handles or []:
+            value = str(handle or "").strip()
+            if value and value not in known:
+                self.delivery_visible_handles.append(value)
+                known.add(value)
 
     @classmethod
     def from_dict(cls, data: dict | None, *, user_goal: str = "") -> "TaskState":
@@ -431,6 +449,9 @@ class TaskState:
         task.search_condition_summary = data.get("search_condition_summary") or {}
         # D12：跨轮续接时恢复结果集预览（显式要图/追问时 grounding 仍能展示证据网格）
         task.result_preview = data.get("result_preview") or []
+        task.delivery_visible_handles = (
+            data.get("delivery_visible_handles") or list(task.result_preview)
+        )
         task.result_total = data.get("result_total")
         task.result_remaining = data.get("result_remaining")
         task.selected_asset_handle = data.get("selected_asset_handle")
@@ -464,6 +485,7 @@ class TaskState:
             "result_total": self.result_total,
             "result_remaining": self.result_remaining,
             "result_preview": self.result_preview,
+            "delivery_visible_handles": self.delivery_visible_handles,
             "tool_results": self.tool_results,
             "active_person": self.active_person,
             "active_event": self.active_event,

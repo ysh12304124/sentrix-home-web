@@ -72,8 +72,39 @@ class ResultSetContractTests(unittest.TestCase):
 
         self.assertEqual(state.current_result_set, "rs_page_test")
         self.assertEqual(state.result_preview, [f"photo_{i}" for i in range(7, 13)])
+        self.assertEqual(state.delivery_visible_handles, [f"photo_{i}" for i in range(1, 13)])
         self.assertTrue(state.has_more)
         self.assertEqual(state.result_remaining, 6)
+
+    def test_task_state_resets_delivery_handles_for_a_new_result_set(self):
+        state = RuntimeTaskState()
+        state.update_from_tool("search_memories", {}, {
+            "result_set_id": "rs_first", "total": 8,
+            "preview": [{"handle": "photo_1"}, {"handle": "photo_2"}],
+        })
+        state.update_from_tool("get_result_page", {}, {
+            "result_set_id": "rs_first", "total": 8,
+            "preview": [{"handle": "photo_7"}],
+        })
+        state.update_from_tool("search_memories", {}, {
+            "result_set_id": "rs_second", "total": 1,
+            "preview": [{"handle": "photo_1"}],
+        })
+
+        self.assertEqual(state.result_preview, ["photo_1"])
+        self.assertEqual(state.delivery_visible_handles, ["photo_1"])
+
+    def test_delivery_visible_handles_round_trip_with_legacy_fallback(self):
+        state = RuntimeTaskState.from_dict({
+            "current_result_set": "rs_x",
+            "result_preview": ["photo_7"],
+            "delivery_visible_handles": ["photo_1", "photo_7"],
+        })
+        self.assertEqual(state.delivery_visible_handles, ["photo_1", "photo_7"])
+        self.assertEqual(
+            RuntimeTaskState.from_dict({"result_preview": ["photo_3"]}).delivery_visible_handles,
+            ["photo_3"],
+        )
 
     def test_preview_carries_bounded_observation_detail(self):
         asset = self.store.create_asset(
