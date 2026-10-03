@@ -302,6 +302,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   （photo_2、photo_3…）复核，不要反复检查同一张；同一张图最多复核一次。看过几张候选仍无目标时，
   直接 final（如实说明或基于已有候选作答）。search_memories 每轮只需调用一次（返回最多 18 张候选，
   preview 显示前几张），需要更多候选/下一页用 get_result_page 翻页，不要反复重新搜索整个相册。
+- 用户要找/查看照片时，只要检索到候选，就应选择最相关的当前 preview 图片并展示；candidate_only 表示“找到相近候选但尚未确认”，不能说“没有找到/记录里看不出来”。不确定时优先检查最相关候选，再把已检查的图片句柄放进 selected_image_handles，并如实说明不确定点。
+- 如果回答依据来自 inspect_photo/read_photo_text 检查过的图片，最终应把对应句柄放入 selected_image_handles；不要因漏写句柄而丢掉已核实的图片证据。未检查的候选不可仅因排名靠前就冒充已核实证据。
 - final 时必须用 evidence_refs 列出你实际引用的工具调用编号（本轮工具调用会按顺序编号 tool_call_1、tool_call_2 …；纯聊天不引用）。
 - 只使用工具返回的事实回答，不编造数字或细节；工具没有返回的内容不要编造。
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
@@ -353,6 +355,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 _IMAGE_REQUEST_RE = __import__("re").compile(
     r"给我看看|给我看|发我|发给我|发来|原图|都给我|全部给我|"
     r"展示|显示(?:一下|给我)?|让我看看|看看(?:这些|照片|图)?|"
+    r"(?:找|寻找|查找|搜索)(?:.{0,8})(?:照片|图片|图像|影像)|"
+    r"(?:照片|图片|图像|影像)(?:.{0,8})(?:找一下|帮我找|找出来)|"
     r"把.{0,6}(?:照片|图片|图)|第二张|第三张|第\d张|那张|哪张|"
     r"打开(?:照片|图片)|看图|给我图", __import__("re").I)
 _INLINE_QUESTION_RE = __import__("re").compile(
@@ -1444,6 +1448,19 @@ def _build_answer_grounding(*, message: str, task: TaskState,
             if handle and handle not in valid_selected_handles:
                 valid_selected_handles.append(handle)
                 valid_selected_ids.append(asset_id)
+    # An inspected photo is already a grounded evidence choice. Preserve only
+    # the first inspected photo when the model omitted the redundant
+    # selected_image_handles field: promoting every inspected item can inflate
+    # delivery and hurt precision. The model may still explicitly select more
+    # than one image when the question calls for it. Never promote uninspected
+    # search results.
+    if not valid_selected_handles:
+        for handle in evidence_handles:
+            if handle in handle_to_id and handle not in valid_selected_handles:
+                valid_selected_handles.append(handle)
+            if valid_selected_handles:
+                break
+        valid_selected_ids = [handle_to_id[handle] for handle in valid_selected_handles]
     return {
         "required": used_evidence,
         "display_mode": display_mode,
