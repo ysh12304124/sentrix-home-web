@@ -37,7 +37,7 @@ function Show-Status {
 }
 
 function Wait-Ready {
-  param([int]$TimeoutSeconds = 120)
+  param([int]$TimeoutSeconds = 180)
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   do {
     $ready = & $manager -Status 2>$null
@@ -52,34 +52,68 @@ function Wait-Ready {
   Write-Warning "vLLM did not become ready within $TimeoutSeconds seconds."
   if (Test-Path -LiteralPath $logPath) {
     Write-Host 'Last vLLM log lines:' -ForegroundColor Yellow
-    Get-Content -LiteralPath $logPath -Tail 30
+    Get-Content -LiteralPath $logPath -Tail 50
   }
   return $false
 }
 
+function Clear-FailedLaunch {
+  Write-Warning 'Cleaning up the unready vLLM launcher and its dedicated WSL distro.'
+  try { & $manager -Stop } catch { Write-Warning "vLLM cleanup reported: $_" }
+  if (Test-Path -LiteralPath $pidFile) {
+    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Seconds 3
+}
+
 switch ($Action) {
   'start' {
+    $needsFreshStart = $false
     if (Test-Path -LiteralPath $pidFile) {
       $rawPid = (Get-Content -LiteralPath $pidFile -Raw).Trim()
-      $existing = Get-Process -Id ([int]$rawPid) -ErrorAction SilentlyContinue
+      $existing = $null
+      if ($rawPid -match '^\d+$') {
+        $existing = Get-Process -Id ([int]$rawPid) -ErrorAction SilentlyContinue
+      }
       if ($existing) {
-        Write-Host "Launcher already exists (Windows PID $rawPid); not starting a duplicate." -ForegroundColor Yellow
-        [void](Wait-Ready)
-        break
+        Write-Host "Checking existing launcher (Windows PID $rawPid)." -ForegroundColor Yellow
+        if (Wait-Ready -TimeoutSeconds 15) { break }
+        $needsFreshStart = $true
+      } else {
+        Write-Host 'Removing a stale launcher PID record.' -ForegroundColor Yellow
+        Remove-Item -LiteralPath $pidFile -Force
+        $needsFreshStart = $true
       }
     }
-    & $manager
-    [void](Wait-Ready)
+    if ($needsFreshStart) { Clear-FailedLaunch }
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+      Write-Host "Starting vLLM (attempt $attempt of 2)." -ForegroundColor Cyan
+      & $manager
+      if (Wait-Ready -TimeoutSeconds 180) { break }
+      Clear-FailedLaunch
+      if ($attempt -eq 2) {
+        Write-Error 'vLLM failed twice. The WSL launcher was cleaned up; use .\vllm.ps1 logs and .\vllm.ps1 status for diagnostics.'
+      }
+      Write-Warning 'Retrying once from a clean WSL state.'
+    }
   }
   'stop' {
     & $manager -Stop
     Write-Host 'Stop command sent.' -ForegroundColor Cyan
   }
   'restart' {
-    & $manager -Stop
-    Start-Sleep -Seconds 2
+    Clear-FailedLaunch
     & $manager
-    [void](Wait-Ready)
+    if (-not (Wait-Ready -TimeoutSeconds 180)) {
+      Clear-FailedLaunch
+      Write-Warning 'Retrying restart once from a clean WSL state.'
+      & $manager
+      if (-not (Wait-Ready -TimeoutSeconds 180)) {
+        Clear-FailedLaunch
+        Write-Error 'vLLM failed twice. The WSL launcher was cleaned up; use .\vllm.ps1 logs and .\vllm.ps1 status for diagnostics.'
+      }
+    }
   }
   'status' {
     Show-Status
