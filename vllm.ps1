@@ -52,9 +52,12 @@ function Wait-Ready {
   Write-Warning "vLLM did not become ready within $TimeoutSeconds seconds."
   if (Test-Path -LiteralPath $logPath) {
     Write-Host 'Last vLLM log lines:' -ForegroundColor Yellow
-    Get-Content -LiteralPath $logPath -Tail 50
+    # Keep diagnostic text off the success stream. Otherwise PowerShell
+    # collects those lines with the final $false return, treats the resulting
+    # array as truthy, and the caller skips stale-launch cleanup/retry.
+    Get-Content -LiteralPath $logPath -Tail 50 | ForEach-Object { Write-Host $_ }
   }
-  return $false
+  return [bool]$false
 }
 
 function Clear-FailedLaunch {
