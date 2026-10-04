@@ -118,23 +118,21 @@ def _model_visible_observation(observation: dict | None) -> dict:
                    if key in _RETRIEVAL_TOP_KEEP}
         preview_items = [item for item in preview if isinstance(item, dict)]
         recommended_handle = str(compact.get("recommended_handle") or "").strip()
-        visible_items = preview_items[:5]
-        # Keep the recommendation usable: search ranks a wider preview window,
-        # while the model context is deliberately capped at five entries.  If
-        # the recommended candidate falls outside that cap, retain the first
-        # four ranked entries and include the recommendation as the fifth.
-        # Handles are rank-stable, so this does not alter ResultSet ordering or
-        # graph retrieval; it only prevents returning a handle the model cannot
-        # see or inspect.
+        # Put the recommendation first because the Agent often inspects only
+        # the default/first photo. The handle still maps to its original
+        # ResultSet rank; this changes only the bounded model-visible ordering.
         recommended_item = next(
             (item for item in preview_items
              if str(item.get("handle") or "").strip() == recommended_handle),
             None,
         ) if recommended_handle else None
-        if recommended_item is not None and all(
-                str(item.get("handle") or "").strip() != recommended_handle
-                for item in visible_items):
-            visible_items = visible_items[:4] + [recommended_item]
+        if recommended_item is not None:
+            visible_items = [recommended_item] + [
+                item for item in preview_items
+                if str(item.get("handle") or "").strip() != recommended_handle
+            ][:4]
+        else:
+            visible_items = preview_items[:5]
         compact["preview"] = [
             {key: item[key] for key in _RETRIEVAL_PREVIEW_KEEP if key in item}
             for item in visible_items

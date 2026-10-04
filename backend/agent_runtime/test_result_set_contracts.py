@@ -154,9 +154,39 @@ class ResultSetContractTests(unittest.TestCase):
 
         handles = [item["handle"] for item in visible["preview"]]
         self.assertEqual(len(handles), 5)
-        self.assertEqual(handles, ["photo_1", "photo_2", "photo_3", "photo_4", "photo_11"])
+        self.assertEqual(handles, ["photo_11", "photo_1", "photo_2", "photo_3", "photo_4"])
         self.assertIn(visible["recommended_handle"], handles)
         self.assertTrue(all("asset_id" not in item for item in visible["preview"]))
+
+    def test_model_observation_puts_visible_recommendation_first(self):
+        visible = _model_visible_observation({
+            "recommended_handle": "photo_3",
+            "preview": [{"handle": f"photo_{i}"} for i in range(1, 7)],
+        })
+
+        self.assertEqual(
+            [item["handle"] for item in visible["preview"]],
+            ["photo_3", "photo_1", "photo_2", "photo_4", "photo_5"],
+        )
+
+    def test_recommended_candidate_outside_preview_replaces_only_the_tail(self):
+        indices = list(range(18))
+        selected = runtime_tools._include_recommended_candidate(
+            indices, candidate_count=48, recommended_handle="photo_40", limit=18,
+        )
+
+        self.assertEqual(len(selected), 18)
+        self.assertEqual(selected[:17], list(range(17)))
+        self.assertEqual(selected[-1], 39)
+
+    def test_recommended_candidate_already_in_preview_does_not_change_membership(self):
+        indices = list(range(18))
+        self.assertEqual(
+            runtime_tools._include_recommended_candidate(
+                indices, candidate_count=48, recommended_handle="photo_12", limit=18,
+            ),
+            indices,
+        )
 
     def test_model_observation_does_not_return_a_stale_recommendation(self):
         visible = _model_visible_observation({

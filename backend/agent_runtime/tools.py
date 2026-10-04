@@ -659,6 +659,31 @@ def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "",
     return selected
 
 
+def _include_recommended_candidate(indices: list[int], candidate_count: int,
+                                   recommended_handle: str,
+                                   *, limit: int) -> list[int]:
+    """Keep the query-ranked recommendation inside the bounded preview window.
+
+    ``photo_N`` handles are stable ResultSet ranks, not preview positions.  A
+    candidate can therefore be ranked as the best match across the full
+    retrieval pool but be silently omitted when the preview is cut to its
+    first N entries.  Retain the current relevance head and replace only its
+    tail with that recommendation; the complete server-side result set and
+    handle-to-asset mapping remain unchanged.
+    """
+    selected = list(indices or [])
+    match = re.fullmatch(r"photo_(\d+)", str(recommended_handle or "").strip())
+    if not match:
+        return selected
+    candidate_index = int(match.group(1)) - 1
+    if candidate_index < 0 or candidate_index >= int(candidate_count):
+        return selected
+    if candidate_index in selected:
+        return selected
+    bounded_limit = max(1, int(limit))
+    return [*selected[:max(0, bounded_limit - 1)], candidate_index]
+
+
 def _build_preview_entries(store, asset_ids: list[str], indices: list[int]) -> list[dict]:
     """Build the model-visible preview from the selected candidate indices.
 
@@ -2717,6 +2742,32 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     preview_indices = _preview_indices(
         asset_ids, mode, store, query=preview_query, limit=_SLOT_PREVIEW_LIMIT,
         trusted_constraints=trusted_constraints, scope_id=scope_id)
+    # Choose the recommendation from the entire retrieved pool, not from the
+    # already-truncated preview. In the latest QA traces, many zero-recall
+    # rows had a GT somewhere in the 48-candidate pool but outside the 18-item
+    # preview. The same query/caption/metadata scorer can recover such a
+    # candidate without adding assets or changing retrieval/metric scoring.
+    recommendation_pool = []
+    for index, asset_id in enumerate(asset_ids):
+        asset = store.get_asset(asset_id) if store is not None else {}
+        recommendation_pool.append({
+            "handle": f"photo_{index + 1}",
+            "evidence_summary": _observation_summary(store, asset_id),
+            "place": _short_place_label(asset or {}),
+        })
+    recommended_handle = _recommended_handle(preview_query, recommendation_pool)
+    original_preview_indices = list(preview_indices)
+    preview_indices = _include_recommended_candidate(
+        preview_indices, len(asset_ids), recommended_handle,
+        limit=_SLOT_PREVIEW_LIMIT)
+    recommended_match = re.fullmatch(r"photo_(\d+)", recommended_handle or "")
+    recommended_rank = int(recommended_match.group(1)) if recommended_match else None
+    slot_retrieval_timing["semantic_retrieval"].update({
+        "recommended_candidate_rank": recommended_rank,
+        "recommended_candidate_promoted": bool(
+            recommended_rank and recommended_rank - 1 not in original_preview_indices
+        ),
+    })
     # 删模型重排：候选即最终。代码融合排序 + gap 截断已保证强相关在前，
     # 不再逐批调用 12B 验证候选（省 ~5 批模型调用/题，避免上下文膨胀）。
     validated_ids = list(asset_ids)
@@ -2788,8 +2839,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             user_goal=((context or {}).get("task_state") or {}).get("user_goal") or ""),
         # 推荐最可能符合问题的 preview 图，避免模型默认 inspect photo_1 而错图
         # （实测候选含 GT 仍拒答的识别类题，多因 inspect 了错误的图）。
-        "recommended_handle": _recommended_handle(
-            preview_query, preview),
+        "recommended_handle": recommended_handle,
         "_retrieved_asset_ids": list(asset_ids),
         "retrieved_asset_ids": list(asset_ids),
         "_preview_asset_ids": preview_asset_ids,
