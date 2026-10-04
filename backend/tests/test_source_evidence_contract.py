@@ -40,7 +40,7 @@ class SourceEvidenceContractTests(unittest.TestCase):
         self.assertEqual(grounding["selected_image_handles"], ["photo_2"])
         self.assertEqual(grounding["selected_asset_ids"], ["asset_2"])
 
-    def test_uninspected_candidates_are_not_promoted_to_delivery(self):
+    def test_explicit_photo_request_delivers_only_the_recommended_visible_candidate(self):
         class FakeResultSet:
             scope_id = "scope_1"
 
@@ -51,10 +51,119 @@ class SourceEvidenceContractTests(unittest.TestCase):
             def get(self, result_set_id):
                 return FakeResultSet() if result_set_id == "rs_1" else None
 
-        task = TaskState(user_goal="找照片", current_result_set="rs_1")
+        task = TaskState(user_goal="帮我找一下这张照片", current_result_set="rs_1")
+        task.result_total = 2
+        task.search_satisfaction = "candidate_only"
+        task.delivery_visible_handles = ["photo_1", "photo_2"]
         task.tool_results = [{
             "tool": "search_memories",
+            "result_set_id": "rs_1",
             "retrieved_asset_ids": ["asset_1", "asset_2"],
+            "evidence_asset_ids": ["asset_1", "asset_2"],
+            "recommended_handle": "photo_2",
+            "preview": [
+                {"handle": "photo_1", "asset_id": "asset_1"},
+                {"handle": "photo_2", "asset_id": "asset_2"},
+            ],
+        }]
+        with patch.dict(runtime_tools._RUNTIME, {"result_sets": FakeResultSetStore()}):
+            grounding = _build_answer_grounding(
+                message="帮我找一下这张照片", task=task,
+            )
+
+        self.assertEqual(grounding["selected_image_handles"], ["photo_2"])
+        self.assertEqual(grounding["selected_asset_ids"], ["asset_2"])
+
+    def test_full_support_fact_answer_delivers_one_recommended_collapsed_source(self):
+        class FakeResultSet:
+            scope_id = "scope_1"
+
+            def visible_asset_ids(self):
+                return ["asset_1", "asset_2"]
+
+        class FakeResultSetStore:
+            def get(self, result_set_id):
+                return FakeResultSet() if result_set_id == "rs_1" else None
+
+        task = TaskState(user_goal="这件事是哪天？", current_result_set="rs_1")
+        task.result_total = 2
+        task.search_satisfaction = "full_support"
+        task.delivery_visible_handles = ["photo_1", "photo_2"]
+        task.tool_results = [{
+            "tool": "search_memories",
+            "result_set_id": "rs_1",
+            "retrieved_asset_ids": ["asset_1", "asset_2"],
+            "evidence_asset_ids": ["asset_1", "asset_2"],
+            "recommended_handle": "photo_2",
+            "preview": [
+                {"handle": "photo_1", "asset_id": "asset_1"},
+                {"handle": "photo_2", "asset_id": "asset_2"},
+            ],
+        }]
+        with patch.dict(runtime_tools._RUNTIME, {"result_sets": FakeResultSetStore()}):
+            grounding = _build_answer_grounding(
+                message="这件事是哪天？", task=task,
+            )
+
+        self.assertEqual(grounding["display_mode"], "collapsed")
+        self.assertEqual(grounding["selected_image_handles"], ["photo_2"])
+        self.assertEqual(grounding["selected_asset_ids"], ["asset_2"])
+
+    def test_candidate_only_fact_query_does_not_promote_uninspected_media(self):
+        class FakeResultSet:
+            scope_id = "scope_1"
+
+            def visible_asset_ids(self):
+                return ["asset_1", "asset_2"]
+
+        class FakeResultSetStore:
+            def get(self, result_set_id):
+                return FakeResultSet() if result_set_id == "rs_1" else None
+
+        task = TaskState(user_goal="这件事是哪天？", current_result_set="rs_1")
+        task.result_total = 2
+        task.search_satisfaction = "candidate_only"
+        task.delivery_visible_handles = ["photo_1", "photo_2"]
+        task.tool_results = [{
+            "tool": "search_memories",
+            "result_set_id": "rs_1",
+            "retrieved_asset_ids": ["asset_1", "asset_2"],
+            "evidence_asset_ids": ["asset_1", "asset_2"],
+            "recommended_handle": "photo_2",
+            "preview": [
+                {"handle": "photo_1", "asset_id": "asset_1"},
+                {"handle": "photo_2", "asset_id": "asset_2"},
+            ],
+        }]
+        with patch.dict(runtime_tools._RUNTIME, {"result_sets": FakeResultSetStore()}):
+            grounding = _build_answer_grounding(
+                message="这件事是哪天？", task=task,
+            )
+
+        self.assertEqual(grounding["selected_image_handles"], [])
+        self.assertEqual(grounding["selected_asset_ids"], [])
+
+    def test_recommended_candidate_must_have_been_shown_to_the_agent(self):
+        class FakeResultSet:
+            scope_id = "scope_1"
+
+            def visible_asset_ids(self):
+                return ["asset_1", "asset_2"]
+
+        class FakeResultSetStore:
+            def get(self, result_set_id):
+                return FakeResultSet() if result_set_id == "rs_1" else None
+
+        task = TaskState(user_goal="帮我找一下这张照片", current_result_set="rs_1")
+        task.result_total = 2
+        task.search_satisfaction = "candidate_only"
+        task.delivery_visible_handles = ["photo_1"]
+        task.tool_results = [{
+            "tool": "search_memories",
+            "result_set_id": "rs_1",
+            "retrieved_asset_ids": ["asset_1", "asset_2"],
+            "evidence_asset_ids": ["asset_1", "asset_2"],
+            "recommended_handle": "photo_2",
             "preview": [
                 {"handle": "photo_1", "asset_id": "asset_1"},
                 {"handle": "photo_2", "asset_id": "asset_2"},

@@ -1469,6 +1469,36 @@ def _build_answer_grounding(*, message: str, task: TaskState,
             if valid_selected_handles:
                 break
         valid_selected_ids = [handle_to_id[handle] for handle in valid_selected_handles]
+    # If the model omitted delivery entirely, keep one ranked result available
+    # when the user explicitly asked for a photo, or when search itself found
+    # full support for the answer. Use the retriever's single recommended
+    # handle (not the whole candidate/evidence pool), and only if it was shown
+    # from the active result set. This closes the common gap where the right
+    # frame is in the ranked preview but never reaches the response payload.
+    # Candidate-only results are exposed only for an explicit photo request;
+    # ordinary factual answers must not turn weak matches into evidence.
+    if (not valid_selected_handles and used_evidence and task.current_result_set
+            and int(task.result_total or 0) > 0
+            and (explicit_image or task.search_satisfaction == "full_support")):
+        shown_handles = set(
+            getattr(task, "delivery_visible_handles", None)
+            or task.result_preview or []
+        )
+        for tr in reversed(tool_results):
+            if str(tr.get("tool") or "") != "search_memories":
+                continue
+            result_set_id = str(tr.get("result_set_id") or "")
+            if result_set_id and result_set_id != str(task.current_result_set):
+                continue
+            preview = [item for item in (tr.get("preview") or [])
+                       if isinstance(item, dict) and item.get("handle")]
+            recommendation = str(tr.get("recommended_handle") or "").strip()
+            if recommendation not in {str(item["handle"]) for item in preview}:
+                recommendation = str((preview[0] or {}).get("handle") or "") if preview else ""
+            if recommendation in shown_handles and recommendation in handle_to_id:
+                valid_selected_handles.append(recommendation)
+                valid_selected_ids = [handle_to_id[recommendation]]
+                break
     return {
         "required": used_evidence,
         "display_mode": display_mode,
