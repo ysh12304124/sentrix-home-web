@@ -142,6 +142,31 @@ class ResultSetContractTests(unittest.TestCase):
         self.assertEqual(len(visible["preview"]), 5)
         self.assertEqual(visible["recommended_handle"], "photo_0")
 
+    def test_model_observation_keeps_recommended_candidate_inside_visible_window(self):
+        visible = _model_visible_observation({
+            "result_set_id": "rs_demo",
+            "recommended_handle": "photo_11",
+            "preview": [
+                {"handle": f"photo_{i}", "asset_id": f"asset_{i}"}
+                for i in range(1, 19)
+            ],
+        })
+
+        handles = [item["handle"] for item in visible["preview"]]
+        self.assertEqual(len(handles), 5)
+        self.assertEqual(handles, ["photo_1", "photo_2", "photo_3", "photo_4", "photo_11"])
+        self.assertIn(visible["recommended_handle"], handles)
+        self.assertTrue(all("asset_id" not in item for item in visible["preview"]))
+
+    def test_model_observation_does_not_return_a_stale_recommendation(self):
+        visible = _model_visible_observation({
+            "result_set_id": "rs_demo",
+            "recommended_handle": "photo_99",
+            "preview": [{"handle": "photo_1"}, {"handle": "photo_2"}],
+        })
+
+        self.assertEqual(visible["recommended_handle"], "photo_1")
+
     def test_reference_keeps_original_visual_intent(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(
             scope_id="album", query="照片", asset_ids=["asset_1"]

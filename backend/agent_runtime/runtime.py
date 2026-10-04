@@ -116,12 +116,39 @@ def _model_visible_observation(observation: dict | None) -> dict:
         # 检索/分页窗口：只暴露决策所需顶层字段 + 白名单 preview。
         compact = {key: value for key, value in observation.items()
                    if key in _RETRIEVAL_TOP_KEEP}
+        preview_items = [item for item in preview if isinstance(item, dict)]
+        recommended_handle = str(compact.get("recommended_handle") or "").strip()
+        visible_items = preview_items[:5]
+        # Keep the recommendation usable: search ranks a wider preview window,
+        # while the model context is deliberately capped at five entries.  If
+        # the recommended candidate falls outside that cap, retain the first
+        # four ranked entries and include the recommendation as the fifth.
+        # Handles are rank-stable, so this does not alter ResultSet ordering or
+        # graph retrieval; it only prevents returning a handle the model cannot
+        # see or inspect.
+        recommended_item = next(
+            (item for item in preview_items
+             if str(item.get("handle") or "").strip() == recommended_handle),
+            None,
+        ) if recommended_handle else None
+        if recommended_item is not None and all(
+                str(item.get("handle") or "").strip() != recommended_handle
+                for item in visible_items):
+            visible_items = visible_items[:4] + [recommended_item]
         compact["preview"] = [
             {key: item[key] for key in _RETRIEVAL_PREVIEW_KEEP if key in item}
-            for item in preview[:5] if isinstance(item, dict)
+            for item in visible_items
         ]
-        if not compact.get("recommended_handle") and compact["preview"]:
-            compact["recommended_handle"] = compact["preview"][0].get("handle")
+        visible_handles = {
+            str(item.get("handle") or "").strip()
+            for item in compact["preview"]
+            if item.get("handle")
+        }
+        if recommended_handle not in visible_handles:
+            recommended_handle = str(
+                compact["preview"][0].get("handle") if compact["preview"] else ""
+            )
+        compact["recommended_handle"] = recommended_handle
         return compact
     # Retrieval diagnostics describe the server-owned full candidate pool and
     # must not become answer facts.  They remain in the recorded trace for
