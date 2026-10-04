@@ -151,6 +151,24 @@ class SemanticSlotTimeGroundingTests(unittest.TestCase):
             order = _preview_query_order(asset_ids, question, None)
         self.assertEqual(order[0], 1)
 
+    def test_specific_event_object_beats_generic_prop_and_photo_action_aliases(self):
+        """Weak caption synonyms must not dominate a specific event-object cue."""
+        asset_ids = ["metal_stand_photo", "wedding_display"]
+        summaries = {
+            "metal_stand_photo": "小女孩在户外与彩色雕塑合影；拍照；金属支架。",
+            "wedding_display": "男子在婚庆迎宾横幅旁留影；横幅、婚纱照。",
+        }
+        query = "参加亲友婚礼，在迎宾展架旁拍的留影"
+        preview = [
+            {"handle": "photo_1", "evidence_summary": summaries["metal_stand_photo"]},
+            {"handle": "photo_2", "evidence_summary": summaries["wedding_display"]},
+        ]
+        with patch("backend.agent_runtime.tools._observation_summary",
+                   side_effect=lambda _store, aid: summaries[aid]):
+            order = _preview_query_order(asset_ids, query, None)
+        self.assertEqual(order[0], 1)
+        self.assertEqual(_recommended_handle(query, preview), "photo_2")
+
     def test_direct_time_and_place_can_use_contextually_matched_metadata(self):
         preview = [{
             "captured_at": "2017-10-04 22:31:47",

@@ -263,6 +263,20 @@ _PREVIEW_QUERY_ALIASES = {
     "室外": ("室外", "户外", "露天"),
 }
 
+# Some caption words are only weak evidence for a query concept. Treating every
+# synonym as interchangeable let generic props/actions (e.g. a metal support
+# stand for a "welcome display", or any "photo-taking" caption for "留影")
+# outrank candidates matching the actual event object. Keep them useful as
+# tie-breakers, but never let one broad alias outweigh a specific match.
+_PREVIEW_LOW_SPECIFICITY_ALIASES = {
+    "支架": 0.15,
+    "广告牌": 0.35,
+    "拍照": 0.25,
+    "站立拍照": 0.25,
+    "摆拍": 0.55,
+    "个人照": 0.75,
+}
+
 _PREVIEW_QUERY_STOPWORDS = {
     "我", "我们", "你", "帮我", "找一下", "找我", "记得", "有次", "那次", "这次",
     "当时", "那个", "这个", "照片", "图片", "留影", "拍照", "拍了", "拍摄", "前面",
@@ -336,9 +350,21 @@ def _preview_text_score(query: str, summary: str,
     if not desc:
         return 0.0
     weights = term_weights or {}
-    score = sum(2.0 * weights.get(term, 1.0)
-                for term, aliases in _PREVIEW_QUERY_ALIASES.items()
-                if term in text and any(alias in desc for alias in aliases))
+    score = 0.0
+    for term, aliases in _PREVIEW_QUERY_ALIASES.items():
+        if term not in text:
+            continue
+        matches = [alias for alias in aliases if alias and alias in desc]
+        if not matches:
+            continue
+        # One concept contributes once. Prefer its literal wording, then the
+        # strongest synonym; counting several synonyms in one caption would
+        # otherwise reward verbose but weakly related descriptions.
+        strength = max(
+            1.0 if alias == term else _PREVIEW_LOW_SPECIFICITY_ALIASES.get(alias, 0.8)
+            for alias in matches
+        )
+        score += 2.0 * weights.get(term, 1.0) * strength
     terms = _preview_query_terms(text)
     if terms:
         cue_terms = {term for term in _PREVIEW_QUERY_ALIASES if term in text}
