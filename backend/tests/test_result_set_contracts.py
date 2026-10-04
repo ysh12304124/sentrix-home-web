@@ -180,6 +180,34 @@ class ResultSetContractTests(unittest.TestCase):
                 asset_ids, "展示牌上写了什么文字", None)
         self.assertEqual(order[0], 1)
 
+    def test_preview_query_order_uses_trusted_place_and_capture_time(self):
+        class PreviewStore:
+            def get_asset(self, asset_id):
+                return {"captured_at": {
+                    "wrong": "2018-04-01 14:00:00",
+                    "answer": "2017-10-04 22:31:47",
+                }[asset_id]}
+
+            def list_observations(self, asset_id, limit=1):
+                return [{"captured_at": self.get_asset(asset_id)["captured_at"]}]
+
+        summaries = {
+            "wrong": "婚礼现场；舞台灯光；宾客合影",
+            "answer": "男子站立拍照；室内装饰布幔",
+        }
+        with patch.object(runtime_tools, "_observation_summary",
+                          side_effect=lambda _store, aid: summaries[aid]), \
+             patch.object(runtime_tools, "_place_matches",
+                          side_effect=lambda item, place, _store:
+                          item["asset_id"] == "answer" and place == "保定市"):
+            order = runtime_tools._preview_query_order(
+                ["wrong", "answer"],
+                "2017年10月4日晚上在保定市婚礼舞台前拍照",
+                PreviewStore(),
+                trusted_constraints={"place": "保定市", "time": "2017年10月4日"},
+            )
+        self.assertEqual(order[0], 1)
+
     def test_query_order_applies_even_when_result_set_fits_preview(self):
         asset_ids = ["noise", "answer"]
         summaries = {"noise": "室内场景；文字：you", "answer": "装饰；文字：一起幸福"}

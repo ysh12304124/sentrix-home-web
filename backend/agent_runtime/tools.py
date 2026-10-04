@@ -485,7 +485,9 @@ def _asset_group_key(store, asset_id: str) -> str:
         return asset_id
 
 
-def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
+def _preview_query_order(asset_ids: list[str], query: str, store,
+                         trusted_constraints: dict | None = None,
+                         scope_id: str = "") -> list[int]:
     """Promote candidates whose stored visual detail matches explicit visual cues."""
     text = str(query or "")
     cues = [(term, aliases) for term, aliases in _PREVIEW_QUERY_ALIASES.items()
@@ -503,13 +505,65 @@ def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
                 requested_count = None
     terms = _preview_query_terms(text)
     single_evidence = _query_prefers_single_evidence(text)
-    if not cues and not terms and requested_count is None and not single_evidence:
+    trusted = trusted_constraints or _trusted_query_constraints(
+        text, store=store, scope_id=scope_id)
+    place_query = str(trusted.get("place") or "").strip()
+    time_query = str(trusted.get("time") or "").strip()
+    time_bounds = None
+    if time_query:
+        try:
+            from ..query_contracts import parse_time_expression
+            time_bounds = parse_time_expression(time_query)
+        except Exception:
+            time_bounds = None
+    time_of_day = []
+    for cue, start_hour, end_hour in (
+        ("凌晨", 0, 5), ("清晨", 4, 8), ("早上", 5, 10),
+        ("上午", 8, 12), ("中午", 11, 14), ("下午", 13, 18),
+        ("傍晚", 17, 20), ("晚上", 18, 24), ("夜晚", 18, 24),
+        ("夜间", 18, 24),
+    ):
+        if cue in text:
+            time_of_day.append((start_hour, end_hour))
+    if (not cues and not terms and requested_count is None and not single_evidence
+            and not place_query and not time_query and not time_of_day):
         return list(range(len(asset_ids)))
     summaries = [_observation_summary(store, asset_id) for asset_id in asset_ids]
     term_weights = _preview_query_term_weights(text, summaries)
     scored = []
     for index, (asset_id, summary) in enumerate(zip(asset_ids, summaries)):
         score = _preview_text_score(text, summary, term_weights)
+        # The retrieval parser already extracts only user-grounded time/place
+        # constraints. Reuse those trusted metadata signals when choosing what
+        # the Agent sees first; a place-aware candidate that entered the search
+        # pool should not stay buried merely because its caption omits the town.
+        if place_query and _place_matches({"asset_id": asset_id}, place_query, store):
+            score += 7.0
+        if (time_query and time_bounds is not None and store is not None):
+            try:
+                asset = store.get_asset(asset_id) or {}
+                observation = (store.list_observations(asset_id=asset_id, limit=1) or [{}])[0]
+                from ..retrieval.temporal import trusted_captured_at
+                captured_at = trusted_captured_at(asset, observation, store=store)
+                if _in_time_bounds(captured_at, time_bounds):
+                    score += 7.0
+            except Exception:
+                pass
+        if time_of_day and store is not None:
+            try:
+                asset = store.get_asset(asset_id) or {}
+                observation = (store.list_observations(asset_id=asset_id, limit=1) or [{}])[0]
+                from ..retrieval.temporal import trusted_captured_at
+                captured_at = trusted_captured_at(asset, observation, store=store)
+                from datetime import datetime
+                captured = datetime.fromisoformat(
+                    str(captured_at or "").replace("Z", "+00:00"))
+                if any(start <= captured.hour < end
+                       or (end == 24 and captured.hour < 5)
+                       for start, end in time_of_day):
+                    score += 3.5
+            except Exception:
+                pass
         if requested_count is not None and store is not None:
             try:
                 face_count = int(store.connection.execute(
@@ -541,7 +595,9 @@ def _preview_query_order(asset_ids: list[str], query: str, store) -> list[int]:
 
 
 def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "",
-                     *, limit: int | None = None) -> list[int]:
+                     *, limit: int | None = None,
+                     trusted_constraints: dict | None = None,
+                     scope_id: str = "") -> list[int]:
     """Select bounded indices under an explicit candidate-window policy.
 
     The full ResultSet remains server-side.  ``SENTRIX_CANDIDATE_STRATEGY`` is
@@ -557,12 +613,14 @@ def _preview_indices(asset_ids: list[str], mode: str, store, query: str = "",
     # ranked source image from the user/evidence window.
     strategy = os.getenv("SENTRIX_CANDIDATE_STRATEGY", "head_only").strip().lower()
     if len(asset_ids) <= preview_limit:
-        return (_preview_query_order(asset_ids, query, store)
+        return (_preview_query_order(asset_ids, query, store,
+                                     trusted_constraints, scope_id)
                 if mode != "representative" else list(range(len(asset_ids))))
     if mode == "representative":
         candidates = _even_indices(len(asset_ids), preview_limit)
     else:
-        candidates = _preview_query_order(asset_ids, query, store)
+        candidates = _preview_query_order(
+            asset_ids, query, store, trusted_constraints, scope_id)
     if strategy in {"head_only", "relevance_head_only"}:
         return candidates[:preview_limit]
     if strategy in {"event_diversity", "diversity_only"}:
@@ -717,7 +775,11 @@ def _search_metadata_only(draft, spec, scope_id, query, mode, user_goal="") -> d
         scope_id=scope_id, query=query or "(时间/地点筛选)", asset_ids=asset_ids,
         unresolved=[])
     store = _RUNTIME.get("store")
-    indices = _preview_indices(asset_ids, mode, store, query=user_goal or query)
+    indices = _preview_indices(
+        asset_ids, mode, store, query=user_goal or query,
+        trusted_constraints=_trusted_query_constraints(
+            user_goal or query, store=store, scope_id=scope_id),
+        scope_id=scope_id)
     preview = [
         _preview_entry(store, assets[idx].get("id"), f"photo_{idx + 1}",
                        priority_rank=rank, selection_reason="相关性最高" if rank == 1 else "事件多样性补充")
@@ -1298,15 +1360,19 @@ def _search_from_prior_result_set(prior_rs, scope_id: str, *, query: str = "",
                  if not _is_face_reference_asset({"asset_id": asset_id}, store)
                  and not _is_synthetic_event_asset({"asset_id": asset_id}, store)]
     preview = []
+    display_query = query or getattr(prior_rs, "query", "") or user_goal
     indices = _preview_indices(
-        asset_ids, "best", store, query=query or getattr(prior_rs, "query", "") or user_goal)
+        asset_ids, "best", store, query=display_query,
+        trusted_constraints=_trusted_query_constraints(
+            user_goal or display_query, store=store, scope_id=scope_id),
+        scope_id=scope_id)
     preview = [
         _preview_entry(store, asset_ids[index], f"photo_{index + 1}",
                        priority_rank=rank, selection_reason="相关性最高" if rank == 1 else "事件多样性补充")
         for rank, index in enumerate(indices, 1)
     ]
     preview_asset_ids = [asset_ids[index] for index in indices if index < len(asset_ids)]
-    display_query = query or getattr(prior_rs, "query", "") or f"(引用已有结果集 {prior_rs.result_set_id})"
+    display_query = display_query or f"(引用已有结果集 {prior_rs.result_set_id})"
     validation = _validate_search_candidates(
         query=display_query,
         user_goal=user_goal,
@@ -2490,7 +2556,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # candidate membership or metric calculation.
     candidate_order_query = user_goal or query_for_retrieval or query
     if final_ids and mode != "representative":
-        order = _preview_query_order(final_ids, candidate_order_query, store)
+        order = _preview_query_order(
+            final_ids, candidate_order_query, store,
+            trusted_constraints=trusted_constraints, scope_id=scope_id)
         final_ids = [final_ids[index] for index in order
                      if 0 <= index < len(final_ids)]
 
@@ -2647,7 +2715,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # the bounded preview that the Agent can actually inspect and deliver.
     preview_query = user_goal or query_for_retrieval or query
     preview_indices = _preview_indices(
-        asset_ids, mode, store, query=preview_query, limit=_SLOT_PREVIEW_LIMIT)
+        asset_ids, mode, store, query=preview_query, limit=_SLOT_PREVIEW_LIMIT,
+        trusted_constraints=trusted_constraints, scope_id=scope_id)
     # 删模型重排：候选即最终。代码融合排序 + gap 截断已保证强相关在前，
     # 不再逐批调用 12B 验证候选（省 ~5 批模型调用/题，避免上下文膨胀）。
     validated_ids = list(asset_ids)
