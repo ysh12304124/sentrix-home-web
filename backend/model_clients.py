@@ -1457,10 +1457,20 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
                 fallback_reason = "context_budget_compaction_retry"
             else:
                 raise
+        def has_observable_content(value):
+            if any(str(value.get(key) or "").strip() for key in (
+                    "caption", "activity", "place", "event_type", "ocr_text")):
+                return True
+            if any(value.get(key) for key in (
+                    "people", "objects", "facts", "clothing", "spatial_relations")):
+                return True
+            detail = value.get("detail") or {}
+            return isinstance(detail, dict) and any(
+                detail.get(key) for key in (
+                    "visible_details", "regions", "text_blocks", "uncertainties"))
+
         parsed = parse_json_response(response)
-        meaningful = any(parsed.get(key) not in (None, "", []) for key in (
-            "caption", "activity", "people", "objects", "facts", "detail",
-        ))
+        meaningful = has_observable_content(parsed)
         if not meaningful and len(evidence_indices) > 3:
             selected_positions = [0, len(evidence_indices) // 2, len(evidence_indices) - 1]
             evidence_indices = [evidence_indices[index] for index in selected_positions]
@@ -1473,6 +1483,28 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
             response = self.chat(retry_prompt, limited_images, self._core_vision_options())
             parsed = parse_json_response(response)
             fallback_reason = "unparseable_multi_image_response"
+            meaningful = has_observable_content(parsed)
+        if not meaningful:
+            # A reported two-image limit can leave an unparseable response,
+            # which the three-image retry above cannot handle. Recover from
+            # up to two individual frames before accepting an empty index.
+            recovery_prompt = (
+                "仅根据这一帧可见画面返回简体中文 JSON，不猜测姓名或未见事件。"
+                "字段：caption（可见内容）、activity（可见动作）、place（可见环境）、"
+                "people、objects、detail（visible_details 数组）、"
+                "representative_indices（固定为 [0]）。看不清时不要编造。"
+            )
+            for source_index in dict.fromkeys((evidence_indices[0], evidence_indices[-1])):
+                recovered = parse_json_response(self.chat(
+                    recovery_prompt, [images[source_index]], self._core_vision_options()))
+                if has_observable_content(recovered):
+                    parsed = recovered
+                    evidence_indices = [source_index]
+                    fallback_reason = "single_image_recovery"
+                    meaningful = True
+                    break
+        if not meaningful:
+            raise ModelError("video event analysis produced no observable content")
         parsed["people"] = as_list(parsed.get("people"))
         parsed["objects"] = as_list(parsed.get("objects"))
         parsed["clothing"] = as_list(parsed.get("clothing"))
