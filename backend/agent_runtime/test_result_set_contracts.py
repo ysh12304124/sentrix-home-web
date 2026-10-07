@@ -220,6 +220,17 @@ class ResultSetContractTests(unittest.TestCase):
             "photo_2",
         )
 
+    def test_search_recommendation_follows_query_ranked_visible_head(self):
+        # The visible order already includes retrieval, time/place and visual
+        # signals. A second caption-only scorer must not redirect the Agent.
+        preview = [
+            {"handle": "photo_7", "evidence_summary": "婚礼舞台前的留影"},
+            {"handle": "photo_2", "evidence_summary": "婚礼舞台前的留影；拍照"},
+        ]
+        self.assertEqual(
+            runtime_tools._recommended_visible_handle(preview), "photo_7")
+        self.assertEqual(runtime_tools._recommended_visible_handle([]), "")
+
     def test_nucleus_binds_date_and_place_to_recommended_photo_not_preview_majority(self):
         state = {"tool_results": [{
             "tool": "search_memories", "recommended_handle": "photo_2",

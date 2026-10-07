@@ -2768,32 +2768,11 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     preview_indices = _preview_indices(
         asset_ids, mode, store, query=preview_query, limit=_SLOT_PREVIEW_LIMIT,
         trusted_constraints=trusted_constraints, scope_id=scope_id)
-    # Choose the recommendation from the entire retrieved pool, not from the
-    # already-truncated preview. In the latest QA traces, many zero-recall
-    # rows had a GT somewhere in the 48-candidate pool but outside the 18-item
-    # preview. The same query/caption/metadata scorer can recover such a
-    # candidate without adding assets or changing retrieval/metric scoring.
-    recommendation_pool = []
-    for index, asset_id in enumerate(asset_ids):
-        asset = store.get_asset(asset_id) if store is not None else {}
-        recommendation_pool.append({
-            "handle": f"photo_{index + 1}",
-            "evidence_summary": _observation_summary(store, asset_id),
-            "place": _short_place_label(asset or {}),
-        })
-    recommended_handle = _recommended_handle(preview_query, recommendation_pool)
-    original_preview_indices = list(preview_indices)
-    preview_indices = _include_recommended_candidate(
-        preview_indices, len(asset_ids), recommended_handle,
-        limit=_SLOT_PREVIEW_LIMIT)
-    recommended_match = re.fullmatch(r"photo_(\d+)", recommended_handle or "")
-    recommended_rank = int(recommended_match.group(1)) if recommended_match else None
-    slot_retrieval_timing["semantic_retrieval"].update({
-        "recommended_candidate_rank": recommended_rank,
-        "recommended_candidate_promoted": bool(
-            recommended_rank and recommended_rank - 1 not in original_preview_indices
-        ),
-    })
+    # The preview has already been ordered using the full query and trusted
+    # metadata. A second caption-only recommendation over all 48 candidates
+    # can disagree with that stronger ordering and steer the Agent to a wrong
+    # photo (or replace a relevant preview tail). Recommend the first visible
+    # item instead; neither candidate membership nor graph ranking changes.
     # 删模型重排：候选即最终。代码融合排序 + gap 截断已保证强相关在前，
     # 不再逐批调用 12B 验证候选（省 ~5 批模型调用/题，避免上下文膨胀）。
     validated_ids = list(asset_ids)
@@ -2809,6 +2788,12 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     # cues could appear effective in telemetry while the Agent never saw the
     # selected candidate. Handles still map to original ResultSet ranks.
     preview = _build_preview_entries(store, asset_ids, preview_indices)
+    recommended_handle = _recommended_visible_handle(preview)
+    recommended_match = re.fullmatch(r"photo_(\d+)", recommended_handle)
+    slot_retrieval_timing["semantic_retrieval"].update({
+        "recommended_candidate_rank": int(recommended_match.group(1)) if recommended_match else None,
+        "recommended_candidate_promoted": False,
+    })
     preview_asset_ids = [item.get("asset_id") for item in preview if item.get("asset_id")]
     public_handles = {asset_id: f"photo_{index + 1}"
                       for index, asset_id in enumerate(rs.visible_asset_ids())}
@@ -2900,6 +2885,11 @@ def _short_place_label(asset: dict) -> str:
     if parts:
         return "".join(parts)
     return str(geocode.get("label") or "")
+
+
+def _recommended_visible_handle(preview: list) -> str:
+    """Use the query-ranked visible head as the search recommendation."""
+    return str((preview[0] or {}).get("handle") or "") if preview else ""
 
 
 def _recommended_handle(query: str, preview: list) -> str:
