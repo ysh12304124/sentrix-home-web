@@ -140,6 +140,30 @@ def parse_json_response(value):
     return {}
 
 
+def parse_partial_image_observation(value):
+    """Recover complete leading visual strings from a truncated image JSON.
+
+    Local VLMs may spend their output budget on OCR and omit the closing brace.
+    Keep only fully quoted, JSON-decodable descriptive strings; never recover
+    partial OCR numbers, arrays, or nested claims from an incomplete response.
+    """
+    text = str(value or "").strip()
+    if not text.startswith("{"):
+        return {}
+    recovered = {}
+    for key in ("caption", "activity", "place", "event_type"):
+        match = re.search(r'"' + key + r'"\s*:\s*("(?:\\.|[^"\\])*")', text, re.DOTALL)
+        if not match:
+            continue
+        try:
+            decoded = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, str) and decoded.strip():
+            recovered[key] = decoded.strip()
+    return recovered
+
+
 def as_list(value):
     if value is None:
         return []
@@ -1367,13 +1391,23 @@ class GammaClient:
         prompt += "、".join(ATMOSPHERE_PRIMARY_TYPES)
         prompt += "。facts 项仅含 subject、predicate、object、confidence。\n不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。\nmetadata: "
         prompt += json.dumps(metadata or {}, ensure_ascii=False)
-        parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
+        raw_image_observation = self.chat(
+            prompt, [{"base64": encoded, "mime_type": mime_type}],
+            self._core_vision_options())
+        parsed = parse_json_response(raw_image_observation)
+        if not parsed:
+            parsed = parse_partial_image_observation(raw_image_observation)
         if (os.getenv("SENTRIX_VISION_RECOVERY_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
                 and not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text"))
                 and not parsed.get("people") and not parsed.get("objects")):
             recovery_prompt = """首轮图片结果只有分类或为空，请补齐可验证的自然语言观察。只根据图片，不猜测姓名，不输出坐标。
 严格返回简体中文 JSON：caption（图片中看到什么，160字内）、activity（正在发生什么，40字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，40字内）、event_type（40字内）、people（最多12项）、objects（最多40项）、ocr_text（1000字内）、detail（visible_details/regions/text_blocks/uncertainties）。画面确实看不清才留空；不要只返回分类字段。"""
-            recovered = parse_json_response(self.chat(recovery_prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
+            raw_recovery = self.chat(
+                recovery_prompt, [{"base64": encoded, "mime_type": mime_type}],
+                self._core_vision_options())
+            recovered = parse_json_response(raw_recovery)
+            if not recovered:
+                recovered = parse_partial_image_observation(raw_recovery)
             for key in ("caption", "activity", "place", "event_type", "people", "objects", "ocr_text"):
                 if recovered.get(key) not in (None, "", []):
                     parsed[key] = recovered[key]

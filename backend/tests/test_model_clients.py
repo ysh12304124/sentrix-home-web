@@ -15,11 +15,32 @@ from backend.model_clients import (
     cap_output_tokens_for_estimated_room,
     normalize_confidence,
     parse_json_response,
+    parse_partial_image_observation,
 )
 from backend.agent_runtime.tool_policy import ToolPolicy
 
 
 class ModelClientTests(unittest.TestCase):
+    def test_truncated_vision_json_keeps_complete_caption_not_partial_ocr(self):
+        parsed = parse_partial_image_observation(
+            '{"caption":"电脑屏幕上有销售出库单",'
+            '"activity":"查看单据","ocr_text":"金额 6,6')
+        self.assertEqual(parsed, {
+            "caption": "电脑屏幕上有销售出库单",
+            "activity": "查看单据",
+        })
+
+    def test_image_analysis_uses_complete_fields_from_truncated_json(self):
+        client = GammaClient()
+        with patch.object(client, "_encode_core_image", return_value=("image", "image/jpeg")), \
+                patch.object(client, "chat", return_value=(
+                    '{"caption":"电脑屏幕上有销售出库单",'
+                    '"activity":"查看单据","ocr_text":"金额 6,6')) as chat:
+            result = client.analyze_image("unused.jpg")
+        self.assertEqual(result["caption"], "电脑屏幕上有销售出库单")
+        self.assertEqual(result["ocr_text"], "")
+        self.assertEqual(chat.call_count, 1)
+
     def test_empty_vision_description_recovers_by_default(self):
         client = GammaClient()
         with patch.object(client, "_encode_core_image", return_value=("image", "image/jpeg")), \
