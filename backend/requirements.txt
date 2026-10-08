@@ -18,6 +18,8 @@ open-clip-torch==3.3.0
 pygeo-cn>=0.1.5
 # International offline fallback when PyGeoCN cannot resolve non-China GPS.
 reverse_geocoder>=1.5,<2
+# Offline Chinese lunar-date conversion for explicitly lunar-dated searches.
+lunar_python==1.3.9
 # pygeo-cn depends on geopandas -> pandas; keep pandas inside the venv so
 # PYTHONNOUSERSITE=1 does not hide it (user-site installs are disabled).
 pandas>=2.0,<3

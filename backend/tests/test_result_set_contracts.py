@@ -4,8 +4,12 @@ import os
 import tempfile
 import unittest
 from unittest.mock import patch
+from pathlib import Path
+
+from PIL import Image
 
 from backend.db import MemoryStore
+from backend.model_clients import GammaClient
 from backend.agent_runtime import tools as runtime_tools
 from backend.agent_runtime.result_set import debug_asset_projection, TaskState as ResultTaskState
 from backend.agent_runtime.intent import visual_intent
@@ -113,6 +117,46 @@ class ResultSetContractTests(unittest.TestCase):
         )
         self.assertEqual(out["query"], "现场人物穿什么")
         self.assertEqual(out["recommended_resolution"]["tool"], "inspect_photo")
+
+    def test_referent_with_new_grounded_place_reopens_full_search(self):
+        rs = runtime_tools._RUNTIME["result_sets"].new(
+            scope_id="album", query="孩子和花灯", asset_ids=["asset_1"]
+        )
+        self.assertTrue(runtime_tools._reference_has_new_grounded_anchor(
+            rs, "正月初三去正定", "就是正月初三那次", {"place": "正定"}))
+        self.assertFalse(runtime_tools._reference_has_new_grounded_anchor(
+            rs, "孩子穿什么", "那次孩子穿什么", {}))
+
+    def test_dining_scene_outranks_generic_group_photo(self):
+        query = "我带明明和朋友在邯郸吃晚餐拍合影"
+        dining = "三人在餐厅内合影，一人抱着孩子；餐饮空间"
+        unrelated = "两个孩子在公园石雕前合影"
+        weights = runtime_tools._preview_query_term_weights(query, [unrelated, dining])
+        self.assertGreater(
+            runtime_tools._preview_text_score(query, dining, weights),
+            runtime_tools._preview_text_score(query, unrelated, weights))
+
+    def test_inspect_retries_context_overflow_with_smaller_image(self):
+        image_path = Path(self.tmp) / "large.jpg"
+        Image.new("RGB", (1600, 1200), (100, 120, 140)).save(image_path)
+        asset = self.store.create_asset(
+            "asset-large", "large.jpg", "image", str(image_path), scope_id="album")
+        gamma = GammaClient()
+        runtime_tools._RUNTIME["gamma"] = gamma
+        rs = runtime_tools._RUNTIME["result_sets"].new(
+            scope_id="album", query="照片", asset_ids=[asset["id"]])
+        with patch.object(gamma, "chat", side_effect=[
+            ValueError("Input length (4326) exceeds model's maximum context length 4096"),
+            '{"observation":"三人在餐厅内合影","certainty":"supported"}',
+        ]) as chat:
+            out = runtime_tools._inspect_photo(
+                {"asset_handle": "photo_1", "question": "有谁"},
+                context={"scope_id": "album", "task_state": {
+                    "current_result_set": rs.result_set_id}})
+        self.assertEqual(out["observation"], "三人在餐厅内合影")
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(chat.call_args_list[1].kwargs["vision_options"],
+                         {"num_predict": 192})
 
     def test_debug_projection_separates_full_candidates_from_preview(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(

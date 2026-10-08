@@ -1329,10 +1329,12 @@ class GammaClient:
             "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "384")),
         }
 
-    def encode_vision_image(self, path):
+    def encode_vision_image(self, path, *, max_dimension=None):
         """Downsample only the model input; the source asset remains untouched."""
         file_path = Path(path)
-        max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "768"))
+        if max_dimension is None:
+            max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "768"))
+        max_dimension = max(1, int(max_dimension))
         try:
             from .image_io import ensure_heif_support, guess_mime_type
             from PIL import Image

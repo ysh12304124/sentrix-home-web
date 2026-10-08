@@ -261,6 +261,12 @@ _PREVIEW_QUERY_ALIASES = {
     "紫色": ("紫色", "紫", "紫布", "紫色布景", "紫色纱幔"),
     "紫": ("紫色", "紫", "紫布", "紫色布景", "紫色纱幔"),
     "室外": ("室外", "户外", "露天"),
+    # A meal is often indexed as a dining scene rather than with the user's
+    # exact verb. Keep the equivalence in preview ranking, not hard filtering.
+    "晚餐": ("晚餐", "聚餐", "用餐", "吃饭", "餐厅", "餐饮空间", "餐桌"),
+    "聚餐": ("聚餐", "用餐", "吃饭", "餐厅", "餐饮空间", "餐桌"),
+    "报销": ("报销", "票据", "收据", "发票", "单据", "凭证"),
+    "单据": ("单据", "票据", "收据", "发票", "凭证"),
 }
 
 # Some caption words are only weak evidence for a query concept. Treating every
@@ -542,6 +548,18 @@ def _preview_query_order(asset_ids: list[str], query: str, store,
             time_bounds = parse_time_expression(time_query)
         except Exception:
             time_bounds = None
+    lunar_dates = set()
+    if store is not None and re.search(r"(?:大年|正月|农历.{1,3}月)初", text):
+        try:
+            from .lunar_time import lunar_solar_dates
+            years = set()
+            for candidate_id in asset_ids:
+                year = str((store.get_asset(candidate_id) or {}).get("captured_at") or "")[:4]
+                if year.isdigit():
+                    years.add(int(year))
+            lunar_dates = {str(day) for day in lunar_solar_dates(text, years)}
+        except (AttributeError, TypeError, ValueError):
+            pass
     time_of_day = []
     for cue, start_hour, end_hour in (
         ("凌晨", 0, 5), ("清晨", 4, 8), ("早上", 5, 10),
@@ -573,6 +591,16 @@ def _preview_query_order(asset_ids: list[str], query: str, store,
                 captured_at = trusted_captured_at(asset, observation, store=store)
                 if _in_time_bounds(captured_at, time_bounds):
                     score += 7.0
+            except Exception:
+                pass
+        if lunar_dates and store is not None:
+            try:
+                asset = store.get_asset(asset_id) or {}
+                observation = (store.list_observations(asset_id=asset_id, limit=1) or [{}])[0]
+                from ..retrieval.temporal import trusted_captured_at
+                captured_at = trusted_captured_at(asset, observation, store=store)
+                if str(captured_at or "")[:10] in lunar_dates:
+                    score += 12.0
             except Exception:
                 pass
         if time_of_day and store is not None:
@@ -1358,6 +1386,21 @@ def _is_referent_query(query: str) -> bool:
     if not q:
         return False
     return any(m in q for m in _REFERENT_MARKERS)
+
+
+def _reference_has_new_grounded_anchor(prior_rs, query: str, user_goal: str,
+                                       filters: dict) -> bool:
+    """Do not trap a refined search inside a stale ResultSet."""
+    if prior_rs is None:
+        return False
+    prior_query = str(getattr(prior_rs, "query", "") or "")
+    current_text = f"{user_goal} {query}"
+    for key in ("time", "place", "person"):
+        value = str(filters.get(key) or "").strip()
+        if (value and _literal_in_text(value, current_text)
+                and not _literal_in_text(value, prior_query)):
+            return True
+    return False
 
 
 def _is_face_reference_asset(item: dict, store=None) -> bool:
@@ -2215,13 +2258,16 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                     prior_rs = rs_store.get(prior_rs_id)
                 except Exception:
                     prior_rs = None
-        try:
-            anchored = _search_from_prior_result_set(
-                prior_rs, scope_id, query=query, user_goal=_user_msg)
-        except (KeyError, IndexError, TypeError):
-            anchored = _bounded_event_result(prior_rs, scope_id, query=query, user_goal=_user_msg) if prior_rs else None
-        if anchored is not None:
-            return anchored
+        if not _reference_has_new_grounded_anchor(prior_rs, query, _user_msg, filters):
+            try:
+                anchored = _search_from_prior_result_set(
+                    prior_rs, scope_id, query=query, user_goal=_user_msg)
+            except (KeyError, IndexError, TypeError):
+                anchored = (_bounded_event_result(
+                    prior_rs, scope_id, query=query, user_goal=_user_msg)
+                    if prior_rs else None)
+            if anchored is not None:
+                return anchored
         # A first-turn referent without a prior result set still goes through
         # the normal retrieval channels.  Resolving an arbitrary event here
         # would silently turn “那次旅行的合影” into an unrelated event.
@@ -2475,6 +2521,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "months": set(_slot_months) or None,
             "days": set(_slot_days) or None,
         }
+    # "正月" and "初三" are lunar components. Never reinterpret them as
+    # Gregorian January/third-day hard filters supplied by a model parser.
+    if re.search(r"(?:大年|正月|农历.{1,3}月)初", user_goal or query):
+        time_comps = {"year": int(_slot_year), "months": None, "days": None} if _slot_year else None
     time_bounds = None
     if filters.get("time") and time_comps is None:
         try:
@@ -2567,6 +2617,51 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         for aid in place_matched_ids:
             scores[aid] = scores.get(aid, 0.0) + place_boost
 
+    # An explicit lunar day is a factual calendar anchor, even when captions
+    # never spell out the holiday. Add media captured on its solar date as an
+    # independent, bounded channel. With no stated year, only years present in
+    # this authorised album are considered; graph/semantic scores remain.
+    lunar_candidate_count = 0
+    lunar_dates = set()
+    lunar_query = f"{user_goal} {query_for_retrieval or query}"
+    if scope_id and re.search(r"(?:大年|正月|农历.{1,3}月)初", lunar_query):
+        try:
+            from .lunar_time import lunar_solar_dates
+            year_rows = _store_fetchall(
+                store,
+                "SELECT DISTINCT substr(captured_at,1,4) AS year "
+                "FROM assets WHERE scope_id=? AND captured_at IS NOT NULL",
+                (scope_id,),
+            )
+            album_years = {int(row["year"]) for row in year_rows
+                           if str(row["year"] or "").isdigit()}
+            lunar_dates = lunar_solar_dates(lunar_query, album_years)
+            if lunar_dates:
+                solar_date_strings = {str(day) for day in lunar_dates}
+                placeholders = ",".join("?" for _ in lunar_dates)
+                date_rows = _store_fetchall(
+                    store,
+                    "SELECT id FROM assets WHERE scope_id=? AND "
+                    f"substr(captured_at,1,10) IN ({placeholders}) LIMIT 240",
+                    (scope_id, *sorted(solar_date_strings)),
+                )
+                calendar_boost = max(scores.values(), default=0.01) * 0.8
+                for date_row in date_rows:
+                    aid = str(date_row["id"])
+                    asset = store.get_asset(aid) or {}
+                    if (_is_face_reference_asset({"asset_id": aid}, store)
+                            or _is_synthetic_event_asset({"asset_id": aid}, store)
+                            or (media_constraint and str(asset.get("media_type") or "").lower()
+                                != media_constraint)
+                            or str(_asset_captured(aid) or "")[:10] not in
+                                solar_date_strings):
+                        continue
+                    if aid not in scores:
+                        lunar_candidate_count += 1
+                    scores[aid] = scores.get(aid, 0.0) + calendar_boost
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+
     # A keyframe is indexed as an image, but the benchmark's video GT is the
     # parent source video.  Expand this provenance edge before the bounded
     # candidate head is cut, so an otherwise correct keyframe hit cannot lose
@@ -2636,6 +2731,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "trusted_place": str(trusted_constraints.get("place") or ""),
             "place_matched_candidate_count": len(place_matched_ids),
             "place_boost": round(place_boost, 6),
+            "lunar_calendar_dates": len(lunar_dates),
+            "lunar_calendar_added_count": lunar_candidate_count,
             "event_anchor_enabled": event_anchor_enabled,
             "event_anchor_source": event_anchor_source,
             "event_anchor_candidate_count": len(event_member_ids),
@@ -3297,8 +3394,32 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
                 "只回答目标人物，不要把同图其他人的外观或动作归给目标人物。"
                 if target_person else ""),
         ) + face_context
-        raw = gamma.chat(prompt, images=inspect_images,
-                         json_mode=True, role="inspect")
+        try:
+            raw = gamma.chat(prompt, images=inspect_images,
+                             json_mode=True, role="inspect")
+        except Exception as first_error:
+            # Retry only a model context overflow with smaller *input* images.
+            # The source photo and the configured model context are unchanged.
+            error_text = str(first_error).lower()
+            if not ("context length" in error_text or "input length" in error_text):
+                raise
+            for dimension in (512, 384):
+                retry_images = []
+                for image_path in ([crop_path] if crop_path else []) + [row["path"]]:
+                    encoded, mime_type = gamma.encode_vision_image(
+                        image_path, max_dimension=dimension)
+                    retry_images.append({"base64": encoded, "mime_type": mime_type})
+                try:
+                    raw = gamma.chat(
+                        prompt, images=retry_images, json_mode=True,
+                        role="inspect", vision_options={"num_predict": 192})
+                    break
+                except Exception as retry_error:
+                    if ("context length" not in str(retry_error).lower()
+                            and "input length" not in str(retry_error).lower()):
+                        raise
+            else:
+                raise first_error
     except Exception as exc:
         if crop_path:
             Path(crop_path).unlink(missing_ok=True)

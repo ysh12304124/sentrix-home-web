@@ -85,6 +85,19 @@ class ModelClientTests(unittest.TestCase):
             self.assertEqual(mime_type, "image/jpeg")
             self.assertEqual(Path(image_file.name).read_bytes(), original_bytes)
 
+    def test_vision_image_encoding_accepts_inspection_retry_dimension(self):
+        import base64
+        from io import BytesIO
+        client = GammaClient()
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "inspection.jpg"
+            Image.new("RGB", (1600, 1200), color=(100, 120, 140)).save(image_path)
+            original = image_path.read_bytes()
+            encoded, _ = client.encode_vision_image(image_path, max_dimension=384)
+            with Image.open(BytesIO(base64.b64decode(encoded))) as resized:
+                self.assertEqual(resized.size, (384, 288))
+            self.assertEqual(image_path.read_bytes(), original)
+
     def test_chat_messages_caps_output_to_remaining_context(self):
         client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
         with patch.object(client, "_tokenize_for_budget", return_value={
