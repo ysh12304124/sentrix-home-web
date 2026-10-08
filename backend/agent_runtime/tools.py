@@ -2478,7 +2478,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             slot_route_levels.append(int(_relax_level or 0))
             for _rank, _item in enumerate(_route_assets[:_SLOT_ROUTE_HEAD], 1):
                 _aid = _item.get("asset_id")
-                if _aid:
+                if (_aid
+                        and not _is_face_reference_asset(_item, store)
+                        and not _is_synthetic_event_asset(_item, store)):
                     per_asset_ranks.setdefault(_aid, []).append(_rank)
 
             # A non-empty strict place search is not proof that its results
@@ -2506,7 +2508,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                         slot_graph_traces.append(_fallback_timing)
                 for _rank, _item in enumerate(_fallback_assets[:_SLOT_ROUTE_HEAD], 1):
                     _aid = _item.get("asset_id")
-                    if _aid:
+                    if (_aid
+                            and not _is_face_reference_asset(_item, store)
+                            and not _is_synthetic_event_asset(_item, store)):
                         place_fallback_ranks.setdefault(_aid, []).append(_rank)
         except Exception as error:
             slot_route_trace.append({
