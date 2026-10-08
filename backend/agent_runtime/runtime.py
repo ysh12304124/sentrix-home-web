@@ -1346,6 +1346,30 @@ def _selected_metadata_facts(task_state: dict, handles: list[str]) -> list[str]:
     return facts[:6]
 
 
+def _selected_inspection_facts(task_state: dict, handles: list[str]) -> list[str]:
+    """Project observed visuals and confirmed identities for selected photos."""
+    selected = set(handles or [])
+    facts = []
+    for result in task_state.get("tool_results") or []:
+        if (result.get("tool") != "inspect_photo"
+                or str(result.get("inspect_handle") or "") not in selected):
+            continue
+        handle = str(result["inspect_handle"])
+        observation = str(result.get("inspect_text") or "").strip()
+        if observation and str(result.get("certainty") or "").lower() != "uncertain":
+            facts.append(f"照片 {handle} 视觉复核：{observation[:240]}")
+        confirmed = []
+        for identity in result.get("photo_identities") or []:
+            if not isinstance(identity, dict) or identity.get("identity_status") != "confirmed":
+                continue
+            label = str(identity.get("person_name") or identity.get("family_role") or "").strip()
+            if label and label not in confirmed:
+                confirmed.append(label)
+        if confirmed:
+            facts.append(f"照片 {handle} 已确认人物：{'、'.join(confirmed[:8])}")
+    return facts[:6]
+
+
 def _build_answer_grounding(*, message: str, task: TaskState,
                             selected_handle: str | None = None,
                             selected_image_handles: list[str] | None = None,
@@ -2046,7 +2070,7 @@ class AgentRuntime:
         max_parse_retries = 3
         guard_retries = 0
         max_guard_retries = 1
-        metadata_refusal_retried = False
+        evidence_refusal_retried = False
         seen_tool_calls = set()
         # 检索/复核收敛：search_memories 每轮最多 1 次（18 张候选 + get_result_page 翻页）、
         # 同一张图最多 inspect/read_photo_text 1 次。
@@ -2777,30 +2801,30 @@ class AgentRuntime:
                     turn.final_answer = naturalize_answer(turn.final_answer)
                 except Exception:
                     pass
-                # A selected photo can carry a reliable capture date/place
-                # even when the visual inspector cannot see that metadata.
-                # The model sometimes says "records cannot confirm" despite
-                # selecting that exact photo. Give it one bounded chance to
-                # use only the selected photo's metadata, never the broad
-                # candidate pool or a benchmark answer label.
-                if (not metadata_refusal_retried and selected_image_handles
+                # The model sometimes refuses even after selecting and
+                # inspecting the exact photo. Give it one bounded chance to
+                # use only that photo's metadata, observed visual details and
+                # confirmed identities; never the broad candidate pool or a
+                # benchmark answer label.
+                if (not evidence_refusal_retried and selected_image_handles
                         and task.tool_results and turn.budget.can_model_step()
-                        and re.search(r"哪年|哪一年|哪天|什么时候|何时|日期|时间|哪次|在哪|哪里|地点|位置", message)
                         and re.search(r"看不出来|不足以确认|无法确认|不能确认|无法判断|不清楚", turn.final_answer)):
-                    selected_facts = _selected_metadata_facts(
-                        task.as_dict(), selected_image_handles)
+                    selected_facts = (
+                        _selected_metadata_facts(task.as_dict(), selected_image_handles)
+                        + _selected_inspection_facts(task.as_dict(), selected_image_handles))
                     if selected_facts:
-                        metadata_refusal_retried = True
-                        turn.steps.append({"type": "metadata_answer_retry", "status": "prompted",
+                        evidence_refusal_retried = True
+                        turn.steps.append({"type": "selected_evidence_answer_retry", "status": "prompted",
                                            "handles": list(selected_image_handles)})
                         messages.append({"role": "assistant", "content": _model_visible_action(action)})
                         messages.append({"role": "user", "content": (
-                            "你刚选择展示的照片有以下拍摄元数据：\n- "
+                            "你刚选择展示的照片有以下已获得的证据：\n- "
                             + "\n- ".join(selected_facts)
-                            + "\n请核对这些照片是否确实对应用户所问事件。若对应，直接回答"
-                              "元数据支持的日期或地点；若只能确认到城市/区，不要编造街道或店名，"
-                              "应先说已确认的部分，再说明更具体部分不明。若照片不对应，"
-                              "不要把它的时间地点套用到用户事件。只输出修正后的 JSON final。"
+                            + "\n请核对这些照片是否对应用户所问事件。若对应，先回答证据支持的"
+                              "人物、画面、日期或地点；只有已确认人物才能使用姓名。无法确认的细节"
+                              "可单独说明，但不要因此否认已确认的部分，也不要编造街道、价格或"
+                              "照片中看不清的内容。若照片不对应，不要套用其信息。"
+                              "只输出修正后的 JSON final。"
                         )})
                         continue
                 # Phase H H-A：简单确定性问题（数量/日期/布尔）直接按 Nucleus 确定性渲染，
