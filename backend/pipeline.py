@@ -545,6 +545,8 @@ class IngestionPipeline:
             "facts": analysis.get("facts", []),
         }
         analysis["canonical"] = {key: analysis.get(key) for key in ("caption", "activity", "place", "scene_type", "semantic", "raw_labels", "people", "objects", "clothing", "emotions", "spatial_relations", "ocr_text", "event_type")}
+        analysis["canonical"]["semantic_status"] = "complete"
+        analysis["semantic_status"] = "complete"
         analysis["location_context"] = metadata.get("reverse_geocode") or {}
         analysis["raw"] = {"gamma": {key: value for key, value in analysis.items() if key != "location_context"}, "location_context": analysis["location_context"], "semantic_status": "complete"}
         objects = analysis.get("objects") or []

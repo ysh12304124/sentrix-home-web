@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from backend.agent_runtime.tools import _event_keyword_anchor
+from backend.agent_runtime.tools import _event_keyword_anchor, _expand_ranked_event_neighbors
 
 
 class EventRetrievalAnchorTests(unittest.TestCase):
@@ -75,6 +75,39 @@ class EventRetrievalAnchorTests(unittest.TestCase):
         result = _event_keyword_anchor("这张照片在哪里拍的？", store, "scope-1")
 
         self.assertIsNone(result)
+
+    def test_ranked_seed_expands_only_its_small_in_scope_event(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript("""
+            CREATE TABLE observations (id TEXT, asset_id TEXT);
+            CREATE TABLE event_observations (event_id TEXT, observation_id TEXT);
+            CREATE TABLE assets (id TEXT, scope_id TEXT, media_type TEXT,
+                                 captured_at TEXT, file_name TEXT, metadata_json TEXT);
+        """)
+        for asset_id, event_id, scope_id in (
+            ("seed", "wedding", "scope-1"),
+            ("sibling", "wedding", "scope-1"),
+            ("other-scope", "wedding", "scope-2"),
+            ("unrelated", "outing", "scope-1"),
+        ):
+            connection.execute("INSERT INTO assets VALUES (?,?,?,?,?,?)", (
+                asset_id, scope_id, "image", "2017-12-16", f"{asset_id}.jpg", "{}"))
+            connection.execute("INSERT INTO observations VALUES (?,?)", (
+                f"obs-{asset_id}", asset_id))
+            connection.execute("INSERT INTO event_observations VALUES (?,?)", (
+                event_id, f"obs-{asset_id}"))
+        store = type("Store", (), {
+            "connection": connection,
+            "get_asset": lambda self, aid: {
+                "file_name": f"{aid}.jpg", "metadata_json": {}}
+        })()
+        scores = {"seed": 0.2}
+        added = _expand_ranked_event_neighbors(scores, store, "scope-1", "image")
+        self.assertEqual(added, {"sibling"})
+        self.assertAlmostEqual(scores["sibling"], 0.14)
+        self.assertNotIn("other-scope", scores)
+        self.assertNotIn("unrelated", scores)
 
 
 if __name__ == "__main__":

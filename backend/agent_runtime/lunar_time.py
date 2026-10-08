@@ -57,3 +57,37 @@ def lunar_solar_dates(query: str, album_years: set[int]) -> set[date]:
         except (TypeError, ValueError, IndexError, KeyError):
             continue
     return dates
+
+
+def lunar_holiday_dates(query: str, album_years: set[int]) -> set[date]:
+    """Expand an explicitly named Spring Festival to its first seven days.
+
+    A holiday without a day is a time *range*, not Gregorian January or a
+    model-guessed year.  Keep every authorised album year in play.  Explicit
+    lunar day wording remains exact and takes precedence over this range.
+    """
+    text = str(query or "")
+    exact = lunar_solar_dates(text, album_years)
+    if exact:
+        return exact
+    if not re.search(r"春节|过年|新春|农历新年", text):
+        return set()
+    explicit_years = {int(year) for year in _YEAR.findall(text)}
+    if not explicit_years:
+        explicit_years = {2000 + int(year) for year in _SHORT_YEAR.findall(text)}
+    years = explicit_years or album_years
+    try:
+        from lunar_python import Lunar
+    except ImportError:
+        return set()
+    dates = set()
+    for year in years:
+        if not 1900 <= year <= 2099:
+            continue
+        for day in range(1, 8):
+            try:
+                solar = Lunar.fromYmd(year, 1, day).getSolar()
+                dates.add(date(solar.getYear(), solar.getMonth(), solar.getDay()))
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+    return dates

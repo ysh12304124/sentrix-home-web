@@ -1368,7 +1368,7 @@ class GammaClient:
         prompt += "。facts 项仅含 subject、predicate、object、confidence。\n不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。\nmetadata: "
         prompt += json.dumps(metadata or {}, ensure_ascii=False)
         parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
-        if (os.getenv("SENTRIX_VISION_RECOVERY_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if (os.getenv("SENTRIX_VISION_RECOVERY_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
                 and not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text"))
                 and not parsed.get("people") and not parsed.get("objects")):
             recovery_prompt = """首轮图片结果只有分类或为空，请补齐可验证的自然语言观察。只根据图片，不猜测姓名，不输出坐标。

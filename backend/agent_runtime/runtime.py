@@ -1312,6 +1312,40 @@ def _confirmed_facts(task_state: dict) -> list[str]:
     return facts
 
 
+def _selected_metadata_facts(task_state: dict, handles: list[str]) -> list[str]:
+    """Expose only metadata attached to explicitly selected visible photos.
+
+    A broad search preview can contain unrelated dates/places, so using all
+    preview metadata as answer facts would manufacture certainty.  This narrow
+    projection is for one final-answer retry, not for replacing the answer.
+    """
+    selected = set(handles or [])
+    if not selected:
+        return []
+    facts: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for result in task_state.get("tool_results") or []:
+        if result.get("tool") != "search_memories":
+            continue
+        for row in result.get("preview") or []:
+            handle = str(row.get("handle") or "")
+            if handle not in selected:
+                continue
+            captured = str(row.get("captured_at") or "").strip()
+            place = str(row.get("place") or "").strip()
+            key = (handle, captured, place)
+            if key in seen or not (captured or place):
+                continue
+            seen.add(key)
+            parts = [f"照片 {handle}"]
+            if captured:
+                parts.append(f"拍摄时间 {captured}")
+            if place:
+                parts.append(f"地点元数据 {place}")
+            facts.append("；".join(parts))
+    return facts[:6]
+
+
 def _build_answer_grounding(*, message: str, task: TaskState,
                             selected_handle: str | None = None,
                             selected_image_handles: list[str] | None = None,
@@ -2012,6 +2046,7 @@ class AgentRuntime:
         max_parse_retries = 3
         guard_retries = 0
         max_guard_retries = 1
+        metadata_refusal_retried = False
         seen_tool_calls = set()
         # 检索/复核收敛：search_memories 每轮最多 1 次（18 张候选 + get_result_page 翻页）、
         # 同一张图最多 inspect/read_photo_text 1 次。
@@ -2742,6 +2777,32 @@ class AgentRuntime:
                     turn.final_answer = naturalize_answer(turn.final_answer)
                 except Exception:
                     pass
+                # A selected photo can carry a reliable capture date/place
+                # even when the visual inspector cannot see that metadata.
+                # The model sometimes says "records cannot confirm" despite
+                # selecting that exact photo. Give it one bounded chance to
+                # use only the selected photo's metadata, never the broad
+                # candidate pool or a benchmark answer label.
+                if (not metadata_refusal_retried and selected_image_handles
+                        and task.tool_results and turn.budget.can_model_step()
+                        and re.search(r"哪年|哪一年|哪天|什么时候|何时|日期|时间|哪次|在哪|哪里|地点|位置", message)
+                        and re.search(r"看不出来|不足以确认|无法确认|不能确认|无法判断|不清楚", turn.final_answer)):
+                    selected_facts = _selected_metadata_facts(
+                        task.as_dict(), selected_image_handles)
+                    if selected_facts:
+                        metadata_refusal_retried = True
+                        turn.steps.append({"type": "metadata_answer_retry", "status": "prompted",
+                                           "handles": list(selected_image_handles)})
+                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                        messages.append({"role": "user", "content": (
+                            "你刚选择展示的照片有以下拍摄元数据：\n- "
+                            + "\n- ".join(selected_facts)
+                            + "\n请核对这些照片是否确实对应用户所问事件。若对应，直接回答"
+                              "元数据支持的日期或地点；若只能确认到城市/区，不要编造街道或店名，"
+                              "应先说已确认的部分，再说明更具体部分不明。若照片不对应，"
+                              "不要把它的时间地点套用到用户事件。只输出修正后的 JSON final。"
+                        )})
+                        continue
                 # Phase H H-A：简单确定性问题（数量/日期/布尔）直接按 Nucleus 确定性渲染，
                 # 不再把 total=5 交给 12B 自由改写（reg3 少报根因）。
                 try:

@@ -1946,6 +1946,59 @@ _SLOT_ROUTE_HEAD = 60
 _SLOT_MAX_CANDIDATES = 48
 
 
+def _expand_ranked_event_neighbors(scores, store, scope_id, media_constraint=None):
+    """Give a few siblings of strong retrieved photos a bounded, soft score.
+
+    Event resolution from question text can miss an event even when one of its
+    photos was retrieved.  Follow only the graph edges of the highest ranked
+    photos; never turn an entire album or a large, noisy event into a hard hit.
+    """
+    if not scores or not scope_id:
+        return set()
+    anchors = sorted(scores, key=lambda aid: -scores[aid])[:12]
+    placeholders = ",".join("?" for _ in anchors)
+    try:
+        rows = _store_fetchall(
+            store,
+            "SELECT o.asset_id, eo.event_id FROM observations o "
+            "JOIN event_observations eo ON eo.observation_id=o.id "
+            f"WHERE o.asset_id IN ({placeholders})",
+            anchors,
+        )
+    except Exception:
+        return set()
+    event_scores = {}
+    for row in rows:
+        asset_id, event_id = row[0], row[1]
+        event_scores[event_id] = max(event_scores.get(event_id, 0.0), scores.get(asset_id, 0.0))
+    added = set()
+    for event_id, seed_score in sorted(event_scores.items(), key=lambda pair: -pair[1])[:4]:
+        try:
+            members = _store_fetchall(
+                store,
+                "SELECT DISTINCT a.id FROM event_observations eo "
+                "JOIN observations o ON o.id=eo.observation_id "
+                "JOIN assets a ON a.id=o.asset_id "
+                "WHERE eo.event_id=? AND a.scope_id=? "
+                "AND (? IS NULL OR a.media_type=?) ORDER BY a.captured_at LIMIT 13",
+                (event_id, scope_id, media_constraint, media_constraint),
+            )
+        except Exception:
+            continue
+        # A large event is too broad to imply that its other photos are relevant.
+        if len(members) > 12:
+            continue
+        for row in members:
+            asset_id = row[0]
+            if (asset_id in scores
+                    or _is_face_reference_asset({"asset_id": asset_id}, store)
+                    or _is_synthetic_event_asset({"asset_id": asset_id}, store)):
+                continue
+            scores[asset_id] = 0.7 * seed_score
+            added.add(asset_id)
+    return added
+
+
 _SEMANTIC_OBJECT_SYNONYMS = (
     # Keep only lexical equivalents. A display stand and a banner are related
     # but not interchangeable evidence, so do not rewrite one into the other.
@@ -2523,7 +2576,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         }
     # "正月" and "初三" are lunar components. Never reinterpret them as
     # Gregorian January/third-day hard filters supplied by a model parser.
-    if re.search(r"(?:大年|正月|农历.{1,3}月)初", user_goal or query):
+    if re.search(r"(?:大年|正月|农历.{1,3}月)初|春节|过年|新春|农历新年", user_goal or query):
         time_comps = {"year": int(_slot_year), "months": None, "days": None} if _slot_year else None
     time_bounds = None
     if filters.get("time") and time_comps is None:
@@ -2624,9 +2677,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     lunar_candidate_count = 0
     lunar_dates = set()
     lunar_query = f"{user_goal} {query_for_retrieval or query}"
-    if scope_id and re.search(r"(?:大年|正月|农历.{1,3}月)初", lunar_query):
+    if scope_id and re.search(r"(?:大年|正月|农历.{1,3}月)初|春节|过年|新春|农历新年", lunar_query):
         try:
-            from .lunar_time import lunar_solar_dates
+            from .lunar_time import lunar_holiday_dates
             year_rows = _store_fetchall(
                 store,
                 "SELECT DISTINCT substr(captured_at,1,4) AS year "
@@ -2635,7 +2688,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             )
             album_years = {int(row["year"]) for row in year_rows
                            if str(row["year"] or "").isdigit()}
-            lunar_dates = lunar_solar_dates(lunar_query, album_years)
+            lunar_dates = lunar_holiday_dates(lunar_query, album_years)
             if lunar_dates:
                 solar_date_strings = {str(day) for day in lunar_dates}
                 placeholders = ",".join("?" for _ in lunar_dates)
@@ -2661,6 +2714,9 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                     scores[aid] = scores.get(aid, 0.0) + calendar_boost
         except (AttributeError, OSError, TypeError, ValueError):
             pass
+
+    event_neighbor_added = _expand_ranked_event_neighbors(
+        scores, store, scope_id, media_constraint=media_constraint)
 
     # A keyframe is indexed as an image, but the benchmark's video GT is the
     # parent source video.  Expand this provenance edge before the bounded
@@ -2736,6 +2792,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "event_anchor_enabled": event_anchor_enabled,
             "event_anchor_source": event_anchor_source,
             "event_anchor_candidate_count": len(event_member_ids),
+            "event_neighbor_added_count": len(event_neighbor_added),
             "lexical_anchor_surface_count": len(lexical_anchor_surfaces),
             "lexical_anchor_candidate_count": len(lexical_anchor_valid),
             "lexical_anchor_added_count": lexical_anchor_added,

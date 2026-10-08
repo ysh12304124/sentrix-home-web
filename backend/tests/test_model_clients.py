@@ -20,6 +20,17 @@ from backend.agent_runtime.tool_policy import ToolPolicy
 
 
 class ModelClientTests(unittest.TestCase):
+    def test_empty_vision_description_recovers_by_default(self):
+        client = GammaClient()
+        with patch.object(client, "_encode_core_image", return_value=("image", "image/jpeg")), \
+                patch.object(client, "chat", side_effect=[
+                    '{"semantic":{"place":{"primary":"居住空间"}}}',
+                    '{"caption":"孩子在客厅玩耍","activity":"玩耍"}',
+                ]) as chat:
+            result = client.analyze_image("unused.jpg")
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(result["caption"], "孩子在客厅玩耍")
+
     def test_heuristic_context_estimate_does_not_starve_json_generation(self):
         self.assertEqual(cap_output_tokens_for_estimated_room(384, 1), 128)
         self.assertEqual(cap_output_tokens_for_estimated_room(384, 200), 200)

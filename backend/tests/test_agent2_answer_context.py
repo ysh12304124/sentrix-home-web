@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from backend.agent_runtime.evidence_ledger import EvidenceLedger, LedgerEntry
+from backend.agent_runtime.runtime import _selected_metadata_facts
 from backend.agent_runtime.final_writer import (
     build_answer_writer_messages,
     clean_writer_output, naturalize_answer,
@@ -14,6 +15,23 @@ from backend.agent_runtime.task_state import EvidenceRequirement, TaskDeclaratio
 
 
 class Agent2AnswerContextTests(unittest.TestCase):
+    def test_selected_metadata_ignores_unselected_preview_dates_and_places(self):
+        state = {"tool_results": [{
+            "tool": "search_memories",
+            "preview": [
+                {"handle": "photo_1", "captured_at": "2018-02-18 15:35:11",
+                 "place": "石家庄市桥西区"},
+                {"handle": "photo_2", "captured_at": "2023-08-01 11:00:00",
+                 "place": "邯郸市永年区"},
+            ],
+        }]}
+        facts = _selected_metadata_facts(state, ["photo_1"])
+        self.assertEqual(len(facts), 1)
+        self.assertIn("2018-02-18", facts[0])
+        self.assertIn("石家庄市桥西区", facts[0])
+        self.assertNotIn("2023", str(facts))
+        self.assertEqual(_selected_metadata_facts(state, ["photo_3"]), [])
+
     def _task(self):
         return TaskState.from_declaration(TaskDeclaration(
             goal="确认照片地点",
