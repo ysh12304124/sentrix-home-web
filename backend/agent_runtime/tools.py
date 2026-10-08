@@ -2589,6 +2589,20 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             time_bounds = parse_time_expression(str(filters["time"]))
         except Exception:
             time_bounds = None
+    # A model slot can return only the year even when the canonical user text
+    # names a specific month/day. The user's narrower bound must win.
+    trusted_time = str(trusted_constraints.get("time") or "")
+    if trusted_time:
+        try:
+            from ..query_contracts import parse_time_expression
+            trusted_bounds = parse_time_expression(trusted_time)
+            if trusted_bounds and (time_bounds is None or
+                    (trusted_bounds[1] - trusted_bounds[0]) <
+                    (time_bounds[1] - time_bounds[0])):
+                time_bounds = trusted_bounds
+                time_comps = None
+        except (TypeError, ValueError):
+            pass
     place_q = filters.get("place") or ""
 
     def _asset_captured(aid):
@@ -2657,6 +2671,35 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     for _aid, _ranks in lexical_anchor_valid.items():
         scores[_aid] += _slot_lexical_anchor_w * sum(
             1.0 / (_slot_rrf_k + rank) for rank in _ranks[:8])
+
+    # Exact capture dates are an independent source of evidence. ANN/FTS may
+    # retrieve a visually similar scene from another year while omitting the
+    # actual day's images entirely. Add only user-grounded, single-day matches
+    # within the authorized scope; the ordinary graph and semantic union stays
+    # intact, and the normal candidate limit still applies below.
+    calendar_day_added = 0
+    if time_bounds is not None and scope_id:
+        from datetime import timedelta
+        if time_bounds[1] - time_bounds[0] == timedelta(days=1):
+            day = time_bounds[0].strftime("%Y-%m-%d")
+            day_rows = _store_fetchall(
+                store,
+                "SELECT id FROM assets WHERE scope_id=? AND substr(captured_at,1,10)=? LIMIT 240",
+                (scope_id, day),
+            )
+            day_boost = max(scores.values(), default=0.01) * 0.8
+            for day_row in day_rows:
+                aid = str(day_row["id"])
+                asset = store.get_asset(aid) or {}
+                if (_is_face_reference_asset({"asset_id": aid}, store)
+                        or _is_synthetic_event_asset({"asset_id": aid}, store)
+                        or (media_constraint and str(asset.get("media_type") or "").lower()
+                            != media_constraint)
+                        or not _time_ok(_asset_captured(aid))):
+                    continue
+                if aid not in scores:
+                    calendar_day_added += 1
+                scores[aid] = scores.get(aid, 0.0) + day_boost
 
     # Unknown GPS/geocode remains open-world in the retrieval kernel, so it
     # cannot erase a plausible image or video frame. Among retained candidates,
@@ -2793,6 +2836,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "place_boost": round(place_boost, 6),
             "lunar_calendar_dates": len(lunar_dates),
             "lunar_calendar_added_count": lunar_candidate_count,
+            "calendar_day_added_count": calendar_day_added,
             "event_anchor_enabled": event_anchor_enabled,
             "event_anchor_source": event_anchor_source,
             "event_anchor_candidate_count": len(event_member_ids),

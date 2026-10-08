@@ -30,12 +30,32 @@ def canonical_enabled() -> bool:
 def extract_time(question: str) -> str | None:
     """返回问题中的时间片段（优先完整日期，其次年月，其次年）或相对时间词。"""
     q = re.sub(r"\s+", "", question or "")
+    # A year-end reference is more precise than the bare year. Extract it
+    # before the generic year pattern, otherwise the slot parser's year-only
+    # component silently discards the user's explicit day/month constraint.
+    year_end = re.search(r"((?:19|20)\d{2})年?(?:的)?(?:最后一天|最后一日|12月31日)", q)
+    if year_end:
+        return f"{year_end.group(1)}年12月31日"
+    year_end_month = re.search(r"((?:19|20)\d{2})年?(?:的)?(?:年底|年末|岁末)", q)
+    if year_end_month:
+        return f"{year_end_month.group(1)}年12月"
+    colloquial_day = re.search(r"((?:19|20)\d{2})年(\d{1,2})月(\d{1,2})号", q)
+    if colloquial_day:
+        return f"{colloquial_day.group(1)}年{int(colloquial_day.group(2))}月{int(colloquial_day.group(3))}日"
     for pattern in (r"(?:19|20)\d{2}年\d{1,2}月\d{1,2}日",
                     r"(?:19|20)\d{2}年\d{1,2}月",
                     r"(?:19|20)\d{2}年"):
         m = re.search(pattern, q)
         if m:
             return m.group(0)
+    # Colloquial two-digit years still carry an explicit month/day. Preserve
+    # that precision instead of reducing "17年12月份" to all of 2017.
+    short_date = re.search(r"(?<!\d)(\d{2})年(\d{1,2})月(?:份)?(?:(\d{1,2})[日号])?", q)
+    if short_date:
+        year = int(short_date.group(1))
+        full_year = 2000 + year if year < 70 else 1900 + year
+        result = f"{full_year}年{int(short_date.group(2))}月"
+        return result + (f"{int(short_date.group(3))}日" if short_date.group(3) else "")
     m = re.search(r"(?<!\d)(\d{2})年", q)
     if m:
         short_year = int(m.group(1))

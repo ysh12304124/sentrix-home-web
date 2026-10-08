@@ -8,9 +8,55 @@ from unittest.mock import patch
 from backend.db import MemoryStore
 from backend.agent_runtime import tools
 from backend.agent_runtime.lunar_time import lunar_holiday_dates, lunar_solar_dates
+from backend.agent_runtime.canonical_intent import extract_time
 
 
 class LunarTimeRetrievalTests(unittest.TestCase):
+    def test_year_end_phrases_keep_the_user_day_or_month(self):
+        self.assertEqual(extract_time("2018年最后一天全家去公园"), "2018年12月31日")
+        self.assertEqual(extract_time("2018年底在古城留影"), "2018年12月")
+        self.assertEqual(extract_time("2018年末的合影"), "2018年12月")
+        self.assertEqual(extract_time("17年12月份参加婚礼"), "2017年12月")
+        self.assertEqual(extract_time("18年12月31号去公园"), "2018年12月31日")
+
+    def test_exact_day_rescues_media_and_overrides_year_only_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memory.db"))
+            try:
+                target = store.create_asset(
+                    "year-end-target", "garden.jpg", "image", str(Path(directory) / "garden.jpg"),
+                    metadata={"captured_at": "2018-12-31 14:00:00"}, scope_id="album")
+                store.add_observation(target["id"], {"caption": "室内植物和步道"}, scope_id="album")
+                wrong = store.create_asset(
+                    "same-year-noise", "other.jpg", "image", str(Path(directory) / "other.jpg"),
+                    metadata={"captured_at": "2018-02-18 14:00:00"}, scope_id="album")
+                store.add_observation(wrong["id"], {"caption": "室内植物和步道"}, scope_id="album")
+                outside = store.create_asset(
+                    "other-scope", "outside.jpg", "image", str(Path(directory) / "outside.jpg"),
+                    metadata={"captured_at": "2018-12-31 15:00:00"}, scope_id="other")
+                tools.bind_runtime(store)
+                with patch.object(tools, "_relaxed_retrieve", return_value=(
+                    tools._SlotRetrievalPacket([{"id": wrong["id"]}], retrieval_timing={}), 0)), \
+                     patch.object(tools, "_trusted_query_constraints", return_value={
+                         "time": "2018年12月31日", "place": None, "person": None}), \
+                     patch("backend.agent_runtime.semantic_slots.parse_semantic_slots", return_value={
+                         "time": {"year": 2018, "months": [], "days": [], "expr": "2018年"},
+                         "place": {"name": "", "hint": ""}, "event": {"name": ""},
+                         "objects": [], "query_core": "室内植物"}):
+                    result = tools._search_memories(
+                        {"query": "室内植物", "filters": {"time": "2018年"}},
+                        context={"scope_id": "album", "task_state": {
+                            "user_goal": "2018年最后一天在室内植物园拍的照片"}},
+                    )
+                ids = [item["asset_id"] for item in result["preview"]]
+                self.assertIn(target["id"], ids)
+                self.assertNotIn(wrong["id"], ids)
+                self.assertNotIn(outside["id"], ids)
+                self.assertGreaterEqual(result["retrieval_timing"]["semantic_retrieval"]
+                                        ["calendar_day_added_count"], 1)
+            finally:
+                store.close()
+
     def test_explicit_and_unqualified_lunar_day(self):
         years = {2018, 2019}
         self.assertEqual(

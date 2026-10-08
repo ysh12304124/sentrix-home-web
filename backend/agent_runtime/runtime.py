@@ -1346,6 +1346,71 @@ def _selected_metadata_facts(task_state: dict, handles: list[str]) -> list[str]:
     return facts[:6]
 
 
+def _direct_metadata_answer_supported(question: str, answer: str,
+                                      task_state: dict, handles: list[str]) -> bool:
+    """Stop visual-only follow-ups after a selected photo already proves a
+    simple capture date/place answer. This never validates image contents,
+    people, document text, or a broad unselected search result.
+    """
+    if not handles or re.search(r"看不出来|不足以确认|无法确认|不能确认|无法判断|不清楚", answer):
+        return False
+    asks_place = bool(re.search(r"(?:哪里|哪儿|何处|在哪(?:里|儿|个)?|哪个(?:城市|位置|地点)|什么(?:地方|地点|位置))", question))
+    asks_date = bool(re.search(r"(?:哪(?:一)?天|哪(?:一)?日|哪(?:一)?年|什么时候|什么时间|何时|几月几日|几号)", question))
+    # A date printed on a document/sign is not the photo's capture date.
+    if asks_date and re.search(r"(?:填写|开具|标注|写着|写的|单据|发票|凭证|票据|表格|报告|收据|证件)", question):
+        asks_date = False
+    if asks_place and re.search(r"(?:写着|写的|标注|单据|发票|凭证|票据|表格)", question):
+        asks_place = False
+    if not (asks_place or asks_date):
+        return False
+    user_bounds = None
+    try:
+        from ..query_contracts import parse_time_expression
+        from .canonical_intent import extract_time
+        user_bounds = parse_time_expression(extract_time(question))
+    except (TypeError, ValueError):
+        pass
+    selected = set(handles)
+    for result in task_state.get("tool_results") or []:
+        if result.get("tool") != "search_memories":
+            continue
+        for row in result.get("preview") or []:
+            if row.get("handle") not in selected:
+                continue
+            place = str(row.get("place") or "").strip()
+            captured = str(row.get("captured_at") or "")[:10]
+            if user_bounds:
+                try:
+                    from datetime import datetime
+                    capture_day = datetime.fromisoformat(captured)
+                except ValueError:
+                    continue
+                if not (user_bounds[0] <= capture_day < user_bounds[1]):
+                    continue
+            if asks_place and place and place in answer:
+                return True
+            if asks_date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", captured):
+                year, month, day = (int(part) for part in captured.split("-"))
+                if (f"{year}年{month}月{day}日" in answer
+                        or f"{year}年{month}月{day}号" in answer
+                        or captured in answer):
+                    return True
+    return False
+
+
+def _remaining_visible_handles(task_state: dict, inspected: set[str]) -> list[str]:
+    """Use actual displayed handles, never infer photo_N+1 from numbering."""
+    handles = []
+    for result in task_state.get("tool_results") or []:
+        if result.get("tool") not in {"search_memories", "get_result_page"}:
+            continue
+        for row in result.get("preview") or []:
+            handle = str(row.get("handle") or "")
+            if handle and handle not in inspected and handle not in handles:
+                handles.append(handle)
+    return handles
+
+
 def _selected_inspection_facts(task_state: dict, handles: list[str]) -> list[str]:
     """Project observed visuals and confirmed identities for selected photos."""
     selected = set(handles or [])
@@ -1603,6 +1668,8 @@ def _build_answer_grounding(*, message: str, task: TaskState,
 
 
 _POLICY_REFUSAL_RULES = [
+    (re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+(?:rules|instructions|prompts)", re.I), "我只能协助检索相册内容，不能忽略既有规则或透露内部提示。"),
+    (re.compile(r"(?:output|show|reveal|print|dump)\b.{0,100}\b(?:internal|system|hidden)\s+(?:prompt|instructions)", re.I), "我不能透露系统内部提示或指令。"),
     (re.compile(r"忽略.*(?:指令|系统提示|提示词|安全规则|限制)", re.I), "我无法透露系统提示词内容，也不能忽略既有的安全规则。"),
     (re.compile(r"(?:告诉|输出|显示|给我).*(?:系统提示|提示词|system prompt)", re.I), "我无法透露系统提示词内容，也不能忽略既有的安全规则。"),
     (re.compile(r"(?:导出|发给|提供|输出|告诉).*(?:特征向量|人脸特征|身份信息|家庭关系|银行卡|密码|住址|电话)", re.I), "我无法导出人脸特征向量和用户隐私身份数据，这属于敏感个人信息。"),
@@ -2601,6 +2668,8 @@ class AgentRuntime:
                     action.get("selected_image_handles") or action.get("image_handles"),
                     task,
                 )
+                metadata_final_supported = _direct_metadata_answer_supported(
+                    message, last_model_final_answer, task.as_dict(), selected_image_handles)
                 # Authoritative Agent2 gate: evidence sufficiency is decided by
                 # the single TaskState, never by intent heuristics or a model
                 # assertion that it is "done".
@@ -2662,8 +2731,9 @@ class AgentRuntime:
                         # 5B 软门槛：需求未满足时只给一次"补证/如实收尾"的机会，不再无限
                         # continue，也不再写死固定文案。模型在提醒后仍输出 final → 放行，
                         # 让其自然回答（包括诚实的"无法确认"），不被代码覆盖。
-                        if unattempted and available and turn.budget.can_model_step() \
-                                and not gate_unattempted_prompted:
+                        if (unattempted and available and turn.budget.can_model_step()
+                                and not metadata_final_supported
+                                and not gate_unattempted_prompted):
                             gate_unattempted_prompted = True
                             prompt_pending = [
                                 f"{state.requirement.id}:{state.requirement.evidence_type}"
@@ -2740,7 +2810,7 @@ class AgentRuntime:
                 # inspect a representative photo when the retrieval contract
                 # explicitly says that visual/person/travel evidence is needed.
                 resolution = _pending_resolution(task)
-                if resolution:
+                if resolution and not metadata_final_supported:
                     # Do not depend on the model obeying a recommendation: on
                     # the first premature final, execute the bounded visual/
                     # OCR resolution directly against the first visible
@@ -2772,8 +2842,9 @@ class AgentRuntime:
                         )})
                         continue
                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
-                if search_has_preview and not inspect_called and visual_gate_requested() \
-                        and visual_retries < max_visual_retries and turn.budget.can_model_step():
+                if (search_has_preview and not inspect_called and visual_gate_requested()
+                        and not metadata_final_supported
+                        and visual_retries < max_visual_retries and turn.budget.can_model_step()):
                     visual_retries += 1
                     denies_found = bool(__import__("re").search(
                         r"没(?:有|找到)|未找到|没有获取到|找不到|还没有",
@@ -3184,11 +3255,24 @@ class AgentRuntime:
             if tool_name in {"inspect_photo", "read_photo_text"}:
                 _h = str(arguments.get("asset_handle") or "").strip() or "photo_1"
                 if _h in inspected_handles and turn.budget.can_model_step():
+                    prior = next((result for result in reversed(task.tool_results)
+                                  if (result.get("tool") == tool_name
+                                      and str(result.get("inspect_handle") or
+                                              result.get("asset_handle") or "") == _h)), {})
+                    remaining = _remaining_visible_handles(task.as_dict(), inspected_handles)
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                    messages.append({"role": "user", "content": (
-                        f"你已复核/读过 {_h}，不要重复查看同一张图。"
-                        "请换 preview/翻页里的下一张（photo_2、photo_3…）复核，或直接输出 final 回答。"
-                    )})
+                    if str(prior.get("certainty") or "").lower() in {"supported", "confirmed"}:
+                        guidance = (f"{_h} 已成功复核，已有可用证据。"
+                                    "不要再检查照片；请依据刚才的观察和已确认身份直接输出 final，"
+                                    "无法确认的个别细节单独说明。")
+                    elif remaining:
+                        guidance = (f"你已复核/读过 {_h}，不要重复查看。"
+                                    f"当前实际展示且尚未复核的句柄只有：{', '.join(remaining[:8])}。"
+                                    "如需继续复核，只能从中选择；否则直接输出 final。")
+                    else:
+                        guidance = (f"你已复核/读过 {_h}，当前没有尚未复核的可见照片。"
+                                    "不要猜测 photo_N 句柄；请基于已有证据输出 final。")
+                    messages.append({"role": "user", "content": guidance})
                     continue
                 inspected_handles.add(_h)
             # 预算 B：连续 2 次同工具同失败原因 → 拦截本次调用，强制换动作
