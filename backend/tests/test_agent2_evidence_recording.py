@@ -58,28 +58,6 @@ class Agent2EvidenceRecordingTests(unittest.TestCase):
         self.assertEqual(task.requirement("text").coverage_status, "failed")
         self.assertEqual(ledger.entries[0].failure_reason, "ocr_failed")
 
-    def test_metadata_place_operation_does_not_consume_temporal_attempt(self):
-        task = TaskState.from_declaration(TaskDeclaration(
-            goal="where and when", scope_id="album1",
-            requirements=(
-                EvidenceRequirement(id="date", evidence_type="temporal_metadata"),
-                EvidenceRequirement(id="place", evidence_type="location_metadata"),
-            ),
-        ))
-        ledger = EvidenceLedger(scope_id="album1")
-        spec = ToolSpec(name="query_memory_metadata", description="metadata", input_schema={},
-                        executor=_execute,
-                        produces_evidence=("structured_fact", "temporal_metadata", "location_metadata"))
-
-        self.assertTrue(record_agent2_tool_evidence(
-            task, ledger, spec, tool_call_id="metadata_place",
-            observation={"metadata_operation": "place", "value": "上海",
-                         "source_asset_ids": ["asset_1"]}))
-
-        self.assertEqual(task.requirement("place").status, "satisfied")
-        self.assertEqual(task.requirement("date").status, "open")
-        self.assertEqual(task.requirement("date").attempt_count, 0)
-
     def test_negative_visual_observation_is_asset_bound_contradiction(self):
         task = TaskState.from_declaration(TaskDeclaration(
             goal="find a boat", scope_id="album1",

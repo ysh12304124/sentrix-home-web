@@ -30,7 +30,7 @@ from .guard_types import (REVISION_HARD_BLOCK, REVISION_REWRITE_ONLY,
                           GuardIssue, GuardResult)
 
 # 检索/事实类工具（存在性判断只针对这些工具的结果）
-_RETRIEVAL_TOOLS = {"search_memories", "query_memory_facts", "search_conversation_history",
+_RETRIEVAL_TOOLS = {"search_memories", "search_conversation_history",
                     "get_core_memory", "get_person_memory", "get_result_page"}
 
 # 整体否认存在（带明确宾语/动作）：total>0 / exists=True 时回答却说没找到。
@@ -57,7 +57,7 @@ def _natural_message(code: str, detail: str = "") -> str:
     """把内部规则码转成用户可读、模型可执行的恢复文案（D4：用户不看到内部规则名）。"""
     base = {
         "placeholder_leak": "回答里出现了'地点名称/数量/时间'这类未填写的占位符，必须替换成真实数据或删除",
-        "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 或 query_memory_facts 完成检索，再基于工具结果回答",
+        "denial_without_search": "你的回答声称没有找到相关记录，但本轮没有调用任何检索工具。请先调用 search_memories 完成检索，再基于工具结果回答",
         "all_requested_but_has_more": "用户要求全部结果，但结果集还有更多未交付。请继续取回剩余结果，或如实说明只交付了部分",
         "delivery_contradiction": "你的回答声称已经全部交付，但实际没有交付任何结果。请如实说明交付情况",
         "omission_conflict": "工具确认存在相关结果（total>0），但你的回答却说没有找到。请基于工具结果如实回答存在的情况，不要整体否认",

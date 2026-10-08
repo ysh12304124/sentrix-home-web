@@ -164,6 +164,9 @@ function effectiveRunSummary(run) {
     judge_valid_count: saved.judge_valid_count ?? judged.length,
     judge_distribution: dist,
     retrieval_recall_mean: saved.retrieval_recall_mean ?? averageMetric(recalls),
+    retrieval_precision_macro: saved.retrieval_precision_macro ?? averageMetric(items.map((item) => item.retrieval_precision)),
+    retrieval_recall_macro: saved.retrieval_recall_macro ?? averageMetric(recalls),
+    retrieval_f1_macro: saved.retrieval_f1_macro ?? averageMetric(items.map((item) => item.retrieval_f1)),
     answer_quality_mean: saved.answer_quality_mean ?? (scores.length ? averageMetric(scores) : null),
     exact_accuracy: saved.exact_accuracy ?? (scores.length ? scores.filter((score) => score === 2).length / scores.length : null),
     core_accuracy: saved.core_accuracy ?? (scores.length ? scores.filter((score) => score >= 1).length / scores.length : null),
@@ -477,8 +480,8 @@ function aggregateMetricRows(phase = {}) {
       ? `历史记录按 Agent/Judge 时间线回退估算 · ${throughputSamples}/${throughputTotal} 题，不能视为实测`
       : "历史记录未保存 Agent 独立阶段墙钟";
   return [
-    ["图片检索 Precision", fmtPct(summary.retrieval_precision_micro), `图片级微平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT 图`, true],
-    ["图片检索 Recall", fmtPct(summary.retrieval_recall_micro), "图片级微平均；与评测记录列表同口径", true],
+    ["媒体检索 Precision", fmtPct(summary.retrieval_precision_macro), `逐 QA 宏平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT 媒体`, true],
+    ["媒体检索 Recall", fmtPct(summary.retrieval_recall_macro), "逐 QA 宏平均；每道 QA 等权", true],
     ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
     ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
     ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "历史记录未保存解析轨迹" : `${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个需解析模型输出`, true],
@@ -489,7 +492,7 @@ function aggregateMetricRows(phase = {}) {
     ["平均任务完成时间", fmtMs(summary.agent_task_latency_mean_ms), activeRun.value?.qa_concurrency > 1
       ? `每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）；并发 ${activeRun.value.qa_concurrency} 负载下含排队与批内干扰，勿与串行 run 直接对比`
       : "每道 QA 各自计时的平均值（输入→最终回答，不含 Judge）", true],
-    ["图片检索 F1", fmtPct(summary.retrieval_f1_micro), "微平均，平衡噪声与漏召回"],
+    ["媒体检索 F1", fmtPct(summary.retrieval_f1_macro), "逐 QA 宏平均，平衡精确率与召回率"],
     ["Judge LLM 平均时延", fmtMs(summary.judge_llm_latency_mean_ms), `每题 Judge 评分调用平均耗时 · Judge 阶段墙钟 ${fmtMs(summary.judge_phase_wall_ms)}`],
     ["任务判断准确率", fmtPct(summary.task_decision_accuracy), `标注 ${summary.task_decision_labeled_count ?? 0} 题 · Judge 有效 ${summary.task_decision_valid_count ?? 0} 题`],
     ["证据对应均分", summary.evidence_mean == null ? "未记录" : `${summary.evidence_mean} / 2`, `0:${evidenceDist["0"] || 0} · 1:${evidenceDist["1"] || 0} · 2:${evidenceDist["2"] || 0}`],
@@ -1551,7 +1554,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <th>耗时</th>
 <th>状态</th>
 <th>进度</th>
-<th>图片级召回率</th>
+<th>媒体召回率</th>
 <th>质量均分</th>
 <th>
 </th>
@@ -1570,7 +1573,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
 <td>{{ runProgressLabel(run) }}</td>
-<td>{{ fmtPct(run.summary?.retrieval_recall_micro) }}</td>
+<td>{{ fmtPct(run.summary?.retrieval_recall_macro ?? run.summary?.retrieval_recall_mean) }}</td>
 <td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>

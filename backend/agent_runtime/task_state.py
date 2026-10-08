@@ -99,8 +99,6 @@ class TaskDeclaration:
             raise ValueError("goal is required")
         if not isinstance(self.scope_id, str) or not self.scope_id:
             raise ValueError("scope_id is required")
-        if not self.requirements:
-            raise ValueError("at least one requirement is required")
         ids = [requirement.id for requirement in self.requirements]
         if len(ids) != len(set(ids)):
             raise ValueError("requirement ids must be unique")
@@ -190,7 +188,8 @@ class TaskState:
         required = [state for state in self.requirements.values()
                     if state.requirement.required]
         if not required:
-            self.status = "blocked"
+            # 允许"零需求"：模型认为不需要额外证据（直接可答 / 无记录可确认时如实拒答）。
+            self.status = "complete"
         elif all(state.status == "satisfied" for state in required):
             self.status = "complete"
         elif any(state.status in {"ambiguous", "unsupported", "blocked_budget", "unavailable"}

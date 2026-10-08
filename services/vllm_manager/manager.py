@@ -439,7 +439,7 @@ def build_state(
         "host": host,
         "port": port,
         "base_url": f"http://127.0.0.1:{port}/v1",
-        "external_url_hint": f"http://192.168.0.153:{port}/v1" if host == "0.0.0.0" else None,
+        "external_url_hint": f"http://127.0.0.1:{port}/v1" if host == "0.0.0.0" else None,
         "model": profile["model"],
         "served_model_name": served_name,
         "dtype": profile.get("dtype"),

@@ -14,6 +14,7 @@ priors (min_sizes) + variance, not InsightFace's SCRFD format.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import threading
 
 import numpy as np
@@ -25,7 +26,10 @@ MIN_SIZES = [[16, 32], [64, 128], [256, 512]]
 INPUT_SIZE = (640, 640)
 VARIANCES = (0.1, 0.2)
 
-DEFAULT_MODEL_PATH = "/home/asus/benchmarks/retinaface/retinaface_r50.onnx"
+# 按 $HOME 推导，不写死某个用户名 —— 写死会让代码换台机器就指向不存在的文件，
+# 而失败方式是启动时那句 "Missing retrieval/face weights" 直接退出，很难一眼看出
+# 是路径问题。（153 上实际路径是 ~/benchmarks/retinaface/retinaface_r50.onnx）
+DEFAULT_MODEL_PATH = str(Path.home() / "benchmarks" / "retinaface" / "retinaface_r50.onnx")
 
 
 def _generate_priors(input_size):

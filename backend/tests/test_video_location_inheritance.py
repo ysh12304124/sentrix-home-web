@@ -13,7 +13,12 @@ from backend.video.processor import VideoMemoryAdapter
 
 class VideoLocationInheritanceTests(unittest.TestCase):
     def test_source_gps_is_inherited_without_visual_place_overwrite(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SENTRIX_DATA_DIR": directory}):
+        # 本文件专门验证 worldmm 链路，必须显式声明算法：
+        # SENTRIX_VIDEO_KEYFRAME_ALGORITHM 的默认值已改为 hybrid_webp。
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"SENTRIX_DATA_DIR": directory,
+                         "SENTRIX_VIDEO_KEYFRAME_ALGORITHM": "worldmm"},
+        ):
             root = Path(directory)
             video = root / "movie.mov"
             video.write_bytes(b"video")

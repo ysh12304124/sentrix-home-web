@@ -1,0 +1,232 @@
+{
+  "service_root": "/home/realmagic/sentrix-vllm",
+  "state_file": "/home/realmagic/Github/Sentrix-Home-Web/data/sentrix_vllm_state_local_100.json",
+  "vllm_binary": "/home/realmagic/Github/Sentrix-Home-Web/.venv/bin/vllm",
+  "default_host": "127.0.0.1",
+  "default_port": 8100,
+  "profiles": {
+    "qwen3.5-0.8b-it": {
+      "model": "/home/lcl/model/Qwen3.5-0.8B",
+      "served_model_name": "qwen3.5-0.8b",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 12,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "notes": "Downloaded from ModelScope as Qwen/Qwen3.5-0.8B.",
+      "default_max_tokens": 1501
+    },
+    "qwen3.5-4b": {
+      "model": "/home/lcl/model/Qwen3.5-4B",
+      "served_model_name": "qwen3.5-4b",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0,
+      "notes": "Qwen3.5-4B multimodal (hybrid linear+full attention). bf16 native weights ~8.8GB.",
+      "default_max_tokens": 1501
+    },
+    "qwen3-vl-4b": {
+      "model": "/home/lcl/model/Qwen3-VL-4B-Instruct",
+      "served_model_name": "qwen3-vl-4b",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0,
+      "notes": "Qwen3-VL-4B-Instruct. bf16 native weights ~8.4GB.",
+      "default_max_tokens": 1501
+    },
+    "qwen3.5-0.8b-lora-v1": {
+      "model": "/home/lcl/model/Qwen3.5-0.8B-sentrix-score2-sft-20260826-merged/merged_hf",
+      "served_model_name": "qwen3.5-0.8b-lora-v1",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "notes": "Merged HF checkpoint from Sentrix score-2 SFT; no runtime LoRA adapter is required.",
+      "default_max_tokens": 1501
+    },
+    "qwen3.5-0.8b-agent-fast-v4": {
+      "model": "/home/lcl/model/Qwen3.5-0.8B-agent-fast-v4-merged/merged_hf",
+      "served_model_name": "qwen3.5-0.8b-agent-fast-v4",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "default_max_tokens": 1501,
+      "notes": "Local merged Qwen3.5-0.8B agent-fast-v4 model."
+    },
+    "qwen3.5-0.8b-agent-closed-loop-v18": {
+      "model": "/home/lcl/model/sentrix_agent_closed_loop_v18_20260828/merged/qwen3.5-0.8b/merged_hf",
+      "served_model_name": "qwen3.5-0.8b-agent-closed-loop-v18",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "default_max_tokens": 1501,
+      "notes": "Local merged Qwen3.5-0.8B closed-loop v18 model."
+    },
+    "qwen3.5-4b-agent-closed-loop-v18": {
+      "model": "/home/lcl/model/sentrix_agent_closed_loop_v18_20260828/merged/qwen3.5-4b/merged_hf",
+      "served_model_name": "qwen3.5-4b-agent-closed-loop-v18",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "default_max_tokens": 1501,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0,
+      "notes": "Local merged Qwen3.5-4B closed-loop v18 model."
+    },
+    "qwen3.5-4b-overfit151-10e": {
+      "model": "/home/lcl/model/sentrix_json_overfit_151_10ep_qwen35_4b_20260828_merged/merged_hf",
+      "served_model_name": "qwen3.5-4b-overfit151-10e",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "default_max_tokens": 1501,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "mm_processor_cache_gb": 0,
+      "notes": "Local merged Qwen3.5-4B overfit151-10e model."
+    },
+    "gemma4-12b-it": {
+      "model": "/home/lcl/model/gemma-4-12B-it",
+      "served_model_name": "gemma4-12b-it",
+      "dtype": "bfloat16",
+      "quantization": "bitsandbytes",
+      "load_format": "bitsandbytes",
+      "gpu_memory_utilization": 0.76,
+      "max_model_len": 8192,
+      "max_num_seqs": 12,
+      "mm_processor_cache_gb": 0,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 5,
+        "video": 0,
+        "audio": 1
+      },
+      "notes": "Default working profile: Gemma4-12B-it bitsandbytes 4-bit weights with BF16 compute/activations, TP=1 on GPU1.",
+      "default_max_tokens": 1501,
+      "cuda_visible_devices": "1"
+    },
+    "gemma4-12b-it-bf16": {
+      "model": "/home/lcl/model/gemma-4-12B-it",
+      "served_model_name": "gemma4-12b-it-bf16",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.78,
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "tensor_parallel_size": 2,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "notes": "Local Gemma4-12B-it BF16 checkpoint; dual-3090 diagnostic profile.",
+      "default_max_tokens": 1501,
+      "extra_args": [
+        "--generation-config",
+        "vllm"
+      ]
+    },
+    "gemma4-12b-it-bnb4-tp2": {
+      "model": "/home/lcl/model/gemma-4-12B-it",
+      "served_model_name": "gemma4-12b-it-bnb4-tp2",
+      "dtype": "bfloat16",
+      "quantization": "bitsandbytes",
+      "load_format": "bitsandbytes",
+      "gpu_memory_utilization": 0.65,
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "tensor_parallel_size": 2,
+      "trust_remote_code": true,
+      "limit_mm_per_prompt": {
+        "image": 2,
+        "video": 0,
+        "audio": 0
+      },
+      "notes": "Diagnostic only: Gemma4-12B-it bitsandbytes 4-bit/BF16 with TP=2; vLLM 0.26.0 currently fails Gemma4 fused-layer shape assertion.",
+      "default_max_tokens": 256
+    },
+    "qwen3.5-0.8b-sentrix-v12": {
+      "model": "/home/lcl/model/Qwen3.5-0.8B",
+      "served_model_name": "qwen3.5-0.8b-sentrix-v12",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "enable_lora": true,
+      "max_lora_rank": 16,
+      "lora_modules": [
+        {
+          "name": "qwen3.5-0.8b-sentrix-v12",
+          "path": "/home/lcl/agent_runs/sentrix_pipeline_v12_qwen35_08b_4ep_batch4_776updates/student_step776_lora"
+        }
+      ],
+      "default_max_tokens": 1501,
+      "cuda_visible_devices": "0",
+      "notes": "Qwen3.5-0.8B base with the Sentrix v12 4-epoch, batch-4, 776-update runtime LoRA adapter."
+    },
+    "qwen3.5-0.8b-sentrix-v12-eos-only-20260912": {
+      "model": "/home/lcl/model/Qwen3.5-0.8B",
+      "served_model_name": "qwen3.5-0.8b-sentrix-v12-eos-only-20260912",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.45,
+      "max_model_len": 8192,
+      "max_num_seqs": 2,
+      "tensor_parallel_size": 1,
+      "trust_remote_code": true,
+      "enable_lora": true,
+      "max_lora_rank": 16,
+      "lora_modules": [
+        {
+          "name": "qwen3.5-0.8b-sentrix-v12-eos-only-20260912",
+          "path": "/home/lcl/agent_runs/sentrix_pipeline_v12_eos_only_20260912/student_step776_lora/student_step776_lora"
+        }
+      ],
+      "default_max_tokens": 1501,
+      "cuda_visible_devices": "1",
+      "notes": "EOS-only 20260912: v12 snapshot plus minimal model-turn EOS append patch; base Qwen3.5-0.8B, 4 epochs, batch4, 776 updates."
+    }
+  }
+}

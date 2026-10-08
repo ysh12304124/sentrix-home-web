@@ -1,0 +1,60 @@
+{
+  "snapshot_name": "sentrix_protocol_aligned_v5_step194_new_planner_prompt_100",
+  "purpose": "Metadata-only reproducibility snapshot for the 100-server runtime; paths below are not runtime configuration overrides.",
+  "server": "192.168.0.100",
+  "repository": "/home/realmagic/Github/Sentrix-Home-Web",
+  "branch_before_commit": "psh",
+  "git_head_before_commit": "dc40c80f",
+  "active_runtime": {
+    "manager_state": "/home/realmagic/sentrix-vllm/state/current.json",
+    "registry_path_outside_repository": "/home/lcl/agent_runs/sentrix_protocol_alignment_v2_20260913/protocol_aligned_eval_registry.json",
+    "registry_sha256": "c7360a6398c6e71a83388d351e8e30c8dad92453c8d7ae795f46827c3f7a8fd8",
+    "profile": "qwen3.5-0.8b-protocol-aligned-v5-step194",
+    "served_model_name": "qwen3.5-0.8b-protocol-aligned-v5-step194",
+    "model_base_path": "/home/lcl/model/Qwen3.5-0.8B",
+    "model_config_json_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+    "adapter_path": "/home/lcl/agent_runs/sentrix_protocol_alignment_v5_20260913/format_aligned_sft_776/student_protocol_aligned_lora/student_step194_lora",
+    "adapter_tree_sha256": "96cf922d35760919073502933218051fe6e84318d5f62c3a321d73649a42a550",
+    "cuda_visible_devices": "0",
+    "max_model_len": 8192,
+    "vllm_manager_url": "http://127.0.0.1:8500",
+    "vllm_base_url": "http://127.0.0.1:8100/v1"
+  },
+  "planner_prompt": {
+    "source": "backend/agent_runtime/goal_planner.py",
+    "source_sha256": "2e4471cdaa39ab355ebaf50388b0ac6e79e4d96dba9e640e5e8d23488b54ceed",
+    "change": "Minimal added rule: replace every angle-bracket placeholder with current-question content; never emit placeholders; preserve the system scope_id."
+  },
+  "evaluation_protocol": {
+    "album": "album3-max",
+    "qa_set": "100qa-full",
+    "scope_id": "album_f74e9d0040c6",
+    "judge_base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+    "judge_model": "doubao-seed-2.0-lite",
+    "judge_credentials": "provided by external runtime secret configuration; intentionally omitted",
+    "max_model_len": 8192,
+    "requested_max_tokens": 384,
+    "temperature": 0
+  },
+  "historical_evaluations": [
+    {
+      "run_id": "20260912-084611-album3-max-qwen3.5-0.8b-it-reuse-6b9164",
+      "variant": "base_model",
+      "points": 32,
+      "note": "Historical baseline requested for this snapshot."
+    },
+    {
+      "run_id": "20260914-010810-album3-max-qwen3.5-0.8b-protocol-aligned-v5-step194-reuse-b1e9fb",
+      "variant": "old_v5_step194_plus_old_planner_prompt",
+      "points": 54,
+      "note": "Historical 100QA result; this is not the new-prompt result."
+    },
+    {
+      "run_id": "20260914-104409-album3-max-qwen3.5-0.8b-protocol-aligned-v5-step194-reuse-a1ae33",
+      "variant": "old_v5_step194_plus_new_planner_prompt",
+      "points": 49,
+      "note": "Latest recorded new-prompt result; do not label it as 54."
+    }
+  ],
+  "runtime_note": "The active registry remains outside this repository and must not be replaced by this metadata file. No API key, token, password, weight file, log, PID, dataset, image, or backup is included."
+}

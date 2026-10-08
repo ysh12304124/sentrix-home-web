@@ -127,7 +127,12 @@ else
 fi
 
 echo "Starting API on :$api_port ..."
-nohup bash "$root/scripts/runtime/start_sentrix_api.sh" >>"$api_log" 2>&1 &
+api_launcher="$root/scripts/runtime/start_sentrix_api.sh"
+if [[ "$api_port" == "8091" ]]; then
+  # Use the same production environment as manual/service restarts.
+  api_launcher="$root/scripts/runtime/start_sentrix_api_8091.sh"
+fi
+nohup bash "$api_launcher" >>"$api_log" 2>&1 &
 api_pid=$!
 
 echo "Starting Web on :$web_port ..."

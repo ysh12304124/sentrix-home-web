@@ -5,12 +5,28 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+from .platform_profile import profile
+
+
+def _effective_provider_spec(provider_env: str) -> str:
+    """该 provider 链的实际取值：环境变量优先，否则由能力档案探测。
+
+    为什么默认不能写死 CPUExecutionProvider：在 46/118 上不配任何变量就会
+    退化成纯 CPU，视觉编码从 0.72 秒变成 21~36 秒（实测），而这条退化在日志里
+    看不出来。
+    """
+    override = (os.getenv(provider_env) or "").strip()
+    if override:
+        return override
+    if provider_env == "RETINAFACE_PROVIDERS":
+        return profile.retinaface_providers()
+    return profile.face_providers()
 
 
 def _cuda_requested(provider_env: str) -> bool:
     return any(
         item.strip() == "CUDAExecutionProvider"
-        for item in os.getenv(provider_env, "CPUExecutionProvider").split(",")
+        for item in _effective_provider_spec(provider_env).split(",")
     )
 
 
@@ -20,7 +36,7 @@ def face_onnx_providers(provider_env: str):
     The limit is per ONNX session. The default 256 MiB budget is deliberately
     conservative because FaceAdapter may own several sessions at once.
     """
-    requested = [item.strip() for item in os.getenv(provider_env, "CPUExecutionProvider").split(",") if item.strip()]
+    requested = [item.strip() for item in _effective_provider_spec(provider_env).split(",") if item.strip()]
     if not _cuda_requested(provider_env):
         return requested
 

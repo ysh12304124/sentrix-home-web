@@ -1,0 +1,4 @@
+# 钉住 numpy 上界：torch/torchvision 在 Jetson 上是按 numpy 1.x 编译的，
+# 2.x 会触发 ABI 冲突（torch.from_numpy 抛异常），而该异常会被上层裸 except 吞掉，
+# 表现为"图片没有任何视觉向量"且链路不报错。实测 46 上因此丢过 223 张图的向量。
+numpy<2

@@ -84,11 +84,15 @@ class Agent2ProductionContractTests(unittest.TestCase):
         conn.execute("INSERT INTO entities VALUES ('e1','乐乐','孩子','person','confirmed')")
         conn.execute("INSERT INTO entity_mentions VALUES ('fi1','e1',.95)")
         conn.commit()
-        store = SimpleNamespace(connection=conn)
+        store = SimpleNamespace(
+            connection=conn,
+            get_asset=lambda asset_id: {"scope_id": "album1"},
+            get_effective_family_membership=lambda scope_id, entity_id: {"membership": "family"},
+        )
         before = conn.total_changes
         rows = _confirmed_photo_identities(store, "a1")
         self.assertEqual(rows[0]["person_name"], "乐乐")
-        self.assertEqual(rows[0]["identity_status"], "confirmed")
+        self.assertEqual(rows[0]["identity_status"], "bound")
         self.assertEqual(conn.total_changes, before)
 
     def test_jit_offers_search_as_identity_prerequisite(self):
