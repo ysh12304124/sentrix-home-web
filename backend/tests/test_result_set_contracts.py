@@ -105,8 +105,64 @@ class ResultSetContractTests(unittest.TestCase):
             "preview": [{"handle": f"photo_{i}"} for i in range(8)],
         })
         self.assertNotIn("asset_ids", visible)
-        self.assertEqual(len(visible["preview"]), 5)
+        self.assertEqual(len(visible["preview"]), 8)
         self.assertEqual(visible["recommended_handle"], "photo_0")
+
+    def test_model_window_exposes_bounded_tail_without_full_descriptions(self):
+        preview = [
+            {"handle": f"photo_{i}", "evidence_summary": "细节" * 150,
+             "people": [{"name": f"person_{n}"} for n in range(6)]}
+            for i in range(18)
+        ]
+        visible = _model_visible_observation({
+            "result_set_id": "rs_demo", "preview": preview,
+            "recommended_handle": "photo_9",
+        })
+        self.assertEqual(len(visible["preview"]), 12)
+        self.assertEqual(visible["preview"][0]["handle"], "photo_9")
+        self.assertIn("photo_10", [item["handle"] for item in visible["preview"]])
+        self.assertNotIn("photo_12", [item["handle"] for item in visible["preview"]])
+        self.assertTrue(all(len(item["evidence_summary"]) <= 121
+                            for item in visible["preview"]))
+        self.assertTrue(all(len(item["people"]) <= 2 for item in visible["preview"]))
+
+    def test_slot_score_cliff_keeps_recall_fallback_pool(self):
+        candidates = [f"asset_{i}" for i in range(30)]
+        scores = {candidate: (100.0 if i < 3 else 10.0 - i * 0.01)
+                  for i, candidate in enumerate(candidates)}
+        self.assertEqual(runtime_tools._slot_gap_bounded_ids(candidates, scores),
+                         candidates[:12])
+        self.assertEqual(runtime_tools._slot_gap_bounded_ids(candidates[:5], scores),
+                         candidates[:5])
+        flat_scores = {candidate: 10.0 for candidate in candidates}
+        self.assertEqual(runtime_tools._slot_gap_bounded_ids(candidates, flat_scores),
+                         candidates)
+
+    def test_capture_neighbor_rescue_is_local_and_bounded(self):
+        assets = {}
+        for name, stamp in (
+            ("anchor", "2019-06-03 12:00:00"),
+            ("near", "2019-06-03 12:01:30"),
+            ("far", "2019-06-03 13:00:00"),
+        ):
+            asset = self.store.create_asset(
+                f"asset-{name}", f"{name}.jpg", "image", f"/tmp/{name}.jpg",
+                metadata={"captured_at": stamp}, scope_id="album")
+            assets[name] = asset["id"]
+        outside = self.store.create_asset(
+            "asset-outside", "outside.jpg", "image", "/tmp/outside.jpg",
+            metadata={"captured_at": "2019-06-03 12:01:00"}, scope_id="other")
+        video = self.store.create_asset(
+            "asset-video", "near.mp4", "video", "/tmp/near.mp4",
+            metadata={"captured_at": "2019-06-03 12:01:00"}, scope_id="album")
+        scores = {assets["anchor"]: 1.0}
+        added = runtime_tools._expand_capture_neighbors(
+            scores, self.store, "album", media_constraint="image")
+        self.assertEqual(added, {assets["near"]})
+        self.assertAlmostEqual(scores[assets["near"]], 0.65)
+        self.assertNotIn(assets["far"], scores)
+        self.assertNotIn(outside["id"], scores)
+        self.assertNotIn(video["id"], scores)
 
     def test_reference_keeps_original_visual_intent(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(

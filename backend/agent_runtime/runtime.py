@@ -99,9 +99,12 @@ _RETRIEVAL_TOP_KEEP = (
     "group_photo_count", "group_photo_sizes", "group_photo_rows",
 )
 _RETRIEVAL_PREVIEW_KEEP = (
-    "handle", "captured_at", "place", "media_kind", "level",
+    "handle", "captured_at", "place", "media_kind",
     "evidence_summary", "people",
 )
+_MODEL_VISIBLE_PREVIEW_LIMIT = 12
+_MODEL_VISIBLE_SUMMARY_HEAD_LIMIT = 120
+_MODEL_VISIBLE_SUMMARY_TAIL_LIMIT = 80
 
 
 def _model_visible_observation(observation: dict | None) -> dict:
@@ -130,13 +133,27 @@ def _model_visible_observation(observation: dict | None) -> dict:
             visible_items = [recommended_item] + [
                 item for item in preview_items
                 if str(item.get("handle") or "").strip() != recommended_handle
-            ][:4]
+            ][: _MODEL_VISIBLE_PREVIEW_LIMIT - 1]
         else:
-            visible_items = preview_items[:5]
-        compact["preview"] = [
-            {key: item[key] for key in _RETRIEVAL_PREVIEW_KEEP if key in item}
-            for item in visible_items
-        ]
+            visible_items = preview_items[:_MODEL_VISIBLE_PREVIEW_LIMIT]
+        compact["preview"] = []
+        for index, item in enumerate(visible_items):
+            projected = {key: item[key] for key in _RETRIEVAL_PREVIEW_KEEP if key in item}
+            summary = str(projected.get("evidence_summary") or "")
+            summary_limit = (_MODEL_VISIBLE_SUMMARY_HEAD_LIMIT if index < 3
+                             else _MODEL_VISIBLE_SUMMARY_TAIL_LIMIT)
+            if len(summary) > summary_limit:
+                projected["evidence_summary"] = summary[:summary_limit] + "…"
+            if isinstance(projected.get("people"), list):
+                projected["people"] = projected["people"][:2]
+            # Empty metadata and repeated image-kind labels only spend context;
+            # the asset type stays explicit for video candidates.
+            for key in ("place", "people", "evidence_summary"):
+                if not projected.get(key):
+                    projected.pop(key, None)
+            if projected.get("media_kind") == "original_image":
+                projected.pop("media_kind", None)
+            compact["preview"].append(projected)
         visible_handles = {
             str(item.get("handle") or "").strip()
             for item in compact["preview"]

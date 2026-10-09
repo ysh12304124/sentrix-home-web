@@ -205,6 +205,27 @@ _RESULT_PAGE_SIZE = 6
 # still scores the media explicitly selected by the Agent, and page pagination
 # remains six items for ordinary result browsing.
 _SLOT_PREVIEW_LIMIT = 18
+# A score cliff is useful for prioritising inspection, but cutting a 20-40
+# candidate union to three made otherwise retrievable evidence unreachable.
+# Keep a bounded fallback pool; the existing rank and preview limits still
+# constrain what is sent to the model.
+_SLOT_GAP_MIN_CANDIDATES = 12
+
+
+def _slot_gap_bounded_ids(kept: list[str], scores: dict[str, float]) -> list[str]:
+    """Keep the score-cliff head plus bounded alternatives, without admitting all noise."""
+    selected = kept[:_SLOT_MAX_CANDIDATES]
+    if len(selected) <= 3:
+        return selected
+    top_score = scores.get(selected[0], 1) or 1.0
+    gap_ratio = float(os.getenv("SENTRIX_SLOT_GAP_RATIO", "0.5"))
+    cutoff = len(selected)
+    for index in range(1, len(selected)):
+        if ((scores.get(selected[index - 1], 0) - scores.get(selected[index], 0))
+                / top_score > gap_ratio):
+            cutoff = index
+            break
+    return selected[:max(cutoff, min(_SLOT_GAP_MIN_CANDIDATES, len(selected)))]
 
 
 def _public_candidate_limit() -> int:
@@ -1945,7 +1966,8 @@ def _place_matches(item, place_q: str, store) -> bool:
 # The latest 1,167-QA traces show relevant assets can rank well below the
 # first page.  Keep a wider server-side union so query-aware preview ranking
 # can recover them; model-visible evidence remains independently bounded by
-# _SLOT_PREVIEW_LIMIT, so this does not inflate the prompt/context window.
+# a separately compacted twelve-item model window, so this does not dump the
+# full server-side candidate pool into the prompt.
 _SLOT_ROUTE_HEAD = 60
 _SLOT_MAX_CANDIDATES = 48
 
@@ -1957,7 +1979,7 @@ def _expand_ranked_event_neighbors(scores, store, scope_id, media_constraint=Non
     photos was retrieved.  Follow only the graph edges of the highest ranked
     photos; never turn an entire album or a large, noisy event into a hard hit.
     """
-    if not scores or not scope_id:
+    if not scores or not scope_id or store is None:
         return set()
     anchors = sorted(scores, key=lambda aid: -scores[aid])[:12]
     placeholders = ",".join("?" for _ in anchors)
@@ -2000,6 +2022,73 @@ def _expand_ranked_event_neighbors(scores, store, scope_id, media_constraint=Non
                 continue
             scores[asset_id] = 0.7 * seed_score
             added.add(asset_id)
+    return added
+
+
+def _expand_capture_neighbors(scores, store, scope_id, media_constraint=None):
+    """Rescue nearby photos when a relevant event has incomplete graph edges.
+
+    A burst can contain one richly captioned photo and several plain-caption
+    frames. Follow only trusted capture times of the strongest search hits,
+    within ten minutes and with a strict per-anchor/total budget. This is a
+    soft candidate signal, not proof that the neighboring frame answers the
+    question; subsequent query-aware ranking and inspection still apply.
+    """
+    if not scores or not scope_id or store is None:
+        return set()
+    from datetime import datetime, timedelta
+    from ..retrieval.temporal import trusted_captured_at
+
+    def captured(asset_id):
+        try:
+            asset = store.get_asset(asset_id) or {}
+            observation = (store.list_observations(asset_id=asset_id, limit=1) or [{}])[0]
+            stamp = trusted_captured_at(asset, observation, store=store)
+            if not stamp:
+                return None
+            return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).replace(tzinfo=None)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+
+    anchors = sorted(scores, key=lambda aid: -scores[aid])[:8]
+    added = set()
+    for anchor in anchors:
+        anchor_time = captured(anchor)
+        if anchor_time is None:
+            continue
+        try:
+            rows = _store_fetchall(
+                store,
+                "SELECT id FROM assets WHERE scope_id=? "
+                "AND datetime(captured_at) BETWEEN datetime(?) AND datetime(?) "
+                "AND (?='' OR media_type=?) "
+                "ORDER BY ABS(julianday(captured_at)-julianday(?)) LIMIT 120",
+                (scope_id, (anchor_time - timedelta(minutes=10)).isoformat(),
+                 (anchor_time + timedelta(minutes=10)).isoformat(),
+                 media_constraint or "", media_constraint or "",
+                 anchor_time.isoformat()),
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            continue
+        nearby = []
+        for row in rows:
+            asset_id = str(row[0])
+            if asset_id in scores or asset_id in added:
+                continue
+            if (_is_face_reference_asset({"asset_id": asset_id}, store)
+                    or _is_synthetic_event_asset({"asset_id": asset_id}, store)):
+                continue
+            candidate_time = captured(asset_id)
+            if candidate_time is None:
+                continue
+            delta = abs((candidate_time - anchor_time).total_seconds())
+            if delta <= 600:
+                nearby.append((delta, asset_id))
+        for _, asset_id in sorted(nearby)[:4]:
+            scores[asset_id] = max(scores.get(asset_id, 0.0), 0.65 * scores[anchor])
+            added.add(asset_id)
+            if len(added) >= 24:
+                return added
     return added
 
 
@@ -2768,6 +2857,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
 
     event_neighbor_added = _expand_ranked_event_neighbors(
         scores, store, scope_id, media_constraint=media_constraint)
+    capture_neighbor_added = _expand_capture_neighbors(
+        scores, store, scope_id, media_constraint=media_constraint)
 
     # A keyframe is indexed as an image, but the benchmark's video GT is the
     # parent source video.  Expand this provenance edge before the bounded
@@ -2786,19 +2877,10 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         kept = [aid for aid in kept if _time_ok(_asset_captured(aid))]
     kept.sort(key=lambda a: -scores.get(a, 0))
 
-    # 断层截断（明显 gap 处截断）+ 有界候选上限 + 保底 3。
-    final_ids = kept[:_SLOT_MAX_CANDIDATES]
-    if len(final_ids) > 3:
-        _top = scores.get(final_ids[0], 1) or 1.0
-        _cut = len(final_ids)
-        _gap_ratio = float(os.getenv("SENTRIX_SLOT_GAP_RATIO", "0.5"))
-        for i in range(1, len(final_ids)):
-            if _top > 0 and (scores.get(final_ids[i - 1], 0) - scores.get(final_ids[i], 0)) / _top > _gap_ratio:
-                _cut = i
-                break
-        final_ids = final_ids[:_cut]
-    if len(final_ids) < 3 and len(kept) > len(final_ids):
-        final_ids = kept[:3]  # 保底 3 张，避免模型无可选
+    # A relative score cliff must not turn a broad graph/semantic union into
+    # only three candidates. Preserve the strongest head and a small fallback
+    # pool so the query-aware preview can rescue a visually matching asset.
+    final_ids = _slot_gap_bounded_ids(kept, scores)
 
     # The candidate set above is still the graph/semantic union.  Only reorder
     # the bounded head by the original user wording before exposing stable
@@ -2845,6 +2927,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             "event_anchor_source": event_anchor_source,
             "event_anchor_candidate_count": len(event_member_ids),
             "event_neighbor_added_count": len(event_neighbor_added),
+            "capture_neighbor_added_count": len(capture_neighbor_added),
             "lexical_anchor_surface_count": len(lexical_anchor_surfaces),
             "lexical_anchor_candidate_count": len(lexical_anchor_valid),
             "lexical_anchor_added_count": lexical_anchor_added,
