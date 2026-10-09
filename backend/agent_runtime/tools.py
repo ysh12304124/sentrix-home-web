@@ -791,7 +791,11 @@ def _preview_entry(store, asset_id: str, handle: str, *, level="exact", conditio
     source_timestamp_sec = None
     source_scene_index = None
     source_video_file_name = None
-    if asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
+    if asset.get("media_type") == "video":
+        media_kind = "video"
+        source_video_asset_id = asset_id
+        source_video_file_name = asset.get("file_name")
+    elif asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"}:
         media_kind = "video_keyframe"
         source_video_asset_id = asset.get("parent_asset_id")
         source_timestamp_sec = asset.get("source_timestamp_sec")
@@ -3274,7 +3278,19 @@ def _get_original_photos(arguments: dict, *, context: dict | None = None) -> dic
     target = handle if asset_id else (rs.visible_asset_ids()[0] if rs.visible_asset_ids() else None)
     store = _RUNTIME.get("store")
     target_asset = store.get_asset(asset_id or target) if store and (asset_id or target) else None
-    if target_asset and target_asset.get("derived_kind") == "video_keyframe" and target_asset.get("parent_asset_id"):
+    if target_asset and target_asset.get("media_type") == "video":
+        return {
+            "summary": "已从当前结果集授权原始视频交付。",
+            "result_set_id": result_set_id,
+            "handle": handle or "first",
+            "delivered": 1,
+            "total": len(rs.visible_asset_ids()),
+            "scope_id": rs.scope_id,
+            "url": f"/api/assets/{asset_id or target}/file",
+            "media_type": "video",
+            "source_video_asset_id": asset_id or target,
+        }
+    if target_asset and target_asset.get("derived_kind") in {"video_keyframe", "video_keyframe_webp"} and target_asset.get("parent_asset_id"):
         source_video_id = target_asset["parent_asset_id"]
         return {
             "summary": "已从结果集授权原始视频交付，来源是关键帧对应的时间点。",
@@ -3433,8 +3449,27 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     if not asset_id or store is None:
         return {"summary": "无法定位照片。", "certainty": "uncertain", "persisted": False,
                 "blocked": ["unknown_handle"]}
+    visual_asset_id = asset_id
+    source_timestamp_sec = None
+    selected_asset = store.get_asset(asset_id) or {}
+    if scope_id and selected_asset.get("scope_id") != scope_id:
+        return {"summary": "无法复核该媒体（不在当前相册范围）。",
+                "certainty": "uncertain", "persisted": False,
+                "blocked": ["scope_mismatch"]}
+    if selected_asset.get("media_type") == "video":
+        frames = [frame for frame in store.list_derived_assets(asset_id)
+                  if (not scope_id or frame.get("scope_id") == scope_id) and frame.get("path")
+                  and Path(frame["path"]).is_file()]
+        if not frames:
+            return {"summary": "视频没有可用的关键帧，无法复核画面。",
+                    "certainty": "uncertain", "persisted": False,
+                    "blocked": ["video_keyframe_unavailable"],
+                    "_source_asset_id": asset_id, "asset_handle": asset_handle}
+        frame = frames[len(frames) // 2]
+        visual_asset_id = frame["id"]
+        source_timestamp_sec = frame.get("source_timestamp_sec")
     row = _store_fetchone(
-        store, "SELECT path, scope_id FROM assets WHERE id = ?", (asset_id,))
+        store, "SELECT path, scope_id FROM assets WHERE id = ?", (visual_asset_id,))
     if row and scope_id and row["scope_id"] != scope_id:
         return {"summary": "无法复核该照片（不在当前相册范围）。", "certainty": "uncertain",
                 "persisted": False, "blocked": ["scope_mismatch"]}
@@ -3445,8 +3480,8 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     if gamma is None:
         return {"summary": "模型不可用。", "certainty": "uncertain", "persisted": False}
     model_call_metrics = []
-    identity_rows = _confirmed_photo_identities(store, asset_id)
-    face_manifest = _photo_face_manifest(store, asset_id)
+    identity_rows = _confirmed_photo_identities(store, visual_asset_id)
+    face_manifest = _photo_face_manifest(store, visual_asset_id)
     if not target_person:
         user_goal = str(task_state.get("user_goal") or task_state.get("last_user_goal") or "")
         target_person = next((str(item.get("person_name") or "") for item in identity_rows
@@ -3538,7 +3573,7 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
     observation_row = _store_fetchone(
         store,
         "SELECT people_json FROM observations WHERE asset_id = ? ORDER BY updated_at DESC LIMIT 1",
-        (asset_id,),
+        (visual_asset_id,),
     )
     try:
         people_values = json.loads(observation_row["people_json"] or "[]") if observation_row else []
@@ -3564,6 +3599,8 @@ def _inspect_photo(arguments: dict, *, context: dict | None = None) -> dict:
             Path(crop_path).unlink(missing_ok=True)
     return {
         "_source_asset_id": asset_id,
+        "inspected_keyframe_asset_id": visual_asset_id if visual_asset_id != asset_id else None,
+        "source_timestamp_sec": source_timestamp_sec,
         "asset_handle": asset_handle,
         "question": question,
         "observation": parsed.get("observation") or parsed.get("scene") or "",

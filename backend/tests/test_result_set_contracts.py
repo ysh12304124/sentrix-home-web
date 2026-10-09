@@ -158,6 +158,57 @@ class ResultSetContractTests(unittest.TestCase):
         self.assertEqual(chat.call_args_list[1].kwargs["vision_options"],
                          {"num_predict": 192})
 
+    def test_video_parent_preview_inspects_keyframe_and_delivers_video(self):
+        video_path = Path(self.tmp) / "scene.mp4"
+        video_path.write_bytes(b"not an image")
+        frame_path = Path(self.tmp) / "frame.jpg"
+        Image.new("RGB", (32, 32), (10, 80, 120)).save(frame_path)
+        video = self.store.create_asset(
+            "asset-video", "scene.mp4", "video", str(video_path), scope_id="album")
+        self.store.create_asset(
+            "asset-frame", "frame.jpg", "image", str(frame_path),
+            metadata={"parent_asset_id": video["id"],
+                      "derived_kind": "video_keyframe", "source_timestamp_sec": 4.5},
+            scope_id="album")
+        rs = runtime_tools._RUNTIME["result_sets"].new(
+            scope_id="album", query="视频里的水灯", asset_ids=[video["id"]])
+        preview = runtime_tools._search_from_prior_result_set(rs, "album")["preview"][0]
+        self.assertEqual(preview["media_kind"], "video")
+        self.assertEqual(preview["source_video_asset_id"], video["id"])
+        gamma = GammaClient()
+        runtime_tools._RUNTIME["gamma"] = gamma
+        with patch.object(gamma, "chat", return_value=(
+                '{"observation":"画面里有人展示水灯","certainty":"supported"}')):
+            inspected = runtime_tools._inspect_photo(
+                {"asset_handle": "photo_1", "question": "视频里做什么"},
+                context={"scope_id": "album", "task_state": {
+                    "current_result_set": rs.result_set_id}})
+        self.assertEqual(inspected["certainty"], "supported")
+        self.assertEqual(inspected["_source_asset_id"], video["id"])
+        self.assertEqual(inspected["inspected_keyframe_asset_id"], "asset-frame")
+        delivered = runtime_tools._get_original_photos(
+            {"handle": "photo_1"}, context={"scope_id": "album", "task_state": {
+                "current_result_set": rs.result_set_id}})
+        self.assertEqual(delivered["media_type"], "video")
+        self.assertEqual(delivered["url"], f"/api/assets/{video['id']}/file")
+
+    def test_video_parent_without_frame_does_not_send_mp4_as_image(self):
+        video_path = Path(self.tmp) / "empty.mp4"
+        video_path.write_bytes(b"not an image")
+        video = self.store.create_asset(
+            "asset-empty-video", "empty.mp4", "video", str(video_path), scope_id="album")
+        rs = runtime_tools._RUNTIME["result_sets"].new(
+            scope_id="album", query="视频", asset_ids=[video["id"]])
+        gamma = GammaClient()
+        runtime_tools._RUNTIME["gamma"] = gamma
+        with patch.object(gamma, "chat") as chat:
+            out = runtime_tools._inspect_photo(
+                {"asset_handle": "photo_1", "question": "有什么"},
+                context={"scope_id": "album", "task_state": {
+                    "current_result_set": rs.result_set_id}})
+        self.assertIn("video_keyframe_unavailable", out["blocked"])
+        chat.assert_not_called()
+
     def test_debug_projection_separates_full_candidates_from_preview(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(
             scope_id="album", query="照片", asset_ids=[f"asset_{i}" for i in range(20)]

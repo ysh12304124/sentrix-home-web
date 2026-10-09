@@ -1346,6 +1346,44 @@ def _selected_metadata_facts(task_state: dict, handles: list[str]) -> list[str]:
     return facts[:6]
 
 
+def _last_supported_inspection_handle(task_state: dict) -> str | None:
+    """Recover a source-bound handle when final omits selected_image_handles.
+
+    Only an actually displayed and successfully inspected item is eligible;
+    search ranking by itself is not evidence that the image matches the query.
+    """
+    visible = {
+        str(row.get("handle") or "")
+        for result in task_state.get("tool_results") or []
+        if result.get("tool") in {"search_memories", "get_result_page"}
+        for row in result.get("preview") or []
+    }
+    supported = []
+    for result in task_state.get("tool_results") or []:
+        handle = str(result.get("inspect_handle") or "")
+        if (result.get("tool") == "inspect_photo" and handle in visible
+                and str(result.get("certainty") or "").lower() in {"supported", "confirmed"}
+                and str(result.get("inspect_observation") or "").strip()):
+            if handle not in supported:
+                supported.append(handle)
+    # Multiple plausible photos are not interchangeable evidence. Let the
+    # model choose explicitly instead of silently promoting the last one.
+    return supported[0] if len(supported) == 1 else None
+
+
+def _visual_tool_correction(tool_name: str, arguments: dict, message: str,
+                            *, inspect_called: bool, available_tools) -> tuple[str, dict]:
+    """Prefer visual inspection for a scene question misrouted to OCR."""
+    if (tool_name == "read_photo_text" and visual_intent(message)
+            and not ocr_intent(message) and not inspect_called
+            and "inspect_photo" in available_tools):
+        return "inspect_photo", {
+            "asset_handle": arguments.get("asset_handle") or "",
+            "question": message,
+        }
+    return tool_name, arguments
+
+
 def _direct_metadata_answer_supported(question: str, answer: str,
                                       task_state: dict, handles: list[str]) -> bool:
     """Stop visual-only follow-ups after a selected photo already proves a
@@ -2877,25 +2915,28 @@ class AgentRuntime:
                 # use only that photo's metadata, observed visual details and
                 # confirmed identities; never the broad candidate pool or a
                 # benchmark answer label.
-                if (not evidence_refusal_retried and selected_image_handles
+                retry_handles = selected_image_handles or ([handle] if (
+                    handle := _last_supported_inspection_handle(task.as_dict())) else [])
+                if (not evidence_refusal_retried and retry_handles
                         and task.tool_results and turn.budget.can_model_step()
                         and re.search(r"看不出来|不足以确认|无法确认|不能确认|无法判断|不清楚", turn.final_answer)):
                     selected_facts = (
-                        _selected_metadata_facts(task.as_dict(), selected_image_handles)
-                        + _selected_inspection_facts(task.as_dict(), selected_image_handles))
+                        _selected_metadata_facts(task.as_dict(), retry_handles)
+                        + _selected_inspection_facts(task.as_dict(), retry_handles))
                     if selected_facts:
                         evidence_refusal_retried = True
                         turn.steps.append({"type": "selected_evidence_answer_retry", "status": "prompted",
-                                           "handles": list(selected_image_handles)})
+                                           "handles": list(retry_handles)})
                         messages.append({"role": "assistant", "content": _model_visible_action(action)})
                         messages.append({"role": "user", "content": (
-                            "你刚选择展示的照片有以下已获得的证据：\n- "
+                            "你已复核的照片有以下已获得的证据：\n- "
                             + "\n- ".join(selected_facts)
                             + "\n请核对这些照片是否对应用户所问事件。若对应，先回答证据支持的"
                               "人物、画面、日期或地点；只有已确认人物才能使用姓名。无法确认的细节"
                               "可单独说明，但不要因此否认已确认的部分，也不要编造街道、价格或"
                               "照片中看不清的内容。若照片不对应，不要套用其信息。"
-                              "只输出修正后的 JSON final。"
+                              "若使用其中的照片作答，在 JSON final 的 selected_image_handles 中"
+                              "保留对应 handle。只输出修正后的 JSON final。"
                         )})
                         continue
                 # Phase H H-A：简单确定性问题（数量/日期/布尔）直接按 Nucleus 确定性渲染，
@@ -3237,6 +3278,17 @@ class AgentRuntime:
                 break
             tool_name = action.get("tool") or ""
             raw_arguments = dict(action.get("arguments") or {})
+            corrected_tool, corrected_arguments = _visual_tool_correction(
+                tool_name, raw_arguments, message, inspect_called=inspect_called,
+                available_tools=self.profile.tools)
+            if corrected_tool != tool_name:
+                # Visual scene questions sometimes trigger OCR even though no
+                # lettering is requested. Read the image once before letting
+                # an empty OCR result turn into a false "cannot tell" answer.
+                tool_name, raw_arguments = corrected_tool, corrected_arguments
+                action = {**action, "tool": tool_name, "arguments": raw_arguments}
+                turn.steps.append({"type": "visual_tool_correction",
+                                   "from": "read_photo_text", "to": tool_name})
             arguments = raw_arguments
             # 收敛硬限制：search 每轮最多 1 次（返回 18 张候选，需要更多用 get_result_page
             # 翻页，不要反复重搜）；同一张图最多 inspect/read_photo_text 1 次。
