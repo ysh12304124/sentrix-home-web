@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sentrix · WorldMM HippoVlog 测评</title>
+  <style>
+    :root { color-scheme: light; --ink:#182238; --muted:#6f7b96; --line:#dce3ef; --blue:#3268ed; --bg:#f3f6fb; --green:#15956b; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1180px; padding:30px 22px 56px; margin:auto; }
+    h1 { margin:0; font-size:28px; letter-spacing:-.02em; }
+    h2 { margin:0 0 8px; font-size:18px; }
+    .sub { color:var(--muted); margin:5px 0 24px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:15px; padding:21px 23px; margin:15px 0; box-shadow:0 2px 8px #253a6410; }
+    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    .metric { border:1px solid var(--line); border-radius:12px; padding:14px; }
+    .metric span { display:block; color:var(--muted); font-size:13px; }
+    .metric strong { display:block; font-size:23px; margin-top:4px; }
+    .flow { display:flex; align-items:center; flex-wrap:wrap; gap:8px; color:#34415f; margin-top:15px; }
+    .step { border-radius:9px; background:#edf3ff; padding:7px 10px; }
+    .arrow { color:#9ba7bd; }
+    .compare { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    .method { border:1px solid var(--line); border-radius:12px; padding:16px; }
+    .method h3 { margin:0 0 5px; font-size:16px; }
+    .method p { margin:0; color:var(--muted); font-size:13px; }
+    .tag { display:inline-block; background:#e8f7f1; color:#087c57; padding:2px 8px; border-radius:20px; font-size:12px; margin-left:6px; }
+    .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:17px; }
+    button { border:0; border-radius:9px; padding:10px 17px; cursor:pointer; font:600 14px inherit; }
+    #start { color:#fff; background:var(--blue); }
+    #stop { color:#8c2b3d; background:#fff0f1; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .state { display:flex; gap:10px; align-items:center; color:var(--muted); }
+    .dot { width:9px; height:9px; border-radius:50%; background:#9aa6ba; }
+    .dot.running { background:#ed9e24; box-shadow:0 0 0 4px #ed9e2420; }
+    .dot.complete { background:var(--green); }
+    .dot.failed { background:#c13b51; }
+    .bar { height:9px; background:#e8edf5; border-radius:9px; overflow:hidden; margin:12px 0 6px; }
+    .bar i { display:block; width:0; height:100%; background:linear-gradient(90deg,#3974f5,#6a96ff); transition:width .25s; }
+    .meta { color:var(--muted); font-size:13px; }
+    .results { overflow:auto; }
+    table { width:100%; border-collapse:collapse; }
+    th,td { padding:10px 9px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-weight:600; font-size:13px; }
+    pre { max-height:260px; overflow:auto; margin:0; background:#111a2a; color:#d5e2f8; padding:13px; border-radius:10px; font:12px/1.5 ui-monospace,monospace; white-space:pre-wrap; }
+    code { overflow-wrap:anywhere; }
+    .notice { color:#7d5a15; background:#fff8e7; border:1px solid #f0dfb1; border-radius:10px; padding:11px 13px; font-size:13px; }
+    @media(max-width:760px) { .grid{grid-template-columns:repeat(2,minmax(0,1fr))} .compare{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Sentrix · WorldMM / HippoVlog 测评</h1>
+  <p class="sub">在 200 服务器运行的独立实验面板 · 对比新关键帧算法，固定 WorldMM 记忆与推理流程</p>
+
+  <section class="card">
+    <h2>数据集</h2>
+    <div class="grid">
+      <div class="metric"><span>视频</span><strong id="videos">--</strong></div>
+      <div class="metric"><span>QA 题目</span><strong id="questions">--</strong></div>
+      <div class="metric"><span>WorldMM 清单</span><strong id="manifest">--</strong></div>
+      <div class="metric"><span>WorldMM 源码</span><strong id="source">检查中</strong></div>
+    </div>
+    <div class="meta" style="margin-top:12px">数据路径：<code id="dataset">读取中</code></div>
+  </section>
+
+  <section class="card">
+    <h2>实验对照</h2>
+    <div class="compare">
+      <div class="method">
+        <h3>WorldMM 均匀抽帧基线</h3>
+        <p>按 WorldMM 视频理解流程从时间窗均匀采样；构建同样的情节、语义、视觉记忆并完成 QA。</p>
+      </div>
+      <div class="method">
+        <h3>Sentrix SVD/eSVD <span class="tag">待测</span></h3>
+        <p>仅替换关键帧生成；关键帧继续进入 WorldMM 的记忆构建、动态检索、回答和评分流程。</p>
+      </div>
+    </div>
+    <div class="flow">
+      <span class="step">HIPPVLog 视频 + 转录</span><b class="arrow">→</b>
+      <span class="step">基线 / SVD-eSVD 关键帧</span><b class="arrow">→</b>
+      <span class="step">情节 + 语义 + 视觉记忆</span><b class="arrow">→</b>
+      <span class="step">WorldMM 自适应检索</span><b class="arrow">→</b>
+      <span class="step">1,000 题 QA 与分类准确率</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>运行状态</h2>
+    <div class="state"><i id="dot" class="dot"></i><strong id="status">空闲</strong><span id="stage">等待启动</span></div>
+    <div class="bar"><i id="progress"></i></div>
+    <div id="counts" class="meta">准备读取数据集和运行配置…</div>
+    <div class="controls">
+      <button id="start">启动完整测评（两种关键帧方案）</button>
+      <button id="resume">继续上次运行</button>
+      <button id="stop">停止运行</button>
+      <span id="message" class="meta"></span>
+    </div>
+  </section>
+
+  <section class="card results">
+    <h2>结果摘要</h2>
+    <table>
+      <thead><tr><th>方案</th><th>已评 QA</th><th>准确率</th><th>音频</th><th>视听</th><th>视觉</th><th>摘要</th><th>SVD 原选帧</th><th>实际送入帧</th><th>相比基线帧数</th><th>保底窗口</th><th>抽帧耗时</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="12" class="meta">尚无本次实验结果</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>运行日志</h2>
+    <pre id="log">日志尚未生成</pre>
+  </section>
+  <p class="notice">每种方案分别保存记忆与 QA 结果，并记录模型/方法配置、逐题结果、各类别准确率、关键帧数量和处理耗时；不会把预处理报告当作正式评测结果。</p>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const pct = (v) => v == null ? "—" : `${(Number(v) * 100).toFixed(2)}%`;
+async function get(path) { const r = await fetch(path, {cache:"no-store"}); if (!r.ok) throw new Error(`${r.status}`); return r.json(); }
+async function refresh() {
+  try {
+    const [cfg, st, result, logs] = await Promise.all([get('/api/config'), get('/api/status'), get('/api/results'), get('/api/log')]);
+    $('videos').textContent = cfg.video_count ?? '--'; $('questions').textContent = cfg.question_count ?? '--';
+    $('manifest').textContent = cfg.manifest_count ?? '--'; $('source').textContent = cfg.worldmm_source_present ? '已就绪' : '缺失';
+    $('dataset').textContent = cfg.dataset_root || '未知';
+    const state = st.status || 'idle'; const label = ({idle:'空闲',queued:'排队中',running:'运行中',complete:'已完成',failed:'失败',cancelled:'已停止'})[state] || state;
+    $('status').textContent = label; $('stage').textContent = st.stage || '等待启动'; $('message').textContent = st.message || '';
+    $('dot').className = `dot ${state}`; $('progress').style.width = `${Math.max(0, Math.min(100, Number(st.progress || 0)))}%`;
+    $('counts').textContent = `视频 ${st.video_done || 0}/${st.video_total || cfg.video_count || 0} · QA ${st.question_done || 0}/${st.question_total || cfg.question_count || 0} · ${st.progress || 0}% · 运行 ${st.run_id || '尚未开始'}`;
+    $('start').disabled = ['queued','running'].includes(state) || !cfg.dataset_ready;
+    $('resume').disabled = ['queued','running','complete','idle'].includes(state) || !st.run_id;
+    $('stop').disabled = !['queued','running'].includes(state);
+    $('log').textContent = logs.text || '日志尚未生成'; $('log').scrollTop = $('log').scrollHeight;
+    const items = result.items || [];
+    const base = items.find(x => x.algorithm === 'worldmm_uniform');
+    $('rows').innerHTML = items.length ? items.map(x => {
+      const actual = x.caption_input_frame_count ?? x.keyframe_count;
+      const baseline = base?.caption_input_frame_count ?? base?.keyframe_count;
+      return `<tr><td>${x.algorithm_label || x.algorithm}</td><td>${x.qa_done || 0}/${x.qa_total || 0}</td><td>${pct(x.accuracy)}</td><td>${pct(x.audio_accuracy)}</td><td>${pct(x.audio_visual_accuracy)}</td><td>${pct(x.visual_accuracy)}</td><td>${pct(x.summary_accuracy)}</td><td>${x.algorithm === 'svd_esvd' ? x.keyframe_count : '—'}</td><td>${actual ?? '—'}</td><td>${baseline ? pct(actual / baseline) : '—'}</td><td>${x.fallback_window_count ?? '—'}</td><td>${x.keyframe_seconds == null ? '—' : `${Number(x.keyframe_seconds).toFixed(1)} 秒`}</td></tr>`;
+    }).join('') : '<tr><td colspan="12" class="meta">尚无本次实验结果</td></tr>';
+  } catch (e) { $('message').textContent = `服务连接中：${e.message}`; }
+}
+$('start').onclick = async () => { $('start').disabled = true; try { const r = await fetch('/api/run', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})}); const x = await r.json(); if (!r.ok) throw new Error(x.error || r.status); } catch(e) { $('message').textContent = e.message; } await refresh(); };
+$('resume').onclick = async () => { $('resume').disabled = true; try { const r = await fetch('/api/resume', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); const x = await r.json(); if (!r.ok) throw new Error(x.error || r.status); } catch(e) { $('message').textContent = e.message; } await refresh(); };
+$('stop').onclick = async () => { await fetch('/api/stop', {method:'POST'}); await refresh(); };
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>
