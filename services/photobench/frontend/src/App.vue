@@ -1782,7 +1782,7 @@ function pipelineMetricRows(phase = {}) {
   ].filter(Boolean);
 }
 
-async function loadRuns() { runs.value = (await api("/api/runs")).runs || []; }
+async function loadRuns() { runs.value = (await api("/api/runs?page_size=100")).runs || []; }
 function runProgressLabel(run) {
   if (run?.mode === "build") return "—";
   const progress = run?.phases?.qa_eval?.progress;
