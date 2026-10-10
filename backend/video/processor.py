@@ -13,6 +13,7 @@ from ..db import make_id
 from ..geocoding import format_gps_prefix
 from .metadata import probe_video_metadata, resolve_ffmpeg_binary
 from .worldmm_adapter import WorldMMAdapter
+from ..platform_profile import profile
 
 
 def _captured_at(value, offset=0.0):
@@ -76,7 +77,7 @@ class VideoMemoryAdapter:
     def _keyframe_algorithm(self):
         return str(
             self.keyframe_algorithm
-            or os.getenv("SENTRIX_VIDEO_KEYFRAME_ALGORITHM", "worldmm")
+            or profile.video_keyframe_algorithm()
         ).strip().lower()
 
     def process(self, asset, pipeline):
@@ -136,6 +137,7 @@ class VideoMemoryAdapter:
             })
 
             algorithm = self._keyframe_algorithm()
+            stage = "video-keyframe-extracting"
             if algorithm == "hybrid_webp":
                 return self._process_hybrid_webp(
                     asset, pipeline, metadata, captured_at, location_label, reverse_geocode,
@@ -227,16 +229,24 @@ class VideoMemoryAdapter:
                 "worldmm_selected_keyframe_count": result.selected_keyframe_count,
                 "video_scene_event_ids": scene_ids,
                 "derived_keyframe_asset_ids": keyframe_asset_ids, "video_processing_seconds": elapsed,
-                "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "cpu"),
+                "worldmm_device": profile.video_device(),
                 "vlm_device": os.getenv("SENTRIX_QWEN3_VL_DEVICE", "cpu"),
                 "error_stage": None, "error": None, "retryable": True,
             })
         except Exception as error:
             data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
             shutil.rmtree(data_root / "derived" / "video" / asset_id / "hybrid-webp" / "vlm-evidence", ignore_errors=True)
+            # Client errors (4xx) are deterministic — retrying won't help.
+            # Mark non-retryable so the batch worker's retry limit can retire them.
+            error_text = f"{type(error).__name__}: {error}"
+            non_retryable_markers = (
+                "400 Bad Request", "401 ", "403 ", "404 ", "422 ",
+                "exceeds the available context size", "exceed_context_size_error",
+            )
+            retryable = not any(marker in error_text for marker in non_retryable_markers)
             return store.update_asset(asset_id, "video-processing-failed", {
-                "video_stage": stage, "error_stage": stage, "error": f"{type(error).__name__}: {error}",
-                "retryable": True, "video_processing_seconds": round(time.perf_counter() - started, 3),
+                "video_stage": stage, "error_stage": stage, "error": error_text,
+                "retryable": retryable, "video_processing_seconds": round(time.perf_counter() - started, 3),
             })
 
     def _process_hybrid_webp(self, asset, pipeline, metadata, captured_at, location_label,
@@ -453,6 +463,6 @@ class VideoMemoryAdapter:
             "event_vlm_seconds": round(event_vlm_seconds, 3),
             "transient_vlm_frame_count": transient_vlm_frame_count,
             "persistent_keyframe_count": len(keyframe_asset_ids),
-            "worldmm_device": os.getenv("SENTRIX_VIDEO_DEVICE", "0"), "vlm_device": "per-keyframe-pipeline",
+            "worldmm_device": profile.video_device(), "vlm_device": "per-keyframe-pipeline",
             "error_stage": None, "error": None, "retryable": True,
         })

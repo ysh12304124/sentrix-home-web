@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 from dataclasses import dataclass
+from .platform_profile import profile
 
 
 class FaceEmbeddingUnavailable(RuntimeError):
@@ -80,7 +81,7 @@ class AdaFaceAdapter(FaceEmbeddingAdapter):
     def __init__(self, model_path=None, architecture="ir_50", device=None, model_version=None, backend=None):
         self.model_path = Path(model_path or os.getenv("ADAFACE_MODEL_PATH", ""))
         self.architecture = architecture or os.getenv("ADAFACE_ARCHITECTURE", "ir_50")
-        self.device = device or os.getenv("ADAFACE_DEVICE", "auto")
+        self.device = device or profile.adaface_device()
         self._model = None
         self._torch = None
         self._using_external_backend = backend is not None

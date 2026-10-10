@@ -137,6 +137,7 @@ class StructuredMemoryExecutor:
             "media_include": include, "media_exclude": exclude,
             "place": self._place(draft, spec),
             "entity_ids": self._entity_ids(spec),
+            "asset_kind": "original_only",
         }
 
     # ---- base query builder ----
@@ -152,6 +153,7 @@ class StructuredMemoryExecutor:
 
         scope_clause, params = self._scope(spec)
         clauses = [scope_clause]
+        clauses.append("COALESCE(a.derived_kind, '') = ''")
         include, exclude = self._media(draft, spec)
         if include:
             clauses.append(f"a.media_type IN ({', '.join('?' * len(include))})")

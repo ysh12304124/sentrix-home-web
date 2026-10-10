@@ -13,12 +13,24 @@ if [[ -f "$root/.env" ]]; then
   source "$root/.env"
   set +a
 fi
+
+# 平台参数层：三台共用一份代码，机器相关的「人为选择」集中在那里；能探测的
+# （CUDA 是否真能用、ffmpeg 有哪些硬解、内存多大、装了 qdrant 没有）交给
+# backend/platform_profile.py，不需要任何参数。
+# 放在 .env **之后**：env 里显式写的值优先级最高，这里只补没写的。
+if [[ -f "$root/scripts/deploy/platform-profiles.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$root/scripts/deploy/platform-profiles.sh"
+  sentrix_apply_platform_profile
+fi
 python_bin="${SENTRIX_PYTHON:-$root/.venv/bin/python}"
 port="${SENTRIX_API_PORT:-8090}"
 export SENTRIX_DATA_DIR="${SENTRIX_DATA_DIR:-$root/data}"
 export SENTRIX_DB_PATH="${SENTRIX_DB_PATH:-$SENTRIX_DATA_DIR/sentrix.db}"
 export SENTRIX_ANN_DIR="${SENTRIX_ANN_DIR:-$SENTRIX_DATA_DIR/ann}"
-export SENTRIX_VECTOR_BACKEND="${SENTRIX_VECTOR_BACKEND:-sqlite}"
+# 向量后端**不在这里写死默认值**：由 backend/platform_profile.py 探测决定
+# （装了 qdrant-client 就用 qdrant，与 153 一致；否则回落 sqlite 并留痕）。
+# 在这里写死会覆盖探测结果 —— 153 用 qdrant、46/118 用 sqlite 的分歧正是这么来的。
 export SENTRIX_QDRANT_PATH="${SENTRIX_QDRANT_PATH:-$SENTRIX_DATA_DIR/qdrant}"
 mkdir -p "$SENTRIX_DATA_DIR/media" "$SENTRIX_ANN_DIR"
 
@@ -32,11 +44,15 @@ runtime_dirs=()
 while IFS= read -r directory; do
   runtime_dirs+=("$directory")
 done < <(find "$site_packages/nvidia" -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
-# GPU face detection (RetinaFace + buffalo_l onnxruntime CUDA) needs cudnn/cublas
-# shipped in the stmem conda env; the project .venv does not vendor nvidia libs.
-while IFS= read -r directory; do
-  runtime_dirs+=("$directory")
-done < <(find /home/asus/miniconda3/envs/stmem/lib/python3.10/site-packages/nvidia -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
+# GPU face detection (RetinaFace + buffalo_l onnxruntime CUDA) needs cudnn/cublas.
+# 项目 .venv 通常不自带 nvidia 库，需要从 conda 环境补。不要写死某个 conda 路径
+# —— 不同机器上用户名和环境名都不同，写死会让脚本换台机器就直接失效。
+# 有 CONDA_PREFIX 就用它；没有就跳过，让 onnxruntime 自己给出缺库的错误。
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+  while IFS= read -r directory; do
+    runtime_dirs+=("$directory")
+  done < <(find "$CONDA_PREFIX"/lib/python*/site-packages/nvidia -mindepth 2 -maxdepth 2 -type d -name lib 2>/dev/null | sort)
+fi
 
 if ((${#runtime_dirs[@]})); then
   runtime_path="$(IFS=:; echo "${runtime_dirs[*]}")"
@@ -48,20 +64,26 @@ export SENTRIX_LLM_BACKEND="${SENTRIX_LLM_BACKEND:-vllm}"
 export SENTRIX_VLLM_BASE_URL="${SENTRIX_VLLM_BASE_URL:-http://127.0.0.1:8100/v1}"
 export SENTRIX_VLLM_MODEL="${SENTRIX_VLLM_MODEL:-gemma4-12b-it}"
 export SENTRIX_VLLM_REGISTRY="${SENTRIX_VLLM_REGISTRY:-$root/configs/sentrix_vllm_registry_192_168_0_153.json}"
+# Sentrix JSON v1 training targets allow up to 1024 output tokens. Keep the
+# local runtime budget aligned; cloud_api uses its separate provider budget.
+export SENTRIX_TOOL_LOOP_MAX_TOKENS="${SENTRIX_TOOL_LOOP_MAX_TOKENS:-1024}"
+export SENTRIX_BIG_MODEL_MAX_OUTPUT_TOKENS="${SENTRIX_BIG_MODEL_MAX_OUTPUT_TOKENS:-4096}"
 # Batch image work is configurable, but the backend also caps the effective
 # value at the active vLLM profile's max_num_seqs.
 export SENTRIX_PIPELINE_MAX_WORKERS="${SENTRIX_PIPELINE_MAX_WORKERS:-2}"
 export SENTRIX_EVENT_SUMMARY_MAX_WORKERS="${SENTRIX_EVENT_SUMMARY_MAX_WORKERS:-2}"
 # Legacy Ollama settings are kept only for explicit SENTRIX_LLM_BACKEND=ollama fallback.
-export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11435}"
-export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:12b}"
+export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e2b}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 export E2B_BASE_URL="${E2B_BASE_URL:-http://127.0.0.1:8101}"
 # 153 GPU driver/library NVML mismatch breaks the CUDA caching allocator; run
 # CLIP embedding on CPU so visual/text recall stays available.
 export CLIP_DEVICE="${CLIP_DEVICE:-cpu}"
-export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-/home/asus/Github/stmem-bak/models/open_clip_pytorch_model.bin}"
-export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-/home/asus/.cache/clip/clip_cn_vit-l-14.pt}"
+# 默认值取仓库相对路径与标准缓存目录：写死别人的家目录在换机器时只会得到一个
+# 指向不存在文件的路径，而 ClipAdapter 拿到不存在的 checkpoint 会直接加载失败。
+export CLIP_CHECKPOINT="${CLIP_CHECKPOINT:-$root/data/models/clip/${CLIP_MODEL_NAME:-ViT-B-32}.bin}"
+export CHINESE_CLIP_CHECKPOINT="${CHINESE_CLIP_CHECKPOINT:-$HOME/.cache/clip/clip_cn_vit-l-14.pt}"
 # R1B proved ViT-B-32 text-to-image is random for Chinese (AUC 0.51); switch the
 # visual slot to Chinese-CLIP ViT-L-14 (D3).  Text slot stays CLIP (AUC 0.996).
 export SENTRIX_IMAGE_EMBEDDER="${SENTRIX_IMAGE_EMBEDDER:-chinese_clip}"

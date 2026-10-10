@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import re
 
 from .guard_types import (GuardIssue, GuardResult, REVISION_REWRITE_ONLY,
@@ -101,7 +102,8 @@ def parse_verdict(raw: str) -> dict | None:
 def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
                        trusted_facts: list[str] | None = None,
                        messages: list | None = None,
-                       include_debug: bool = False):
+                       include_debug: bool = False,
+                       step_id: str | None = None):
     """返回 (faithful, issues[, debug])。任何异常/输出不可解析都降级为放行。
 
     messages: 完整 agent 对话轨迹（含全部工具返回与 captured_at 等元数据）。
@@ -156,7 +158,13 @@ def judge_faithfulness(chat_fn, *, query: str, tool_results: list, answer: str,
             {"role": "system", "content": JUDGE_SYSTEM},
             {"role": "user", "content": user},
         ]
-        raw = chat_fn(judge_messages)
+        signature = inspect.signature(chat_fn)
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                             for p in signature.parameters.values())
+        metadata = {"call_type": "faithfulness_judge", "step_id": step_id}
+        kwargs = {k: v for k, v in metadata.items()
+                  if accepts_kwargs or k in signature.parameters}
+        raw = chat_fn(judge_messages, **kwargs)
         verdict = parse_verdict(raw)
         if not verdict or "faithful" not in verdict:
             if include_debug:

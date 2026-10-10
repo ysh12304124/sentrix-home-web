@@ -67,6 +67,23 @@ class StructuredMemoryTests(unittest.TestCase):
         result = self.executor.execute(draft, _spec(), "structured_fact")
         self.assertEqual(result.total, 1)
 
+    def test_counts_exclude_derived_video_keyframes(self):
+        self.executor.store.create_asset(
+            "keyframe", "keyframe.jpg", "image", "/x/keyframe.jpg",
+            metadata={"captured_at": "2024-06-01T10:00:00", "derived_kind": "video_keyframe"},
+            scope_id="home",
+        )
+        self.executor.store.add_observation(
+            "keyframe", {"id": "keyframe-obs", "captured_at": "2024-06-01T10:00:00"},
+            scope_id="home",
+        )
+        image_count = self.executor.execute(
+            _draft("count", {"media_type": "image"}), _spec(), "structured_fact")
+        video_count = self.executor.execute(
+            _draft("count", {"media_type": "video"}), _spec(), "structured_fact")
+        self.assertEqual(image_count.total, 4)
+        self.assertEqual(video_count.total, 1)
+
     def test_exists(self):
         draft = _draft("exists", _TIME_2024)
         result = self.executor.execute(draft, _spec(), "structured_fact")

@@ -5,10 +5,12 @@ set -euo pipefail
 export CUDA_VISIBLE_DEVICES=1
 
 MODEL_DIR=/home/realmagic/models/compassjudger/CompassJudger-1-1.5B-Instruct-int8
-VLLM_BIN=/home/realmagic/miniconda3/envs/sentrix-judge/bin/vllm
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# vllm 是 conda 环境里的可执行文件；用 CONDA_PREFIX 探测，别再写死某个用户名。
+VLLM_BIN="${VLLM_BIN:-${CONDA_PREFIX:-/nonexistent}/bin/vllm}"
 PORT=8110
-PID_FILE="$HOME/github/sentrix-home-web/.judge.pid"
-LOG_DIR="$HOME/github/sentrix-home-web/logs"
+PID_FILE="$root/.judge.pid"
+LOG_DIR="$root/logs"
 mkdir -p "$LOG_DIR"
 
 if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then

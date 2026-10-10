@@ -1,0 +1,242 @@
+import json
+
+from .family_graph import validate_relationship_pair
+
+
+FAMILY_GRAPH_PROMPT = """你是家庭相册关系推断器。只能使用输入中已经落库的文字描述、事件与人物绑定 ID；
+绝不查看、索取或假设原始图片。请判断人物是否为家庭成员，并在有足够文本证据时输出直接中文关系。
+成员 membership 只能是 family、friend、unknown；低频或证据不足必须为 unknown。
+共现记录表示稳定人物在同一张已描述照片中出现；反复的成人-儿童家庭场景、家庭合影和长期共同出游是家庭成员及亲子/配偶关系的强证据。不要因一次活动同框就认定家庭。
+关系只能在证据充分时输出，必须填写合法的正反向标签。只返回 JSON：
+{"memberships":[{"person_id":"","membership":"family|friend|unknown","confidence":0.0}],
+ "relationships":[{"subject_entity_id":"","predicate":"父亲","object_entity_id":"","inverse_predicate":"女儿","confidence":0.0}]}。
+不要编造姓名、关系或不存在的人物 ID。输入："""
+
+
+class FamilyGraphService:
+    """Build and persist one scope's family graph from existing semantic evidence."""
+
+    def __init__(self, store, gamma=None):
+        self.store = store
+        self.gamma = gamma
+
+    def run(self, run_id, scope_id):
+        run = self.store.get_family_analysis_run(run_id)
+        if not run:
+            raise KeyError(run_id)
+        if run.get("status") == "running":
+            raise RuntimeError("run already running")
+        self.store.update_family_analysis_run(run_id, status="running", stage="build_text_evidence")
+        try:
+            evidence = self._build_text_evidence(scope_id)
+            self.store.update_family_analysis_run(run_id, status="running", stage="infer_graph")
+            output = self._infer(evidence)
+            self.store.update_family_analysis_run(run_id, status="running", stage="write_graph")
+            counts = self._persist(scope_id, run_id, evidence, output)
+            self.store.update_family_analysis_run(run_id, status="running", stage="write_portraits")
+            counts["portraits"] = self._write_portraits(scope_id, run_id, evidence)
+            counts["event_watermark"] = self._event_count(scope_id)
+            return self.store.update_family_analysis_run(
+                run_id, status="completed", stage="done", stats={**counts, "input_mode": "semantic_text_only"}
+            )
+        except Exception as error:
+            return self.store.update_family_analysis_run(run_id, status="failed", error=str(error))
+
+    def _event_count(self, scope_id):
+        return self.store.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE scope_id = ?", (scope_id,)
+        ).fetchone()[0]
+
+    def _infer(self, evidence):
+        if not self.gamma:
+            return {"memberships": [], "relationships": []}
+        model_people = sorted(
+            evidence.get("people") or [],
+            key=lambda item: (-len(item.get("observation_ids") or []), item["person_id"]),
+        )[:8]
+        core_ids = {item["person_id"] for item in model_people}
+        model_evidence = {
+            "scope_id": evidence.get("scope_id"),
+            "input_mode": "semantic_text_only",
+            "people": [{
+                "person_id": item["person_id"],
+                "observation_ids": (item.get("observation_ids") or [])[:6],
+                "descriptions": [str(text)[:300] for text in (item.get("descriptions") or [])[:2]],
+            } for item in model_people],
+            "cooccurrences": [item for item in (evidence.get("cooccurrences") or [])
+                              if item["person_a"] in core_ids and item["person_b"] in core_ids][:30],
+        }
+        response = self.gamma.chat(
+            FAMILY_GRAPH_PROMPT + json.dumps(model_evidence, ensure_ascii=False),
+            images=None, json_mode=True, role="verify",
+        )
+        if isinstance(response, dict):
+            return response
+        try:
+            return json.loads(response or "{}")
+        except (TypeError, ValueError):
+            return {"memberships": [], "relationships": []}
+
+    def _persist(self, scope_id, run_id, evidence, output):
+        people = {item["person_id"]: item for item in evidence.get("people") or []}
+        self.store.supersede_model_family_relationships(scope_id)
+        memberships = 0
+        relationships = 0
+        by_person = {
+            str(item.get("person_id") or ""): item
+            for item in (output.get("memberships") or []) if isinstance(item, dict)
+        }
+        for person_id, person in people.items():
+            item = by_person.get(person_id) or {}
+            membership = item.get("membership") if item.get("membership") in {"family", "friend", "unknown"} else "unknown"
+            if membership != "unknown" and not self._has_explicit_membership_evidence(membership, person):
+                membership = "unknown"
+            self.store.set_family_membership(
+                scope_id, person_id, membership, source="model",
+                confidence=float(item.get("confidence") or 0),
+                evidence_refs=person.get("observation_ids") or [], inference_run_id=run_id,
+            )
+            memberships += 1
+        for item in output.get("relationships") or []:
+            if not isinstance(item, dict):
+                continue
+            subject = str(item.get("subject_entity_id") or "")
+            object_id = str(item.get("object_entity_id") or "")
+            predicate = str(item.get("predicate") or "")
+            inverse = str(item.get("inverse_predicate") or "")
+            if subject not in people or object_id not in people or subject == object_id:
+                continue
+            try:
+                validate_relationship_pair(predicate, inverse)
+            except ValueError:
+                continue
+            if not self._has_explicit_relation_evidence(predicate, people[subject], people[object_id]):
+                continue
+            self.store.set_family_relationship(
+                scope_id, subject, predicate, object_id, inverse, source="model",
+                confidence=float(item.get("confidence") or 0),
+                evidence_refs=list(dict.fromkeys(
+                    (people[subject].get("observation_ids") or []) + (people[object_id].get("observation_ids") or [])
+                )), inference_run_id=run_id,
+            )
+            for related_person_id in (subject, object_id):
+                self.store.set_family_membership(
+                    scope_id, related_person_id, "family", source="model",
+                    confidence=float(item.get("confidence") or 0),
+                    evidence_refs=people[related_person_id].get("observation_ids") or [],
+                    inference_run_id=run_id,
+                )
+            relationships += 1
+        return {"people": len(people), "memberships": memberships, "relationships": relationships}
+
+    @staticmethod
+    def _has_explicit_relation_evidence(predicate, subject, object_person):
+        """Anonymous co-occurrence is never enough to assign a family role."""
+        text = " ".join((subject.get("descriptions") or []) + (object_person.get("descriptions") or []))
+        signals = {
+            "父亲": ("父亲", "爸爸", "父女", "父子"), "母亲": ("母亲", "妈妈", "母女", "母子"),
+            "儿子": ("儿子", "父子", "母子"), "女儿": ("女儿", "父女", "母女"),
+            "丈夫": ("丈夫", "夫妻", "夫妇"), "妻子": ("妻子", "夫妻", "夫妇"),
+            "哥哥": ("哥哥", "兄妹", "兄弟", "姐弟"), "姐姐": ("姐姐", "兄妹", "姐弟", "姐妹"),
+            "弟弟": ("弟弟", "兄弟", "姐弟"), "妹妹": ("妹妹", "兄妹", "姐妹"),
+            "朋友": ("朋友", "同学", "闺蜜", "好友"), "密友": ("密友", "闺蜜", "挚友"),
+            "其他亲属": ("亲属", "家人", "家庭成员"),
+        }
+        return any(token in text for token in signals.get(predicate, (predicate,)))
+
+    @staticmethod
+    def _has_explicit_membership_evidence(membership, person):
+        text = " ".join(person.get("descriptions") or [])
+        signals = {
+            "family": ("家人", "全家", "亲属", "家庭成员", "父亲", "母亲", "爸爸", "妈妈", "儿子", "女儿", "夫妻"),
+            "friend": ("朋友", "同学", "闺蜜", "好友", "同事"),
+        }
+        return any(token in text for token in signals.get(membership, ()))
+
+    def _write_portraits(self, scope_id, run_id, evidence):
+        relationships = self.store.list_effective_family_relationships(scope_id)
+        count = 0
+        for person in evidence.get("people") or []:
+            person_id = person["person_id"]
+            membership = self.store.get_effective_family_membership(scope_id, person_id) or {}
+            rels = [item["predicate"] for item in relationships if item.get("subject_entity_id") == person_id]
+            descriptions = person.get("descriptions") or []
+            text = "；".join(filter(None, [
+                f"家庭归属：{membership.get('membership') or 'unknown'}",
+                ("关系：" + "、".join(rels)) if rels else "",
+                "近期记忆：" + "；".join(descriptions[:3]) if descriptions else "",
+            ]))
+            if text:
+                self.store.write_family_portrait(scope_id, person_id, text, source="model", evidence_refs=person.get("observation_ids") or [], inference_run_id=run_id)
+                count += 1
+        return count
+
+    def _build_text_evidence(self, scope_id):
+        rows = self.store.connection.execute(
+            """SELECT fc.entity_id, fi.id AS face_instance_id,
+                      COALESCE(em.confidence, fi.detection_confidence, 0) AS confidence,
+                      o.id AS observation_id, o.caption, o.activity,
+                      o.canonical_json, o.detail_json
+               FROM face_instances fi
+               JOIN face_clusters fc ON fc.id = fi.cluster_id
+               JOIN entities e ON e.id = fc.entity_id
+               JOIN observations o ON o.id = fi.observation_id
+               LEFT JOIN entity_mentions em
+                 ON em.entity_id = fc.entity_id AND em.face_instance_id = fi.id
+               WHERE o.scope_id = ? AND e.scope_id = ?
+                 AND e.entity_type = 'person' AND e.status NOT IN ('rejected', 'superseded')
+               ORDER BY o.created_at ASC""",
+            (scope_id, scope_id),
+        ).fetchall()
+        people = {}
+        people_by_observation = {}
+        for row in rows:
+            value = dict(row)
+            person = people.setdefault(value["entity_id"], {
+                "person_id": value["entity_id"],
+                "face_instance_ids": [],
+                "observation_ids": [],
+                "descriptions": [],
+                "confidence": 0.0,
+            })
+            people_by_observation.setdefault(value["observation_id"], set()).add(value["entity_id"])
+            if value.get("face_instance_id"):
+                person["face_instance_ids"].append(value["face_instance_id"])
+            person["observation_ids"].append(value["observation_id"])
+            person["confidence"] = max(person["confidence"], float(value.get("confidence") or 0))
+            description = self._semantic_description(value)
+            if description:
+                person["descriptions"].append(description)
+        values = []
+        for person in people.values():
+            person["face_instance_ids"] = list(dict.fromkeys(person["face_instance_ids"]))
+            person["observation_ids"] = list(dict.fromkeys(person["observation_ids"]))
+            person["descriptions"] = list(dict.fromkeys(person["descriptions"]))[:20]
+            values.append(person)
+        pair_counts = {}
+        for observation_id, entity_ids in people_by_observation.items():
+            ordered = sorted(entity_ids)
+            for index, left in enumerate(ordered):
+                for right in ordered[index + 1:]:
+                    item = pair_counts.setdefault((left, right), {"count": 0, "observation_ids": []})
+                    item["count"] += 1
+                    item["observation_ids"].append(observation_id)
+        cooccurrences = [
+            {"person_a": left, "person_b": right, "count": item["count"], "observation_ids": item["observation_ids"][:8]}
+            for (left, right), item in pair_counts.items()
+        ]
+        cooccurrences.sort(key=lambda item: (-item["count"], item["person_a"], item["person_b"]))
+        return {"scope_id": scope_id, "input_mode": "semantic_text_only", "people": values,
+                "cooccurrences": cooccurrences}
+
+    @staticmethod
+    def _semantic_description(row):
+        parts = [str(row.get(key) or "").strip() for key in ("caption", "activity")]
+        for key in ("canonical_json", "detail_json"):
+            try:
+                payload = json.loads(row.get(key) or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if payload:
+                parts.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return "；".join(part for part in parts if part)

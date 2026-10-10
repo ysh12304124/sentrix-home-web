@@ -18,7 +18,7 @@ from .budget_manager import BudgetState
 # 单个需求的最大取证尝试次数：达到仍未 satisfied → failed 终态（已尝试未确认），
 # 避免模型反复 search 无证据而一直 running、耗尽预算导致"未完成"。
 _MAX_REQUIREMENT_ATTEMPTS = 3
-from .jit_prompt import build_jit_system_prompt
+from .jit_prompt import build_jit_system_prompt, select_jit_tool_specs
 from .answer_nucleus import (build_nucleus, classify_deterministic,
                              render_simple)
 from .completion import (CompletionState, DELIVER_MEDIA, RETRIEVE_EVIDENCE,
@@ -32,6 +32,7 @@ from .profile import get_profile
 from .result_set import TaskState
 from .tool_policy import ToolPolicy
 from .tool_registry import get_tool, list_tools
+from .runtime_contract import serialize_runtime_action
 
 
 def _people_count_from_summary(text: str) -> int:
@@ -87,6 +88,29 @@ def _natural_partial(task_state: dict, problems=None) -> str:
     if extras:
         base += " " + "；".join(extras[:2]) + "。"
     return base + "你可以让我继续核对，或换个问法再试。"
+
+
+def _ocr_recovery_instruction(question: str, tool_results: list[dict]) -> str:
+    """Keep OCR recovery scoped to values that actually answer the question."""
+    kind = classify_deterministic(question)
+    nucleus = build_nucleus({"tool_results": tool_results or []}, question)
+    if kind == "price":
+        value = nucleus.get("price")
+        if value is not None:
+            return ("\nOCR 已直接读到与金额问题匹配的值：" + (value.display or str(value.value))
+                    + "。只报告这个已读到的值，不得替换、推断或补充其他数字。")
+        return ("\n上述 OCR 文字没有提供可确认的金额。必须明确说“现有记录不足以确认”，"
+                "不得为了直接回答补数字。")
+    if kind == "year":
+        values = nucleus.all("year")
+        if values:
+            return ("\nOCR 已直接读到与年份问题匹配的值："
+                    + "、".join(value.display or str(value.value) for value in values)
+                    + "。只报告这些已读到的值，不得推断其他年份。")
+        return ("\n上述 OCR 文字没有提供可确认的年份。必须明确说“现有记录不足以确认”，"
+                "不得为了直接回答补数字。")
+    return ("\n上述 OCR 文字只能按原文引用。若它不能直接回答当前问题，"
+            "必须明确说“现有记录不足以确认”，不得从无关文字推断或补充数字。")
 
 
 # 模型可见的检索窗口字段白名单：命中统计、候选规模、验证诊断都属于服务端遥测，
@@ -283,8 +307,8 @@ def _normalize_delivery_image_handles(handles, task_state, limit: int = 6) -> li
 
 
 def _model_visible_action(action: dict) -> str:
-    """Feed the parsed action back without model reasoning or prose."""
-    return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+    """Feed the canonical Sentrix action back to the model."""
+    return serialize_runtime_action(action)
 
 
 _RECOVERY_MESSAGE_MARKERS = (
@@ -297,6 +321,8 @@ _RECOVERY_MESSAGE_MARKERS = (
     "请先调用 search_memories",
     "这与工具结果矛盾",
     "当前任务还没有完成",
+    "上一条（你刚输出的内容）是你的最终回答",
+    "基于这些读到的文字直接回答具体内容",
 )
 
 
@@ -635,8 +661,8 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
         """
         if not spec.can_satisfy(evidence_type):
             return False
-        # query_memory_facts / query_memory_metadata 已删除：没有按 operation
-        # 收窄证据类型的聚合工具，回归统一的 spec.can_satisfy 判定。
+        if spec.name == "query_memory_facts":
+            return evidence_type == "structured_fact"
         return True
 
     def mark_failure(reason: str) -> bool:
@@ -685,6 +711,12 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             or observation_certainty in {"uncertain", "unsupported"}):
         return mark_failure(str(observation.get("reason") or observation_status
                                 or "uncertain_evidence"))
+    if spec.name == "query_memory_facts" and (
+            observation_status != "ok"
+            or observation.get("value") is None
+            or not bool((observation.get("coverage") or {}).get("complete"))):
+        return mark_failure(str(observation.get("reason") or observation_status
+                                or "incomplete_structured_fact"))
 
     confidence = _evidence_confidence(observation)
     preview = observation.get("preview") or []
@@ -958,21 +990,21 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             evidence_rows.append({"evidence_type": "visible_text", "value": value,
                                   "subject": str(observation.get("question") or "照片文字"),
                                   "asset_id": str(observation.get("asset_handle") or (input_refs[0] if input_refs else ""))})
-        for ev in (observation.get("exact_values") or []):
-            if ev.get("type") == "year" and ev.get("value"):
-                evidence_rows.append({
-                    "evidence_type": "structured_fact",
-                    "value": f"创立/创建年份为 {ev.get('value')} 年",
-                    "certainty": "confirmed",
-                    "subject": "品牌创立年份",
-                })
-            elif ev.get("type") == "price" and ev.get("value"):
-                evidence_rows.append({
-                    "evidence_type": "structured_fact",
-                    "value": f"价格: {ev.get('text', ev.get('value'))}",
-                    "certainty": "confirmed",
-                    "subject": "商品价格",
-                })
+    elif spec.name == "query_memory_facts":
+        evidence_rows.append({
+            "evidence_type": "structured_fact",
+            "value": {
+                "fact_type": observation.get("fact_type"),
+                "subject": observation.get("subject"),
+                "value": observation.get("value"),
+                "unit": observation.get("unit"),
+                "rows": observation.get("rows") or [],
+                "filters_applied": observation.get("filters_applied") or {},
+                "coverage": observation.get("coverage") or {},
+            },
+            "subject": str(observation.get("fact_type") or "结构化统计"),
+            "certainty": "confirmed",
+        })
     elif spec.name == "query_photo_people":
         people = observation.get("people") or []
         unknown = observation.get("unconfirmed_people") or []
@@ -1031,14 +1063,9 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             person = str(observation.get("person") or "")
             evidence_rows.append({"evidence_type": "confirmed_identity",
                                   "value": {"person": person,
-                                            "family_role": observation.get("family_role")},
+                                            "membership": observation.get("membership"),
+                                            "membership_source": observation.get("membership_source")},
                                   "subject": person})
-            if observation.get("claims") or observation.get("patterns") or observation.get("relationships"):
-                evidence_rows.append({"evidence_type": "structured_fact",
-                                      "value": {"claims": observation.get("claims") or [],
-                                                "patterns": observation.get("patterns") or [],
-                                                "relationships": observation.get("relationships") or []},
-                                      "subject": person})
 
     covered_types = {row["evidence_type"] for row in evidence_rows}
     # A summary string is transport metadata, never a substitute for an
@@ -2157,7 +2184,7 @@ class AgentRuntime:
             from .tools import result_set_context
             ctx = result_set_context(task.current_result_set, self.scope_id)
             if ctx:
-                messages.append({"role": "system", "content": ctx})
+                _merge_system_constraint(messages, ctx)
         if selected_handle:
             # Phase C C15：用户点选了结果集里的照片，模型可直接用该 handle 复核/交付原图
             ctx = f"用户当前选中了照片（handle={selected_handle}）"
@@ -2166,11 +2193,11 @@ class AgentRuntime:
             ctx += ("。问'这张/原图/里面有几个人'时，直接用 "
                     f"get_original_photos(handle={selected_handle}) 或 "
                     f"inspect_photo(asset_handle={selected_handle})，不要重新全库搜索。")
-            messages.append({"role": "system", "content": ctx})
+            _merge_system_constraint(messages, ctx)
         if history:
-            messages.append({"role": "system", "content": f"最近对话：\n{history}"})
+            _merge_system_constraint(messages, f"最近对话：\n{history}")
         if conversation_summary:
-            messages.append({"role": "system", "content": f"本会话摘要：\n{conversation_summary}"})
+            _merge_system_constraint(messages, f"本会话摘要：\n{conversation_summary}")
         active_lines = []
         if task.active_person:
             active_lines.append(f"当前关注人物：{task.active_person}")
@@ -2183,7 +2210,7 @@ class AgentRuntime:
         if task.open_questions:
             active_lines.append("未解决问题：" + "、".join(str(q) for q in task.open_questions[:5]))
         if active_lines:
-            messages.append({"role": "system", "content": "当前上下文：\n" + "\n".join(active_lines)})
+            _merge_system_constraint(messages, "当前上下文：\n" + "\n".join(active_lines))
         messages.append({"role": "user", "content": message})
         self._emit_progress(turn, progress_callback, stage="thinking", status="running",
                             text="正在理解你的问题…")
@@ -2233,6 +2260,7 @@ class AgentRuntime:
         # 5B：证据需求未满足时，最多给模型一次补证/修正的机会；模型坚持 final 就放行，
         # 代码不再写死"现有证据不足，无法确认。"覆盖模型已给的好答案。
         gate_unattempted_prompted = False
+        structured_fact_reminder_prompted = False
         # 反编造：零工具调用却给出具体数字断言时，只给一次"检索核实"机会；模型坚持再放行。
         fabrication_check_prompted = False
         wants_visual = visual_intent(message)
@@ -2330,6 +2358,8 @@ class AgentRuntime:
                                      if agent2_evidence_ledger is not None else 0)
             turn.steps.append({
                 "type": "tool", "tool": tool_name, "tool_call_id": call_id,
+                "step_id": call_id,
+                "internal_model_call_metrics": observation.get("_model_call_metrics") or [],
                 "arguments": args, "status": "ok" if decision.allowed else "denied",
                 "observation": observation, "error": decision.error,
                 "parent_step_id": last_model_step_id,
@@ -2656,9 +2686,11 @@ class AgentRuntime:
             if agent2_task_state is not None and agent2_evidence_ledger is not None:
                 from .requirement_completion import RequirementCompletion
                 model_step["tool_candidates"] = [
-                    spec.name for spec in RequirementCompletion(
-                        agent2_task_state, agent2_evidence_ledger
-                    ).allowed_capabilities(list_tools(readiness="ready"))
+                    spec.name for spec in select_jit_tool_specs(
+                        task_state=agent2_task_state,
+                        preview_handles=task.result_preview,
+                        allowed_tool_names=self.profile.tools,
+                    )
                 ]
             if self.include_debug:
                 import copy as _copy
@@ -2745,9 +2777,11 @@ class AgentRuntime:
                     })
                     if agent2_status != "complete":
                         from .requirement_completion import RequirementCompletion
-                        available = RequirementCompletion(
-                            agent2_task_state, agent2_evidence_ledger
-                        ).allowed_capabilities(list_tools(readiness="ready"))
+                        available = select_jit_tool_specs(
+                            task_state=agent2_task_state,
+                            preview_handles=task.result_preview,
+                            allowed_tool_names=self.profile.tools,
+                        )
                         # Planner declarations describe semantic evidence
                         # (location/memory) but may omit the prerequisite
                         # visual resolution tool. If search explicitly marks
@@ -2786,13 +2820,41 @@ class AgentRuntime:
                         # 5B 软门槛：需求未满足时只给一次"补证/如实收尾"的机会，不再无限
                         # continue，也不再写死固定文案。模型在提醒后仍输出 final → 放行，
                         # 让其自然回答（包括诚实的"无法确认"），不被代码覆盖。
-                        if (unattempted and available and turn.budget.can_model_step()
-                                and not metadata_final_supported
-                                and not gate_unattempted_prompted):
+                        structured_unattempted = [
+                            state for state in unattempted
+                            if state.requirement.evidence_type == "structured_fact"
+                        ]
+                        if (structured_unattempted and not structured_fact_reminder_prompted
+                                and not any(tr.get("tool") == "query_memory_facts"
+                                            for tr in task.tool_results)
+                                and turn.budget.can_model_step()):
+                            structured_fact_reminder_prompted = True
+                            final_gate.update({
+                                "decision": "continue_structured_fact_once",
+                                "unattempted_requirements": [
+                                    state.requirement.id for state in structured_unattempted
+                                ],
+                            })
+                            messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                            messages.append({"role": "user", "content": (
+                                "该问题声明了全量结构化统计需求。若要报告数量、日期或分组，"
+                                "请调用 query_memory_facts 获取当前相册的精确统计；"
+                                "如果条件不支持或没有可确认口径，也可以直接输出 final 如实说明，"
+                                "不要把检索候选数当作统计答案。"
+                            )})
+                            continue
+                        unattempted_for_prompt = [
+                            state for state in unattempted
+                            if not (structured_fact_reminder_prompted
+                                    and state.requirement.evidence_type == "structured_fact")
+                        ]
+                        if unattempted_for_prompt and available and turn.budget.can_model_step() \
+                                and not metadata_final_supported \
+                                and not gate_unattempted_prompted:
                             gate_unattempted_prompted = True
                             prompt_pending = [
                                 f"{state.requirement.id}:{state.requirement.evidence_type}"
-                                for state in unattempted
+                                for state in unattempted_for_prompt
                             ]
                             final_gate.update({
                                 "decision": "continue_unattempted_once",
@@ -2852,7 +2914,11 @@ class AgentRuntime:
                 # Agent 2.0 Guard: 如果从未执行任何检索工具且存在未满足的记忆/地点/事实需求，禁止直接猜测 final
                 if is_candidate_mode and not task.tool_results and agent2_task_state is not None:
                     open_ev_types = {r.requirement.evidence_type for r in agent2_task_state.requirements.values() if r.status in ("open", "running")}
-                    if open_ev_types and turn.budget.can_model_step():
+                    only_reminded_structured_fact = (
+                        structured_fact_reminder_prompted
+                        and open_ev_types == {"structured_fact"}
+                    )
+                    if open_ev_types and not only_reminded_structured_fact and turn.budget.can_model_step():
                         messages.append({"role": "assistant", "content": _model_visible_action(action)})
                         messages.append({"role": "user", "content": (
                             "你尚未检索相册，禁止直接猜测回答。请先调用 search_memories 检索相关照片。"
@@ -3071,11 +3137,15 @@ class AgentRuntime:
                     turn.l2_faithfulness_checked = True
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
+                    judge_step_id = f"step_{debug_step_seq}" if self.include_debug else None
+                    if self.include_debug:
+                        debug_step_seq += 1
                     try:
                         judge_result = judge_faithfulness(
                             self.chat_fn, query=message, tool_results=task.tool_results,
                             answer=turn.final_answer, trusted_facts=trusted,
-                            messages=messages, include_debug=self.include_debug)
+                            messages=messages, include_debug=self.include_debug,
+                            step_id=judge_step_id)
                         if self.include_debug:
                             faithful, judge_problems, judge_debug = judge_result
                         else:
@@ -3084,9 +3154,7 @@ class AgentRuntime:
                                       "problems": list(judge_problems)}
                         if self.include_debug:
                             judge_step["debug"] = judge_debug
-                            step_id = f"step_{debug_step_seq}"
-                            debug_step_seq += 1
-                            judge_step["step_id"] = step_id
+                            judge_step["step_id"] = judge_step_id
                             judge_step["call_type"] = "faithfulness_judge"
                         turn.steps.append(judge_step)
                         if not faithful:
@@ -3187,13 +3255,13 @@ class AgentRuntime:
                              + "\n如果观察与用户假设矛盾，以观察为准回答，不要迎合用户假设。"
                              if inspect_obs else "") +
                             ("\nread_photo_text 实际读到的文字是：\n" + "\n".join(ocr_obs)
-                             + "\n基于这些读到的文字直接回答具体内容（价格/店名/电话/年份），"
-                               "不要笼统说'还不能确认'；检索层的不确定可单独用一句自然语言带过。"
+                             + _ocr_recovery_instruction(message, task.tool_results)
                              if ocr_obs else "") +
                             "\n请只输出一个 JSON final（保留 evidence_refs 引用你实际使用的工具结果，"
                             "并在 evidence_refs 中列出你引用过的 inspect_photo 调用编号），"
                             "并按 query_satisfaction 如实表述（candidate_only 不能声称确认）。"
-                            "final 必须先直接回答用户问题本身（地点问题直接说'是在…'，数字问题直接给数字），"
+                            "final 必须先回答用户问题本身；只有已有与问题匹配的确定值时才直接给出数字，"
+                            "否则明确说“现有记录不足以确认”，不能为了直答编造数字；地点问题可直接引用已确认地点，"
                             "不确定的其余条件用一句自然语言带过；禁止输出"
                             "'找到 N 张接近的照片；部分信息能对上；我可以继续帮你核对'这类套话。"
                         )
@@ -3544,6 +3612,8 @@ class AgentRuntime:
                                 error=decision.error, latency_s=latency)
             turn.steps.append({
                 "type": "tool", "tool": tool_name, "tool_call_id": tool_call_id,
+                "step_id": tool_call_id,
+                "internal_model_call_metrics": (result.observation or {}).get("_model_call_metrics") or [],
                 "arguments": arguments,
                 "status": result.status, "observation": result.observation,
                 "error": result.error, "latency_s": latency,

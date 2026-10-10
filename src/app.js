@@ -28,6 +28,7 @@
     assets: [],
     persons: [],
     personInsights: null,
+    familyGraph: null,
     entities: [],
     entityGroups: [],
     geoPlaces: [],
@@ -50,6 +51,12 @@
     assetFilter: "all",
     assetSort: "newest",
     personFilter: "all",
+    peopleGraphView: "graph",
+    peopleGraphSelection: "",
+    peopleGraphTransform: { x: 0, y: 0, scale: 1 },
+    peopleGraphLayout: {},
+    peopleGraphDraftEdge: null,
+    peopleGraphUndo: null,
     saving: false,
     expandedEntityTypes: {},
   };
@@ -272,7 +279,9 @@
         ? aspects.join(" · ")
         : (item.captured_at || item.caption || "本轮相关内容");
       if (mediaType === "video") {
-        return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
+        const timestamp = Number(item.source_timestamp_sec);
+        const frameTime = Number.isFinite(timestamp) && timestamp >= 0 ? ` data-evidence-timestamp="${timestamp}"` : "";
+        return `<article class="image-result media-result-video"><video src="${escapeHtml(item.media_url)}" controls preload="metadata" playsinline${frameTime} aria-label="${escapeHtml(label)}"></video><button class="media-result-info" data-action="open-asset" data-asset-id="${escapeHtml(item.asset_id)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(String(caption))}</small></button></article>`;
       }
       return `<button class="image-result" data-action="open-timeline-image" data-image-url="${escapeHtml(item.media_url)}" data-image-label="${escapeHtml(label)}" data-image-time="${escapeHtml(item.captured_at || "")}" data-image-place="${escapeHtml(item.place || item.location || "")}" data-image-activity="${escapeHtml(item.caption || caption || "")}" title="查看照片"><img src="${escapeHtml(item.media_url)}" alt="${escapeHtml(label)}" loading="lazy" /></button>`;
     }).join("");
@@ -637,45 +646,28 @@
   }
 
   function peopleView() {
-    const visible = state.persons.filter((person) => state.personFilter === "all" || !person.confirmed);
-    const pending = state.persons.filter((person) => !person.confirmed);
-    const primary = visible.filter((person) => person.confirmed || !person.single_sample);
-    const singles = visible.filter((person) => !person.confirmed && person.single_sample);
-    const batchCandidates = pending.filter((person) => !person.single_sample).sort((a, b) => (b.photo_count || 0) - (a.photo_count || 0));
-    const insights = state.personInsights;
-    const tiers = (insights && insights.tiers) || { core: [], common: [], incidental: [] };
-    const insightByPerson = new Map();
-    [...(tiers.core || []), ...(tiers.common || []), ...(tiers.incidental || [])].forEach((item) => insightByPerson.set(item.person_id, item));
-    const clusterSamplesByPerson = new Map();
-    (state.clusters || []).forEach((cluster) => {
-      if (cluster.entity_id) {
-        const existing = clusterSamplesByPerson.get(cluster.entity_id) || [];
-        clusterSamplesByPerson.set(cluster.entity_id, existing.concat(cluster.samples || []));
-      }
-    });
-    const tierRank = new Map();
-    (tiers.core || []).forEach((item, i) => tierRank.set(item.person_id, i));
-    (tiers.common || []).forEach((item, i) => tierRank.set(item.person_id, 100 + i));
-    (tiers.incidental || []).forEach((item, i) => tierRank.set(item.person_id, 200 + i));
-    const sortedVisible = [...visible].sort((a, b) => (tierRank.get(a.id) ?? 1000) - (tierRank.get(b.id) ?? 1000));
-    const personCard = (person, index) => {
-      const insight = insightByPerson.get(person.id);
-      const samples = (clusterSamplesByPerson.get(person.id) || []).filter((s) => (s.quality || 0) >= 0.5).slice(0, 3);
-      const name = insight ? (insight.display_name || person.display_name || person.name || "未命名成员") : (person.confirmed ? (person.display_name || person.name) : `待命名成员 ${index + 1}`);
-      const caution = !person.confirmed && person.single_sample ? `<small>单张样本，需谨慎确认</small>` : "";
-      const sampleThumbs = samples.length ? `<div class="cluster-samples-inline">${samples.map((s) => faceAvatar(s.id, "人脸样本", "gray")).join("")}</div>` : "";
-      const roleLine = insight ? (insight.role_state === "confirmed" ? (insight.family_role || "角色已确认") : (insight.role_candidates && insight.role_candidates[0] ? `建议 · ${insight.role_candidates[0].role} ${Math.round((insight.role_candidates[0].confidence || 0) * 100)}%` : "角色待定")) : (person.family_role ? `角色 · ${person.family_role}` : "待确认角色");
-      const portraitText = insight && insight.portrait && insight.portrait.portrait_text ? insight.portrait.portrait_text : (person.profile?.preference_summary_zh || person.profile?.summary_zh || "");
-      const portraitLine = portraitText ? `<small class="person-profile-line" title="${escapeHtml(portraitText)}">${escapeHtml(portraitText.length > 60 ? portraitText.slice(0, 60) + "…" : portraitText)}</small>` : "";
-      const coverage = insight ? `<span><strong>${insight.date_count || 0}</strong> 天</span><span><strong>${insight.event_count || 0}</strong> 个事件</span>` : (person.confirmed ? `<span><strong>${person.mention_count || 0}</strong> 次出现</span><span><strong>✓</strong> 已确认</span>` : `<span><strong>${person.cluster_count || 0}</strong> 个人物簇</span><span>待确认</span>`);
-      const coreBadge = insight && (tiers.core || []).some((item) => item.person_id === person.id) ? `<span class="suggestion-badge">重要</span>` : "";
-      const actions = insight ? `<button class="button small primary" data-action="open-person-insight" data-person-id="${escapeHtml(person.id)}">查看 / 处理</button>` : (person.confirmed ? `<button class="button small ghost" data-action="open-person" data-person-id="${escapeHtml(person.id)}">查看证据</button><button class="button small ghost" data-action="open-person-profile" data-person-id="${escapeHtml(person.id)}">画像</button>` : `<button class="button small primary" data-action="confirm-person" data-person-id="${escapeHtml(person.id)}">确认</button><button class="button small ghost" data-action="delete-person" data-person-id="${escapeHtml(person.id)}">不是人物</button>`);
-      return `<article class="person-card ${person.confirmed ? "" : "needs-review"}"><div class="person-head">${faceAvatar(person.avatar_face_instance_id, name, person.confirmed ? "green" : "gray")}${coreBadge}${person.confirmed ? `<span class="confirmed">✓ 已确认</span>` : `<span class="needs-label">待确认</span>`}</div><h2>${escapeHtml(name)}</h2><p>${escapeHtml(roleLine)}</p>${sampleThumbs}${portraitLine}${caution}<div class="person-stats">${coverage}</div><div class="person-actions">${actions}</div></article>`;
-    };
-    const primarySorted = sortedVisible.filter((person) => !person.single_sample);
-    const relHypotheses = (insights && insights.relationship_hypotheses) || [];
-    const suggestedRelHtml = relHypotheses.length ? `<section class="insight-tier"><h3 class="insight-tier-title">系统建议的关系</h3><div class="suggested-relations">${relHypotheses.map((rel) => `<div class="suggested-relation"><span class="suggestion-badge">系统建议</span><span>${escapeHtml(rel.subject_person_id)} → ${escapeHtml(rel.predicate)} → ${escapeHtml(rel.object_person_id)}</span><button class="button small primary" data-action="confirm-relationship-hypothesis" data-hypothesis-id="${escapeHtml(rel.id)}">确认</button><button class="button small ghost" data-action="reject-relationship-hypothesis" data-hypothesis-id="${escapeHtml(rel.id)}">拒绝</button></div>`).join("")}</div></section>` : "";
-    return `${pageHeader("家庭治理 / 人物", "先确认人物，再让关系长出来。", "人脸模型只生成候选。系统会推断重要人物、建议角色和鲜活画像；单张样本会折叠在下方，仍可展开查看原图后确认或驳回。", `<button class="button primary" data-action="invite">${icon("＋")}生成邀请</button>`)}${suggestedRelHtml}<div class="people-toolbar"><div class="segmented"><button class="${state.personFilter === "all" ? "active" : ""}" data-person-filter="all">全部人物</button><button class="${state.personFilter === "pending" ? "active" : ""}" data-person-filter="pending">待确认 <b>${pending.length}</b></button><button data-action="relationship-graph">关系图</button></div><button class="button ghost" data-action="reload">${icon("↻")}刷新</button></div>${batchCandidates.length >= 2 ? `<div class="people-banner"><div><strong>我在照片里发现了 ${batchCandidates.length} 个常出现的人</strong><small>先给他们命名并设定家庭角色，系统会在此基础上持续积累每个人的记忆和关系。</small></div><button class="button primary" data-action="batch-confirm">${icon("＋")}批量命名</button></div>` : ""}<section class="people-grid">${primarySorted.length ? primarySorted.map((person, index) => personCard(person, index)).join("") : emptyState(singles.length ? "没有待确认的多人物簇" : "还没有人物候选", singles.length ? "单样本候选折叠在下方，可能是小脸或误检。" : "导入包含人脸的图片后，InsightFace 会生成待确认候选；不会凭空创建家庭成员。", singles.length ? "" : `<button class="button small primary" data-view="imports">${icon("＋")}导入图片</button>`)}</section>${singles.length ? `<details class="single-clusters" style="margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:12px;"><summary style="cursor:pointer;color:var(--muted);font-size:12px;">单张样本（${singles.length}）· 可能是小脸或误检，展开后谨慎确认</summary><div class="people-grid" style="margin-top:12px;">${singles.map((person, index) => personCard(person, primarySorted.length + index)).join("")}</div></details>` : ""}`;
+    const graph = window.SentrixPeopleGraph.toGraphModel(state.familyGraph || { people: [], relationships: [] });
+    const groups = window.SentrixPeopleGraph.partitionPeople(graph);
+    const visibleIds = new Set([...groups.family, ...groups.friends].map((person) => person.id));
+    const positions = { ...window.SentrixPeopleGraph.layoutPeopleGraph(graph, 1000, 640), ...state.peopleGraphLayout };
+    const peopleById = new Map(graph.people.map((person) => [person.id, person]));
+    const selected = peopleById.get(state.peopleGraphSelection);
+    const directlyRelated = new Set(graph.edges.filter((edge) => edge.subjectId === state.peopleGraphSelection || edge.objectId === state.peopleGraphSelection).flatMap((edge) => [edge.subjectId, edge.objectId]));
+    const dim = (id) => state.peopleGraphSelection && !directlyRelated.has(id) && id !== state.peopleGraphSelection ? "dim" : "";
+    const edgeSvg = graph.edges.filter((edge) => visibleIds.has(edge.subjectId) && visibleIds.has(edge.objectId)).map((edge) => {
+      const from = positions[edge.subjectId], to = positions[edge.objectId]; if (!from || !to) return "";
+      const label = edge.predicate === "朋友" || edge.predicate === "密友" ? `${peopleById.get(edge.subjectId)?.display_name || "待命名人物"}的朋友` : edge.predicate;
+      const isDim = state.peopleGraphSelection && edge.subjectId !== state.peopleGraphSelection && edge.objectId !== state.peopleGraphSelection;
+      return `<g class="people-graph-edge ${isDim ? "dim" : ""}" data-people-action="select-people-graph-edge" data-subject-id="${escapeHtml(edge.subjectId)}" data-object-id="${escapeHtml(edge.objectId)}" data-predicate="${escapeHtml(edge.predicate)}" data-inverse="${escapeHtml(edge.inversePredicate)}"><line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" marker-end="url(#people-graph-arrow)"/><text x="${(from.x + to.x) / 2}" y="${(from.y + to.y) / 2 - 8}">${escapeHtml(label)}</text></g>`;
+    }).join("");
+    const nodeSvg = [...groups.family, ...groups.friends].map((person) => { const point = positions[person.id]; if (!point) return ""; const avatar = person.avatar_face_instance_id ? `<image href="/api/face-instances/${encodeURIComponent(person.avatar_face_instance_id)}/crop" x="${point.x - 28}" y="${point.y - 28}" width="56" height="56" preserveAspectRatio="xMidYMid slice" clip-path="url(#people-avatar-${escapeHtml(person.id)})"/>` : `<text class="people-graph-initial" x="${point.x}" y="${point.y + 6}">${escapeHtml((person.display_name || "?").slice(0, 1))}</text>`; return `<g class="people-graph-node ${person.id === state.peopleGraphSelection ? "selected" : ""} ${dim(person.id)}" data-people-action="select-people-graph-person" data-person-id="${escapeHtml(person.id)}" tabindex="0" aria-label="查看${escapeHtml(person.display_name)}"><clipPath id="people-avatar-${escapeHtml(person.id)}"><circle cx="${point.x}" cy="${point.y}" r="28"/></clipPath><circle cx="${point.x}" cy="${point.y}" r="34"/>${avatar}<text class="people-graph-name" x="${point.x}" y="${point.y + 52}">${escapeHtml(person.display_name || "待命名人物")}</text><circle class="people-graph-handle" cx="${point.x + 37}" cy="${point.y - 25}" r="8" data-people-action="start-people-graph-edge" data-person-id="${escapeHtml(person.id)}" aria-label="从${escapeHtml(person.display_name)}添加关系">+</circle></g>`; }).join("");
+    const graphCanvas = `<section class="people-graph-canvas" data-people-graph-canvas><svg viewBox="0 0 1000 640" role="img" aria-label="家庭人物关系图谱"><defs><marker id="people-graph-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z"/></marker></defs><g data-people-graph-world transform="translate(${state.peopleGraphTransform.x} ${state.peopleGraphTransform.y}) scale(${state.peopleGraphTransform.scale})">${edgeSvg}${nodeSvg}</g></svg><div class="people-graph-zoom"><button data-action="people-graph-zoom-out">−</button><button data-action="people-graph-fit">适配全图</button><button data-action="people-graph-zoom-in">＋</button></div></section>`;
+    const pendingRows = groups.pending.sort((a, b) => (b.appearance_count || 0) - (a.appearance_count || 0)).map((person) => `<article class="people-pending-row">${faceAvatar(person.avatar_face_instance_id, person.display_name || "待命名人物", "gray")}<div><strong>${escapeHtml(person.display_name || "待命名人物")}</strong><small>出现 ${person.appearance_count || 0} 次</small></div><button class="button small ghost" data-action="select-people-graph-person" data-person-id="${escapeHtml(person.id)}">整理</button></article>`).join("");
+    const relationships = selected ? graph.edges.filter((edge) => edge.subjectId === selected.id || edge.objectId === selected.id).map((edge) => { const other = peopleById.get(edge.subjectId === selected.id ? edge.objectId : edge.subjectId); const relation = edge.subjectId === selected.id ? edge.predicate : edge.inversePredicate; return `<li>${escapeHtml(relation)}：${escapeHtml(other?.display_name || "待命名人物")}</li>`; }).join("") : "";
+    const media = (selected?.representative_media || []).map((item) => `<button class="people-media-thumb" data-action="open-asset" data-asset-id="${escapeHtml(item.id)}">${item.media_type === "video" ? `<video src="/api/assets/${encodeURIComponent(item.id)}/file" muted preload="metadata" aria-label="${escapeHtml(selected.display_name)}的代表视频"></video>` : `<img src="/api/assets/${encodeURIComponent(item.id)}/file" alt="${escapeHtml(selected.display_name)}的代表照片" loading="lazy"/>`}</button>`).join("");
+    const drawer = selected ? `<aside class="people-graph-drawer"><button class="people-drawer-close" data-action="close-people-graph-person">×</button>${faceAvatar(selected.avatar_face_instance_id, selected.display_name || "待命名人物", "green")}<h2>${escapeHtml(selected.display_name || "待命名人物")}</h2><p>${selected.membershipValue === "family" ? "家庭成员" : selected.membershipValue === "friend" ? "朋友" : "待整理人物"}</p><h3>相互关系</h3><ul>${relationships || "<li>尚未建立关系</li>"}</ul><h3>人物画像</h3><p>${escapeHtml(selected.portrait?.portrait_text || "暂未生成画像")}</p>${media ? `<h3>代表记忆</h3><div class="people-media-strip">${media}</div>` : ""}<div class="people-drawer-actions"><button class="button small ghost" data-action="rename-people-graph-person" data-person-id="${escapeHtml(selected.id)}">改名字</button><button class="button small ghost" data-action="set-people-graph-membership" data-person-id="${escapeHtml(selected.id)}" data-membership="family">设为家人</button><button class="button small ghost" data-action="set-people-graph-membership" data-person-id="${escapeHtml(selected.id)}" data-membership="friend">设为朋友</button></div></aside>` : "";
+    const chooser = state.peopleGraphDraftEdge ? `<div class="people-relation-chooser"><span>${state.peopleGraphDraftEdge.objectId ? "选择关系" : "再点击目标人物"}</span>${state.peopleGraphDraftEdge.objectId ? window.SentrixPeopleGraph.relationChoices().map((choice) => `<button data-action="save-people-graph-edge" data-predicate="${escapeHtml(choice.predicate)}" data-inverse="${escapeHtml(choice.inversePredicate)}">${escapeHtml(choice.label)}</button>`).join("") : ""}${state.peopleGraphDraftEdge.existing ? `<button class="danger" data-action="delete-people-graph-edge">删除关系</button>` : ""}<button data-action="cancel-people-graph-edge">取消</button></div>` : "";
+    return `${pageHeader("家庭人物", "把相册里的人，连成清楚的关系。", "关系默认来自模型判断；你的修改会直接写入数据库，并永久优先于后续推断。", `<button class="button ghost" data-action="merge-family-scopes">合并相册范围</button>`)}<div class="people-graph-tabs"><button class="${state.peopleGraphView === "graph" ? "active" : ""}" data-action="show-people-graph">关系图谱</button><button class="${state.peopleGraphView === "pending" ? "active" : ""}" data-action="show-people-pending">待整理人物 <b>${groups.pending.length}</b></button><button class="button small ghost" data-action="reload">↻ 刷新</button></div>${state.peopleGraphView === "graph" ? `<div class="people-graph-stage">${graphCanvas}${drawer}${chooser}</div>` : `<section class="people-pending-list">${pendingRows || emptyState("没有待整理人物", "模型尚未发现需要你确认身份或关系的人物。")}</section>`}`;
   }
 
   function knowledgeView() {
@@ -1182,7 +1174,7 @@
     const scopeId = state.scopeId;
     const calls = await Promise.allSettled([
           window.sentrixApi.dashboard(scopeId), window.sentrixApi.events(scopeId), window.sentrixApi.assets("?limit=1000", scopeId), window.sentrixApi.people("", scopeId), window.sentrixApi.stories(), window.sentrixApi.health(), window.sentrixApi.entities("", scopeId), window.sentrixApi.faceClusters("", scopeId), window.sentrixApi.relationships(scopeId), window.sentrixApi.knowledge("", scopeId), window.sentrixApi.trips(scopeId, "pending"), window.sentrixApi.entityMergeCandidates(scopeId), window.sentrixApi.entityGroups(scopeId),
-          window.sentrixApi.geoPlaces(scopeId), window.sentrixApi.personInsights(scopeId),
+          window.sentrixApi.geoPlaces(scopeId), window.sentrixApi.personInsights(scopeId), window.sentrixApi.familyGraph(scopeId),
     ]);
     state.dashboard = calls[0].status === "fulfilled" ? calls[0].value : null;
     state.events = calls[1].status === "fulfilled" ? calls[1].value.events || [] : [];
@@ -1200,6 +1192,7 @@
     state.clusters = calls[7].status === "fulfilled" ? calls[7].value.clusters || [] : [];
     state.relationships = calls[8].status === "fulfilled" ? calls[8].value.relationships || [] : [];
     state.personInsights = calls[14].status === "fulfilled" ? calls[14].value : null;
+    state.familyGraph = calls[15].status === "fulfilled" ? calls[15].value : null;
         state.knowledge = calls[9].status === "fulfilled" ? calls[9].value : { profiles: [], claims: [] };
         state.trips = calls[10].status === "fulfilled" ? calls[10].value.trips || [] : [];
         state.entityMergeCandidates = calls[11].status === "fulfilled" ? calls[11].value.candidates || [] : [];
@@ -1264,6 +1257,14 @@
       submitPhotoInspector();
     });
     document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action, element)));
+    document.querySelectorAll("video[data-evidence-timestamp]").forEach((player) => player.addEventListener("loadedmetadata", () => {
+      const timestamp = Number(player.dataset.evidenceTimestamp);
+      if (!Number.isFinite(timestamp) || timestamp < 0) return;
+      player.pause();
+      player.currentTime = timestamp;
+    }, { once: true }));
+    document.querySelectorAll("[data-people-action]").forEach((element) => element.addEventListener("click", (event) => { event.stopPropagation(); handleAction(element.dataset.peopleAction, element); }));
+    bindPeopleGraphEvents();
     const fileInput = document.getElementById("file-input");
     if (fileInput) fileInput.addEventListener("change", handleFiles);
     if (state.view === "imports") document.querySelector('.page-heading [data-action="open-folder"]')?.remove();
@@ -1287,6 +1288,74 @@
     const topUser = document.querySelector(".top-user");
     const topUserLabel = topUser?.querySelector("span:not(.avatar)");
     if (topUserLabel) topUserLabel.textContent = "相册管理";
+  }
+
+  function bindPeopleGraphEvents() {
+    const canvas = document.querySelector("[data-people-graph-canvas]");
+    if (!canvas) return;
+    let gesture = null;
+    let frame = 0;
+    const renderGesture = () => { frame = 0; renderView(); };
+    canvas.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const scale = state.peopleGraphTransform.scale * (event.deltaY < 0 ? 1.12 : 1 / 1.12);
+      state.peopleGraphTransform.scale = Math.max(.45, Math.min(2.5, scale));
+      if (!frame) frame = requestAnimationFrame(renderGesture);
+    }, { passive: false });
+    canvas.addEventListener("pointerdown", (event) => {
+      const node = event.target.closest(".people-graph-node");
+      const handle = event.target.closest(".people-graph-handle");
+      if (handle) {
+        const sourceNode = handle.closest(".people-graph-node");
+        const sourceCircle = sourceNode?.querySelector("circle");
+        const draft = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        draft.setAttribute("class", "people-graph-draft-edge");
+        draft.setAttribute("x1", sourceCircle?.getAttribute("cx") || "0");
+        draft.setAttribute("y1", sourceCircle?.getAttribute("cy") || "0");
+        draft.setAttribute("x2", draft.getAttribute("x1")); draft.setAttribute("y2", draft.getAttribute("y1"));
+        canvas.querySelector("[data-people-graph-world]")?.appendChild(draft);
+        gesture = { type: "relation", personId: handle.dataset.personId, draft, rect: canvas.getBoundingClientRect() };
+        canvas.setPointerCapture(event.pointerId);
+        event.preventDefault();
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      gesture = { type: node ? "node" : "pan", personId: node?.dataset.personId || "", x: event.clientX, y: event.clientY, rect };
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!gesture) return;
+      if (gesture.type === "relation") {
+        const x = ((event.clientX - gesture.rect.left) * 1000 / gesture.rect.width - state.peopleGraphTransform.x) / state.peopleGraphTransform.scale;
+        const y = ((event.clientY - gesture.rect.top) * 640 / gesture.rect.height - state.peopleGraphTransform.y) / state.peopleGraphTransform.scale;
+        gesture.draft?.setAttribute("x2", String(x)); gesture.draft?.setAttribute("y2", String(y));
+        return;
+      }
+      const dx = (event.clientX - gesture.x) * 1000 / gesture.rect.width;
+      const dy = (event.clientY - gesture.y) * 640 / gesture.rect.height;
+      gesture.x = event.clientX; gesture.y = event.clientY;
+      if (gesture.type === "node") {
+        const current = state.peopleGraphLayout[gesture.personId] || window.SentrixPeopleGraph.layoutPeopleGraph(window.SentrixPeopleGraph.toGraphModel(state.familyGraph || {}), 1000, 640)[gesture.personId] || { x: 500, y: 320 };
+        state.peopleGraphLayout[gesture.personId] = { x: Math.max(40, Math.min(960, current.x + dx)), y: Math.max(40, Math.min(600, current.y + dy)) };
+      } else {
+        state.peopleGraphTransform.x += dx; state.peopleGraphTransform.y += dy;
+      }
+      if (!frame) frame = requestAnimationFrame(renderGesture);
+    });
+    canvas.addEventListener("pointerup", (event) => {
+      if (gesture?.type === "relation") {
+        const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(".people-graph-node");
+        if (target?.dataset.personId && target.dataset.personId !== gesture.personId) {
+          state.peopleGraphDraftEdge = { subjectId: gesture.personId, objectId: target.dataset.personId };
+          state.peopleGraphSelection = gesture.personId;
+        }
+        gesture.draft?.remove(); renderView();
+      }
+      gesture = null;
+    });
+    canvas.addEventListener("dblclick", (event) => {
+      if (!event.target.closest(".people-graph-node")) { state.peopleGraphTransform = { x: 0, y: 0, scale: 1 }; state.peopleGraphLayout = {}; renderView(); }
+    });
   }
 
   async function submitSearch(event, selectedEntityId = "") {
@@ -1881,6 +1950,84 @@
     if (action === "delete-story") { await window.sentrixApi.deleteStory(element.dataset.storyId); state.toast = "故事草稿已删除"; return refreshData(); }
     if (action === "open-person") { openModal({ type: "loading" }, { push: true }); try { const detail = await window.sentrixApi.personEvidence(element.dataset.personId, state.scopeId); return openModal({ type: "person-evidence", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物证据：${error.message}`; return renderShellNavigation(); } }
     if (action === "open-person-profile") { openModal({ type: "loading" }, { push: true }); const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-profile", detail }); }
+    if (action === "show-people-graph") { state.peopleGraphView = "graph"; return renderView(); }
+    if (action === "show-people-pending") { state.peopleGraphView = "pending"; return renderView(); }
+    if (action === "select-people-graph-person") {
+      const personId = element.dataset.personId;
+      if (state.peopleGraphDraftEdge?.subjectId && state.peopleGraphDraftEdge.subjectId !== personId) {
+        state.peopleGraphDraftEdge.objectId = personId;
+      }
+      state.peopleGraphSelection = personId;
+      state.peopleGraphView = "graph";
+      return renderView();
+    }
+    if (action === "close-people-graph-person") { state.peopleGraphSelection = ""; return renderView(); }
+    if (action === "start-people-graph-edge") { state.peopleGraphDraftEdge = { subjectId: element.dataset.personId }; return renderView(); }
+    if (action === "cancel-people-graph-edge") { state.peopleGraphDraftEdge = null; return renderView(); }
+    if (action === "select-people-graph-edge") {
+      state.peopleGraphDraftEdge = { subjectId: element.dataset.subjectId, objectId: element.dataset.objectId, existing: true };
+      return renderView();
+    }
+    if (action === "save-people-graph-edge") {
+      const edge = state.peopleGraphDraftEdge;
+      if (!edge?.subjectId || !edge?.objectId) { state.toast = "请先从一个人物连到另一个人物"; return renderShellNavigation(); }
+      try {
+        await window.sentrixApi.updateFamilyRelationship({ scope_id: state.scopeId, subject_entity_id: edge.subjectId, object_entity_id: edge.objectId, predicate: element.dataset.predicate, inverse_predicate: element.dataset.inverse });
+        state.peopleGraphUndo = { subjectId: edge.subjectId, objectId: edge.objectId, predicate: element.dataset.predicate, inversePredicate: element.dataset.inverse };
+        state.peopleGraphDraftEdge = null;
+        state.toast = "关系已保存；后续模型不会覆盖你的修改";
+        return refreshData();
+      } catch (error) { state.toast = `保存关系失败：${error.message}`; state.peopleGraphDraftEdge = null; return renderShellNavigation(); }
+    }
+    if (action === "delete-people-graph-edge") {
+      const edge = state.peopleGraphDraftEdge;
+      if (!edge?.subjectId || !edge?.objectId) return;
+      try {
+        await window.sentrixApi.retractFamilyRelationship({ scope_id: state.scopeId, subject_entity_id: edge.subjectId, object_entity_id: edge.objectId });
+        state.peopleGraphDraftEdge = null; state.toast = "关系已删除，模型不会重新建立它"; return refreshData();
+      } catch (error) { state.toast = `删除关系失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "people-graph-zoom-in" || action === "people-graph-zoom-out") { const amount = action.endsWith("in") ? 1.2 : 1 / 1.2; state.peopleGraphTransform.scale = Math.max(.45, Math.min(2.5, state.peopleGraphTransform.scale * amount)); return renderView(); }
+    if (action === "people-graph-fit") { state.peopleGraphTransform = { x: 0, y: 0, scale: 1 }; state.peopleGraphLayout = {}; return renderView(); }
+    if (action === "rename-people-graph-person") { openModal({ type: "loading" }, { push: true }); try { const detail = await window.sentrixApi.personProfile(element.dataset.personId); return openModal({ type: "person-name-edit", detail }); } catch (error) { state.modal = null; state.toast = `无法读取人物资料：${error.message}`; return renderShellNavigation(); } }
+    if (action === "set-people-graph-membership") { try { await window.sentrixApi.updateFamilyMembership(element.dataset.personId, { scope_id: state.scopeId, membership: element.dataset.membership }); state.toast = "归属已保存"; return refreshData(); } catch (error) { state.toast = `保存归属失败：${error.message}`; return renderShellNavigation(); } }
+    if (action === "edit-family-membership") {
+      const membership = window.prompt("家庭归属（family / friend / unknown）", element.dataset.membership || "unknown");
+      if (membership === null) return;
+      try {
+        await window.sentrixApi.updateFamilyMembership(element.dataset.personId, { scope_id: state.scopeId, membership: membership.trim() });
+        state.toast = "已保存你的家庭归属修正；后续模型推断不会覆盖它";
+        return refreshData();
+      } catch (error) { state.toast = `保存家庭归属失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "merge-family-scopes") {
+      const available = (state.spaces || []).map((space) => space.id).filter(Boolean).join(", ");
+      const raw = window.prompt(`输入需要合并的相册 scope_id（逗号分隔）。当前可选：${available}`, state.scopeId || "");
+      if (raw === null) return;
+      const scopeIds = raw.split(",").map((item) => item.trim()).filter(Boolean);
+      if (!scopeIds.includes(state.scopeId)) scopeIds.unshift(state.scopeId);
+      try {
+        await window.sentrixApi.mergeFamilyGraphScopes(scopeIds);
+        state.toast = "相册已合并为同一家庭图谱；原始照片和事件保持在各自相册中";
+        return refreshData();
+      } catch (error) { state.toast = `合并相册家庭失败：${error.message}`; return renderShellNavigation(); }
+    }
+    if (action === "edit-family-relationship") {
+      const predicate = window.prompt("正向关系（例如：父亲、母亲、丈夫、妻子）", element.dataset.predicate || "");
+      if (predicate === null) return;
+      const inverse = window.prompt("反向关系（例如：女儿、儿子、妻子、丈夫）", element.dataset.inverse || "");
+      if (inverse === null) return;
+      try {
+        await window.sentrixApi.updateFamilyRelationship({
+          scope_id: state.scopeId,
+          subject_entity_id: element.dataset.subjectId,
+          object_entity_id: element.dataset.objectId,
+          predicate: predicate.trim(), inverse_predicate: inverse.trim(),
+        });
+        state.toast = "已保存你的关系修正；后续模型推断不会覆盖它";
+        return refreshData();
+      } catch (error) { state.toast = `保存家庭关系失败：${error.message}`; return renderShellNavigation(); }
+    }
     if (action === "edit-person-properties") return openModal({ type: "person-property-edit", detail: state.modal.detail });
     if (action === "edit-person-name") return openModal({ type: "person-name-edit", detail: state.modal.detail });
     if (action === "confirm-person") { const person = state.persons.find((item) => item.id === element.dataset.personId) || { id: element.dataset.personId, name: "待确认人物" }; return openModal({ type: "person", person }); }

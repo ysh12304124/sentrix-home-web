@@ -41,6 +41,16 @@ class ParseVerdictTests(unittest.TestCase):
 
 
 class SeverityMappingTests(unittest.TestCase):
+    def test_judge_passes_call_identity_to_metrics_wrapper(self):
+        calls = []
+        def chat_fn(messages, *, call_type=None, step_id=None):
+            calls.append((call_type, step_id))
+            return '{"faithful": true, "problems": []}'
+        faithful, _ = judge_faithfulness(
+            chat_fn, query="q", tool_results=[], answer="a", step_id="step_7")
+        self.assertTrue(faithful)
+        self.assertEqual(calls, [("faithfulness_judge", "step_7")])
+
     def _judge(self, ptype: str):
         verdict = json_dumps = __import__("json").dumps(
             {"faithful": False,

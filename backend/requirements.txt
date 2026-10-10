@@ -24,7 +24,7 @@ lunar_python==1.3.9
 # PYTHONNOUSERSITE=1 does not hide it (user-site installs are disabled).
 pandas>=2.0,<3
 # Vendored WorldMM-a keyframe / DMD / Scene pipeline.
-numpy>=1.26,<3
+numpy>=1.26,<2
 opencv-python-headless>=4.10,<5
 # Bundled Windows FFmpeg fallback when a system ffmpeg/ffprobe is unavailable.
 imageio-ffmpeg>=0.6,<1

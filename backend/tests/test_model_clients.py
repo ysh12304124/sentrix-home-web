@@ -57,6 +57,21 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(cap_output_tokens_for_estimated_room(384, 200), 200)
         self.assertEqual(cap_output_tokens_for_estimated_room(384, 900), 384)
         self.assertEqual(cap_output_tokens_for_estimated_room(64, 1), 64)
+    @patch("backend.model_clients.time.perf_counter", side_effect=[10.0, 12.0])
+    @patch("backend.model_clients.httpx.post")
+    def test_nonstream_call_records_elapsed_time_without_inventing_ttft(self, post, clock):
+        post.return_value.json.return_value = {
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 25, "completion_tokens": 10},
+        }
+        client = GammaClient(base_url="http://sentrix-vllm/v1", model="test-model")
+        self.assertEqual(client.chat("test", json_mode=True), "{}")
+        metrics = client.get_and_clear_call_metrics()
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(metrics[0]["total_ms"], 2000.0)
+        self.assertEqual(metrics[0]["tokens_per_second"], 5.0)
+        self.assertIsNone(metrics[0]["ttft_ms"])
+        self.assertFalse(metrics[0]["streamed"])
 
     def test_tool_policy_preserves_private_model_metrics_for_runtime_extraction(self):
         payload = {
@@ -467,13 +482,21 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(result["semantic"]["objects"][0]["label"], "玩具")
         self.assertEqual(chat.call_count, 2)
 
-    def test_clip_uses_project_checkpoint_when_environment_is_unset(self):
-        checkpoint = Path(__file__).resolve().parents[2] / "data" / "models" / "clip" / "ViT-B-32.bin"
-        with patch.dict("os.environ", {"CLIP_CHECKPOINT": ""}, clear=False), patch.object(Path, "is_file", autospec=True) as is_file:
-            is_file.side_effect = lambda path: path == checkpoint
+    def test_clip_defaults_to_the_chinese_clip_checkpoint(self):
+        """ClipAdapter 必须与 embeddings/scheme.py 的 IMAGE_MODEL 对齐。
+
+        历史上导入侧用 open_clip ViT-B-32、检索侧钉死 chinese-clip，落库的视觉向量
+        检索侧一条都用不上（153 实测 visual 空间里积了 8782 条 ViT-B-32 向量，
+        episodic/semantic 同样被污染）。写入侧与查询侧必须是同一个模型。
+        """
+        from backend.embeddings.scheme import IMAGE_MODEL
+
+        with patch.dict("os.environ", {"CLIP_CHECKPOINT": "", "CHINESE_CLIP_CHECKPOINT": ""}, clear=False):
             adapter = __import__("backend.model_clients", fromlist=["ClipAdapter"]).ClipAdapter()
 
-        self.assertEqual(adapter.checkpoint, str(checkpoint))
+        self.assertEqual(adapter.model_name, IMAGE_MODEL)
+        self.assertEqual(adapter.embedding_dimension, 768)
+        self.assertTrue(adapter.checkpoint.endswith("clip_cn_vit-l-14.pt"), adapter.checkpoint)
 
     def test_person_appearance_analysis_returns_only_target_clothing(self):
         with tempfile.NamedTemporaryFile(suffix=".jpg") as image:

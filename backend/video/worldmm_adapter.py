@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .contracts import WorldMMKeyframe, WorldMMResult, WorldMMScene
+from ..platform_profile import profile
 
 
 HYBRID_METHOD_VERSION = "sentrix-keyframe-hybrid-v2.0.0"
@@ -131,7 +132,7 @@ class WorldMMAdapter:
             "--output", str(output), "--width", os.getenv("SENTRIX_VIDEO_WIDTH", "640"),
             "--sample-fps", os.getenv("SENTRIX_VIDEO_SAMPLE_FPS", "10"),
             "--analysis-fps", os.getenv("SENTRIX_VIDEO_ANALYSIS_FPS", "5"),
-            "--device", os.getenv("SENTRIX_VIDEO_DEVICE", "cpu"),
+            "--device", profile.video_device(),
             "--yolo-model", str(yolo), "--pose-model", str(pose),
         ]
         if os.getenv("SENTRIX_VIDEO_DISABLE_SEMANTICS", "0").lower() in {"1", "true", "yes"}:

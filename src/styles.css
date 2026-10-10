@@ -251,6 +251,38 @@ button { cursor: pointer; }
 .family-edge:hover .family-edge-hit { stroke: var(--green); }
 .family-edge-label { font-size: 11px; fill: var(--ink); text-anchor: middle; font-weight: 700; pointer-events: none; }
 .family-graph-toolbar { margin-top: 22px; }
+.people-graph-tabs { display:flex; align-items:center; gap:8px; margin:18px 0 12px; }
+.people-graph-tabs > button:not(.button) { border:0; border-bottom:2px solid transparent; padding:9px 11px; background:transparent; color:var(--muted); cursor:pointer; font:inherit; }
+.people-graph-tabs > button.active { color:var(--ink); border-bottom-color:var(--green); font-weight:700; }
+.people-graph-tabs .button { margin-left:auto; }
+.people-graph-stage { position:relative; min-height:650px; overflow:hidden; border:1px solid var(--line); border-radius:16px; background:radial-gradient(circle at 50% 30%, #fafff8, var(--soft)); }
+.people-graph-canvas { position:absolute; inset:0; touch-action:none; cursor:grab; overflow:hidden; }
+.people-graph-canvas:active { cursor:grabbing; }
+.people-graph-canvas svg { display:block; width:100%; height:100%; min-height:650px; user-select:none; }
+.people-graph-edge { cursor:pointer; }
+.people-graph-edge line { stroke:#799078; stroke-width:2.5; fill:none; }
+.people-graph-draft-edge { stroke:#1f562c; stroke-width:3; stroke-dasharray:6 5; pointer-events:none; }
+.people-graph-edge text { fill:var(--ink); font-size:14px; font-weight:700; text-anchor:middle; paint-order:stroke; stroke:#fafff8; stroke-width:5px; stroke-linejoin:round; }
+.people-graph-edge.dim, .people-graph-node.dim { opacity:.18; }
+.people-graph-node { cursor:pointer; transition:opacity .18s ease; }
+.people-graph-node > circle:first-of-type { fill:#fff; stroke:#638062; stroke-width:3; filter:drop-shadow(0 4px 7px rgba(32,55,34,.13)); }
+.people-graph-node.selected > circle:first-of-type { stroke:#1f562c; stroke-width:5; }
+.people-graph-node image { pointer-events:none; }
+.people-graph-name { fill:var(--ink); text-anchor:middle; font-size:14px; font-weight:700; pointer-events:none; }
+.people-graph-initial { fill:var(--green); font-size:20px; text-anchor:middle; font-weight:700; pointer-events:none; }
+.people-graph-handle { fill:var(--green); stroke:#fff; stroke-width:2; color:#fff; font-size:13px; text-anchor:middle; cursor:crosshair; }
+.people-graph-zoom { position:absolute; right:16px; bottom:16px; display:flex; overflow:hidden; border:1px solid var(--line); border-radius:9px; background:#fff; box-shadow:var(--shadow); }
+.people-graph-zoom button { border:0; border-right:1px solid var(--line); padding:8px 11px; background:#fff; color:var(--ink); cursor:pointer; }
+.people-graph-zoom button:last-child { border-right:0; }
+.people-graph-drawer { position:absolute; top:14px; right:14px; z-index:3; width:min(310px,calc(100% - 28px)); max-height:calc(100% - 28px); overflow:auto; border:1px solid var(--line); border-radius:14px; padding:20px; background:rgba(255,255,255,.96); box-shadow:0 18px 45px rgba(20,35,18,.18); }
+.people-graph-drawer .face-avatar, .people-graph-drawer .person-avatar { width:58px; height:58px; }
+.people-graph-drawer h2 { margin:9px 0 2px; }.people-graph-drawer h3 { margin:18px 0 7px; font-size:12px; }.people-graph-drawer p,.people-graph-drawer li { color:var(--muted); font-size:12px; line-height:1.65; }.people-graph-drawer ul { margin:0; padding-left:18px; }
+.people-drawer-close { position:absolute; top:9px; right:10px; border:0; background:transparent; font-size:22px; cursor:pointer; }.people-drawer-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:16px; }
+.people-media-strip { display:flex; gap:7px; overflow:auto; }.people-media-thumb { flex:0 0 72px; height:56px; overflow:hidden; padding:0; border:1px solid var(--line); border-radius:7px; background:var(--soft); cursor:pointer; }.people-media-thumb img,.people-media-thumb video { width:100%; height:100%; object-fit:cover; }
+.people-relation-chooser { position:absolute; z-index:4; left:18px; bottom:18px; display:flex; flex-wrap:wrap; gap:6px; max-width:420px; padding:12px; border:1px solid var(--line); border-radius:12px; background:#fff; box-shadow:var(--shadow); }.people-relation-chooser span { flex-basis:100%; color:var(--muted); font-size:11px; }.people-relation-chooser button { border:1px solid var(--line); border-radius:7px; padding:6px 8px; background:#fff; color:var(--ink); cursor:pointer; font:inherit; font-size:11px; }.people-relation-chooser button:hover { border-color:var(--green); }.people-relation-chooser .danger { color:#a33; }
+.people-pending-list { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:10px; }.people-pending-row { display:flex; align-items:center; gap:12px; padding:12px; border:1px solid var(--line); border-radius:12px; background:#fff; }.people-pending-row .face-avatar,.people-pending-row .person-avatar { width:48px; height:48px; }.people-pending-row div { min-width:0; flex:1; }.people-pending-row strong,.people-pending-row small { display:block; }.people-pending-row small { color:var(--muted); margin-top:4px; font-size:11px; }
+@media (max-width:780px) { .people-graph-stage { min-height:72vh; margin:0 -8px; border-radius:12px; }.people-graph-canvas svg { min-height:72vh; }.people-graph-drawer { top:auto; bottom:0; right:0; width:100%; max-height:48%; box-sizing:border-box; border-radius:14px 14px 0 0; }.people-graph-zoom { right:10px; top:10px; bottom:auto; }.people-relation-chooser { left:10px; right:10px; bottom:10px; max-width:none; } }
+@media (prefers-reduced-motion: reduce) { .people-graph-node { transition:none; } }
 .relation-form { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
 .relation-form label { display: block; color: var(--muted); font-size: 10px; margin: 0; }
 .relation-form select, .relation-form input { display: block; width: 100%; box-sizing: border-box; margin-top: 6px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); font: inherit; }

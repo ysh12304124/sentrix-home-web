@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -9,6 +10,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from ..platform_profile import profile
+
+log = logging.getLogger("sentrix.video")
 
 
 def _value(item, key, default=""):
@@ -302,7 +306,7 @@ def check_video_gpu_capacity():
     consumer without a capacity check can OOM the production inference.
     Returns None when the device is CPU-only or capacity cannot be measured.
     """
-    device = str(os.getenv("SENTRIX_VIDEO_DEVICE", "cpu")).strip().lower()
+    device = str(profile.video_device()).strip().lower()
     if device in ("", "cpu", "auto"):
         return None
     min_free_mib = int(os.getenv("SENTRIX_VIDEO_GPU_MIN_FREE_MIB", "4096"))
@@ -310,6 +314,16 @@ def check_video_gpu_capacity():
     if free_mib is None:
         return None
     if free_mib < min_free_mib:
+        if profile.is_jetson():
+            # Jetson 是**统一内存**：torch.cuda.mem_get_info().free 返回的是整机可用
+            # 内存，而不是"独立显存还剩多少"。一个加载了 12B VLM 的 Orin NX 上，
+            # 这个数字永远达不到为独立显存选的 4096MiB —— 硬拦会让视频处理整条被
+            # 挡死。这里降级为告警：解码侧已有 CPU 回退，试一下比直接拒绝好。
+            log.warning(
+                "视频抽帧可用内存偏低（%s MiB < %s MiB），仍继续：统一内存下该读数"
+                "不区分显存与主存，且解码已有 CPU 回退", free_mib, min_free_mib,
+            )
+            return free_mib
         raise RuntimeError(
             f"insufficient GPU memory for video keyframe extraction: "
             f"{free_mib} MiB free < {min_free_mib} MiB required (SENTRIX_VIDEO_GPU_MIN_FREE_MIB)"
@@ -335,7 +349,7 @@ def run(video_path, output_dir, video_id):
         "--target-decode-workers", os.getenv("SENTRIX_VIDEO_TARGET_DECODE_WORKERS", "4"),
         "--merge-max-sec", os.getenv("SENTRIX_VIDEO_PREFILTER_MERGE_MAX_SEC", "12"),
         "--webp-quality", os.getenv("SENTRIX_VIDEO_WEBP_QUALITY", "80"),
-        "--device", os.getenv("SENTRIX_VIDEO_DEVICE", "0"),
+        "--device", profile.video_device(),
     ]
     process = subprocess.run(command, check=False, capture_output=True, text=True,
                              timeout=int(os.getenv("SENTRIX_VIDEO_TIMEOUT_SECONDS", "7200")))

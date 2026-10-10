@@ -14,6 +14,7 @@ import argparse
 import copy
 import concurrent.futures
 import base64
+import gzip
 import hashlib
 import itertools
 from io import BytesIO
@@ -50,10 +51,18 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from backend.runtime_providers import (
     ManagerLifecycleProvider,
     ManagerTelemetryProvider,
+    VllmTelemetryProvider,
+    HostNvidiaTelemetryProvider,
+    LlamaCppTelemetryProvider,
+    LocalJetsonLlamaCppTelemetryProvider,
+    is_jetson_host,
+    OrinLlamaCppTelemetryProvider,
+    OllamaTelemetryProvider,
     OpenAICompatibleInferenceProvider,
     UnavailableLifecycleProvider,
     UnavailableTelemetryProvider,
 )
+from backend.apple_telemetry import LocalAppleUnifiedTelemetryProvider, is_apple_silicon
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_DATA_ROOT = PROJECT_ROOT / "data"
@@ -71,11 +80,45 @@ def _load_runtime_connection_config() -> dict:
         return {}
 
 
+def _load_dotenv_file(path: Path) -> None:
+    """Load KEY=VALUE lines. Values already in the process environment stay."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        try:
+            parsed = shlex.split(value, posix=True)
+        except ValueError:
+            parsed = []
+        if len(parsed) == 1:
+            value = parsed[0]
+        os.environ[key] = value
+
+
+def _configured_url(env_name: str, config_key: str, *, fallback: str = "") -> str:
+    """Resolve a host endpoint from the environment, then the local JSON.
+
+    An explicit empty environment value means the endpoint is unset and must
+    not fall through to another machine.
+    """
+    if env_name in os.environ:
+        return str(os.environ.get(env_name) or "").strip()
+    if config_key in RUNTIME_CONNECTION_CONFIG:
+        return str(RUNTIME_CONNECTION_CONFIG.get(config_key) or "").strip()
+    return fallback
+
+
+_load_dotenv_file(PROJECT_ROOT / ".env.local")
 RUNTIME_CONNECTION_CONFIG = _load_runtime_connection_config()
-DEFAULT_SENTRIX_URL = (
-    os.environ.get("BENCH_SENTRIX_URL")
-    or str(RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or "")
-    or "http://192.168.0.153:8091"
+DEFAULT_SENTRIX_URL = _configured_url(
+    "BENCH_SENTRIX_URL", "sentrix_url", fallback="http://127.0.0.1:8091"
 )
 
 
@@ -92,6 +135,75 @@ def local_lan_ip() -> str:
         probe.close()
 
 
+def _is_orin_telemetry_host(host) -> bool:
+    """该主机是否被显式配置为远端 Orin 遥测目标。
+
+    原先这里直接比对字面量 `192.168.0.118`：把某一台机器的地址编进主干，换台机器
+    就得改代码。本机是 Jetson 时由 is_jetson_host() 判定（能力信号）；跨机场景由
+    SENTRIX_ORIN_TELEMETRY_HOST 显式声明（形如 orin@<host>）。
+    """
+    if not host:
+        return False
+    remote = os.getenv("SENTRIX_ORIN_TELEMETRY_HOST", "").strip()
+    return bool(remote) and host == remote.split("@", 1)[-1]
+
+
+def resolve_runtime_framework(value: str, model_base_url: str) -> str:
+    framework = str(value or "").strip().lower().replace("_", ".")
+    if framework and framework != "generic":
+        return framework
+    endpoint = urlparse(model_base_url)
+    if endpoint.port == 11434:
+        return "ollama"
+    if endpoint.port == 8100 and (is_jetson_host() or _is_orin_telemetry_host(endpoint.hostname)):
+        return "llama.cpp"
+    # Port 8100 is also used by vLLM; an arbitrary service is not llama.cpp.
+    return "generic"
+
+
+def detect_runtime_framework(value: str, model_base_url: str) -> str:
+    framework = resolve_runtime_framework(value, model_base_url)
+    if framework != "generic" or not model_base_url:
+        return framework
+    metrics_url = normalize_model_base_url(model_base_url).removesuffix("/v1") + "/metrics"
+    try:
+        metrics = request_text(metrics_url, timeout=3).lower()
+    except Exception:
+        return framework
+    if "vllm:" in metrics:
+        return "vllm"
+    if "llamacpp:" in metrics or "llama_" in metrics:
+        return "llama.cpp"
+    return framework
+
+
+def select_runtime_providers(manager_url: str, endpoint_url: str,
+                             framework: str, *, cloud: bool = False):
+    """Choose the model lifecycle and local telemetry by runtime and host."""
+    endpoint = urlparse(endpoint_url)
+    host = (endpoint.hostname or "").strip().lower()
+    local_hosts = {"127.0.0.1", "localhost", "::1", local_lan_ip()}
+    is_local_endpoint = host in local_hosts
+    # A Manager URL is only authoritative for managed vLLM. External
+    # OpenAI-compatible llama.cpp/Ollama endpoints may still carry a stale
+    # Manager setting in the UI; never let that hide the endpoint host check.
+    if manager_url and framework in {"generic", "vllm", "vllm_manager"}:
+        if not is_local_endpoint:
+            return ManagerLifecycleProvider(manager_url), UnavailableTelemetryProvider(), "unavailable"
+        return ManagerLifecycleProvider(manager_url), ManagerTelemetryProvider(manager_url), "vllm_manager"
+    lifecycle = UnavailableLifecycleProvider()
+    jetson = is_jetson_host()
+    if not cloud and framework in {"llama.cpp", "llamacpp"} and jetson and host in local_hosts:
+        return lifecycle, LocalJetsonLlamaCppTelemetryProvider(endpoint_url=endpoint_url), "jetson_local_pss"
+    if not cloud and is_apple_silicon() and is_local_endpoint:
+        return lifecycle, LocalAppleUnifiedTelemetryProvider(endpoint_url=endpoint_url), "apple_unified"
+    if not cloud and not jetson and host in local_hosts:
+        telemetry_class = {"llama.cpp": LlamaCppTelemetryProvider, "llamacpp": LlamaCppTelemetryProvider,
+                           "ollama": OllamaTelemetryProvider, "vllm": VllmTelemetryProvider}.get(framework, HostNvidiaTelemetryProvider)
+        return lifecycle, telemetry_class(endpoint_url=endpoint_url), "host_nvidia_smi"
+    return lifecycle, UnavailableTelemetryProvider(), "unavailable"
+
+
 VLLM_TARGETS_PATH = PROJECT_ROOT / "config/vllm_targets.json"
 CUSTOM_JUDGE_PROMPT_PATH = PROJECT_ROOT / "config/custom_judge_prompt.json"
 TASK_ACTION_POLICY_PATH = PROJECT_ROOT / "config/qa_task_actions.json"
@@ -101,6 +213,13 @@ EVIDENCE_JUDGE_ENABLED = os.environ.get("BENCH_EVIDENCE_JUDGE", "0") == "1"
 # so disk I/O does not become part of the Agent/Judge wall-clock measurements.
 PERSIST_DEBOUNCE_SECONDS = max(
     0.05, float(os.environ.get("PHOTOBENCH_PERSIST_DEBOUNCE_SECONDS", "0.25"))
+)
+# Keep the frequently rewritten run.json snapshot bounded.  The append-only
+# gpu_samples.jsonl file is the complete telemetry source and get_run() loads
+# its full history for the UI, so this tail is an I/O safeguard rather than a
+# user-visible time-range limit.
+LIVE_TELEMETRY_TAIL_POINTS = max(
+    0, int(os.environ.get("PHOTOBENCH_LIVE_TELEMETRY_TAIL_POINTS", "240"))
 )
 JUDGE_RETRY_ATTEMPTS = max(1, int(os.environ.get("PHOTOBENCH_JUDGE_RETRY_ATTEMPTS", "6")))
 JUDGE_RETRY_BACKOFF_SECONDS = max(0.1, float(os.environ.get("PHOTOBENCH_JUDGE_RETRY_BACKOFF_SECONDS", "5.0")))
@@ -187,17 +306,8 @@ DEFAULT_JUDGE_URL = (
     or str(RUNTIME_CONNECTION_CONFIG.get("judge_url") or "")
     or _P_URL
 )
-DEFAULT_VLLM_API_URL = (
-    os.environ.get("BENCH_VLLM_API_URL")
-    or (str(RUNTIME_CONNECTION_CONFIG.get("vllm_manager_url"))
-        if "vllm_manager_url" in RUNTIME_CONNECTION_CONFIG else "http://192.168.0.153:8500")
-)
-DEFAULT_VLLM_BASE_URL = (
-    os.environ.get("BENCH_VLLM_BASE_URL")
-    or (str(RUNTIME_CONNECTION_CONFIG.get("model_base_url"))
-        if "model_base_url" in RUNTIME_CONNECTION_CONFIG else "")
-    or ""
-)
+DEFAULT_VLLM_API_URL = _configured_url("BENCH_VLLM_API_URL", "vllm_manager_url")
+DEFAULT_VLLM_BASE_URL = _configured_url("BENCH_VLLM_BASE_URL", "model_base_url")
 BIG_MODEL_PROFILE_ID = "big_model"
 BIG_MODEL_BASE_URL = os.environ.get("BENCH_BIG_MODEL_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3")
 BIG_MODEL_MODEL = os.environ.get("BENCH_BIG_MODEL_MODEL", "doubao-seed-2.0-lite")
@@ -250,12 +360,20 @@ if not DEFAULT_VLLM_BASE_URL and "model_base_url" not in RUNTIME_CONNECTION_CONF
     ).rstrip("/")
 
 
-def resolve_vllm_target(target_id: str | None) -> tuple[str, dict]:
-    selected = str(target_id or DEFAULT_VLLM_TARGET_ID)
+def resolve_vllm_target(target_id: str | None, *, manager_url: str = "", model_base_url: str = "") -> tuple[str, dict]:
+    selected = str(target_id or DEFAULT_VLLM_TARGET_ID).strip()
     target = VLLM_TARGETS.get(selected)
-    if not target:
-        raise ValueError(f"unknown vLLM target: {selected}")
-    return selected, target
+    if target:
+        return selected, target
+    if manager_url or model_base_url:
+        return selected or "external", {
+            "label": selected or "external",
+            "manager_url": manager_url,
+            "model_base_url": model_base_url,
+            "description": "ad-hoc endpoint from the evaluation form",
+        }
+    known = ", ".join(sorted(VLLM_TARGETS)) or "(none)"
+    raise ValueError(f"unknown vLLM target: {selected or DEFAULT_VLLM_TARGET_ID}; known: {known}")
 
 
 def normalize_model_base_url(value: str | None) -> str:
@@ -655,6 +773,37 @@ def request_json(url: str, payload=None, method: str = "GET", timeout: int = 120
         raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {detail}") from exc
 
 
+def arbiter_status_snapshot(sentrix_url: str) -> dict:
+    """Proxy optional Arbiter state without exposing server-local URLs to browsers."""
+    try:
+        return {
+            "supported": True,
+            "status": request_json(f"{sentrix_url.rstrip('/')}/api/arbiter/status", timeout=3),
+        }
+    except Exception as exc:
+        error = str(exc)
+        unsupported = error.startswith("HTTP 404 ") or error.startswith("HTTP 405 ")
+        return {
+            "supported": False if unsupported else None,
+            "status": None,
+            "reason": "endpoint_not_supported" if unsupported else "temporarily_unavailable",
+        }
+
+
+def paginate_rows(rows: list, page: int, page_size: int, *, max_page_size: int = 100) -> dict:
+    page = max(1, int(page))
+    page_size = max(1, min(max_page_size, int(page_size)))
+    total = len(rows)
+    pages = max(1, math.ceil(total / page_size))
+    page = min(page, pages)
+    start = (page - 1) * page_size
+    return {
+        "runs": rows[start:start + page_size], "page": page,
+        "page_size": page_size, "total": total, "pages": pages,
+        "has_previous": page > 1, "has_next": page < pages,
+    }
+
+
 def request_text(url: str, timeout: int = 120) -> str:
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1051,6 +1200,23 @@ def _resolve_predicted_media(asset_ids: list[str], assets_by_name: dict) -> list
                 "face_crop", "face_id_crop", "face_identity_crop", "face_reference",
             }:
                 continue
+        derived_kind = str(asset.get("derived_kind") or metadata.get("derived_kind") or "")
+        parent_asset_id = str(asset.get("parent_asset_id") or metadata.get("parent_asset_id") or "")
+        if derived_kind in {"video_keyframe", "video_keyframe_webp"} and parent_asset_id in assets_by_id:
+            source_file_name, source_asset = assets_by_id[parent_asset_id]
+            if _infer_media_type(source_file_name, source_asset.get("media_type") or source_asset.get("asset_type")) == "video":
+                media = {
+                    "asset_id": parent_asset_id,
+                    "file_name": source_file_name,
+                    "media_type": "video",
+                    "media_id": Path(source_file_name).stem,
+                    "source_timestamp_sec": asset.get("source_timestamp_sec") or metadata.get("source_timestamp_sec"),
+                    "source_keyframe_asset_id": str(asset_id),
+                }
+                if source_asset.get("media_url"):
+                    media["media_url"] = source_asset["media_url"]
+                resolved.append(media)
+                continue
         media_type = _infer_media_type(file_name, asset.get("media_type") or asset.get("asset_type"))
         media = {
             "asset_id": str(asset_id),
@@ -1173,6 +1339,105 @@ def _macro_metrics_from_counts(items: list[dict], field: str) -> dict:
         values["f1"].append(f1)
     return {metric: sum(samples) / len(samples) if samples else None
             for metric, samples in values.items()} | {"metric_count": len(rows)}
+
+
+RANKING_KS = (1, 5, 10)
+
+
+def _ranking_metrics(ranked_keys: list, gt_keys: set) -> dict:
+    """Ranking metrics over the ordered tool candidate list of one question.
+
+    The order is the tool's recall order, so these read the ranking the
+    set-based precision/recall/F1 above deliberately discards.  With several
+    positives per question R@K and Hit@K answer different things -- R@K is the
+    share of positives inside the first K, Hit@K only asks whether any positive
+    made it -- so both are reported rather than one standing in for the other.
+    """
+    if not gt_keys:
+        return {}
+    ranked = list(ranked_keys)
+    data = {"ranked_count": len(ranked), "gt_count": len(gt_keys)}
+    for k in RANKING_KS:
+        found = len(gt_keys & set(ranked[:k]))
+        data[f"r_at_{k}"] = round(found / len(gt_keys), 4)
+        data[f"hit_at_{k}"] = 1.0 if found else 0.0
+    first = next((index for index, key in enumerate(ranked, 1) if key in gt_keys), None)
+    data["mrr"] = round(1.0 / first, 4) if first else 0.0
+    hits = 0
+    total = 0.0
+    for index, key in enumerate(ranked, 1):
+        if key in gt_keys:
+            hits += 1
+            total += hits / index
+    data["average_precision"] = round(total / len(gt_keys), 4)
+    data["p_at_5"] = round(len(gt_keys & set(ranked[:5])) / min(5, len(ranked)), 4) if ranked else 0.0
+    return data
+
+
+def _mean_ranking_metrics(items: list[dict], field: str = "image_ranking") -> dict:
+    """Average the per-question ranking metrics into one run-level summary.
+
+    R@K is averaged only over questions whose positive count fits inside K.  A
+    question with 25 ground-truth images tops out at 5/25 however well it is
+    ranked, so including it would average a known-item search together with an
+    exhaustive set search and report neither.  Those questions still feed mAP,
+    which is defined for any number of positives.
+    """
+    rows = [item[field] for item in items
+            if isinstance(item.get(field), dict) and int(item[field].get("gt_count") or 0) > 0]
+    if not rows:
+        return {}
+    data: dict = {}
+    for k in RANKING_KS:
+        subset = [row for row in rows if int(row.get("gt_count") or 0) <= k]
+        data[f"r_at_{k}_question_count"] = len(subset)
+        if subset:
+            data[f"r_at_{k}"] = round(sum(row[f"r_at_{k}"] for row in subset) / len(subset), 4)
+            data[f"hit_at_{k}"] = round(sum(row[f"hit_at_{k}"] for row in subset) / len(subset), 4)
+        else:
+            data[f"r_at_{k}"] = None
+            data[f"hit_at_{k}"] = None
+    # With |GT| <= K the only thing left that can stop a question from reaching
+    # R@K = 1 is the tool returning fewer candidates than there are positives, so
+    # count those instead of reporting an averaged ceiling: 95% of questions sit
+    # at exactly 100% and the average only restates the shortage rate.  Counted
+    # over the R@5 population because that is the number these annotate.
+    r5_rows = [row for row in rows if int(row.get("gt_count") or 0) <= 5]
+    data["coverage_short_count"] = sum(
+        1 for row in r5_rows if int(row.get("ranked_count") or 0) < int(row.get("gt_count") or 0))
+    data["no_candidate_count"] = sum(1 for row in r5_rows if int(row.get("ranked_count") or 0) == 0)
+    # mAP and MRR are defined for any positive count, so they use every question.
+    data["mrr"] = round(sum(row["mrr"] for row in rows) / len(rows), 4)
+    data["average_precision"] = round(sum(row["average_precision"] for row in rows) / len(rows), 4)
+    p5 = [row for row in rows if int(row.get("gt_count") or 0) <= 5]
+    data["p_at_5"] = round(sum(row["p_at_5"] for row in p5) / len(p5), 4) if p5 else None
+    data["p_at_5_question_count"] = len(p5)
+    data["question_count"] = len(rows)
+    data["multi_positive_count"] = sum(1 for row in rows if int(row.get("gt_count") or 0) > 1)
+    data["short_candidate_count"] = sum(1 for row in rows if int(row.get("ranked_count") or 0) < 10)
+    return data
+
+
+def _ranking_from_item(item: dict) -> dict:
+    """Ranking metrics for one persisted question, rebuilt when not recorded.
+
+    Runs summarised before this metric existed stored the candidate order and
+    the GT sets but no per-question ranking result, so it is recomputed from
+    those fields rather than leaving the whole history blank.
+    """
+    recorded = item.get("image_ranking")
+    if isinstance(recorded, dict):
+        return recorded
+    gt_media = [entry for entry in (item.get("gt_images") or [])
+                if entry.get("media_type") == "image"]
+    if not gt_media:
+        return {}
+    candidates = item.get("retrieved_candidate_media") or item.get("retrieved_candidate_images") or []
+    return _ranking_metrics(
+        [_media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+         for value in candidates if value.get("media_type") == "image"],
+        {_media_key(entry.get("media_type"), entry.get("media_id")) for entry in gt_media},
+    )
 
 
 def _retrieval_metric_eligible(item: dict) -> bool:
@@ -2056,6 +2321,7 @@ class GpuSampler:
             try:
                 gpu_result = self.provider.gpu_stats()
                 memory_result = self.provider.process_memory()
+                system_result = self.provider.system_memory() if hasattr(self.provider, "system_memory") else {}
                 if gpu_result.get("status") != "available":
                     gpu_result = local_nvidia_smi_stats()
                     memory_result = {"status": "unavailable", "data": {}}
@@ -2063,18 +2329,52 @@ class GpuSampler:
                         self._stop.wait(self.interval)
                         continue
                 data = gpu_result.get("data") or {}
-                process_memory = (
-                    memory_result.get("data") or {}
-                    if memory_result.get("status") == "available" else {}
-                )
+                # Keep auxiliary process/system data even when model PID
+                # attribution is unavailable; never turn a missing model
+                # process into a false zero.
+                process_memory = memory_result.get("data") or {}
+                system_memory = system_result.get("data") or {}
                 ts = time.perf_counter()
                 for gpu in data.get("gpus", []):
                     sample = dict(gpu)
+                    if sample.get("cpu_temperature_c") is None and data.get("cpu_temperature_c") is not None:
+                        sample["cpu_temperature_c"] = data["cpu_temperature_c"]
                     sample["_t"] = ts
                     sample["model_process_memory_used_mib"] = process_memory.get("process_memory_used_mib")
+                    sample["model_process_system_memory_used_mib"] = process_memory.get("model_process_system_memory_used_mib")
+                    sample["benchmark_process_memory_used_mib"] = process_memory.get("benchmark_process_memory_used_mib")
+                    sample["benchmark_process_gpu_memory_mib"] = process_memory.get("benchmark_process_gpu_memory_mib")
+                    sample["other_processes_memory_mib"] = process_memory.get("other_processes_memory_mib")
+                    sample["all_processes_memory_mib"] = process_memory.get("all_processes_memory_mib")
+                    sample["system_memory_used_mib"] = system_memory.get("system_memory_used_mib")
+                    sample["system_memory_total_mib"] = system_memory.get("system_memory_total_mib")
+                    sample["system_memory_available_mib"] = system_memory.get("system_memory_available_mib")
+                    sample["system_memory_scope"] = system_memory.get("system_memory_scope")
+                    sample["system_memory_delta_mib"] = process_memory.get("system_memory_delta_mib")
+                    sample["system_memory_baseline_mib"] = process_memory.get("system_memory_baseline_mib")
+                    sample["llama_server_args"] = process_memory.get("llama_server_args")
+                    sample["sentrix_stack_pss_mib"] = process_memory.get("sentrix_stack_pss_mib")
+                    sample["product_stack_memory_mib"] = process_memory.get("product_stack_memory_mib")
+                    sample["memory_scope"] = process_memory.get("memory_scope") or sample.get("memory_scope")
+                    sample["process_memory_scope"] = process_memory.get("process_memory_scope")
+                    sample["model_process_system_memory_scope"] = process_memory.get("model_process_system_memory_scope")
+                    sample["benchmark_process_memory_scope"] = process_memory.get("benchmark_process_memory_scope")
+                    sample["benchmark_process_gpu_memory_scope"] = process_memory.get("benchmark_process_gpu_memory_scope")
+                    sample["process_attribution"] = process_memory.get("process_attribution")
+                    sample["all_processes_scope"] = process_memory.get("all_processes_scope")
+                    sample["model_processes"] = process_memory.get("processes") or []
+                    sample["model_system_processes"] = process_memory.get("model_system_processes") or []
+                    sample["benchmark_processes"] = process_memory.get("benchmark_processes") or []
+                    sample["benchmark_gpu_processes"] = process_memory.get("benchmark_gpu_processes") or []
+                    sample["other_processes"] = process_memory.get("other_processes") or []
+                    sample["all_processes"] = process_memory.get("all_processes") or []
                     sample["model_process_memory_limit_mib"] = process_memory.get("process_memory_limit_mib")
                     sample["model_process_memory_over_limit"] = process_memory.get("process_memory_over_limit")
                     sample["model_process_pid"] = process_memory.get("root_pid")
+                    sample["memory_unit"] = process_memory.get("memory_unit") or sample.get("memory_unit")
+                    sample["source"] = gpu_result.get("source") or self.provider.__class__.__name__
+                    sample["pss_sampled_at_monotonic"] = process_memory.get("pss_sampled_at_monotonic")
+                    sample["kv_cache_used_tokens"] = process_memory.get("kv_cache_used_tokens")
                     vllm_metrics = process_memory.get("vllm_metrics") or {}
                     sample["kv_cache_usage_pct"] = vllm_metrics.get("kv_cache_usage_pct")
                     memory_profile = process_memory.get("memory_profile") or {}
@@ -2099,9 +2399,13 @@ class GpuSampler:
             return {"samples_count": 0}
         metrics = {}
         for key in (
-            "temperature_c", "gpu_utilization_pct", "memory_used_mib",
-            "model_process_memory_used_mib", "kv_cache_usage_pct",
-            "power_draw_w", "sm_clock_mhz",
+            "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
+            "gpu_allocated_unified_memory_mib", "gpu_in_use_unified_memory_mib",
+            "model_process_memory_used_mib", "kv_cache_usage_pct", "kv_cache_used_tokens",
+            "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
+            "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
+            "model_process_system_memory_used_mib", "system_memory_delta_mib",
+            "sentrix_stack_pss_mib", "product_stack_memory_mib",
         ):
             values = [
                 s[key] for s in self.samples
@@ -2122,6 +2426,35 @@ class GpuSampler:
         over_limit_flags = [sample.get("model_process_memory_over_limit") for sample in self.samples
                             if isinstance(sample.get("model_process_memory_over_limit"), bool)]
         latest = self.samples[-1]
+        if latest.get("memory_unit") == "process_pss_uma_mib":
+            pss_sample_count = len({s["pss_sampled_at_monotonic"] for s in self.samples
+                                    if s.get("pss_sampled_at_monotonic") is not None})
+            return {
+                "samples_count": len(self.samples), "pss_samples_count": pss_sample_count,
+                "source": ("jetson_local_pss" if isinstance(self.provider, LocalJetsonLlamaCppTelemetryProvider)
+                           else "orin_ssh_pss"),
+                "memory_profile": {
+                    "method": "orin_process_pss_uma_v1",
+                    "memory_unit": "process_pss_uma_mib",
+                    "kv_cache_used_peak_tokens": (metrics.get("kv_cache_used_tokens") or {}).get("peak"),
+                    "kv_cache_usage_peak_pct": (metrics.get("kv_cache_usage_pct") or {}).get("peak"),
+                    "kv_cache_used_peak_gib": None,
+                    "comparable_workload_memory_gib": None,
+                    "note": "PSS is shared physical RAM, not dedicated GPU VRAM; KV bytes unavailable without verified per-token allocation.",
+                }, **metrics,
+            }
+        if latest.get("memory_unit") == "apple_phys_footprint_mib":
+            return {
+                "samples_count": len(self.samples),
+                "source": "apple_unified",
+                "memory_profile": {
+                    "method": "apple_phys_footprint_v1",
+                    "memory_unit": "apple_phys_footprint_mib",
+                    "comparable_workload_memory_gib": None,
+                    "note": "Process physical footprint is not dedicated GPU VRAM; per-process GPU-only memory and KV bytes are unavailable.",
+                },
+                **metrics,
+            }
         kv_capacity_gib = latest.get("kv_cache_capacity_gib")
         process_memory = metrics.get("model_process_memory_used_mib") or {}
         kv_usage = metrics.get("kv_cache_usage_pct") or {}
@@ -2147,6 +2480,7 @@ class GpuSampler:
             "model_process_over_limit_samples": sum(over_limit_flags) if over_limit_flags else None,
             "memory_profile": {
                 "method": "idle_process_minus_reserved_kv_plus_peak_used_kv_v1",
+                "comparable_memory_is_estimate": True,
                 "idle_process_memory_gib": round(idle_process_mib / 1024, 4)
                     if isinstance(idle_process_mib, (int, float)) else None,
                 "kv_cache_capacity_gib": kv_capacity_gib,
@@ -2182,6 +2516,7 @@ class BenchmarkRun:
                  mode: str = "full", existing_scope_id: str = "",
                  scope_reused_from_runs: list | None = None,
                  use_current_model: bool = False, current_model_snapshot: dict | None = None,
+                 runtime_framework: str = "generic",
                  use_cloud_model: bool = False, resume_state: dict | None = None,
                  qa_limit: int | None = None):
         if mode not in RUN_MODES:
@@ -2211,12 +2546,10 @@ class BenchmarkRun:
         self.vllm_api_url = vllm_api_url.rstrip("/")
         self.vllm_target_id = vllm_target_id
         self.vllm_model_base_url = vllm_model_base_url.rstrip("/")
-        if self.vllm_api_url:
-            self.lifecycle_provider = ManagerLifecycleProvider(self.vllm_api_url)
-            self.telemetry_provider = ManagerTelemetryProvider(self.vllm_api_url)
-        else:
-            self.lifecycle_provider = UnavailableLifecycleProvider()
-            self.telemetry_provider = UnavailableTelemetryProvider()
+        self.runtime_framework = resolve_runtime_framework(runtime_framework, self.vllm_model_base_url)
+        (self.lifecycle_provider, self.telemetry_provider, self.telemetry_source) = select_runtime_providers(
+            self.vllm_api_url, self.vllm_model_base_url, self.runtime_framework, cloud=self.use_cloud_model,
+        )
         self.results_root = results_root
         self.lock = threading.RLock()
         self._judge_rate_lock = threading.Lock()
@@ -2269,6 +2602,8 @@ class BenchmarkRun:
             "vllm_target_id": vllm_target_id,
             "vllm_manager_url": vllm_api_url,
             "vllm_model_base_url": vllm_model_base_url,
+            "telemetry_source": self.telemetry_source,
+            "runtime_framework": self.runtime_framework,
             "qa_count": len(self.qa_rows),
             "input_integrity": self.input_integrity,
             "hardware_snapshots": {"start": None, "end": None},
@@ -2325,6 +2660,8 @@ class BenchmarkRun:
                 "vllm_target_id": vllm_target_id,
                 "vllm_manager_url": vllm_api_url,
                 "vllm_model_base_url": vllm_model_base_url,
+                "runtime_framework": self.runtime_framework,
+                "telemetry_source": self.telemetry_source,
                 "status": "pending",
                 "started_at": None,
                 "finished_at": None,
@@ -2406,8 +2743,125 @@ class BenchmarkRun:
     def _persist_gpu_sample(self, sample: dict) -> None:
         """Append each sample immediately so cancellation does not lose in-memory data."""
         with self.lock:
+            phase = self._current_phase or "unassigned"
+            phase_labels = {
+                "model_deploy": "模型加载",
+                "scope_setup": "创建相册",
+                "scope_attach": "绑定相册",
+                "identity_seed": "身份预置",
+                "photo_import": "数据导入",
+                "pipeline_processing": "相册流水线预处理",
+                "qa_eval": "QA 测评",
+                "gpu_metrics": "资源指标收尾",
+                "aggregate": "结果汇总",
+                "unassigned": "未分配阶段",
+            }
+            persisted_sample = dict(sample)
+            # Keep phase metadata beside every raw sample so a complete
+            # time-series can be reconstructed after a restart/failure.
+            persisted_sample.setdefault("phase", phase)
+            persisted_sample.setdefault("phase_label", phase_labels.get(phase, phase))
             with self._gpu_samples_path().open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                handle.write(json.dumps(persisted_sample, ensure_ascii=False) + "\n")
+            # Keep the full live view in run.json as well as in JSONL.  The
+            # append-only JSONL remains the authoritative source for rebuilding
+            # a complete curve after a restart/failure.
+            live = self.state.setdefault("telemetry_live", {
+                "status": "running", "source": self.telemetry_source,
+                "samples_count": 0, "latest": {}, "peak": {}, "phase_snapshots": {}, "history": [],
+            })
+            # Runs created by older builds may contain null/absent collections;
+            # normalize them before appending live samples so one legacy field
+            # cannot disable all realtime persistence.
+            if not isinstance(live.get("history"), list):
+                live["history"] = []
+            if not isinstance(live.get("peak"), dict):
+                live["peak"] = {}
+            if not isinstance(live.get("phase_snapshots"), dict):
+                live["phase_snapshots"] = {}
+            if sample.get("llama_server_args") and not self.state.get("llama_server_args"):
+                self.state["llama_server_args"] = sample.get("llama_server_args")
+            live["status"] = "running"
+            live["source"] = sample.get("source") or self.telemetry_source
+            live["samples_count"] = int(live.get("samples_count") or 0) + 1
+            fields = (
+                "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                "gpu_allocated_unified_memory_mib", "gpu_in_use_unified_memory_mib",
+                "model_process_memory_used_mib", "kv_cache_usage_pct",
+                "model_process_system_memory_used_mib",
+                "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
+                "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz", "other_processes_memory_mib",
+                "all_processes_memory_mib", "system_memory_used_mib", "system_memory_total_mib",
+                "system_memory_delta_mib", "sentrix_stack_pss_mib", "product_stack_memory_mib",
+            )
+            live["latest"] = {key: sample.get(key) for key in fields if sample.get(key) is not None}
+            live["model_processes"] = sample.get("model_processes") or []
+            live["model_system_processes"] = sample.get("model_system_processes") or []
+            live["benchmark_processes"] = sample.get("benchmark_processes") or []
+            live["benchmark_gpu_processes"] = sample.get("benchmark_gpu_processes") or []
+            live["other_processes"] = sample.get("other_processes") or []
+            live["all_processes"] = sample.get("all_processes") or []
+            live["scopes"] = {
+                "system_memory": sample.get("system_memory_scope"),
+                "gpu_memory": sample.get("memory_scope"),
+                "model_process": sample.get("process_memory_scope"),
+                "model_process_ram": sample.get("model_process_system_memory_scope"),
+                "benchmark_process_ram": sample.get("benchmark_process_memory_scope"),
+                "benchmark_process_gpu": sample.get("benchmark_process_gpu_memory_scope"),
+                "all_gpu_processes": sample.get("all_processes_scope"),
+                "process_attribution": sample.get("process_attribution"),
+            }
+            live["history"].append({
+                "t": sample.get("_t", time.time()),
+                "phase": phase,
+                "phase_label": phase_labels.get(phase, phase),
+                **live["latest"],
+            })
+            if LIVE_TELEMETRY_TAIL_POINTS and len(live["history"]) > LIVE_TELEMETRY_TAIL_POINTS:
+                del live["history"][:-LIVE_TELEMETRY_TAIL_POINTS]
+            peak = live.setdefault("peak", {})
+            for key in fields:
+                value = sample.get(key)
+                if isinstance(value, (int, float)):
+                    peak[key] = max(float(peak.get(key, value)), float(value))
+            phase_view = live.setdefault("phase_snapshots", {}).setdefault(phase, {
+                "samples_count": 0, "latest": {}, "peak": {},
+            })
+            phase_view["samples_count"] = int(phase_view.get("samples_count") or 0) + 1
+            phase_view["latest"] = live["latest"]
+            phase_peak = phase_view.setdefault("peak", {})
+            for key in fields:
+                value = sample.get(key)
+                if isinstance(value, (int, float)):
+                    phase_peak[key] = max(float(phase_peak.get(key, value)), float(value))
+            self._refresh_gpu_metrics_phase()
+            # Debounced persistence prevents one disk write per sample while
+            # still making the latest values visible to the next API poll.
+            self.persist()
+
+    def _refresh_gpu_metrics_phase(self) -> None:
+        """Publish a rolling aggregate so the GPU card is live, not end-of-run only."""
+        existing = (self.state.get("phases") or {}).get("gpu_metrics") or {}
+        if existing.get("status") in {"done", "skipped"}:
+            return
+        now = time.monotonic()
+        if now - float(getattr(self, "_gpu_metrics_publish_at", 0.0) or 0.0) < 2.0:
+            return
+        sampler = getattr(self, "_gpu_sampler", None)
+        if sampler is None or not sampler.samples:
+            return
+        self._gpu_metrics_publish_at = now
+        partial = sampler.aggregate()
+        if not partial.get("samples_count"):
+            return
+        partial.update({
+            "status": "running",
+            "partial": True,
+            "started_at": existing.get("started_at") or now_iso(),
+            "updated_at": now_iso(),
+            "llama_server_args": self.state.get("llama_server_args"),
+        })
+        self.state.setdefault("phases", {})["gpu_metrics"] = partial
 
     def cancel(self, source: str = "api"):
         self._cancel.set()
@@ -2612,7 +3066,7 @@ class BenchmarkRun:
         self._record_phase(phase, "status", "partial")
 
     def _hardware_snapshot(self) -> dict:
-        """Use existing Manager endpoints; absence is recorded, never inferred from logs."""
+        """Sample the selected runtime provider; do not require a model manager."""
         if self.use_cloud_model:
             return {
                 "captured_at": now_iso(),
@@ -2620,21 +3074,15 @@ class BenchmarkRun:
                 "status": "not_applicable",
                 "reason": "cloud_api_has_no_local_gpu_metrics",
             }
-        if not self.vllm_api_url:
-            gpu = local_nvidia_smi_stats()
-            if gpu.get("status") == "available":
-                return {
-                    "captured_at": now_iso(), "source": "nvidia-smi",
-                    "status": "available", "gpu": (gpu.get("data") or {}).get("gpus") or [],
-                    "process_memory": None,
-                }
+        if self.telemetry_source == "unavailable":
             return {
                 "captured_at": now_iso(),
                 "source": "external",
                 "status": "not_applicable",
-                "reason": "external model endpoint has no manager metrics and nvidia-smi is unavailable",
+                "reason": "external model endpoint has no local telemetry",
             }
-        snapshot = {"captured_at": now_iso(), "manager": None, "gpu": None, "process_memory": None}
+        snapshot = {"captured_at": now_iso(), "source": self.telemetry_source,
+                    "manager": None, "gpu": None, "process_memory": None}
         try:
             snapshot["manager"] = self.lifecycle_provider.state()
         except Exception as exc:
@@ -2665,6 +3113,11 @@ class BenchmarkRun:
         self.state["started_at"] = now_iso()
         self.state["status"] = "running"
         self.state["hardware_snapshots"]["start"] = self._hardware_snapshot()
+        if (not self.use_cloud_model and self.telemetry_source != "unavailable"
+                and not self._gpu_sampling_started):
+            self._reset_gpu_samples_file()
+            self._gpu_sampling_started = True
+            self._gpu_sampler.start()
         self._current_phase = None
         self.persist()
         all_phases = [
@@ -2686,6 +3139,10 @@ class BenchmarkRun:
                 if self._cancel.is_set():
                     break
                 self._current_phase = name
+                self._record_phase(name, "status", "running")
+                with self.lock:
+                    self.state["current_phase"] = name
+                    self.state.setdefault("telemetry_live", {})["current_phase"] = name
                 fn()
             if self._cancel.is_set():
                 if self._current_phase:
@@ -2713,8 +3170,9 @@ class BenchmarkRun:
             self.state["fatal_error"] = str(e)
             traceback.print_exc()
         finally:
-            if not self.use_cloud_model:
+            if not self.use_cloud_model and self.telemetry_source != "unavailable":
                 self._gpu_sampler.stop()
+                self.state.setdefault("telemetry_live", {})["status"] = "stopped"
             self.state["hardware_snapshots"]["end"] = self._hardware_snapshot()
             gpu_phase = self.state["phases"].get("gpu_metrics") or {}
             if self._gpu_sampling_started and gpu_phase.get("status") != "done":
@@ -2722,6 +3180,9 @@ class BenchmarkRun:
                 partial.update({"status": "partial", "partial": True, "finished_at": now_iso()})
                 self.state["phases"]["gpu_metrics"] = partial
             self.state["finished_at"] = now_iso()
+            with self.lock:
+                self.state["current_phase"] = None
+                self.state.setdefault("telemetry_live", {})["current_phase"] = None
             self.persist(wait=True)
             if self.delete_scope_after_run:
                 self._cleanup_scope()
@@ -2855,7 +3316,7 @@ class BenchmarkRun:
                     return exc
             served_names = {state.get("profile"), state.get("served_model_name")}
             if self.model_profile in served_names:
-                base = state.get("external_url_hint") or f"http://192.168.0.153:{state.get('port', 8100)}/v1"
+                base = state.get("external_url_hint") or f"http://127.0.0.1:{state.get('port', 8100)}/v1"
                 root = base.rstrip("/").removesuffix("/v1")
                 probe = self._probe_model_endpoint(state, root, timeout=20, once=True)
                 if probe is None:
@@ -2959,7 +3420,7 @@ class BenchmarkRun:
         # 3. Health check (cancel-aware)
         state = self.lifecycle_provider.state()
         port = state.get("port", 8105)
-        base = state.get("external_url_hint") or f"http://192.168.0.153:{port}/v1"
+        base = state.get("external_url_hint") or f"http://127.0.0.1:{port}/v1"
         model_api_root = base.rstrip("/").removesuffix("/v1")
         t_health0 = time.perf_counter()
         health_error = self._probe_model_endpoint(state, model_api_root)
@@ -3026,7 +3487,8 @@ class BenchmarkRun:
         t0 = time.perf_counter()
         # Auto-name: PhotoBench-{timestamp}-{album}-{model}
         ts_short = datetime.now().strftime("%Y%m%d-%H%M%S")
-        scope_name = f"PhotoBench-{ts_short}-{safe_slug(self.album_id)}-{safe_slug(self.model_profile)}"
+        model_slug = safe_slug(self.model_profile)[-40:]
+        scope_name = f"PhotoBench-{ts_short}-{safe_slug(self.album_id)}-{model_slug}"[:100]
         result = request_json(f"{self.sentrix_url}/api/memory-spaces",
                               {"name": scope_name}, "POST", 30)
         scope_id = result.get("id") or result.get("scope_id")
@@ -3289,7 +3751,11 @@ class BenchmarkRun:
 
     def _phase_processing(self):
         self._phase_start("pipeline_processing")
-        if not self.use_cloud_model:
+        # The sampler starts once at run begin and must remain continuous across
+        # phases; resetting here would silently erase model-deploy/scope/import
+        # telemetry from the full-run curve.
+        if (not self.use_cloud_model and self.telemetry_source != "unavailable"
+                and not self._gpu_sampling_started):
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -3364,15 +3830,19 @@ class BenchmarkRun:
             for asset in assets:
                 status = str(asset.get("status") or "unknown")
                 status_counts[status] = status_counts.get(status, 0) + 1
-            # Compare each asset's state instead of only aggregate counts. Two assets
-            # can transition in opposite directions during one poll and leave the
-            # counts unchanged even though the pipeline is making progress.
-            asset_status_signature = tuple(sorted(
+            # Track progress with a *stable* signature: aggregate counts plus
+            # the set of (id, terminal-status) pairs for assets that have left
+            # pending states. Per-asset status flapping inside the pending set
+            # (e.g. video-keyframe-extracting ↔ video-queued during a retry
+            # loop) must NOT reset the stall timer — otherwise the detector is
+            # defeated and the pipeline hangs forever.
+            non_pending_signature = tuple(sorted(
                 (str(asset.get("id") or asset.get("asset_id") or asset.get("path") or index),
                  str(asset.get("status") or "unknown"))
                 for index, asset in enumerate(assets)
+                if asset.get("status") not in PIPELINE_PENDING_STATUSES
             ))
-            progress_signature = (asset_status_signature, batch_status)
+            progress_signature = (len(pending), processed, failed, non_pending_signature, batch_status)
             now = time.monotonic()
             if getattr(self, "_pipeline_progress_signature", None) != progress_signature:
                 self._pipeline_progress_signature = progress_signature
@@ -3491,7 +3961,7 @@ class BenchmarkRun:
     def _phase_qa_eval(self):
         self._phase_start("qa_eval")
         # reuse 模式没有 pipeline_processing 阶段，QA 采样在这里兜底启动 GPU 采样。
-        if not self.use_cloud_model and not self._gpu_sampling_started:
+        if not self.use_cloud_model and self.telemetry_source != "unavailable" and not self._gpu_sampling_started:
             self._reset_gpu_samples_file()
             self._gpu_sampling_started = True
             self._gpu_sampler.start()
@@ -3635,7 +4105,7 @@ class BenchmarkRun:
                 self._record_phase("qa_eval", "agent_phase_total_seconds", round(agent_phase_wall_ms / 1000, 3))
                 self._record_phase("qa_eval", "agent_phase_wall_ms", agent_phase_wall_ms)
                 self._record_phase("qa_eval", "agent_completed", self._qa_agent_completed)
-                if not self.use_cloud_model:
+                if not self.use_cloud_model and self.telemetry_source != "unavailable":
                     self._gpu_sampler.stop()
 
             while pending:
@@ -3926,6 +4396,14 @@ class BenchmarkRun:
             retrieved_names = {value["file_name"] for value in retrieved_media}
             evidence_names = {value["file_name"] for value in evidence_media}
             gt_images = [value for value in gt_media if value["media_type"] == "image"]
+            # Ranking reads the tool candidate list in recall order.  Keys come
+            # from the same resolution the set metrics use, so a keyframe that
+            # resolves to its parent video is scored as that video here too.
+            ranking = _ranking_metrics(
+                [_media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
+                 for value in retrieved_media if value.get("media_type") == "image"],
+                {_media_key(entry["media_type"], entry["media_id"]) for entry in gt_images},
+            )
 
             # Agent phase ends before any Judge request starts.  Judge is queued
             # by _phase_qa_eval in a separate executor after this item returns.
@@ -3959,6 +4437,7 @@ class BenchmarkRun:
                 "selected_asset_ids": media_sets["selected_asset_ids"],
                 "media_retrieval_counts": metrics["media"],
                 "image_retrieval_counts": metrics["image"],
+                "image_ranking": ranking,
                 "video_retrieval_counts": metrics["video"],
                 "media_retrieval_recall": metrics["media"]["recall"],
                 "media_retrieval_precision": metrics["media"]["precision"],
@@ -4346,20 +4825,44 @@ class BenchmarkRun:
         return bound
 
     @staticmethod
-    def _trace_action(step: dict) -> dict | None:
-        detail = step.get("detail")
-        if isinstance(detail, dict) and detail.get("action"):
-            return detail
-        text = str(detail or "").strip()
+    @staticmethod
+    def _parse_action_payload(value) -> dict | None:
+        """Extract a structured Agent action from trace payloads.
+
+        New Sentrix traces store the model JSON in ``raw`` / ``raw_full`` and
+        may wrap it in a markdown fence. Older traces used ``detail``.
+        """
+        if isinstance(value, dict):
+            return value if value.get("action") else None
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.startswith("```"):
+            body = text.split("\n", 1)[-1]
+            if body.rstrip().endswith("```"):
+                body = body.rstrip()[:-3]
+            text = body.strip()
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and parsed.get("action"):
+                return parsed
+        except json.JSONDecodeError:
+            pass
         start = text.find("{")
         if start < 0:
             return None
-        for end in range(len(text), start, -1):
-            try:
-                value = json.loads(text[start:end])
-            except json.JSONDecodeError:
-                continue
-            return value if isinstance(value, dict) else None
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) and parsed.get("action") else None
+
+    @classmethod
+    def _trace_action(cls, step: dict) -> dict | None:
+        for key in ("detail", "raw", "raw_full"):
+            parsed = cls._parse_action_payload(step.get(key))
+            if parsed is not None:
+                return parsed
         return None
 
     @classmethod
@@ -4863,6 +5366,16 @@ class BenchmarkRun:
                 return response, attempt
             except Exception as exc:
                 last_error = exc
+                # 4xx 是请求本身的问题（订阅失效 / key 失效 / 路径错），重试改变不了
+                # 任何事，只会把 0.2 秒的失败拖成几分钟。直接抛，让问题立刻可见。
+                # 实测：豆包 AgentPlan 订阅失效时每次 0.2s 返回 400，被 6 次退避
+                # 拖成约 195 秒/题，487 题判分空转 8.6 小时。
+                client_code = self._judge_client_error(exc)
+                if client_code is not None:
+                    raise RuntimeError(
+                        f"judge request rejected with HTTP {client_code} "
+                        f"(client error, not retryable): {exc}"
+                    ) from exc
                 if attempt >= JUDGE_RETRY_ATTEMPTS:
                     break
                 delay = self._judge_retry_delay(exc, attempt)
@@ -4888,6 +5401,29 @@ class BenchmarkRun:
             ) + JUDGE_REQUEST_INTERVAL_SECONDS
         if wait_seconds and self._cancel.wait(wait_seconds):
             raise RunCancelledError("cancelled while waiting for Judge rate limit")
+
+    @staticmethod
+    def _judge_client_error(error: BaseException) -> int | None:
+        """返回**不可重试**的 4xx 状态码（400/401/403/404/422…）；否则 None。
+
+        408（超时）与 429（限流）刻意排除：它们重试是对的，而且
+        _judge_retry_delay 读的 Retry-After 就是给它们用的。
+
+        request_json 把 urllib 的 HTTPError 包装成 RuntimeError，原异常挂在
+        __cause__ 上，所以这里沿异常链找带 .code 的那一层（与 _judge_retry_delay
+        找 Retry-After 的做法一致）。
+        """
+        current: BaseException | None = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            code = getattr(current, "code", None)
+            # 4xx 里有两类**必须**重试：429 限流、408 请求超时 —— 重试正是对症下药，
+            # 而且 _judge_retry_delay 读的 Retry-After 就是给它们用的。
+            if isinstance(code, int) and 400 <= code < 500 and code not in (408, 429):
+                return code
+            current = current.__cause__ or current.__context__
+        return None
 
     @staticmethod
     def _judge_retry_delay(error: Exception, attempt: int) -> float:
@@ -4959,11 +5495,13 @@ class BenchmarkRun:
                 "reason": "cloud_api_has_no_local_gpu_metrics",
             })
             return
+        if self.telemetry_source == "unavailable":
+            self._phase_done("gpu_metrics", {"status": "skipped", "source": "external", "reason": "remote_endpoint_has_no_local_telemetry"})
+            return
         agg = self._gpu_sampler.aggregate()
-        agg.update({
-            "status": "done" if agg.get("samples_count") else "unavailable",
-            "source": "manager" if self.vllm_api_url else "nvidia-smi",
-        })
+        agg["partial"] = False
+        agg["status"] = "done" if agg.get("samples_count") else "unavailable"
+        agg["source"] = self.telemetry_source
         self._phase_done("gpu_metrics", agg)
 
     def _phase_aggregate(self):
@@ -5062,6 +5600,7 @@ class BenchmarkRun:
             media_macro = _macro_metrics_from_counts(typed_retrieval_items, "media_retrieval_counts")
             image_macro = _macro_metrics_from_counts(typed_retrieval_items, "image_retrieval_counts")
             video_macro = _macro_metrics_from_counts(typed_retrieval_items, "video_retrieval_counts")
+            image_ranking = _mean_ranking_metrics(typed_retrieval_items)
             precision, recall, f1 = (
                 media_metrics["precision"], media_metrics["recall"], media_metrics["f1"])
             retrieval_metric_count = media_metrics["metric_count"]
@@ -5079,6 +5618,9 @@ class BenchmarkRun:
             image_metrics = {"precision": precision, "recall": recall, "f1": f1,
                              "metric_count": retrieval_metric_count}
             video_metrics = None
+            # These runs never recorded a candidate order, so R@K/MRR/mAP would
+            # have to invent one.  Report nothing and let the panel say so.
+            image_ranking = _mean_ranking_metrics(metric_items)
             legacy_values = {
                 metric: [item.get(f"retrieval_{metric}") for item in retrieval_items
                          if isinstance(item.get(f"retrieval_{metric}"), (int, float))]
@@ -5198,6 +5740,7 @@ class BenchmarkRun:
             "image_retrieval_recall_macro": round(image_macro["recall"], 3) if image_macro["recall"] is not None else None,
             "image_retrieval_f1_macro": round(image_macro["f1"], 3) if image_macro["f1"] is not None else None,
             "image_retrieval_metric_count": image_metrics["metric_count"] if image_metrics else None,
+            "image_ranking": image_ranking or None,
             "video_retrieval_precision_micro": round(video_metrics["precision"], 3) if video_metrics and video_metrics["precision"] is not None else None,
             "video_retrieval_recall_micro": round(video_metrics["recall"], 3) if video_metrics and video_metrics["recall"] is not None else None,
             "video_retrieval_f1_micro": round(video_metrics["f1"], 3) if video_metrics and video_metrics["f1"] is not None else None,
@@ -5371,7 +5914,7 @@ class OrchestratorRepository:
                        if isinstance(step, dict)
                        and str(step.get("stage") or step.get("type") or "") == "model"
                        and str(step.get("call_type") or "agent") in {"agent", "recovery"}]
-        if agent_steps and any(step.get("parse_status") is not None for step in agent_steps):
+        if agent_steps:
             hydrated["agent_stability"] = BenchmarkRun._agent_stability(hydrated)
         return hydrated
 
@@ -5739,6 +6282,41 @@ class OrchestratorRepository:
         return {"task_id": task_id, "run_ids": run_ids, "status": "running",
                 "vllm_target_id": target_id}
 
+    @staticmethod
+    def _run_list_entry(state: dict) -> dict:
+        """Return only fields needed by the run table and reuse-base index."""
+        summary = OrchestratorRepository._list_summary(state)
+        summary_keys = {
+            "total", "completed", "judge_valid_count", "judge_distribution",
+            "retrieval_recall_mean", "retrieval_recall_macro",
+            "media_retrieval_recall_macro", "answer_quality_mean",
+        }
+        result = {
+            key: state.get(key) for key in (
+                "run_id", "mode", "scope_source", "scope_id", "scope_name",
+                "album_id", "model_profile", "model_name", "model_source",
+                "model_backend", "qa_set", "qa_count", "status", "created_at",
+                "started_at", "finished_at", "failed_phase", "fatal_error",
+                "telemetry_source", "runtime_framework",
+            )
+            if state.get(key) is not None
+        }
+        result["item_count"] = len(state.get("items") or [])
+        result["summary"] = {key: summary.get(key) for key in summary_keys
+                             if summary.get(key) is not None}
+        qa_phase = (state.get("phases") or {}).get("qa_eval") or {}
+        if qa_phase:
+            result["phases"] = {"qa_eval": {
+                key: qa_phase.get(key) for key in ("status", "progress")
+                if qa_phase.get(key) is not None
+            }}
+        rejudge = state.get("rejudge") or {}
+        if rejudge:
+            result["rejudge"] = {key: rejudge.get(key) for key in (
+                "status", "completed", "total", "failed", "rejudge_id",
+            ) if rejudge.get(key) is not None}
+        return result
+
     def list_runs(self) -> list[dict]:
         with self.lock:
             runs = list(self.runs.items())
@@ -5881,6 +6459,12 @@ class OrchestratorRepository:
             # summary, but the potentially expensive work happens outside the
             # repository lock so list/progress requests remain responsive.
             result["summary"] = self._effective_summary(state)
+        live = result.get("telemetry_live")
+        if isinstance(live, dict):
+            samples_path = self.results_root / run_id / "gpu_samples.jsonl"
+            result["telemetry_live"] = copy.deepcopy(live)
+            self._attach_gpu_sample_history(result["telemetry_live"], samples_path)
+            self._publish_full_sample_phase_stats(result, result["telemetry_live"])
         return result
 
     def _compute_graph_quality_background(
@@ -5985,6 +6569,118 @@ class OrchestratorRepository:
                 "run_id": run_id,
                 "scope_id": scope_id,
             }
+
+    @staticmethod
+    def _series_stats(history: list, key: str) -> dict:
+        values = [float(point[key]) for point in history if isinstance(point.get(key), (int, float))]
+        if not values:
+            return {}
+        ordered = sorted(values)
+        count = len(ordered)
+        return {
+            "peak": ordered[-1],
+            "mean": round(sum(values) / count, 1),
+            "p50": ordered[count // 2],
+            "p95": ordered[min(count - 1, int(count * 0.95))],
+        }
+
+    @staticmethod
+    def _downsample_history(history: list, limit: int = 240) -> list:
+        count = len(history)
+        if count <= limit:
+            return history
+        chosen = {0, count - 1}
+        previous = history[0].get("phase")
+        for index, point in enumerate(history):
+            phase = point.get("phase")
+            if phase != previous:
+                chosen.add(index)
+                previous = phase
+        step = (count - 1) / (limit - 1)
+        for index in range(limit):
+            chosen.add(min(count - 1, int(round(index * step))))
+        if len(chosen) > limit:
+            chosen = {min(count - 1, int(round(index * step))) for index in range(limit)}
+            chosen.add(count - 1)
+        return [history[index] for index in sorted(chosen)]
+
+    @staticmethod
+    def _publish_full_sample_phase_stats(result: dict, live: dict) -> None:
+        stats = live.pop("_full_sample_stats", None) or {}
+        phases = result.get("phases")
+        if not isinstance(phases, dict) or not stats:
+            return
+        gpu = phases.get("gpu_metrics")
+        if not isinstance(gpu, dict):
+            return
+        phases = dict(phases)
+        gpu = dict(gpu)
+        for key, value in stats.items():
+            if value:
+                gpu[key] = value
+        phases["gpu_metrics"] = gpu
+        result["phases"] = phases
+
+    @staticmethod
+    def _attach_gpu_sample_history(live: dict, samples_path: Path) -> None:
+        history, latest, peak = [], {}, {}
+        try:
+            fields = (
+                "temperature_c", "cpu_temperature_c", "gpu_utilization_pct", "memory_used_mib",
+                "gpu_allocated_unified_memory_mib", "gpu_in_use_unified_memory_mib",
+                "model_process_memory_used_mib", "kv_cache_usage_pct",
+                "model_process_system_memory_used_mib",
+                "benchmark_process_memory_used_mib", "benchmark_process_gpu_memory_mib",
+                "kv_cache_used_tokens", "power_draw_w", "sm_clock_mhz",
+                "other_processes_memory_mib", "all_processes_memory_mib",
+                "system_memory_used_mib", "system_memory_total_mib",
+                "system_memory_delta_mib", "sentrix_stack_pss_mib", "product_stack_memory_mib",
+            )
+            lines = samples_path.read_text(encoding="utf-8").splitlines() if samples_path.is_file() else []
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                point = {k: item[k] for k in fields if item.get(k) is not None}
+                if point:
+                    history.append({
+                        "t": item.get("_t", time.time()),
+                        "phase": item.get("phase", "unassigned"),
+                        "phase_label": item.get("phase_label", "未分配阶段"),
+                        **point,
+                    })
+                    latest = point
+                    for key, value in point.items():
+                        if isinstance(value, (int, float)):
+                            peak[key] = max(float(peak.get(key, value)), float(value))
+            if history:
+                scopes = live.get("scopes") if isinstance(live.get("scopes"), dict) else {}
+                if scopes.get("system_memory"):
+                    latest.setdefault("system_memory_scope", scopes["system_memory"])
+                    peak.setdefault("system_memory_scope", scopes["system_memory"])
+                if scopes.get("benchmark_process_ram"):
+                    latest.setdefault("benchmark_process_memory_scope", scopes["benchmark_process_ram"])
+                    peak.setdefault("benchmark_process_memory_scope", scopes["benchmark_process_ram"])
+                live["_full_sample_stats"] = {
+                    "model_process_system_memory_used_mib": OrchestratorRepository._series_stats(
+                        history, "model_process_system_memory_used_mib"),
+                    "system_memory_delta_mib": OrchestratorRepository._series_stats(
+                        history, "system_memory_delta_mib"),
+                    "cpu_temperature_c": OrchestratorRepository._series_stats(
+                        history, "cpu_temperature_c"),
+                    "temperature_c": OrchestratorRepository._series_stats(
+                        history, "temperature_c"),
+                }
+                live["history"] = OrchestratorRepository._downsample_history(history, limit=240)
+                live["latest"] = latest
+                live["peak"] = peak
+                live["samples_count"] = max(int(live.get("samples_count") or 0), len(history))
+            elif not isinstance(live.get("history"), list):
+                live["history"] = []
+        except Exception:
+            if not isinstance(live.get("history"), list):
+                live["history"] = []
 
     def get_keyframe_analysis(self, run_id: str) -> dict:
         """Analyze whether video keyframes are useful for this complete run.
@@ -7160,6 +7856,18 @@ class OrchestratorRepository:
     def _effective_summary(cls, state: dict) -> dict:
         saved = dict(state.get("summary") or {})
         items = state.get("items") or []
+        if not saved.get("image_ranking"):
+            # R@K/MRR/mAP are a pure function of the recorded candidate order and
+            # the per-question GT sets, so runs summarised by an older build are
+            # derived here rather than rewritten on disk.  Runs that never stored
+            # an order stay empty and the panel says so instead of showing a zero.
+            saved["image_ranking"] = _mean_ranking_metrics(
+                [{"image_ranking": _ranking_from_item(item)}
+                 for item in items
+                 if isinstance(item, dict) and _retrieval_metric_eligible(item)]) or None
+        for item in items:
+            if isinstance(item, dict) and item.get("execution_trace"):
+                item["agent_stability"] = BenchmarkRun._agent_stability(item)
         recalls = [item.get("retrieval_recall") for item in items
                    if isinstance(item.get("retrieval_recall"), (int, float))]
         scores = [score for item in items
@@ -7219,6 +7927,7 @@ class OrchestratorRepository:
         for key, value in BenchmarkRun._capability_summary(items, state.get("phases") or {}).items():
             if (key == "retrieval_recall_mean"
                     or key.startswith(("retrieval_", "media_retrieval_", "image_retrieval_", "video_retrieval_"))
+                    or key.startswith("json_parse_")
                     or saved.get(key) is None):
                 saved[key] = value
         if saved.get("benchmark_e2e_latency_excluding_judge_ms") is None:
@@ -7597,6 +8306,7 @@ class OrchestratorRepository:
                 delete_scope_after_run=False, mode="resume", existing_scope_id=scope_id,
                 scope_reused_from_runs=old_state.get("scope_reused_from_runs") or [],
                 use_current_model=use_current_model, current_model_snapshot=current_snapshot,
+                runtime_framework=old_state.get("runtime_framework") or "generic",
                 use_cloud_model=False, resume_state=old_state,
             )
             self.runs[run_id] = run
@@ -8043,6 +8753,7 @@ class OrchestratorRepository:
         judge_api_key_suite = str(payload.get("judge_api_key") or resolved_judge_api_key)
         model_base_url = normalize_model_base_url(payload.get("model_base_url"))
         endpoint_model = str(payload.get("endpoint_model") or "").strip()
+        runtime_framework = detect_runtime_framework(payload.get("runtime_framework"), model_base_url)
         vllm_manager_url = normalize_service_url(payload.get("vllm_manager_url"))
         if BIG_MODEL_PROFILE_ID in models and CURRENT_MODEL_SELECTION in models:
             raise ValueError("big_model cannot be combined with current model")
@@ -8053,9 +8764,13 @@ class OrchestratorRepository:
         if managed_models and not vllm_manager_url:
             raise ValueError("选择模型注册表中的模型时必须提供模型管理器地址")
         if managed_models:
-            target_id, target = resolve_vllm_target(payload.get("vllm_target_id"))
-            vllm_api_url = vllm_manager_url or str(target["manager_url"])
-            vllm_model_base_url = model_base_url or str(target["model_base_url"])
+            target_id, target = resolve_vllm_target(
+                payload.get("vllm_target_id"),
+                manager_url=vllm_manager_url,
+                model_base_url=model_base_url,
+            )
+            vllm_api_url = vllm_manager_url or str(target.get("manager_url") or "")
+            vllm_model_base_url = model_base_url or str(target.get("model_base_url") or "")
         else:
             target_id = ""
             vllm_api_url = ""
@@ -8152,6 +8867,7 @@ class OrchestratorRepository:
                     scope_reused_from_runs=scope_reused_from_runs,
                     use_current_model=use_current_model,
                     current_model_snapshot=current_model_snapshot,
+                    runtime_framework=runtime_framework,
                     use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
                     qa_limit=qa_limit,
                 )
@@ -8187,17 +8903,51 @@ class OrchestratorRepository:
 # ---------------------------------------------------------------------------
 
 class OrchestratorHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
     repo: OrchestratorRepository
     web_root: Path
 
+    def end_headers(self):
+        # Every response has a known end even on clients/proxies with broken keep-alive.
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        super().end_headers()
+
+    def _write_body(self, body: bytes):
+        # 16KiB writes plus a 10s socket timeout aborted large run details
+        # after the first TCP window and left the hardware panel blank.
+        sock = self.connection
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        try:
+            sock.settimeout(120)
+            self.wfile.flush()
+            view = memoryview(body)
+            step = 256 * 1024
+            for offset in range(0, len(view), step):
+                sock.sendall(view[offset:offset + step])
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def _json(self, value, status: int = 200):
-        body = json.dumps(value, ensure_ascii=False).encode()
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        compressed = len(body) >= 1024 and "gzip" in self.headers.get("Accept-Encoding", "").lower()
+        if compressed:
+            body = gzip.compress(body, compresslevel=5)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def _payload(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -8206,6 +8956,9 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/current-model":
+                self._json({"error": "current-model requires POST"}, 405)
+                return
             if parsed.path == "/api/memory-spaces":
                 # 复用相册测评的相册下拉数据：转发 Sentrix 后端列表（新创建的在前）。
                 params = parse_qs(parsed.query)
@@ -8236,7 +8989,25 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                    "evidence_judge_enabled": EVIDENCE_JUDGE_ENABLED,
                    "judge_providers": _public_judge_providers(JUDGE_PROVIDERS),
                    "default_judge_provider_id": DEFAULT_JUDGE_PROVIDER_ID,
+                   "cloud_model_profile": {
+                       "id": BIG_MODEL_PROFILE_ID,
+                       "label": "big_model（云端 API）",
+                       "source": "cloud_api",
+                       "available": BIG_MODEL_ENABLED,
+                       "base_url": BIG_MODEL_BASE_URL,
+                       "model": BIG_MODEL_MODEL,
+                       "manager_required": False,
+                       "local_token_preflight": False,
+                       "local_gpu_metrics": False,
+                   },
                 })
+                return
+            if parsed.path == "/api/arbiter-status":
+                with RUNTIME_CONNECTION_CONFIG_LOCK:
+                    sentrix_url = str(
+                        RUNTIME_CONNECTION_CONFIG.get("sentrix_url") or DEFAULT_SENTRIX_URL
+                    ).rstrip("/")
+                self._json(arbiter_status_snapshot(sentrix_url))
                 return
             if parsed.path == "/api/manifests":
                 self._json({"manifests": self.repo.list_manifests()})
@@ -8289,8 +9060,28 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                         return
                 self._json({"error": "media not found"}, 404)
                 return
+            if parsed.path.startswith("/api/assets/") and parsed.path.endswith("/file"):
+                asset_id = unquote(parsed.path.removeprefix("/api/assets/").removesuffix("/file")).strip("/")
+                if not asset_id or "/" in asset_id:
+                    self._json({"error": "invalid asset id"}, 400)
+                    return
+                self._proxy_sentrix_asset(asset_id)
+                return
             if parsed.path == "/api/runs":
-                self._json({"runs": self.repo.list_runs()})
+                query = parse_qs(parsed.query)
+                try:
+                    page = max(1, int((query.get("page") or ["1"])[0]))
+                    page_size = max(1, min(100, int((query.get("page_size") or ["20"])[0])))
+                except ValueError as exc:
+                    raise ValueError("page and page_size must be integers") from exc
+                runs = self.repo.list_runs()
+                response = paginate_rows(runs, page, page_size)
+                response["active_count"] = sum(
+                    1 for run in runs
+                    if run.get("status") in {"running", "pending", "cancelling"}
+                    or (run.get("rejudge") or {}).get("status") == "running"
+                )
+                self._json(response)
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/graph-quality"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/graph-quality"))
@@ -8522,6 +9313,27 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"error": str(e)}, 400)
 
+    def _proxy_sentrix_asset(self, asset_id: str):
+        """Serve Sentrix media from the 8771 origin, preserving video ranges and MIME type."""
+        headers = {}
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers["Range"]
+        request = urllib.request.Request(
+            f"{DEFAULT_SENTRIX_URL.rstrip('/')}/api/assets/{quote(asset_id)}/file",
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                self.send_response(getattr(response, "status", HTTPStatus.OK))
+                for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"):
+                    value = response.headers.get(name)
+                    if value:
+                        self.send_header(name, value)
+                self.end_headers()
+                shutil.copyfileobj(response, self.wfile)
+        except urllib.error.HTTPError as exc:
+            self._json({"error": f"asset proxy failed: {exc.code}"}, exc.code)
+
     def _serve_file(self, path: Path):
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -8573,12 +9385,24 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                 pass
             return
         body = path.read_bytes()
+        compressed = (len(body) >= 1024
+                      and (ct.startswith("text/") or ct == "application/javascript")
+                      and "gzip" in self.headers.get("Accept-Encoding", "").lower())
+        if compressed:
+            body = gzip.compress(body, compresslevel=5)
         self.send_response(200)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        if relative := path.relative_to(self.web_root.resolve()).as_posix():
+            immutable = relative.startswith("assets/") and bool(re.search(r"-[A-Za-z0-9_-]{6,}\.", path.name))
+        else:
+            immutable = False
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if immutable else "no-cache")
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def log_message(self, *args):
         pass
