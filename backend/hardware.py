@@ -8,6 +8,7 @@ run_qa_benchmark 写入 run meta、QA Dashboard 展示。
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shutil
 import subprocess
 from datetime import datetime
@@ -49,6 +50,49 @@ def collect_gpu() -> list[dict]:
     return gpus
 
 
+_CPU_HWMON_NAMES = ("k10temp", "coretemp", "cpu_thermal", "cpu-thermal")
+_CPU_TEMP_LABELS = ("tctl", "tdie", "package id 0", "cpu")
+
+
+def read_cpu_temperature_c(root: Path | None = None) -> float | None:
+    """CPU package temperature in Celsius, or None when the sensor is absent.
+
+    153 is AMD k10temp Tctl. Intel boards expose coretemp. Orin may expose
+    cpu-thermal; tegrastats cpu@ remains the preferred source there.
+    NVMe, NIC and amdgpu sensors are ignored.
+    """
+    base = root or Path("/sys/class/hwmon")
+    if not base.is_dir():
+        return None
+    for hw in sorted(base.iterdir()):
+        try:
+            name = (hw / "name").read_text(encoding="ascii").strip().lower()
+        except OSError:
+            continue
+        if name not in _CPU_HWMON_NAMES:
+            continue
+        chosen = None
+        chosen_rank = 99
+        for sensor in sorted(hw.glob("temp*_input")):
+            label = ""
+            label_path = hw / sensor.name.replace("_input", "_label")
+            try:
+                label = label_path.read_text(encoding="ascii").strip().lower()
+            except OSError:
+                pass
+            try:
+                celsius = round(float(sensor.read_text(encoding="ascii").strip()) / 1000.0, 3)
+            except (OSError, ValueError):
+                continue
+            rank = _CPU_TEMP_LABELS.index(label) if label in _CPU_TEMP_LABELS else 50
+            if chosen is None or rank < chosen_rank:
+                chosen = celsius
+                chosen_rank = rank
+        if chosen is not None:
+            return chosen
+    return None
+
+
 def collect_cpu() -> dict:
     cores = None
     try:
@@ -63,7 +107,7 @@ def collect_cpu() -> dict:
                 load_avg = [round(float(x), 2) for x in parts[:3]]
     except Exception:
         pass
-    return {"cores": cores, "load_avg": load_avg}
+    return {"cores": cores, "load_avg": load_avg, "temperature_c": read_cpu_temperature_c()}
 
 
 def collect_memory() -> dict:

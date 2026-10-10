@@ -2020,6 +2020,8 @@ class AgentRuntime:
                                      if agent2_evidence_ledger is not None else 0)
             turn.steps.append({
                 "type": "tool", "tool": tool_name, "tool_call_id": call_id,
+                "step_id": call_id,
+                "internal_model_call_metrics": observation.get("_model_call_metrics") or [],
                 "arguments": args, "status": "ok" if decision.allowed else "denied",
                 "observation": observation, "error": decision.error,
                 "parent_step_id": last_model_step_id,
@@ -2760,11 +2762,15 @@ class AgentRuntime:
                     turn.l2_faithfulness_checked = True
                     turn.budget.record_model_step()
                     trusted = _confirmed_facts(task.as_dict()) + _trusted_facts(task.as_dict())
+                    judge_step_id = f"step_{debug_step_seq}" if self.include_debug else None
+                    if self.include_debug:
+                        debug_step_seq += 1
                     try:
                         judge_result = judge_faithfulness(
                             self.chat_fn, query=message, tool_results=task.tool_results,
                             answer=turn.final_answer, trusted_facts=trusted,
-                            messages=messages, include_debug=self.include_debug)
+                            messages=messages, include_debug=self.include_debug,
+                            step_id=judge_step_id)
                         if self.include_debug:
                             faithful, judge_problems, judge_debug = judge_result
                         else:
@@ -2773,9 +2779,7 @@ class AgentRuntime:
                                       "problems": list(judge_problems)}
                         if self.include_debug:
                             judge_step["debug"] = judge_debug
-                            step_id = f"step_{debug_step_seq}"
-                            debug_step_seq += 1
-                            judge_step["step_id"] = step_id
+                            judge_step["step_id"] = judge_step_id
                             judge_step["call_type"] = "faithfulness_judge"
                         turn.steps.append(judge_step)
                         if not faithful:
@@ -3142,6 +3146,8 @@ class AgentRuntime:
                                 error=decision.error, latency_s=latency)
             turn.steps.append({
                 "type": "tool", "tool": tool_name, "tool_call_id": tool_call_id,
+                "step_id": tool_call_id,
+                "internal_model_call_metrics": (result.observation or {}).get("_model_call_metrics") or [],
                 "arguments": arguments,
                 "status": result.status, "observation": result.observation,
                 "error": result.error, "latency_s": latency,

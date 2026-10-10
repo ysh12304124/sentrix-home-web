@@ -120,6 +120,7 @@ class VideoMemoryAdapter:
             })
 
             algorithm = self._keyframe_algorithm()
+            stage = "video-keyframe-extracting"
             if algorithm == "hybrid_webp":
                 return self._process_hybrid_webp(
                     asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started,
@@ -228,9 +229,17 @@ class VideoMemoryAdapter:
         except Exception as error:
             data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
             shutil.rmtree(data_root / "derived" / "video" / asset_id / "hybrid-webp" / "vlm-evidence", ignore_errors=True)
+            # Client errors (4xx) are deterministic — retrying won't help.
+            # Mark non-retryable so the batch worker's retry limit can retire them.
+            error_text = f"{type(error).__name__}: {error}"
+            non_retryable_markers = (
+                "400 Bad Request", "401 ", "403 ", "404 ", "422 ",
+                "exceeds the available context size", "exceed_context_size_error",
+            )
+            retryable = not any(marker in error_text for marker in non_retryable_markers)
             return store.update_asset(asset_id, "video-processing-failed", {
-                "video_stage": stage, "error_stage": stage, "error": f"{type(error).__name__}: {error}",
-                "retryable": True, "video_processing_seconds": round(time.perf_counter() - started, 3),
+                "video_stage": stage, "error_stage": stage, "error": error_text,
+                "retryable": retryable, "video_processing_seconds": round(time.perf_counter() - started, 3),
             })
 
     def _process_hybrid_webp(self, asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started):

@@ -28,7 +28,7 @@ class RuntimeProviderTests(unittest.TestCase):
     def test_generic_gpu_telemetry_does_not_claim_every_process_as_the_model(self):
         provider = HostNvidiaTelemetryProvider(endpoint_url="http://127.0.0.1:8100/v1")
         self.assertEqual(provider.process_memory()["status"], "unavailable")
-        self.assertEqual(provider.process_memory()["reason"], "model_process_identity_not_configured")
+        self.assertEqual(provider.process_memory()["reason"], "matching_model_process_not_found")
 
     @patch.object(VllmTelemetryProvider, "_query")
     def test_vllm_provider_separates_model_and_other_gpu_processes(self, query):

@@ -1,0 +1,31 @@
+# 123(Orin)部署关键信息 — L9分身 20260914
+
+## 核心选型（华哥已审阅，文档见 Jetson_Orin运行分析0914.md）
+- **123部署的是 llama-server，NOT TensorRT**
+- TensorRT是早期讹传，0912核实118跑的就是llama-server
+- Ollama失败根因: gemma4:12b思考模式吃光num_predict预算→content空→全链路失效
+- llama-server胜出: --reasoning off关闭思考，118同款验证
+
+## 123当前部署状态
+- llama-server: 192.168.1.123:8100 (--model gemma4-bf16.gguf --reasoning off --ctx-size 8192 --flash-attn on --jinja --threads 12)
+- API 8091: 指向 8100/v1
+- orchestrator 8771: 运行中
+- 评测: run ID 20260914-191017-album3-14, compact-10q (200-9启动)
+
+## 118同款启动参数（从118抄回）
+- llama-server路径: /home/orin/llama.cpp-bench/build/bin/llama-server
+- 依赖: ~/llama.cpp-bench/build/bin/*.so (15个)
+- 模型: ~/VLM/gemma4/weights/gguf/gemma4-bf16.gguf (8.7G)
+- 启动: --reasoning off --port 8100 --ctx-size 8192 --flash-attn on --jinja --threads 12
+
+## 分工
+- 200-8: 跑qwen3-vl-4b评测 + 盯123的8091稳定性
+- 200-9: 盯album3-14评测进度，出QA对比结果（目标对齐118基线1.20分）
+
+## 排障日志
+- llama-server日志: 看8100服务
+- API日志: sentrix-api-8091.log
+- Orchestrator日志: 8771端口
+
+## 时间线
+- ETA交付: 0915-0916出123完整展示成果（管线跑通+QA评测对比）
