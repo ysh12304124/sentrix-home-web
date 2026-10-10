@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "vite build"
+    "build": "vite build",
+    "test:bindings": "node --test test-template-bindings.mjs"
   },
   "dependencies": {
     "echarts": "^6.0.0",
