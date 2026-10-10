@@ -2411,7 +2411,9 @@ function pipelineMetricRows(phase = {}) {
 
 async function loadRuns(page = runPage.value.page || 1) {
   const payload = await api(`/api/runs?page=${Math.max(1, Number(page) || 1)}&page_size=${runPage.value.page_size}`, {
-    timeoutMs: 8000,
+    // Historical runs may need to read persisted summaries on a cold start.
+    // An 8s abort made the entire dashboard appear empty during that read.
+    timeoutMs: 30000,
     retries: 2,
   });
   runs.value = payload.runs || [];
@@ -2496,6 +2498,12 @@ async function loadActiveRun({ resetPage = false } = {}) {
   if (activeRunId.value !== runId) return;
   activeRun.value = payload;
   const fallbackSummary = effectiveRunSummary(activeRun.value);
+  // The detailed report already contains the run-bound metric snapshot.
+  // Show it immediately, even if unrelated QA/trace requests are slow.
+  graphQuality.value = fallbackSummary.graph_quality?.available
+    ? fallbackSummary.graph_quality
+    : (graphQualityCache.get(runId) || null);
+  void loadGraphQuality();
   runs.value = runs.value.map((run) => run.run_id === activeRunId.value
     ? { ...run, summary: { ...(run.summary || {}), ...fallbackSummary } }
     : run);
@@ -2511,7 +2519,6 @@ async function loadActiveRun({ resetPage = false } = {}) {
     Object.assign(reviewDrafts, reviewPayload.reviews || {});
   }
   await Promise.all([loadKeyframeAnalysis(runId), loadMemoryEffectiveness(runId), loadQaPage(resetPage ? 1 : qaPage.value.page)]);
-  loadGraphQuality();
 }
 function reviewFor(summary) {
   const qaId = String(summary?.qa_id || "");
@@ -2562,6 +2569,7 @@ function scrollToRunDetail() {
 function selectRun(run) {
   activeRunId.value = run.run_id;
   activeRun.value = { ...run };
+  graphQuality.value = graphQualityCache.get(run.run_id) || null;
   scrollToRunDetail();
   void loadActiveRun({ resetPage: true }).catch((err) => {
     if (activeRunId.value === run.run_id) error.value = err.message || "读取评测详情失败";
@@ -2930,21 +2938,26 @@ async function init() {
     judgeProviderId.value = runtimeConfig.judge_provider_id || config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
     connectionConfigState.value = "saved";
     connectionConfigMessage.value = "已读取配置文件";
-    const [, manifestPayload] = await Promise.all([
+    const [, manifestResult, runsResult] = await Promise.allSettled([
       loadJudgePrompts(),
       api("/api/manifests"),
       loadRuns(1),
       vllmManagerUrl.value.trim() ? loadProfiles() : Promise.resolve(),
     ]);
-    manifests.value = manifestPayload.manifests || [];
-    // Keep completed reports selected so graph/face/QA-type metrics remain visible.
+    if (manifestResult.status === "fulfilled") manifests.value = manifestResult.value.manifests || [];
+    const startupErrors = [];
+    if (manifestResult.status === "rejected") startupErrors.push(manifestResult.reason?.message || "读取数据集失败");
+    if (runsResult.status === "rejected") startupErrors.push(runsResult.reason?.message || "读取测评记录失败");
+    if (startupErrors.length) error.value = startupErrors.join("；");
+    // Keep the newest completed report selected, including runs with errors:
+    // their saved graph/face/QA metrics are still inspectable.
     current = runs.value.find((run) => ["running", "pending"].includes(run.status))
-      || runs.value.find((run) => run.status === "completed");
+      || runs.value.find((run) => ["completed", "completed_with_errors"].includes(run.status));
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
   if (modelEndpoint.value.trim()) void loadCurrentModel({ openPopover: false });
   if (current) {
     activeRunId.value = current.run_id;
-    void loadActiveRun({ resetPage: true });
+    void loadActiveRun({ resetPage: true }).catch((e) => { error.value = e.message || "读取测评详情失败"; });
     if (["running", "pending"].includes(current.status)) startPolling();
   }
   if (await loadArbiterStatus()) arbiterTimer = window.setInterval(loadArbiterStatus, 3000);
@@ -3311,7 +3324,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </article>
 </div>
-      <h3 class="result-heading">关键指标</h3>
+      <h3 class="result-heading">关键指标 <a class="graph-metric-shortcut" href="#graph-quality-section">查看人脸聚类、可验边、图效果与分题型 QA ↓</a></h3>
       <div class="phase-list key-metric-list">
         <article v-for="row in keyMetricRows(activeRun)" :key="row.label" class="phase-card key-metric-card">
           <div class="phase-title"><b>{{ row.label }}</b></div>
@@ -3541,7 +3554,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 </details>
-        <details class="phase-card result-phase-card aggregate-result-card">
+        <details open class="phase-card result-phase-card aggregate-result-card">
 <summary class="phase-title">
 <b>指标汇总</b>
 <span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.aggregate)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.aggregate)) }}</span>
@@ -3568,7 +3581,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 </div>
-<div class="token-distribution-section graph-quality-section">
+<div id="graph-quality-section" class="token-distribution-section graph-quality-section">
 <div class="phase-title">
 <b>可验证边指标（规则参考 / 独立 GT）</b>
 <span class="muted small" v-if="graphQuality?.available">{{ graphQuality.total_nodes }} 节点 · {{ graphQuality.total_edges }} 条边</span>
@@ -3607,7 +3620,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <p class="metric-calc-time">{{ graphQuality.face_clustering.identity_gallery_available ? '当前主指标使用身份库对齐：检测框通过评测开始前 seeded 的 confirmed identity cluster 映射到身份 ID，再与每张图的 GT 身份集合计算多脸 P/R/F1；未知脸不计为已知身份，GT 不反向参与聚类。' : (graphQuality.face_clustering.image_identity_link_available ? '当前主指标使用图像级身份关联：GT 只提供每张图的身份集合，因此多脸图通过“GT 身份集合是否相交”与“检测 cluster 集合是否相交”计算跨图同人链接；不会伪造逐框对应。严格单脸 pairwise 作为辅助诊断，资产缺失、零脸、多脸和未入簇分别统计。' : (Number(graphQuality.face_clustering.metric_definition_version) >= 2 ? '当前是严格单脸口径：只纳入单身份标注、恰好一张检测脸且已入簇的可对齐样本；多脸图不猜测框与身份的对应关系。' : '当前是旧版缓存指标：请重启 PhotoBench 后自动重算。')) }}</p>
 </div>
 <p v-if="graphQuality?.available" class="metric-calc-time">参考关系 {{ graphQuality.reference_edge_count ?? 0 }} 条 · 已构建可验证边 {{ graphQuality.evaluable_predicted_edge_count ?? 0 }} 条（{{ graphEvaluableEdgeSummary() }}） · 未纳入 P/R/F1 {{ graphQuality.unverifiable_edge_count ?? 0 }} 条。</p>
-<div v-if="graphQuality?.available && graphQuestionTypeRows().length" class="graph-quality-type-wrap">
+<div v-if="graphQuestionTypeRows().length" class="graph-quality-type-wrap">
 <div class="phase-title graph-quality-subtitle">
 <b>按问题类型的图记忆 QA 表现</b>
 <span class="muted small">全量题目分桶 · {{ effectiveRunSummary(activeRun).graph_qa_metric_scope === 'end_to_end_retrieval_chain' ? '整条检索链路' : '历史记录' }}</span>
