@@ -18,3 +18,17 @@ q_*.py
 /web-*.log
 .venv-text/
 .chrome-debug-profile/
+
+# Machine-local IDE settings and launchers.
+/.idea/
+/start.ps1
+/vllm.ps1
+
+# Local evaluation data and temporary runtime artifacts.
+/.tmp-*.json
+/.venv-face/
+/backend/model_cache/
+/replay_pid*.log
+/services/photobench/data/album3-max-video10/
+/services/photobench/frontend/pnpm-lock.yaml
+.pytest_cache/
