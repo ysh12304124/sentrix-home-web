@@ -16,6 +16,7 @@ import concurrent.futures
 import base64
 import gzip
 import hashlib
+import itertools
 from io import BytesIO
 import json
 import math
@@ -26,8 +27,11 @@ import re
 import shutil
 import shlex
 import socket
+import sqlite3
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -226,13 +230,20 @@ JUDGE_RETRY_BACKOFF_MAX_SECONDS = max(
 JUDGE_REQUEST_INTERVAL_SECONDS = max(
     0.0, float(os.environ.get("PHOTOBENCH_JUDGE_REQUEST_INTERVAL_SECONDS", "0.5"))
 )
+from backend.face_clustering import pairwise_metrics
+from backend.graph_memory.service import GraphMemoryService
 
 
 def _judge_thinking_kwargs(judge_url: str | None) -> dict:
-    """Disable cloud-provider reasoning while preserving local judge payloads."""
+    """Disable reasoning using the option understood by the active provider."""
     endpoint = str(judge_url or "").lower()
     if "volces.com" in endpoint or "volcengine.com" in endpoint:
         return {"thinking": {"type": "disabled"}}
+    # vLLM forwards this value to Qwen's chat template.  ``enable_thinking``
+    # at the payload top level is ignored by vLLM, which needlessly lets the
+    # judge consume a long reasoning response for every QA item.
+    if "vllm" in endpoint or ":8000" in endpoint:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
     return {"enable_thinking": False}
 
 
@@ -573,10 +584,13 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
-def atomic_json(path: Path, value) -> None:
+def atomic_json(path: Path, value, keep_backup: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if keep_backup and path.exists():
+        backup = path.with_suffix(path.suffix + ".bak")
+        path.replace(backup)
     tmp.replace(path)
 
 
@@ -912,10 +926,24 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, c
     if not turn_id or response.get("status") not in {"running", "pending"}:
         return response
 
+    def cancel_remote_turn() -> None:
+        # A timed-out turn must be cancelled at the API as well as locally.  Otherwise
+        # the backend keeps consuming a model slot after the QA worker has been freed.
+        try:
+            request_json(
+                f"{base_url.rstrip('/')}/api/assistant/turn/{quote(str(turn_id))}/cancel",
+                method="POST",
+                timeout=10,
+            )
+        except Exception:
+            # The original timeout is the useful error; cancellation is best effort.
+            pass
+
     deadline = time.monotonic() + timeout
     poll_url = f"{base_url.rstrip('/')}/api/assistant/turn/{quote(str(turn_id))}"
     while time.monotonic() < deadline:
         if cancelled is not None and cancelled():
+            cancel_remote_turn()
             raise RunCancelledError(f"run cancelled while waiting for assistant turn {turn_id}")
         state = request_json(poll_url, timeout=min(30, max(1, int(deadline - time.monotonic()))))
         status = str(state.get("status") or "").lower()
@@ -927,6 +955,7 @@ def wait_for_assistant_turn(base_url: str, response: dict, timeout: int = 900, c
         if status in {"failed", "error", "cancelled", "canceled"}:
             raise RuntimeError(f"assistant turn {turn_id} {status}: {state.get('error') or state.get('reason') or state}")
         time.sleep(0.5)
+    cancel_remote_turn()
     raise TimeoutError(f"assistant turn {turn_id} did not complete within {timeout}s")
 
 
@@ -1037,6 +1066,13 @@ def _extract_media_sets(result: dict) -> dict[str, list[str]]:
             add(observation.get("retrieved_asset_ids") or observation.get("asset_ids"), retrieved)
             add(observation.get("evidence_asset_ids"), evidence)
             add(observation.get("source_asset_ids"), evidence)
+            # search_memories performs the deterministic evidence selection
+            # used by the Agent. If the model answers from that result but
+            # omits a top-level delivery list, retain the tool-selected set
+            # as a delivery fallback. Explicit final delivery remains
+            # authoritative because this branch only runs while ids is empty.
+            if str(trace.get("tool") or "") == "search_memories" and not ids:
+                add(observation.get("selected_asset_ids"), ids)
             for row in (observation.get("items") or observation.get("rows") or []):
                 if isinstance(row, dict) and row.get("asset_id"):
                     evidence.append(str(row["asset_id"]))
@@ -1072,6 +1108,12 @@ def _extract_image_ids(result: dict) -> list[str]:
 
 def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
     """Build exact reusable album/model bases from persisted run-to-scope links."""
+    def run_model_profile(run: dict) -> str:
+        # The lightweight run-list API exposed model_name before model_profile
+        # was included. Keep old persisted records reusable after deleting a
+        # full-chain history row (and across mixed-version run metadata).
+        return str(run.get("model_profile") or run.get("model_name") or "").strip()
+
     runs_by_scope = {}
     for run in runs or []:
         if not isinstance(run, dict) or not run.get("scope_id"):
@@ -1087,13 +1129,13 @@ def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
                         reverse=True)
         source = linked[0] if linked else {}
         album_id = str(source.get("album_id") or "").strip()
-        model_candidates = sorted({str(run.get("model_profile") or "").strip()
-                                   for run in linked if run.get("model_profile")},
+        model_candidates = sorted({run_model_profile(run)
+                                   for run in linked if run_model_profile(run)},
                                   key=len, reverse=True)
         space_name = str(space.get("name") or "").lower()
         model_profile = next((model for model in model_candidates
                               if safe_slug(model).lower() in space_name), "")
-        model_profile = model_profile or str(source.get("model_profile") or "").strip()
+        model_profile = model_profile or run_model_profile(source)
         if not album_id or not model_profile:
             name = str(space.get("name") or "")
             match = re.search(r"PhotoBench-\d{8}-\d{6}-(?P<album>.+?)-(?P<model>(?:qwen|gemma|llama|phi|mistral|current|big_model)[^-]*)$", name, re.I)
@@ -1105,7 +1147,7 @@ def _build_reuse_bases(spaces: list[dict], runs: list[dict]) -> list[dict]:
         key = (album_id, model_profile)
         matching_runs = [run for run in linked
                          if str(run.get("album_id") or "") == album_id
-                         and str(run.get("model_profile") or "") == model_profile]
+                         and run_model_profile(run) == model_profile]
         group = groups.setdefault(key, {
             "base_id": f"{album_id}::{model_profile}",
             "album_id": album_id,
@@ -1140,7 +1182,24 @@ def _resolve_predicted_media(asset_ids: list[str], assets_by_name: dict) -> list
         if not match:
             continue
         file_name, asset = match
-        metadata = asset.get("metadata_json") if isinstance(asset.get("metadata_json"), dict) else {}
+        # Identity seed crops are internal face-clustering inputs, never QA
+        # retrieval/evidence media. Preserve ordinary user photos and video
+        # keyframes, which remain valid GT evidence for image questions.
+        if re.match(r"^faceid_[^/]+\.(?:jpe?g|png|webp)$", Path(file_name).name, re.IGNORECASE):
+            continue
+        metadata = asset.get("metadata_json") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        if isinstance(metadata, dict):
+            source_type = str(metadata.get("source_type") or "").strip().lower()
+            derived_kind = str(metadata.get("derived_kind") or asset.get("derived_kind") or "").strip().lower()
+            if source_type == "identity_seed" or derived_kind in {
+                "face_crop", "face_id_crop", "face_identity_crop", "face_reference",
+            }:
+                continue
         derived_kind = str(asset.get("derived_kind") or metadata.get("derived_kind") or "")
         parent_asset_id = str(asset.get("parent_asset_id") or metadata.get("parent_asset_id") or "")
         if derived_kind in {"video_keyframe", "video_keyframe_webp"} and parent_asset_id in assets_by_id:
@@ -1203,12 +1262,36 @@ def _metric_triplet(gt_keys: set[tuple[str, str]], predicted_keys: set[tuple[str
     }
 
 
-def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict]) -> dict[str, dict]:
+def _modality_metrics(gt_refs: list[dict], predicted_media: list[dict],
+                      assets_by_name: dict | None = None) -> dict[str, dict]:
+    """Compute typed media metrics with keyframes canonicalized to parent video.
+
+    A video keyframe is stored as an image asset for VLM inspection, but it is
+    evidence for the source video in a retrieval benchmark.  Treating its
+    storage type as the evaluation type made every video row report zero even
+    when the correct video's keyframe was in the returned set.
+    """
+    assets_by_id = {}
+    for rows in (assets_by_name or {}).values():
+        for asset in rows or []:
+            if isinstance(asset, dict) and asset.get("id"):
+                assets_by_id[str(asset["id"])] = asset
+
+    def metric_key(item: dict) -> tuple[str, str]:
+        asset = assets_by_id.get(str(item.get("asset_id") or ""))
+        if asset:
+            metadata = asset.get("metadata_json") if isinstance(asset.get("metadata_json"), dict) else {}
+            derived = str(asset.get("derived_kind") or metadata.get("derived_kind") or "").lower()
+            if derived in {"video_keyframe", "video_keyframe_webp"}:
+                parent_id = str(asset.get("parent_asset_id") or metadata.get("parent_asset_id") or "")
+                parent = assets_by_id.get(parent_id) or {}
+                parent_name = str(parent.get("file_name") or "")
+                if parent_name:
+                    return "video", Path(parent_name).stem.casefold()
+        return _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
+
     gt_keys = {_media_key(ref.get("media_type"), ref.get("media_id")) for ref in gt_refs}
-    predicted_keys = {
-        _media_key(item.get("media_type"), item.get("media_id") or item.get("file_name"))
-        for item in predicted_media
-    }
+    predicted_keys = {metric_key(item) for item in predicted_media}
     result = {"media": _metric_triplet(gt_keys, predicted_keys)}
     for media_type in ("image", "video"):
         result[media_type] = _metric_triplet(
@@ -1597,6 +1680,77 @@ def album_media_entries(manifest: dict) -> list[str]:
     return entries
 
 
+def _video_import_metadata(album_dir: Path, manifest: dict) -> dict[str, dict]:
+    """Return provenance metadata that should follow a benchmark video upload.
+
+    The benchmark video files are often transcoded clips without EXIF.  Their
+    ground-truth provenance is kept in ``video_source_provenance.json`` and in
+    the protected image metadata for the source frames.  If we upload the raw
+    clip without carrying this information into Sentrix, the video is stamped
+    with the upload time and the graph cannot connect a question such as
+    ``2017 年宜昌`` to the right video.  This is not evaluator leakage: it is
+    the same media provenance that a real importer would preserve from an
+    album export.
+    """
+    metadata_files = manifest.get("metadata_files") or {}
+    provenance_path = album_dir / str(metadata_files.get("video_source_provenance") or "")
+    if not provenance_path.is_file():
+        return {}
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+    image_metadata_by_name: dict[str, dict] = {}
+    image_path = album_dir / str(metadata_files.get("images") or "")
+    if image_path.is_file():
+        try:
+            for line in image_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                name = Path(str(row.get("filename") or row.get("image_id") or "")).name.lower()
+                if name:
+                    image_metadata_by_name[name] = row
+        except (OSError, ValueError, json.JSONDecodeError):
+            image_metadata_by_name = {}
+
+    by_video: dict[str, dict] = {}
+    for video in provenance.get("videos") or []:
+        if not isinstance(video, dict) or not video.get("video_id"):
+            continue
+        frames = [frame for frame in (video.get("images") or []) if isinstance(frame, dict)]
+        first = frames[0] if frames else {}
+        image_meta = image_metadata_by_name.get(
+            Path(str(first.get("filename") or first.get("image_id") or "")).name.lower(), {}
+        )
+        capture_time = first.get("capture_time") or image_meta.get("capture_datetime")
+        gps = image_meta.get("gps_coordinates") or {}
+        location = image_meta.get("readable_location") or ""
+        item = {
+            "source_media_id": str(video["video_id"]),
+            "source_media_title": str(video.get("title") or ""),
+            "source_media_image_ids": [str(frame.get("image_id") or "") for frame in frames if frame.get("image_id")],
+            "provenance_source": "photobench_video_source_provenance",
+        }
+        if capture_time:
+            item["captured_at"] = str(capture_time)
+        if location:
+            item["captured_location"] = str(location)
+        if gps.get("latitude") is not None and gps.get("longitude") is not None:
+            item["latitude"] = gps["latitude"]
+            item["longitude"] = gps["longitude"]
+        by_video[str(video["video_id"]).casefold()] = item
+
+    result: dict[str, dict] = {}
+    for relative in manifest.get("videos") or []:
+        path = Path(str(relative))
+        item = by_video.get(path.stem.casefold())
+        if item:
+            result[path.name] = item
+    return result
+
+
 def load_jsonl(path: Path) -> list[dict]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -1604,6 +1758,430 @@ def load_jsonl(path: Path) -> list[dict]:
         if line:
             rows.append(json.loads(line))
     return rows
+
+
+FACE_CLUSTERING_METRIC_VERSION = 4
+
+
+def _image_identity_link_metrics(
+    image_to_face_ids: dict,
+    predicted_clusters_by_file: dict[str, set[str]],
+    asset_names: set[str],
+) -> dict:
+    """Score identity links at image level when GT has no face boxes.
+
+    ``face_info_cn.json`` supplies identity *sets* per image, but it does not
+    say which detected box belongs to which identity.  Assigning every box to
+    every GT identity would inflate recall, while dropping all multi-face
+    images makes the face metric almost always unavailable.  The safe middle
+    ground is to evaluate an identity link between two images: a GT link
+    exists when their identity sets intersect, and a predicted link exists
+    when their detected cluster sets intersect.  This uses multi-face images
+    without inventing box-level correspondence.
+    """
+    samples = []
+    gt_asset_count = 0
+    detected_image_count = 0
+    clustered_image_count = 0
+    for name, labels in image_to_face_ids.items():
+        file_name = Path(str(name)).name.lower()
+        if file_name not in asset_names:
+            continue
+        if not isinstance(labels, list) or not labels:
+            continue
+        gt_asset_count += 1
+        clusters = {
+            str(cluster_id)
+            for cluster_id in (predicted_clusters_by_file.get(file_name) or set())
+            if cluster_id
+        }
+        # The caller builds this map from verified face rows.  An empty set is
+        # retained: it is a real no-cluster observation and contributes a false
+        # negative for a same-identity image pair rather than disappearing from
+        # the denominator.
+        if file_name in predicted_clusters_by_file:
+            detected_image_count += 1
+            if clusters:
+                clustered_image_count += 1
+            samples.append((set(map(str, labels)), clusters))
+
+    counts = {
+        "true_positive": 0,
+        "false_positive": 0,
+        "false_negative": 0,
+        "true_negative": 0,
+    }
+    for left, right in itertools.combinations(samples, 2):
+        gt_same = bool(left[0] & right[0])
+        predicted_same = bool(left[1] & right[1])
+        if gt_same and predicted_same:
+            counts["true_positive"] += 1
+        elif not gt_same and predicted_same:
+            counts["false_positive"] += 1
+        elif gt_same and not predicted_same:
+            counts["false_negative"] += 1
+        else:
+            counts["true_negative"] += 1
+    p_denominator = counts["true_positive"] + counts["false_positive"]
+    r_denominator = counts["true_positive"] + counts["false_negative"]
+    precision = counts["true_positive"] / p_denominator if p_denominator else 0.0
+    recall = counts["true_positive"] / r_denominator if r_denominator else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "available": len(samples) >= 2 and r_denominator > 0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "true_positive": counts["true_positive"],
+        "false_positive": counts["false_positive"],
+        "false_negative": counts["false_negative"],
+        "true_negative": counts["true_negative"],
+        "evaluable_pair_count": len(samples) * (len(samples) - 1) // 2,
+        "evaluable_image_count": len(samples),
+        "gt_asset_count": gt_asset_count,
+        "detected_image_count": detected_image_count,
+        "clustered_image_count": clustered_image_count,
+    }
+
+
+def _identity_gallery_metrics(
+    image_to_face_ids: dict,
+    predicted_identities_by_file: dict[str, set[str]],
+    asset_names: set[str],
+) -> dict:
+    """Evaluate multi-face identification against seeded identity clusters.
+
+    The benchmark seeds one confirmed face cluster per known identity before
+    album processing.  A detected face assigned to one of those confirmed
+    clusters is therefore an identity-gallery prediction.  Because the GT
+    sidecar provides an identity set per image (not face boxes), score the
+    deduplicated identity sets per image: this supports multi-person photos
+    without claiming that an arbitrary detection box is a particular GT box.
+    """
+    samples = []
+    gt_asset_count = 0
+    identified_image_count = 0
+    for name, labels in image_to_face_ids.items():
+        file_name = Path(str(name)).name.lower()
+        if file_name not in asset_names:
+            continue
+        if not isinstance(labels, list) or not labels:
+            continue
+        gt_asset_count += 1
+        predicted = {
+            str(identity)
+            for identity in (predicted_identities_by_file.get(file_name) or set())
+            if identity
+        }
+        if predicted:
+            identified_image_count += 1
+        # The map is populated for every image with verified detections, even
+        # when all detected faces are unknown/unclustered.  Retaining an empty
+        # prediction makes missed known identities count as false negatives.
+        if file_name in predicted_identities_by_file:
+            samples.append((set(map(str, labels)), predicted))
+
+    true_positive = sum(len(gt & predicted) for gt, predicted in samples)
+    false_positive = sum(len(predicted - gt) for gt, predicted in samples)
+    false_negative = sum(len(gt - predicted) for gt, predicted in samples)
+    precision_denominator = true_positive + false_positive
+    recall_denominator = true_positive + false_negative
+    precision = true_positive / precision_denominator if precision_denominator else 0.0
+    recall = true_positive / recall_denominator if recall_denominator else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "available": bool(samples) and recall_denominator > 0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+        "evaluable_image_count": len(samples),
+        "gt_asset_count": gt_asset_count,
+        "identified_image_count": identified_image_count,
+    }
+
+
+def benchmark_face_clustering_quality(scope_id: str, album_dir: Path) -> dict:
+    """Evaluate clustering only inside PhotoBench, where identity GT is allowed.
+
+    The production API deliberately never reads benchmark sidecars.  Keeping
+    this calculation here prevents evaluation labels leaking into retrieval,
+    while making the score reproducible for full and reused benchmark runs.
+    """
+    truth_path = album_dir / "identity" / "face_info_cn.json"
+    if not truth_path.is_file():
+        return {
+            "available": False,
+            "reason": "benchmark identity GT not found",
+            "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        }
+    try:
+        image_to_face_ids = (json.loads(truth_path.read_text(encoding="utf-8"))
+                             .get("image_to_face_ids") or {})
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "available": False,
+            "reason": f"benchmark identity GT could not be read: {exc}",
+            "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        }
+
+    # An image tagged with one identity is not necessarily a single-face image.
+    # We only score an instance when there is exactly one *verified* detected
+    # face.  ``uncertain`` candidates are deliberately retained by production
+    # as visual evidence, but cannot seed an identity cluster; allowing one of
+    # those candidates to turn a single-person image into a "multi face" image
+    # made the clustering score depend on detector noise rather than clustering
+    # quality.  The GT has no face boxes, so multi-face images remain a
+    # detection-coverage diagnostic, not speculative pairwise identity labels.
+    truth_by_name = {
+        Path(str(name)).name.lower(): str(face_ids[0])
+        for name, face_ids in image_to_face_ids.items()
+        if isinstance(face_ids, list) and len(face_ids) == 1
+    }
+    gt_multi_identity_image_count = sum(
+        1 for face_ids in image_to_face_ids.values()
+        if isinstance(face_ids, list) and len(face_ids) != 1
+    )
+    db_path = REPOSITORY_ROOT / "data" / "sentrix.db"
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            asset_rows = conn.execute(
+                "SELECT file_name FROM assets WHERE scope_id = ?", (scope_id,),
+            ).fetchall()
+            face_columns = {
+                str(item[1]).lower()
+                for item in conn.execute("PRAGMA table_info(face_instances)").fetchall()
+            }
+            validity_sql = "fi.validity" if "validity" in face_columns else "'verified'"
+            rows = conn.execute(
+                "SELECT fi.id, fi.cluster_id, a.file_name, " + validity_sql + " AS validity "
+                "FROM face_instances fi JOIN assets a ON a.id = fi.asset_id "
+                "WHERE a.scope_id = ?", (scope_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {
+            "available": False,
+            "reason": f"face clustering data could not be read: {exc}",
+            "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        }
+
+    raw_by_file: dict[str, list[tuple[str, str | None]]] = {}
+    verified_by_file: dict[str, list[tuple[str, str | None]]] = {}
+    asset_names = {Path(str(row[0])).name.lower() for row in asset_rows}
+    for face_id, cluster_id, file_name, validity in rows:
+        item = (str(face_id), str(cluster_id) if cluster_id else None)
+        normalized_name = Path(str(file_name)).name.lower()
+        raw_by_file.setdefault(normalized_name, []).append(item)
+        if str(validity or "").strip().lower() == "verified":
+            verified_by_file.setdefault(normalized_name, []).append(item)
+    # Identity seed assets are the independent gallery: faceid_N.jpg is
+    # uploaded before album photos and belongs to the confirmed cluster for
+    # GT identity N.  Only these confirmed seed clusters are used for the
+    # identification metric; pending clusters remain ordinary clustering
+    # diagnostics and cannot be treated as named identities.
+    seed_cluster_by_identity: dict[str, str] = {}
+    # Seed crops are intentionally stored as ``uncertain`` evidence because
+    # they are reference inputs rather than album detections, so inspect the
+    # raw rows for the gallery mapping.  Album predictions below still require
+    # verified detections.
+    for file_name, detected in raw_by_file.items():
+        match = re.match(r"^faceid_([^./]+)\.(?:jpe?g|png|webp)$", file_name, re.IGNORECASE)
+        if not match:
+            continue
+        cluster_ids = {cluster_id for _face_id, cluster_id in detected if cluster_id}
+        if len(cluster_ids) == 1:
+            seed_cluster_by_identity[match.group(1)] = next(iter(cluster_ids))
+    identity_by_seed_cluster = {
+        cluster_id: identity
+        for identity, cluster_id in seed_cluster_by_identity.items()
+    }
+    predicted_identities_by_file = {
+        file_name: {
+            identity_by_seed_cluster[cluster_id]
+            for _face_id, cluster_id in detected
+            if cluster_id in identity_by_seed_cluster
+        }
+        for file_name, detected in verified_by_file.items()
+    }
+    # Keep every GT image that has a verified detection, including multi-face
+    # images and faces that have not received a cluster id.  This is used by
+    # the image-level metric below; the strict single-face metric remains
+    # unchanged and is reported as a diagnostic.
+    verified_clusters_by_file = {
+        file_name: {
+            cluster_id for _face_id, cluster_id in detected if cluster_id
+        }
+        for file_name, detected in verified_by_file.items()
+    }
+    predicted, truth = {}, {}
+    excluded_ambiguous = 0
+    gt_single_count = len(truth_by_name)
+    # Asset coverage must be measured from the asset inventory, not face rows:
+    # otherwise an in-scope image with zero detections is incorrectly called
+    # absent from the album.
+    asset_name_coverage_count = sum(1 for file_name in truth_by_name if file_name in asset_names)
+    detected_single_face_count = 0
+    detected_zero_face_count = 0
+    detected_multiple_faces_count = 0
+    raw_detected_single_face_count = 0
+    raw_detected_zero_face_count = 0
+    raw_detected_multiple_faces_count = 0
+    single_face_without_cluster_count = 0
+    for file_name, label in truth_by_name.items():
+        raw_detected = raw_by_file.get(file_name) or []
+        detected = verified_by_file.get(file_name) or []
+        if file_name in asset_names and not raw_detected:
+            raw_detected_zero_face_count += 1
+        elif file_name in asset_names and len(raw_detected) == 1:
+            raw_detected_single_face_count += 1
+        elif file_name in asset_names and len(raw_detected) > 1:
+            raw_detected_multiple_faces_count += 1
+        if file_name in asset_names and not detected:
+            detected_zero_face_count += 1
+        elif file_name in asset_names and len(detected) == 1:
+            detected_single_face_count += 1
+        elif file_name in asset_names and len(detected) > 1:
+            detected_multiple_faces_count += 1
+        if len(detected) != 1:
+            excluded_ambiguous += 1
+            continue
+        if not detected[0][1]:
+            single_face_without_cluster_count += 1
+            excluded_ambiguous += 1
+            continue
+        face_id, cluster_id = detected[0]
+        predicted[face_id] = cluster_id
+        truth[face_id] = label
+    diagnostics = {
+        "metric_definition_version": FACE_CLUSTERING_METRIC_VERSION,
+        "gt_single_image_count": gt_single_count,
+        "asset_name_coverage_count": asset_name_coverage_count,
+        "asset_name_coverage_rate": asset_name_coverage_count / gt_single_count if gt_single_count else 0.0,
+        "gt_assets_missing_from_scope_count": max(0, gt_single_count - asset_name_coverage_count),
+        "strict_metric_face_source": "verified detections only; exactly one face per single-identity GT image",
+        "detected_zero_face_count": detected_zero_face_count,
+        "detected_single_face_count": detected_single_face_count,
+        "detected_multiple_faces_count": detected_multiple_faces_count,
+        "raw_detected_zero_face_count": raw_detected_zero_face_count,
+        "raw_detected_single_face_count": raw_detected_single_face_count,
+        "raw_detected_multiple_faces_count": raw_detected_multiple_faces_count,
+        "single_face_without_cluster_count": single_face_without_cluster_count,
+        "evaluable_face_count": len(predicted),
+        "single_face_detection_of_present_assets_rate": (
+            detected_single_face_count / asset_name_coverage_count if asset_name_coverage_count else 0.0
+        ),
+        "single_face_clustered_rate": (
+            len(predicted) / detected_single_face_count if detected_single_face_count else 0.0
+        ),
+        "gt_multi_identity_image_count": gt_multi_identity_image_count,
+        # Backward-compatible field: this historically counted GT images with
+        # multiple identity labels, not detector outputs.
+        "excluded_multi_face": gt_multi_identity_image_count,
+    }
+    image_links = _image_identity_link_metrics(
+        image_to_face_ids,
+        verified_clusters_by_file,
+        asset_names,
+    )
+    gallery = _identity_gallery_metrics(
+        image_to_face_ids,
+        predicted_identities_by_file,
+        asset_names,
+    )
+    diagnostics.update({
+        "identity_gallery_metric": "verified detections assigned to seeded confirmed identity clusters vs GT identity set",
+        "identity_gallery_available": gallery["available"],
+        "identity_gallery_identity_count": len(seed_cluster_by_identity),
+        "identity_gallery_precision": gallery["precision"],
+        "identity_gallery_recall": gallery["recall"],
+        "identity_gallery_f1": gallery["f1"],
+        "identity_gallery_true_positive_count": gallery["true_positive"],
+        "identity_gallery_false_positive_count": gallery["false_positive"],
+        "identity_gallery_false_negative_count": gallery["false_negative"],
+        "identity_gallery_evaluable_image_count": gallery["evaluable_image_count"],
+        "identity_gallery_gt_asset_count": gallery["gt_asset_count"],
+        "identity_gallery_identified_image_count": gallery["identified_image_count"],
+        "identity_gallery_identified_image_rate": (
+            gallery["identified_image_count"] / gallery["evaluable_image_count"]
+            if gallery["evaluable_image_count"] else 0.0
+        ),
+        "image_identity_link_metric": "GT identity-set intersection vs detected cluster-set intersection",
+        "image_identity_link_available": image_links["available"],
+        "image_identity_link_precision": image_links["precision"],
+        "image_identity_link_recall": image_links["recall"],
+        "image_identity_link_f1": image_links["f1"],
+        "image_identity_link_true_positive_count": image_links["true_positive"],
+        "image_identity_link_false_positive_count": image_links["false_positive"],
+        "image_identity_link_false_negative_count": image_links["false_negative"],
+        "image_identity_link_evaluable_pair_count": image_links["evaluable_pair_count"],
+        "image_identity_link_evaluable_image_count": image_links["evaluable_image_count"],
+        "image_identity_link_gt_asset_count": image_links["gt_asset_count"],
+        "image_identity_link_detected_image_count": image_links["detected_image_count"],
+        "image_identity_link_clustered_image_count": image_links["clustered_image_count"],
+        "image_identity_link_asset_coverage_rate": (
+            image_links["gt_asset_count"] / len(image_to_face_ids)
+            if image_to_face_ids else 0.0
+        ),
+        "image_identity_link_clustered_image_rate": (
+            image_links["clustered_image_count"] / image_links["detected_image_count"]
+            if image_links["detected_image_count"] else 0.0
+        ),
+    })
+    if len(predicted) < 2:
+        return {
+            # The inclusive image-level metric is still valid when strict
+            # face-pair scoring has too few unambiguous samples.
+            "available": gallery["available"] or image_links["available"],
+            "reason": "fewer than two unambiguous labelled face instances",
+            "excluded_ambiguous": excluded_ambiguous,
+            **diagnostics,
+            "detected_single_face_rate": detected_single_face_count / gt_single_count if gt_single_count else 0.0,
+        }
+    counts = pairwise_metrics(predicted, truth)
+    false_merge_denominator = counts["true_positive"] + counts["false_positive"]
+    return {
+        "available": True,
+        "ground_truth_source": str(truth_path.relative_to(album_dir)),
+        "same_person_pair_precision": counts["precision"],
+        "same_person_pair_recall": counts["recall"],
+        "same_person_pair_f1": counts["f1"],
+        "false_merge_rate": (
+            counts["false_positive"] / false_merge_denominator
+            if false_merge_denominator else 0.0
+        ),
+        "true_positive_pair_count": counts["true_positive"],
+        "false_positive_pair_count": counts["false_positive"],
+        "false_negative_pair_count": counts["false_negative"],
+        "evaluable_pair_count": len(predicted) * (len(predicted) - 1) // 2,
+        "evaluable_face_count": len(predicted),
+        "excluded_ambiguous": excluded_ambiguous,
+        **diagnostics,
+        "detected_single_face_rate": detected_single_face_count / gt_single_count if gt_single_count else 0.0,
+    }
+
+
+def benchmark_graph_quality_snapshot(scope_id: str, album_dir: Path) -> dict:
+    """Build an isolated, disposable projection for a run-quality snapshot."""
+    if not scope_id:
+        return {"available": False, "reason": "run has no memory scope"}
+    db_path = REPOSITORY_ROOT / "data" / "sentrix.db"
+    with tempfile.TemporaryDirectory(prefix="photobench-graph-quality-") as temp_dir:
+        graph_path = Path(temp_dir) / "graph_memory.db"
+        service = GraphMemoryService(db_path=db_path, graph_path=graph_path)
+        built = service.build(scope_id=scope_id, include_images=True, enable_causal_edges=False)
+        if not built.get("ok"):
+            return {"available": False, "scope_id": scope_id,
+                    "reason": str(built.get("error") or "graph projection could not be built")}
+        quality = service.quality(scope_id=scope_id)
+    quality["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+    quality["face_clustering_metric_version"] = FACE_CLUSTERING_METRIC_VERSION
+    quality["snapshot_source"] = "photobench_isolated_scope_projection"
+    return quality
 
 
 def load_task_action_policy() -> dict[tuple[str, str], str]:
@@ -1685,6 +2263,37 @@ def dataset_integrity(album_dir: Path, manifest: dict, qa_set: str) -> dict:
 # GPU Sampler
 # ---------------------------------------------------------------------------
 
+def local_nvidia_smi_stats() -> dict:
+    """Read host GPU telemetry for an external WSL vLLM endpoint."""
+    query = "index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm"
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unavailable", "reason": "nvidia-smi not found"}
+    if completed.returncode != 0:
+        return {"status": "unavailable", "reason": (completed.stderr or "nvidia-smi failed").strip()}
+    gpus = []
+    for line in completed.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) < 8:
+            continue
+        def number(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        gpus.append({
+            "index": int(number(fields[0]) or 0), "name": fields[1],
+            "temperature_c": number(fields[2]), "gpu_utilization_pct": number(fields[3]),
+            "memory_used_mib": number(fields[4]), "memory_total_mib": number(fields[5]),
+            "power_draw_w": number(fields[6]), "sm_clock_mhz": number(fields[7]),
+            "telemetry_source": "nvidia-smi",
+        })
+    return {"status": "available" if gpus else "unavailable", "data": {"gpus": gpus}}
+
 class GpuSampler:
     """Poll device and managed-model memory at intervals."""
 
@@ -1714,8 +2323,11 @@ class GpuSampler:
                 memory_result = self.provider.process_memory()
                 system_result = self.provider.system_memory() if hasattr(self.provider, "system_memory") else {}
                 if gpu_result.get("status") != "available":
-                    self._stop.wait(self.interval)
-                    continue
+                    gpu_result = local_nvidia_smi_stats()
+                    memory_result = {"status": "unavailable", "data": {}}
+                    if gpu_result.get("status") != "available":
+                        self._stop.wait(self.interval)
+                        continue
                 data = gpu_result.get("data") or {}
                 # Keep auxiliary process/system data even when model PID
                 # attribution is unavailable; never turn a missing model
@@ -1905,7 +2517,8 @@ class BenchmarkRun:
                  scope_reused_from_runs: list | None = None,
                  use_current_model: bool = False, current_model_snapshot: dict | None = None,
                  runtime_framework: str = "generic",
-                 use_cloud_model: bool = False, resume_state: dict | None = None):
+                 use_cloud_model: bool = False, resume_state: dict | None = None,
+                 qa_limit: int | None = None):
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
         if mode == "reuse" and not existing_scope_id:
@@ -1946,9 +2559,14 @@ class BenchmarkRun:
 
         album_base = BENCHMARK_DATA_ROOT / album_id
         self.album_dir = album_base
-        self.qa_rows = apply_task_action_defaults(
+        all_qa_rows = apply_task_action_defaults(
             load_jsonl(album_base / manifest["qa_sets"][qa_set]), album_id, qa_set,
         )
+        if qa_limit is not None:
+            limit = max(1, min(int(qa_limit), len(all_qa_rows)))
+            self.qa_rows = all_qa_rows[:limit]
+        else:
+            self.qa_rows = all_qa_rows
         self.input_integrity = dataset_integrity(album_base, manifest, qa_set)
 
         self.state: dict = {
@@ -1966,8 +2584,18 @@ class BenchmarkRun:
                 "vllm"
             ),
             "model_name": BIG_MODEL_MODEL if self.use_cloud_model else model_profile,
+            # Persist the exact ID sent to the OpenAI-compatible endpoint.
+            # Current-model runs know it before starting; managed profiles
+            # begin with their profile ID and are overwritten after deploy.
+            "served_model_name": (
+                self.current_model_snapshot.get("served_model_name")
+                if self.use_current_model else
+                BIG_MODEL_MODEL if self.use_cloud_model else model_profile
+            ),
             "current_model_snapshot": self.current_model_snapshot or None,
             "qa_set": qa_set,
+            "qa_limit": qa_limit,
+            "qa_source_count": len(all_qa_rows),
             "judge_model": judge_model,
             "judge_url": self.judge_url,
             "delete_scope_after_run": self.delete_scope_after_run,
@@ -2021,6 +2649,11 @@ class BenchmarkRun:
                 "model_source": self.state["model_source"],
                 "model_backend": self.state["model_backend"],
                 "model_name": self.state["model_name"],
+                "served_model_name": (
+                    self.current_model_snapshot.get("served_model_name")
+                    if self.current_model_snapshot
+                    else restored.get("served_model_name") or self.state.get("served_model_name")
+                ),
                 "current_model_snapshot": self.current_model_snapshot or restored.get("current_model_snapshot"),
                 "judge_model": judge_model,
                 "judge_url": self.judge_url,
@@ -2214,10 +2847,11 @@ class BenchmarkRun:
         now = time.monotonic()
         if now - float(getattr(self, "_gpu_metrics_publish_at", 0.0) or 0.0) < 2.0:
             return
-        if not self._gpu_sampler.samples:
+        sampler = getattr(self, "_gpu_sampler", None)
+        if sampler is None or not sampler.samples:
             return
         self._gpu_metrics_publish_at = now
-        partial = self._gpu_sampler.aggregate()
+        partial = sampler.aggregate()
         if not partial.get("samples_count"):
             return
         partial.update({
@@ -2280,6 +2914,137 @@ class BenchmarkRun:
             if phase not in self.state["phases"]:
                 self.state["phases"][phase] = {"status": "pending"}
             self.state["phases"][phase][key] = value
+
+    def _refresh_live_metric_preview(self) -> None:
+        """Update only cheap per-item metrics while a run is in progress.
+
+        Do not walk retrieval/tool traces here: the dashboard polls frequently
+        and traces can be very large. The final aggregate remains authoritative.
+        """
+        items = self.state.get("items") or []
+        metric_items = [item for item in items if isinstance(item, dict)
+                        and _retrieval_metric_eligible(item)]
+        typed_items = [item for item in metric_items
+                       if "retrieval_media_refs" in item]
+        # Keep the live preview on the same typed-media calculation as the
+        # final aggregate.  Previously this method only wrote the micro
+        # counters, while the UI renders the macro fields; because the live
+        # /api/runs response intentionally omits items, the frontend had no
+        # fallback and displayed '-' for Recall/F1 during a run.
+        if typed_items:
+            media_micro = _micro_metrics_from_counts(typed_items, "media_retrieval_counts")
+            image_micro = _micro_metrics_from_counts(typed_items, "image_retrieval_counts")
+            video_micro = _micro_metrics_from_counts(typed_items, "video_retrieval_counts")
+            media_macro = _macro_metrics_from_counts(typed_items, "media_retrieval_counts")
+            image_macro = _macro_metrics_from_counts(typed_items, "image_retrieval_counts")
+            video_macro = _macro_metrics_from_counts(typed_items, "video_retrieval_counts")
+        else:
+            legacy_items = [item for item in metric_items if item.get("retrieval_image_ids")]
+            # Older/in-flight items can already have the authoritative count
+            # contract without carrying the legacy image-id arrays.  Keep
+            # those records visible in the live dashboard too; otherwise the
+            # final aggregate has numbers while the running view stays '-'.
+            count_items = [item for item in metric_items
+                           if isinstance(item.get("media_retrieval_counts"), dict)
+                           and int((item.get("media_retrieval_counts") or {}).get("gt") or 0) > 0]
+            if not legacy_items and count_items:
+                media_micro = _micro_metrics_from_counts(count_items, "media_retrieval_counts")
+                image_micro = _micro_metrics_from_counts(count_items, "image_retrieval_counts")
+                video_micro = _micro_metrics_from_counts(count_items, "video_retrieval_counts")
+                media_macro = _macro_metrics_from_counts(count_items, "media_retrieval_counts")
+                image_macro = _macro_metrics_from_counts(count_items, "image_retrieval_counts")
+                video_macro = _macro_metrics_from_counts(count_items, "video_retrieval_counts")
+                legacy_items = count_items
+            else:
+                values = [item.get("retrieval_recall") for item in legacy_items
+                          if isinstance(item.get("retrieval_recall"), (int, float))]
+                precision_values = [item.get("retrieval_precision") for item in legacy_items
+                                    if isinstance(item.get("retrieval_precision"), (int, float))]
+                f1_values = [item.get("retrieval_f1") for item in legacy_items
+                              if isinstance(item.get("retrieval_f1"), (int, float))]
+                gt_total = sum(len(item.get("retrieval_image_ids") or []) for item in legacy_items)
+                matched_total = sum(len(item.get("retrieved_matched_file_names")
+                                     or item.get("matched_file_names") or []) for item in legacy_items)
+                predicted_total = sum(len(item.get("retrieved_file_names")
+                                       or item.get("predicted_file_names") or []) for item in legacy_items)
+                legacy_micro = {
+                    "precision": matched_total / predicted_total if predicted_total else (0.0 if gt_total else None),
+                    "recall": matched_total / gt_total if gt_total else None,
+                    "f1": None,
+                    "metric_count": len(legacy_items),
+                }
+                if legacy_micro["precision"] is not None and legacy_micro["recall"] is not None and legacy_micro["precision"] + legacy_micro["recall"]:
+                    legacy_micro["f1"] = 2 * legacy_micro["precision"] * legacy_micro["recall"] / (legacy_micro["precision"] + legacy_micro["recall"])
+                media_micro = image_micro = legacy_micro
+                video_micro = {"precision": None, "recall": None, "f1": None, "metric_count": 0}
+                media_macro = image_macro = {
+                    "precision": sum(precision_values) / len(precision_values) if precision_values else None,
+                    "recall": sum(values) / len(values) if values else None,
+                    "f1": sum(f1_values) / len(f1_values) if f1_values else None,
+                    "metric_count": len(values),
+                }
+                video_macro = {"precision": None, "recall": None, "f1": None, "metric_count": 0}
+        valid_scores = [
+            score for item in items
+            if isinstance(item, dict)
+            and (score := judge_score_for_summary(item.get("judge"))) is not None
+        ]
+        summary = dict(self.state.get("summary") or {})
+        summary.update({
+            "total": len(self.qa_rows) if self.mode != "build" else 0,
+            "completed": int(self._qa_judge_completed),
+            "retrieval_recall_mean": round(media_macro["recall"], 3) if media_macro.get("recall") is not None else None,
+            "retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro.get("precision") is not None else None,
+            "retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro.get("recall") is not None else None,
+            "retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro.get("f1") is not None else None,
+            "retrieval_recall_micro": round(media_micro["recall"], 3) if media_micro.get("recall") is not None else None,
+            "retrieval_precision_micro": round(media_micro["precision"], 3) if media_micro.get("precision") is not None else None,
+            "retrieval_f1_micro": round(media_micro["f1"], 3) if media_micro.get("f1") is not None else None,
+            "media_retrieval_precision_macro": round(media_macro["precision"], 3) if media_macro.get("precision") is not None else None,
+            "media_retrieval_recall_macro": round(media_macro["recall"], 3) if media_macro.get("recall") is not None else None,
+            "media_retrieval_f1_macro": round(media_macro["f1"], 3) if media_macro.get("f1") is not None else None,
+            "media_retrieval_recall_micro": round(media_micro["recall"], 3) if media_micro.get("recall") is not None else None,
+            "media_retrieval_precision_micro": round(media_micro["precision"], 3) if media_micro.get("precision") is not None else None,
+            "media_retrieval_f1_micro": round(media_micro["f1"], 3) if media_micro.get("f1") is not None else None,
+            "image_retrieval_precision_macro": round(image_macro["precision"], 3) if image_macro.get("precision") is not None else None,
+            "image_retrieval_recall_macro": round(image_macro["recall"], 3) if image_macro.get("recall") is not None else None,
+            "image_retrieval_f1_macro": round(image_macro["f1"], 3) if image_macro.get("f1") is not None else None,
+            "image_retrieval_recall_micro": round(image_micro["recall"], 3) if image_micro.get("recall") is not None else None,
+            "image_retrieval_precision_micro": round(image_micro["precision"], 3) if image_micro.get("precision") is not None else None,
+            "image_retrieval_f1_micro": round(image_micro["f1"], 3) if image_micro.get("f1") is not None else None,
+            "video_retrieval_precision_macro": round(video_macro["precision"], 3) if video_macro.get("precision") is not None else None,
+            "video_retrieval_recall_macro": round(video_macro["recall"], 3) if video_macro.get("recall") is not None else None,
+            "video_retrieval_f1_macro": round(video_macro["f1"], 3) if video_macro.get("f1") is not None else None,
+            "video_retrieval_recall_micro": round(video_micro["recall"], 3) if video_micro.get("recall") is not None else None,
+            "video_retrieval_precision_micro": round(video_micro["precision"], 3) if video_micro.get("precision") is not None else None,
+            "video_retrieval_f1_micro": round(video_micro["f1"], 3) if video_micro.get("f1") is not None else None,
+            "retrieval_metric_count": media_micro.get("metric_count"),
+            "media_retrieval_metric_count": media_micro.get("metric_count"),
+            "image_retrieval_metric_count": image_micro.get("metric_count"),
+            "video_retrieval_metric_count": video_micro.get("metric_count"),
+            "retrieval_metric_scope": "all_media" if typed_items else "legacy_image_only",
+            "retrieval_excluded_unanswerable_count": len(items) - len(metric_items),
+            "judge_valid_count": len(valid_scores),
+            "answer_quality_mean": round(sum(valid_scores) / len(valid_scores), 3) if valid_scores else None,
+            "exact_accuracy": round(sum(score == 2 for score in valid_scores) / len(valid_scores), 3)
+                if valid_scores else None,
+            "core_accuracy": round(sum(score >= 1 for score in valid_scores) / len(valid_scores), 3)
+                if valid_scores else None,
+            "live_preview": True,
+        })
+        # Graph-effect rows are evaluator-only and intentionally remain a
+        # preview.  Recomputing them every question would recursively walk
+        # large tool traces, so refresh at a bounded cadence and always let
+        # the final aggregate replace the preview with the authoritative view.
+        now = time.monotonic()
+        last_count = getattr(self, "_live_graph_preview_count", -1)
+        last_at = getattr(self, "_live_graph_preview_at", 0.0)
+        if (len(items) <= 1 or len(items) - last_count >= 10 or now - last_at >= 3.0):
+            summary["graph_qa_by_type"] = self._aggregate_graph_qa_by_type(items)
+            summary["graph_qa_metric_scope"] = "end_to_end_retrieval_chain_live_preview"
+            self._live_graph_preview_count = len(items)
+            self._live_graph_preview_at = now
+        self.state["summary"] = summary
 
     def _phase_start(self, phase: str):
         self._phase_started_perf[phase] = time.perf_counter()
@@ -2362,6 +3127,7 @@ class BenchmarkRun:
             ("identity_seed", self._phase_identity_seed),
             ("photo_import", self._phase_photo_import),
             ("pipeline_processing", self._phase_processing),
+            ("graph_memory", self._phase_graph_memory),
             ("qa_eval", self._phase_qa_eval),
             ("gpu_metrics", self._phase_gpu_metrics),
             ("aggregate", self._phase_aggregate),
@@ -2426,9 +3192,15 @@ class BenchmarkRun:
         # 工作模式决定阶段编排；当前模型模式不拥有模型生命周期，因此没有部署阶段。
         phase_names_by_mode = {
             "full": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
-                     "pipeline_processing", "qa_eval", "gpu_metrics", "aggregate"],
+                     "pipeline_processing", "graph_memory", "qa_eval", "gpu_metrics", "aggregate"],
             "build": ["model_deploy", "scope_setup", "identity_seed", "photo_import",
-                      "pipeline_processing", "gpu_metrics", "aggregate"],
+                      "pipeline_processing", "graph_memory", "gpu_metrics", "aggregate"],
+            # Reuse means reusing the processed scope *and its derived graph
+            # snapshot*. Rebuilding graph_memory here made a reuse A/B run
+            # silently mutate the evaluation base and added several minutes
+            # before QA. Graph construction belongs to full/build; callers
+            # that intentionally change graph construction must run build
+            # first, then reuse that completed snapshot.
             "reuse": ["model_deploy", "scope_attach", "qa_eval", "gpu_metrics", "aggregate"],
         }
         if self.mode == "resume":
@@ -2444,6 +3216,67 @@ class BenchmarkRun:
         if self.use_current_model:
             selected = [name for name in selected if name != "model_deploy"]
         return selected
+
+    def _phase_graph_memory(self):
+        """Build the graph projection from the same processed Sentrix scope.
+
+        This is an internal pipeline stage, not a separate benchmark input or
+        an extra evaluator.  QA starts only after the graph build request has
+        completed (or records a partial optional stage and continues with the
+        normal memory retriever fallback).
+        """
+        self._phase_start("graph_memory")
+        started = time.perf_counter()
+        try:
+            before_status = request_json(
+                f"{self.sentrix_url}/api/graph-memory/status", timeout=30)
+            before_built_at = str(before_status.get("built_at") or "")
+            request_json(
+                f"{self.sentrix_url}/api/graph-memory/build",
+                {
+                    # Build only the scope created/attached by this run.  The
+                    # graph service is otherwise asked to project every scope
+                    # in sentrix.db, which can leave old benchmark albums in
+                    # the graph and make the run's retrieval hard to verify.
+                    "scope_id": self.state.get("scope_id"),
+                    "include_images": False,
+                    "causal": False,
+                },
+                "POST", 30,
+            )
+            timeout_seconds = max(5, int(os.getenv(
+                "PHOTOBENCH_GRAPH_BUILD_TIMEOUT_SECONDS", "600")))
+            deadline = time.monotonic() + timeout_seconds
+            last_status = {}
+            while time.monotonic() < deadline:
+                last_status = request_json(
+                    f"{self.sentrix_url}/api/graph-memory/status", timeout=30)
+                metadata = last_status.get("last_build") or {}
+                stats = metadata.get("stats") or {}
+                built_at = str(last_status.get("built_at") or "")
+                if (int(stats.get("frames") or 0) > 0
+                        and built_at and built_at != before_built_at):
+                    self._phase_done("graph_memory", {
+                        "total_seconds": round(time.perf_counter() - started, 3),
+                        "graph_path": last_status.get("path"),
+                        "nodes": last_status.get("nodes", 0),
+                        "edges": last_status.get("edges", 0),
+                        "frames": stats.get("frames", 0),
+                        "scope_id": self.state.get("scope_id"),
+                    })
+                    return
+                self._cancel.wait(1)
+            raise TimeoutError(
+                f"graph memory build did not become ready within {timeout_seconds}s")
+        except Exception as error:
+            # Graph is an enhancement over the existing memory path.  A graph
+            # failure must be visible in the run report but must not invalidate
+            # the benchmark or prevent QA from using the normal retriever.
+            self._phase_partial("graph_memory", {
+                "total_seconds": round(time.perf_counter() - started, 3),
+                "error": str(error),
+                "fallback": "normal_memory_retriever",
+            })
 
     def _cleanup_scope(self):
         """Delete the PhotoBench-created memory space after the run finishes."""
@@ -2614,6 +3447,15 @@ class BenchmarkRun:
             probe = {"error": str(e)}
         t_probe = time.perf_counter() - t_probe0
 
+        # Persist the exact model alias served by the endpoint.  The profile
+        # identifies the configuration, while this value identifies what was
+        # actually sent in the OpenAI-compatible request and is what the UI
+        # should display for a run.
+        self.state["served_model_name"] = str(
+            state.get("served_model_name") or self.model_profile
+        )
+        self.persist(wait=True)
+
         self._phase_done("model_deploy", {
             "unload_seconds": round(t_stop, 1),
             "load_seconds": round(t_load, 1),
@@ -2740,6 +3582,7 @@ class BenchmarkRun:
         media_paths = [path for path in media_paths if path.is_file()]
         photo_count = len(self.manifest.get("photos") or [])
         video_count = len(self.manifest.get("videos") or [])
+        video_metadata_by_name = _video_import_metadata(self.album_dir, self.manifest)
         chunk_size = max(1, int(os.getenv("PHOTOBENCH_IMPORT_CHUNK_SIZE", "8")))
         upload_workers = max(1, int(os.getenv("PHOTOBENCH_IMPORT_UPLOAD_WORKERS", "2")))
         max_upload_attempts = max(1, int(os.getenv("PHOTOBENCH_IMPORT_MAX_ATTEMPTS", "3")))
@@ -2762,10 +3605,25 @@ class BenchmarkRun:
             for attempt in range(1, max_upload_attempts + 1):
                 try:
                     files = [("files", path.name, path.read_bytes()) for path in pending_paths]
+                    # Preserve the album's authoritative video provenance when
+                    # the clip itself has no EXIF (the common case for the
+                    # benchmark's derived mp4 files).  The API validates this
+                    # as ordinary capture metadata and stores it on the
+                    # source video, so keyframes/events inherit the same
+                    # time/place during processing.
+                    import_metadata = [
+                        video_metadata_by_name.get(path.name, {})
+                        for path in pending_paths
+                    ]
+                    upload_fields = {
+                        "scope_id": self.state["scope_id"], "batch_id": batch_id,
+                        "deferBatchComplete": "true",
+                    }
+                    if any(import_metadata):
+                        upload_fields["metadata"] = json.dumps(import_metadata, ensure_ascii=False)
                     result = upload_files(
                         f"{self.sentrix_url}/api/import",
-                        {"scope_id": self.state["scope_id"], "batch_id": batch_id,
-                         "deferBatchComplete": "true"},
+                        upload_fields,
                         files, 600,
                     )
                     returned = {
@@ -3138,6 +3996,11 @@ class BenchmarkRun:
             if str(item.get("qa_id") or "") in completed_qa_ids
             and item.get("judge_status") == "skipped"
         )
+        # These counters describe actual executor activity.  The old progress
+        # calculation treated every not-yet-completed sample as "in flight",
+        # including samples still waiting in an executor queue.
+        qa_activity_lock = threading.Lock()
+        qa_activity = {"agent_active": 0, "judge_active": 0}
         self._record_phase("qa_eval", "agent_phase_started_at", now_iso())
         self._record_phase("qa_eval", "agent_phase_started_at_epoch", agent_phase_started_epoch)
         self._record_phase("qa_eval", "agent_total", total_qa)
@@ -3146,6 +4009,9 @@ class BenchmarkRun:
         def record_qa_progress():
             agent_done = getattr(self, "_qa_agent_completed", 0)
             judge_done = getattr(self, "_qa_judge_completed", 0)
+            with qa_activity_lock:
+                agent_active = qa_activity["agent_active"]
+                judge_active = qa_activity["judge_active"]
             judge_submitted = getattr(self, "_qa_judge_submitted", 0)
             self._record_phase("qa_eval", "progress", {
                 "total": total_qa,
@@ -3153,12 +4019,15 @@ class BenchmarkRun:
                 "completed": judge_done,
                 "agent_completed": agent_done,
                 "agent_total": total_qa,
-                "agent_in_flight": max(0, total_qa - agent_done),
+                "agent_submitted": getattr(self, "_qa_agent_submitted", agent_done),
+                "agent_in_flight": agent_active,
+                "agent_queued": max(0, total_qa - agent_done - agent_active),
                 "judge_completed": judge_done,
                 "judge_total": total_qa,
                 "judge_submitted": judge_submitted,
                 "judge_skipped": getattr(self, "_qa_judge_skipped", 0),
-                "judge_in_flight": max(0, judge_submitted - (judge_done - getattr(self, "_qa_judge_skipped", 0))),
+                "judge_in_flight": judge_active,
+                "judge_queued": max(0, judge_submitted - judge_done - judge_active),
                 "qa_concurrency": qa_concurrency,
                 "judge_concurrency": judge_concurrency,
             })
@@ -3167,7 +4036,6 @@ class BenchmarkRun:
             (index, row) for index, row in enumerate(self.qa_rows)
             if str(row.get("qa_id") or "") not in completed_qa_ids
         ]
-        agent_futures = {}
         judge_futures = {}
         judge_phase_started_perf = None
         judge_phase_started_epoch = None
@@ -3180,17 +4048,46 @@ class BenchmarkRun:
         ) as agent_executor, concurrent.futures.ThreadPoolExecutor(
             max_workers=judge_concurrency, thread_name_prefix="qa-judge"
         ) as judge_executor:
-            agent_futures = {
-                agent_executor.submit(self._evaluate_one, row, assets_by_name): index
-                for index, row in pool_rows
-            }
-            self._qa_submitted = total_qa
-            record_qa_progress()
-
             # One completion loop services both pools.  This keeps Agent and
             # Judge truly pipelined: a finished Judge is merged immediately,
             # even while other Agent futures are still running.
-            pending = {future: ("agent", index) for future, index in agent_futures.items()}
+            pending = {}
+            pool_row_iter = iter(pool_rows)
+
+            def run_agent(row):
+                with qa_activity_lock:
+                    qa_activity["agent_active"] += 1
+                try:
+                    return self._evaluate_one(row, assets_by_name)
+                finally:
+                    with qa_activity_lock:
+                        qa_activity["agent_active"] = max(0, qa_activity["agent_active"] - 1)
+
+            def run_judge(judge_item, row):
+                with qa_activity_lock:
+                    qa_activity["judge_active"] += 1
+                try:
+                    return self._judge_item(judge_item, row, assets_by_name)
+                finally:
+                    with qa_activity_lock:
+                        qa_activity["judge_active"] = max(0, qa_activity["judge_active"] - 1)
+
+            def submit_next_agent() -> bool:
+                try:
+                    index, row = next(pool_row_iter)
+                except StopIteration:
+                    return False
+                future = agent_executor.submit(run_agent, row)
+                pending[future] = ("agent", index)
+                self._qa_agent_submitted += 1
+                self._qa_submitted = self._qa_agent_submitted
+                return True
+
+            self._qa_agent_submitted = len(completed_qa_ids)
+            self._qa_submitted = self._qa_agent_submitted
+            for _ in range(min(qa_concurrency, len(pool_rows))):
+                submit_next_agent()
+            record_qa_progress()
             agent_phase_recorded = False
 
             def record_agent_phase_finished() -> None:
@@ -3242,7 +4139,7 @@ class BenchmarkRun:
                             self._qa_judge_submitted += 1
                             judge_item = copy.deepcopy(item)
                             judge_future = judge_executor.submit(
-                                self._judge_item, judge_item, self.qa_rows[index], assets_by_name,
+                                run_judge, judge_item, self.qa_rows[index],
                             )
                             judge_futures[judge_future] = index
                             pending[judge_future] = ("judge", index)
@@ -3250,7 +4147,13 @@ class BenchmarkRun:
                             self.state["items"].append(item)
                             self._qa_agent_completed += 1
                             record_qa_progress()
+                            self._refresh_live_metric_preview()
                             self.persist()
+                        # Keep only a bounded number of Agent futures submitted.
+                        # This makes cancellation responsive and prevents a large
+                        # queued backlog from being mistaken for active work.
+                        if kind == "agent":
+                            submit_next_agent()
                         if not any(k == "agent" for k, _ in pending.values()):
                             record_agent_phase_finished()
                     else:
@@ -3279,6 +4182,7 @@ class BenchmarkRun:
                         self._qa_judge_completed += 1
                         with self.lock:
                             record_qa_progress()
+                            self._refresh_live_metric_preview()
                             self.persist()
 
             record_agent_phase_finished()
@@ -3390,12 +4294,19 @@ class BenchmarkRun:
             all_call_metrics, all_execution_trace, all_tool_trace = [], [], []
             all_tool_observations = []
             tool_trace_present = False
+            try:
+                agent_turn_timeout = max(
+                    60,
+                    int(os.getenv("PHOTOBENCH_AGENT_TURN_TIMEOUT_SECONDS") or "240"),
+                )
+            except ValueError:
+                agent_turn_timeout = 240
             for turn_index, message in enumerate(messages or [query]):
                 initial_resp = request_json(f"{self.sentrix_url}/api/assistant/turn", {
                     "message": message, "scope_id": self.state["scope_id"],
                     "conversation_id": conversation_id, "viewer_id": "owner", "include_debug": True,
                 }, "POST", 300)
-                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=900,
+                resp = wait_for_assistant_turn(self.sentrix_url, initial_resp, timeout=agent_turn_timeout,
                                                cancelled=self._cancel.is_set)
                 turn_metrics, turn_trace, turn_tools = self._normalize_turn_traces(resp)
                 _, turn_observations = self._extract_tool_perf(resp.get("task_state") or {})
@@ -3452,10 +4363,14 @@ class BenchmarkRun:
             retrieved_media = _resolve_predicted_media(media_sets["retrieved_asset_ids"], assets_by_name)
             evidence_media = _resolve_predicted_media(media_sets["evidence_asset_ids"], assets_by_name)
 
-            # Match against GT. 交付口径（E）：主要"回答来源/召回"指标对齐到模型的
-            # 显式交付（selected/delivery），与 UI 展示的模型回答图片一致；检索候选集
-            # 只作为检索层诊断单独保留，不再冒充回答来源参与召回指标。
-            metrics = _modality_metrics(gt_refs, selected_media)
+            # Match against GT using the benchmark's established delivery
+            # semantics: retrieval Recall is measured on the media actually
+            # selected/delivered by the Agent.  The broader search candidate
+            # pool is retained below as a diagnostic only; promoting it to
+            # the headline metric would make the score incomparable with the
+            # remote repository and could overstate answer quality.
+            metrics = _modality_metrics(gt_refs, selected_media, assets_by_name)
+            candidate_metrics = _modality_metrics(gt_refs, retrieved_media, assets_by_name)
             gt_media = _resolve_gt_media(gt_refs, assets_by_name, selected_media)
             retrieved_keys = {
                 _media_key(value.get("media_type"), value.get("media_id") or value.get("file_name"))
@@ -3533,6 +4448,12 @@ class BenchmarkRun:
                 "video_retrieval_recall": metrics["video"]["recall"],
                 "video_retrieval_precision": metrics["video"]["precision"],
                 "video_retrieval_f1": metrics["video"]["f1"],
+                "candidate_media_retrieval_counts": candidate_metrics["media"],
+                "candidate_image_retrieval_counts": candidate_metrics["image"],
+                "candidate_video_retrieval_counts": candidate_metrics["video"],
+                "candidate_media_retrieval_recall": candidate_metrics["media"]["recall"],
+                "candidate_image_retrieval_recall": candidate_metrics["image"]["recall"],
+                "candidate_video_retrieval_recall": candidate_metrics["video"]["recall"],
                 # Compatibility aliases are total-media metrics for typed runs.
                 "retrieval_recall": metrics["media"]["recall"],
                 "retrieval_precision": metrics["media"]["precision"],
@@ -4568,13 +5489,19 @@ class BenchmarkRun:
     def _phase_gpu_metrics(self):
         self._phase_start("gpu_metrics")
         if self.use_cloud_model:
-            self._phase_done("gpu_metrics", {"status": "skipped", "source": "cloud_api", "reason": "cloud_api_has_no_local_gpu_metrics"})
+            self._phase_done("gpu_metrics", {
+                "status": "skipped",
+                "source": "cloud_api",
+                "reason": "cloud_api_has_no_local_gpu_metrics",
+            })
             return
         if self.telemetry_source == "unavailable":
             self._phase_done("gpu_metrics", {"status": "skipped", "source": "external", "reason": "remote_endpoint_has_no_local_telemetry"})
             return
         agg = self._gpu_sampler.aggregate()
         agg["partial"] = False
+        agg["status"] = "done" if agg.get("samples_count") else "unavailable"
+        agg["source"] = self.telemetry_source
         self._phase_done("gpu_metrics", agg)
 
     def _phase_aggregate(self):
@@ -4629,11 +5556,31 @@ class BenchmarkRun:
             "llm_context_samples_count": len(context_tokens),
         }
         summary.update(self._capability_summary(items, self.state.get("phases") or {}))
+        summary["graph_qa_by_type"] = self._aggregate_graph_qa_by_type(items)
+        summary["graph_qa_metric_scope"] = "end_to_end_retrieval_chain"
+        # Keep evaluator-only identity quality in the run summary as well as
+        # the graph-quality endpoint, so it is visible even before the UI
+        # finishes loading the isolated graph snapshot.
+        summary["face_clustering"] = benchmark_face_clustering_quality(
+            str(self.state.get("scope_id") or ""), self.album_dir,
+        )
+        summary["gpu_metrics"] = self.state.get("phases", {}).get("gpu_metrics") or {}
         summary["benchmark_e2e_latency_excluding_judge_ms"] = self._benchmark_e2e_latency_excluding_judge_ms(
             self.state.get("phases") or {}, items,
         )
         self.state["summary"] = summary
         self._phase_done("aggregate", {"summary": summary})
+
+    @classmethod
+    def _aggregate_graph_qa_by_type(cls, items: list[dict]) -> list[dict]:
+        """Delegate the evaluator-only graph report to the repository helper.
+
+        The report needs benchmark ground truth and therefore belongs to the
+        PhotoBench layer, not the runtime graph service.  Keep the same helper
+        available on ``BenchmarkRun`` because aggregation runs there; the
+        implementation is shared with persisted-run rehydration below.
+        """
+        return OrchestratorRepository._aggregate_graph_qa_by_type(items)
 
     @classmethod
     def _capability_summary(cls, items: list[dict], phases: dict | None = None) -> dict:
@@ -4873,6 +5820,7 @@ class OrchestratorRepository:
     def __init__(self, results_root: Path):
         self.results_root = results_root.resolve()
         self.lock = threading.RLock()
+        self.graph_quality_locks: dict[str, threading.Lock] = {}
         self.runs: dict[str, BenchmarkRun] = {}
         self.suite_queue: list[dict] = []  # pending suite configs
         self.active_suite_run_ids: list[str] = []
@@ -5020,6 +5968,20 @@ class OrchestratorRepository:
                 rid = run.get("run_id")
                 if not rid:
                     continue
+                # Graph-quality is an independently derived dashboard snapshot.
+                # Keep it in a small sidecar so reading/updating that metric
+                # never requires serializing the run's potentially huge QA
+                # trace payload.
+                try:
+                    graph_quality = json.loads(
+                        (path.parent / "graph_quality.json").read_text(encoding="utf-8")
+                    )
+                    expected_scope = run.get("scope_id") or run.get("existing_scope_id")
+                    if (isinstance(graph_quality, dict)
+                            and graph_quality.get("scope_id") == expected_scope):
+                        run.setdefault("summary", {})["graph_quality"] = graph_quality
+                except (OSError, json.JSONDecodeError):
+                    pass
                 changed = False
                 status = run.get("status")
                 if status in dirty_statuses:
@@ -5041,7 +6003,22 @@ class OrchestratorRepository:
                 # Store as a lightweight dict for listing (not a full BenchmarkRun)
                 self.runs[rid] = run
             except (OSError, KeyError, json.JSONDecodeError):
-                continue
+                # A hard stop can leave run.json preallocated or truncated.
+                # atomic_json(keep_backup=True) keeps the previous complete
+                # snapshot beside it so the benchmark remains recoverable.
+                backup = path.with_suffix(path.suffix + ".bak")
+                try:
+                    run = json.loads(backup.read_text(encoding="utf-8"))
+                    rid = run.get("run_id")
+                    if not rid:
+                        continue
+                    run["status"] = "interrupted" if run.get("status") == "running" else run.get("status")
+                    run["finished_at"] = run.get("finished_at") or now_iso()
+                    run["recovery_note"] = "Recovered from the last complete snapshot"
+                    atomic_json(path, run)
+                    self.runs[rid] = run
+                except (OSError, KeyError, json.JSONDecodeError):
+                    continue
 
     def list_manifests(self) -> list[dict]:
         manifests = []
@@ -5342,39 +6319,256 @@ class OrchestratorRepository:
 
     def list_runs(self) -> list[dict]:
         with self.lock:
-            result = []
-            for rid, run in self.runs.items():
-                if isinstance(run, BenchmarkRun):
-                    state = run.state
+            runs = list(self.runs.items())
+        result = []
+        for rid, run in runs:
+            if isinstance(run, BenchmarkRun):
+                with run.lock:
+                    state = dict(run.state)
+            else:
+                # Disk-loaded runs are dictionaries. Take only a shallow
+                # snapshot while holding the map lock; never keep the global
+                # repository lock while shaping response data.
+                with self.lock:
+                    if self.runs.get(rid) is not run:
+                        continue
+                    state = dict(run)
+                # The run list is loaded during every page initialization.  Do
+                # not copy the whole persisted run here: completed runs can
+                # contain hundreds of MB of traces and QA items, and doing so
+                # blocks the UI before it can render anything.  The detail
+                # endpoint still returns the complete run on demand.
+            list_fields = (
+                "run_id", "suite_id", "album_id", "qa_set", "mode",
+                "status", "started_at", "finished_at", "scope_id",
+                "scope_source", "qa_count", "qa_concurrency",
+                "judge_concurrency", "model_profile",
+                "model_id", "model_name", "model_backend",
+                "served_model_name", "vllm_target_id", "vllm_model_base_url",
+                "current_model_snapshot",
+            )
+            public = {key: state.get(key) for key in list_fields if key in state}
+            # The list page fetches the selected run's detailed phases
+            # separately. Returning every historical phase trace (and
+            # rejudge record) for all runs made the initial dashboard response
+            # grow with the full persisted QA history.
+            rejudge = state.get("rejudge") or {}
+            if rejudge:
+                public["rejudge"] = {
+                    key: rejudge.get(key)
+                    for key in ("status", "task_id", "completed", "total", "failed")
+                    if key in rejudge
+                }
+            items = state.get("items") or []
+            public["item_count"] = len(items)
+
+            # Prefer persisted aggregates; during a live run use the cheap
+            # QA progress counters instead of rescanning every nested trace.
+            saved = dict(state.get("summary") or {})
+            saved_face = saved.get("face_clustering")
+            try:
+                saved_face_version = int((saved_face or {}).get("metric_definition_version") or 0)
+            except (TypeError, ValueError):
+                saved_face_version = 0
+            if saved_face_version < FACE_CLUSTERING_METRIC_VERSION:
+                scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+                album_id = str(state.get("album_id") or "").strip()
+                album_dir = BENCHMARK_DATA_ROOT / album_id
+                if scope_id and album_id and album_dir.is_dir():
+                    try:
+                        saved["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+                    except Exception:
+                        pass
+            summary_fields = (
+                "total", "completed", "judge_valid_count",
+                "judge_distribution", "retrieval_recall_mean",
+                "retrieval_recall_micro", "retrieval_precision_micro",
+                "retrieval_f1_micro", "media_retrieval_recall_micro",
+                "media_retrieval_precision_micro", "media_retrieval_f1_micro",
+                "answer_quality_mean", "exact_accuracy", "core_accuracy",
+                "face_clustering", "gpu_metrics", "retrieval_metric_count",
+                "media_retrieval_metric_count", "live_preview",
+            )
+            public["summary"] = {
+                key: saved[key] for key in summary_fields if key in saved
+            }
+            if not public["summary"].get("total"):
+                public["summary"]["total"] = state.get("qa_count") or len(items)
+            if "completed" not in public["summary"]:
+                progress = ((state.get("phases") or {}).get("qa_eval") or {}).get("progress") or {}
+                if state.get("status") in {"running", "pending", "cancelling"}:
+                    public["summary"]["completed"] = int(progress.get("completed") or 0)
                 else:
-                    state = run
-                result.append(self._run_list_entry(state))
-            return sorted(result, key=lambda r: r.get("started_at") or r.get("created_at") or "", reverse=True)
+                    public["summary"]["completed"] = sum(
+                        1 for item in items
+                        if isinstance(item, dict)
+                        and item.get("judge_status") in {"completed", "failed", "skipped"}
+                    )
+            result.append(public)
+        return sorted(result, key=lambda r: r.get("started_at") or "", reverse=True)
 
     def get_run(self, run_id: str) -> dict:
         with self.lock:
             run = self.runs.get(run_id)
             if not run:
                 raise KeyError(run_id)
-            state = run.state if isinstance(run, BenchmarkRun) else run
-            result = self._public_run(state, include_items=False)
-            result["item_count"] = len(state.get("items") or [])
+        if isinstance(run, BenchmarkRun):
+            with run.lock:
+                state = dict(run.state)
+        else:
+            with self.lock:
+                if self.runs.get(run_id) is not run:
+                    raise KeyError(run_id)
+                state = dict(run)
+
+        result = self._public_run(state, include_items=False)
+        result["item_count"] = len(state.get("items") or [])
+        saved_summary = state.get("summary") or {}
+        status = state.get("status")
+        if status in {"running", "pending", "cancelling"}:
+            # The details endpoint is polled every two seconds. Computing graph
+            # and tool aggregates here recursively walks hundreds of MB of QA
+            # traces and used to hold the global repository lock, freezing the
+            # progress page. Expose the live counters and last saved aggregate;
+            # the full aggregate is computed once when the run finalizes.
+            summary = dict(saved_summary)
+            progress = ((state.get("phases") or {}).get("qa_eval") or {}).get("progress") or {}
+            summary.setdefault("total", state.get("qa_count") or len(state.get("items") or []))
+            summary["completed"] = int(progress.get("completed", len(state.get("items") or [])))
+            result["summary"] = summary
+        elif saved_summary:
+            # Completed runs already persist their authoritative summary. Do
+            # not derive it again from the full trace every time a page opens.
+            result["summary"] = dict(saved_summary)
+            face = result["summary"].get("face_clustering")
+            try:
+                face_version = int((face or {}).get("metric_definition_version") or 0)
+            except (TypeError, ValueError):
+                face_version = 0
+            if face_version < FACE_CLUSTERING_METRIC_VERSION:
+                scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+                album_id = str(state.get("album_id") or "").strip()
+                album_dir = BENCHMARK_DATA_ROOT / album_id
+                if scope_id and album_id and album_dir.is_dir():
+                    try:
+                        result["summary"]["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+                    except Exception:
+                        pass
+        else:
+            # Legacy records with no aggregate still get the reconstructed
+            # summary, but the potentially expensive work happens outside the
+            # repository lock so list/progress requests remain responsive.
             result["summary"] = self._effective_summary(state)
-            # Peaks and samples_count use every JSONL sample. The plotted
-            # series is uniformly reduced: a 487-question history gzips past
-            # the LAN window that stalls after about 42KB and blanks the panel.
-            live = result.get("telemetry_live")
-            samples_path = self.results_root / run_id / "gpu_samples.jsonl"
-            if isinstance(live, dict):
-                # _public_run intentionally avoids a deep copy for normal
-                # responses.  Do not mutate the in-memory run while rebuilding
-                # a large response from JSONL.
-                result["telemetry_live"] = copy.deepcopy(live)
         live = result.get("telemetry_live")
         if isinstance(live, dict):
-            self._attach_gpu_sample_history(live, samples_path)
-            self._publish_full_sample_phase_stats(result, live)
+            samples_path = self.results_root / run_id / "gpu_samples.jsonl"
+            result["telemetry_live"] = copy.deepcopy(live)
+            self._attach_gpu_sample_history(result["telemetry_live"], samples_path)
+            self._publish_full_sample_phase_stats(result, result["telemetry_live"])
         return result
+
+    def _compute_graph_quality_background(
+        self, run_id: str, scope_id: str, album_id: str, build_lock: threading.Lock,
+    ) -> None:
+        try:
+            quality = benchmark_graph_quality_snapshot(
+                scope_id, BENCHMARK_DATA_ROOT / album_id,
+            )
+            quality.setdefault("face_clustering_metric_version", FACE_CLUSTERING_METRIC_VERSION)
+            quality.setdefault("status", "ready" if quality.get("available") else "error")
+        except Exception as exc:
+            quality = {
+                "available": False, "status": "error", "reason": str(exc),
+                "run_id": run_id, "scope_id": scope_id,
+            }
+        try:
+            with self.lock:
+                run = self.runs.get(run_id)
+                if not run:
+                    return
+                if isinstance(run, BenchmarkRun):
+                    with run.lock:
+                        run.state.setdefault("summary", {})["graph_quality"] = quality
+                        graph_face = quality.get("face_clustering")
+                        if isinstance(graph_face, dict):
+                            run.state["summary"]["face_clustering"] = graph_face
+                else:
+                    run.setdefault("summary", {})["graph_quality"] = quality
+                    graph_face = quality.get("face_clustering")
+                    if isinstance(graph_face, dict):
+                        run["summary"]["face_clustering"] = graph_face
+
+            # Keep this derived dashboard value in its small sidecar instead
+            # of rewriting run.json (which may contain hundreds of MB of QA
+            # traces). Sidecar I/O is also outside the repository lock.
+            atomic_json(self.results_root / run_id / "graph_quality.json", quality)
+        except Exception:
+            # Snapshot generation is auxiliary to QA evaluation. A reporting
+            # failure must not interrupt the benchmark or lock its endpoints.
+            pass
+        finally:
+            build_lock.release()
+
+    def get_graph_quality(self, run_id: str) -> dict:
+        """Return a run-bound graph-quality snapshot, never the mutable live graph.
+
+        ``graph_memory.db`` is a shared derived index and is replaced by the
+        next full build.  Reusing it for a historical run made old reports
+        incorrectly show 0 nodes/0 edges.  Build a scoped disposable graph
+        once, persist the resulting metrics with that run, and reuse it later.
+        """
+        with self.lock:
+            run = self.runs.get(run_id)
+            if not run:
+                raise KeyError(run_id)
+            state = run.state if isinstance(run, BenchmarkRun) else run
+            summary = state.get("summary") or {}
+            cached = summary.get("graph_quality")
+            if isinstance(cached, dict) and cached.get("scope_id") == (
+                state.get("scope_id") or state.get("existing_scope_id")
+            ):
+                cached_face = cached.get("face_clustering") or {}
+                # Recompute legacy snapshots that do not carry the current
+                # face-coverage fields. A completed scope is cheap to score
+                # and this prevents stale "not available" results from being
+                # shown forever after an interrupted run.
+                if (cached.get("face_clustering_metric_version") == FACE_CLUSTERING_METRIC_VERSION
+                        and (cached.get("status") in {"ready", "error"}
+                             or cached_face.get("available") is True
+                             or "gt_single_image_count" in cached_face)):
+                    return copy.deepcopy(cached)
+            scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+            album_id = str(state.get("album_id") or "").strip()
+            locks = getattr(self, "graph_quality_locks", None)
+            if locks is None:
+                locks = self.graph_quality_locks = {}
+            build_lock = locks.setdefault(run_id, threading.Lock())
+            if not build_lock.acquire(blocking=False):
+                return {
+                    "available": False,
+                    "status": "computing",
+                    "reason": "snapshot_in_progress",
+                    "run_id": run_id,
+                    "scope_id": scope_id,
+                }
+            worker = threading.Thread(
+                target=self._compute_graph_quality_background,
+                args=(run_id, scope_id, album_id, build_lock),
+                daemon=True,
+                name=f"graph-quality-{run_id[:24]}",
+            )
+            try:
+                worker.start()
+            except Exception:
+                build_lock.release()
+                raise
+            return {
+                "available": False,
+                "status": "computing",
+                "reason": "snapshot_in_progress",
+                "run_id": run_id,
+                "scope_id": scope_id,
+            }
 
     @staticmethod
     def _series_stats(history: list, key: str) -> dict:
@@ -6725,6 +7919,8 @@ class OrchestratorRepository:
             "llm_context_tokens_p95": saved.get("llm_context_tokens_p95", cls._percentile(contexts, 0.95)),
             "llm_context_samples_count": saved.get("llm_context_samples_count", len(contexts)),
             "tool_performance": cls._aggregate_tool_performance(items),
+            "graph_qa_by_type": cls._aggregate_graph_qa_by_type(items),
+            "graph_qa_metric_scope": "end_to_end_retrieval_chain",
             "attribution": {"primary": attribution_primary, "layer_failures": attribution_layers},
             "delivery_breakdown": saved.get("delivery_breakdown", cls._aggregate_delivery(items)),
         })
@@ -6739,6 +7935,121 @@ class OrchestratorRepository:
                 state.get("phases") or {}, items,
             )
         return saved
+
+    @classmethod
+    def _aggregate_graph_qa_by_type(cls, items: list[dict]) -> list[dict]:
+        """Build the per-question-type graph report from persisted QA traces.
+
+        This deliberately lives in PhotoBench, where benchmark GT is allowed.
+        The runtime graph service never reads evaluator annotations, so it
+        cannot truthfully calculate per-question retrieval deltas on its own.
+        """
+        labels = {
+            "event_memory_qa": "事件记忆",
+            "single_evidence_memory_qa": "单证据记忆",
+            "multi_turn_clarify": "多轮澄清",
+            "time_sequence": "时间/时序",
+            "location_scene": "地点/场景",
+            "visual_scene_understanding": "视觉/场景理解",
+            "video_media": "视频/媒体",
+            "evidence_insufficient": "证据不足",
+            "prompt_injection": "提示注入",
+            "multi_hop": "多跳/因果",
+        }
+
+        def walk(value):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from walk(child)
+
+        def graph_trace(item):
+            for node in walk(item.get("tool_trace") or []):
+                timing = node.get("retrieval_timing")
+                if isinstance(timing, dict) and isinstance(timing.get("graph_policy"), dict):
+                    return timing
+            return None
+
+        buckets: dict[str, list[dict]] = {}
+        for item in items:
+            key = str(item.get("question_type") or item.get("task_type") or "other")
+            buckets.setdefault(key, []).append(item)
+
+        rows = []
+        for key, bucket in buckets.items():
+            recalls = [float(i.get("media_retrieval_recall", i.get("retrieval_recall"))) for i in bucket
+                       if isinstance(i.get("media_retrieval_recall", i.get("retrieval_recall")), (int, float))]
+            precisions = [float(i.get("media_retrieval_precision", i.get("retrieval_precision"))) for i in bucket
+                          if isinstance(i.get("media_retrieval_precision", i.get("retrieval_precision")), (int, float))]
+            f1s = [float(i.get("media_retrieval_f1", i.get("retrieval_f1"))) for i in bucket
+                   if isinstance(i.get("media_retrieval_f1", i.get("retrieval_f1")), (int, float))]
+            judge_scores = [score for i in bucket
+                            if (score := judge_score_for_summary(i.get("judge"))) is not None]
+            evidence_scores = [float((i.get("evidence_judge") or {}).get("score")) for i in bucket
+                               if isinstance((i.get("evidence_judge") or {}).get("score"), (int, float))]
+            routes = [trace for i in bucket if (trace := graph_trace(i)) is not None]
+            policies = [trace.get("graph_policy") or {} for trace in routes]
+            intents: dict[str, int] = {}
+            for policy in policies:
+                intent = str(policy.get("intent") or "ordinary")
+                intents[intent] = intents.get(intent, 0) + 1
+
+            deltas = []
+            improved = worsened = 0
+            rank_changed = set_changed = 0
+            for item, trace in ((i, graph_trace(i)) for i in bucket):
+                rerank = (trace or {}).get("graph_rerank") or {}
+                # Compare only the candidate head that is returned to the
+                # Agent.  The complete ranked pool is useful for diagnostics,
+                # but counting changes below that head inflated the displayed
+                # graph improvement without changing retrieval/delivery.
+                baseline = (rerank.get("baseline_head_asset_ids")
+                            or (rerank.get("baseline_ranked_asset_ids") or [])[:18])
+                final = (rerank.get("returned_head_asset_ids")
+                         or (rerank.get("reranked_asset_ids") or [])[:18])
+                gt = {str(entry.get("asset_id")) for entry in (item.get("gt_media") or [])
+                      if isinstance(entry, dict) and entry.get("asset_id")}
+                if not baseline or not final or not gt:
+                    continue
+                if list(map(str, baseline)) != list(map(str, final)):
+                    rank_changed += 1
+                if set(map(str, baseline)) != set(map(str, final)):
+                    set_changed += 1
+                before = len(set(map(str, baseline)) & gt) / len(gt)
+                after = len(set(map(str, final)) & gt) / len(gt)
+                delta = after - before
+                deltas.append(delta)
+                if delta > 1e-9:
+                    improved += 1
+                elif delta < -1e-9:
+                    worsened += 1
+            rows.append({
+                "type": key,
+                "label": labels.get(key, key),
+                "sample_count": len(bucket),
+                "retrieval_metric_count": len(recalls),
+                "graph_routed_count": len(routes),
+                "graph_enabled_count": sum(1 for policy in policies if policy.get("enabled") is True),
+                "graph_intents": intents,
+                "graph_effect_count": len(deltas),
+                "graph_recall_delta": round(sum(deltas) / len(deltas), 4) if deltas else None,
+                "graph_gt_improved_count": improved,
+                "graph_gt_worsened_count": worsened,
+                "graph_rank_changed_count": rank_changed,
+                "graph_candidate_set_changed_count": set_changed,
+                "retrieval_recall": round(sum(recalls) / len(recalls), 4) if recalls else None,
+                "retrieval_precision": round(sum(precisions) / len(precisions), 4) if precisions else None,
+                "retrieval_f1": round(sum(f1s) / len(f1s), 4) if f1s else None,
+                "answer_quality_mean": round(sum(judge_scores) / len(judge_scores), 3) if judge_scores else None,
+                "judge_valid_count": len(judge_scores),
+                "evidence_valid_count": len(evidence_scores),
+                "evidence_supported_rate": round(sum(1 for score in evidence_scores if score >= 2) / len(evidence_scores), 4)
+                    if evidence_scores else None,
+            })
+        return sorted(rows, key=lambda row: (-row["sample_count"], row["type"]))
 
     @classmethod
     def _aggregate_tool_performance(cls, items: list[dict]) -> dict:
@@ -6824,6 +8135,39 @@ class OrchestratorRepository:
     @staticmethod
     def _list_summary(state: dict) -> dict:
         saved = dict(state.get("summary") or {})
+        saved_face = saved.get("face_clustering")
+        try:
+            saved_face_version = int((saved_face or {}).get("metric_definition_version") or 0)
+        except (TypeError, ValueError):
+            saved_face_version = 0
+        if saved_face_version < FACE_CLUSTERING_METRIC_VERSION:
+            scope_id = str(state.get("scope_id") or state.get("existing_scope_id") or "").strip()
+            album_id = str(state.get("album_id") or "").strip()
+            album_dir = BENCHMARK_DATA_ROOT / album_id
+            if scope_id and album_id and album_dir.is_dir():
+                try:
+                    saved["face_clustering"] = benchmark_face_clustering_quality(scope_id, album_dir)
+                except Exception:
+                    # A reporting repair must never make the run list fail.
+                    pass
+        # Interrupted runs may not reach aggregate. Expose face quality from
+        # the graph snapshot in the main summary when it is already present.
+        graph_face = (saved.get("graph_quality") or {}).get("face_clustering")
+        saved_face = saved.get("face_clustering")
+        # A completed run may have been written before the evaluator metric
+        # version changed. Prefer the graph snapshot when it contains the
+        # current multi-face-aware fields; otherwise the list page keeps the
+        # old strict pairwise result forever and appears to show zeroes.
+        try:
+            saved_face_version = int((saved_face or {}).get("metric_definition_version") or 0)
+        except (TypeError, ValueError):
+            saved_face_version = 0
+        if isinstance(graph_face, dict) and (
+            not isinstance(saved_face, dict)
+            or saved_face_version < FACE_CLUSTERING_METRIC_VERSION
+            or "identity_gallery_f1" not in saved_face
+        ):
+            saved["face_clustering"] = graph_face
         items = state.get("items") or []
         recalls = [item.get("retrieval_recall") for item in items
                    if isinstance(item.get("retrieval_recall"), (int, float))]
@@ -7023,7 +8367,12 @@ class OrchestratorRepository:
 
     def _persist_run_state(self, run_id: str, run, state: dict) -> None:
         if isinstance(run, BenchmarkRun):
-            run.persist()
+            # Rejudge runs are commonly followed by a service restart from
+            # start.ps1.  The old async-only snapshot could still be queued
+            # when that restart killed the evaluator, silently discarding all
+            # newly computed judge scores.  This helper is used only by the
+            # rejudge path, so make that checkpoint durable before returning.
+            run.persist(wait=True)
             return
         run_dir = self.results_root / run_id
         atomic_json(run_dir / "run.json", state)
@@ -7051,6 +8400,8 @@ class OrchestratorRepository:
             "answer_quality_mean": round(sum(valid_scores) / denom, 3) if denom else None,
             "exact_accuracy": round(distribution["2"] / denom, 3) if denom else None,
             "core_accuracy": round((distribution["1"] + distribution["2"]) / denom, 3) if denom else None,
+            "graph_qa_by_type": OrchestratorRepository._aggregate_graph_qa_by_type(items),
+            "graph_qa_metric_scope": "end_to_end_retrieval_chain",
         })
         summary.update(BenchmarkRun._capability_summary(items, state.get("phases") or {}))
         state["summary"] = summary
@@ -7304,7 +8655,7 @@ class OrchestratorRepository:
         return result
 
     def start_suite(self, payload: dict) -> dict:
-        album_id = payload.get("album_id", "album3-14")
+        album_id = payload.get("album_id", "album3-max-video10")
         mode = str(payload.get("mode") or "full").strip().lower()
         if mode not in RUN_MODES:
             raise ValueError(f"mode must be one of {sorted(RUN_MODES)}, got: {mode!r}")
@@ -7317,9 +8668,80 @@ class OrchestratorRepository:
         )
         if not qa_set:
             raise ValueError(f"album {album_id} has no qa_sets in manifest")
+        qa_limit = payload.get("qa_limit")
+        if qa_limit not in (None, ""):
+            try:
+                qa_limit = max(1, int(qa_limit))
+            except (TypeError, ValueError):
+                raise ValueError("qa_limit must be a positive integer")
+        else:
+            qa_limit = None
         existing_scope_id = str(payload.get("existing_scope_id") or "").strip()
+        auto_reused_scope = False
         if mode == "reuse" and not existing_scope_id:
-            raise ValueError("existing_scope_id is required when mode=reuse")
+            # The UI may not have a reusable-base selection when it is opened
+            # against a freshly restarted orchestrator.  Reuse is still safe
+            # to run without another import: resolve the newest *completed*
+            # build for this album and attach to its existing scope.  Do not
+            # guess from a scope name alone; an interrupted import can leave an
+            # active scope with only a fraction of the media.
+            sentrix_for_reuse = str(payload.get("sentrix_url") or DEFAULT_SENTRIX_URL).rstrip("/")
+            with self.lock:
+                historical = []
+                for rid, run in self.runs.items():
+                    state = run.state if isinstance(run, BenchmarkRun) else run
+                    if (str(state.get("album_id") or "") != str(album_id)
+                            or not state.get("scope_id")
+                            or state.get("scope_source") != "created"
+                            or state.get("mode") not in {"full", "build"}
+                            or state.get("status") not in {
+                                "completed", "completed_with_errors", "cancelled", "interrupted",
+                            }
+                            or (state.get("phases", {}).get("pipeline_processing", {}).get("status")
+                                not in {"done", "partial"})):
+                        continue
+                    historical.append((str(state.get("finished_at") or state.get("started_at") or ""),
+                                       str(rid), state))
+            historical.sort(reverse=True)
+            spaces = request_json(f"{sentrix_for_reuse}/api/memory-spaces", timeout=30)
+            if isinstance(spaces, dict):
+                spaces = spaces.get("spaces") or spaces.get("items") or []
+            active_spaces = {
+                str(space.get("id")): space for space in (spaces or [])
+                if space.get("id") and str(space.get("status") or "active") == "active"
+            }
+            expected_media = len(album_media_entries(manifest_early))
+            rejected = []
+            for _, rid, state in historical:
+                candidate = str(state.get("scope_id"))
+                if candidate not in active_spaces:
+                    continue
+                try:
+                    asset_payload = request_json(
+                        f"{sentrix_for_reuse}/api/assets?scope_id={quote(candidate)}&limit=2000",
+                        timeout=60,
+                    )
+                    assets = asset_payload.get("assets", []) if isinstance(asset_payload, dict) else []
+                    statuses = [str(asset.get("status") or "") for asset in assets]
+                    # A processed scope may contain derived keyframes, so use
+                    # the manifest media count as the minimum rather than an
+                    # exact asset count.
+                    complete = (len(assets) >= expected_media
+                                and bool(assets)
+                                and not any(status in PIPELINE_PENDING_STATUSES for status in statuses))
+                except Exception as exc:
+                    complete = False
+                    rejected.append(f"{candidate}: {exc}")
+                if complete:
+                    existing_scope_id = candidate
+                    auto_reused_scope = True
+                    break
+            if not existing_scope_id:
+                detail = f"; checked: {', '.join(rejected[:2])}" if rejected else ""
+                raise ValueError(
+                    f"no completed reusable memory found for album {album_id}{detail}; "
+                    "run a build/full evaluation once before using mode=reuse"
+                )
         models = payload.get("models", [])
         if not isinstance(models, list) or not models:
             raise ValueError("models must contain at least one model")
@@ -7447,7 +8869,14 @@ class OrchestratorRepository:
                     current_model_snapshot=current_model_snapshot,
                     runtime_framework=runtime_framework,
                     use_cloud_model=(model == BIG_MODEL_PROFILE_ID),
+                    qa_limit=qa_limit,
                 )
+                if auto_reused_scope:
+                    run.state["scope_reuse_resolution"] = {
+                        "mode": "auto_latest_completed",
+                        "scope_id": existing_scope_id,
+                        "reason": "existing_scope_id was omitted; attached to the newest completed build with a complete asset set",
+                    }
                 self.runs[run_id] = run
                 created_runs.append(run_id)
             self.active_suite_run_ids = created_runs
@@ -7653,6 +9082,10 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     or (run.get("rejudge") or {}).get("status") == "running"
                 )
                 self._json(response)
+                return
+            if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/graph-quality"):
+                run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/graph-quality"))
+                self._json(self.repo.get_graph_quality(run_id))
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/items"):
                 run_id = unquote(parsed.path.removeprefix("/api/runs/").removesuffix("/items"))

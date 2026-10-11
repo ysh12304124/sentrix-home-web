@@ -177,26 +177,69 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
                         nucleus.values.append(NucleusValue(
                             kind="year", value=m.group(1), certainty="confirmed",
                             source="ocr", display=m.group(1)))
-        # 4) 地点（GPS 反编码，条件匹配）；where 题把匹配照片地点绑为硬值防编造
-        _place_counter: dict[str, int] = {}
-        if tr.get("tool") == "search_memories":
-            for p in (tr.get("preview") or []) or []:
-                place = str(p.get("place") or "").strip()
-                cond = (p.get("condition_summary") or {}).get("place") or {}
-                matched = cond == "matched" if isinstance(cond, str) else True
-                if len(place) >= 2 and matched \
-                        and place not in [v.display for v in nucleus.all("place")]:
+    # 4) 时间/地点（来自搜索结果的结构化媒体元数据）。 Bind these facts
+    # to the query-recommended photo. A majority over a mixed preview can
+    # confidently report another event's date/place.
+    required_evidence_types = {
+        str(req.get("evidence_type") or "")
+        for req in (task_state.get("requirements") or [])
+        if isinstance(req, dict) and req.get("required", True)
+        and str(req.get("status") or "open") in {"open", "running", "partially_supported"}
+    }
+    date_requested = bool(
+        _Q_DATE.search(question or "")
+        or _Q_YEAR.search(question or "")
+        or "temporal_metadata" in required_evidence_types
+    )
+    place_requested = bool(
+        _Q_WHERE.search(question or "")
+        or "location_metadata" in required_evidence_types
+    )
+
+    metadata_candidates = []
+    if any((tr or {}).get("tool") == "search_memories"
+           for tr in task_state.get("tool_results") or []):
+        for tr in task_state.get("tool_results") or []:
+            if tr.get("tool") != "search_memories":
+                continue
+            preview = [item for item in (tr.get("preview") or [])
+                       if isinstance(item, dict)]
+            if not preview:
+                continue
+            recommended = str(tr.get("recommended_handle") or "")
+            selected = next((item for item in preview
+                             if recommended and item.get("handle") == recommended), None)
+            metadata_candidates.append(selected or preview[0])
+        if metadata_candidates:
+            selected = metadata_candidates[-1]
+            captured_at = str(selected.get("captured_at") or "").strip()
+            if captured_at and _Q_YEAR.search(question or ""):
+                year_match = _YEAR_RE.search(captured_at)
+                if year_match:
+                    year = year_match.group(1)
                     nucleus.values.append(NucleusValue(
-                        kind="place", value=place, certainty="confirmed",
-                        source="search_memories", display=place))
-                if len(place) >= 2:
-                    _place_counter[place] = _place_counter.get(place, 0) + 1
-        if _Q_WHERE.search(question) and _place_counter:
-            top_place, top_n = max(_place_counter.items(), key=lambda kv: kv[1])
-            if top_n >= 2 and top_place not in [v.display for v in nucleus.all("place")]:
+                        kind="year", value=year, certainty="confirmed",
+                        source=f"search_memories.{selected.get('handle')}.captured_at",
+                        display=year))
+            elif captured_at and date_requested:
+                match = re.match(r"(\d{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})", captured_at)
+                if match:
+                    date = f"{match.group(1)}年{int(match.group(2))}月{int(match.group(3))}日"
+                    nucleus.values.append(NucleusValue(
+                        kind="date", value=date, certainty="confirmed",
+                        source=f"search_memories.{selected.get('handle')}.captured_at",
+                        display=date))
+
+    # Place metadata must come from the same recommended photo, not the most
+    # frequent location among unrelated search candidates.
+        if place_requested:
+            selected = metadata_candidates[-1] if metadata_candidates else {}
+            top_place = str(selected.get("place") or "").strip()
+            if len(top_place) >= 2:
                 nucleus.values.append(NucleusValue(
                     kind="place", value=top_place, certainty="confirmed",
-                    source="search_memories_majority", display=top_place))
+                    source=f"search_memories.{selected.get('handle')}.place",
+                    display=top_place))
 
     # 5) 当前关注人物
     active = task_state.get("active_person")
@@ -212,7 +255,7 @@ def build_nucleus(task_state: dict, question: str = "") -> AnswerNucleus:
 # ---------------------------------------------------------------------------
 
 def classify_deterministic(question: str) -> str | None:
-    """返回 'count' | 'date' | 'year' | 'price' | 'boolean' | None。"""
+    """返回 'count' | 'date' | 'year' | 'place' | 'price' | 'boolean' | None。"""
     q = question or ""
     if _Q_PRICE.search(q):
         return "price"
@@ -220,6 +263,8 @@ def classify_deterministic(question: str) -> str | None:
         return "year"
     if _Q_DATE.search(q) and not _Q_COUNT.search(q):
         return "date"
+    if _Q_WHERE.search(q):
+        return "place"
     if _Q_COUNT.search(q):
         return "count"
     if _Q_BOOL.search(q):
@@ -260,6 +305,11 @@ def render_simple(nucleus: AnswerNucleus, kind: str, question: str = "") -> str 
                 break
         v = best or vs[0]
         return f"{v.value} 年。"
+    if kind == "place":
+        v = nucleus.get("place")
+        if v is None:
+            return None
+        return f"地点是 {v.display or v.value}。"
     if kind == "price":
         # 只当问题里的商品词与核值 label 匹配时才确定性渲染，避免错配（如多个价格）
         q = question or ""

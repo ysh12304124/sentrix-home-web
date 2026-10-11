@@ -48,7 +48,7 @@ test("web gateway only proxies the authoritative Sentrix API", () => {
   assert.doesNotMatch(source, /COGNEE_BASE_URL|mockSearch|function handleApi/);
   assert.match(source, /return proxyBackend\(req, res, url\);/);
   assert.match(source, /SENTRIX_BACKEND_URL/, "backend must be overridable via SENTRIX_BACKEND_URL");
-  assert.match(source, /127\.0\.0\.1:9598/, "default backend is the authoritative Agent API");
+  assert.match(source, /SENTRIX_API_PORT \|\| 11001/, "default backend must match the local API startup port");
   assert.match(source, /\/api\/model-profiles\/switch/);
   assert.match(source, /1_000_000/, "model switching must outlive the vLLM ready timeout");
   assert.match(source, /cache-control.*no-cache/s, "static assets must be revalidated after UI fixes");

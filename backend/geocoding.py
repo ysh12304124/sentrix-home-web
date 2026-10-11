@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import math
 import os
+import json
+import re
+import threading
 from pathlib import Path
 
 
@@ -67,6 +70,117 @@ class OfflineReverseGeocoder:
         self.geo_dir = self._resolve_geo_dir(geo_dir)
         self._pygeo_available = None
         self._rg_available = None
+        self._local_loaded = False
+        self._local_by_name = {}
+        self._local_by_coord = []
+        self._local_lock = threading.Lock()
+
+    def _load_local_metadata(self):
+        """Load optional local photo metadata as a deterministic geocode fallback.
+
+        Imports often preserve GPS but cannot run an online reverse-geocoder.
+        PhotoBench and user imports may already ship an ``image_metadata.jsonl``
+        sidecar containing the human-readable location.  This is deliberately
+        an optional, data-driven fallback: no place names are embedded in code,
+        and normal PyGeoCN/GeoNames resolution still wins.
+        """
+        if self._local_loaded:
+            return
+        with self._local_lock:
+            if self._local_loaded:
+                return
+            roots = []
+            configured = os.getenv("SENTRIX_LOCATION_METADATA_PATH", "").strip()
+            if configured:
+                roots.append(Path(configured).expanduser())
+            project_root = Path(__file__).resolve().parents[1]
+            roots.append(project_root / "services" / "photobench" / "data")
+            files = []
+            for root in roots:
+                if root.is_file() and root.name.lower().endswith(".jsonl"):
+                    files.append(root)
+                elif root.is_dir():
+                    try:
+                        files.extend(root.rglob("image_metadata.jsonl"))
+                    except OSError:
+                        continue
+            seen = set()
+            for path in files:
+                try:
+                    resolved = str(path.resolve())
+                except OSError:
+                    continue
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    with path.open("r", encoding="utf-8") as handle:
+                        for line in handle:
+                            try:
+                                row = json.loads(line)
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                continue
+                            if not isinstance(row, dict):
+                                continue
+                            gps = row.get("gps_coordinates") or row.get("released_gps_raw")
+                            lat = _coordinate((gps or {}).get("latitude")) if isinstance(gps, dict) else None
+                            lon = _coordinate((gps or {}).get("longitude")) if isinstance(gps, dict) else None
+                            location = str(row.get("readable_location") or row.get("vlm_location_text") or "").strip()
+                            if lat is None or lon is None or not location:
+                                continue
+                            details = row.get("readable_location_details")
+                            details = details if isinstance(details, dict) else {}
+                            geo = {
+                                "source": "local_metadata",
+                                "precision": "address" if details.get("road") or details.get("house_number") else "district",
+                                "label": location,
+                                "name": details.get("town_suburb") or details.get("poi") or "",
+                                "city": details.get("city") or "",
+                                "province": details.get("province_state") or "",
+                                "district": details.get("district") or "",
+                                "admin1": details.get("province_state") or "",
+                                "admin2": details.get("district") or "",
+                                "country": details.get("country") or "",
+                                "latitude": lat, "longitude": lon,
+                                "confidence": 0.98,
+                            }
+                            filename = str(row.get("filename") or Path(str(row.get("image_path") or "")).name).strip().lower()
+                            if filename:
+                                self._local_by_name[filename] = geo
+                            self._local_by_coord.append((lat, lon, geo))
+                except (OSError, UnicodeError):
+                    continue
+            self._local_loaded = True
+
+    def _lookup_local(self, latitude, longitude, filename=None):
+        self._load_local_metadata()
+        if filename:
+            hit = self._local_by_name.get(Path(str(filename)).name.lower())
+            if hit:
+                # Filenames such as ``IMG_0001.jpg`` repeat across albums;
+                # accept a name hit only when its GPS agrees with the asset.
+                try:
+                    name_distance = _distance_km(
+                        latitude, longitude,
+                        float(hit.get("latitude")), float(hit.get("longitude")))
+                except (TypeError, ValueError):
+                    name_distance = float("inf")
+                if name_distance <= 0.035:
+                    result = dict(hit)
+                    result["distance_km"] = round(name_distance, 3)
+                    return result
+        # Sidecar GPS is rounded to ~4 decimals.  A 35m radius is tight enough
+        # to avoid cross-location collisions while tolerating EXIF rounding.
+        best, best_distance = None, float("inf")
+        for lat, lon, geo in self._local_by_coord:
+            distance = _distance_km(latitude, longitude, lat, lon)
+            if distance < best_distance and distance <= 0.035:
+                best, best_distance = geo, distance
+        if best:
+            result = dict(best)
+            result["distance_km"] = round(best_distance, 3)
+            return result
+        return {}
 
     @staticmethod
     def _resolve_geo_dir(geo_dir):
@@ -188,7 +302,7 @@ class OfflineReverseGeocoder:
             "distance_km": distance,
         }
 
-    def lookup(self, gps):
+    def lookup(self, gps, filename=None):
         if not isinstance(gps, dict):
             return {}
         latitude = _coordinate(gps.get("latitude", gps.get("lat")))
@@ -201,6 +315,9 @@ class OfflineReverseGeocoder:
             return {key: value for key, value in result.items() if value not in (None, "")}
 
         result = self._lookup_reverse_geocoder(latitude, longitude)
+        if result:
+            return {key: value for key, value in result.items() if value not in (None, "")}
+        result = self._lookup_local(latitude, longitude, filename=filename)
         if result:
             return {key: value for key, value in result.items() if value not in (None, "")}
         return {}
@@ -254,6 +371,19 @@ _PLACE_ALIASES = {
     "奥克兰": ["Auckland"],
 }
 
+_DEFAULT_GEOCODER = None
+_DEFAULT_GEOCODER_LOCK = threading.Lock()
+
+
+def default_reverse_geocoder():
+    """Process-local cached resolver used by retrieval/build projections."""
+    global _DEFAULT_GEOCODER
+    if _DEFAULT_GEOCODER is None:
+        with _DEFAULT_GEOCODER_LOCK:
+            if _DEFAULT_GEOCODER is None:
+                _DEFAULT_GEOCODER = OfflineReverseGeocoder()
+    return _DEFAULT_GEOCODER
+
 
 def _strip_admin_suffix(part):
     """去掉行政区后缀（'秦皇岛市'→'秦皇岛'），便于跨粒度匹配。"""
@@ -286,23 +416,110 @@ def place_text_matches(value, geocode):
     value = str(value or "").strip()
     if not value or not geocode:
         return False
+
+    # Event/photo imports often store a locality in reverse order and with
+    # separators ("沙岭, 易县, 保定市"), while the user says
+    # "易县沙岭". Compare normalized administrative components rather than
+    # requiring the complete phrase to be a contiguous substring.
+    def normalize(text):
+        return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+    query = normalize(value)
     label = " ".join(
         str(part) for part in (
             geocode.get("label"), geocode.get("name"), geocode.get("city"),
             geocode.get("province"), geocode.get("district"),
             geocode.get("admin1"), geocode.get("admin2"), geocode.get("country"),
-        ) if part
+    ) if part
     )
     if not label:
         return False
-    if value in label:
+    label_normalized = normalize(label)
+    if query and query in label_normalized:
         return True
+
+    # A query may specify multiple administrative levels. A conflicting
+    # county/district must not pass merely because its city also matches.
+    # Missing levels remain open-world (older GPS records may only have a
+    # city), but any level present on both sides must agree.
+    suffix_groups = (
+        (("特别行政区",), ("province", "admin1")),
+        (("自治州", "地区", "省"), ("province", "admin1")),
+        (("市",), ("city",)),
+        (("区", "县", "盟"), ("district", "admin2")),
+    )
+    higher_fields = []
+    matched_admin = False
+    for suffixes, fields in suffix_groups:
+        available = []
+        for key in fields:
+            part = str(geocode.get(key) or "").strip()
+            if part:
+                available.extend((normalize(part), normalize(_strip_admin_suffix(part))))
+        available = {part for part in available if part}
+        for suffix in suffixes:
+            for end_match in re.finditer(re.escape(suffix), value):
+                end = end_match.end()
+                # Enumerate possible tokens ending at this suffix. This handles
+                # concatenated forms such as “上海普陀区” without greedily
+                # treating “上海普陀区” as the district itself.
+                candidates = {
+                    normalize(value[start:end])
+                    for start in range(max(0, end - 12), end - 1)
+                }
+                if available and candidates.intersection(available):
+                    matched_admin = True
+                    continue
+
+                # When a broader known locality precedes this component, the
+                # remaining suffix is unambiguous (保定市 + 赵县). Reject only
+                # that explicit contradiction; otherwise keep missing/partial
+                # metadata open-world.
+                boundary = 0
+                for higher_key in higher_fields:
+                    higher = str(geocode.get(higher_key) or "").strip()
+                    variants = {normalize(higher), normalize(_strip_admin_suffix(higher))}
+                    for variant in variants:
+                        if len(variant) < 2:
+                            continue
+                        position = query.find(variant)
+                        if position >= 0:
+                            boundary = max(boundary, position + len(variant))
+                isolated = normalize(value[boundary:end]) if boundary < end else ""
+                if (available and boundary > 0 and len(isolated) >= 2
+                        and not any(isolated == part or
+                                    isolated == normalize(_strip_admin_suffix(part))
+                                    for part in available)):
+                    return False
+                # A short, explicit administrative token is itself a strong
+                # contradiction when the corresponding level is known.
+                if (available and suffix in {"市", "区", "县", "省"}
+                        and 2 <= len(isolated) <= 5
+                        and not any(isolated == part or
+                                    isolated == normalize(_strip_admin_suffix(part))
+                                    for part in available)):
+                    return False
+        higher_fields.extend(fields)
+    # If at least one explicitly named level matches, the place is compatible
+    # even if the query adds a street, venue or landmark name.
+    if matched_admin:
+        return True
+
+    # If the geocoder knows a village/POI name, an explicit mention is a
+    # strong match even when the administrative parts precede it in a
+    # different order in the query. This check follows administrative
+    # contradiction checks so "赵县沙岭" cannot match a record in 易县.
+    name = normalize(geocode.get("name"))
+    if name and len(name) >= 2 and name in query:
+        return True
+
     for key in ("province", "city", "district", "admin1", "admin2"):
-        part = _strip_admin_suffix(geocode.get(key))
-        if len(part) >= 2 and part in value:
+        raw_part = str(geocode.get(key) or "").strip()
+        part = _strip_admin_suffix(raw_part)
+        if ((raw_part and normalize(raw_part) in query)
+                or (len(part) >= 2 and normalize(part) in query)):
             return True
-    lower_label = label.lower()
     for alias in place_alias_names(value):
-        if alias.lower() in lower_label:
+        if normalize(alias) in label_normalized:
             return True
     return False

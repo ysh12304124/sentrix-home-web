@@ -29,3 +29,6 @@ artifacts/*
 # Machine-local service endpoints; copy runtime_connection.example.json.
 config/runtime_connection.json
 config/vllm_targets.json
+
+# Local album with private media and run-specific benchmark material.
+data/album3-max-video10/

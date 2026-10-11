@@ -277,6 +277,18 @@ class ExtractImageIdsTests(unittest.TestCase):
             ],
         )
 
+    def test_face_identity_seed_crops_are_not_qa_retrieved_media(self):
+        assets_by_name = {
+            "faceid_10.jpg": [{"id": "face-seed", "media_type": "image"}],
+            "derived-face.webp": [{"id": "derived-face", "media_type": "image",
+                                    "metadata_json": {"derived_kind": "face_crop"}}],
+            "2017-10-04 223242.jpg": [{"id": "real-photo", "media_type": "image"}],
+            "video-007.mp4": [{"id": "video-asset", "media_type": "video"}],
+        }
+        resolved = MODULE._resolve_predicted_media(
+            ["face-seed", "derived-face", "real-photo", "video-asset"], assets_by_name)
+        self.assertEqual([item["asset_id"] for item in resolved], ["real-photo", "video-asset"])
+
     def test_tool_binding_uses_conversation_turn_when_step_ids_repeat(self):
         calls = [
             {"conversation_turn": 0, "step_id": "model_call_1"},
@@ -655,7 +667,7 @@ class ExtractImageIdsTests(unittest.TestCase):
         qa_path = Path(__file__).resolve().parents[1] / "data" / "album3" / "qa" / "full-album3.jsonl"
         rows = {
             row["qa_id"]: row
-            for row in (json.loads(line) for line in qa_path.read_text().splitlines() if line.strip())
+            for row in (json.loads(line) for line in qa_path.read_text(encoding="utf-8").splitlines() if line.strip())
         }
 
         clothing = rows["validation-album3-012-q08"]
@@ -849,4 +861,3 @@ class HostEndpointTests(unittest.TestCase):
             MODULE._configured_url("BENCH_ABSENT_TEST_ONLY", "no_such_key", fallback="http://127.0.0.1:8091"),
             "http://127.0.0.1:8091",
         )
-

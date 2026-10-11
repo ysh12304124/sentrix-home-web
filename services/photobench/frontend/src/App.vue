@@ -2,6 +2,10 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import * as echarts from "echarts";
 
+const graphQualityCache = new Map();
+const graphQualityRequests = new Map();
+const graphQualityRetryAt = new Map();
+
 const EXECUTION_PHASES = [
   { key: "model_deploy", label: "模型部署" },
   { key: "scope_setup", label: "创建相册" },
@@ -213,6 +217,8 @@ function memoryLayerSpecialMetrics(level) {
     { label: "回答 Exact Accuracy", value: fmtPct(correctness.exact_accuracy), note: `正确 ${correctness.correct || 0} · 部分 ${correctness.partial || 0} · 错误 ${correctness.incorrect || 0}` },
   ];
 }
+const graphQuality = ref(null);
+const graphQualityLoading = ref(false);
 const qaPage = ref({ items: [], page: 1, page_size: 20, total: 0, pages: 1 });
 const qaDetails = reactive({});
 const openQaItems = reactive(new Set());
@@ -220,13 +226,13 @@ const loadingQaItems = reactive(new Set());
 const qaPageSize = ref(20);
 const qaFilters = reactive({ search: "", score: "", task_type: "", tag: "", angle: "", difficulty: "", answerability: "", agent_status: "", primary: "" });
 const reviewDrafts = reactive({});
-const selectedAlbum = ref("album3-14");
+const selectedAlbum = ref("album3-max-video10");
 const albumCountLabel = (manifest) => {
   const videos = Number(manifest?.video_count || 0);
   const base = `${manifest.face_count}人 / ${manifest.photo_count}图`;
   return videos ? `${base} / ${videos}视频` : base;
 };
-const selectedQa = ref("compact-10q");
+const selectedQa = ref("mixed-image-video-487q");
 const selectedModels = reactive(new Set());
 const sentrixUrl = ref("");
 const judgeUrl = ref("");
@@ -266,8 +272,8 @@ const rejudgeSubmitting = ref(false);
 const reviewSaving = ref(false);
 const loading = ref(true);
 const activeView = ref("runs");
-const qaBrowserAlbum = ref("album3");
-const qaBrowserSet = ref("full-album3-38q");
+const qaBrowserAlbum = ref("album3-max-video10");
+const qaBrowserSet = ref("mixed-image-video-487q");
 const qaBrowserItems = ref([]);
 const qaBrowserSearch = ref("");
 const qaBrowserTag = ref("");
@@ -321,7 +327,18 @@ const api = async (path, options = {}) => {
 };
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
 const esc = (value) => String(value ?? "");
-const modelName = (run) => run?.model_profile || run?.model_name || run?.profile || "unknown";
+// Display the endpoint's exact served ID.  The value is also sent unchanged
+// in API requests, so aliases such as qwen3-vl-4b and qwen3-vl-4b-instruct
+// remain distinguishable.
+const modelDisplayName = (value) => String(value || "");
+const modelName = (run) => {
+  // 新记录保存了实际发送到 OpenAI-compatible endpoint 的 served alias。
+  // 优先展示它，不把 qwen3-vl-4b 和 qwen3-vl-4b-instruct 混成一个名称。
+  const actualName = run?.served_model_name
+    || run?.current_model_snapshot?.served_model_name;
+  if (actualName) return String(actualName);
+  return run?.model_profile || run?.model_name || run?.profile || "unknown";
+};
 const albumName = (run) => run?.scope_name || run?.album_id || run?.qa_name || "album";
 const qaName = (run) => run?.qa_set || run?.qa_name || "qa";
 const fmtDate = (value) => value ? new Date(value).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "-";
@@ -333,6 +350,11 @@ const duration = (run) => {
 };
 const fmtMs = (value) => value == null ? "-" : value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Number(value).toFixed(0)}ms`;
 const fmtPct = (value) => value == null ? "-" : `${(Number(value) * 100).toFixed(1)}%`;
+const fmtSignedPct = (value) => {
+  if (value == null) return "-";
+  const number = Number(value);
+  return `${number > 0 ? "+" : ""}${(number * 100).toFixed(1)}%`;
+};
 const fmtTokens = (value) => value == null || !Number.isFinite(Number(value)) ? "-" : `${Math.round(Number(value)).toLocaleString("en-US")} token`;
 const scoreClass = (score) => score === 2 ? "score-2" : score === 1 ? "score-1" : score === 0 ? "score-0" : "score-none";
 const statusLabel = (status) => ({ done: "完成", running: "进行中", pending: "等待", cancelling: "停止中", failed: "失败", completed: "完成", completed_with_errors: "完成但有错误", interrupted: "中断", cancelled: "已取消", partial: "部分完成", stalled: "已停滞", not_run: "未执行", skipped: "不适用" }[status] || status || "等待");
@@ -666,17 +688,16 @@ function itemMedia(item, gt = false) {
       return { ...ref, file_name: fileName, matched: (item.matched_file_names || []).includes(fileName) };
     }));
   }
-  // 交付口径（E）：模型"召回/回答来源"= 模型显式交付的图（selected/predicted），
-  // 不再把上游 evidence 全量候选冒充回答来源。历史 run 只有 evidence/retrieved 字段时再回退。
-  if (item.predicted_media?.length) return decorateMedia(item.predicted_media);
-  if (item.predicted_images?.length) return decorateMedia(item.predicted_images);
-  if (item.predicted_file_names?.length) {
-    return item.predicted_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
-  }
+  // Model recall is the upstream evidence projection, not only explicit delivery.
   if (item.evidence_source_media?.length) return decorateMedia(item.evidence_source_media);
   if (item.evidence_source_images?.length) return decorateMedia(item.evidence_source_images);
   if (item.evidence_source_file_names?.length) {
     return decorateMedia(item.evidence_source_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
+  }
+  if (item.predicted_media?.length) return decorateMedia(item.predicted_media);
+  if (item.predicted_images?.length) return decorateMedia(item.predicted_images);
+  if (item.predicted_file_names?.length) {
+    return item.predicted_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
   }
   // A validator may leave all candidates as candidate_only.  They are not
   // answer evidence, but hiding them makes a healthy retrieval look empty
@@ -691,23 +712,11 @@ function itemMedia(item, gt = false) {
   return (item.retrieved_file_names || []).slice(0, 6)
     .map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
 }
-function toolRecallMedia(item) {
-  // 工具召回图片 = search 等找图工具返回的检索候选集（retrieved），与"模型使用图片"严格区分。
-  if (item.retrieved_candidate_media?.length) return decorateMedia(item.retrieved_candidate_media);
-  if (item.retrieved_candidate_images?.length) return decorateMedia(item.retrieved_candidate_images);
-  if (item.retrieved_file_names?.length) {
-    return item.retrieved_file_names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
-  }
-  return [];
-}
 function itemEvidenceMedia(item) {
-  // 模型使用图片 = 模型显式交付图（predicted/selected）；未显式交付 → 空（"回答依据图片为空"），
-  // 绝不回退到 evidence/retrieved 候选（否则又变成"回答来源==完整候选集"）。
-  const media = item?.predicted_media || item?.predicted_images || [];
+  const media = item?.evidence_source_media || item?.evidence_source_images || [];
   if (media.length) return decorateMedia(media);
-  const names = item?.predicted_file_names || [];
-  if (names.length) return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
-  return [];
+  const names = item?.evidence_source_file_names || [];
+  return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
 }
 function isDirectEvidence(item, media) {
   const ref = typeof media === "string" ? { media_id: media, media_type: inferMediaType(media) } : media;
@@ -1224,12 +1233,12 @@ function aggregateMetricRows(phase = {}) {
       ? `历史记录按 Agent/Judge 时间线回退估算 · ${throughputSamples}/${throughputTotal} 题，不能视为实测`
       : "历史记录未保存 Agent 独立阶段墙钟";
   const typedMediaMetrics = summary.retrieval_metric_scope === "all_media";
-  return [
-    [typedMediaMetrics ? "媒体检索 Precision" : "历史图片检索 Precision", fmtPct(summary.retrieval_precision_macro), `交付准确率：模型拿出来交付的图里有多少属于 GT · 逐 QA 求值后平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT · 排除 ${summary.retrieval_excluded_unanswerable_count ?? 0} 道不可回答题`, true],
-    [typedMediaMetrics ? "媒体检索 Recall" : "历史图片检索 Recall", fmtPct(summary.retrieval_recall_macro), typedMediaMetrics ? "交付覆盖率：该题 GT 里有多少被模型交付出来 · 逐 QA 等权平均；图/视频按类型与稳定标识匹配" : "交付覆盖率：该题 GT 里有多少被模型交付出来 · 逐 QA 等权平均；历史 run 无法补算视频指标", true],
-    ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Judge 给最终回答打分（2 完全支持 / 1 部分支持 / 0 不支持）的均值，唯一回答「模型能不能用」的端到端结论 · 有效 ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · 无效 ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
-    ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `在限定步数内跑完流程的题占比，衡量 Agent 是否收敛而不是反复绕圈 · 有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
-    ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "需要结构化输出的调用里一次解析成功的比例，衡量格式稳定性 · 历史记录未保存解析轨迹" : `需要结构化输出的调用里一次解析成功的比例，衡量格式稳定性 · ${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个`, true],
+  const rows = [
+    [typedMediaMetrics ? "媒体检索 Precision" : "历史图片检索 Precision", fmtPct(summary.retrieval_precision_macro), `逐 QA 求值后平均 · ${summary.retrieval_metric_count ?? 0} 题有 GT · 排除 ${summary.retrieval_excluded_unanswerable_count ?? 0} 道不可回答题`, true],
+    [typedMediaMetrics ? "媒体检索 Recall" : "历史图片检索 Recall", fmtPct(summary.retrieval_recall_macro), typedMediaMetrics ? "每道 QA 的 Recall 等权平均；图视频按类型与稳定标识匹配" : "每道 QA 的 Recall 等权平均；历史 run 无法补算视频指标", true],
+    ["回答质量均分", summary.answer_quality_mean == null ? "-" : `${summary.answer_quality_mean} / 2`, `Valid ${summary.judge_valid_count ?? 0}/${summary.total ?? 0} · Invalid ${(summary.total ?? 0) - (summary.judge_valid_count ?? 0)} · 0:${dist["0"] || 0} · 1:${dist["1"] || 0} · 2:${dist["2"] || 0}`, true],
+    ["步数内 QA 完成率", fmtPct(summary.qa_completion_within_steps_rate), `有效记录 ${summary.qa_completion_valid_count ?? 0} 题`, true],
+    ["JSON 解析成功率", fmtPct(summary.json_parse_success_rate), summary.json_parse_total == null ? "历史记录未保存解析轨迹" : `${summary.json_parse_success ?? 0}/${summary.json_parse_total} 个需解析模型输出`, true],
     ["Agent 并发吞吐折算时延", fmtMs(summary.agent_throughput_latency_ms), throughputNote, true],
     ["平均调用轮数", summary.agent_loop_calls_mean == null ? "未记录" : `${Number(summary.agent_loop_calls_mean).toFixed(2)} 轮`, `每道题平均经历几轮模型调用，轮数越高越可能在反复试探 · 仅 Agent/Recovery，不含 L2 Judge、Final Writer 和工具内部模型`, true],
     ["累计输入 token", fmtTokens(summary.prompt_tokens_total), "所有主 Agent 调用喂进去的 prompt token 总量，用于估算上下文成本", true],
@@ -1250,6 +1259,7 @@ function aggregateMetricRows(phase = {}) {
     ["LLM TTFT 均值", fmtMs(summary.llm_ttft_ms_mean), "首 token 响应时间均值，衡量并发排队下的响应灵敏度"],
     ["LLM 生成速度", summary.llm_tokens_per_second_mean == null ? "-" : `${Number(summary.llm_tokens_per_second_mean).toFixed(1)} token/s`, "主 Agent 平均生成速度；流式调用是纯解码速率，非流式是端到端速率，两者不可直接横比"],
   ];
+  return appendFaceAndGpuMetrics(rows, summary);
 }
 function keyMetricRows(run) {
   // 首屏只放五个能直接判读的结论值；其余明细留在各自折叠卡片里，避免
@@ -1318,6 +1328,41 @@ function recallMetricRows(run) {
     ["计分题数", `${ranking.question_count} 题`, `多正样本 ${ranking.multi_positive_count ?? 0} 题 · 候选不足 10 张的 ${ranking.short_candidate_count ?? 0} 题 · 已排除不可回答题`],
   ];
 }
+function appendFaceAndGpuMetrics(rows, summary) {
+  const face = summary.face_clustering;
+  if (face?.available) {
+    const gallery = face.identity_gallery_available === true;
+    const inclusive = gallery || face.image_identity_link_available === true;
+    const f1 = gallery ? face.identity_gallery_f1 : face.image_identity_link_f1;
+    const precision = gallery ? face.identity_gallery_precision : face.image_identity_link_precision;
+    const recall = gallery ? face.identity_gallery_recall : face.image_identity_link_recall;
+    rows.push([gallery ? "人脸聚类 F1（身份库对齐）" : (inclusive ? "人脸聚类 F1（图像级身份关联）" : "人脸聚类 F1"), fmtPct(inclusive ? f1 : face.same_person_pair_f1), gallery
+      ? `身份库命中 ${face.identity_gallery_true_positive_count ?? 0} · 可评估图像 ${face.identity_gallery_evaluable_image_count ?? 0}`
+      : inclusive
+        ? `同身份图像对 ${face.image_identity_link_true_positive_count ?? 0} · 可评估图像 ${face.image_identity_link_evaluable_image_count ?? 0}`
+      : `同人脸对 ${face.true_positive_pair_count ?? 0} · 可评估人脸 ${face.evaluable_face_count ?? 0}`, true]);
+    rows.push([gallery ? "人脸聚类 P / R（身份库对齐）" : (inclusive ? "人脸聚类 P / R（图像级）" : "人脸聚类 P / R"), `${fmtPct(inclusive ? precision : face.same_person_pair_precision)} / ${fmtPct(inclusive ? recall : face.same_person_pair_recall)}`, gallery
+      ? "每张多脸图逐人检测，检测框通过 seeded confirmed cluster 对齐身份库后与 GT 身份集合比较"
+      : inclusive
+        ? "多脸图按 GT 身份集合与跨图共享 cluster 的一致性计算；不猜测框与身份的对应关系"
+      : "仅纳入身份标注与检测脸可无歧义对应的样本", true]);
+    if (inclusive && face.same_person_pair_f1 != null) {
+      rows.push(["严格单脸 pairwise F1", fmtPct(face.same_person_pair_f1), `严格可评估人脸 ${face.evaluable_face_count ?? 0}；多脸图不纳入此项`]);
+    }
+  } else if (face?.reason) {
+    rows.push(["人脸聚类质量", "未评分", face.reason]);
+  } else if (activeRun.value?.status === "running") {
+    // Face-clustering quality is computed during aggregate after QA finishes.
+    // Keep a visible placeholder while the run is active instead of silently
+    // hiding the metric and making the dashboard look incomplete.
+    rows.push(["人脸聚类质量", "待汇总", "QA 测评完成后计算同人脸对 P / R / F1；当前批次仍在运行"]);
+  }
+  const gpu = summary.gpu_metrics;
+  if (gpu?.samples_count) {
+    rows.push(["GPU 采样", `${gpu.samples_count} 次`, `来源 ${gpu.source || "local"} · 显存峰值 ${gpu.memory_used_mib?.peak ?? "-"} MiB`]);
+  }
+  return rows;
+}
 function tokenDistributionRows() {
   const summary = effectiveRunSummary(activeRun.value);
   return [
@@ -1331,6 +1376,140 @@ function tokenDistributionRows() {
 }
 function tokenDistributionCount() {
   return effectiveRunSummary(activeRun.value).llm_context_samples_count ?? 0;
+}
+function graphQualityPrimaryRows() {
+  const quality = graphQuality.value;
+  if (!quality?.available) return [];
+  const hasGroundTruth = quality.reference_edge_ground_truth_available === true;
+  const matched = quality.reference_edge_true_positive_count ?? 0;
+  const predicted = quality.evaluable_predicted_edge_count ?? 0;
+  const reference = quality.reference_edge_count ?? 0;
+  return [
+    [hasGroundTruth ? "可验证边真实准确率（P）" : "可验证边规则准确率（P）", fmtPct(quality.reference_edge_precision), hasGroundTruth ? `${matched}/${predicted} 条构建边匹配独立 GT` : `${matched}/${predicted} 条可验证构建边与确定性参考规则一致`, true],
+    [hasGroundTruth ? "可验证边真实召回率（R）" : "可验证边规则召回率（R）", fmtPct(quality.reference_edge_recall), hasGroundTruth ? `${matched}/${reference} 条独立 GT 关系被构建` : `${matched}/${reference} 条确定性参考关系被构建`, true],
+    [hasGroundTruth ? "可验证边真实 F1" : "可验证边规则 F1", fmtPct(quality.reference_edge_f1), hasGroundTruth ? "独立 GT 下准确率和召回率的综合指标" : "基于源字段和建图规则的工程回归指标，不代表独立人工真值", true],
+    ["节点来源可追溯率", fmtPct(quality.node_source_traceability_rate), `${quality.total_nodes ?? 0} 个节点都有来源；不代表内容或关系一定正确`, true],
+  ];
+}
+function graphQualityDiagnosticRows() {
+  const quality = graphQuality.value;
+  if (!quality?.available) return [];
+  return [
+    ["源字段规则一致率（内部诊断）", quality.source_consistency_precision == null ? "-" : `${fmtPct(quality.source_consistency_precision)} / ${fmtPct(quality.source_consistency_recall)}`, `${quality.source_consistency_true_positive_count ?? 0}/${quality.source_consistency_reference_edge_count ?? 0}，与上方规则 P/R 同源`],
+    ["节点连接率", fmtPct(quality.node_connected_rate), `${quality.connected_nodes ?? 0}/${quality.total_nodes ?? 0} 个节点至少连接一条边`],
+    ["有效边率", fmtPct(quality.valid_edge_rate), `${quality.valid_edges ?? 0}/${quality.total_edges ?? 0} 条边通过端点、时序和字段校验`],
+    ["边证据支持率", fmtPct(quality.edge_evidence_support_rate), `${quality.supported_edges ?? 0}/${quality.total_edges ?? 0} 条边的证据字段能找到支持；不是独立真值准确率`],
+    ["边一致性率", fmtPct(quality.edge_consistency_rate), `${quality.consistent_edges ?? 0}/${quality.total_edges ?? 0} 条边通过端点、时间顺序和关系语义约束`],
+    ["重复边率", fmtPct(quality.duplicate_edge_rate), `${quality.duplicate_edges ?? 0} 条重复边 / ${quality.total_edges ?? 0} 条边`],
+    ["不可验证边占比", quality.total_edges ? fmtPct((quality.unverifiable_edge_count ?? 0) / quality.total_edges) : "-", "语义相似、因果等暂无独立参考真值的边，不混入真实性分数"],
+  ];
+}
+function graphIdentityRows() {
+  const identity = graphQuality.value?.face_clustering;
+  if (!identity?.available) return [];
+  const gallery = identity.identity_gallery_available === true;
+  const inclusive = identity.image_identity_link_available === true;
+  const diagnostics = Number(identity.metric_definition_version) >= 2
+    ? [
+      [gallery ? "身份库 GT 图像覆盖率" : (inclusive ? "GT 标注图像资产覆盖率" : "单身份 GT 图片资产覆盖率"), fmtPct(gallery ? (identity.identity_gallery_gt_asset_count / Math.max(1, identity.gt_single_image_count + identity.gt_multi_identity_image_count)) : (inclusive ? identity.image_identity_link_asset_coverage_rate : identity.asset_name_coverage_rate)),
+        gallery
+          ? `${identity.identity_gallery_gt_asset_count ?? 0}/${(identity.gt_single_image_count ?? 0) + (identity.gt_multi_identity_image_count ?? 0)} 张 GT 图像进入身份库评估`
+          : inclusive
+            ? `${identity.image_identity_link_gt_asset_count ?? 0}/${(identity.gt_single_image_count ?? 0) + (identity.gt_multi_identity_image_count ?? 0)} 张 GT 按文件名存在于当前 scope`
+          : `${identity.asset_name_coverage_count ?? 0}/${identity.gt_single_image_count ?? 0} 张标注图片按文件名存在于当前 scope；缺失 ${identity.gt_assets_missing_from_scope_count ?? 0} 张`],
+      ["scope 内 GT 图片恰好单脸率", fmtPct(identity.single_face_detection_of_present_assets_rate),
+        `${identity.detected_single_face_count ?? 0}/${identity.asset_name_coverage_count ?? 0} 张；多脸 ${identity.detected_multiple_faces_count ?? 0} 张、无脸记录 ${identity.detected_zero_face_count ?? 0} 张`],
+      ["单脸样本入簇率", fmtPct(identity.single_face_clustered_rate),
+        `${identity.evaluable_face_count ?? 0}/${identity.detected_single_face_count ?? 0} 张恰好单脸 GT 已有 cluster_id`],
+      ...(gallery ? [["身份库识别图像率", fmtPct(identity.identity_gallery_identified_image_rate),
+        `${identity.identity_gallery_identified_image_count ?? 0}/${identity.identity_gallery_evaluable_image_count ?? 0} 张有至少一个已知身份命中`]] : []),
+      ...(inclusive ? [["多脸图像入簇覆盖率", fmtPct(identity.image_identity_link_clustered_image_rate),
+        `${identity.image_identity_link_clustered_image_count ?? 0}/${identity.image_identity_link_detected_image_count ?? 0} 张有检测的 GT 图像包含 cluster_id`]] : []),
+    ]
+    : [["覆盖率诊断", "待刷新", "当前是旧版快照，尚未区分相册缺图、零脸检测和多脸图；重启 PhotoBench 后会自动重算"]];
+  return [
+    [gallery ? "同一人物聚类 F1（身份库对齐）" : (inclusive ? "同一人物聚类 F1（图像级身份关联）" : "同一人物聚类 F1"), fmtPct(gallery ? identity.identity_gallery_f1 : (inclusive ? identity.image_identity_link_f1 : identity.same_person_pair_f1)), gallery
+      ? "多脸图逐框经过 seeded confirmed identity cluster 对齐后，与 GT 身份集合计算 P/R/F1"
+      : inclusive
+        ? "多脸图通过 GT 身份集合与跨图共享 cluster 评估，不进行未经标注支持的逐框配对"
+      : "准确率和召回率的综合指标", true],
+    [gallery ? "同一人物聚类准确率（身份库）" : (inclusive ? "同一人物聚类准确率（图像级）" : "同一人物聚类准确率"), fmtPct(gallery ? identity.identity_gallery_precision : (inclusive ? identity.image_identity_link_precision : identity.same_person_pair_precision)),
+      gallery ? "身份库命中的身份中，属于该 GT 图片真实人物的比例" : (inclusive ? "预测共享 cluster 的图像对中，GT 确实共享人物的比例" : "聚到一起的脸对中，真实同人的比例"), true],
+    [gallery ? "不同人物识别错误率" : (inclusive ? "不同人物图像错误合并率" : "不同人物错误合并率"), fmtPct(gallery ? (identity.identity_gallery_false_positive_count / Math.max(1, identity.identity_gallery_true_positive_count + identity.identity_gallery_false_positive_count)) : (inclusive ? (identity.image_identity_link_false_positive_count / Math.max(1, identity.image_identity_link_true_positive_count + identity.image_identity_link_false_positive_count)) : identity.false_merge_rate)),
+      gallery ? "身份库命中的身份不在该 GT 图片身份集合中的比例" : (inclusive ? "GT 不共享人物但被同一 cluster 连接的图像对比例" : "聚到一起的脸对中，实际不同人的比例"), true],
+    [gallery ? "同一人物聚类召回率（身份库）" : (inclusive ? "同一人物聚类召回率（图像级）" : "同一人物聚类召回率"), fmtPct(gallery ? identity.identity_gallery_recall : (inclusive ? identity.image_identity_link_recall : identity.same_person_pair_recall)),
+      gallery ? "GT 身份集合中的人物被检测并正确落入身份库 cluster 的比例" : (inclusive ? "GT 共享人物的图像对中，成功通过 cluster 连接的比例" : "真实同人的脸对中，成功聚到一起的比例"), true],
+    ...(inclusive && identity.same_person_pair_f1 != null ? [["严格单脸 pairwise F1", fmtPct(identity.same_person_pair_f1), `仅 ${identity.evaluable_face_count ?? 0} 张无歧义单脸样本`]] : []),
+    ...diagnostics,
+  ];
+}
+function graphQuestionTypeRows() {
+  const rows = effectiveRunSummary(activeRun.value).graph_qa_by_type;
+  return Array.isArray(rows) ? rows : [];
+}
+function graphEdgeTypeSummary() {
+  const counts = graphQuality.value?.edge_type_counts;
+  if (!counts || typeof counts !== "object") return "未记录";
+  const entries = Object.entries(counts).filter(([, count]) => Number(count) > 0);
+  return entries.length ? entries.map(([type, count]) => `${type} ${count}`).join(" · ") : "未记录";
+}
+function graphEvaluableEdgeSummary() {
+  const counts = graphQuality.value?.evaluable_edge_subtype_counts;
+  if (!counts || typeof counts !== "object") return "未记录";
+  const labels = { SHARES_RELATION: "共享关系", MENTIONS_OBJECT: "对象提及", TIME_PRECEDES: "时间先后",
+    CLIP_CONTAINS: "片段包含", VIDEO_CONTAINS: "视频包含", MENTIONS_PERSON: "人物提及",
+    OCCURRED_AT: "地点", CAPTURED_ON: "日期" };
+  const entries = Object.entries(counts).filter(([, count]) => Number(count) > 0);
+  return entries.length ? entries.map(([type, count]) => `${labels[type] || type} ${count}`).join(" · ") : "未记录";
+}
+function graphQualityUnavailableText() {
+  const quality = graphQuality.value;
+  if (graphQualityLoading.value || quality?.status === "computing" || quality?.reason === "snapshot_in_progress") {
+    return "图结构快照正在生成，完成后会自动显示统计。";
+  }
+  return quality?.reason ? `暂无可用图结构快照：${quality.reason}` : "该运行暂无可用图结构快照。";
+}
+async function loadGraphQuality() {
+  const runId = activeRunId.value;
+  if (!runId) { graphQuality.value = null; return; }
+  if (graphQualityCache.has(runId)) {
+    graphQuality.value = graphQualityCache.get(runId);
+    return;
+  }
+  if (graphQualityRequests.has(runId)) return graphQualityRequests.get(runId);
+  if ((graphQualityRetryAt.get(runId) || 0) > Date.now()) return;
+  graphQualityLoading.value = true;
+  const request = (async () => {
+    try {
+      // Graph memory is a mutable shared index. Ask PhotoBench for the
+      // run-bound snapshot instead of auditing whichever scope was built last.
+      const payload = await api(`/api/runs/${encodeURIComponent(runId)}/graph-quality`);
+      if (payload?.status === "computing") {
+        // The backend single-flights this expensive snapshot. Avoid hammering
+        // it on every progress poll while the one calculation is in flight.
+        // A completed run does not keep the normal progress poll alive, so
+        // schedule one bounded retry here as well. Otherwise a first request
+        // that sees `snapshot_in_progress` leaves the graph QA and face
+        // quality panels permanently empty until the user reselects the run.
+        graphQualityRetryAt.set(runId, Date.now() + 5000);
+        window.setTimeout(() => {
+          if (!destroyed && activeRunId.value === runId) loadGraphQuality();
+        }, 5100);
+      } else {
+        graphQualityCache.set(runId, payload);
+        graphQualityRetryAt.delete(runId);
+      }
+      if (activeRunId.value === runId) graphQuality.value = payload;
+    } catch (error) {
+      graphQualityRetryAt.set(runId, Date.now() + 5000);
+      if (activeRunId.value === runId) graphQuality.value = { available: false, reason: error.message };
+    } finally {
+      graphQualityRequests.delete(runId);
+      if (activeRunId.value === runId) graphQualityLoading.value = false;
+    }
+  })();
+  graphQualityRequests.set(runId, request);
+  return request;
 }
 function itemCallMetrics(item) {
   return Array.isArray(item?.model_call_metrics)
@@ -2232,7 +2411,9 @@ function pipelineMetricRows(phase = {}) {
 
 async function loadRuns(page = runPage.value.page || 1) {
   const payload = await api(`/api/runs?page=${Math.max(1, Number(page) || 1)}&page_size=${runPage.value.page_size}`, {
-    timeoutMs: 8000,
+    // Historical runs may need to read persisted summaries on a cold start.
+    // An 8s abort made the entire dashboard appear empty during that read.
+    timeoutMs: 30000,
     retries: 2,
   });
   runs.value = payload.runs || [];
@@ -2263,7 +2444,10 @@ async function loadQaPage(page = qaPage.value.page || 1) {
   const runId = activeRunId.value;
   const params = new URLSearchParams({ page: String(page), page_size: String(qaPageSize.value) });
   Object.entries(qaFilters).forEach(([key, value]) => { if (value) params.set(key, value); });
-  const payload = await api(`/api/runs/${encodeURIComponent(runId)}/items?${params}`);
+  // Large historical runs can contend with the parallel keyframe/memory
+  // summaries during initial load. Keep the item request alive so a healthy
+  // evaluator does not leave the QA browser falsely showing zero results.
+  const payload = await api(`/api/runs/${encodeURIComponent(runId)}/items?${params}`, { timeoutMs: 60000 });
   if (activeRunId.value !== runId) return;
   qaPage.value = payload;
   const refreshDetails = [];
@@ -2314,6 +2498,12 @@ async function loadActiveRun({ resetPage = false } = {}) {
   if (activeRunId.value !== runId) return;
   activeRun.value = payload;
   const fallbackSummary = effectiveRunSummary(activeRun.value);
+  // The detailed report already contains the run-bound metric snapshot.
+  // Show it immediately, even if unrelated QA/trace requests are slow.
+  graphQuality.value = fallbackSummary.graph_quality?.available
+    ? fallbackSummary.graph_quality
+    : (graphQualityCache.get(runId) || null);
+  void loadGraphQuality();
   runs.value = runs.value.map((run) => run.run_id === activeRunId.value
     ? { ...run, summary: { ...(run.summary || {}), ...fallbackSummary } }
     : run);
@@ -2379,6 +2569,7 @@ function scrollToRunDetail() {
 function selectRun(run) {
   activeRunId.value = run.run_id;
   activeRun.value = { ...run };
+  graphQuality.value = graphQualityCache.get(run.run_id) || null;
   scrollToRunDetail();
   void loadActiveRun({ resetPage: true }).catch((err) => {
     if (activeRunId.value === run.run_id) error.value = err.message || "读取评测详情失败";
@@ -2564,12 +2755,11 @@ const startDisabledReason = computed(() => {
 });
 const modeLabel = (mode) => (({ full: "全链路", reuse: "复用测评", build: "构建相册" })[mode || "full"] || mode);
 const modeBadgeClass = (mode) => (({ full: "mode-full", reuse: "mode-reuse", build: "mode-build" })[mode || "full"] || "mode-full");
-function exportTraces() {
+function exportSftTraces() {
   if (!activeRunId.value) return;
   const scores = exportScores.value;
   if (!scores.length) { window.alert("请至少勾选一个评分再导出"); return; }
-  // 每题只含两项：planner 完整输入/输出 + 完整轨迹
-  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-trace?scores=${scores.join(",")}`, "_blank");
+  window.open(`/api/runs/${encodeURIComponent(activeRunId.value)}/export-sft?scores=${scores.join(",")}`, "_blank");
 }
 async function saveJudgePrompt() {
   const prompt = rejudgePrompt.value.trim();
@@ -2748,20 +2938,27 @@ async function init() {
     judgeProviderId.value = runtimeConfig.judge_provider_id || config.value.default_judge_provider_id || (config.value.judge_providers?.[0]?.id || "");
     connectionConfigState.value = "saved";
     connectionConfigMessage.value = "已读取配置文件";
-    const [, manifestPayload] = await Promise.all([
+    const [, manifestResult, runsResult] = await Promise.allSettled([
       loadJudgePrompts(),
       api("/api/manifests"),
       loadRuns(1),
       vllmManagerUrl.value.trim() ? loadProfiles() : Promise.resolve(),
     ]);
-    manifests.value = manifestPayload.manifests || [];
-    current = runs.value.find((run) => ["running", "pending"].includes(run.status));
+    if (manifestResult.status === "fulfilled") manifests.value = manifestResult.value.manifests || [];
+    const startupErrors = [];
+    if (manifestResult.status === "rejected") startupErrors.push(manifestResult.reason?.message || "读取数据集失败");
+    if (runsResult.status === "rejected") startupErrors.push(runsResult.reason?.message || "读取测评记录失败");
+    if (startupErrors.length) error.value = startupErrors.join("；");
+    // Keep the newest completed report selected, including runs with errors:
+    // their saved graph/face/QA metrics are still inspectable.
+    current = runs.value.find((run) => ["running", "pending"].includes(run.status))
+      || runs.value.find((run) => ["completed", "completed_with_errors"].includes(run.status));
   } catch (e) { error.value = e.message; } finally { loading.value = false; }
   if (modelEndpoint.value.trim()) void loadCurrentModel({ openPopover: false });
   if (current) {
     activeRunId.value = current.run_id;
-    void loadActiveRun({ resetPage: true });
-    startPolling();
+    void loadActiveRun({ resetPage: true }).catch((e) => { error.value = e.message || "读取测评详情失败"; });
+    if (["running", "pending"].includes(current.status)) startPolling();
   }
   if (await loadArbiterStatus()) arbiterTimer = window.setInterval(loadArbiterStatus, 3000);
 }
@@ -2787,7 +2984,7 @@ async function loadQaBrowser() {
   finally { qaBrowserLoading.value = false; }
 }
 function qaTypeLabel(t) {
-  return ({event_memory_qa:"事件记忆",single_evidence_memory_qa:"单图证据",relationship_qa:"关系问答",multi_turn_clarify:"多轮澄清",multi_turn_disambiguation:"多轮消歧",ambiguous_retrieval:"模糊检索",evidence_insufficient:"证据不足",unsupported_retrieval:"无依据检索",instruction_injection:"指令注入",prompt_injection:"提示注入",data_exfiltration:"数据泄露",authority_impersonation:"权限伪造",mixed_injection:"混合注入",indirect_injection:"间接注入",jailbreak_attempt:"越狱尝试"}[t]) || t || "未分类";
+  return ({event_memory_qa:"事件记忆",single_evidence_memory_qa:"单图证据",relationship_qa:"关系问答",multi_hop:"多跳/因果",multi_turn_clarify:"多轮澄清",multi_turn_disambiguation:"多轮消歧",ambiguous_retrieval:"模糊检索",evidence_insufficient:"证据不足",unsupported_retrieval:"无依据检索",instruction_injection:"指令注入",prompt_injection:"提示注入",data_exfiltration:"数据泄露",authority_impersonation:"权限伪造",mixed_injection:"混合注入",indirect_injection:"间接注入",jailbreak_attempt:"越狱尝试"}[t]) || t || "未分类";
 }
 function qaActionBadge(a) {
   return ({answer:"回答",refuse:"拒答",clarify:"澄清"}[a]) || a || "-";
@@ -2925,7 +3122,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <div v-if="currentModelInfo && currentModelPopoverOpen" class="current-model-popover" role="status" aria-live="polite">
               <span class="popover-arrow"></span>
               <div class="current-model-popover-head"><span>MODEL ENDPOINT</span><button type="button" aria-label="关闭" @click="currentModelPopoverOpen = false">×</button></div>
-              <strong>{{ currentModelInfo.served_model_name || `${(currentModelInfo.served_models || []).length} 个模型待选择` }}</strong>
+              <strong>{{ currentModelInfo.served_model_name ? modelDisplayName(currentModelInfo.served_model_name) : `${(currentModelInfo.served_models || []).length} 个模型待选择` }}</strong>
               <div class="current-model-status"><i></i>{{ currentModelInfo.manager_available ? '已读取 Manager 当前运行状态' : '已连接 OpenAI-compatible 端点' }}</div>
               <dl>
                 <div><dt>模型服务</dt><dd>{{ currentModelInfo.model_base_url }}</dd></div>
@@ -2952,13 +3149,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
             <label class="endpoint-model-select">可用模型
               <select v-model="selectedEndpointModel" :disabled="!endpointModels.length" @change="onEndpointModelChange">
                 <option value="">{{ endpointModels.length ? '请选择模型' : '先获取模型列表' }}</option>
-                <option v-for="model in endpointModels" :key="model" :value="model">{{ model }}</option>
+                <option v-for="model in endpointModels" :key="model" :value="model">{{ modelDisplayName(model) }}</option>
               </select>
             </label>
             <button class="btn ghost compact endpoint-test-button" type="button" :disabled="!selectedEndpointModel || modelTestState === 'testing'" @click="testEndpointModel">{{ modelTestState === 'testing' ? '测试中…' : '测试 POST' }}</button>
             <span v-if="modelTestMessage" class="model-test-feedback" :class="`state-${modelTestState}`">{{ modelTestMessage }}</span>
             <label class="check endpoint-reuse-check" :class="{ active: selectedModels.has('__current__') }">
-              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ selectedEndpointModel }}，不启停）</span>
+              <input type="checkbox" :checked="selectedModels.has('__current__')" :disabled="!selectedEndpointModel || !currentModelInfo?.served_model_name" @change="setModelSelected('__current__', $event.target.checked)" />复用所选模型<span v-if="selectedEndpointModel">（{{ modelDisplayName(selectedEndpointModel) }}，不启停）</span>
             </label>
           </div>
           <div class="model-picker cloud-model-picker">
@@ -3025,8 +3222,8 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <span class="phase-status" :class="run.status">{{ statusLabel(run.status) }}</span>
 </td>
 <td>{{ runProgressLabel(run) }}</td>
-<td>{{ fmtPct(run.summary?.media_retrieval_recall_macro ?? run.summary?.retrieval_recall_macro ?? run.summary?.retrieval_recall_mean) }}</td>
-<td>{{ run.summary?.answer_quality_mean ?? "-" }}</td>
+<td :title="run.status === 'running' && run.summary?.live_preview ? '阶段性指标：仅基于目前已完成的题目，任务结束后以最终汇总为准' : ''">{{ fmtPct(run.summary?.media_retrieval_recall_micro ?? run.summary?.retrieval_recall_micro) }}</td>
+<td :title="run.status === 'running' && run.summary?.live_preview ? '阶段性指标：仅统计目前已有 Judge 评分的题目，任务结束后以最终汇总为准' : ''">{{ run.summary?.answer_quality_mean ?? "-" }}</td>
 <td>
 <button class="btn danger compact" @click.stop="deleteRun(run)">删除</button>
 </td>
@@ -3050,7 +3247,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
               <label class="checkbox-inline"><input type="checkbox" value="1" v-model="exportScores">1 分</label>
               <label class="checkbox-inline"><input type="checkbox" value="2" v-model="exportScores">2 分</label>
             </span>
-            <button class="btn compact" @click="exportTraces" title="每题导出 planner 完整输入/输出 + 完整轨迹">导出轨迹 JSON</button>
+            <button class="btn compact" @click="exportSftTraces">导出 SFT JSON</button>
           </div>
         </div>
       </div>
@@ -3127,7 +3324,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </article>
 </div>
-      <h3 class="result-heading">关键指标</h3>
+      <h3 class="result-heading">关键指标 <a class="graph-metric-shortcut" href="#graph-quality-section">查看人脸聚类、可验边、图效果与分题型 QA ↓</a></h3>
       <div class="phase-list key-metric-list">
         <article v-for="row in keyMetricRows(activeRun)" :key="row.label" class="phase-card key-metric-card">
           <div class="phase-title"><b>{{ row.label }}</b></div>
@@ -3357,7 +3554,7 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 </div>
 </div>
 </details>
-        <details class="phase-card result-phase-card aggregate-result-card">
+        <details open class="phase-card result-phase-card aggregate-result-card">
 <summary class="phase-title">
 <b>指标汇总</b>
 <span class="phase-status" :class="resultPhaseStatus(activeRun.phases?.aggregate)">{{ statusLabel(resultPhaseStatus(activeRun.phases?.aggregate)) }}</span>
@@ -3383,6 +3580,73 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
 <small>{{ row[2] }}</small>
 </div>
 </div>
+</div>
+<div id="graph-quality-section" class="token-distribution-section graph-quality-section">
+<div class="phase-title">
+<b>可验证边指标（规则参考 / 独立 GT）</b>
+<span class="muted small" v-if="graphQuality?.available">{{ graphQuality.total_nodes }} 节点 · {{ graphQuality.total_edges }} 条边</span>
+<span class="muted small" v-else>{{ graphQualityLoading || graphQuality?.status === 'computing' ? '图结构快照生成中…' : '暂无可用快照' }}</span>
+</div>
+<p class="metric-calc-time">可验证边按确定性规则筛选；有独立人工/外部 GT 时显示真实 P/R/F1，否则显示源字段规则参考 P/R/F1，用于建图回归检查。</p>
+<div v-if="graphQuality?.available" class="graph-quality-group">
+<div class="graph-quality-group-title"><b>可验证边 P/R/F1</b><span>{{ graphQuality.reference_edge_ground_truth_available === true ? '独立关系 GT' : '确定性规则参考' }}</span></div>
+<div class="token-distribution-grid graph-quality-primary-grid">
+<div v-for="row in graphQualityPrimaryRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<span>{{ row[0] }}</span>
+<strong>{{ row[1] }}</strong>
+<small>{{ row[2] }}</small>
+</div>
+</div>
+</div>
+<div v-if="graphQuality?.available" class="graph-quality-group graph-quality-diagnostic-group">
+<div class="graph-quality-group-title"><b>结构健康（用于定位图的缺陷，不等同真实性）</b><span>全量规则检查</span></div>
+<div class="token-distribution-grid">
+<div v-for="row in graphQualityDiagnosticRows()" :key="row[0]" class="phase-metric">
+<span>{{ row[0] }}</span>
+<strong>{{ row[1] }}</strong>
+<small>{{ row[2] }}</small>
+</div>
+</div>
+</div>
+<div v-if="graphQuality?.available && graphIdentityRows().length" class="graph-quality-group graph-quality-diagnostic-group">
+<div class="graph-quality-group-title"><b>人脸身份聚类质量</b><span>{{ graphQuality.face_clustering.identity_gallery_available ? '身份库对齐 · 支持多脸' : (graphQuality.face_clustering.image_identity_link_available ? '多脸图像级身份关联 · pairwise' : (Number(graphQuality.face_clustering.metric_definition_version) >= 2 ? '严格单脸子集 · pairwise' : '旧版口径 · 等待刷新')) }}</span></div>
+<div class="token-distribution-grid graph-quality-primary-grid">
+<div v-for="row in graphIdentityRows()" :key="row[0]" :class="['phase-metric', { 'priority-metric': row[3] }]">
+<span>{{ row[0] }}</span>
+<strong>{{ row[1] }}</strong>
+<small>{{ row[2] }}</small>
+</div>
+</div>
+<p class="metric-calc-time">{{ graphQuality.face_clustering.identity_gallery_available ? '当前主指标使用身份库对齐：检测框通过评测开始前 seeded 的 confirmed identity cluster 映射到身份 ID，再与每张图的 GT 身份集合计算多脸 P/R/F1；未知脸不计为已知身份，GT 不反向参与聚类。' : (graphQuality.face_clustering.image_identity_link_available ? '当前主指标使用图像级身份关联：GT 只提供每张图的身份集合，因此多脸图通过“GT 身份集合是否相交”与“检测 cluster 集合是否相交”计算跨图同人链接；不会伪造逐框对应。严格单脸 pairwise 作为辅助诊断，资产缺失、零脸、多脸和未入簇分别统计。' : (Number(graphQuality.face_clustering.metric_definition_version) >= 2 ? '当前是严格单脸口径：只纳入单身份标注、恰好一张检测脸且已入簇的可对齐样本；多脸图不猜测框与身份的对应关系。' : '当前是旧版缓存指标：请重启 PhotoBench 后自动重算。')) }}</p>
+</div>
+<p v-if="graphQuality?.available" class="metric-calc-time">参考关系 {{ graphQuality.reference_edge_count ?? 0 }} 条 · 已构建可验证边 {{ graphQuality.evaluable_predicted_edge_count ?? 0 }} 条（{{ graphEvaluableEdgeSummary() }}） · 未纳入 P/R/F1 {{ graphQuality.unverifiable_edge_count ?? 0 }} 条。</p>
+<div v-if="graphQuestionTypeRows().length" class="graph-quality-type-wrap">
+<div class="phase-title graph-quality-subtitle">
+<b>按问题类型的图记忆 QA 表现</b>
+<span class="muted small">全量题目分桶 · {{ effectiveRunSummary(activeRun).graph_qa_metric_scope === 'end_to_end_retrieval_chain' ? '整条检索链路' : '历史记录' }}</span>
+</div>
+<p class="metric-calc-time">检索 P/R/F1 与回答质量按评测元数据分组统计；“图效果”只显示同一题加入图重排后，对媒体 GT 召回的实际变化。</p>
+<div class="call-table-wrap">
+<table class="call-table graph-quality-type-table">
+<thead><tr><th>问题类型</th><th>题数</th><th>图路由</th><th>图效果</th><th>检索 Recall</th><th>检索 Precision</th><th>检索 F1</th><th>回答质量</th><th>证据支持率</th></tr></thead>
+<tbody>
+<tr v-for="row in graphQuestionTypeRows()" :key="row.type">
+<td>{{ row.label }}</td>
+<td>{{ row.sample_count }}<span class="muted small">（{{ row.retrieval_metric_count }} 题有媒体 GT）</span></td>
+<td>{{ row.graph_routed_count ? `${row.graph_enabled_count}/${row.graph_routed_count}` : '-' }}<span class="muted small" v-if="row.graph_intents">{{ Object.keys(row.graph_intents).join('、') }}</span></td>
+<td v-if="row.graph_effect_count"><span :class="row.graph_gt_improved_count > row.graph_gt_worsened_count ? 'metric-good' : 'muted'">召回 {{ fmtSignedPct(row.graph_recall_delta) }}</span><span class="muted small"> · 提升 {{ row.graph_gt_improved_count }} 题<template v-if="row.graph_gt_worsened_count">，降低 {{ row.graph_gt_worsened_count }} 题</template> · 重排 {{ row.graph_rank_changed_count ?? 0 }} 题<template v-if="row.graph_candidate_set_changed_count"> · 候选集变化 {{ row.graph_candidate_set_changed_count }} 题</template></span></td>
+<td v-else>-</td>
+<td>{{ fmtPct(row.retrieval_recall) }}</td>
+<td>{{ fmtPct(row.retrieval_precision) }}</td>
+<td>{{ fmtPct(row.retrieval_f1) }}</td>
+<td>{{ row.answer_quality_mean == null ? '-' : `${row.answer_quality_mean} / 2` }}<span class="muted small">（{{ row.judge_valid_count }}）</span></td>
+<td>{{ fmtPct(row.evidence_supported_rate) }}<span class="muted small" v-if="row.evidence_valid_count">（{{ row.evidence_valid_count }}）</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p v-if="!graphQuality?.available" class="qa-performance-empty">{{ graphQualityUnavailableText() }}</p>
 </div>
 </details>
         <details v-if="deliveryBreakdown()" class="phase-card result-phase-card">
@@ -3478,17 +3742,6 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                 <span v-if="itemDetail(summary).answerability">{{ itemDetail(summary).answerability }}</span>
                 <span v-for="tag in itemDetail(summary).tags || []" :key="tag" class="qa-run-tag">{{ tag }}</span>
               </div>
-              <section class="qa-layer-chain">
-                <div class="qa-layer-chain-head"><strong>本题证据链</strong><span>关键帧若存在，显示为 L0 媒体；不会直接标成 L2 事件</span></div>
-                <div class="qa-layer-chain-row">
-                  <div v-for="(node, nodeIndex) in itemLayerChain(itemDetail(summary))" :key="node.key" class="qa-layer-node-wrap">
-                    <div class="qa-layer-node" :class="`qa-layer-node-${node.status}`">
-                      <b>{{ node.key }}</b><strong>{{ node.name }}</strong><span>{{ node.detail }}</span><em>{{ node.evidence }}</em>
-                    </div>
-                    <i v-if="nodeIndex < itemLayerChain(itemDetail(summary)).length - 1" class="qa-layer-arrow" aria-hidden="true">→</i>
-                  </div>
-                </div>
-              </section>
               <section v-if="conversationTurns(itemDetail(summary)).length > 1" class="result-conversation-card">
                 <header class="result-conversation-head">
                   <div><small>MULTI-TURN CONVERSATION</small><strong>同一个多轮对话样本</strong><span>{{ conversationTurns(itemDetail(summary)).length }} 轮按顺序执行，后续轮次复用同一会话上下文</span></div>
@@ -3525,11 +3778,11 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                     <span><small>JSON 解析</small><b>{{ itemParseRate(itemDetail(summary)) }}</b></span>
                     <span><small>步数内完成</small><b>{{ completionLabel(itemDetail(summary)) }}</b></span>
                   </div>
-                  <h4>工具召回图片（{{ toolRecallMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in toolRecallMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!toolRecallMedia(itemDetail(summary)).length" class="muted small">检索未返回可识别媒体</span></div>
-                  <h4>模型使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`used-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">回答依据图片为空（模型未选择交付图）</span></div>
-                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多使用图片（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`used-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata" @loadedmetadata="pauseVideoAtEvidenceFrame(media, $event)"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
+                  <h4>模型召回媒体（{{ itemMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemMedia(itemDetail(summary)).length" class="muted small">模型没有返回可识别的媒体</span></div>
+                  <h4>回答来源媒体（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`evidence-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
+                  <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`evidence-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>

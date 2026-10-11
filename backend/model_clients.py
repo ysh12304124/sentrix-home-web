@@ -16,6 +16,22 @@ from .runtime_providers import OpenAICompatibleInferenceProvider, normalize_open
 from .platform_profile import profile
 
 
+def cap_output_tokens_for_estimated_room(requested_tokens, estimated_room, *, minimum_tokens=128):
+    """Soft-cap generation by a heuristic context estimate without starving JSON output.
+
+    The tokenizer/server-side preflight remains the authoritative limit. A rough
+    character estimate can be pessimistic for Chinese tool traces; allowing only
+    one token produces malformed JSON even when the real context has ample room.
+    """
+    requested = max(1, int(requested_tokens))
+    minimum = max(1, min(requested, int(minimum_tokens)))
+    try:
+        room = int(estimated_room)
+    except (TypeError, ValueError):
+        return requested
+    return min(requested, max(minimum, room))
+
+
 def align_face_crop(image, bbox, landmarks=None):
     """Return an RGB AdaFace input, using InsightFace's five-point alignment when available."""
     from PIL import Image
@@ -124,6 +140,30 @@ def parse_json_response(value):
             except json.JSONDecodeError:
                 pass
     return {}
+
+
+def parse_partial_image_observation(value):
+    """Recover complete leading visual strings from a truncated image JSON.
+
+    Local VLMs may spend their output budget on OCR and omit the closing brace.
+    Keep only fully quoted, JSON-decodable descriptive strings; never recover
+    partial OCR numbers, arrays, or nested claims from an incomplete response.
+    """
+    text = str(value or "").strip()
+    if not text.startswith("{"):
+        return {}
+    recovered = {}
+    for key in ("caption", "activity", "place", "event_type"):
+        match = re.search(r'"' + key + r'"\s*:\s*("(?:\\.|[^"\\])*")', text, re.DOTALL)
+        if not match:
+            continue
+        try:
+            decoded = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, str) and decoded.strip():
+            recovered[key] = decoded.strip()
+    return recovered
 
 
 def as_list(value):
@@ -339,7 +379,10 @@ class OllamaBackend:
                 "num_predict": vision_options["num_predict"],
             })
         try:
-            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response = httpx.post(
+                f"{self._base_url}/api/chat", json=payload, timeout=self.timeout,
+                trust_env=False,
+            )
             response.raise_for_status()
             data = response.json()
             return data.get("message", {}).get("content", "")
@@ -352,7 +395,12 @@ class OllamaBackend:
             return []
         model = os.getenv("SENTRIX_TEXT_EMBED_MODEL", self._model)
         try:
-            response = httpx.post(f"{self._base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout)
+            response = httpx.post(
+                f"{self._base_url}/api/embed",
+                json={"model": model, "input": [str(text)]},
+                timeout=self.timeout,
+                trust_env=False,
+            )
             response.raise_for_status()
             payload = response.json()
             embeddings = payload.get("embeddings") or []
@@ -554,6 +602,12 @@ class GammaClient:
         )
         self.manager_url = str(manager_setting or "").strip().rstrip("/")
         self._call_metrics_local = threading.local()
+        # A non-default role can route to a different OpenAI-compatible
+        # endpoint even when the primary backend is Ollama.  Cache those
+        # providers too: creating one per turn recreates httpx/SSL transports
+        # in executor threads and can terminate the Windows API process.
+        self._inference_providers = {}
+        self._inference_provider_lock = threading.RLock()
         # --- E2B facade wiring (before per-role setup) ---
         _init_timeout = timeout or float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
         _init_keep_alive = keep_alive if keep_alive is not None else os.getenv("OLLAMA_KEEP_ALIVE", "0")
@@ -639,13 +693,18 @@ class GammaClient:
         endpoint_base = normalize_openai_base_url(endpoint_base)
         if self.inference_provider and self.inference_provider.base_url == endpoint_base:
             return self.inference_provider
-        return OpenAICompatibleInferenceProvider(
-            endpoint_base,
-            api_key=self.api_key,
-            api_mode=self.api_mode,
-            manager_url=self.manager_url,
-            timeout=self.timeout,
-        )
+        with self._inference_provider_lock:
+            provider = self._inference_providers.get(endpoint_base)
+            if provider is None:
+                provider = OpenAICompatibleInferenceProvider(
+                    endpoint_base,
+                    api_key=self.api_key,
+                    api_mode=self.api_mode,
+                    manager_url=self.manager_url,
+                    timeout=self.timeout,
+                )
+                self._inference_providers[endpoint_base] = provider
+            return provider
 
     _CACHE_TTL_SECONDS = 5.0
 
@@ -765,7 +824,11 @@ class GammaClient:
         if budget:
             prompt_tokens = int(budget["prompt_tokens"])
             max_model_len = int(budget["max_model_len"])
-            available_output_tokens = max_model_len - prompt_tokens
+            # The tokenizer endpoint can differ slightly from the model's
+            # multimodal chat template. Keep a small margin instead of
+            # requesting the exact remaining boundary, which vLLM may reject.
+            context_safety_margin = 16
+            available_output_tokens = max_model_len - prompt_tokens - context_safety_margin
             if available_output_tokens < 1:
                 metrics = {
                     "status": "context_budget_exceeded",
@@ -811,27 +874,82 @@ class GammaClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request_started = time.perf_counter()
+        budget_metrics = {
+            "requested_max_tokens": requested_max_tokens,
+            "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
+            "available_output_tokens": (
+                int(budget["max_model_len"]) - int(budget["prompt_tokens"])
+                if budget else None
+            ),
+            "max_model_len": int(budget["max_model_len"]) if budget else None,
+            "preflight_prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
+            "estimated_total_tokens": (
+                int(budget["prompt_tokens"]) + int(max_tokens)
+                if budget and max_tokens is not None else None
+            ),
+            "token_count_source": budget_source if (budget or is_cloud_api) else "response_usage",
+            "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
+            "preflight_fallback_reason": preflight_reason,
+        }
         try:
             return self._chat_openai_stream(
                 endpoint_base, payload, headers, role, model, json_mode=False,
-                budget_metrics={
-                    "requested_max_tokens": requested_max_tokens,
-                    "effective_max_tokens": int(max_tokens) if max_tokens is not None else None,
-                    "available_output_tokens": (
-                        int(budget["max_model_len"]) - int(budget["prompt_tokens"])
-                        if budget else None
-                    ),
-                    "max_model_len": int(budget["max_model_len"]) if budget else None,
-                    "preflight_prompt_tokens": int(budget["prompt_tokens"]) if budget else None,
-                    "estimated_total_tokens": (
-                        int(budget["prompt_tokens"]) + int(max_tokens)
-                        if budget and max_tokens is not None else None
-                    ),
-                    "token_count_source": budget_source if (budget or is_cloud_api) else "response_usage",
-                    "preflight_status": preflight_status if (budget or is_cloud_api) else "not_configured",
-                    "preflight_fallback_reason": preflight_reason,
-                })
+                budget_metrics=budget_metrics)
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            # The local vLLM endpoint applies the chat template after our
+            # lightweight estimate.  A long evidence/result-set context can
+            # therefore be a few hundred tokens larger than the estimate.  In
+            # that case vLLM returns the exact output room in its 400 message;
+            # retry once with that bound instead of converting an otherwise
+            # valid turn into an empty answer / unscored benchmark item.
+            retry_max_tokens = self._vllm_available_output_tokens(error)
+            current_max_tokens = payload.get("max_tokens")
+            if (retry_max_tokens is not None and isinstance(current_max_tokens, int)
+                    and 16 <= retry_max_tokens < current_max_tokens):
+                retry_payload = dict(payload)
+                retry_payload["max_tokens"] = retry_max_tokens
+                retry_metrics = dict(budget_metrics)
+                retry_metrics.update({
+                    "effective_max_tokens": retry_max_tokens,
+                    "available_output_tokens": retry_max_tokens,
+                    "preflight_status": "vllm_context_retry",
+                    "preflight_fallback_reason": "vllm_reported_context_limit",
+                })
+                try:
+                    return self._chat_openai_stream(
+                        endpoint_base, retry_payload, headers, role, model,
+                        json_mode=False, budget_metrics=retry_metrics)
+                except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as retry_error:
+                    error = retry_error
+            # A second vLLM 400 form reports that the *input itself* is above
+            # max-model-len (rather than that the requested completion is too
+            # large).  This happens after several verbose tool observations.
+            # Keep the system prompt and latest observation intact, compact
+            # older tool observations, then retry the same turn once.
+            overflow_tokens = self._vllm_input_overflow_tokens(error)
+            compacted_messages = self._compact_messages_for_vllm_context(
+                payload.get("messages") or [], overflow_tokens)
+            if compacted_messages is not None:
+                retry_payload = dict(payload)
+                retry_payload["messages"] = compacted_messages
+                # Retain the safe output cap discovered in the first retry;
+                # compacting old observations creates room for that response
+                # without returning to the original overflowing request.
+                if (retry_max_tokens is not None and isinstance(current_max_tokens, int)
+                        and 16 <= retry_max_tokens < current_max_tokens):
+                    retry_payload["max_tokens"] = retry_max_tokens
+                retry_metrics = dict(budget_metrics)
+                retry_metrics.update({
+                    "effective_max_tokens": retry_payload.get("max_tokens"),
+                    "preflight_status": "vllm_context_compaction_retry",
+                    "preflight_fallback_reason": "vllm_reported_input_overflow",
+                })
+                try:
+                    return self._chat_openai_stream(
+                        endpoint_base, retry_payload, headers, role, model,
+                        json_mode=False, budget_metrics=retry_metrics)
+                except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as retry_error:
+                    error = retry_error
             error_detail = _http_error_detail(error)
             self._record_call_metrics(role, model, endpoint_base, {
                 "status": "error",
@@ -850,6 +968,120 @@ class GammaClient:
                 "preflight_fallback_reason": preflight_reason,
             })
             raise ModelError(f"model request failed: {error_detail}") from error
+
+    @staticmethod
+    def _vllm_available_output_tokens(error) -> int | None:
+        """Extract vLLM's exact remaining generation room from a 400 body."""
+        response = getattr(error, "response", None)
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return None
+        try:
+            body = response.text
+        except Exception:
+            return None
+        # vLLM: "384 > 4501 - 4311" or "maximum context length is 4096;
+        # requested 64 output tokens with at least 4033 input tokens".
+        # Prefer the server's remaining room and leave a small template margin.
+        match = re.search(r"\b(\d+)\s*>\s*(\d+)\s*-\s*(\d+)", str(body))
+        if match:
+            available = int(match.group(2)) - int(match.group(3))
+            return max(0, available - 16)
+        context_match = re.search(r"maximum context length is\s*(\d+)", str(body), re.IGNORECASE)
+        input_match = re.search(r"(?:at least\s*)?(\d+)\s*input tokens", str(body), re.IGNORECASE)
+        if context_match and input_match:
+            available = int(context_match.group(1)) - int(input_match.group(1))
+            return max(0, available - 16)
+        return None
+
+    @staticmethod
+    def _vllm_input_overflow_tokens(error) -> int | None:
+        """Return how far a vLLM request exceeds its context window."""
+        response = getattr(error, "response", None)
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return None
+        try:
+            body = str(response.text)
+        except Exception:
+            return None
+        match = re.search(
+            r"maximum context length is\s*(\d+)\s*tokens.*?request has\s*(\d+)\s*input tokens",
+            body, re.IGNORECASE | re.DOTALL)
+        if match:
+            return max(1, int(match.group(2)) - int(match.group(1)))
+        # vLLM's common OpenAI-compatible 400 reports the requested output
+        # separately from the prompt length. A one-token total overflow can
+        # remain after reducing max_tokens because the Agent conversation is
+        # already at the context boundary. Convert that form to a prompt
+        # overflow too, so older tool observations are compacted before retry.
+        context = re.search(r"maximum context length is\s*(\d+)\s*tokens", body, re.IGNORECASE)
+        input_tokens = re.search(
+            r"(?:at least\s*)?(\d+)\s*input tokens", body, re.IGNORECASE)
+        output_tokens = re.search(r"requested\s*(\d+)\s*output tokens", body, re.IGNORECASE)
+        if context and input_tokens and output_tokens:
+            return max(1, int(input_tokens.group(1)) + int(output_tokens.group(1))
+                       - int(context.group(1)))
+        length = re.search(
+            r"input length\s*\(?\s*(\d+)\s*\)?\s*exceeds maximum context length\s*\(?\s*(\d+)",
+            body, re.IGNORECASE)
+        if length:
+            return max(1, int(length.group(1)) - int(length.group(2)))
+        return None
+
+    @staticmethod
+    def _compact_messages_for_vllm_context(messages, overflow_tokens: int | None):
+        """Shrink prior tool-result messages without removing the latest evidence."""
+        if not overflow_tokens or overflow_tokens < 1 or len(messages) < 3:
+            return None
+        compacted = [dict(message) if isinstance(message, dict) else message for message in messages]
+        changed = False
+
+        def compact_text(content, *, head: int, tail: int):
+            text = str(content or "")
+            if len(text) <= head + tail + 80:
+                return content
+            return (text[:head]
+                    + "\n[较早工具观察已压缩；保留首尾，事实以最新观察为准]\n"
+                    + text[-tail:])
+
+        # Over-compress modestly: the local estimator undercounts Chinese and
+        # model-template overhead, so a one-token server overflow may in
+        # practice require removing much more than four characters per token.
+        # Several tool observations can accumulate across a turn.
+        remaining_chars = max(2400, (int(overflow_tokens) + 256) * 6)
+        # Prefer shortening the newest tool result first if it is itself huge:
+        # protecting a 4k-character observation verbatim can leave no prompt
+        # room at all. A latest user question (non-tool message) stays intact.
+        latest_index = len(compacted) - 1
+        indexes = [latest_index, *range(1, latest_index)]
+        for index in indexes:
+            message = compacted[index]
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            is_tool_observation = role == "user" and content.lstrip().startswith("工具 ")
+            if is_tool_observation:
+                if index == latest_index:
+                    shortened = compact_text(content, head=600, tail=300)
+                else:
+                    shortened = compact_text(content, head=100, tail=80)
+            elif len(content) > 900:
+                shortened = compact_text(content, head=320, tail=140)
+            else:
+                continue
+            if shortened == content:
+                continue
+            message["content"] = shortened
+            removed = len(content) - len(shortened)
+            remaining_chars -= removed
+            changed = True
+            if remaining_chars <= 0:
+                break
+        return compacted if changed else None
 
     def _tokenize_for_budget(self, endpoint_base, messages):
         """Ask the Manager bound to this endpoint to tokenize with the active model."""
@@ -929,15 +1161,39 @@ class GammaClient:
                 "num_ctx": vision_options["num_ctx"],
                 "num_predict": vision_options["num_predict"],
             })
+        # Ollama may briefly reset/refuse the HTTP connection while loading a
+        # model or recovering from VRAM pressure.  A single transient failure
+        # must not turn the rest of a 487-question benchmark into failures.
         try:
-            response = httpx.post(f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout)
-            response.raise_for_status()
-            data = response.json()
-            text = data.get("message", {}).get("content", "")
-            self._record_validation_call(role, endpoint_base, model, json_mode, text)
-            return text
-        except (httpx.HTTPError, ValueError) as error:
-            raise ModelError(f"model request failed: {_http_error_detail(error)}") from error
+            retry_count = max(0, min(5, int(os.getenv("OLLAMA_RETRY_COUNT", "3"))))
+        except (TypeError, ValueError):
+            retry_count = 3
+        last_error = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = httpx.post(
+                    f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout,
+                    trust_env=False,
+                )
+                response.raise_for_status()
+                data = response.json()
+                text = data.get("message", {}).get("content", "")
+                self._record_validation_call(role, endpoint_base, model, json_mode, text)
+                return text
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
+                    httpx.ReadTimeout, httpx.RemoteProtocolError,
+                    httpx.PoolTimeout, httpx.WriteError, httpx.WriteTimeout) as error:
+                last_error = error
+                if attempt >= retry_count:
+                    break
+                # Short bounded backoff lets Ollama finish restarting/loading.
+                time.sleep(min(8.0, 0.75 * (2 ** attempt)))
+            except (httpx.HTTPError, ValueError) as error:
+                # HTTP 4xx/5xx and malformed payloads are deterministic; do
+                # not duplicate those requests.
+                last_error = error
+                break
+        raise ModelError(f"model request failed after retries: {_http_error_detail(last_error)}") from last_error
 
 
     def _record_call_metrics(self, role, model, endpoint, metrics):
@@ -1102,16 +1358,18 @@ class GammaClient:
         return {
             "think": False,
             "num_ctx": int(os.getenv("VISION_CORE_NUM_CTX", "4096")),
-            # The full observation contract contains caption, people, objects,
-            # clothing, relations and detail arrays.  320 tokens truncates this
-            # JSON before it can be parsed, silently producing an empty memory.
-            "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "800")),
+            # Ingestion must remain bounded.  The prompt below is deliberately
+            # compact so a 384-token JSON response retains the retrieval fields
+            # without a slow outlier monopolising the local VLM.
+            "num_predict": int(os.getenv("VISION_CORE_NUM_PREDICT", "384")),
         }
 
-    def encode_vision_image(self, path):
+    def encode_vision_image(self, path, *, max_dimension=None):
         """Downsample only the model input; the source asset remains untouched."""
         file_path = Path(path)
-        max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "896"))
+        if max_dimension is None:
+            max_dimension = int(os.getenv("VISION_CORE_MAX_DIMENSION", "768"))
+        max_dimension = max(1, int(max_dimension))
         try:
             from .image_io import ensure_heif_support, guess_mime_type
             from PIL import Image
@@ -1135,8 +1393,7 @@ class GammaClient:
         file_path = Path(path)
         encoded, mime_type = self._encode_core_image(file_path)
         prompt = """你是家庭记忆观察器。仅根据图片和元数据抽取可验证的核心观察，不猜测姓名。
-严格返回简体中文 JSON 对象，不要解释。caption、activity、place、event_type 是必须同时输出的自然语言观察字段；即使能够选择 semantic，也不能只输出 semantic 选择。画面能判断时不要留空，caption 不超过160字；activity、place、event_type 各不超过40字；people、objects、clothing、emotions、spatial_relations 尽量完整记录（分别最多12、40、12、12、40项），每项可包含不超过80字的可见细节；facts 最多8项；ocr_text 不超过1000字；确实看不清才用空数组或空字符串。
-字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts、detail。detail 用于保存不应被短摘要丢弃的可验证细节，包含 visible_details、regions、text_blocks、uncertainties 四个数组，每项写清可见内容和 confidence，不要猜测。semantic.place.primary 只能选择地点主类，details 从图片可观察的地点细节中多选；semantic.objects 是物品记录数组，每项包含 primary、label、details；semantic.atmosphere.labels 和 details 都是可观察画面氛围的多选值，不描述人物心理。
+严格返回简体中文 JSON 对象，不要解释。字段固定为：caption、activity、place、scene_type、semantic、people、objects、clothing、emotions、spatial_relations、ocr_text、event_type、facts、detail。caption 不超过100字；activity、place、event_type 各不超过30字；people 最多6项、objects 最多12项、clothing/emotions/spatial_relations 各最多6项、facts 最多4项、ocr_text 最多240字。每项只保留检索需要的短语；确实看不清才用空数组或空字符串。detail 仅保留最关键的 visible_details、regions、text_blocks、uncertainties，各最多4项。semantic.place.primary 只能选择地点主类，semantic.objects 仅保留清晰可见物体；不描述人物心理。
 地点主类只能从："""
         prompt += "、".join(PLACE_PRIMARY_TYPES)
         prompt += "；物品主类只能从："
@@ -1145,11 +1402,23 @@ class GammaClient:
         prompt += "、".join(ATMOSPHERE_PRIMARY_TYPES)
         prompt += "。facts 项仅含 subject、predicate、object、confidence。\n不要把来源成员当成画面人物，也不要推测拍摄者姓名；source_owner 只作为事件来源候选。\nmetadata: "
         prompt += json.dumps(metadata or {}, ensure_ascii=False)
-        parsed = parse_json_response(self.chat(prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
-        if not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text")) and not parsed.get("people") and not parsed.get("objects"):
+        raw_image_observation = self.chat(
+            prompt, [{"base64": encoded, "mime_type": mime_type}],
+            self._core_vision_options())
+        parsed = parse_json_response(raw_image_observation)
+        if not parsed:
+            parsed = parse_partial_image_observation(raw_image_observation)
+        if (os.getenv("SENTRIX_VISION_RECOVERY_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+                and not any(str(parsed.get(key) or "").strip() for key in ("caption", "activity", "place", "event_type", "ocr_text"))
+                and not parsed.get("people") and not parsed.get("objects")):
             recovery_prompt = """首轮图片结果只有分类或为空，请补齐可验证的自然语言观察。只根据图片，不猜测姓名，不输出坐标。
 严格返回简体中文 JSON：caption（图片中看到什么，160字内）、activity（正在发生什么，40字内）、place（语义地点描述，如家中客厅/餐厅/公园，不要GPS，40字内）、event_type（40字内）、people（最多12项）、objects（最多40项）、ocr_text（1000字内）、detail（visible_details/regions/text_blocks/uncertainties）。画面确实看不清才留空；不要只返回分类字段。"""
-            recovered = parse_json_response(self.chat(recovery_prompt, [{"base64": encoded, "mime_type": mime_type}], self._core_vision_options()))
+            raw_recovery = self.chat(
+                recovery_prompt, [{"base64": encoded, "mime_type": mime_type}],
+                self._core_vision_options())
+            recovered = parse_json_response(raw_recovery)
+            if not recovered:
+                recovered = parse_partial_image_observation(raw_recovery)
             for key in ("caption", "activity", "place", "event_type", "people", "objects", "ocr_text"):
                 if recovered.get(key) not in (None, "", []):
                     parsed[key] = recovered[key]
@@ -1203,22 +1472,52 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
         except ModelError as error:
             match = re.search(r"At most\s+(\d+)\s+image(?:\(s\))?", str(error), flags=re.IGNORECASE)
             image_limit = int(match.group(1)) if match else 0
-            if image_limit < 1 or image_limit >= len(images):
-                raise
-            if image_limit == 1:
+            if image_limit >= 1 and image_limit < len(images):
+                if image_limit == 1:
+                    evidence_indices = [0]
+                else:
+                    evidence_indices = [
+                        round(index * (len(images) - 1) / (image_limit - 1))
+                        for index in range(image_limit)
+                    ]
+                limited_images = [images[index] for index in evidence_indices]
+                retry_prompt = prompt + "\n当前模型图片上限较低，本次按时间均匀抽取了 " + str(len(limited_images)) + " 张证据图。"
+                response = self.chat(retry_prompt, limited_images, self._core_vision_options())
+            elif re.search(r"(?:input length|maximum context length|context length)", str(error), re.IGNORECASE):
+                # Qwen3-VL served with a small max-model-len can reject a
+                # single video evidence image after the chat template expands
+                # the verbose observation contract.  Keep the same evidence
+                # and semantics, but retry with a bounded contract that fits
+                # the endpoint instead of marking the video permanently failed.
+                compact_prompt = (
+                    "你是家庭视频事件观察器。仅根据按时间顺序的证据图和上下文，返回简体中文 JSON。"
+                    "描述可见人物、物品、环境和活动变化，不猜姓名，不编造事实。"
+                    "字段必须包含 caption、activity、place、scene_type、people、objects、"
+                    "event_type、facts、detail、representative_indices。"
+                    "caption不超过120字，activity/place/event_type各不超过30字，people最多10项，"
+                    "objects最多20项，facts最多6项，detail包含visible_details、regions、"
+                    "text_blocks、uncertainties四个数组，representative_indices最多3项。"
+                    "上下文：" + json.dumps({"metadata": metadata or {}, "yolo_timeline": yolo_semantics or {}}, ensure_ascii=False)
+                )
+                response = self.chat(compact_prompt, images[:1], self._core_vision_options())
                 evidence_indices = [0]
+                fallback_reason = "context_budget_compaction_retry"
             else:
-                evidence_indices = [
-                    round(index * (len(images) - 1) / (image_limit - 1))
-                    for index in range(image_limit)
-                ]
-            limited_images = [images[index] for index in evidence_indices]
-            retry_prompt = prompt + "\n当前模型图片上限较低，本次按时间均匀抽取了 " + str(len(limited_images)) + " 张证据图。"
-            response = self.chat(retry_prompt, limited_images, self._core_vision_options())
+                raise
+        def has_observable_content(value):
+            if any(str(value.get(key) or "").strip() for key in (
+                    "caption", "activity", "place", "event_type", "ocr_text")):
+                return True
+            if any(value.get(key) for key in (
+                    "people", "objects", "facts", "clothing", "spatial_relations")):
+                return True
+            detail = value.get("detail") or {}
+            return isinstance(detail, dict) and any(
+                detail.get(key) for key in (
+                    "visible_details", "regions", "text_blocks", "uncertainties"))
+
         parsed = parse_json_response(response)
-        meaningful = any(parsed.get(key) not in (None, "", []) for key in (
-            "caption", "activity", "people", "objects", "facts", "detail",
-        ))
+        meaningful = has_observable_content(parsed)
         if not meaningful and len(evidence_indices) > 3:
             selected_positions = [0, len(evidence_indices) // 2, len(evidence_indices) - 1]
             evidence_indices = [evidence_indices[index] for index in selected_positions]
@@ -1231,6 +1530,28 @@ caption 和 activity 必须由选中的证据图片直接支持，不得描述�
             response = self.chat(retry_prompt, limited_images, self._core_vision_options())
             parsed = parse_json_response(response)
             fallback_reason = "unparseable_multi_image_response"
+            meaningful = has_observable_content(parsed)
+        if not meaningful:
+            # A reported two-image limit can leave an unparseable response,
+            # which the three-image retry above cannot handle. Recover from
+            # up to two individual frames before accepting an empty index.
+            recovery_prompt = (
+                "仅根据这一帧可见画面返回简体中文 JSON，不猜测姓名或未见事件。"
+                "字段：caption（可见内容）、activity（可见动作）、place（可见环境）、"
+                "people、objects、detail（visible_details 数组）、"
+                "representative_indices（固定为 [0]）。看不清时不要编造。"
+            )
+            for source_index in dict.fromkeys((evidence_indices[0], evidence_indices[-1])):
+                recovered = parse_json_response(self.chat(
+                    recovery_prompt, [images[source_index]], self._core_vision_options()))
+                if has_observable_content(recovered):
+                    parsed = recovered
+                    evidence_indices = [source_index]
+                    fallback_reason = "single_image_recovery"
+                    meaningful = True
+                    break
+        if not meaningful:
+            raise ModelError("video event analysis produced no observable content")
         parsed["people"] = as_list(parsed.get("people"))
         parsed["objects"] = as_list(parsed.get("objects"))
         parsed["clothing"] = as_list(parsed.get("clothing"))
@@ -1636,6 +1957,9 @@ class FaceAdapter:
         self.identity_fallback = False
         self.identity_fallback_model = None
         self.identity_fallback_error = None
+        # Delegate ONNX face work to the isolated Python 3.12 sidecar when
+        # configured; the main project runtime is Python 3.13 on Windows.
+        self.sidecar_url = os.getenv("FACE_SIDECAR_URL", "").rstrip("/")
 
     @property
     def identity_configured(self):
@@ -1670,6 +1994,21 @@ class FaceAdapter:
     def detect(self, path):
         if not self.enabled:
             return []
+        if self.sidecar_url:
+            try:
+                import httpx
+                response = httpx.post(
+                    f"{self.sidecar_url}/detect",
+                    json={"path": str(path)},
+                    timeout=float(os.getenv("FACE_SIDECAR_TIMEOUT", "120")),
+                    trust_env=False,
+                )
+                response.raise_for_status()
+                self.error = None
+                return response.json().get("faces") or []
+            except Exception as error:
+                self.error = f"face sidecar: {error}"
+                return []
         try:
             import cv2
             import numpy as np
@@ -1735,16 +2074,31 @@ class FaceAdapter:
             from .face_detector import RetinaFaceTiledDetector
             if self._retina is None:
                 self._retina = RetinaFaceTiledDetector()
-                self._ensure_face_analysis()
+                # InsightFace's optional Python wrapper can crash on Windows
+                # during native initialization. RetinaFace + the bundled
+                # ArcFace ONNX model are sufficient for detection/identity;
+                # use them directly when the wrapper is unavailable.
+                try:
+                    self._ensure_face_analysis()
+                except Exception as error:
+                    self.identity_runtime_error = str(error)
+                    self._app = None
                 if self._recognition_session is None:
                     self._recognition_session = self._load_buffalo_recognition()
             if self._app is None:
                 return []
             detections = self._retina.detect(image)
             image_height, image_width = image.shape[:2]
-            min_size = int(os.getenv("FACE_MIN_SIZE", "64"))
+            # Group-photo faces are often only 32–63 px wide in the source
+            # image. The detector already runs tiled inference and SCRFD
+            # verification, so a 64px hard cutoff needlessly drops these faces.
+            min_size = int(os.getenv("FACE_MIN_SIZE", "32"))
             verified_scrfd_score = float(os.getenv("FACE_VERIFIED_SCRFD_SCORE", "0.7"))
-            verified_min_area = float(os.getenv("FACE_VERIFIED_MIN_AREA", "0.003"))
+            # Area is normalized against the *whole* photo; 0.003 rejects
+            # virtually every person in a group shot. Keep the independent
+            # SCRFD score, bbox agreement and landmark checks as safeguards.
+            verified_min_area = float(os.getenv("FACE_VERIFIED_MIN_AREA", "0.0003"))
+            identity_min_quality = float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.30"))
             results = []
             for det in detections:
                 bbox = [float(value) for value in det["bbox"]]
@@ -1755,6 +2109,38 @@ class FaceAdapter:
                 score = float(det["confidence"])
                 sub, sub_x, sub_y = self._expand_crop(image, bbox)
                 if sub is None:
+                    continue
+                if self._app is None:
+                    try:
+                        crop = align_face_crop(image, bbox, det["landmarks"])
+                        raw_sharpness = _laplacian_variance(crop)
+                    except Exception:
+                        crop = None
+                        raw_sharpness = 0.0
+                    embedding = self._recognition_embed(crop) if crop is not None and self._recognition_session is not None else []
+                    if embedding:
+                        area_ratio = min(1.0, (width * height) / max(1.0, image_width * image_height))
+                        sharpness = _normalize_sharpness(raw_sharpness)
+                        quality = compute_face_quality(score, area_ratio, sharpness, [])
+                        results.append({
+                            "bbox": bbox,
+                            "confidence": score,
+                            "quality": quality,
+                            "area_ratio": area_ratio,
+                            "sharpness": sharpness,
+                            "raw_sharpness": raw_sharpness,
+                            "pose": [],
+                            "landmarks": det["landmarks"],
+                            "embedding": embedding,
+                            "embedding_model": "buffalo_l",
+                            "embedding_version": os.getenv("FACE_MODEL_NAME", "buffalo_l"),
+                            "identity_ready": True,
+                            "face_validity": "verified",
+                            "identity_eligible": (
+                                score >= verified_scrfd_score
+                                and quality >= identity_min_quality
+                            ),
+                        })
                     continue
                 with self._face_analysis_lock:
                     sub_faces = self._app.get(sub)
@@ -1837,7 +2223,7 @@ class FaceAdapter:
                     "face_validity": validity,
                     "identity_eligible": (
                         validity == "verified"
-                        and quality >= float(os.getenv("FACE_IDENTITY_MIN_QUALITY", "0.55"))
+                        and quality >= identity_min_quality
                     ),
                 })
             return results

@@ -13,6 +13,9 @@ import os
 _RELATIVE = ("这两年", "近两年", "最近两年", "最近一年", "今年", "去年", "前年",
              "上上个月", "上个月", "去年春天", "去年夏天", "去年秋天", "去年冬天")
 
+_CALENDAR_WORDS = ("国庆节", "国庆", "春节", "元旦", "中秋", "端午",
+                   "春天", "春季", "夏天", "夏季", "秋天", "秋季", "冬天", "冬季")
+
 # 场景/语义噪声词：不作为 canonical 地点（observation.place 的场景类型，非检索地点）
 _PLACE_NOISE = ("户外", "户外公共场所", "餐厅", "厨房", "室内", "沙滩", "街道",
                 "快餐店", "奶茶店", "咖啡", "室内厨房", "餐厅内部", "天花板", "墙面")
@@ -27,11 +30,41 @@ def canonical_enabled() -> bool:
 def extract_time(question: str) -> str | None:
     """返回问题中的时间片段（优先完整日期，其次年月，其次年）或相对时间词。"""
     q = re.sub(r"\s+", "", question or "")
-    for pattern in (r"20\d{2}年\d{1,2}月\d{1,2}日", r"20\d{2}年\d{1,2}月", r"20\d{2}年"):
+    # A year-end reference is more precise than the bare year. Extract it
+    # before the generic year pattern, otherwise the slot parser's year-only
+    # component silently discards the user's explicit day/month constraint.
+    year_end = re.search(r"((?:19|20)\d{2})年?(?:的)?(?:最后一天|最后一日|12月31日)", q)
+    if year_end:
+        return f"{year_end.group(1)}年12月31日"
+    year_end_month = re.search(r"((?:19|20)\d{2})年?(?:的)?(?:年底|年末|岁末)", q)
+    if year_end_month:
+        return f"{year_end_month.group(1)}年12月"
+    colloquial_day = re.search(r"((?:19|20)\d{2})年(\d{1,2})月(\d{1,2})号", q)
+    if colloquial_day:
+        return f"{colloquial_day.group(1)}年{int(colloquial_day.group(2))}月{int(colloquial_day.group(3))}日"
+    for pattern in (r"(?:19|20)\d{2}年\d{1,2}月\d{1,2}日",
+                    r"(?:19|20)\d{2}年\d{1,2}月",
+                    r"(?:19|20)\d{2}年"):
         m = re.search(pattern, q)
         if m:
             return m.group(0)
+    # Colloquial two-digit years still carry an explicit month/day. Preserve
+    # that precision instead of reducing "17年12月份" to all of 2017.
+    short_date = re.search(r"(?<!\d)(\d{2})年(\d{1,2})月(?:份)?(?:(\d{1,2})[日号])?", q)
+    if short_date:
+        year = int(short_date.group(1))
+        full_year = 2000 + year if year < 70 else 1900 + year
+        result = f"{full_year}年{int(short_date.group(2))}月"
+        return result + (f"{int(short_date.group(3))}日" if short_date.group(3) else "")
+    m = re.search(r"(?<!\d)(\d{2})年", q)
+    if m:
+        short_year = int(m.group(1))
+        full_year = 2000 + short_year if short_year < 70 else 1900 + short_year
+        return f"{full_year}年"
     for expr in _RELATIVE:
+        if expr in q:
+            return expr
+    for expr in _CALENDAR_WORDS:
         if expr in q:
             return expr
     return None

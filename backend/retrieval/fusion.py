@@ -23,7 +23,7 @@ ANCHOR_BOOST = 1.0
 
 ANCHOR_RETRIEVERS = ("metadata", "entity")
 SEMANTIC_RETRIEVERS = ("lexical", "visual_ann", "text_ann")
-EXPANDER_RETRIEVERS = ("adjacency",)
+EXPANDER_RETRIEVERS = ("adjacency", "graph")
 
 
 def rrf_score(ranks: dict[str, int], k: int = RRF_K) -> float:
@@ -41,6 +41,7 @@ DEFAULT_CHANNEL_WEIGHTS = {
     "metadata": 1.0,
     "entity": 1.0,
     "adjacency": 0.5,
+    "graph": 1.0,
 }
 
 

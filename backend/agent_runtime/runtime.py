@@ -123,9 +123,12 @@ _RETRIEVAL_TOP_KEEP = (
     "group_photo_count", "group_photo_sizes", "group_photo_rows",
 )
 _RETRIEVAL_PREVIEW_KEEP = (
-    "handle", "captured_at", "place", "media_kind", "level",
+    "handle", "captured_at", "place", "media_kind",
     "evidence_summary", "people",
 )
+_MODEL_VISIBLE_PREVIEW_LIMIT = 12
+_MODEL_VISIBLE_SUMMARY_HEAD_LIMIT = 120
+_MODEL_VISIBLE_SUMMARY_TAIL_LIMIT = 80
 
 
 def _model_visible_observation(observation: dict | None) -> dict:
@@ -140,12 +143,51 @@ def _model_visible_observation(observation: dict | None) -> dict:
         # 检索/分页窗口：只暴露决策所需顶层字段 + 白名单 preview。
         compact = {key: value for key, value in observation.items()
                    if key in _RETRIEVAL_TOP_KEEP}
-        compact["preview"] = [
-            {key: item[key] for key in _RETRIEVAL_PREVIEW_KEEP if key in item}
-            for item in preview[:5] if isinstance(item, dict)
-        ]
-        if not compact.get("recommended_handle") and compact["preview"]:
-            compact["recommended_handle"] = compact["preview"][0].get("handle")
+        preview_items = [item for item in preview if isinstance(item, dict)]
+        recommended_handle = str(compact.get("recommended_handle") or "").strip()
+        # Put the recommendation first because the Agent often inspects only
+        # the default/first photo. The handle still maps to its original
+        # ResultSet rank; this changes only the bounded model-visible ordering.
+        recommended_item = next(
+            (item for item in preview_items
+             if str(item.get("handle") or "").strip() == recommended_handle),
+            None,
+        ) if recommended_handle else None
+        if recommended_item is not None:
+            visible_items = [recommended_item] + [
+                item for item in preview_items
+                if str(item.get("handle") or "").strip() != recommended_handle
+            ][: _MODEL_VISIBLE_PREVIEW_LIMIT - 1]
+        else:
+            visible_items = preview_items[:_MODEL_VISIBLE_PREVIEW_LIMIT]
+        compact["preview"] = []
+        for index, item in enumerate(visible_items):
+            projected = {key: item[key] for key in _RETRIEVAL_PREVIEW_KEEP if key in item}
+            summary = str(projected.get("evidence_summary") or "")
+            summary_limit = (_MODEL_VISIBLE_SUMMARY_HEAD_LIMIT if index < 3
+                             else _MODEL_VISIBLE_SUMMARY_TAIL_LIMIT)
+            if len(summary) > summary_limit:
+                projected["evidence_summary"] = summary[:summary_limit] + "…"
+            if isinstance(projected.get("people"), list):
+                projected["people"] = projected["people"][:2]
+            # Empty metadata and repeated image-kind labels only spend context;
+            # the asset type stays explicit for video candidates.
+            for key in ("place", "people", "evidence_summary"):
+                if not projected.get(key):
+                    projected.pop(key, None)
+            if projected.get("media_kind") == "original_image":
+                projected.pop("media_kind", None)
+            compact["preview"].append(projected)
+        visible_handles = {
+            str(item.get("handle") or "").strip()
+            for item in compact["preview"]
+            if item.get("handle")
+        }
+        if recommended_handle not in visible_handles:
+            recommended_handle = str(
+                compact["preview"][0].get("handle") if compact["preview"] else ""
+            )
+        compact["recommended_handle"] = recommended_handle
         return compact
     # Retrieval diagnostics describe the server-owned full candidate pool and
     # must not become answer facts.  They remain in the recorded trace for
@@ -207,7 +249,12 @@ def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None
     if not isinstance(arguments, dict) or not preview_handles:
         return arguments, None
     normalized = dict(arguments)
-    requested = str(arguments.get("asset_handle") or "")
+    # Some local models emit the schema-equivalent ``handle`` key even though
+    # the public tool contract is ``asset_handle``.  Previously that request
+    # was treated as omitted and silently rebound to preview[0], so an intended
+    # inspection of photo_2 could inspect photo_1 instead.  Keep the canonical
+    # field authoritative when both are present; otherwise accept the alias.
+    requested = str(arguments.get("asset_handle") or arguments.get("handle") or "")
     # Older local-model prompts used image_id/query for visual inspection.  An
     # image_id is often a private ResultSet id (rs_...), not a public handle;
     # never pass it through as an asset handle or silently inspect a stale id.
@@ -220,6 +267,7 @@ def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None
     if not requested:
         normalized["asset_handle"] = preview_handles[0]
         return normalized, None
+    normalized["asset_handle"] = requested
     if requested not in preview_handles:
         if legacy_image_id and requested == legacy_image_id:
             # Legacy image_id values are private result-set references rather
@@ -248,6 +296,14 @@ def _normalize_selected_image_handles(handles, preview_handles, limit: int = 6) 
         if len(selected) >= max(1, int(limit)):
             break
     return selected
+
+
+def _normalize_delivery_image_handles(handles, task_state, limit: int = 6) -> list[str]:
+    """Allow delivery from any preview already exposed in the active result set."""
+    visible = getattr(task_state, "delivery_visible_handles", None)
+    if not visible:
+        visible = getattr(task_state, "result_preview", None)
+    return _normalize_selected_image_handles(handles, visible, limit=limit)
 
 
 def _model_visible_action(action: dict) -> str:
@@ -312,7 +368,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   不要编造 preview 之外的 handle。
 - search_memories 若返回 recommended_handle，inspect_photo / read_photo_text 默认优先使用该 handle；
   不要因为示例中的 photo_1 文本而改选其它照片。
-- selected_image_handles 只填写最终确实要展示给用户的图片，必须来自当前 preview，最多 6 张；搜索返回的全部候选不能直接当作展示图片。
+- selected_image_handles 只填写最终确实要展示给用户的图片，必须来自当前结果集已向你展示过的 preview（包括已翻阅的前几页），最多 6 张；搜索返回但从未展示的候选不能直接当作展示图片。
 - 当用户询问照片里的视觉细节（桌上物品、衣服颜色、人数、文字/招牌、天气、穿什么、有没有某物）时，
   如果 search_memories 返回了 preview 候选（有 photo_1 等 handle），你必须调用 inspect_photo 复核 preview 里的照片，
   不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
@@ -322,6 +378,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
   （photo_2、photo_3…）复核，不要反复检查同一张；同一张图最多复核一次。看过几张候选仍无目标时，
   直接 final（如实说明或基于已有候选作答）。search_memories 每轮只需调用一次（返回最多 18 张候选，
   preview 显示前几张），需要更多候选/下一页用 get_result_page 翻页，不要反复重新搜索整个相册。
+- 用户要找/查看照片时，只要检索到候选，就应选择最相关的当前 preview 图片并展示；candidate_only 表示“找到相近候选但尚未确认”，不能说“没有找到/记录里看不出来”。不确定时优先检查最相关候选，再把已检查的图片句柄放进 selected_image_handles，并如实说明不确定点。
+- 如果回答依据来自 inspect_photo/read_photo_text 检查过的图片，最终应把对应句柄放入 selected_image_handles；不要因漏写句柄而丢掉已核实的图片证据。未检查的候选不可仅因排名靠前就冒充已核实证据。
 - final 时必须用 evidence_refs 列出你实际引用的工具调用编号（本轮工具调用会按顺序编号 tool_call_1、tool_call_2 …；纯聊天不引用）。
 - 只使用工具返回的事实回答，不编造数字或细节；工具没有返回的内容不要编造。
 - rows/value 是工具的真实结果：只能报告其中实际出现的月份、地点、数字；
@@ -373,6 +431,8 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 _IMAGE_REQUEST_RE = __import__("re").compile(
     r"给我看看|给我看|发我|发给我|发来|原图|都给我|全部给我|"
     r"展示|显示(?:一下|给我)?|让我看看|看看(?:这些|照片|图)?|"
+    r"(?:找|寻找|查找|搜索)(?:.{0,8})(?:照片|图片|图像|影像)|"
+    r"(?:照片|图片|图像|影像)(?:.{0,8})(?:找一下|帮我找|找出来)|"
     r"把.{0,6}(?:照片|图片|图)|第二张|第三张|第\d张|那张|哪张|"
     r"打开(?:照片|图片)|看图|给我图", __import__("re").I)
 _INLINE_QUESTION_RE = __import__("re").compile(
@@ -699,6 +759,12 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
             "asset": (asset_ids[index] if index < len(asset_ids)
                       else str(item.get("asset_id") or "")),
         } for index, item in enumerate(preview) if isinstance(item, dict)]
+        required_evidence_types = {
+            state.requirement.evidence_type
+            for state in task_state.requirements.values()
+            if state.requirement.required
+            and state.status in {"open", "running", "partially_supported"}
+        }
         if assets or asset_ids:
             evidence_rows.append({
                 "evidence_type": "memory_asset",
@@ -773,8 +839,40 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                     "asset_id": asset_id or str(item.get("handle") or ""),
                     "certainty": "confirmed",
                 })
-        location_question = (not question_text or bool(re.search(
-            r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text)))
+        cond_summary = observation.get("condition_summary") or {}
+        for cond_key, cond_status in cond_summary.items():
+            if preview_evidence_allowed and cond_status in {"matched", "confirmed"}:
+                evidence_rows.append({
+                    "evidence_type": "structured_fact",
+                    "value": f"检索确认满足条件：{cond_key}（共找到 {len(assets)} 张照片）",
+                    "certainty": "confirmed",
+                    "subject": cond_key,
+                })
+        group_count = observation.get("group_photo_count")
+        group_sizes = observation.get("group_photo_sizes") or []
+        if preview_evidence_allowed and group_count:
+            evidence_rows.append({
+                "evidence_type": "structured_fact",
+                "value": {
+                    "group_photo_count": int(group_count),
+                    "group_photo_sizes": list(group_sizes),
+                    "rows": observation.get("group_photo_rows") or [],
+                },
+                "subject": "事件合影人数统计",
+                "asset_id": ((observation.get("group_photo_rows") or [{}])[0].get("asset_id")
+                             if isinstance((observation.get("group_photo_rows") or [{}])[0], dict)
+                             else ""),
+                "certainty": "supported",
+            })
+        # Metadata is already a first-class field on every asset.  Do not rely
+        # only on the natural-language regex here: planner-declared
+        # location_metadata/temporal_metadata requirements are authoritative,
+        # and this also survives garbled or abbreviated question text.
+        location_question = (
+            "location_metadata" in required_evidence_types
+            or not question_text
+            or bool(re.search(r"在哪里|哪儿|哪个城市|什么地点|何处|哪举办|地点具体", question_text))
+        )
         places = [item for item in assets if item.get("place")]
         # GPS/reverse-geocode is a direct structured field.  For a location
         # question the highest-ranked preview may therefore be used as a
@@ -792,8 +890,11 @@ def record_agent2_tool_evidence(task_state, evidence_ledger, spec, *,
                 "subject": "照片地点",
                 "asset_id": places[0].get("asset_id") or places[0].get("asset") or "",
             })
-        date_question = (not question_text or bool(re.search(
-            r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text)))
+        date_question = (
+            "temporal_metadata" in required_evidence_types
+            or not question_text
+            or bool(re.search(r"哪天|什么时候|何时|哪一年|年份|日期|时间|几月|最早|最近一次", question_text))
+        )
         dates = [item for item in assets if item.get("captured_at")]
         if dates and not preview_evidence_allowed and date_question:
             dates = dates[:1]
@@ -1255,6 +1356,167 @@ def _confirmed_facts(task_state: dict) -> list[str]:
     return facts
 
 
+def _selected_metadata_facts(task_state: dict, handles: list[str]) -> list[str]:
+    """Expose only metadata attached to explicitly selected visible photos.
+
+    A broad search preview can contain unrelated dates/places, so using all
+    preview metadata as answer facts would manufacture certainty.  This narrow
+    projection is for one final-answer retry, not for replacing the answer.
+    """
+    selected = set(handles or [])
+    if not selected:
+        return []
+    facts: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for result in task_state.get("tool_results") or []:
+        if result.get("tool") != "search_memories":
+            continue
+        for row in result.get("preview") or []:
+            handle = str(row.get("handle") or "")
+            if handle not in selected:
+                continue
+            captured = str(row.get("captured_at") or "").strip()
+            place = str(row.get("place") or "").strip()
+            key = (handle, captured, place)
+            if key in seen or not (captured or place):
+                continue
+            seen.add(key)
+            parts = [f"照片 {handle}"]
+            if captured:
+                parts.append(f"拍摄时间 {captured}")
+            if place:
+                parts.append(f"地点元数据 {place}")
+            facts.append("；".join(parts))
+    return facts[:6]
+
+
+def _last_supported_inspection_handle(task_state: dict) -> str | None:
+    """Recover a source-bound handle when final omits selected_image_handles.
+
+    Only an actually displayed and successfully inspected item is eligible;
+    search ranking by itself is not evidence that the image matches the query.
+    """
+    visible = {
+        str(row.get("handle") or "")
+        for result in task_state.get("tool_results") or []
+        if result.get("tool") in {"search_memories", "get_result_page"}
+        for row in result.get("preview") or []
+    }
+    supported = []
+    for result in task_state.get("tool_results") or []:
+        handle = str(result.get("inspect_handle") or "")
+        if (result.get("tool") == "inspect_photo" and handle in visible
+                and str(result.get("certainty") or "").lower() in {"supported", "confirmed"}
+                and str(result.get("inspect_observation") or "").strip()):
+            if handle not in supported:
+                supported.append(handle)
+    # Multiple plausible photos are not interchangeable evidence. Let the
+    # model choose explicitly instead of silently promoting the last one.
+    return supported[0] if len(supported) == 1 else None
+
+
+def _visual_tool_correction(tool_name: str, arguments: dict, message: str,
+                            *, inspect_called: bool, available_tools) -> tuple[str, dict]:
+    """Prefer visual inspection for a scene question misrouted to OCR."""
+    if (tool_name == "read_photo_text" and visual_intent(message)
+            and not ocr_intent(message) and not inspect_called
+            and "inspect_photo" in available_tools):
+        return "inspect_photo", {
+            "asset_handle": arguments.get("asset_handle") or "",
+            "question": message,
+        }
+    return tool_name, arguments
+
+
+def _direct_metadata_answer_supported(question: str, answer: str,
+                                      task_state: dict, handles: list[str]) -> bool:
+    """Stop visual-only follow-ups after a selected photo already proves a
+    simple capture date/place answer. This never validates image contents,
+    people, document text, or a broad unselected search result.
+    """
+    if not handles or re.search(r"看不出来|不足以确认|无法确认|不能确认|无法判断|不清楚", answer):
+        return False
+    asks_place = bool(re.search(r"(?:哪里|哪儿|何处|在哪(?:里|儿|个)?|哪个(?:城市|位置|地点)|什么(?:地方|地点|位置))", question))
+    asks_date = bool(re.search(r"(?:哪(?:一)?天|哪(?:一)?日|哪(?:一)?年|什么时候|什么时间|何时|几月几日|几号)", question))
+    # A date printed on a document/sign is not the photo's capture date.
+    if asks_date and re.search(r"(?:填写|开具|标注|写着|写的|单据|发票|凭证|票据|表格|报告|收据|证件)", question):
+        asks_date = False
+    if asks_place and re.search(r"(?:写着|写的|标注|单据|发票|凭证|票据|表格)", question):
+        asks_place = False
+    if not (asks_place or asks_date):
+        return False
+    user_bounds = None
+    try:
+        from ..query_contracts import parse_time_expression
+        from .canonical_intent import extract_time
+        user_bounds = parse_time_expression(extract_time(question))
+    except (TypeError, ValueError):
+        pass
+    selected = set(handles)
+    for result in task_state.get("tool_results") or []:
+        if result.get("tool") != "search_memories":
+            continue
+        for row in result.get("preview") or []:
+            if row.get("handle") not in selected:
+                continue
+            place = str(row.get("place") or "").strip()
+            captured = str(row.get("captured_at") or "")[:10]
+            if user_bounds:
+                try:
+                    from datetime import datetime
+                    capture_day = datetime.fromisoformat(captured)
+                except ValueError:
+                    continue
+                if not (user_bounds[0] <= capture_day < user_bounds[1]):
+                    continue
+            if asks_place and place and place in answer:
+                return True
+            if asks_date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", captured):
+                year, month, day = (int(part) for part in captured.split("-"))
+                if (f"{year}年{month}月{day}日" in answer
+                        or f"{year}年{month}月{day}号" in answer
+                        or captured in answer):
+                    return True
+    return False
+
+
+def _remaining_visible_handles(task_state: dict, inspected: set[str]) -> list[str]:
+    """Use actual displayed handles, never infer photo_N+1 from numbering."""
+    handles = []
+    for result in task_state.get("tool_results") or []:
+        if result.get("tool") not in {"search_memories", "get_result_page"}:
+            continue
+        for row in result.get("preview") or []:
+            handle = str(row.get("handle") or "")
+            if handle and handle not in inspected and handle not in handles:
+                handles.append(handle)
+    return handles
+
+
+def _selected_inspection_facts(task_state: dict, handles: list[str]) -> list[str]:
+    """Project observed visuals and confirmed identities for selected photos."""
+    selected = set(handles or [])
+    facts = []
+    for result in task_state.get("tool_results") or []:
+        if (result.get("tool") != "inspect_photo"
+                or str(result.get("inspect_handle") or "") not in selected):
+            continue
+        handle = str(result["inspect_handle"])
+        observation = str(result.get("inspect_text") or "").strip()
+        if observation and str(result.get("certainty") or "").lower() != "uncertain":
+            facts.append(f"照片 {handle} 视觉复核：{observation[:240]}")
+        confirmed = []
+        for identity in result.get("photo_identities") or []:
+            if not isinstance(identity, dict) or identity.get("identity_status") != "confirmed":
+                continue
+            label = str(identity.get("person_name") or identity.get("family_role") or "").strip()
+            if label and label not in confirmed:
+                confirmed.append(label)
+        if confirmed:
+            facts.append(f"照片 {handle} 已确认人物：{'、'.join(confirmed[:8])}")
+    return facts[:6]
+
+
 def _build_answer_grounding(*, message: str, task: TaskState,
                             selected_handle: str | None = None,
                             selected_image_handles: list[str] | None = None,
@@ -1424,6 +1686,49 @@ def _build_answer_grounding(*, message: str, task: TaskState,
             if handle and handle not in valid_selected_handles:
                 valid_selected_handles.append(handle)
                 valid_selected_ids.append(asset_id)
+    # An inspected photo is already a grounded evidence choice. Preserve only
+    # the first inspected photo when the model omitted the redundant
+    # selected_image_handles field: promoting every inspected item can inflate
+    # delivery and hurt precision. The model may still explicitly select more
+    # than one image when the question calls for it. Never promote uninspected
+    # search results.
+    if not valid_selected_handles:
+        for handle in evidence_handles:
+            if handle in handle_to_id and handle not in valid_selected_handles:
+                valid_selected_handles.append(handle)
+            if valid_selected_handles:
+                break
+        valid_selected_ids = [handle_to_id[handle] for handle in valid_selected_handles]
+    # If the model omitted delivery entirely, keep one ranked result available
+    # when the user explicitly asked for a photo, or when search itself found
+    # full support for the answer. Use the retriever's single recommended
+    # handle (not the whole candidate/evidence pool), and only if it was shown
+    # from the active result set. This closes the common gap where the right
+    # frame is in the ranked preview but never reaches the response payload.
+    # Candidate-only results are exposed only for an explicit photo request;
+    # ordinary factual answers must not turn weak matches into evidence.
+    if (not valid_selected_handles and used_evidence and task.current_result_set
+            and int(task.result_total or 0) > 0
+            and (explicit_image or task.search_satisfaction == "full_support")):
+        shown_handles = set(
+            getattr(task, "delivery_visible_handles", None)
+            or task.result_preview or []
+        )
+        for tr in reversed(tool_results):
+            if str(tr.get("tool") or "") != "search_memories":
+                continue
+            result_set_id = str(tr.get("result_set_id") or "")
+            if result_set_id and result_set_id != str(task.current_result_set):
+                continue
+            preview = [item for item in (tr.get("preview") or [])
+                       if isinstance(item, dict) and item.get("handle")]
+            recommendation = str(tr.get("recommended_handle") or "").strip()
+            if recommendation not in {str(item["handle"]) for item in preview}:
+                recommendation = str((preview[0] or {}).get("handle") or "") if preview else ""
+            if recommendation in shown_handles and recommendation in handle_to_id:
+                valid_selected_handles.append(recommendation)
+                valid_selected_ids = [handle_to_id[recommendation]]
+                break
     return {
         "required": used_evidence,
         "display_mode": display_mode,
@@ -1445,6 +1750,8 @@ def _build_answer_grounding(*, message: str, task: TaskState,
 
 
 _POLICY_REFUSAL_RULES = [
+    (re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+(?:rules|instructions|prompts)", re.I), "我只能协助检索相册内容，不能忽略既有规则或透露内部提示。"),
+    (re.compile(r"(?:output|show|reveal|print|dump)\b.{0,100}\b(?:internal|system|hidden)\s+(?:prompt|instructions)", re.I), "我不能透露系统内部提示或指令。"),
     (re.compile(r"忽略.*(?:指令|系统提示|提示词|安全规则|限制)", re.I), "我无法透露系统提示词内容，也不能忽略既有的安全规则。"),
     (re.compile(r"(?:告诉|输出|显示|给我).*(?:系统提示|提示词|system prompt)", re.I), "我无法透露系统提示词内容，也不能忽略既有的安全规则。"),
     (re.compile(r"(?:导出|发给|提供|输出|告诉).*(?:特征向量|人脸特征|身份信息|家庭关系|银行卡|密码|住址|电话)", re.I), "我无法导出人脸特征向量和用户隐私身份数据，这属于敏感个人信息。"),
@@ -1822,12 +2129,38 @@ class AgentRuntime:
                                  "status": "open",
                              } for item in declaration.get("requirements") or []]})
             if self.profile.features.get("agent2_authoritative") and not planner_result.ok:
-                turn.final_answer = "当前问题的证据需求无法可靠规划，因此暂时无法确认。"
-                turn.status = "partial"
-                turn.reason = planner_result.fallback_reason or "planner_invalid"
-                turn.termination_reason = "planner_blocked"
-                self.chat_fn = _orig_chat_fn
-                return turn
+                # A transient planner timeout must not terminate the turn before
+                # retrieval.  The old behaviour converted every vLLM queue/read
+                # timeout into a refusal, yielding zero retrieval recall even
+                # though the legacy tool loop could still search the album.
+                # Build the smallest safe declaration locally and continue with
+                # the normal tool loop; the user question remains the semantic
+                # retrieval goal and memory_asset is the only required source.
+                from .task_state import TaskDeclaration, EvidenceRequirement
+                fallback_declaration = TaskDeclaration(
+                    goal=str(message or "").strip() or "检索相册中的相关记忆",
+                    scope_id=self.scope_id,
+                    requirements=(EvidenceRequirement(
+                        id="req_fallback_memory",
+                        evidence_type="memory_asset",
+                        description="从相册中检索与用户问题相关的照片或视频",
+                        required=True,
+                    ),),
+                )
+                agent2_task_state = Agent2TaskState.from_declaration(fallback_declaration)
+                agent2_evidence_ledger = EvidenceLedger(scope_id=self.scope_id)
+                decision.update({
+                    "status": "fallback_recovery",
+                    "reason": planner_result.fallback_reason or "planner_invalid",
+                })
+                turn.agent2_trace = {
+                    "trace_version": 2,
+                    "task_declaration": fallback_declaration.as_dict(),
+                    "task_state": agent2_task_state.as_dict(),
+                    "evidence_ledger": agent2_evidence_ledger.as_dict(),
+                    "planner_decisions": [decision],
+                    "planner_revisions": [],
+                }
         guard = FinalGuard(scope_id=self.scope_id, viewer_id=self.viewer_id)
         is_candidate_mode = bool(
             self.profile.features.get("agent2_authoritative")
@@ -1886,6 +2219,7 @@ class AgentRuntime:
         max_parse_retries = 3
         guard_retries = 0
         max_guard_retries = 1
+        evidence_refusal_retried = False
         seen_tool_calls = set()
         # 检索/复核收敛：search_memories 每轮最多 1 次（18 张候选 + get_result_page 翻页）、
         # 同一张图最多 inspect/read_photo_text 1 次。
@@ -1900,6 +2234,8 @@ class AgentRuntime:
         tool_result_cache = {}
         dedup_retries = 0
         max_dedup_retries = 2
+        duplicate_final_nudge_used = False
+        cached_duplicate_reused = False
         search_has_preview = False
         inspect_called = False
         tool_call_seq = 0
@@ -1934,6 +2270,8 @@ class AgentRuntime:
         recent_tool_failures: list[tuple[str, str]] = []
         tool_repeat_rejections = 0
         max_tool_repeat_rejections = 2
+        budget_exhausted_nudge_used = False
+        preview_handle_nudges = 0
 
         def visual_gate_requested() -> bool:
             """Use only the planner requirement on the authoritative path.
@@ -2124,9 +2462,13 @@ class AgentRuntime:
         wants_ocr = ocr_intent(message)
         adaptive_inspections = self.profile.max_inspections
         if wants_multi:
-            adaptive_inspections = max(adaptive_inspections, 4)
+            adaptive_inspections = max(adaptive_inspections, 8)
+            turn.budget.max_tool_calls = max(turn.budget.max_tool_calls, 12)
+            turn.budget.max_model_steps = max(turn.budget.max_model_steps, 16)
         elif wants_ocr:
-            adaptive_inspections = max(adaptive_inspections, 2)
+            adaptive_inspections = max(adaptive_inspections, 4)
+            turn.budget.max_tool_calls = max(turn.budget.max_tool_calls, 8)
+            turn.budget.max_model_steps = max(turn.budget.max_model_steps, 12)
             # read_photo_text 需要整图 + 3x3 tile 多次图片推理，放宽总预算
             # （同图 OCR 结果已缓存，只有首次需要长预算）
             turn.budget.wall_time_s = max(turn.budget.wall_time_s, 240)
@@ -2409,10 +2751,12 @@ class AgentRuntime:
                 break
             if action.get("action") == "final":
                 last_model_final_answer = str(action.get("answer") or "").strip()
-                selected_image_handles = _normalize_selected_image_handles(
+                selected_image_handles = _normalize_delivery_image_handles(
                     action.get("selected_image_handles") or action.get("image_handles"),
-                    task.result_preview,
+                    task,
                 )
+                metadata_final_supported = _direct_metadata_answer_supported(
+                    message, last_model_final_answer, task.as_dict(), selected_image_handles)
                 # Authoritative Agent2 gate: evidence sufficiency is decided by
                 # the single TaskState, never by intent heuristics or a model
                 # assertion that it is "done".
@@ -2505,6 +2849,7 @@ class AgentRuntime:
                                     and state.requirement.evidence_type == "structured_fact")
                         ]
                         if unattempted_for_prompt and available and turn.budget.can_model_step() \
+                                and not metadata_final_supported \
                                 and not gate_unattempted_prompted:
                             gate_unattempted_prompted = True
                             prompt_pending = [
@@ -2586,7 +2931,7 @@ class AgentRuntime:
                 # inspect a representative photo when the retrieval contract
                 # explicitly says that visual/person/travel evidence is needed.
                 resolution = _pending_resolution(task)
-                if resolution:
+                if resolution and not metadata_final_supported:
                     # Do not depend on the model obeying a recommendation: on
                     # the first premature final, execute the bounded visual/
                     # OCR resolution directly against the first visible
@@ -2618,8 +2963,9 @@ class AgentRuntime:
                         )})
                         continue
                 # 视觉细节意图 + 有 preview 候选 + 未 inspect → 确定性纠正一步（不依赖 12B 随机自觉）
-                if search_has_preview and not inspect_called and visual_gate_requested() \
-                        and visual_retries < max_visual_retries and turn.budget.can_model_step():
+                if (search_has_preview and not inspect_called and visual_gate_requested()
+                        and not metadata_final_supported
+                        and visual_retries < max_visual_retries and turn.budget.can_model_step()):
                     visual_retries += 1
                     denies_found = bool(__import__("re").search(
                         r"没(?:有|找到)|未找到|没有获取到|找不到|还没有",
@@ -2647,6 +2993,35 @@ class AgentRuntime:
                     turn.final_answer = naturalize_answer(turn.final_answer)
                 except Exception:
                     pass
+                # The model sometimes refuses even after selecting and
+                # inspecting the exact photo. Give it one bounded chance to
+                # use only that photo's metadata, observed visual details and
+                # confirmed identities; never the broad candidate pool or a
+                # benchmark answer label.
+                retry_handles = selected_image_handles or ([handle] if (
+                    handle := _last_supported_inspection_handle(task.as_dict())) else [])
+                if (not evidence_refusal_retried and retry_handles
+                        and task.tool_results and turn.budget.can_model_step()
+                        and re.search(r"看不出来|不足以确认|无法确认|不能确认|无法判断|不清楚", turn.final_answer)):
+                    selected_facts = (
+                        _selected_metadata_facts(task.as_dict(), retry_handles)
+                        + _selected_inspection_facts(task.as_dict(), retry_handles))
+                    if selected_facts:
+                        evidence_refusal_retried = True
+                        turn.steps.append({"type": "selected_evidence_answer_retry", "status": "prompted",
+                                           "handles": list(retry_handles)})
+                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                        messages.append({"role": "user", "content": (
+                            "你已复核的照片有以下已获得的证据：\n- "
+                            + "\n- ".join(selected_facts)
+                            + "\n请核对这些照片是否对应用户所问事件。若对应，先回答证据支持的"
+                              "人物、画面、日期或地点；只有已确认人物才能使用姓名。无法确认的细节"
+                              "可单独说明，但不要因此否认已确认的部分，也不要编造街道、价格或"
+                              "照片中看不清的内容。若照片不对应，不要套用其信息。"
+                              "若使用其中的照片作答，在 JSON final 的 selected_image_handles 中"
+                              "保留对应 handle。只输出修正后的 JSON final。"
+                        )})
+                        continue
                 # Phase H H-A：简单确定性问题（数量/日期/布尔）直接按 Nucleus 确定性渲染，
                 # 不再把 total=5 交给 12B 自由改写（reg3 少报根因）。
                 try:
@@ -2988,6 +3363,17 @@ class AgentRuntime:
                 break
             tool_name = action.get("tool") or ""
             raw_arguments = dict(action.get("arguments") or {})
+            corrected_tool, corrected_arguments = _visual_tool_correction(
+                tool_name, raw_arguments, message, inspect_called=inspect_called,
+                available_tools=self.profile.tools)
+            if corrected_tool != tool_name:
+                # Visual scene questions sometimes trigger OCR even though no
+                # lettering is requested. Read the image once before letting
+                # an empty OCR result turn into a false "cannot tell" answer.
+                tool_name, raw_arguments = corrected_tool, corrected_arguments
+                action = {**action, "tool": tool_name, "arguments": raw_arguments}
+                turn.steps.append({"type": "visual_tool_correction",
+                                   "from": "read_photo_text", "to": tool_name})
             arguments = raw_arguments
             # 收敛硬限制：search 每轮最多 1 次（返回 18 张候选，需要更多用 get_result_page
             # 翻页，不要反复重搜）；同一张图最多 inspect/read_photo_text 1 次。
@@ -3006,11 +3392,24 @@ class AgentRuntime:
             if tool_name in {"inspect_photo", "read_photo_text"}:
                 _h = str(arguments.get("asset_handle") or "").strip() or "photo_1"
                 if _h in inspected_handles and turn.budget.can_model_step():
+                    prior = next((result for result in reversed(task.tool_results)
+                                  if (result.get("tool") == tool_name
+                                      and str(result.get("inspect_handle") or
+                                              result.get("asset_handle") or "") == _h)), {})
+                    remaining = _remaining_visible_handles(task.as_dict(), inspected_handles)
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                    messages.append({"role": "user", "content": (
-                        f"你已复核/读过 {_h}，不要重复查看同一张图。"
-                        "请换 preview/翻页里的下一张（photo_2、photo_3…）复核，或直接输出 final 回答。"
-                    )})
+                    if str(prior.get("certainty") or "").lower() in {"supported", "confirmed"}:
+                        guidance = (f"{_h} 已成功复核，已有可用证据。"
+                                    "不要再检查照片；请依据刚才的观察和已确认身份直接输出 final，"
+                                    "无法确认的个别细节单独说明。")
+                    elif remaining:
+                        guidance = (f"你已复核/读过 {_h}，不要重复查看。"
+                                    f"当前实际展示且尚未复核的句柄只有：{', '.join(remaining[:8])}。"
+                                    "如需继续复核，只能从中选择；否则直接输出 final。")
+                    else:
+                        guidance = (f"你已复核/读过 {_h}，当前没有尚未复核的可见照片。"
+                                    "不要猜测 photo_N 句柄；请基于已有证据输出 final。")
+                    messages.append({"role": "user", "content": guidance})
                     continue
                 inspected_handles.add(_h)
             # 预算 B：连续 2 次同工具同失败原因 → 拦截本次调用，强制换动作
@@ -3041,6 +3440,71 @@ class AgentRuntime:
             if call_signature in seen_tool_calls:
                 cached_observation = tool_result_cache.get(call_signature)
                 if cached_observation is not None:
+                    if cached_duplicate_reused:
+                        # One cached replay is useful when the model repeats a
+                        # read-only request. Replaying it indefinitely bloats
+                        # the prompt until vLLM has no output room left (the
+                        # model then emits a truncated "{" and the QA fails).
+                        forced = self._force_final_once(turn, messages)
+                        if forced:
+                            forced_problems = guard.check(
+                                forced,
+                                task_state={
+                                    "scope_id": self.scope_id,
+                                    "viewer_id": self.viewer_id,
+                                    "user_query": message,
+                                    "history_text": history,
+                                    "result_mode": task.result_mode,
+                                    "has_more": task.has_more,
+                                    "delivery_state": task.delivery_state,
+                                    "fulfillment": task.fulfillment,
+                                    "fact_total": task.fact_total,
+                                    "fact_value": task.fact_value,
+                                    "fact_operation": task.fact_operation,
+                                    "fact_rows": task.fact_rows,
+                                    "fact_group_by": task.fact_group_by,
+                                    "last_tool": task.last_tool,
+                                    "tool_results": task.tool_results,
+                                    "evidence_refs": [],
+                                },
+                                delivered_count=task.delivered_count,
+                            )
+                            if forced_problems:
+                                turn.steps.append({
+                                    "type": "guard", "status": "fail",
+                                    "codes": list(forced_problems),
+                                    "attempt": 1,
+                                })
+                                if getattr(forced_problems, "severity", "truth") == "hard_block":
+                                    turn.status = "blocked_by_guard"
+                                    turn.reason = "hard_block:" + ";".join(
+                                        str(problem) for problem in forced_problems)
+                                    turn.final_answer = render_emergency_summary(
+                                        task.as_dict(), reason="回答未通过事实校验")
+                                    turn.termination_reason = "guard_recovery_exhausted"
+                                else:
+                                    turn.status = "partial"
+                                    turn.reason = "forced_final_guard:" + ";".join(
+                                        str(problem) for problem in forced_problems[:2])
+                                    turn.final_answer = _natural_partial(
+                                        task.as_dict(), list(forced_problems))
+                                    turn.termination_reason = "forced_final_guard_rejected"
+                            else:
+                                turn.steps.append({
+                                    "type": "guard", "status": "pass", "codes": [],
+                                    "attempt": 1,
+                                })
+                                turn.final_answer = forced
+                                turn.status = "complete"
+                                turn.reason = ""
+                                turn.termination_reason = "forced_final_after_duplicate_tool_call"
+                        else:
+                            turn.status = "partial" if turn.steps else "error"
+                            turn.reason = "duplicate_tool_call_reused"
+                            turn.termination_reason = "cached_tool_result_limit"
+                            turn.final_answer = render_emergency_summary(
+                                task.as_dict(), reason="重复调用已停止")
+                        break
                     if not turn.budget.can_model_step():
                         # No model step remains to consume the cached result.
                         # Still close honestly as a bounded partial instead of
@@ -3052,6 +3516,7 @@ class AgentRuntime:
                         turn.final_answer = render_emergency_summary(
                             task.as_dict(), reason="预算用尽")
                         break
+                    cached_duplicate_reused = True
                     dedup_retries += 1
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     messages.append({"role": "user", "content": (
@@ -3063,20 +3528,21 @@ class AgentRuntime:
                         "请直接基于该结果输出 final；如果证据仍不足，请明确说明无法确认。"
                     )})
                     continue
-                if dedup_retries < max_dedup_retries and turn.budget.can_model_step():
+                if (dedup_retries < max_dedup_retries or not duplicate_final_nudge_used) \
+                        and turn.budget.can_model_step():
                     dedup_retries += 1
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                    if dedup_retries >= max_dedup_retries:
+                    if dedup_retries >= max_dedup_retries and not duplicate_final_nudge_used:
+                        duplicate_final_nudge_used = True
                         messages.append({"role": "user", "content": (
-                            "你再次重复调用相同的工具和参数，被拒绝。"
-                            "你不能再重复调用该工具。请立即调用 inspect_photo（asset_handle=photo_1）复核预览照片，"
-                            "或直接输出 final 回答。"
+                            "该工具和参数已被重复调用并拒绝；不要再提交相同调用，也不要臆造句柄。"
+                            "请基于现有工具证据直接输出 final；若确实还需视觉核验，只能使用当前预览中"
+                            "尚未检查的句柄，否则明确说明缺少哪项证据。"
                         )})
                     else:
                         messages.append({"role": "user", "content": (
-                            "你刚用相同的工具和参数调用过，重复调用会被拒绝。"
-                            "请换一个动作：如果需要看照片细节请调用 inspect_photo（使用预览里的 handle），"
-                            "否则直接输出 final。"
+                            "你刚用相同工具和参数调用过，重复调用会被拒绝。请改用不同且当前有效的证据句柄，"
+                            "或基于已有证据直接输出 final；不得猜测不存在的句柄。"
                         )})
                     continue
                 turn.status = "partial" if turn.steps else "error"
@@ -3186,6 +3652,31 @@ class AgentRuntime:
                     failed_code = RESOLVE_VISUAL if tool_name == "inspect_photo" else RESOLVE_OCR
                     if _auto_retry_failed_resolution({"code": failed_code, "tool": tool_name}):
                         continue
+                if (decision.reason == "asset_handle_not_in_current_preview"
+                        and self.profile.features.get("agent2_authoritative")
+                        and preview_handle_nudges < 2
+                        and turn.budget.can_model_step()):
+                    preview_handle_nudges += 1
+                    messages.append({"role": "user", "content": (
+                        "你请求的图片句柄当前未展示，不能直接检查。请先用 get_result_page 翻到包含该候选的页面；"
+                        "如果没有更多候选，就改用当前已展示的图片或基于已有证据作答。"
+                    )})
+                    continue
+                # When the bounded tool budget is exhausted, give the model
+                # one final synthesis turn over the evidence already gathered.
+                # Returning immediately here made ordinary budget exhaustion
+                # look like an execution failure even when usable evidence was
+                # present; the safety/evidence gate still validates the final.
+                if (decision.reason == "budget exhausted"
+                        and self.profile.features.get("agent2_authoritative")
+                        and not budget_exhausted_nudge_used
+                        and turn.budget.can_model_step()):
+                    budget_exhausted_nudge_used = True
+                    messages.append({"role": "user", "content": (
+                        "本轮可用工具预算已经用完。不要再调用任何工具；请仅基于当前已获得的证据输出 final。"
+                        "如果现有证据不足以回答，明确说明无法确认，不要猜测或补造事实。"
+                    )})
+                    continue
                 # A late duplicate/stale inspection must not erase a complete
                 # structured answer. Preserve the model answer when no
                 # structured override exists; for event group counts use the

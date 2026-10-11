@@ -12,7 +12,13 @@ except ImportError:
     np = None
 
 from backend.db import MemoryStore
-from backend.face_clustering import FaceClusterer, FaceSample, pairwise_metrics
+from backend.face_clustering import (
+    FaceClusterer,
+    FaceSample,
+    pairwise_metrics,
+    resolve_online_match_threshold,
+    resolve_recluster_match_threshold,
+)
 from backend.face_embeddings import (
     AdaFaceAdapter,
     EmbeddingResult,
@@ -498,6 +504,18 @@ class FaceEmbeddingContractTests(unittest.TestCase):
 
 
 class FaceClustererTests(unittest.TestCase):
+    def test_online_and_batch_thresholds_have_independent_defaults_and_overrides(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertAlmostEqual(resolve_online_match_threshold(), 0.20)
+            self.assertAlmostEqual(resolve_recluster_match_threshold(), 0.28)
+
+        with patch.dict(os.environ, {
+            "FACE_ONLINE_CLUSTER_THRESHOLD": "0.31",
+            "FACE_RECLUSTER_THRESHOLD": "0.44",
+        }, clear=True):
+            self.assertAlmostEqual(resolve_online_match_threshold(), 0.31)
+            self.assertAlmostEqual(resolve_recluster_match_threshold(), 0.44)
+
     def test_frontal_and_profile_views_share_multi_view_cluster(self):
         samples = [
             FaceSample("frontal", vector(0), quality=0.98, pose_bucket="frontal"),
@@ -632,6 +650,23 @@ class FacePersistenceTests(unittest.TestCase):
         cluster = self.store._row("SELECT status, confidence FROM face_clusters WHERE id = ?", (low_quality["cluster_id"],))
         self.assertEqual(cluster["status"], "pending")
         self.assertLess(cluster["confidence"], 0.30)
+
+    def test_verified_medium_quality_face_with_embedding_can_join_cluster(self):
+        first = self.store.add_face_instance(
+            "asset-1", self.obs_one["id"],
+            {"bbox": [1, 2, 101, 122], "embedding": vector(0), "confidence": 0.94,
+             "quality": 0.82, "embedding_model": "adaface", "embedding_version": "test"},
+            threshold=0.78,
+        )
+        medium = self.store.add_face_instance(
+            "asset-2", self.obs_two["id"],
+            {"bbox": [1, 2, 101, 122], "embedding": vector(12), "confidence": 0.82,
+             "quality": 0.40, "identity_eligible": True,
+             "embedding_model": "adaface", "embedding_version": "test"},
+            threshold=0.78,
+        )
+
+        self.assertEqual(medium["cluster_id"], first["cluster_id"])
 
     def test_evidence_only_face_has_no_cluster_or_candidate_entity(self):
         saved = self.store.add_face_instance(

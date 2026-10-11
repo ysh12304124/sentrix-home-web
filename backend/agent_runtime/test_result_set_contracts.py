@@ -7,8 +7,10 @@ from unittest.mock import patch
 
 from backend.db import MemoryStore
 from backend.agent_runtime import tools as runtime_tools
+from backend.agent_runtime.result_set import TaskState as RuntimeTaskState
 from backend.agent_runtime.result_set import debug_asset_projection
 from backend.agent_runtime.intent import visual_intent
+from backend.agent_runtime.answer_nucleus import build_nucleus
 from backend.agent_runtime.completion import (
     CompletionState, RESOLVE_OCR, RESOLVE_VISUAL,
 )
@@ -55,6 +57,55 @@ class ResultSetContractTests(unittest.TestCase):
         self.assertEqual(page["page_size"], 6)
         self.assertEqual(len(page["preview"]), 6)
 
+    def test_task_state_advances_current_preview_to_the_returned_page(self):
+        state = RuntimeTaskState()
+        state.update_from_tool("search_memories", {}, {
+            "result_set_id": "rs_page_test", "total": 18,
+            "has_more": True, "remaining": 12,
+            "preview": [{"handle": f"photo_{i}"} for i in range(1, 7)],
+        })
+        state.update_from_tool("get_result_page", {"page": 2}, {
+            "result_set_id": "rs_page_test", "total": 18,
+            "has_more": True, "remaining": 6,
+            "preview": [{"handle": f"photo_{i}"} for i in range(7, 13)],
+        })
+
+        self.assertEqual(state.current_result_set, "rs_page_test")
+        self.assertEqual(state.result_preview, [f"photo_{i}" for i in range(7, 13)])
+        self.assertEqual(state.delivery_visible_handles, [f"photo_{i}" for i in range(1, 13)])
+        self.assertTrue(state.has_more)
+        self.assertEqual(state.result_remaining, 6)
+
+    def test_task_state_resets_delivery_handles_for_a_new_result_set(self):
+        state = RuntimeTaskState()
+        state.update_from_tool("search_memories", {}, {
+            "result_set_id": "rs_first", "total": 8,
+            "preview": [{"handle": "photo_1"}, {"handle": "photo_2"}],
+        })
+        state.update_from_tool("get_result_page", {}, {
+            "result_set_id": "rs_first", "total": 8,
+            "preview": [{"handle": "photo_7"}],
+        })
+        state.update_from_tool("search_memories", {}, {
+            "result_set_id": "rs_second", "total": 1,
+            "preview": [{"handle": "photo_1"}],
+        })
+
+        self.assertEqual(state.result_preview, ["photo_1"])
+        self.assertEqual(state.delivery_visible_handles, ["photo_1"])
+
+    def test_delivery_visible_handles_round_trip_with_legacy_fallback(self):
+        state = RuntimeTaskState.from_dict({
+            "current_result_set": "rs_x",
+            "result_preview": ["photo_7"],
+            "delivery_visible_handles": ["photo_1", "photo_7"],
+        })
+        self.assertEqual(state.delivery_visible_handles, ["photo_1", "photo_7"])
+        self.assertEqual(
+            RuntimeTaskState.from_dict({"result_preview": ["photo_3"]}).delivery_visible_handles,
+            ["photo_3"],
+        )
+
     def test_preview_carries_bounded_observation_detail(self):
         asset = self.store.create_asset(
             "asset-detail", "detail.jpg", "image", "/tmp/detail.jpg",
@@ -91,6 +142,61 @@ class ResultSetContractTests(unittest.TestCase):
         self.assertEqual(len(visible["preview"]), 5)
         self.assertEqual(visible["recommended_handle"], "photo_0")
 
+    def test_model_observation_keeps_recommended_candidate_inside_visible_window(self):
+        visible = _model_visible_observation({
+            "result_set_id": "rs_demo",
+            "recommended_handle": "photo_11",
+            "preview": [
+                {"handle": f"photo_{i}", "asset_id": f"asset_{i}"}
+                for i in range(1, 19)
+            ],
+        })
+
+        handles = [item["handle"] for item in visible["preview"]]
+        self.assertEqual(len(handles), 5)
+        self.assertEqual(handles, ["photo_11", "photo_1", "photo_2", "photo_3", "photo_4"])
+        self.assertIn(visible["recommended_handle"], handles)
+        self.assertTrue(all("asset_id" not in item for item in visible["preview"]))
+
+    def test_model_observation_puts_visible_recommendation_first(self):
+        visible = _model_visible_observation({
+            "recommended_handle": "photo_3",
+            "preview": [{"handle": f"photo_{i}"} for i in range(1, 7)],
+        })
+
+        self.assertEqual(
+            [item["handle"] for item in visible["preview"]],
+            ["photo_3", "photo_1", "photo_2", "photo_4", "photo_5"],
+        )
+
+    def test_recommended_candidate_outside_preview_replaces_only_the_tail(self):
+        indices = list(range(18))
+        selected = runtime_tools._include_recommended_candidate(
+            indices, candidate_count=48, recommended_handle="photo_40", limit=18,
+        )
+
+        self.assertEqual(len(selected), 18)
+        self.assertEqual(selected[:17], list(range(17)))
+        self.assertEqual(selected[-1], 39)
+
+    def test_recommended_candidate_already_in_preview_does_not_change_membership(self):
+        indices = list(range(18))
+        self.assertEqual(
+            runtime_tools._include_recommended_candidate(
+                indices, candidate_count=48, recommended_handle="photo_12", limit=18,
+            ),
+            indices,
+        )
+
+    def test_model_observation_does_not_return_a_stale_recommendation(self):
+        visible = _model_visible_observation({
+            "result_set_id": "rs_demo",
+            "recommended_handle": "photo_99",
+            "preview": [{"handle": "photo_1"}, {"handle": "photo_2"}],
+        })
+
+        self.assertEqual(visible["recommended_handle"], "photo_1")
+
     def test_reference_keeps_original_visual_intent(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(
             scope_id="album", query="照片", asset_ids=["asset_1"]
@@ -100,6 +206,50 @@ class ResultSetContractTests(unittest.TestCase):
         )
         self.assertEqual(out["query"], "婚礼伴娘穿什么")
         self.assertEqual(out["recommended_resolution"]["tool"], "inspect_photo")
+
+    def test_recommended_handle_uses_geocoded_place_for_metadata_questions(self):
+        preview = [
+            {"handle": "photo_1", "place": "邯郸市永年区",
+             "evidence_summary": "室内婚礼现场；宾客合影"},
+            {"handle": "photo_2", "place": "保定市易县",
+             "evidence_summary": "男子站在紫色布幔前拍照"},
+        ]
+        self.assertEqual(
+            runtime_tools._recommended_handle(
+                "我在易县沙岭的婚礼仪式舞台前拍留影是哪一天的事？", preview),
+            "photo_2",
+        )
+
+    def test_search_recommendation_follows_query_ranked_visible_head(self):
+        # The visible order already includes retrieval, time/place and visual
+        # signals. A second caption-only scorer must not redirect the Agent.
+        preview = [
+            {"handle": "photo_7", "evidence_summary": "婚礼舞台前的留影"},
+            {"handle": "photo_2", "evidence_summary": "婚礼舞台前的留影；拍照"},
+        ]
+        self.assertEqual(
+            runtime_tools._recommended_visible_handle(preview), "photo_7")
+        self.assertEqual(runtime_tools._recommended_visible_handle([]), "")
+
+    def test_nucleus_binds_date_and_place_to_recommended_photo_not_preview_majority(self):
+        state = {"tool_results": [{
+            "tool": "search_memories", "recommended_handle": "photo_2",
+            "preview": [
+                {"handle": "photo_1", "captured_at": "2017-12-16 10:24:14",
+                 "place": "邯郸市永年区"},
+                {"handle": "photo_2", "captured_at": "2017-10-04 22:31:47",
+                 "place": "保定市易县"},
+                {"handle": "photo_3", "captured_at": "2017-12-16 11:00:00",
+                 "place": "邯郸市永年区"},
+            ],
+        }]}
+        nucleus = build_nucleus(state, "这张照片是哪一天拍的？在哪里拍的？")
+        date = next(value for value in nucleus.values if value.kind == "date")
+        place = next(value for value in nucleus.values if value.kind == "place")
+        self.assertEqual(date.display, "2017年10月4日")
+        self.assertEqual(place.display, "保定市易县")
+        self.assertIn("photo_2", date.source)
+        self.assertIn("photo_2", place.source)
 
     def test_debug_projection_separates_full_candidates_from_preview(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(
@@ -130,7 +280,9 @@ class ResultSetContractTests(unittest.TestCase):
         asset_ids = ["noise_1", "answer", "noise_2"]
         summaries = {
             "noise_1": "婚礼现场；舞台；装饰灯光",
-            "answer": "户外站立；广告牌；文字：结婚这里的幸福",
+            # 图像管线常把迎宾展架描述为“横幅、支架”，而不会使用
+            # “广告牌”或“欢迎牌”这个同义词；预览排序必须覆盖该表达。
+            "answer": "户外站立；横幅、支架；文字：结婚这里的幸福",
             "noise_2": "婚礼现场；宾客",
         }
         with patch.object(runtime_tools, "_observation_summary",
