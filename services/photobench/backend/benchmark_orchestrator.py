@@ -1066,13 +1066,6 @@ def _extract_media_sets(result: dict) -> dict[str, list[str]]:
             add(observation.get("retrieved_asset_ids") or observation.get("asset_ids"), retrieved)
             add(observation.get("evidence_asset_ids"), evidence)
             add(observation.get("source_asset_ids"), evidence)
-            # search_memories performs the deterministic evidence selection
-            # used by the Agent. If the model answers from that result but
-            # omits a top-level delivery list, retain the tool-selected set
-            # as a delivery fallback. Explicit final delivery remains
-            # authoritative because this branch only runs while ids is empty.
-            if str(trace.get("tool") or "") == "search_memories" and not ids:
-                add(observation.get("selected_asset_ids"), ids)
             for row in (observation.get("items") or observation.get("rows") or []):
                 if isinstance(row, dict) and row.get("asset_id"):
                     evidence.append(str(row["asset_id"]))

@@ -4,7 +4,7 @@ from unittest.mock import patch
 from backend.agent_runtime import tools as runtime_tools
 from backend.agent_runtime.result_set import TaskState
 from backend.agent_runtime.runtime import _build_answer_grounding
-from services.photobench.backend.benchmark_orchestrator import _extract_image_sets
+from services.photobench.backend.benchmark_orchestrator import OrchestratorRepository, _extract_image_sets
 
 
 class SourceEvidenceContractTests(unittest.TestCase):
@@ -233,6 +233,42 @@ class SourceEvidenceContractTests(unittest.TestCase):
         self.assertEqual(sets["retrieved_asset_ids"], ["asset_1", "asset_2"])
         self.assertEqual(sets["evidence_asset_ids"], ["asset_1"])
         self.assertEqual(sets["selected_asset_ids"], [])
+
+    def test_search_preview_is_not_an_implicit_answer_delivery(self):
+        result = {
+            "tool_trace": [{
+                "tool": "search_memories",
+                "observation": {
+                    "retrieved_asset_ids": ["asset_1", "asset_2"],
+                    "evidence_asset_ids": ["asset_1", "asset_2"],
+                    "selected_asset_ids": ["asset_1"],
+                },
+            }],
+        }
+        sets = _extract_image_sets(result)
+        self.assertEqual(sets["retrieved_asset_ids"], ["asset_1", "asset_2"])
+        self.assertEqual(sets["selected_asset_ids"], [])
+
+        result["answer_grounding"] = {"selected_asset_ids": ["asset_2"]}
+        self.assertEqual(_extract_image_sets(result)["selected_asset_ids"], ["asset_2"])
+
+    def test_graph_recall_delta_uses_graph_heads_not_delivery_projection(self):
+        item = {
+            "question_type": "event_memory_qa",
+            "gt_media": [{"asset_id": "asset_1"}],
+            "tool_trace": [{"tool": "search_memories", "retrieval_timing": {
+                "graph_policy": {"enabled": True, "intent": "event"},
+                "graph_rerank": {
+                    "baseline_head_asset_ids": ["noise"],
+                    "returned_head_asset_ids": ["asset_1"],
+                },
+            }}],
+        }
+        without_delivery = OrchestratorRepository._aggregate_graph_qa_by_type([item])[0]
+        item["selected_asset_ids"] = ["noise"]
+        with_delivery = OrchestratorRepository._aggregate_graph_qa_by_type([item])[0]
+        self.assertEqual(without_delivery["graph_recall_delta"], 1.0)
+        self.assertEqual(with_delivery["graph_recall_delta"], 1.0)
 
 
 if __name__ == "__main__":

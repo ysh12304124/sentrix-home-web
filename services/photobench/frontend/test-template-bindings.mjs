@@ -29,6 +29,18 @@ test("merged graph and QA metrics remain visible without an extra expansion or g
   }
 });
 
+test("QA detail separates retrieval candidates from explicitly delivered media", () => {
+  const source = readFileSync(new URL("./src/App.vue", import.meta.url), "utf8");
+  const usedMedia = source.match(/function itemEvidenceMedia\(item\) \{([\s\S]*?)\r?\n\}\r?\nfunction toolRecallMedia/);
+  assert.ok(usedMedia, "model-used media helper is missing");
+  assert.match(usedMedia[1], /predicted_media/);
+  assert.doesNotMatch(usedMedia[1], /evidence_source_media|retrieved_candidate_media/);
+  assert.match(source, /<summary>工具召回媒体（\{\{ toolRecallMedia\(itemDetail\(summary\)\)\.length \}\}）<\/summary>/);
+  assert.match(source, /模型回答来源媒体（\{\{ itemEvidenceMedia\(itemDetail\(summary\)\)\.length \}\}）/);
+  assert.ok(source.indexOf("模型回答来源媒体（") < source.indexOf("<summary>工具召回媒体（"),
+    "answer sources should appear before the expandable retrieval candidates");
+});
+
 test("startup isolates run-list failures from dataset manifests and selects the latest completed report", () => {
   const source = readFileSync(new URL("./src/App.vue", import.meta.url), "utf8");
   assert.match(source, /Promise\.allSettled\(\[\s*loadJudgePrompts\(\),\s*api\("\/api\/manifests"\),\s*loadRuns\(1\)/);

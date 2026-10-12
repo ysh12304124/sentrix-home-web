@@ -126,7 +126,7 @@ _RETRIEVAL_PREVIEW_KEEP = (
     "handle", "captured_at", "place", "media_kind",
     "evidence_summary", "people",
 )
-_MODEL_VISIBLE_PREVIEW_LIMIT = 12
+_MODEL_VISIBLE_PREVIEW_LIMIT = 5
 _MODEL_VISIBLE_SUMMARY_HEAD_LIMIT = 120
 _MODEL_VISIBLE_SUMMARY_TAIL_LIMIT = 80
 

@@ -713,10 +713,19 @@ function itemMedia(item, gt = false) {
     .map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) }));
 }
 function itemEvidenceMedia(item) {
-  const media = item?.evidence_source_media || item?.evidence_source_images || [];
+  // Only explicitly delivered media counts as used by the model. Search
+  // candidates and tool-side evidence projections remain retrieval diagnostics.
+  const media = item?.predicted_media || item?.predicted_images || [];
   if (media.length) return decorateMedia(media);
-  const names = item?.evidence_source_file_names || [];
+  const names = item?.predicted_file_names || [];
   return decorateMedia(names.map((file_name) => ({ file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name) })));
+}
+function toolRecallMedia(item) {
+  const media = item?.retrieved_candidate_media || item?.retrieved_candidate_images || [];
+  if (media.length) return decorateMedia(media);
+  return decorateMedia((item?.retrieved_file_names || []).map((file_name) => ({
+    file_name, media_type: inferMediaType(file_name), media_url: albumLocalUrl(file_name),
+  })));
 }
 function isDirectEvidence(item, media) {
   const ref = typeof media === "string" ? { media_id: media, media_type: inferMediaType(media) } : media;
@@ -3778,11 +3787,13 @@ onUnmounted(() => { destroyed = true; if (pollTimer) clearTimeout(pollTimer); if
                     <span><small>JSON 解析</small><b>{{ itemParseRate(itemDetail(summary)) }}</b></span>
                     <span><small>步数内完成</small><b>{{ completionLabel(itemDetail(summary)) }}</b></span>
                   </div>
-                  <h4>模型召回媒体（{{ itemMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemMedia(itemDetail(summary)).length" class="muted small">模型没有返回可识别的媒体</span></div>
-                  <h4>回答来源媒体（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
-                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`evidence-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">没有记录可展示的证据来源</span></div>
+                  <h4>模型回答来源媒体（{{ itemEvidenceMedia(itemDetail(summary)).length }}）</h4>
+                  <div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(0, 3)" :key="`evidence-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!itemEvidenceMedia(itemDetail(summary)).length" class="muted small">未显式交付媒体</span></div>
                   <details v-if="itemEvidenceMedia(itemDetail(summary)).length > 3" class="qa-detail-block"><summary>查看更多来源（{{ itemEvidenceMedia(itemDetail(summary)).length - 3 }}）</summary><div class="image-grid"><div v-for="media in itemEvidenceMedia(itemDetail(summary)).slice(3)" :key="`evidence-more-${media.asset_id || media.file_name}`" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div></div></details>
+                  <details class="qa-detail-block"><summary>工具召回媒体（{{ toolRecallMedia(itemDetail(summary)).length }}）</summary>
+                    <p class="muted small">这里汇总该题各次工具调用的去重候选；单次槽位检索最多 18 张，整题可能超过 18 张。候选不代表模型逐张查看或用于回答，旧记录也不会随当前上限改写。</p>
+                    <div class="image-grid"><div v-for="media in toolRecallMedia(itemDetail(summary))" :key="media.asset_id || media.file_name" class="image-tile"><video v-if="isVideoMedia(media) && imageUrl(media)" :src="imageUrl(media)" controls playsinline preload="metadata"></video><img v-else-if="imageUrl(media)" :src="imageUrl(media)" :alt="media.file_name" loading="lazy" @click="openImage(media)" /><span v-else class="image-empty">无媒体</span><span class="image-label">{{ media.file_name || media.media_id || media.image_id }}</span></div><span v-if="!toolRecallMedia(itemDetail(summary)).length" class="muted small">检索未返回可识别媒体</span></div>
+                  </details>
                 </div>
                 <div>
                   <h4>正确答案</h4><p>{{ itemDetail(summary).reference_answer }}</p>

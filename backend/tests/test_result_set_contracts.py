@@ -34,6 +34,11 @@ class ResultSetContractTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
 
+    def test_slot_limits_match_remote_main(self):
+        self.assertEqual(runtime_tools._SLOT_ROUTE_HEAD, 30)
+        self.assertEqual(runtime_tools._SLOT_MAX_CANDIDATES, 18)
+        self.assertEqual(runtime_tools._SLOT_PREVIEW_LIMIT, 6)
+
     def test_search_reference_hides_internal_asset_ids_and_bounds_preview(self):
         rs = runtime_tools._RUNTIME["result_sets"].new(
             scope_id="album", query="照片", asset_ids=[f"asset_{i}" for i in range(20)]
@@ -105,10 +110,10 @@ class ResultSetContractTests(unittest.TestCase):
             "preview": [{"handle": f"photo_{i}"} for i in range(8)],
         })
         self.assertNotIn("asset_ids", visible)
-        self.assertEqual(len(visible["preview"]), 8)
+        self.assertEqual(len(visible["preview"]), 5)
         self.assertEqual(visible["recommended_handle"], "photo_0")
 
-    def test_model_window_exposes_bounded_tail_without_full_descriptions(self):
+    def test_model_window_uses_main_limit_without_full_descriptions(self):
         preview = [
             {"handle": f"photo_{i}", "evidence_summary": "细节" * 150,
              "people": [{"name": f"person_{n}"} for n in range(6)]}
@@ -118,25 +123,25 @@ class ResultSetContractTests(unittest.TestCase):
             "result_set_id": "rs_demo", "preview": preview,
             "recommended_handle": "photo_9",
         })
-        self.assertEqual(len(visible["preview"]), 12)
+        self.assertEqual(len(visible["preview"]), 5)
         self.assertEqual(visible["preview"][0]["handle"], "photo_9")
-        self.assertIn("photo_10", [item["handle"] for item in visible["preview"]])
-        self.assertNotIn("photo_12", [item["handle"] for item in visible["preview"]])
+        self.assertIn("photo_3", [item["handle"] for item in visible["preview"]])
+        self.assertNotIn("photo_5", [item["handle"] for item in visible["preview"]])
         self.assertTrue(all(len(item["evidence_summary"]) <= 121
                             for item in visible["preview"]))
         self.assertTrue(all(len(item["people"]) <= 2 for item in visible["preview"]))
 
-    def test_slot_score_cliff_keeps_recall_fallback_pool(self):
+    def test_slot_score_cliff_matches_main_candidate_bounds(self):
         candidates = [f"asset_{i}" for i in range(30)]
         scores = {candidate: (100.0 if i < 3 else 10.0 - i * 0.01)
                   for i, candidate in enumerate(candidates)}
         self.assertEqual(runtime_tools._slot_gap_bounded_ids(candidates, scores),
-                         candidates[:12])
+                         candidates[:3])
         self.assertEqual(runtime_tools._slot_gap_bounded_ids(candidates[:5], scores),
-                         candidates[:5])
+                         candidates[:3])
         flat_scores = {candidate: 10.0 for candidate in candidates}
         self.assertEqual(runtime_tools._slot_gap_bounded_ids(candidates, flat_scores),
-                         candidates)
+                         candidates[:18])
 
     def test_capture_neighbor_rescue_is_local_and_bounded(self):
         assets = {}

@@ -323,18 +323,11 @@ def _query_memory_facts(arguments: dict, *, context: dict | None = None) -> dict
 # ---- Tool 2: search_memories ----
 _RESULT_PREVIEW_LIMIT = 6
 _RESULT_PAGE_SIZE = 6
-# The remote main retrieval contract keeps at most 18 slot candidates. The
-# Agent must be able to inspect that same complete top-k window; otherwise a
-# correct candidate at ranks 7-18 exists in retrieval diagnostics but cannot
-# be selected as delivered evidence. This changes exposure only: the evaluator
-# still scores the media explicitly selected by the Agent, and page pagination
-# remains six items for ordinary result browsing.
-_SLOT_PREVIEW_LIMIT = 18
-# A score cliff is useful for prioritising inspection, but cutting a 20-40
-# candidate union to three made otherwise retrievable evidence unreachable.
-# Keep a bounded fallback pool; the existing rank and preview limits still
-# constrain what is sent to the model.
-_SLOT_GAP_MIN_CANDIDATES = 12
+# Match remote main's bounded slot-result window. The graph retriever and its
+# pre-slot graph-effect telemetry remain unchanged; this only caps the ordinary
+# route merge and the media handles exposed by search_memories.
+_SLOT_PREVIEW_LIMIT = 6
+_SLOT_GAP_MIN_CANDIDATES = 3
 
 
 def _slot_gap_bounded_ids(kept: list[str], scores: dict[str, float]) -> list[str]:
@@ -2088,13 +2081,10 @@ def _place_matches(item, place_q: str, store) -> bool:
         return False
 
 
-# The latest 1,167-QA traces show relevant assets can rank well below the
-# first page.  Keep a wider server-side union so query-aware preview ranking
-# can recover them; model-visible evidence remains independently bounded by
-# a separately compacted twelve-item model window, so this does not dump the
-# full server-side candidate pool into the prompt.
-_SLOT_ROUTE_HEAD = 60
-_SLOT_MAX_CANDIDATES = 48
+# Match main's 30-per-route and 18-final-candidate limits. The six-item tool
+# preview and five-item model projection are bounded separately above.
+_SLOT_ROUTE_HEAD = 30
+_SLOT_MAX_CANDIDATES = 18
 
 
 def _expand_ranked_event_neighbors(scores, store, scope_id, media_constraint=None):
@@ -3009,9 +2999,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         kept = [aid for aid in kept if _time_ok(_asset_captured(aid))]
     kept.sort(key=lambda a: -scores.get(a, 0))
 
-    # A relative score cliff must not turn a broad graph/semantic union into
-    # only three candidates. Preserve the strongest head and a small fallback
-    # pool so the query-aware preview can rescue a visually matching asset.
+    # Match main's score-cliff cutoff and three-candidate minimum after the
+    # 18-item cap. Graph retrieval and its effect telemetry run before this.
     final_ids = _slot_gap_bounded_ids(kept, scores)
 
     # The candidate set above is still the graph/semantic union.  Only reorder
@@ -3190,7 +3179,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         asset_ids, mode, store, query=preview_query, limit=_SLOT_PREVIEW_LIMIT,
         trusted_constraints=trusted_constraints, scope_id=scope_id)
     # The preview has already been ordered using the full query and trusted
-    # metadata. A second caption-only recommendation over all 48 candidates
+    # metadata. A second caption-only recommendation over all 18 candidates
     # can disagree with that stronger ordering and steer the Agent to a wrong
     # photo (or replace a relevant preview tail). Recommend the first visible
     # item instead; neither candidate membership nor graph ranking changes.
