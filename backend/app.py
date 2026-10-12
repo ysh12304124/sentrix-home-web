@@ -32,7 +32,8 @@ from .image_io import (
     media_type_from_upload,
     needs_browser_transcode,
 )
-from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
+from .model_clients import FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
+from .embeddings.qwen3_vl_remote import create_visual_media_embedder
 from .pipeline import IngestionPipeline
 from .person_appearance import expanded_person_crop
 from .person_insights import rank_core_people
@@ -58,7 +59,10 @@ ensure_heif_support()
 store = MemoryStore(os.getenv("SENTRIX_DB_PATH", str(DATA_DIR / "sentrix.db")))
 gamma = GammaClient()
 gamma.bind_store(store)
-pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
+pipeline = IngestionPipeline(
+    store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(),
+    clip=create_visual_media_embedder(),
+)
 conversation_store = ConversationStore(store)
 CONVERSATION_STORE_ENABLED = os.getenv("SENTRIX_CONVERSATION_STORE_V1", "0").lower() in {"1", "true", "on"}
 
@@ -2849,6 +2853,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                   for s in turn.steps if s.get("type") == "judge"],
     }
     tool_trace = []
+    retrieved_asset_ids = []
     for step in turn.steps:
         if step.get("type") != "tool":
             continue
@@ -2876,6 +2881,7 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
             result_set = result_sets.get(result_set_id) if result_sets and result_set_id else None
             if result_set is not None:
                 tool_record.update(debug_asset_projection(result_set, observation.get("preview")))
+                retrieved_asset_ids.extend(tool_record.get("debug_asset_ids") or [])
         tool_trace.append(tool_record)
     return {
         "answer": turn.final_answer,
@@ -2898,6 +2904,10 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "answer_grounding": turn.answer_grounding,
         "selected_image_handles": list(getattr(turn, "selected_image_handles", []) or []),
         "selected_image_ids": list(getattr(turn, "selected_image_ids", []) or []),
+        # Stable benchmark/audit projection of every search candidate returned
+        # during the turn. This avoids losing recall accounting when a later
+        # tool replaces the current ResultSet or the Agent selects no image.
+        "retrieved_asset_ids": list(dict.fromkeys(retrieved_asset_ids)) if include_debug else [],
         "termination_reason": turn.termination_reason,
         "debug_trace": turn.steps if include_debug else None,
     }

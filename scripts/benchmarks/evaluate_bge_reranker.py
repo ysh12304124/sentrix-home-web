@@ -100,9 +100,16 @@ def _retrieval_query(item: dict) -> str:
     return " ".join(messages[-3:]) or str(item.get("question") or "").strip()
 
 
-def _remote_coarse(base_url: str, scope_id: str, query: str, limit: int = 50) -> dict:
+def _remote_coarse(
+    base_url: str,
+    scope_id: str,
+    query: str,
+    limit: int = 50,
+    *,
+    backend: str = "hybrid",
+) -> dict:
     payload = json.dumps({
-        "scope_id": scope_id, "query": query, "backend": "hybrid", "limit": limit,
+        "scope_id": scope_id, "query": query, "backend": backend, "limit": limit,
     }, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/search",
@@ -112,6 +119,13 @@ def _remote_coarse(base_url: str, scope_id: str, query: str, limit: int = 50) ->
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=300) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _remote_health(base_url: str) -> dict:
+    request = urllib.request.Request(f"{base_url.rstrip('/')}/health", method="GET")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -165,8 +179,17 @@ def _spec(query: str, scope_id: str, media_type: str):
 
 
 def _rank_metrics(ranked: list[str], gt_ids: list[str]) -> dict:
+    gt_set = set(gt_ids)
     first_rank = next((index for index, asset_id in enumerate(ranked, 1)
-                       if asset_id in gt_ids), None)
+                       if asset_id in gt_set), None)
+    top8 = ranked[:8]
+    hits_at_8 = len(set(top8) & gt_set)
+    precision_at_8 = hits_at_8 / len(top8) if top8 else 0.0
+    recall_at_8 = hits_at_8 / len(gt_set) if gt_set else 0.0
+    f1_at_8 = (
+        2.0 * precision_at_8 * recall_at_8 / (precision_at_8 + recall_at_8)
+        if precision_at_8 + recall_at_8 else 0.0
+    )
     return {
         "r1": int(first_rank is not None and first_rank <= 1),
         "r3": int(first_rank is not None and first_rank <= 3),
@@ -174,6 +197,9 @@ def _rank_metrics(ranked: list[str], gt_ids: list[str]) -> dict:
         "r8": int(first_rank is not None and first_rank <= 8),
         "mrr": (1.0 / first_rank) if first_rank else 0.0,
         "first_rank": first_rank,
+        "precision_at_8": precision_at_8,
+        "recall_at_8": recall_at_8,
+        "f1_at_8": f1_at_8,
     }
 
 
@@ -199,6 +225,15 @@ def _summarize(rows: list[dict], variant: str) -> dict:
         "r_at_5": round(sum(item["r5"] for item in metrics) / count, 4),
         "r_at_8": round(sum(item["r8"] for item in metrics) / count, 4),
         "mrr": round(sum(item["mrr"] for item in metrics) / count, 4),
+        "precision_at_8_macro": round(
+            sum(item["precision_at_8"] for item in metrics) / count, 4
+        ),
+        "recall_at_8_macro": round(
+            sum(item["recall_at_8"] for item in metrics) / count, 4
+        ),
+        "f1_at_8_macro": round(
+            sum(item["f1_at_8"] for item in metrics) / count, 4
+        ),
         "latency_median_ms": round(statistics.median(latencies), 1) if latencies else 0.0,
         "latency_p95_ms": round(_percentile(latencies, 0.95), 1),
     }
@@ -215,9 +250,25 @@ def main() -> int:
                         default="legacy_ab")
     parser.add_argument("--coarse-url", default="",
                         help="Optional compatibility endpoint; default uses the native kernel")
+    parser.add_argument(
+        "--coarse-backend", choices=("hybrid", "multiroute_rrf", "vector"),
+        default="hybrid", help="Remote Sentrix Lite retrieval policy",
+    )
+    parser.add_argument(
+        "--candidate-cache-in", default="",
+        help="Reuse full coarse candidate IDs from a previous evaluator report",
+    )
+    parser.add_argument(
+        "--skip-rerank", action="store_true",
+        help="Only collect/evaluate the coarse Top-K candidate cache",
+    )
     parser.add_argument("--coarse-scope", default="scope_06a94e4483964088")
     parser.add_argument("--video-limit", type=int, default=48)
     parser.add_argument("--image-limit", type=int, default=50)
+    parser.add_argument(
+        "--qa-id", action="append", default=[],
+        help="Evaluate only the selected QA ID; may be repeated for targeted retries",
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -252,11 +303,34 @@ def main() -> int:
     kernel = EvidenceRetrievalKernel(
         store, retrievers=retrievers, embedding_router=router, config=config,
     )
+    coarse_service_health = _remote_health(args.coarse_url) if args.coarse_url else None
     cases = _select_cases(
         Path(args.qa_dir), args.video_limit, args.image_limit, selection=args.selection,
     )
+    if args.qa_id:
+        requested_qa_ids = {str(value) for value in args.qa_id}
+        cases = [case for case in cases if str(case.get("qa_id")) in requested_qa_ids]
     by_name, name_by_id = _asset_lookup(store, args.scope)
-    scorer = get_local_reranker()
+    cached_rows: dict[str, dict] = {}
+    if args.candidate_cache_in:
+        cache_payload = json.loads(
+            Path(args.candidate_cache_in).read_text(encoding="utf-8-sig")
+        )
+        cached_rows = {
+            str(row.get("qa_id")): row
+            for row in (cache_payload.get("rows") or [])
+            if row.get("qa_id") and row.get("coarse_candidate_ids")
+        }
+    scorer = None if args.skip_rerank else get_local_reranker()
+    reranker_model_name = Path(
+        os.getenv("SENTRIX_RERANKER_MODEL_PATH", "")
+    ).name.casefold()
+    if os.getenv("SENTRIX_RERANKER_URL", "").strip():
+        reranker_variant = "rrf_plus_temporal_qwen3_vl"
+    elif "qwen" in reranker_model_name:
+        reranker_variant = "rrf_plus_temporal_qwen3_text"
+    else:
+        reranker_variant = "rrf_plus_temporal_bge"
     rows = []
     missing_gt = []
     rerank_errors = []
@@ -268,8 +342,18 @@ def main() -> int:
             missing_gt.append(case.get("qa_id"))
             continue
         coarse_started = time.perf_counter()
-        if args.coarse_url:
-            response = _remote_coarse(args.coarse_url, args.coarse_scope, query, 50)
+        cached = cached_rows.get(str(case.get("qa_id")))
+        if cached:
+            coarse_ids = [
+                str(asset_id) for asset_id in cached.get("coarse_candidate_ids") or []
+                if asset_id
+            ][:50]
+            coarse_ms = float(cached.get("rrf_latency_ms") or 0.0)
+        elif args.coarse_url:
+            response = _remote_coarse(
+                args.coarse_url, args.coarse_scope, query, 50,
+                backend=args.coarse_backend,
+            )
             coarse_ids = []
             for item in response.get("results") or []:
                 native_id = by_name.get(str(item.get("file_name") or "").casefold())
@@ -286,17 +370,23 @@ def main() -> int:
             coarse_ms = (time.perf_counter() - coarse_started) * 1000
         rerank_started = time.perf_counter()
         try:
-            reranked = rerank_candidates(
-                query,
-                coarse_ids,
-                store,
-                scorer=scorer,
-                window_seconds=float(os.getenv("SENTRIX_RERANKER_CLUSTER_WINDOW_SECONDS", "1")),
-            )
-            reranked_ids = reranked.asset_ids
-            rerank_ms = (time.perf_counter() - rerank_started) * 1000
-            cluster_count = len(reranked.clusters)
-            rerank_status = reranked.telemetry.get("status")
+            if args.skip_rerank:
+                reranked_ids = list(coarse_ids)
+                rerank_ms = 0.0
+                cluster_count = len(coarse_ids)
+                rerank_status = "skipped"
+            else:
+                reranked = rerank_candidates(
+                    query,
+                    coarse_ids,
+                    store,
+                    scorer=scorer,
+                    window_seconds=float(os.getenv("SENTRIX_RERANKER_CLUSTER_WINDOW_SECONDS", "1")),
+                )
+                reranked_ids = reranked.asset_ids
+                rerank_ms = (time.perf_counter() - rerank_started) * 1000
+                cluster_count = len(reranked.clusters)
+                rerank_status = reranked.telemetry.get("status")
         except Exception as error:
             reranked_ids = list(coarse_ids)
             rerank_ms = (time.perf_counter() - rerank_started) * 1000
@@ -312,6 +402,8 @@ def main() -> int:
             "coarse_candidate_count": len(coarse_ids),
             "temporal_cluster_count": cluster_count,
             "rerank_status": rerank_status,
+            "coarse_candidate_ids": coarse_ids,
+            "reranked_candidate_ids": reranked_ids,
             "rrf": _rank_metrics(coarse_ids, gt_ids),
             "reranked": _rank_metrics(reranked_ids, gt_ids),
             "rrf_latency_ms": round(coarse_ms, 1),
@@ -328,24 +420,27 @@ def main() -> int:
     for group in (*group_names, "all"):
         selected = rows if group == "all" else [row for row in rows if row["group"] == group]
         rrf = _summarize(selected, "rrf")
-        reranked = _summarize(selected, "reranked")
         groups[group] = {
             "rrf": rrf,
-            "rrf_plus_temporal_bge": reranked,
-            "delta": {
-                key: round(reranked[key] - rrf[key], 4)
-                for key in ("r_at_1", "r_at_3", "r_at_5", "r_at_8", "mrr")
-            },
-            "rerank_incremental_median_ms": round(statistics.median(
-                row["rerank_incremental_ms"] for row in selected
-            ), 1) if selected else 0.0,
             "average_coarse_candidates": round(statistics.mean(
                 row["coarse_candidate_count"] for row in selected
             ), 1) if selected else 0.0,
-            "average_temporal_clusters": round(statistics.mean(
-                row["temporal_cluster_count"] for row in selected
-            ), 1) if selected else 0.0,
         }
+        if not args.skip_rerank:
+            reranked = _summarize(selected, "reranked")
+            groups[group].update({
+                reranker_variant: reranked,
+                "delta": {
+                    key: round(reranked[key] - rrf[key], 4)
+                    for key in ("r_at_1", "r_at_3", "r_at_5", "r_at_8", "mrr")
+                },
+                "rerank_incremental_median_ms": round(statistics.median(
+                    row["rerank_incremental_ms"] for row in selected
+                ), 1) if selected else 0.0,
+                "average_temporal_clusters": round(statistics.mean(
+                    row["temporal_cluster_count"] for row in selected
+                ), 1) if selected else 0.0,
+            })
 
     result = {
         "schema_version": "sentrix_bge_reranker_ablation_v1",
@@ -362,13 +457,29 @@ def main() -> int:
             "missing_gt": missing_gt,
         },
         "configuration": {
-            "coarse_ranking": "sentrix_lite_named_vector_rrf_plus_lexical" if args.coarse_url
-                              else config.ranking_strategy,
+            "coarse_ranking": (
+                f"sentrix_lite_{args.coarse_backend}"
+                if args.coarse_url else config.ranking_strategy
+            ),
             "coarse_top_k": 50,
-            "channels": (["clip_image", "visual_caption", "object", "relation", "lexical"]
-                         if args.coarse_url else [retriever.name for retriever in retrievers]),
+            "channels": (
+                ["image", "visual_caption", "object", "relation", "speech", "lexical"]
+                if args.coarse_url and args.coarse_backend == "multiroute_rrf"
+                else (["image", "visual_caption", "object", "relation", "speech"]
+                      if args.coarse_url and args.coarse_backend == "vector"
+                      else (["image", "visual_caption", "object", "relation", "lexical"]
+                            if args.coarse_url
+                            else [retriever.name for retriever in retrievers]))
+            ),
             "coarse_url": args.coarse_url or None,
+            "coarse_backend": args.coarse_backend if args.coarse_url else None,
+            "coarse_service_health": coarse_service_health,
+            "candidate_cache_in": str(Path(args.candidate_cache_in).resolve())
+                                  if args.candidate_cache_in else None,
+            "rerank_enabled": not args.skip_rerank,
             "reranker_model_path": os.getenv("SENTRIX_RERANKER_MODEL_PATH"),
+            "reranker_url": os.getenv("SENTRIX_RERANKER_URL") or None,
+            "reranker_variant": reranker_variant,
             "reranker_device": os.getenv("SENTRIX_RERANKER_DEVICE", "auto"),
             "ranking_policy": "coarse_bge_rank_fusion",
             "coarse_rank_weight": float(os.getenv(
@@ -396,7 +507,8 @@ def main() -> int:
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(groups, ensure_ascii=False, indent=2), flush=True)
     print(f"saved: {output.resolve()}", flush=True)
-    scorer.unload()
+    if scorer is not None:
+        scorer.unload()
     return 0 if not missing_gt and not rerank_errors else 2
 
 

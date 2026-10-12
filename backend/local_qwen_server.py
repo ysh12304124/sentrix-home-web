@@ -222,8 +222,11 @@ def create_app(runtime: LocalQwenRuntime) -> web.Application:
 
     @routes.post("/admin/model/load")
     async def load_model(_request):
-        runtime.start_loading()
-        return web.json_response({"status": runtime.status, "model_resident": runtime.model is not None}, status=200 if runtime.model is not None else 202)
+        # CUDA initialization from a worker thread can corrupt the native heap on
+        # Windows (0xc0000374 in ntdll.dll). Keep model loading on the aiohttp
+        # main thread; this endpoint may block briefly while weights are loaded.
+        runtime.ensure_loaded()
+        return web.json_response({"status": runtime.status, "model_resident": runtime.model is not None})
 
     @routes.post("/admin/model/unload")
     async def unload_model(_request):
@@ -234,6 +237,9 @@ def create_app(runtime: LocalQwenRuntime) -> web.Application:
     async def chat(request):
         try:
             payload = await request.json()
+            # Load on the server's main thread before generation is dispatched
+            # to a worker. This is required for stable CUDA startup on Windows.
+            runtime.ensure_loaded()
             result = await asyncio.to_thread(runtime.generate, payload)
         except (ValueError, json.JSONDecodeError) as exc:
             return web.json_response({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)
@@ -298,7 +304,7 @@ def main() -> int:
     runtime = LocalQwenRuntime(model_path, args.model_name, args.idle_unload_seconds)
     runtime.start_idle_monitor()
     if args.eager_load:
-        runtime.start_loading()
+        runtime.ensure_loaded()
     print(f"OpenAI-compatible Qwen server: http://{args.host}:{args.port}/v1", flush=True)
     web.run_app(create_app(runtime), host=args.host, port=args.port, print=None)
     return 0

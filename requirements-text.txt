@@ -1,8 +1,6 @@
-# Isolated bge-m3 embedding environment (R9-4).
-# Used only by the text_embedder_sidecar — the main API never imports these.
-# Install into a dedicated venv (.venv-text) with PYTHONNOUSERSITE=1 so the
-# ~/.local transformers 5.11 / torch 2.5.1 conflict is avoided.
-sentence-transformers>=3.0,<4
-transformers>=4.40,<5
+# Isolated local text embedding environment (BGE-M3 or Qwen3 Embedding).
+# Qwen3 support requires transformers>=4.51 and a current SentenceTransformers.
+sentence-transformers>=5.0,<6
+transformers>=4.51,<6
 torch>=2.1
 numpy>=1.24

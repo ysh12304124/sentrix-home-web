@@ -675,6 +675,17 @@ def _extract_time_from_query(query: str) -> str | None:
     return None
 
 
+def _sanitize_model_filters(filters: dict, *, query: str, user_goal: str) -> dict:
+    """Keep model-produced time constraints anchored to explicit user text."""
+    sanitized = dict(filters or {})
+    explicit_time = _extract_time_from_query(f"{user_goal or ''} {query or ''}")
+    if explicit_time:
+        sanitized["time"] = explicit_time
+    else:
+        sanitized.pop("time", None)
+    return sanitized
+
+
 def _event_resolution(question: str, store, scope_id: str) -> dict | None:
     """W2.4：多轮引用解析到 Event（turn-0 无结果集时的二级锚）。
 
@@ -1493,7 +1504,7 @@ def _place_matches(item, place_q: str, store) -> bool:
         return False
 
 
-# 拆槽多路召回：每路保留 Top-50，跨路 RRF 后再由时间聚类 + BGE 重排；
+# 拆槽多路召回：每路保留 Top-50，跨路 RRF 后再由时间聚类 + 本地模型重排；
 # 最终仍只向 Agent 暴露有限候选。环境变量允许离线评测做严格消融。
 _SLOT_ROUTE_HEAD = max(1, int(os.getenv("SENTRIX_SLOT_ROUTE_HEAD", "50")))
 _SLOT_RERANK_HEAD = max(1, int(os.getenv("SENTRIX_RERANK_HEAD", "50")))
@@ -1705,6 +1716,7 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         return True
 
     kept = []
+    _relax_level = 0
     if time_comps is not None or time_bounds or place_q:
         for _aid in scores:
             if (time_comps is not None or time_bounds) and not _time_ok(_asset_captured(_aid)):
@@ -1714,14 +1726,22 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
             kept.append(_aid)
         if not kept and (time_comps is not None or time_bounds):
             kept = [a for a in scores if _time_ok(_asset_captured(a))]
+            _relax_level = 1
+            # Imported/migrated media may have no reliable capture timestamp.
+            # A hard temporal miss must not discard semantically strong
+            # candidates altogether; keep them as approximate evidence.
+            if not kept:
+                kept = list(scores)
+                _relax_level = 2
         elif not kept:
             kept = list(scores)  # 地点全删（非标准地名）→ 保留靠语义排序
+            _relax_level = 1
     else:
         kept = list(scores)
     kept.sort(key=lambda a: -scores.get(a, 0))
 
     # 多路 RRF 的 Top-50 是粗排候选。先按来源视频和时间戳做 +/-1 秒聚类，
-    # 再把结构化视觉文本交给本地 BGE cross-encoder 重排。聚类只使用资产元数据，
+    # 再把结构化视觉文本交给本地 reranker 重排。聚类只使用资产元数据，
     # 不读取 QA/GT。模型不可用时完整回退到原有 RRF + gap 截断路径。
     _rerank_enabled = str(os.getenv("SENTRIX_RERANKER_ENABLED", "0")).strip().lower() in {
         "1", "true", "yes", "on",
@@ -1791,8 +1811,8 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
                                    "subject_clothing": _o.get("subject_clothing") or []},
             "attributions": ([{"retriever": "slot_route", "rank": 0,
                                "score": scores.get(_aid, 0), "score_kind": "structured"}]
-                             + ([{"retriever": "bge_reranker", "rank": final_ids.index(_aid) + 1,
-                                  "score": _rerank_scores.get(_aid), "score_kind": "cross_encoder"}]
+                             + ([{"retriever": "local_reranker", "rank": final_ids.index(_aid) + 1,
+                                  "score": _rerank_scores.get(_aid), "score_kind": "relevance_probability"}]
                                 if _aid in _rerank_scores else [])),
         })
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
@@ -1802,14 +1822,13 @@ def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
         retrieval_timing={"reranker": _rerank_timing},
         channel_trace={"reranker": _rerank_timing},
     )
-    _relax_level = 0
     asset_ids = [item.get("asset_id") for item in assets if item.get("asset_id")]
     rs = _RUNTIME["result_sets"].new(
         scope_id=scope_id, query=query, asset_ids=asset_ids,
         unresolved=[g.get("reason") for g in (packet.gaps or [])],
     )
     preview_indices = _preview_indices(asset_ids, mode, store, query=query)
-    # 不调用 12B 做逐图验证；启用时候选顺序已由本地 BGE cross-encoder 给出。
+    # 不调用大模型做逐图验证；启用时候选顺序已由本地 reranker 给出。
     validated_ids = list(asset_ids)
     candidate_only_ids = []
     ranked_ids = list(asset_ids)

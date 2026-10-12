@@ -31,4 +31,6 @@ Stop-ManagedProcess "Web" (Join-Path $PidDir "web.pid")
 Stop-ManagedProcess "API" (Join-Path $PidDir "api.pid")
 if (-not $KeepPhotoBench) { Stop-ManagedProcess "PhotoBench" (Join-Path $PidDir "photobench.pid") }
 if (-not $KeepBge) { Stop-ManagedProcess "BGE" (Join-Path $PidDir "bge.pid") }
+Stop-ManagedProcess "VL Embed" (Join-Path $PidDir "vl-embed.pid")
+Stop-ManagedProcess "VL Rerank" (Join-Path $PidDir "vl-rerank.pid")
 if (-not $KeepModel) { Stop-ManagedProcess "Qwen" (Join-Path $PidDir "qwen.pid") }

@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 
 from backend.retrieval.reranker import (
     TemporalCluster,
@@ -32,6 +33,21 @@ class _Scorer:
 class _FailIfCalledScorer:
     def score(self, query, passages):
         raise AssertionError("whole-video candidates must not invoke BGE")
+
+
+class _MultimodalScorer:
+    model_path = "Qwen3-VL-Reranker-2B"
+    device = "remote"
+    backend = "qwen3_vl_reranker"
+    last_load_ms = 0.0
+    supports_multimodal = True
+
+    def __init__(self):
+        self.documents = []
+
+    def score_multimodal(self, query, documents):
+        self.documents = documents
+        return [0.25 + index for index in range(len(documents))]
 
 
 class TemporalClusterTests(unittest.TestCase):
@@ -125,6 +141,18 @@ class RerankTests(unittest.TestCase):
         )
         self.assertEqual(result.asset_ids, ["v1", "v2"])
         self.assertEqual(result.telemetry["status"], "skipped_whole_video_only")
+
+    def test_vl_reranker_receives_real_media_and_does_not_skip_whole_video(self):
+        scorer = _MultimodalScorer()
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            store = _Store(
+                {"v1": {"media_type": "video", "path": video.name}},
+                {"v1": [{"caption": "person riding a bicycle"}]},
+            )
+            result = rerank_candidates("bicycle", ["v1"], store, scorer=scorer)
+        self.assertEqual(result.telemetry["status"], "ok")
+        self.assertEqual(scorer.documents[0]["video"], video.name)
+        self.assertIn("person riding a bicycle", scorer.documents[0]["text"])
 
 
 if __name__ == "__main__":

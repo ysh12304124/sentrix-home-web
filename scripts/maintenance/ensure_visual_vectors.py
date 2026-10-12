@@ -91,7 +91,8 @@ def _backfill_field_desc(store, embedder, scope_id=None):
             continue
         observation = observations[0]
         desc_text = _observation_desc_text(observation)
-        vector = embedder.embed_query(desc_text)
+        encode = getattr(embedder, "embed_document", embedder.embed_query)
+        vector = encode(desc_text)
         if not vector:
             skipped_embed_fail += 1
             continue

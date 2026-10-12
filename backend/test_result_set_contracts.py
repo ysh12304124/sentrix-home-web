@@ -238,13 +238,21 @@ class ResultSetContractTests(unittest.TestCase):
         self.assertIsNone(_pending_resolution(task))
 
     def test_empty_search_does_not_overwrite_usable_result_set(self):
-        state = ResultTaskState(current_result_set="rs_good")
+        state = ResultTaskState(
+            current_result_set="rs_good",
+            result_preview=["photo_1", "photo_2"],
+            result_total=2,
+            search_satisfaction="candidate_only",
+        )
         state.update_from_tool(
             "search_memories", {"mode": "best"},
             {"result_set_id": "rs_empty", "total": 0, "preview": [],
              "query_satisfaction": "no_match"},
         )
         self.assertEqual(state.current_result_set, "rs_good")
+        self.assertEqual(state.result_preview, ["photo_1", "photo_2"])
+        self.assertEqual(state.result_total, 2)
+        self.assertEqual(state.search_satisfaction, "candidate_only")
 
     def test_first_empty_search_keeps_empty_result_set_for_followup_state(self):
         state = ResultTaskState()
@@ -261,6 +269,25 @@ class ResultSetContractTests(unittest.TestCase):
             "tool_results": [{"tool": "inspect_photo", "inspect_handle": "photo_1"}],
         })()
         self.assertEqual(_next_resolution_handle(task, "inspect_photo"), "photo_2")
+
+    def test_result_page_rebinds_current_preview_handles(self):
+        state = ResultTaskState(
+            current_result_set="rs_good", result_preview=["photo_1", "photo_2"],
+        )
+        state.update_from_tool(
+            "get_result_page", {"result_set_id": "rs_good", "page": 2},
+            {"result_set_id": "rs_good", "total": 12,
+             "preview": [{"handle": "photo_7"}, {"handle": "photo_8"}],
+             "has_more": False, "remaining": 0},
+        )
+        self.assertEqual(state.result_preview, ["photo_7", "photo_8"])
+
+    def test_legacy_handle_is_normalized_to_asset_handle(self):
+        arguments, stale = _normalize_preview_handle(
+            {"handle": "photo_2", "question": "看图"}, ["photo_1", "photo_2"],
+        )
+        self.assertEqual(arguments["asset_handle"], "photo_2")
+        self.assertIsNone(stale)
 
     def test_completion_search_recommendation_reads_top_level_and_legacy_nested(self):
         top_level = [{

@@ -62,21 +62,25 @@ class IngestionPipeline:
         self.video_memory_adapter = VideoMemoryAdapter()
 
     def _text_embed(self, text: str):
-        """文本嵌入：单一方案 TEXT=bge（BAAI/bge-m3），见 embeddings/scheme.py。
-
-        历史上这里会按 env 在 clip 与 bge 之间切换，导致 semantic/episodic 向量多套
-        并存、索引对不上。现在钉死 bge：sidecar 失败就显式报错，绝不静默降级成 clip
-        （否则又写入一套错误模型的向量）。
-        """
-        from .embeddings import scheme
-        import httpx
-        url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
-        resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=20)
-        resp.raise_for_status()
-        vec = (resp.json() or {}).get("vector")
-        if not vec:
-            raise RuntimeError("bge sidecar returned empty vector")
-        return vec, scheme.TEXT_MODEL
+        """文本嵌入：本地 text sidecar 或 CLIP。返回 (vector, model_name)。"""
+        if os.getenv("SENTRIX_TEXT_EMBEDDER", "clip").strip().lower() in {"bge", "qwen3", "local"}:
+            import httpx
+            url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
+            resp = httpx.post(
+                f"{url}/embed",
+                json={"text": str(text), "input_type": "document"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            vec = payload.get("vector")
+            if not vec:
+                raise RuntimeError("text embedding sidecar returned an empty vector")
+            return vec, payload.get("model") or os.getenv(
+                "SENTRIX_TEXT_EMBED_MODEL_ID",
+                os.getenv("SENTRIX_TEXT_EMBED_MODEL", "BAAI/bge-m3"),
+            )
+        return self.clip.embed_text(str(text)), self.clip.model_name
 
     def _field_desc_text(self, analysis: dict) -> str:
         """完整描述文本：caption + place + objects + event_type + ocr_text（observations 字段）。
@@ -107,7 +111,7 @@ class IngestionPipeline:
         return " ".join(filter(None, [caption, place, object_text, event_type, ocr_text]))
 
     def _field_desc_embed(self, text: str):
-        """用 bge-m3 sidecar 编码完整描述；失败返回 (None, None)，不阻塞语义导入。
+        """用本地 text sidecar 编码完整描述；失败返回 (None, None)。
 
         复用带熔断的 BgeM3TextQueryEmbedder（sidecar 死亡时快速返回空向量），
         生成失败仅跳过 field_desc 通道，绝不让图片导入报错。
@@ -116,7 +120,11 @@ class IngestionPipeline:
             from .embeddings.bge_text import BgeM3TextQueryEmbedder
             if getattr(self, "_field_desc_embedder", None) is None:
                 self._field_desc_embedder = BgeM3TextQueryEmbedder()
-            vector = self._field_desc_embedder.embed_query(text)
+            embed_document = getattr(
+                self._field_desc_embedder, "embed_document",
+                self._field_desc_embedder.embed_query,
+            )
+            vector = embed_document(text)
             if vector:
                 return vector, self._field_desc_embedder.model_id
         except Exception:

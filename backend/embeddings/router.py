@@ -5,8 +5,8 @@ point for the retrieval layer.  Construction happens at the Application
 Composition Root (``app.py``); the Kernel and Agent only ever see this object.
 
 Selection is env-driven:
-  SENTRIX_IMAGE_EMBEDDER = clip | chinese_clip        (visual slot)
-  SENTRIX_TEXT_EMBEDDER  = clip | bge                  (text slot)
+  SENTRIX_IMAGE_EMBEDDER = clip | chinese_clip | qwen3_vl (visual slot)
+  SENTRIX_TEXT_EMBEDDER  = clip | bge | qwen3           (text slot)
 
 A slot whose embedder is unavailable reports ``available=False`` and the
 corresponding ANN retriever skips with a trace reason — never a silent empty.
@@ -26,27 +26,33 @@ class EmbeddingRouter:
 
     @classmethod
     def from_clip(cls, clip):
-        """Build with the LOCKED scheme (see embeddings/scheme.py).
+        """Build the two query slots selected by the deployed vector spaces.
 
-        历史上 IMAGE/TEXT 可被 env 切成 clip/chinese_clip/bge，导致向量/索引多套并存、
-        检索时好时坏。现钉死单一方案，不再读 env 选择：IMAGE=chinese_clip、TEXT=bge。
+        ``scheme`` remains the conservative fallback for old deployments, but
+        an explicit runtime configuration must win.  In particular, the Agent
+        Qwen3-VL+BGE profile needs a 2048-d Qwen visual query for its Qdrant
+        image route; silently constructing a Chinese-CLIP query here makes
+        that route dimension-incompatible even though ingestion used Qwen.
         """
         from . import scheme
-        image_kind = scheme.IMAGE_EMBEDDER
-        text_kind = scheme.TEXT_EMBEDDER
+        image_kind = os.getenv("SENTRIX_IMAGE_EMBEDDER", scheme.IMAGE_EMBEDDER).strip().lower()
+        text_kind = os.getenv("SENTRIX_TEXT_EMBEDDER", scheme.TEXT_EMBEDDER).strip().lower()
         visual = None
         if image_kind == "chinese_clip":
             from .chinese_clip_visual import ChineseClipVisualEmbedder
             visual = ChineseClipVisualEmbedder.shared()
-        elif clip is not None:
+        elif image_kind in {"qwen3_vl", "qwen3-vl", "qwen_vl"}:
+            from .qwen3_vl_remote import Qwen3VLVisualAdapter
+            visual = Qwen3VLVisualAdapter.shared()
+        elif image_kind == "clip" and clip is not None:
             from .clip_visual import ClipVisualQueryEmbedder
             visual = ClipVisualQueryEmbedder(clip)
         else:
             raise ValueError(f"unknown SENTRIX_IMAGE_EMBEDDER: {image_kind}")
         text = None
-        if text_kind == "bge":
-            from .bge_text import BgeM3TextQueryEmbedder
-            text = BgeM3TextQueryEmbedder()
+        if text_kind in {"bge", "qwen3", "local"}:
+            from .bge_text import LocalTextQueryEmbedder
+            text = LocalTextQueryEmbedder()
         elif clip is not None:
             from .clip_text import ClipTextQueryEmbedder
             text = ClipTextQueryEmbedder(clip)

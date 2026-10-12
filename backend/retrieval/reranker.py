@@ -1,4 +1,4 @@
-"""Temporal-clustered BGE reranking for the final RRF candidate head.
+"""Temporal-clustered local reranking for the final RRF candidate head.
 
 The retrieval kernel remains responsible for recall and RRF fusion.  This
 module only reorders the bounded candidate head and removes near-duplicate
@@ -17,6 +17,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    import httpx
+except Exception:  # pragma: no cover - optional local service client
+    httpx = None
 
 
 _SPACE_RE = re.compile(r"\s+")
@@ -371,8 +376,15 @@ def build_cluster_text(cluster: TemporalCluster, store, *, max_chars: int = 6000
     return "\n".join(lines)[:max(1, int(max_chars))]
 
 
-class LocalBgeReranker:
-    """Lazy local cross-encoder with optional idle GPU/CPU unload."""
+class LocalReranker:
+    """Lazy BGE/Qwen3 reranker with optional idle GPU/CPU unload.
+
+    Classic BGE cross-encoders expose one sequence-classification logit.  The
+    Qwen3 reranker family instead exposes a causal language model and scores a
+    document from the probability of the next token being ``yes`` rather than
+    ``no``.  Model type detection happens locally from ``config.json`` so the
+    runtime remains fully offline.
+    """
 
     def __init__(
         self,
@@ -391,6 +403,11 @@ class LocalBgeReranker:
         self._model = None
         self._tokenizer = None
         self._device = "unloaded"
+        self._backend = "unloaded"
+        self._qwen_prefix_tokens: list[int] = []
+        self._qwen_suffix_tokens: list[int] = []
+        self._qwen_yes_token_id: int | None = None
+        self._qwen_no_token_id: int | None = None
         self._lock = threading.RLock()
         self._last_used = 0.0
         self._timer: threading.Timer | None = None
@@ -399,6 +416,10 @@ class LocalBgeReranker:
     @property
     def device(self) -> str:
         return self._device
+
+    @property
+    def backend(self) -> str:
+        return self._backend
 
     def _resolved_device(self, torch) -> str:
         requested = self.requested_device.casefold()
@@ -413,24 +434,53 @@ class LocalBgeReranker:
             return
         model_dir = Path(self.model_path)
         if not model_dir.is_dir():
-            raise FileNotFoundError(f"BGE reranker model directory not found: {model_dir}")
+            raise FileNotFoundError(f"Reranker model directory not found: {model_dir}")
         started = time.monotonic()
         import torch
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+        )
 
         device = self._resolved_device(torch)
         dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path, local_files_only=True, use_fast=True,
+        config = AutoConfig.from_pretrained(self.model_path, local_files_only=True)
+        architectures = " ".join(getattr(config, "architectures", None) or []).casefold()
+        is_qwen_reranker = (
+            str(getattr(config, "model_type", "")).casefold() == "qwen3"
+            and "causallm" in architectures
         )
-        model = AutoModelForSequenceClassification.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
             local_files_only=True,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
+            use_fast=True,
+            padding_side="left" if is_qwen_reranker else "right",
+        )
+        model_class = AutoModelForCausalLM if is_qwen_reranker else AutoModelForSequenceClassification
+        model = model_class.from_pretrained(
+            self.model_path, local_files_only=True, dtype=dtype, low_cpu_mem_usage=True,
         )
         model.eval()
         model.to(device)
+
+        if is_qwen_reranker:
+            prefix = (
+                "<|im_start|>system\nJudge whether the Document meets the requirements "
+                "based on the Query and the Instruct provided. Note that the answer can "
+                "only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+            )
+            suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            self._qwen_prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+            self._qwen_suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
+            self._qwen_yes_token_id = tokenizer.convert_tokens_to_ids("yes")
+            self._qwen_no_token_id = tokenizer.convert_tokens_to_ids("no")
+            if self._qwen_yes_token_id == tokenizer.unk_token_id or self._qwen_no_token_id == tokenizer.unk_token_id:
+                raise RuntimeError("Qwen3 reranker tokenizer does not contain the required yes/no tokens")
+            self._backend = "qwen3_causal_lm"
+        else:
+            self._backend = "sequence_classification"
         self._tokenizer = tokenizer
         self._model = model
         self._device = str(device)
@@ -461,6 +511,11 @@ class LocalBgeReranker:
             self._model = None
             self._tokenizer = None
             self._device = "unloaded"
+            self._backend = "unloaded"
+            self._qwen_prefix_tokens = []
+            self._qwen_suffix_tokens = []
+            self._qwen_yes_token_id = None
+            self._qwen_no_token_id = None
             gc.collect()
             try:
                 import torch
@@ -480,31 +535,137 @@ class LocalBgeReranker:
             with torch.inference_mode():
                 for start in range(0, len(passages), self.batch_size):
                     batch = passages[start:start + self.batch_size]
-                    encoded = self._tokenizer(
-                        [[query, passage] for passage in batch],
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_length,
-                        return_tensors="pt",
-                    )
+                    if self._backend == "qwen3_causal_lm":
+                        instruction = os.getenv(
+                            "SENTRIX_RERANKER_INSTRUCTION",
+                            "Given a personal memory question, determine whether the candidate "
+                            "media description contains evidence relevant to answering the question.",
+                        ).strip()
+                        pairs = [
+                            f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {passage}"
+                            for passage in batch
+                        ]
+                        body_limit = max(
+                            1,
+                            self.max_length
+                            - len(self._qwen_prefix_tokens)
+                            - len(self._qwen_suffix_tokens),
+                        )
+                        body = self._tokenizer(
+                            pairs,
+                            padding=False,
+                            truncation=True,
+                            max_length=body_limit,
+                            add_special_tokens=False,
+                            return_attention_mask=False,
+                        )
+                        body["input_ids"] = [
+                            self._qwen_prefix_tokens + ids + self._qwen_suffix_tokens
+                            for ids in body["input_ids"]
+                        ]
+                        encoded = self._tokenizer.pad(
+                            body, padding=True, return_tensors="pt",
+                        )
+                    else:
+                        encoded = self._tokenizer(
+                            [[query, passage] for passage in batch],
+                            padding=True,
+                            truncation=True,
+                            max_length=self.max_length,
+                            return_tensors="pt",
+                        )
                     encoded = {key: value.to(self._device) for key, value in encoded.items()}
-                    logits = self._model(**encoded, return_dict=True).logits.view(-1).float()
-                    scores.extend(torch.sigmoid(logits).detach().cpu().tolist())
+                    logits = self._model(**encoded, return_dict=True).logits
+                    if self._backend == "qwen3_causal_lm":
+                        next_token_logits = logits[:, -1, :].float()
+                        yes_logits = next_token_logits[:, self._qwen_yes_token_id]
+                        no_logits = next_token_logits[:, self._qwen_no_token_id]
+                        binary_logits = torch.stack((no_logits, yes_logits), dim=1)
+                        batch_scores = torch.softmax(binary_logits, dim=1)[:, 1]
+                    else:
+                        batch_scores = torch.sigmoid(logits.view(-1).float())
+                    scores.extend(batch_scores.detach().cpu().tolist())
             self._last_used = time.monotonic()
             self._schedule_idle_unload()
             return [float(score) for score in scores]
 
 
-_RERANKER: LocalBgeReranker | None = None
+class RemoteQwen3VLReranker:
+    """Client for the multimodal Qwen3-VL reranker sidecar."""
+
+    supports_multimodal = True
+
+    def __init__(self, base_url: str, model_path: str = "Qwen3-VL-Reranker-2B",
+                 batch_size: int = 1):
+        self.base_url = str(base_url).rstrip("/")
+        self.model_path = str(model_path)
+        self._device = "remote"
+        self._backend = "qwen3_vl_reranker"
+        self.last_load_ms = 0.0
+        self.timeout = float(os.getenv("SENTRIX_RERANKER_TIMEOUT", "300"))
+        self.batch_size = max(1, int(batch_size))
+
+    @property
+    def device(self):
+        return self._device
+
+    @property
+    def backend(self):
+        return self._backend
+
+    def unload(self):
+        if httpx is None:
+            return
+        try:
+            httpx.post(f"{self.base_url}/unload", timeout=5)
+        except Exception:
+            pass
+
+    def score(self, query: str, passages: list[str]) -> list[float]:
+        return self.score_multimodal(
+            query, [{"text": passage} for passage in passages],
+        )
+
+    def score_multimodal(self, query: str, documents: list[dict]) -> list[float]:
+        if httpx is None:
+            raise RuntimeError("httpx is unavailable for VL reranking")
+        instruction = os.getenv(
+            "SENTRIX_RERANKER_INSTRUCTION",
+            "Given a personal memory question, rank media containing evidence "
+            "relevant to answering the question.",
+        ).strip()
+        scores: list[float] = []
+        for start in range(0, len(documents), self.batch_size):
+            batch = documents[start:start + self.batch_size]
+            response = httpx.post(
+                f"{self.base_url}/rerank",
+                json={"instruction": instruction, "query": {"text": query},
+                      "documents": batch},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+            self.last_load_ms = max(
+                self.last_load_ms, float(payload.get("load_ms") or 0.0),
+            )
+            scores.extend(float(score) for score in (payload.get("scores") or []))
+        return scores
+
+
+LocalBgeReranker = LocalReranker  # Backward-compatible import for local scripts.
+
+
+_RERANKER: Any | None = None
 _RERANKER_CONFIG: tuple | None = None
 _RERANKER_LOCK = threading.Lock()
 
 
-def get_local_reranker() -> LocalBgeReranker:
+def get_local_reranker():
     global _RERANKER, _RERANKER_CONFIG
     model_path = os.getenv("SENTRIX_RERANKER_MODEL_PATH", "").strip()
+    remote_url = os.getenv("SENTRIX_RERANKER_URL", "").strip()
     config = (
-        model_path,
+        model_path, remote_url,
         os.getenv("SENTRIX_RERANKER_DEVICE", "auto"),
         int(os.getenv("SENTRIX_RERANKER_BATCH_SIZE", "8")),
         int(os.getenv("SENTRIX_RERANKER_MAX_LENGTH", "512")),
@@ -514,12 +675,33 @@ def get_local_reranker() -> LocalBgeReranker:
         if _RERANKER is None or _RERANKER_CONFIG != config:
             if _RERANKER is not None:
                 _RERANKER.unload()
-            _RERANKER = LocalBgeReranker(
-                config[0], device=config[1], batch_size=config[2],
-                max_length=config[3], idle_unload_seconds=config[4],
-            )
+            if remote_url:
+                _RERANKER = RemoteQwen3VLReranker(
+                    remote_url, model_path, batch_size=config[3],
+                )
+            else:
+                _RERANKER = LocalReranker(
+                    config[0], device=config[2], batch_size=config[3],
+                    max_length=config[4], idle_unload_seconds=config[5],
+                )
             _RERANKER_CONFIG = config
         return _RERANKER
+
+
+def _cluster_document(cluster: TemporalCluster, store, text: str) -> dict:
+    """Attach real media to the structured text used by the VL reranker."""
+    document: dict[str, Any] = {"text": text} if text else {}
+    # A temporal cluster is represented by its highest coarse-ranked centre.
+    # Passing every adjacent frame would multiply vision tokens without adding
+    # independent evidence.
+    asset = store.get_asset(cluster.center_id) or {}
+    path = str(asset.get("path") or "")
+    if path and Path(path).is_file():
+        if str(asset.get("media_type") or "").lower() == "video":
+            document["video"] = path
+        else:
+            document["image"] = path
+    return document
 
 
 def rerank_candidates(
@@ -535,7 +717,7 @@ def rerank_candidates(
     fusion_rrf_k: float | None = None,
     skip_whole_video_only: bool | None = None,
 ) -> RerankResult:
-    """Cluster and BGE-rerank a coarse RRF candidate list."""
+    """Cluster and locally rerank a coarse RRF candidate list."""
     started = time.monotonic()
     cluster_started = time.monotonic()
     clusters = cluster_candidates(candidate_ids, store, window_seconds=window_seconds)
@@ -551,7 +733,9 @@ def rerank_candidates(
         and _timeline_key(store.get_asset(asset_id) or {}) == (None, None)
         for asset_id in candidate_ids
     )
-    if skip_whole_video and whole_video_only:
+    scorer = scorer or get_local_reranker()
+    supports_multimodal = bool(getattr(scorer, "supports_multimodal", False))
+    if skip_whole_video and whole_video_only and not supports_multimodal:
         return RerankResult(
             asset_ids=[cluster.center_id for cluster in clusters],
             score_by_asset={},
@@ -573,7 +757,9 @@ def rerank_candidates(
     passages = [build_cluster_text(cluster, store, max_chars=max_passage_chars)
                 for cluster in clusters]
     text_ms = round((time.monotonic() - text_started) * 1000, 1)
-    nonempty = [index for index, passage in enumerate(passages) if passage]
+    documents = [_cluster_document(cluster, store, passage)
+                 for cluster, passage in zip(clusters, passages)]
+    nonempty = [index for index, document in enumerate(documents) if document]
     if not nonempty:
         return RerankResult(
             asset_ids=[cluster.center_id for cluster in clusters],
@@ -588,27 +774,35 @@ def rerank_candidates(
             },
         )
 
-    scorer = scorer or get_local_reranker()
     model_started = time.monotonic()
-    nonempty_scores = scorer.score(query, [passages[index] for index in nonempty])
+    if supports_multimodal and hasattr(scorer, "score_multimodal"):
+        nonempty_scores = scorer.score_multimodal(
+            query, [documents[index] for index in nonempty],
+        )
+    else:
+        nonempty_scores = scorer.score(query, [passages[index] for index in nonempty])
     model_ms = round((time.monotonic() - model_started) * 1000, 1)
     if len(nonempty_scores) != len(nonempty):
-        raise RuntimeError("BGE reranker returned a different number of scores")
+        raise RuntimeError("Local reranker returned a different number of scores")
     all_scores = [-1.0] * len(clusters)
     for index, score in zip(nonempty, nonempty_scores):
         all_scores[index] = float(score)
     coarse_weight = (float(os.getenv("SENTRIX_RERANKER_COARSE_RANK_WEIGHT", "1"))
                      if coarse_rank_weight is None else float(coarse_rank_weight))
-    bge_weight = (float(os.getenv("SENTRIX_RERANKER_BGE_RANK_WEIGHT", "0.25"))
-                  if bge_rank_weight is None else float(bge_rank_weight))
+    configured_reranker_weight = os.getenv(
+        "SENTRIX_RERANKER_RANK_WEIGHT",
+        os.getenv("SENTRIX_RERANKER_BGE_RANK_WEIGHT", "0.25"),
+    )
+    reranker_weight = (float(configured_reranker_weight)
+                       if bge_rank_weight is None else float(bge_rank_weight))
     rrf_k = (float(os.getenv("SENTRIX_RERANKER_FUSION_RRF_K", "60"))
              if fusion_rrf_k is None else float(fusion_rrf_k))
     rrf_k = max(0.0, rrf_k)
-    bge_order = sorted(range(len(clusters)), key=lambda index: (-all_scores[index], index))
-    bge_ranks = {index: rank for rank, index in enumerate(bge_order, 1)}
+    reranker_order = sorted(range(len(clusters)), key=lambda index: (-all_scores[index], index))
+    reranker_ranks = {index: rank for rank, index in enumerate(reranker_order, 1)}
     fused_scores = {
         index: (coarse_weight / (rrf_k + index + 1)
-                + bge_weight / (rrf_k + bge_ranks[index]))
+                + reranker_weight / (rrf_k + reranker_ranks[index]))
         for index in range(len(clusters))
     }
     order = sorted(range(len(clusters)), key=lambda index: (-fused_scores[index], index))
@@ -620,13 +814,15 @@ def rerank_candidates(
         "status": "ok",
         "model": Path(getattr(scorer, "model_path", "bge-reranker")).name,
         "device": getattr(scorer, "device", "unknown"),
+        "backend": getattr(scorer, "backend", "unknown"),
         "coarse_candidates": len(candidate_ids),
         "temporal_clusters": len(clusters),
         "merged_candidates": len(candidate_ids) - len(clusters),
         "cluster_window_seconds": float(window_seconds),
-        "ranking_policy": "coarse_bge_rank_fusion",
+        "ranking_policy": "coarse_local_reranker_rank_fusion",
         "coarse_rank_weight": coarse_weight,
-        "bge_rank_weight": bge_weight,
+        "reranker_rank_weight": reranker_weight,
+        "bge_rank_weight": reranker_weight,  # Backward-compatible report field.
         "fusion_rrf_k": rrf_k,
         "cluster_ms": cluster_ms,
         "text_build_ms": text_ms,

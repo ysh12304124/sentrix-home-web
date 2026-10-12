@@ -373,19 +373,24 @@ class TaskState:
             has_matches = total is None or int(total or 0) > 0
             if has_matches or not self.current_result_set:
                 self.current_result_set = observation["result_set_id"]
-            self.result_mode = arguments.get("mode") or "best"
-            self.has_more = bool(observation.get("has_more"))
-            self.delivery_state = "available" if observation.get("has_more") else "complete"
-            total = observation.get("total")
-            self.result_total = int(total) if total is not None else None
-            self.result_remaining = observation.get("remaining")
-            self.result_preview = [p.get("handle") for p in (observation.get("preview") or [])][:20]
+                self.result_mode = arguments.get("mode") or "best"
+                self.has_more = bool(observation.get("has_more"))
+                self.delivery_state = "available" if observation.get("has_more") else "complete"
+                self.result_total = int(total) if total is not None else None
+                self.result_remaining = observation.get("remaining")
+                self.result_preview = [
+                    p.get("handle") for p in (observation.get("preview") or []) if p.get("handle")
+                ][:20]
             if total == 0:
-                self.fulfillment = "empty"
+                # Do not erase a previously usable candidate window. The empty
+                # query is still recorded in tool_results, but visual tools may
+                # continue resolving handles from the last non-empty result.
+                if not self.current_result_set or not self.result_preview:
+                    self.fulfillment = "empty"
             else:
                 self.fulfillment = "partial" if observation.get("gaps") else "fulfilled"
-            self.search_satisfaction = observation.get("query_satisfaction")
-            self.search_condition_summary = observation.get("condition_summary") or {}
+                self.search_satisfaction = observation.get("query_satisfaction")
+                self.search_condition_summary = observation.get("condition_summary") or {}
             # Event-anchored search may already contain a bounded structured
             # count (for example two group photos of sizes 3 and 4). Promote
             # that fact into the same nucleus fields used by query_memory_facts
@@ -398,6 +403,20 @@ class TaskState:
                     "sizes": observation.get("group_photo_sizes") or [],
                 }
                 self.fact_operation = "group"
+        if tool_name == "get_result_page" and observation.get("result_set_id"):
+            # Paging changes the handles currently visible to the model. Keep
+            # ToolPolicy bound to that exact page; otherwise a valid handle
+            # from get_result_page is checked against the previous search page.
+            self.current_result_set = observation["result_set_id"]
+            self.has_more = bool(observation.get("has_more"))
+            self.result_remaining = observation.get("remaining")
+            preview = observation.get("preview") or []
+            self.result_preview = [
+                item.get("handle") for item in preview
+                if isinstance(item, dict) and item.get("handle")
+            ][:20]
+            if observation.get("total") is not None:
+                self.result_total = int(observation.get("total") or 0)
         if tool_name == "get_original_photos":
             self.delivery_state = "delivered"
             self.delivered_count = observation.get("delivered")

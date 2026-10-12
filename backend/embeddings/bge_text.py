@@ -1,4 +1,4 @@
-"""bge-m3 text query embedder — HTTP SidecarClient (Phase R9-4).
+"""Local text query/document embedder — HTTP sidecar client.
 
 The bge-m3 model lives in an isolated venv (``.venv-text``, requirements-text.txt)
 behind a small HTTP sidecar (scripts/maintenance/text_embedder_sidecar.py).  The
@@ -23,9 +23,12 @@ except Exception:  # pragma: no cover - optional dependency
 _DEFAULT_URL = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101")
 
 
-class BgeM3TextQueryEmbedder:
+class LocalTextQueryEmbedder:
     def __init__(self, model_id: str | None = None, base_url: str | None = None):
-        self._model_id = model_id or os.getenv("SENTRIX_TEXT_EMBED_MODEL", "BAAI/bge-m3")
+        self._model_id = model_id or os.getenv(
+            "SENTRIX_TEXT_EMBED_MODEL_ID",
+            os.getenv("SENTRIX_TEXT_EMBED_MODEL", "BAAI/bge-m3"),
+        )
         self._base_url = (base_url or _DEFAULT_URL).rstrip("/")
         self._timeout = float(os.getenv("SENTRIX_TEXT_EMBEDDER_TIMEOUT", "10"))
         self._failures = 0
@@ -91,14 +94,14 @@ class BgeM3TextQueryEmbedder:
         self._health_value = True
         self._health_checked_at = time.monotonic()
 
-    def embed_query(self, text: str) -> list[float]:
+    def _embed(self, text: str, input_type: str) -> list[float]:
         if httpx is None:
             return []
         if self._tripped_at and time.monotonic() - self._tripped_at < 10.0:
             return []
         try:
             response = httpx.post(f"{self._base_url}/embed",
-                                  json={"text": str(text or "")},
+                                  json={"text": str(text or ""), "input_type": input_type},
                                   timeout=self._timeout)
             response.raise_for_status()
             vector = response.json().get("vector") or []
@@ -107,3 +110,12 @@ class BgeM3TextQueryEmbedder:
         except Exception:
             self._record_failure()
             return []
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text, "query")
+
+    def embed_document(self, text: str) -> list[float]:
+        return self._embed(text, "document")
+
+
+BgeM3TextQueryEmbedder = LocalTextQueryEmbedder  # Backward-compatible import.

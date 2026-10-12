@@ -6,6 +6,8 @@ param(
     [int]$WebPort = 0,
     [int]$ModelPort = 0,
     [int]$BgePort = 0,
+    [int]$VlEmbedPort = 0,
+    [int]$VlRerankPort = 0,
     [int]$PhotoBenchPort = 0,
     [int]$ModelIdleUnloadSeconds = 0,
     [switch]$EagerLoadModel,
@@ -174,7 +176,9 @@ function Start-ManagedProcess {
 function Show-Status {
     $rows = @(
         @{ Name = "Qwen"; Url = "http://127.0.0.1:$ModelPort/v1/models" },
-        @{ Name = "BGE"; Url = "http://127.0.0.1:$BgePort/health" },
+        @{ Name = "Embedder"; Url = "http://127.0.0.1:$BgePort/health" },
+        @{ Name = "VL Embed"; Url = "http://127.0.0.1:$VlEmbedPort/health" },
+        @{ Name = "VL Rerank"; Url = "http://127.0.0.1:$VlRerankPort/health" },
         @{ Name = "API"; Url = "http://127.0.0.1:$ApiPort/api/health" },
         @{ Name = "Web"; Url = "http://127.0.0.1:$WebPort/" },
         @{ Name = "PhotoBench"; Url = "http://127.0.0.1:$PhotoBenchPort/api/config" }
@@ -192,6 +196,8 @@ if ($ApiPort -le 0) { $ApiPort = [int]$(if ($env:SENTRIX_API_PORT) { $env:SENTRI
 if ($WebPort -le 0) { $WebPort = [int]$(if ($env:PORT) { $env:PORT } else { "4174" }) }
 if ($ModelPort -le 0) { $ModelPort = [int]$(if ($env:LOCAL_QWEN_PORT) { $env:LOCAL_QWEN_PORT } else { "11434" }) }
 if ($BgePort -le 0) { $BgePort = [int]$(if ($env:SENTRIX_TEXT_EMBEDDER_PORT) { $env:SENTRIX_TEXT_EMBEDDER_PORT } else { "8101" }) }
+if ($VlEmbedPort -le 0) { $VlEmbedPort = [int]$(if ($env:SENTRIX_QWEN3_VL_EMBEDDER_PORT) { $env:SENTRIX_QWEN3_VL_EMBEDDER_PORT } else { "8102" }) }
+if ($VlRerankPort -le 0) { $VlRerankPort = [int]$(if ($env:SENTRIX_QWEN3_VL_RERANKER_PORT) { $env:SENTRIX_QWEN3_VL_RERANKER_PORT } else { "8103" }) }
 if ($PhotoBenchPort -le 0) { $PhotoBenchPort = [int]$(if ($env:PHOTOBENCH_PORT) { $env:PHOTOBENCH_PORT } else { "8772" }) }
 if ($ModelIdleUnloadSeconds -le 0) { $ModelIdleUnloadSeconds = [int]$(if ($env:LOCAL_QWEN_IDLE_UNLOAD_SECONDS) { $env:LOCAL_QWEN_IDLE_UNLOAD_SECONDS } else { "60" }) }
 
@@ -203,6 +209,13 @@ if ($Restart) { & (Join-Path $PSScriptRoot "stop_local.ps1") }
 $runtime = Resolve-CondaRuntime
 $Python = $runtime.Python
 $Node = $runtime.Node
+$VlPython = $Python
+if ($env:SENTRIX_QWEN3_VL_PYTHON_PATH) {
+    if (-not (Test-Path -LiteralPath $env:SENTRIX_QWEN3_VL_PYTHON_PATH -PathType Leaf)) {
+        throw "SENTRIX_QWEN3_VL_PYTHON_PATH must point to the isolated Qwen3-VL python.exe."
+    }
+    $VlPython = (Resolve-Path -LiteralPath $env:SENTRIX_QWEN3_VL_PYTHON_PATH).Path
+}
 $ModelName = if ($env:LOCAL_QWEN_MODEL_NAME) { $env:LOCAL_QWEN_MODEL_NAME } else { "Qwen3-VL-4B-Instruct" }
 $ModelUrl = "http://127.0.0.1:$ModelPort"
 $BgeUrl = "http://127.0.0.1:$BgePort"
@@ -233,25 +246,72 @@ if (-not (Test-Url "$ModelUrl/v1/models")) {
 if ($SkipBge) {
     $env:SENTRIX_TEXT_EMBEDDER = "clip"
 } else {
-    $BgeModel = $env:LOCAL_BGE_MODEL_PATH
-    if (-not $BgeModel -or -not (Test-Path -LiteralPath $BgeModel -PathType Container)) {
-        throw "LOCAL_BGE_MODEL_PATH in .env.local must point to the complete local BGE-M3 model directory."
+    $TextEmbedModel = if ($env:LOCAL_TEXT_EMBED_MODEL_PATH) {
+        $env:LOCAL_TEXT_EMBED_MODEL_PATH
+    } else {
+        $env:LOCAL_BGE_MODEL_PATH
     }
-    $env:SENTRIX_TEXT_EMBEDDER = "bge"
-    $env:SENTRIX_TEXT_EMBED_MODEL = $BgeModel
-    $env:SENTRIX_TEXT_EMBEDDER_DEVICE = "cpu"
+    if (-not $TextEmbedModel -or -not (Test-Path -LiteralPath $TextEmbedModel -PathType Container)) {
+        throw "LOCAL_TEXT_EMBED_MODEL_PATH in .env.local must point to a complete local embedding model directory."
+    }
+    Set-DefaultEnv "SENTRIX_TEXT_EMBEDDER" "local"
+    $env:SENTRIX_TEXT_EMBED_MODEL = $TextEmbedModel
+    Set-DefaultEnv "SENTRIX_TEXT_EMBEDDER_DEVICE" "cpu"
     $env:SENTRIX_TEXT_EMBEDDER_HOST = "127.0.0.1"
     $env:SENTRIX_TEXT_EMBEDDER_PORT = "$BgePort"
     $env:SENTRIX_TEXT_EMBEDDER_URL = $BgeUrl
-    Start-ManagedProcess "bge" $Python @("scripts/maintenance/text_embedder_sidecar.py", "--host", "127.0.0.1", "--port", "$BgePort") $RootDir (Join-Path $PidDir "bge.pid") "$BgeUrl/health" $BgePort 180 | Out-Null
+    Start-ManagedProcess "embedder" $Python @("scripts/maintenance/text_embedder_sidecar.py", "--host", "127.0.0.1", "--port", "$BgePort") $RootDir (Join-Path $PidDir "bge.pid") "$BgeUrl/health" $BgePort 180 | Out-Null
+}
+
+$ImageEmbedderKind = if ($env:SENTRIX_IMAGE_EMBEDDER) { $env:SENTRIX_IMAGE_EMBEDDER.ToLowerInvariant() } else { "clip" }
+$VlCodePath = $env:SENTRIX_QWEN3_VL_CODE_PATH
+$PreviousVlProcessEnv = @{}
+foreach ($key in @(
+    "SENTRIX_QWEN3_VL_MODE", "SENTRIX_QWEN3_VL_MODEL_PATH",
+    "SENTRIX_QWEN3_VL_MODEL_ID", "SENTRIX_QWEN3_VL_DEVICE",
+    "SENTRIX_QWEN3_VL_IDLE_UNLOAD_SECONDS"
+)) {
+    $PreviousVlProcessEnv[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+}
+if ($ImageEmbedderKind -in @("qwen3_vl", "qwen3-vl", "qwen_vl")) {
+    $VlEmbedModel = $env:SENTRIX_QWEN3_VL_EMBED_MODEL_PATH
+    if (-not $VlEmbedModel -or -not (Test-Path -LiteralPath $VlEmbedModel -PathType Container)) {
+        throw "SENTRIX_QWEN3_VL_EMBED_MODEL_PATH must point to Qwen3-VL-Embedding-2B."
+    }
+    if (-not $VlCodePath -or -not (Test-Path -LiteralPath $VlCodePath -PathType Container)) {
+        throw "SENTRIX_QWEN3_VL_CODE_PATH must point to the official Qwen3-VL-Embedding repository."
+    }
+    $env:SENTRIX_QWEN3_VL_MODE = "embedding"
+    $env:SENTRIX_QWEN3_VL_MODEL_PATH = $VlEmbedModel
+    $env:SENTRIX_QWEN3_VL_MODEL_ID = if ($env:SENTRIX_QWEN3_VL_EMBED_MODEL_ID) { $env:SENTRIX_QWEN3_VL_EMBED_MODEL_ID } else { "Qwen/Qwen3-VL-Embedding-2B" }
+    $env:SENTRIX_QWEN3_VL_DEVICE = if ($env:SENTRIX_QWEN3_VL_EMBEDDER_DEVICE) { $env:SENTRIX_QWEN3_VL_EMBEDDER_DEVICE } else { "cuda" }
+    $env:SENTRIX_QWEN3_VL_EMBEDDER_URL = "http://127.0.0.1:$VlEmbedPort"
+    Start-ManagedProcess "vl-embed" $VlPython @("scripts/maintenance/qwen3_vl_retrieval_sidecar.py", "--host", "127.0.0.1", "--port", "$VlEmbedPort") $RootDir (Join-Path $PidDir "vl-embed.pid") "$($env:SENTRIX_QWEN3_VL_EMBEDDER_URL)/health" $VlEmbedPort 30 | Out-Null
+}
+
+if ($env:SENTRIX_RERANKER_URL) {
+    $VlRerankModel = $env:SENTRIX_RERANKER_MODEL_PATH
+    if (-not $VlRerankModel -or -not (Test-Path -LiteralPath $VlRerankModel -PathType Container)) {
+        throw "SENTRIX_RERANKER_MODEL_PATH must point to Qwen3-VL-Reranker-2B."
+    }
+    $env:SENTRIX_QWEN3_VL_MODE = "reranker"
+    $env:SENTRIX_QWEN3_VL_MODEL_PATH = $VlRerankModel
+    $env:SENTRIX_QWEN3_VL_MODEL_ID = "Qwen/Qwen3-VL-Reranker-2B"
+    $env:SENTRIX_QWEN3_VL_DEVICE = if ($env:SENTRIX_RERANKER_DEVICE) { $env:SENTRIX_RERANKER_DEVICE } else { "cuda" }
+    $env:SENTRIX_QWEN3_VL_IDLE_UNLOAD_SECONDS = if ($env:SENTRIX_RERANKER_IDLE_UNLOAD_SECONDS) { $env:SENTRIX_RERANKER_IDLE_UNLOAD_SECONDS } else { "60" }
+    $env:SENTRIX_RERANKER_URL = "http://127.0.0.1:$VlRerankPort"
+    Start-ManagedProcess "vl-rerank" $VlPython @("scripts/maintenance/qwen3_vl_retrieval_sidecar.py", "--host", "127.0.0.1", "--port", "$VlRerankPort") $RootDir (Join-Path $PidDir "vl-rerank.pid") "$($env:SENTRIX_RERANKER_URL)/health" $VlRerankPort 30 | Out-Null
+}
+foreach ($key in $PreviousVlProcessEnv.Keys) {
+    [Environment]::SetEnvironmentVariable($key, $PreviousVlProcessEnv[$key], "Process")
 }
 
 $env:SENTRIX_DATA_DIR = $DataDir
 $env:SENTRIX_DB_PATH = Join-Path $DataDir "sentrix.db"
 $env:SENTRIX_ANN_DIR = Join-Path $DataDir "ann"
 $env:SENTRIX_VECTOR_BACKEND = "qdrant"
-$env:SENTRIX_QDRANT_PATH = Join-Path $DataDir "qdrant"
-$env:SENTRIX_QDRANT_COLLECTION_PREFIX = "sentrix_local"
+Set-DefaultEnv "SENTRIX_QDRANT_PATH" (Join-Path $DataDir "qdrant")
+Set-DefaultEnv "SENTRIX_QDRANT_COLLECTION_PREFIX" "sentrix_local"
 $env:SENTRIX_LLM_BACKEND = "openai"
 $env:SENTRIX_VLLM_BASE_URL = "$ModelUrl/v1"
 $env:SENTRIX_VLLM_MODEL = $ModelName
@@ -268,7 +328,7 @@ $env:SENTRIX_VERIFY_MODEL = $ModelName
 $env:SENTRIX_CLAIM_MODEL = $ModelName
 $env:SENTRIX_REPAIR_MODEL = $ModelName
 $env:OLLAMA_MODEL = $ModelName
-$env:SENTRIX_IMAGE_EMBEDDER = "clip"
+Set-DefaultEnv "SENTRIX_IMAGE_EMBEDDER" "clip"
 Set-DefaultEnv "CLIP_DEVICE" "cpu"
 Set-DefaultEnv "CLIP_MODEL_NAME" "ViT-B-32"
 Set-DefaultEnv "FACE_ENABLED" "false"

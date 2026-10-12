@@ -29,9 +29,12 @@ PROFILES = {
                "search_memories", "get_original_photos", "get_result_page",
                "inspect_photo", "read_photo_text", "search_conversation_history",
                "get_core_memory", "get_person_profile"),
-        max_model_steps=8,
-        max_tool_calls=6,
-        max_inspections=3,
+        # A normal grounded QA turn can require search -> fact lookup ->
+        # visual/OCR verification -> writer. Six calls caused valid evidence
+        # paths to be rejected at the final verification step in PhotoBench.
+        max_model_steps=14,
+        max_tool_calls=11,
+        max_inspections=6,
         # search_memories may perform several bounded 12B validation batches
         # before the Agent gets a final Writer turn.  Keep a dedicated reserve
         # instead of falling into the emergency renderer after validation.

@@ -1,0 +1,220 @@
+{
+  "schema_version": "sentrix_bge_reranker_ablation_v1",
+  "dataset": {
+    "qa_dir": "D:\\RuiMeng\\memory\\_rag\\new\\_memory\\sentrix-home-web\\services\\photobench\\data\\album3-max-video10\\qa",
+    "scope_id": "album3-max-video10-migrated",
+    "selection": "all 48 single-video rows + first 50 image-related source rows (legacy AB compatible)",
+    "selected": 2,
+    "evaluated": 2,
+    "missing_gt": []
+  },
+  "configuration": {
+    "coarse_ranking": "sentrix_lite_named_vector_rrf_plus_lexical",
+    "coarse_top_k": 50,
+    "channels": [
+      "clip_image",
+      "visual_caption",
+      "object",
+      "relation",
+      "lexical"
+    ],
+    "coarse_url": "http://127.0.0.1:8091",
+    "reranker_model_path": "D:\\RuiMeng\\memory_rag\\new_memory\\models\\models\\BAAI--bge-reranker-v2-m3\\snapshots\\master",
+    "reranker_device": "cuda",
+    "cluster_window_seconds": 1.0
+  },
+  "groups": {
+    "video": {
+      "rrf": {
+        "questions": 1,
+        "r_at_1": 1.0,
+        "r_at_3": 1.0,
+        "r_at_8": 1.0,
+        "mrr": 1.0,
+        "latency_median_ms": 126.8,
+        "latency_p95_ms": 126.8
+      },
+      "rrf_plus_temporal_bge": {
+        "questions": 1,
+        "r_at_1": 1.0,
+        "r_at_3": 1.0,
+        "r_at_8": 1.0,
+        "mrr": 1.0,
+        "latency_median_ms": 9654.0,
+        "latency_p95_ms": 9654.0
+      },
+      "delta": {
+        "r_at_1": 0.0,
+        "r_at_3": 0.0,
+        "r_at_8": 0.0,
+        "mrr": 0.0
+      },
+      "rerank_incremental_median_ms": 9527.2,
+      "average_coarse_candidates": 10,
+      "average_temporal_clusters": 10
+    },
+    "image_sample50": {
+      "rrf": {
+        "questions": 1,
+        "r_at_1": 1.0,
+        "r_at_3": 1.0,
+        "r_at_8": 1.0,
+        "mrr": 1.0,
+        "latency_median_ms": 233.9,
+        "latency_p95_ms": 233.9
+      },
+      "rrf_plus_temporal_bge": {
+        "questions": 1,
+        "r_at_1": 1.0,
+        "r_at_3": 1.0,
+        "r_at_8": 1.0,
+        "mrr": 1.0,
+        "latency_median_ms": 366.4,
+        "latency_p95_ms": 366.4
+      },
+      "delta": {
+        "r_at_1": 0.0,
+        "r_at_3": 0.0,
+        "r_at_8": 0.0,
+        "mrr": 0.0
+      },
+      "rerank_incremental_median_ms": 132.5,
+      "average_coarse_candidates": 50,
+      "average_temporal_clusters": 50
+    },
+    "all": {
+      "rrf": {
+        "questions": 2,
+        "r_at_1": 1.0,
+        "r_at_3": 1.0,
+        "r_at_8": 1.0,
+        "mrr": 1.0,
+        "latency_median_ms": 180.3,
+        "latency_p95_ms": 228.5
+      },
+      "rrf_plus_temporal_bge": {
+        "questions": 2,
+        "r_at_1": 1.0,
+        "r_at_3": 1.0,
+        "r_at_8": 1.0,
+        "mrr": 1.0,
+        "latency_median_ms": 5010.2,
+        "latency_p95_ms": 9189.6
+      },
+      "delta": {
+        "r_at_1": 0.0,
+        "r_at_3": 0.0,
+        "r_at_8": 0.0,
+        "mrr": 0.0
+      },
+      "rerank_incremental_median_ms": 4829.9,
+      "average_coarse_candidates": 30,
+      "average_temporal_clusters": 30
+    }
+  },
+  "rerank_errors": [],
+  "rows": [
+    {
+      "qa_id": "album3video-v1-006",
+      "group": "video",
+      "question": "三峡工程模型那段记录里，镜头从大坝主体继续移动后展示了什么？",
+      "gt_asset_ids": [
+        "asset_5a3bc9745226"
+      ],
+      "gt_file_names": [
+        "video-003.mp4"
+      ],
+      "coarse_candidate_count": 10,
+      "temporal_cluster_count": 10,
+      "rerank_status": "ok",
+      "rrf": {
+        "r1": 1,
+        "r3": 1,
+        "r8": 1,
+        "mrr": 1.0,
+        "first_rank": 1
+      },
+      "reranked": {
+        "r1": 1,
+        "r3": 1,
+        "r8": 1,
+        "mrr": 1.0,
+        "first_rank": 1
+      },
+      "rrf_latency_ms": 126.8,
+      "reranked_latency_ms": 9654.0,
+      "rerank_incremental_ms": 9527.2,
+      "rrf_top8": [
+        "video-003.mp4",
+        "video-012.mp4",
+        "video-001.mp4",
+        "video-021.mp4",
+        "video-026.mp4",
+        "video-025.mp4",
+        "video-016.mp4",
+        "video-007.mp4"
+      ],
+      "reranked_top8": [
+        "video-003.mp4",
+        "video-012.mp4",
+        "video-021.mp4",
+        "video-005.mp4",
+        "video-026.mp4",
+        "video-016.mp4",
+        "video-025.mp4",
+        "video-006.mp4"
+      ]
+    },
+    {
+      "qa_id": "album3v4-001",
+      "group": "image_sample50",
+      "question": "我在馆陶县参加记录的那场婚礼仪式，具体是在哪里举办的？",
+      "gt_asset_ids": [
+        "asset_b2a2a54be804"
+      ],
+      "gt_file_names": [
+        "video-001.mp4"
+      ],
+      "coarse_candidate_count": 50,
+      "temporal_cluster_count": 50,
+      "rerank_status": "ok",
+      "rrf": {
+        "r1": 1,
+        "r3": 1,
+        "r8": 1,
+        "mrr": 1.0,
+        "first_rank": 1
+      },
+      "reranked": {
+        "r1": 1,
+        "r3": 1,
+        "r8": 1,
+        "mrr": 1.0,
+        "first_rank": 1
+      },
+      "rrf_latency_ms": 233.9,
+      "reranked_latency_ms": 366.4,
+      "rerank_incremental_ms": 132.5,
+      "rrf_top8": [
+        "video-001.mp4",
+        "2017-12-16 140213.jpg",
+        "video-026.mp4",
+        "2017-10-04 223242.jpg",
+        "video-007.mp4",
+        "2017-12-16 102414.jpg",
+        "2017-10-04 223228.jpg",
+        "2017-12-16 100650.jpg"
+      ],
+      "reranked_top8": [
+        "video-001.mp4",
+        "video-007.mp4",
+        "2017-12-16 140213.jpg",
+        "2017-12-16 102414.jpg",
+        "IMG_20230805_184325.jpg",
+        "2018-08-18 112054.jpg",
+        "2017-12-16 100650.jpg",
+        "IMG_20230805_195635.jpg"
+      ]
+    }
+  ]
+}

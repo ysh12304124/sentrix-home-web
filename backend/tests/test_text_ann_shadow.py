@@ -34,6 +34,16 @@ class SidecarClientCircuitBreakerTests(unittest.TestCase):
             post.return_value.json.return_value = {"vector": [1.0, 0.0, 2.0]}
             embedder = bge_module.BgeM3TextQueryEmbedder(base_url="http://sidecar:8101")
             self.assertEqual(embedder.embed_query("厨房"), [1.0, 0.0, 2.0])
+            self.assertEqual(post.call_args.kwargs["json"]["input_type"], "query")
+
+    def test_document_embedding_uses_document_mode(self):
+        with mock.patch.object(bge_module.httpx, "post") as post:
+            post.return_value = mock.Mock()
+            post.return_value.raise_for_status.return_value = None
+            post.return_value.json.return_value = {"vector": [0.5, 0.5]}
+            embedder = bge_module.LocalTextQueryEmbedder(base_url="http://sidecar:8101")
+            self.assertEqual(embedder.embed_document("图片描述"), [0.5, 0.5])
+            self.assertEqual(post.call_args.kwargs["json"]["input_type"], "document")
 
     def test_circuit_breaker_trips_after_five_failures(self):
         # 熔断阈值迭代放宽：3→5（连续 5 次失败才熔断，降低 sidecar 偶发慢响应的误熔断）

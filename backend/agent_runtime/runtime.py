@@ -208,6 +208,14 @@ def _normalize_preview_handle(arguments: dict, preview_handles: list[str] | None
         return arguments, None
     normalized = dict(arguments)
     requested = str(arguments.get("asset_handle") or "")
+    # Some OpenAI-compatible local models emit the schema-neutral ``handle``
+    # key even though visual tools declare ``asset_handle``. Treat it as the
+    # current public preview handle instead of sending an empty asset_handle to
+    # ToolPolicy (which was measured as a false stale-preview rejection).
+    legacy_handle = str(arguments.get("handle") or "")
+    if not requested and legacy_handle:
+        requested = legacy_handle
+        normalized["asset_handle"] = legacy_handle
     # Older local-model prompts used image_id/query for visual inspection.  An
     # image_id is often a private ResultSet id (rs_...), not a public handle;
     # never pass it through as an asset handle or silently inspect a stale id.
