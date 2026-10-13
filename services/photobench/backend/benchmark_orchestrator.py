@@ -3126,7 +3126,7 @@ class BenchmarkRun:
         if not scope_id:
             return
         import subprocess
-        repo_root = Path(__file__).resolve().parents[2]
+        repo_root = Path(__file__).resolve().parents[3]
         script = repo_root / "scripts" / "maintenance" / "rebuild_ann_indices.py"
         if not script.is_file():
             print(f"[ann] rebuild skipped: script not found: {script}", flush=True)
