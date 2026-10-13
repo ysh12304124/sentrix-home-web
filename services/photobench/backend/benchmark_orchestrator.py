@@ -3115,6 +3115,33 @@ class BenchmarkRun:
         else:
             self._phase_done("pipeline_processing", phase_result)
         self._auto_build_fts(self.state.get("scope_id", ""))
+        self._rebuild_ann(self.state.get("scope_id", ""))
+
+    def _rebuild_ann(self, scope_id: str) -> None:
+        """ANN重建：scope_finalize钩子只挂在ingest收尾路径上，photobench导入
+        （deferBatchComplete=true）绕开了它——新scope的visual向量已落库，
+        但.hnsw派生文件不更新，检索侧visual通道静默全瞎（实测487QA召回被压到21%）。
+        在QA前从memory_vectors重建；刻意不传--visual-embedder，避免全库重跑
+        chinese-clip（参考914d891，实测秒级）。"""
+        if not scope_id:
+            return
+        import subprocess
+        repo_root = Path(__file__).resolve().parents[2]
+        script = repo_root / "scripts" / "maintenance" / "rebuild_ann_indices.py"
+        if not script.is_file():
+            print(f"[ann] rebuild skipped: script not found: {script}", flush=True)
+            return
+        t0 = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script),
+                 "--db", str(repo_root / "data" / "sentrix.db"),
+                 "--ann-dir", str(repo_root / "data" / "ann"), "--apply"],
+                cwd=str(repo_root), capture_output=True, timeout=3600, check=False)
+            print(f"[ann] rebuild finished in {time.perf_counter() - t0:.1f}s rc={proc.returncode}",
+                  flush=True)
+        except Exception as exc:
+            print(f"[ann] rebuild FAILED (QA continues without visual ANN): {exc}", flush=True)
 
     def _auto_build_fts(self, scope_id: str) -> None:
         """定向FTS构建：caption+QA关键词（非全量），pipeline完成后QA前自动执行。
