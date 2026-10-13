@@ -49,6 +49,20 @@ class _BatchStore:
 
 
 class IngestSchedulerTests(unittest.TestCase):
+    def test_ollama_pipeline_uses_its_configured_bounded_parallelism(self):
+        with patch.dict(ingest_app.os.environ, {
+            "SENTRIX_LLM_BACKEND": "ollama",
+            "OLLAMA_NUM_PARALLEL": "4",
+            "SENTRIX_PIPELINE_MAX_WORKERS": "4",
+            "SENTRIX_EVENT_SUMMARY_MAX_WORKERS": "3",
+        }, clear=False):
+            limits = ingest_app._pipeline_worker_limits()
+
+        self.assertEqual(limits["concurrency_source"], "ollama_num_parallel")
+        self.assertEqual(limits["service_concurrency_limit"], 4)
+        self.assertEqual(limits["effective_workers"], 4)
+        self.assertEqual(limits["event_summary_workers"], 3)
+
     def test_semantic_inference_starts_before_all_fast_commits(self):
         events = []
         semantic_started = threading.Event()
@@ -109,11 +123,12 @@ class IngestSchedulerTests(unittest.TestCase):
 
     def test_terminal_failed_assets_are_skipped_from_batch_work(self):
         store = _BatchStore(
-            [{"id": "queued"}, {"id": "retryable"}, {"id": "terminal"}],
+            [{"id": "queued"}, {"id": "retryable"}, {"id": "terminal"}, {"id": "video-terminal"}],
             {
                 "queued": {"status": "queued", "metadata_json": {}},
                 "retryable": {"status": "failed", "metadata_json": {"pipeline_attempts": 1}},
                 "terminal": {"status": "failed", "metadata_json": {"pipeline_attempts": ingest_app.PIPELINE_MAX_ATTEMPTS}},
+                "video-terminal": {"status": "video-processing-failed", "metadata_json": {"pipeline_attempts": ingest_app.PIPELINE_MAX_ATTEMPTS}},
             },
         )
 
@@ -122,6 +137,7 @@ class IngestSchedulerTests(unittest.TestCase):
         self.assertIn("queued", selected)
         self.assertIn("retryable", selected)
         self.assertNotIn("terminal", selected)
+        self.assertNotIn("video-terminal", selected)
 
 
 if __name__ == "__main__":

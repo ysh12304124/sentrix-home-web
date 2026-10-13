@@ -32,8 +32,17 @@ from .image_io import (
     media_type_from_upload,
     needs_browser_transcode,
 )
-from .model_clients import ClipAdapter, FaceAdapter, FunASRClient, GammaClient, align_face_crop, parse_json_response
+from .model_clients import (
+    ClipAdapter,
+    FaceAdapter,
+    FunASRClient,
+    GammaClient,
+    align_face_crop,
+    cap_output_tokens_for_estimated_room,
+    parse_json_response,
+)
 from .pipeline import IngestionPipeline
+from .graph_memory import GraphMemoryService
 from .person_appearance import expanded_person_crop
 from .person_insights import rank_core_people
 from .runtime_providers import (
@@ -60,6 +69,8 @@ gamma = GammaClient()
 gamma.bind_store(store)
 pipeline = IngestionPipeline(store, gamma=gamma, asr=FunASRClient(), face=FaceAdapter(), clip=ClipAdapter())
 conversation_store = ConversationStore(store)
+graph_memory_service = GraphMemoryService()
+graph_memory_build_lock = threading.Lock()
 CONVERSATION_STORE_ENABLED = os.getenv("SENTRIX_CONVERSATION_STORE_V1", "0").lower() in {"1", "true", "on"}
 
 app = FastAPI(title="Sentrix Home Memory API", version="0.1.0")
@@ -74,7 +85,7 @@ VLLM_REGISTRY = Path(os.getenv("SENTRIX_VLLM_REGISTRY", "/home/realmagic/sentrix
 VLLM_API_URL = os.getenv("SENTRIX_VLLM_API_URL", "").strip()
 RUNTIME_VLLM_API_URL = None
 RUNTIME_VLLM_BASE_URL = None
-RUNTIME_MODEL_SOURCE = "managed"
+RUNTIME_MODEL_SOURCE = os.getenv("SENTRIX_RUNTIME_SOURCE", "managed").strip().lower()
 RUNTIME_MODEL_PROFILE = None
 SUPPORTED_IMPORT_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif",
@@ -87,6 +98,18 @@ PIPELINE_MAX_RETRIES = max(0, int(os.getenv("SENTRIX_PIPELINE_MAX_RETRIES", "1")
 PIPELINE_MAX_ATTEMPTS = PIPELINE_MAX_RETRIES + 1
 PIPELINE_WORK_STATUSES = ("queued", "failed", "video-queued", "video-processing-failed")
 PIPELINE_STALE_STATUSES = ("processing", "semantic_enriching")
+
+
+class SemanticCircuitOpen(RuntimeError):
+    """The local vision service is unhealthy; stop before requests pile up."""
+
+
+def _is_vision_transport_failure(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in (
+        "timed out", "timeout", "connection refused", "connecterror",
+        "readtimeout", "remoteprotocolerror", "server disconnected",
+    ))
 
 
 @contextlib.contextmanager
@@ -149,6 +172,18 @@ def _normalized_capture_metadata(payload=None, *, captured_at=None, captured_loc
         if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
             raise ValueError("latitude or longitude is outside its valid range")
         result["gps"] = {"latitude": latitude, "longitude": longitude}
+    # Album exports may carry provenance for media containers that have no
+    # usable EXIF (notably benchmark/phone videos).  Keep only the small,
+    # typed fields accepted by the import pipeline; these are metadata, not
+    # evaluator labels, and let derived keyframes inherit the source event's
+    # time/place context.
+    for key in ("source_media_id", "source_media_title", "provenance_source"):
+        value = payload.get(key)
+        if value:
+            result[key] = str(value).strip()
+    image_ids = payload.get("source_media_image_ids")
+    if isinstance(image_ids, list):
+        result["source_media_image_ids"] = [str(value).strip() for value in image_ids if str(value).strip()]
     return result
 
 
@@ -311,14 +346,24 @@ def _finalize_scope_async(scope_id: str) -> None:
 
 def _pipeline_worker_limits():
     configured = max(1, int(profile.pipeline_workers()))
-    state = _load_vllm_state() or {}
-    # vLLM 托管时有 manager 公布的值；llama.cpp 走 openai-compatible 外部端点时
-    # 没有 manager，此时由能力档案（或 SENTRIX_SERVICE_MAX_SEQS）给出槽位数。
-    service_limit = max(1, int(state.get("max_num_seqs") or profile.service_parallel()))
+    backend = str(os.getenv("SENTRIX_LLM_BACKEND", "")).strip().lower()
+    # A managed vLLM service reports its scheduling capacity through the
+    # manager state.  Ollama has no such state; treating the missing value as
+    # one silently serializes every image in a batch even when its own bounded
+    # scheduler has been configured for more than one request.
+    if backend == "ollama":
+        service_limit = max(1, int(os.getenv("OLLAMA_NUM_PARALLEL", str(profile.service_parallel()))))
+        concurrency_source = "ollama_num_parallel"
+    else:
+        state = _load_vllm_state() or {}
+        service_limit = max(1, int(state.get("max_num_seqs") or profile.service_parallel()))
+        concurrency_source = "vllm_max_num_seqs" if state.get("max_num_seqs") else "profile_service_parallel"
     summary_configured = max(1, int(profile.event_summary_workers()))
     return {
         "configured_workers": configured,
         "vllm_max_num_seqs": service_limit,
+        "service_concurrency_limit": service_limit,
+        "concurrency_source": concurrency_source,
         "effective_workers": min(configured, service_limit),
         "event_summary_workers": min(summary_configured, service_limit),
     }
@@ -344,7 +389,11 @@ def _batch_work_asset_ids(task_store, batch_id, *, include_stale=False):
     selected = []
     for row in rows:
         asset = task_store.get_asset(row["id"]) or {}
-        if asset.get("status") == "failed" and _pipeline_attempt_count(asset) >= PIPELINE_MAX_ATTEMPTS:
+        # ``video-processing-failed`` is also terminal after the configured
+        # retry budget.  Previously only image ``failed`` assets were filtered,
+        # so one broken video was selected again on every loop iteration and
+        # remained visible as ``processing`` forever.
+        if _pipeline_attempt_count(asset) >= PIPELINE_MAX_ATTEMPTS:
             continue
         selected.append(row["id"])
     return selected
@@ -405,6 +454,11 @@ def _process_image_stages(image_ids, task_store, task_pipeline, limits):
     next_fast_submit = 0
     next_fast_commit = 0
     next_semantic_commit = 0
+    vision_failures = 0
+    try:
+        vision_failure_threshold = max(1, int(os.getenv("SENTRIX_VISION_FAILURE_THRESHOLD", "2")))
+    except (TypeError, ValueError):
+        vision_failure_threshold = 2
 
     def mark_fast_failed(asset_id, error):
         asset = task_store.get_asset(asset_id) or {}
@@ -417,6 +471,7 @@ def _process_image_stages(image_ids, task_store, task_pipeline, limits):
             })
 
     def mark_semantic_failed(asset_id, error):
+        nonlocal vision_failures
         asset = task_store.get_asset(asset_id) or {}
         attempts = _pipeline_attempt_count(asset)
         with db_write_guard("ingest-commit-semantic-error"):
@@ -426,6 +481,35 @@ def _process_image_stages(image_ids, task_store, task_pipeline, limits):
                 "error": str(error), "failed_stage": "semantic",
                 "pipeline_failure_terminal": attempts >= PIPELINE_MAX_ATTEMPTS,
             })
+        if _is_vision_transport_failure(error):
+            vision_failures += 1
+            if vision_failures >= vision_failure_threshold:
+                raise SemanticCircuitOpen(
+                    f"vision service circuit opened after {vision_failures} transport failures: {error}"
+                )
+        else:
+            vision_failures = 0
+
+    # Keep the single-worker full rebuild on one Python thread.  InsightFace/
+    # onnxruntime and torch-backed CLIP use native runtimes; moving their lazy
+    # initialization into executor threads can terminate Windows processes
+    # with an access violation and leave assets stuck in ``processing``.
+    if worker_count == 1:
+        for asset_id in image_ids:
+            try:
+                prepared = task_pipeline.prepare_fast_image(asset_id)
+                with db_write_guard("ingest-commit-fast"):
+                    task_pipeline.commit_fast_image(asset_id, prepared)
+            except Exception as error:
+                mark_fast_failed(asset_id, error)
+                continue
+            try:
+                prepared = task_pipeline.prepare_semantic_image(asset_id)
+                with db_write_guard("ingest-commit-semantic"):
+                    task_pipeline.commit_semantic_image(asset_id, prepared, summarize_event=False)
+            except Exception as error:
+                mark_semantic_failed(asset_id, error)
+        return
 
     def commit_semantic(asset_id):
         future = semantic_pending.pop(asset_id)
@@ -600,6 +684,21 @@ def _process_ingest_asset_group(asset_ids, batch_id, finalize_batch=False):
         }
         with db_write_guard("ingest-group-metrics"):
             task_store.update_ingest_batch_metadata(batch_id, {"pipeline_metrics": metrics})
+    except SemanticCircuitOpen as error:
+        # Abort the build cleanly after repeated VLM transport failures.  This
+        # prevents queued image requests from keeping a sick vLLM instance
+        # busy, and leaves the batch explicitly resumable after recovery.
+        with db_write_guard("ingest-group-semantic-circuit-open"):
+            task_store.cancel_ingest_batch(batch_id, source="semantic_circuit_open")
+            task_store.update_ingest_batch_metadata(batch_id, {
+                "pipeline_metrics": {
+                    **limits, "status": "semantic_circuit_open",
+                    "asset_count": len(asset_ids),
+                    "total_wall_seconds": round(time.perf_counter() - started_at, 4),
+                    "error": str(error),
+                }
+            })
+        return
     except Exception as error:
         with db_write_guard("ingest-group-metrics-error"):
             task_store.update_ingest_batch_metadata(batch_id, {
@@ -627,12 +726,17 @@ def process_ingest_batch(asset_ids, batch_id):
             recovered_ids = _recover_stale_batch_assets(task_store, batch_id)
         all_asset_ids.extend(item for item in recovered_ids if item not in all_asset_ids)
         while True:
+            # A semantic circuit-open cancellation must win over retryable
+            # failed assets.  Otherwise the outer loop immediately replays the
+            # two timeout requests that opened the circuit.
+            batch = task_store.get_ingest_batch(batch_id) or {}
+            if batch.get("status") == "cancelled":
+                return
             queued_ids = _batch_work_asset_ids(task_store, batch_id)
             if queued_ids:
                 all_asset_ids.extend(item for item in queued_ids if item not in all_asset_ids)
                 _process_ingest_asset_group(queued_ids, batch_id, finalize_batch=False)
                 continue
-            batch = task_store.get_ingest_batch(batch_id) or {}
             pending_row = task_store._row(
                 "SELECT COUNT(*) AS count FROM assets WHERE batch_id = ? AND status IN ('queued', 'processing', 'semantic_enriching')",
                 (batch_id,),
@@ -880,6 +984,8 @@ def _sync_vllm_state_on_startup():
     # 把这台机器实际生效的能力打出来。46 上曾因为少一个环境变量而静默切到
     # 另一条视频链路，排查花了很久——留痕后这类问题一眼可见。
     profile.log_summary()
+    if RUNTIME_MODEL_SOURCE in {"cloud_api", "external"} or getattr(gamma, "backend", "") != "openai":
+        return
     try:
         state = _load_vllm_state()
         if state and state.get("pid"):
@@ -1477,6 +1583,8 @@ def reprocess_video(asset_id: str, background_tasks: BackgroundTasks):
     store.cleanup_video_derivatives(asset_id)
     store.update_asset(asset_id, "video-queued", {
         "video_stage": "video-queued", "error": None, "error_stage": None,
+        "pipeline_attempts": 0, "pipeline_retry_count": 0,
+        "pipeline_failure_terminal": False,
     })
     background_tasks.add_task(process_asset, asset_id)
     return {"accepted": True, "asset_id": asset_id, "status": "video-queued"}
@@ -2613,7 +2721,10 @@ def _turn_executor():
         # concurrency (aligned with the serving model's max_num_seqs, e.g. 16);
         # the old fixed 2 workers serialized those turns and silently throttled
         # concurrent runs. Env-overridable, default 16.
-        workers = max(2, int(os.getenv("SENTRIX_ASSISTANT_TURN_WORKERS", "16")))
+        # A local Ollama endpoint has one generation queue.  In that mode the
+        # launcher intentionally sets this to 1; do not silently turn it back
+        # into two concurrent tool-loop/model calls.
+        workers = max(1, int(os.getenv("SENTRIX_ASSISTANT_TURN_WORKERS", "16")))
         _TURN_EXECUTOR = ThreadPoolExecutor(max_workers=workers)
     return _TURN_EXECUTOR
 
@@ -2681,13 +2792,46 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
                 os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"),
             )))
         else:
+            # Qwen3-VL is served with a 4096-token context.  Tool evidence
+            # can be expanded by the chat template after the lightweight
+            # estimate below, so 256 output tokens leaves too little margin
+            # and turns long-but-valid turns into repeated vLLM 400s.  Keep
+            # the local default conservative; deployments can still override
+            # it explicitly.
             max_tokens = max(1, min(1501, int(os.getenv("SENTRIX_TOOL_LOOP_MAX_TOKENS", "384"))))
-            # Phase H H4：max_model_len=4501 的硬上限保护——prompt 越长输出预算越小，
-            # 避免 400（此前 guard recovery 时 prompt 4118 + 384 = 4502 恰好超限）
+            # vLLM local Qwen3-VL is launched with max_model_len=4096. When
+            # the estimate reaches the boundary, compact earlier tool results
+            # before shrinking generation to 1 token: an under-estimated chat
+            # template can otherwise still turn that request into a 4097-token
+            # failure. The newest tool observation and system instructions
+            # remain intact.
             try:
-                room = 4400 - _estimate_prompt_tokens(messages)
+                context_limit = max(1024, int(os.getenv("SENTRIX_CONTEXT_LIMIT", "4096")))
+                # Local token estimates undercount Chinese tokenization and
+                # Qwen chat-template overhead on long tool histories. Reserve
+                # enough space for both before choosing an output budget.
+                context_safety_margin = max(
+                    384, int(os.getenv("SENTRIX_CONTEXT_SAFETY_MARGIN", "1536")))
+                room = context_limit - context_safety_margin - _estimate_prompt_tokens(messages)
+                for _ in range(5):
+                    # Several modest tool observations can exceed the window
+                    # together even when no single message crosses a large
+                    # character threshold. Compact them before choosing a tiny
+                    # output budget.
+                    if room >= max_tokens + 64:
+                        break
+                    compacted = GammaClient._compact_messages_for_vllm_context(
+                        messages, max(1, max_tokens + 64 - room))
+                    if compacted is None:
+                        break
+                    messages = compacted
+                    room = context_limit - context_safety_margin - _estimate_prompt_tokens(messages)
                 if room < max_tokens:
-                    max_tokens = max(64, room)
+                    # This is only a heuristic estimate. Do not reduce JSON
+                    # tool calls to one token; GammaClient's tokenizer/server
+                    # retry is the authoritative context boundary.
+                    max_tokens = cap_output_tokens_for_estimated_room(
+                        max_tokens, room, minimum_tokens=128)
             except Exception:
                 pass
         try:
@@ -2846,7 +2990,12 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
     for step in turn.steps:
         if step.get("type") != "tool":
             continue
-        observation = step.get("observation") or {}
+        # Keep the model-safe observation in normal responses, but expose the
+        # original server payload to benchmark/admin debug consumers so graph
+        # routing telemetry (retrieval_timing.graph_policy) is scoreable.
+        observation = (step.get("debug_observation")
+                       if include_debug and isinstance(step.get("debug_observation"), dict)
+                       else step.get("observation")) or {}
         tool_record = {
             "tool": step.get("tool", ""), "status": step.get("status", ""),
             "tool_call_id": step.get("tool_call_id") or "",
@@ -2893,7 +3042,13 @@ def _tool_loop_turn(message, conversation_id, scope_id, viewer_id, recent_turns=
         "selected_image_handles": list(getattr(turn, "selected_image_handles", []) or []),
         "selected_image_ids": list(getattr(turn, "selected_image_ids", []) or []),
         "termination_reason": turn.termination_reason,
-        "debug_trace": turn.steps if include_debug else None,
+        "debug_trace": (
+            [dict(step, observation=(step.get("debug_observation")
+                                     if isinstance(step.get("debug_observation"), dict)
+                                     else step.get("observation")))
+             for step in turn.steps]
+            if include_debug else None
+        ),
     }
 
 
@@ -2902,13 +3057,14 @@ def assistant_turn(request: AssistantTurnRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
     message = request.message.strip()
+    scope_id = request.scope_id.strip() or "home-default"
     conversation_id = request.conversation_id
     recent_turns = ""
     conversation_summary = ""
     if CONVERSATION_STORE_ENABLED:
         # D2：无会话时自动创建；恢复旧会话时按 active 校验
         if not conversation_id:
-            conversation_id = conversation_store.create_conversation(scope_id=request.scope_id)
+            conversation_id = conversation_store.create_conversation(scope_id=scope_id)
         try:
             if conversation_store.get_conversation(conversation_id):
                 history = conversation_store.last_messages(conversation_id, limit=8)
@@ -2926,7 +3082,7 @@ def assistant_turn(request: AssistantTurnRequest):
                            "created_at": time.time()}
     _turn_executor().submit(
         _execute_turn_job, turn_id, message, conversation_id,
-        request.scope_id, request.viewer_id, recent_turns,
+        scope_id, request.viewer_id, recent_turns,
         request.selected_asset_handle, request.selected_result_set_id,
         conversation_summary, request.include_debug)
     return {
@@ -3879,6 +4035,71 @@ def summarize_pending_events(background_tasks: BackgroundTasks, scope_id: str | 
     ])
     background_tasks.add_task(pipeline.summarize_pending_events, scope_id, max(1, limit))
     return {"accepted": accepted, "status": "event-summary-queued"}
+
+
+@app.get("/api/graph-memory/status")
+def graph_memory_status():
+    return graph_memory_service.status()
+
+
+@app.get("/api/graph-memory/quality")
+def graph_memory_quality(scope_id: str | None = None):
+    """Read-only full graph quality audit; never called by the QA runner."""
+    return graph_memory_service.quality(scope_id=scope_id)
+
+
+@app.post("/api/graph-memory/build")
+def build_graph_memory(background_tasks: BackgroundTasks, payload: dict | None = None):
+    payload = payload or {}
+    if not graph_memory_build_lock.acquire(False):
+        return {"accepted": False, "status": "already-running"}
+    try:
+        scope_id = str(payload.get("scope_id") or "").strip() or None
+        include_images = bool(payload.get("include_images", False))
+        causal = bool(payload.get("causal", False))
+
+        def _build_graph_memory():
+            try:
+                graph_memory_service.build(
+                    scope_id=scope_id,
+                    include_images=include_images,
+                    enable_causal_edges=causal,
+                )
+            finally:
+                graph_memory_build_lock.release()
+
+        background_tasks.add_task(_build_graph_memory)
+        return {
+            "accepted": True,
+            "status": "graph-build-queued",
+            "scope_id": scope_id,
+            "include_images": include_images,
+            "causal": causal,
+            "graph_path": graph_memory_service.graph_path,
+        }
+    except Exception:
+        graph_memory_build_lock.release()
+        raise
+
+
+@app.post("/api/graph-memory/rebuild")
+def rebuild_graph_memory(background_tasks: BackgroundTasks, payload: dict | None = None):
+    return build_graph_memory(background_tasks, payload)
+
+
+@app.post("/api/graph-memory/search")
+def search_graph_memory(payload: dict):
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    result = graph_memory_service.search(
+        query,
+        top_k=int(payload.get("top_k") or 10),
+        scope_id=str(payload.get("scope_id") or "").strip() or None,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("error") or "graph memory unavailable")
+    return result
 
 
 @app.get("/api/query-gaps")

@@ -26,9 +26,8 @@ MIN_SIZES = [[16, 32], [64, 128], [256, 512]]
 INPUT_SIZE = (640, 640)
 VARIANCES = (0.1, 0.2)
 
-# 按 $HOME 推导，不写死某个用户名 —— 写死会让代码换台机器就指向不存在的文件，
-# 而失败方式是启动时那句 "Missing retrieval/face weights" 直接退出，很难一眼看出
-# 是路径问题。（153 上实际路径是 ~/benchmarks/retinaface/retinaface_r50.onnx）
+# Keep the fallback portable; deployments can still override it with
+# RETINAFACE_MODEL_PATH (the Windows launcher does so explicitly).
 DEFAULT_MODEL_PATH = str(Path.home() / "benchmarks" / "retinaface" / "retinaface_r50.onnx")
 
 
@@ -173,7 +172,7 @@ class RetinaFaceTiledDetector:
         ]
 
     def detect(self, image, threshold=0.3):
-        """Two-pass tiled detection: coarse 1024px, then fine 640px only if empty."""
+        """Two-pass tiled detection: coarse, then fine only if empty."""
         self._load()
         faces = self._detect_tiled(image, tile=1024, overlap=128, threshold=threshold)
         if not faces:

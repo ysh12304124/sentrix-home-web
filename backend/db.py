@@ -4812,7 +4812,13 @@ class MemoryStore:
         self.connection.commit()
         return self._row("SELECT * FROM face_clusters WHERE id = ?", (new_cluster["id"],))
 
-    def add_face_instance(self, asset_id, observation_id, face, threshold=0.30, model_name="buffalo_l"):
+    def add_face_instance(self, asset_id, observation_id, face, threshold=None, model_name="buffalo_l"):
+        # Online ingestion favors recall; callers may still pass an explicit
+        # threshold for controlled migrations/tests.
+        if threshold is None:
+            from .face_clustering import resolve_online_match_threshold
+
+            threshold = resolve_online_match_threshold()
         asset = self.get_asset(asset_id) or {}
         scope_id = asset.get("scope_id") or "home-default"
         embedding = self._normalise_vector(face.get("embedding"))
@@ -4953,18 +4959,57 @@ class MemoryStore:
             ),
         )
 
-    def recluster_faces(self, threshold=0.30, minimum_quality=0.55, scope_id=None):
-        """Globally regroup faces with quality-aware multi-view prototypes."""
-        from .face_clustering import FaceClusterer, FaceSample
+    def recluster_faces(self, threshold=None, minimum_quality=0.55, scope_id=None,
+                        include_unclustered=False, candidate_confidence=None):
+        """Globally regroup faces with quality-aware multi-view prototypes.
 
+        ``include_unclustered`` is an explicit recovery/evaluation mode for
+        face detections that already have a saved embedding but were kept out
+        of identity clustering by the online eligibility gate.  The default
+        remains the historical, conservative behaviour so normal maintenance
+        calls cannot silently promote uncertain detections.
+        """
+        from .face_clustering import FaceClusterer, FaceSample, resolve_recluster_match_threshold
+
+        if threshold is None:
+            threshold = resolve_recluster_match_threshold()
+
+        if candidate_confidence is None:
+            try:
+                candidate_confidence = float(os.getenv(
+                    "FACE_RECLUSTER_CANDIDATE_CONFIDENCE", "0.50"
+                ))
+            except (TypeError, ValueError):
+                candidate_confidence = 0.50
+        candidate_confidence = max(0.0, min(1.0, candidate_confidence))
+
+        eligibility_sql = "AND fi.cluster_id IS NOT NULL"
+        query_params = [minimum_quality]
+        if include_unclustered:
+            # Keep every existing cluster member, and add only verified
+            # unclustered embeddings that pass the explicit candidate gate.
+            # This makes the operation reversible/A-B testable and avoids
+            # treating arbitrary low-quality evidence as a new identity.
+            eligibility_sql = (
+                "AND (fi.cluster_id IS NOT NULL OR "
+                "(fi.detection_confidence >= ? AND fi.quality >= ?))"
+            )
+            query_params = [candidate_confidence, minimum_quality]
+        scope_sql = " AND a.scope_id = ?" if scope_id else ""
+        if scope_id:
+            query_params.append(scope_id)
+
+        quality_sql = "" if include_unclustered else " AND fi.quality >= ?"
         instances = self._rows(
             """SELECT fi.id, fi.cluster_id, fi.embedding_json, fi.quality, fi.detection_confidence,
             fi.pose_bucket, fi.embedding_model, fi.embedding_version
             FROM face_instances fi JOIN assets a ON a.id = fi.asset_id
-            WHERE fi.embedding_json != '[]' AND fi.cluster_id IS NOT NULL AND fi.quality >= ?
-            AND fi.validity = 'verified'"""
-            + (" AND a.scope_id = ?" if scope_id else ""),
-            (minimum_quality, scope_id) if scope_id else (minimum_quality,),
+            WHERE fi.embedding_json != '[]'
+            AND fi.validity = 'verified'
+            """ + eligibility_sql + quality_sql + scope_sql,
+            query_params if include_unclustered else (
+                [minimum_quality] + ([scope_id] if scope_id else [])
+            ),
         )
         if not instances:
             return {"instances": 0, "clusters": 0, "threshold": threshold, "minimum_quality": minimum_quality}
@@ -5041,6 +5086,8 @@ class MemoryStore:
         return {
             "instances": len(instances), "clusters": len(result.clusters),
             "threshold": threshold, "minimum_quality": minimum_quality,
+            "include_unclustered": bool(include_unclustered),
+            "candidate_confidence": candidate_confidence,
             "noise": sum(1 for cluster in result.clusters if cluster.noise),
             "attached_uncertain": attached,
         }

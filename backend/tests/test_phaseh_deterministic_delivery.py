@@ -54,12 +54,24 @@ class NucleusExtractionTests(unittest.TestCase):
         self.assertEqual(n.get("place").value, "上海")
         self.assertEqual(n.get("person").value, "明明")
 
+    def test_year_and_date_are_extracted_from_search_preview(self):
+        state = {"tool_results": [{"tool": "search_memories", "total": 2,
+                                   "preview": [
+                                       {"captured_at": "2018-12-30 15:04:14"},
+                                       {"captured_at": "2018-12-30 14:34:06"},
+                                   ]}]}
+        year = build_nucleus(state, "具体是哪一年的事儿？").get("year")
+        self.assertEqual(year.value, "2018")
+        date = build_nucleus(state, "具体是哪天发生的？").get("date")
+        self.assertEqual(date.display, "2018年12月30日")
+
 
 class SimpleRenderTests(unittest.TestCase):
     def test_classify(self):
         self.assertEqual(classify_deterministic("一共有多少张照片？"), "count")
         self.assertEqual(classify_deterministic("具体是哪天拍的？"), "date")
         self.assertEqual(classify_deterministic("有没有去过北京？"), "boolean")
+        self.assertEqual(classify_deterministic("这是在哪个景区？"), "place")
         self.assertIsNone(classify_deterministic("照片里有哪些人？"))
 
     def test_render_count(self):
@@ -75,6 +87,10 @@ class SimpleRenderTests(unittest.TestCase):
         n = build_nucleus({"fact_operation": "exists", "fact_value": False,
                            "tool_results": []})
         self.assertEqual(render_simple(n, "boolean"), "没有找到相关记录。")
+
+    def test_render_place(self):
+        self.assertEqual(render_simple(build_nucleus(_search_state(place="正定县")), "place"),
+                         "地点是 正定县。")
 
     def test_render_none_when_missing(self):
         self.assertIsNone(render_simple(AnswerNucleus(), "count"))

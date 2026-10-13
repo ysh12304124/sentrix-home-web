@@ -54,6 +54,26 @@ class ModelEndpointSelectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "is not exposed"):
             self.repo.query_current_model("", "host:11434", "missing")
 
+    def test_restart_recovers_last_complete_snapshot_when_current_file_is_corrupt(self) -> None:
+        run_dir = self.repo.results_root / "interrupted-run"
+        original = {
+            "run_id": "interrupted-run", "status": "running",
+            "items": [{"qa_id": "q1"}], "phases": {"qa_eval": {"status": "running"}},
+        }
+        latest = {**original, "items": [{"qa_id": "q1"}, {"qa_id": "q2"}]}
+        path = run_dir / "run.json"
+        orchestrator.atomic_json(path, original, keep_backup=True)
+        orchestrator.atomic_json(path, latest, keep_backup=True)
+        # Simulate a hard stop after Windows preallocates the destination.
+        path.write_bytes(b"\x00" * 1024)
+
+        recovered = orchestrator.OrchestratorRepository(self.repo.results_root)
+
+        state = recovered.runs["interrupted-run"]
+        self.assertEqual(state["status"], "interrupted")
+        self.assertEqual(state["items"], original["items"])
+        self.assertIn("Recovered from the last complete snapshot", state["recovery_note"])
+
     @patch.object(orchestrator, "OpenAICompatibleInferenceProvider")
     @patch.object(orchestrator, "ManagerLifecycleProvider")
     def test_manager_state_must_match_endpoint_and_requested_model(

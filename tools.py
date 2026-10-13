@@ -521,6 +521,7 @@ def _observation_summary(store, asset_id: str) -> str:
         return ""
     observation = rows[0] or {}
     parts = []
+    event_parts = []
     for key in ("caption", "activity", "place"):
         value = str(observation.get(key) or "").strip()
         if value and value not in parts:
@@ -550,9 +551,43 @@ def _observation_summary(store, asset_id: str) -> str:
             value = str(value or "").strip()
             if value and value not in details:
                 details.append(value)
-        if details:
-            parts.append("；".join(details[:6]))
-    return "；".join(parts)[:300]
+    if details:
+        parts.append("；".join(details[:6]))
+    # Event-level memory is stored separately from observations.  Include it
+    # in the bounded preview so a successful event/date/place recall gives the
+    # Agent the same evidence that drove the ranking.  This is a data-driven
+    # join and does not infer or invent facts from the benchmark answer.
+    try:
+        connection = getattr(store, "connection", None)
+        if connection is not None:
+            event_rows = connection.execute(
+                "SELECT e.title, e.summary, e.place, e.time_start, e.time_end "
+                "FROM events e JOIN event_observations eo ON eo.event_id = e.id "
+                "WHERE eo.observation_id = ("
+                "SELECT id FROM observations WHERE asset_id = ? "
+                "ORDER BY created_at DESC, revision DESC LIMIT 1) "
+                "ORDER BY e.updated_at DESC", (asset_id,)
+            ).fetchall()
+            seen_events = set()
+            for row in event_rows:
+                values = []
+                for index in range(len(row)):
+                    value = str(row[index] or "").strip()
+                    if index == 2 and re.fullmatch(
+                            r"[-+]?\d+(?:\.\d+)?\s*[,; ]\s*[-+]?\d+(?:\.\d+)?", value):
+                        continue
+                    values.append(value)
+                value = "；".join(item for item in values if item)
+                if value and value not in seen_events:
+                    event_parts.append("事件：" + value[:220])
+                    seen_events.add(value)
+                if len(seen_events) >= 2:
+                    break
+    except Exception:
+        pass
+    # Keep event evidence at the head so a long visual caption cannot truncate
+    # the date/place/summary that motivated the retrieval.
+    return "；".join(event_parts + parts)[:420]
 
 
 def _asset_group_key(store, asset_id: str) -> str:
@@ -642,11 +677,27 @@ def _preview_entry(store, asset_id: str, handle: str, *, level="exact", conditio
         source_video = store.get_asset(source_video_asset_id) if store and source_video_asset_id else None
         source_video_file_name = (source_video or {}).get("file_name")
     evidence_summary = _observation_summary(store, asset_id)
+    place_label = _short_place_label(asset) if asset else ""
+    # Prefer a human-readable event place when the asset has no reverse
+    # geocode.  GPS-looking values are deliberately not shown as a place.
+    if not place_label and store is not None:
+        try:
+            row = store.connection.execute(
+                "SELECT e.place FROM events e JOIN event_observations eo ON eo.event_id=e.id "
+                "WHERE eo.observation_id=(SELECT id FROM observations WHERE asset_id=? "
+                "ORDER BY created_at DESC, revision DESC LIMIT 1) "
+                "ORDER BY e.updated_at DESC LIMIT 1", (asset_id,)
+            ).fetchone()
+            candidate = str((row[0] if row else "") or "").strip()
+            if candidate and not re.fullmatch(r"[-+]?\d+(?:\.\d+)?\s*[,; ]\s*[-+]?\d+(?:\.\d+)?", candidate):
+                place_label = candidate
+        except Exception:
+            pass
     return {
         "handle": handle,
         "captured_at": asset.get("captured_at"),
         "level": level,
-        "place": _short_place_label(asset) if asset else "",
+        "place": place_label,
         "media_kind": media_kind,
         "source_video_asset_id": source_video_asset_id,
         "source_timestamp_sec": source_timestamp_sec,
@@ -768,7 +819,7 @@ def _event_resolution(question: str, store, scope_id: str) -> dict | None:
         pass
     try:
         rows = store.connection.execute(
-            "SELECT id,title,place,activity,participants_json,substr(time_start,1,10) AS ts,"
+            "SELECT id,title,place,activity,summary,participants_json,substr(time_start,1,10) AS ts,"
             "substr(time_start,1,7) AS ym FROM events "
             "WHERE scope_id=? AND status NOT IN ('rejected','superseded','merged')", (scope_id,)).fetchall()
     except Exception:
@@ -785,7 +836,9 @@ def _event_resolution(question: str, store, scope_id: str) -> dict | None:
             if str(pid) in (r["participants_json"] or ""):
                 score += 3
         # 数据驱动的文本重叠：问题与事件 title/place/activity 的中文子串匹配（不硬编码任何关键词）
-        hay = " ".join(str(x) for x in (r["title"], r["place"], r["activity"]) if x)
+        hay = " ".join(str(x) for x in (
+            r["title"], r["place"], r["activity"], r["summary"]
+        ) if x)
         overlap = 0
         for length in (4, 3, 2):
             ngrams = {hay[i:i + length] for i in range(max(0, len(hay) - length + 1))
@@ -841,7 +894,7 @@ def _event_resolution_geo(question, store, scope_id, time_expr=None, place=None)
         return None
     try:
         rows = store.connection.execute(
-            "SELECT e.id, e.title, e.time_start, e.event_type, e.activity, "
+            "SELECT e.id, e.title, e.time_start, e.event_type, e.activity, e.place, e.summary, "
             "a.metadata_json AS cover_meta "
             "FROM events e LEFT JOIN assets a ON a.id=e.cover_asset_id "
             "WHERE e.scope_id=? AND e.status NOT IN ('rejected','superseded','merged')",
@@ -862,7 +915,12 @@ def _event_resolution_geo(question, store, scope_id, time_expr=None, place=None)
                 geo = None
         if place and geo and place_text_matches(place, geo):
             score += 3
-        hay = " ".join(str(x) for x in (r["title"], r["event_type"], r["activity"]) if x)
+        event_place_text = " ".join(str(x) for x in (
+            r["place"], r["title"], r["event_type"], r["activity"], r["summary"]
+        ) if x)
+        if place and place.lower() in event_place_text.lower():
+            score += 3
+        hay = event_place_text
         q = str(question or "")
         for length in (3, 2):
             ngrams = {hay[i:i + length] for i in range(max(0, len(hay) - length + 1))

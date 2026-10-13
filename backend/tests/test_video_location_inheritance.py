@@ -39,6 +39,9 @@ class VideoLocationInheritanceTests(unittest.TestCase):
             self.assertEqual(scene["place"], "深圳市龙岗区")
             self.assertEqual(frame["captured_location"], "22.484600,114.543800")
             self.assertEqual(frame["metadata_json"]["location_source"], "video_metadata")
+            self.assertEqual(frame["metadata_json"]["location_provenance"], "gps")
+            self.assertEqual(frame["metadata_json"]["capture_time_source"], "video_metadata")
+            store.close()
 
 
 if __name__ == "__main__":

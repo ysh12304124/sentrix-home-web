@@ -19,12 +19,40 @@ from typing import Any, Protocol
 from ..query_contracts import Constraint, QueryFacet
 
 
+VIDEO_DERIVED_KINDS = frozenset({
+    "video_keyframe",
+    "video_keyframe_webp",
+    "video_mtsw_keyframe",
+})
+
+
+def effective_media_type(asset: dict | None) -> str:
+    """Normalize keyframes to the video modality for retrieval filters."""
+    asset = asset or {}
+    metadata = asset.get("metadata_json") or {}
+    if isinstance(metadata, str):
+        try:
+            import json
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    derived = str(
+        asset.get("derived_kind")
+        or (metadata.get("derived_kind") if isinstance(metadata, dict) else "")
+        or ""
+    ).strip().lower()
+    if derived in VIDEO_DERIVED_KINDS:
+        return "video"
+    return str(asset.get("media_type") or "").strip().lower()
+
+
 @dataclass(frozen=True)
 class HardFilterContext:
     scope_ids: tuple[str, ...]
     viewer_id: str = "owner"
     media_types: tuple[str, ...] | None = None      # hard media filter (e.g. image only)
     time_bounds: tuple[datetime, datetime] | None = None
+    annual_time_window: tuple[int, int, int, int] | None = None
     negated_media: frozenset[str] = frozenset()      # must_not media (video etc.)
     negated_dimensions: frozenset[str] = frozenset()
     all_authorized: bool = False
@@ -36,6 +64,7 @@ class HardFilterContext:
         from ..query_contracts import HARD
         media_types, negated_media = [], set()
         time_bounds = None
+        annual_time_window = None
         negated_dimensions = set()
         place = None
         for constraint in spec.constraints:
@@ -53,6 +82,8 @@ class HardFilterContext:
                 bounds = _parse_time_bounds(constraint.value)
                 if bounds:
                     time_bounds = bounds
+                else:
+                    annual_time_window = _parse_annual_time_window(constraint.value)
             elif constraint.negated:
                 negated_dimensions.add(constraint.dimension)
         return cls(
@@ -60,6 +91,7 @@ class HardFilterContext:
             viewer_id=spec.viewer_id,
             media_types=tuple(media_types) or None,
             time_bounds=time_bounds,
+            annual_time_window=annual_time_window,
             negated_media=frozenset(negated_media),
             negated_dimensions=frozenset(negated_dimensions),
             all_authorized=spec.scope_mode == "all_authorized",
@@ -75,6 +107,14 @@ def _parse_time_bounds(value: str):
         return None
 
 
+def _parse_annual_time_window(value: str):
+    from ..query_contracts import parse_annual_time_expression
+    try:
+        return parse_annual_time_expression(value)
+    except Exception:
+        return None
+
+
 @dataclass
 class RetrievalQuery:
     whole_query: str
@@ -86,6 +126,10 @@ class RetrievalQuery:
 
     @classmethod
     def from_spec(cls, spec, *, embedding_router=None) -> "RetrievalQuery":
+        # Keep the historical whole-query contract for ANN/lexical channels.
+        # GraphExpander separately appends semantic facets for route decisions;
+        # mixing them here changes embedding input and can regress retrieval
+        # scores for callers that rely on the constraint-only text.
         whole = " ".join(c.source_text or c.value for c in spec.constraints)
         facets = list(spec.facets)
         if not facets and not whole:
