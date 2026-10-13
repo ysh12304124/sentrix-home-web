@@ -473,6 +473,7 @@
     "100qa-full": "qa/album3-max-100qa.jsonl",
     "max-answerable": "qa/max-answerable.jsonl",
     "max-clarify": "qa/max-clarify.jsonl",
-    "max-refuse": "qa/max-refuse.jsonl"
+    "max-refuse": "qa/max-refuse.jsonl",
+    "mixed-image-video-487q": "qa/mixed-image-video-487q.jsonl"
   }
 }
