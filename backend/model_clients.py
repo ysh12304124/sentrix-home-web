@@ -339,7 +339,7 @@ class OllamaBackend:
                 "num_predict": vision_options["num_predict"],
             })
         try:
-            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout, trust_env=False)
             response.raise_for_status()
             data = response.json()
             return data.get("message", {}).get("content", "")
@@ -352,7 +352,7 @@ class OllamaBackend:
             return []
         model = os.getenv("SENTRIX_TEXT_EMBED_MODEL", self._model)
         try:
-            response = httpx.post(f"{self._base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout)
+            response = httpx.post(f"{self._base_url}/api/embed", json={"model": model, "input": [str(text)]}, timeout=self.timeout, trust_env=False)
             response.raise_for_status()
             payload = response.json()
             embeddings = payload.get("embeddings") or []
@@ -494,7 +494,7 @@ class E2BBackend:
                 "num_predict": vision_options["num_predict"],
             })
         try:
-            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout)
+            response = httpx.post(f"{self._base_url}/api/chat", json=payload, timeout=self.timeout, trust_env=False)
             response.raise_for_status()
             data = response.json()
             return data.get("message", {}).get("content", "")
@@ -507,7 +507,7 @@ class E2BBackend:
 
     def health(self):
         try:
-            response = httpx.get(f"{self._base_url}/api/health", timeout=min(10, self.timeout))
+            response = httpx.get(f"{self._base_url}/api/health", timeout=min(10, self.timeout), trust_env=False)
             response.raise_for_status()
             return response.json()
         except Exception:
@@ -930,7 +930,7 @@ class GammaClient:
                 "num_predict": vision_options["num_predict"],
             })
         try:
-            response = httpx.post(f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout)
+            response = httpx.post(f"{endpoint_base}/api/chat", json=payload, timeout=self.timeout, trust_env=False)
             response.raise_for_status()
             data = response.json()
             text = data.get("message", {}).get("content", "")

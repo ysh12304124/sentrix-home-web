@@ -326,7 +326,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         self.manager_url = normalize_service_url(manager_url)
         self.timeout = float(timeout)
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=5, keepalive_expiry=300)
-        self._client = httpx.Client(limits=limits)
+        self._client = httpx.Client(limits=limits, trust_env=False)
 
     @property
     def headers(self) -> dict:
@@ -623,7 +623,7 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
         data.setdefault("memory_unit", "process_pss_uma_mib")
         data.setdefault("memory_profile", {"method": "orin_process_pss_uma_v1"})
         try:
-            response = httpx.get(f"{self.endpoint}/metrics", timeout=2)
+            response = httpx.get(f"{self.endpoint}/metrics", timeout=2, trust_env=False)
             response.raise_for_status()
             values = {}
             for line in response.text.splitlines():

@@ -84,7 +84,7 @@ class IngestionPipeline:
         from .embeddings import scheme
         import httpx
         url = os.getenv("SENTRIX_TEXT_EMBEDDER_URL", "http://127.0.0.1:8101").rstrip("/")
-        resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=20)
+        resp = httpx.post(f"{url}/embed", json={"text": str(text)}, timeout=20, trust_env=False)
         resp.raise_for_status()
         vec = (resp.json() or {}).get("vector")
         if not vec:

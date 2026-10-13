@@ -68,7 +68,7 @@ class BgeM3TextQueryEmbedder:
         if now - self._health_checked_at < self._health_ttl:
             return self._health_value
         try:
-            response = httpx.get(f"{self._base_url}/health", timeout=5)
+            response = httpx.get(f"{self._base_url}/health", timeout=5, trust_env=False)
             self._health_checked_at = now
             self._health_value = response.status_code == 200
             return self._health_value
@@ -98,6 +98,7 @@ class BgeM3TextQueryEmbedder:
             return []
         try:
             response = httpx.post(f"{self._base_url}/embed",
+            trust_env=False,
                                   json={"text": str(text or "")},
                                   timeout=self._timeout)
             response.raise_for_status()

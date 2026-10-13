@@ -756,7 +756,7 @@ def _vllm_api(path: str, method: str = "GET", json_body=None, timeout=30):
     import httpx as _httpx
     url = manager_url.rstrip("/") + path
     try:
-        resp = _httpx.request(method, url, json=json_body, timeout=timeout)
+        resp = _httpx.request(method, url, json=json_body, timeout=timeout, trust_env=False)
         if resp.status_code >= 400:
             return None
         return resp.json()
@@ -884,7 +884,7 @@ def _run_vllm_switch(request: ModelSwitchRequest):
     )}
     timeout = max(60, int(request.ready_timeout) + 90 if request.wait_ready else 60)
     try:
-        response = httpx.post(f"{manager_api}/switch", json=body, timeout=timeout)
+        response = httpx.post(f"{manager_api}/switch", json=body, timeout=timeout, trust_env=False)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail={
             "message": f"vLLM manager API unreachable: {manager_api}", "error": str(exc)})
@@ -3497,7 +3497,7 @@ def _background_conversation_summary(conversation_id, scope_id):
                 "model": getattr(gamma, "model", "gemma4-12b-it"),
                 "messages": msgs, "temperature": 0.0, "max_tokens": 700,
             }
-            resp = httpx.post(f"{gamma.base_url}/chat/completions", json=payload, timeout=60)
+            resp = httpx.post(f"{gamma.base_url}/chat/completions", json=payload, timeout=60, trust_env=False)
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
 

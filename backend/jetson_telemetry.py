@@ -317,7 +317,7 @@ class LocalJetsonLlamaCppTelemetryProvider:
     def _metrics(self) -> dict:
         data = {}
         try:
-            response = httpx.get(f"{self.endpoint}/metrics", timeout=2)
+            response = httpx.get(f"{self.endpoint}/metrics", timeout=2, trust_env=False)
             response.raise_for_status()
             values = {}
             for line in response.text.splitlines():
