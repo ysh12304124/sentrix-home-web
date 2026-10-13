@@ -2,6 +2,7 @@
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from backend.db import MemoryStore
@@ -44,6 +45,20 @@ class TextAnnRetrieverTests(unittest.TestCase):
             retriever = TextAnnRetriever(store, embedding_router=router, ann_dir=tmp, spaces=("semantic",))
             hits = retriever.retrieve(RetrievalQuery(whole_query="A"),
                                       HardFilterContext(scope_ids=("album1",)), 5)
+            store.close()
+            self.assertTrue(hits)
+            self.assertEqual(hits[0].asset_id, "asset_1")
+
+    def test_empty_qdrant_falls_back_to_hnsw(self):
+        with tempfile.TemporaryDirectory(prefix="tann-") as tmp:
+            _build_semantic_index(tmp)
+            store = MemoryStore(":memory:")
+            retriever = TextAnnRetriever(store, embedding_router=self._router(),
+                                         ann_dir=tmp, spaces=("semantic",))
+            with patch.dict("os.environ", {"SENTRIX_VECTOR_BACKEND": "qdrant"}), \
+                    patch.object(retriever, "_retrieve_qdrant", return_value=[]):
+                hits = retriever.retrieve(RetrievalQuery(whole_query="A"),
+                                          HardFilterContext(scope_ids=("album1",)), 5)
             store.close()
             self.assertTrue(hits)
             self.assertEqual(hits[0].asset_id, "asset_1")

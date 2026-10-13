@@ -7,16 +7,20 @@ installing the Sentrix vLLM Manager.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
-import re
 import csv
 import io
+import json
+import os
+import re
 import subprocess
+import threading
 import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from backend.hardware import read_cpu_temperature_c
 from backend.jetson_telemetry import LocalJetsonLlamaCppTelemetryProvider, is_jetson_host
 
 
@@ -192,6 +196,57 @@ def _query_compute_apps() -> list[dict]:
     return rows
 
 
+
+def _process_pss_mib(pid: int) -> float | None:
+    """Read proportional set size, with a slower smaps fallback.
+
+    A missing value is not a zero and is never replaced with RSS. Some kernels
+    expose smaps_rollup only partially, while the per-map smaps file remains
+    readable.
+    """
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
+            for line in file:
+                if line.startswith("Pss:"):
+                    return round(int(line.split()[1]) / 1024, 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    total_kib = 0
+    found = False
+    try:
+        with open(f"/proc/{pid}/smaps", encoding="ascii") as file:
+            for line in file:
+                if line.startswith("Pss:"):
+                    total_kib += int(line.split()[1])
+                    found = True
+    except (OSError, ValueError, IndexError):
+        return None
+    return round(total_kib / 1024, 2) if found else None
+
+
+def _process_smaps_field_mib(pid: int, field: str) -> float | None:
+    """Read one smaps_rollup field, then fall back to summing smaps."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
+            for line in file:
+                if line.startswith(field):
+                    return round(int(line.split()[1]) / 1024, 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    total_kib = 0
+    found = False
+    try:
+        with open(f"/proc/{pid}/smaps", encoding="ascii") as file:
+            for line in file:
+                if line.startswith(field):
+                    total_kib += int(line.split()[1])
+                    found = True
+    except (OSError, ValueError, IndexError):
+        return None
+    return round(total_kib / 1024, 2) if found else None
+    return None
+
+
 def _sum_mib(rows: list[dict], key: str) -> float | None:
     values = [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
     return round(sum(values), 2) if values else None
@@ -207,6 +262,10 @@ def _augment_host_process_memory(
     expose them. Missing values must not be interpreted as 0.
     """
     data = dict(data or {})
+    for key in ("product_stack_memory_mib", "benchmark_process_memory_used_mib",
+                "benchmark_process_memory_scope", "sentrix_stack_pss_mib",
+                "sentrix_stack_pss_scope"):
+        data.pop(key, None)
     try:
         process_rows = _host_process_rows()
     except Exception:
@@ -232,28 +291,56 @@ def _augment_host_process_memory(
     model_rows = []
     for row in process_rows:
         identity = str(row.get("identity") or "")
-        if row["pid"] in known_model_pids or (hint and hint in identity) or (port and port in identity):
+        if known_model_pids:
+            is_model = row["pid"] in known_model_pids
+        else:
+            is_model = (hint and hint in identity) or (port and port in identity)
+        if is_model:
             model_rows.append(row)
 
     system_rows = [row for row in process_rows if _is_system_related_process(row)]
     system_pids = {row["pid"] for row in system_rows}
     system_gpu_rows = [row for row in compute_apps if row.get("pid") in system_pids]
 
+    # Preserve the caller's exact model PID attribution. Do not broaden a
+    # PID-selected model into every process matching a generic runtime hint.
+    model_pids = {row["pid"] for row in model_rows}
+    sentrix_rows = [row for row in system_rows if row["pid"] not in model_pids]
+    for row in system_rows:
+        row["pss_mib"] = _process_pss_mib(int(row["pid"]))
+        row["smaps_rss_mib"] = _process_smaps_field_mib(int(row["pid"]), "Rss:")
     model_rss = _sum_mib(model_rows, "rss_mib")
     system_rss = _sum_mib(system_rows, "rss_mib")
+    sentrix_pss = _sum_mib(sentrix_rows, "pss_mib")
+    product_pss = _sum_mib(system_rows, "pss_mib")
+    model_smaps_rss = _sum_mib(model_rows, "smaps_rss_mib")
     system_gpu = _sum_mib(system_gpu_rows, "used_memory_mib")
     if model_rss is not None:
         data["model_process_system_memory_used_mib"] = model_rss
         data["model_process_system_memory_scope"] = "host_process_rss"
         data["model_system_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in model_rows[:20]
         ]
-    if system_rss is not None:
-        data["benchmark_process_memory_used_mib"] = system_rss
-        data["benchmark_process_memory_scope"] = "photobench_related_host_process_rss"
+    if sentrix_pss is not None:
+        data["sentrix_stack_pss_mib"] = sentrix_pss
+        data["sentrix_stack_pss_scope"] = "sentrix_related_pss_excluding_model"
+    # Product attribution is only valid when every related process has PSS and
+    # the model's VmRSS/smaps-Rss compensation inputs are both available.
+    # RSS remains available for the separate model VmRSS metric, but must not
+    # silently become a product total.
+    pss_complete = bool(system_rows) and all(row.get("pss_mib") is not None for row in system_rows)
+    model_pss_complete = bool(model_rows) and all(row.get("pss_mib") is not None for row in model_rows)
+    if (product_pss is not None and pss_complete and model_rss is not None
+            and model_smaps_rss is not None and model_pss_complete):
+        uma_extra = max(0.0, model_rss - model_smaps_rss)
+        product_memory = round(product_pss + uma_extra, 2)
+        data["product_stack_memory_mib"] = product_memory
+        data["benchmark_process_memory_used_mib"] = product_memory
+        data["benchmark_process_memory_scope"] = "all_related_pss_plus_model_uma_extra"
+        data["model_uma_extra_mib"] = round(uma_extra, 2)
         data["benchmark_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in system_rows[:50]
         ]
     if system_gpu is not None:
@@ -325,6 +412,20 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         self.api_mode = str(api_mode or "generic").strip().lower()
         self.manager_url = normalize_service_url(manager_url)
         self.timeout = float(timeout)
+        # ``httpx.stream(...)`` creates a new Client (and therefore a new
+        # Windows SSL context) for every request.  The API's tool-loop runs in
+        # worker threads; under a long PhotoBench run that repeated concurrent
+        # SSL initialisation has caused a native access violation and killed
+        # uvicorn.  Keep one transport per configured endpoint instead.
+        # Local model endpoints must not inherit an enterprise proxy either.
+        self._stream_client = httpx.Client(timeout=self.timeout, trust_env=False)
+        # Binding an external local vLLM endpoint probes ``/v1/models`` before
+        # a run starts.  These non-streaming calls used module-level httpx
+        # helpers, which inherited Windows HTTP_PROXY and made 127.0.0.1:8000
+        # time out even though the server was healthy.  Keep one no-proxy
+        # client for every request path, not only streaming.
+        self._client = httpx.Client(timeout=self.timeout, trust_env=False)
+        self._stream_lock = threading.RLock()
 
     @property
     def headers(self) -> dict:
@@ -338,7 +439,7 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
             root = self.base_url.removesuffix("/v1")
             for suffix in ("/health", "/api/health"):
                 try:
-                    response = httpx.get(f"{root}{suffix}", headers=self.headers, timeout=min(10, self.timeout))
+                    response = self._client.get(f"{root}{suffix}", headers=self.headers, timeout=min(10, self.timeout))
                     response.raise_for_status()
                     body = response.json() if response.content else {}
                     return {"status": "available", "source": suffix, "detail": body}
@@ -347,9 +448,40 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
             return {"status": "unavailable", "error": str(models_error)}
 
     def list_models(self) -> dict:
-        response = httpx.get(f"{self.base_url}/models", headers=self.headers, timeout=min(15, self.timeout))
-        response.raise_for_status()
-        body = response.json()
+        def stdlib_models():
+            request = urllib.request.Request(
+                f"{self.base_url}/models", headers=self.headers, method="GET",
+            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=min(15, self.timeout)) as reply:
+                return json.loads(reply.read().decode("utf-8"))
+
+        is_loopback = self.base_url.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]"))
+        if is_loopback:
+            # WSL-hosted vLLM occasionally drops an httpx/WinHTTP loopback
+            # connection, while the stdlib no-proxy transport is stable.
+            try:
+                body = stdlib_models()
+            except Exception:
+                response = self._client.get(
+                    f"{self.base_url}/models", headers=self.headers,
+                    timeout=min(15, self.timeout),
+                )
+                response.raise_for_status()
+                body = response.json()
+        else:
+            try:
+                response = self._client.get(
+                    f"{self.base_url}/models", headers=self.headers,
+                    timeout=min(15, self.timeout),
+                )
+                response.raise_for_status()
+                body = response.json()
+            except httpx.HTTPError as http_error:
+                try:
+                    body = stdlib_models()
+                except Exception as fallback_error:
+                    raise http_error from fallback_error
         models = [
             str(item.get("id")) for item in body.get("data") or []
             if isinstance(item, dict) and item.get("id")
@@ -361,27 +493,78 @@ class OpenAICompatibleInferenceProvider(InferenceProvider):
         if self.api_mode == "generic":
             body.pop("chat_template_kwargs", None)
             body = {key: value for key, value in body.items() if value is not None}
-        response = httpx.post(
-            f"{self.base_url}/chat/completions", json=body, headers=self.headers,
-            timeout=timeout or self.timeout,
+        # A stuck multimodal request must not occupy a pipeline worker for the
+        # full text-model timeout (and then be retried three more times).  This
+        # is especially important for a local vLLM server: a malformed or
+        # pathological image can leave one vision request pending while the
+        # rest of the benchmark is still healthy.  Keep the normal text
+        # timeout/retry policy unchanged, but bound image calls separately.
+        has_image = any(
+            isinstance(message, dict)
+            and isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict)
+                and part.get("type") in {"image_url", "input_image"}
+                for part in message.get("content") or []
+            )
+            for message in body.get("messages") or []
         )
-        response.raise_for_status()
-        return response
+        request_timeout = timeout or self.timeout
+        try:
+            retry_env = "SENTRIX_VISION_RETRY_COUNT" if has_image else "SENTRIX_OPENAI_RETRY_COUNT"
+            retry_default = "1" if has_image else "3"
+            retry_count = max(0, min(5, int(os.getenv(retry_env, retry_default))))
+        except (TypeError, ValueError):
+            retry_count = 1 if has_image else 3
+        if has_image:
+            try:
+                vision_timeout = max(30.0, float(os.getenv("SENTRIX_VISION_TIMEOUT_SECONDS", "90")))
+                request_timeout = min(float(request_timeout), vision_timeout)
+            except (TypeError, ValueError):
+                request_timeout = min(float(request_timeout), 90.0)
+        last_error = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = self._client.post(
+                    f"{self.base_url}/chat/completions", json=body, headers=self.headers,
+                    timeout=request_timeout,
+                )
+                response.raise_for_status()
+                return response
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
+                    httpx.ReadTimeout, httpx.RemoteProtocolError,
+                    httpx.PoolTimeout, httpx.WriteError, httpx.WriteTimeout) as error:
+                last_error = error
+                if attempt >= retry_count:
+                    break
+                time.sleep(min(8.0, 0.75 * (2 ** attempt)))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenAI-compatible model request failed")
 
     def chat_stream(self, payload: dict, *, timeout: float | None = None):
         body = dict(payload or {})
         if self.api_mode == "generic":
             body.pop("chat_template_kwargs", None)
             body = {key: value for key, value in body.items() if value is not None}
-        return httpx.stream(
-            "POST", f"{self.base_url}/chat/completions", json=body,
-            headers=self.headers, timeout=timeout or self.timeout,
-        )
+        # The client is thread-safe.  The lock only protects context-manager
+        # creation, avoiding another transport mutation during the Windows
+        # SSL setup path; streaming itself remains owned by the caller.
+        with self._stream_lock:
+            return self._stream_client.stream(
+                "POST", f"{self.base_url}/chat/completions", json=body,
+                headers=self.headers, timeout=timeout or self.timeout,
+            )
+
+    def close(self):
+        """Release the shared streaming transport during controlled teardown."""
+        self._stream_client.close()
+        self._client.close()
 
     def token_count(self, messages: list[dict], *, timeout: float = 15) -> dict | None:
         if not self.manager_url:
             return None
-        response = httpx.post(
+        response = self._client.post(
             f"{self.manager_url}/tokenize-current",
             json={"messages": messages, "add_generation_prompt": True},
             timeout=min(timeout, self.timeout),
@@ -523,10 +706,11 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                 if len(row) < 7: continue
                 v = [float(x) for x in row[1:]]
                 gpus.append({"index": int(float(row[0])), "gpu_utilization_pct": v[0], "memory_used_mib": v[1], "memory_total_mib": v[2], "temperature_c": v[3], "power_draw_w": v[4], "sm_clock_mhz": v[5]})
-            return {"status": "available", "source": "host_nvidia_smi", "data": {
-                "gpus": gpus,
-                "memory_scope": "gpu_device",
-            }}
+            data = {"gpus": gpus, "memory_scope": "gpu_device"}
+            cpu_temperature_c = read_cpu_temperature_c()
+            if cpu_temperature_c is not None:
+                data["cpu_temperature_c"] = cpu_temperature_c
+            return {"status": "available", "source": "host_nvidia_smi", "data": data}
         except Exception as exc:
             return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
 
@@ -538,7 +722,18 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
         return self._read_system_memory()
     def process_memory(self) -> dict:
         try:
-            candidates = _query_compute_apps()
+            candidates = []
+            for row in self._query("compute-apps=pid,process_name,used_memory"):
+                if len(row) < 3:
+                    continue
+                try:
+                    candidates.append({
+                        "pid": int(float(row[0])),
+                        "process_name": row[1],
+                        "used_memory_mib": float(row[2]),
+                    })
+                except (ValueError, TypeError):
+                    continue
             hints = [self.process_hint]
             matches = []
             for item in candidates:
@@ -572,8 +767,9 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                 return {"status": "unavailable", "source": "host_nvidia_smi",
                         "reason": "matching_model_process_not_found", "data": data}
             others = [item for item in candidates if item not in matches]
+            model_gpu_memory_mib = sum(x["used_memory_mib"] for x in matches)
             data = _augment_host_process_memory({
-                "process_memory_used_mib": sum(x["used_memory_mib"] for x in matches),
+                "process_memory_used_mib": model_gpu_memory_mib,
                 "processes": matches, "model_processes": matches,
                 "model_process_scope": "gpu_compute_processes",
                 "other_processes_memory_mib": sum(x["used_memory_mib"] for x in others),
@@ -581,6 +777,9 @@ class HostNvidiaTelemetryProvider(TelemetryProvider):
                 "all_processes": candidates, "all_processes_scope": "gpu_compute_processes",
             }, process_hint=self.process_hint, endpoint_port=self.endpoint_port,
                 model_pids={item["pid"] for item in matches}, compute_apps=candidates)
+            # _augment_host_process_memory may add RAM attribution, but the
+            # model GPU metric remains the exact nvidia-smi PID sum above.
+            data["process_memory_used_mib"] = model_gpu_memory_mib
             return {"status": "available", "source": "host_nvidia_smi", "data": data}
         except Exception as exc:
             return {"status": "unavailable", "source": "host_nvidia_smi", "error": str(exc)}
@@ -646,9 +845,12 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
         command = (
             f'pid=$(cat {self.pid_file}) || exit 1; '
             'case "$pid" in *[!0-9]*|"") exit 2;; esac; '
-            'ps -p "$pid" -o args= | grep -Fq "/llama-server --model " || exit 3; '
+            'ps -p "$pid" -o comm= | grep -Fxq "llama-server" || exit 3; '
             'ps -p "$pid" -o args= | grep -Fq -- "--port 8100" || exit 3; '
-            'awk \'/^Pss:/{print $2}\' "/proc/$pid/smaps_rollup"; '
+            'pss=$(awk \'/^Pss:/{print $2}\' "/proc/$pid/smaps_rollup" 2>/dev/null); '
+            'if [ -z "$pss" ]; then pss=$(awk \'/^Pss:/{s+=$2} END{if(s) print s}\' "/proc/$pid/smaps" 2>/dev/null); fi; '
+            '[ -n "$pss" ] || exit 4; printf "%s\\n" "$pss"; '
+            'awk \'/^VmRSS:/{print $2}\' "/proc/$pid/status"; '
             'printf "pid=%s\\n" "$pid"'
         )
         try:
@@ -659,9 +861,12 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
             )
             lines = completed.stdout.strip().splitlines()
             pss_mib = int(lines[0]) / 1024
-            pid = int(lines[1].removeprefix("pid="))
+            rss_mib = int(lines[1]) / 1024
+            pid = int(lines[2].removeprefix("pid="))
             data["root_pid"] = pid
             data["process_memory_used_mib"] = round(pss_mib, 2)
+            data["model_process_system_memory_used_mib"] = round(rss_mib, 2)
+            data["model_process_system_memory_scope"] = "remote_host_process_vmrss"
             data["pss_sampled_at_monotonic"] = time.monotonic()
             self._last_memory = {"status": "available", "source": "orin_ssh_pss", "data": data}
             return {"status": "available", "source": "orin_ssh_pss", "data": {"gpus": [{"index": 0, "memory_unit": "process_pss_uma_mib"}]}}
@@ -673,15 +878,38 @@ class OrinLlamaCppTelemetryProvider(TelemetryProvider):
 
     def process_memory(self) -> dict:
         if self._last_memory.get("status") == "available":
-            data = _augment_host_process_memory(
-                self._last_memory.get("data") or {},
-                process_hint="llama-server", endpoint_port="8100",
-                model_pids={
-                    int((self._last_memory.get("data") or {}).get("root_pid"))
-                } if str((self._last_memory.get("data") or {}).get("root_pid") or "").isdigit() else set(),
-            )
-            return {**self._last_memory, "data": data}
+            # This provider executes on 153 but the model process lives on
+            # 118. Never scan 153 /proc and label those processes as Orin.
+            return self._last_memory
         return self._last_memory
+
+    def system_memory(self) -> dict:
+        """Read total/available RAM from the remote Orin host.
+
+        The provider runs on 153 while the model runs on 118, so reading the
+        local /proc would report the wrong machine. MemAvailable is the Linux
+        kernel's reclaimable-memory estimate and gives a host-wide used value
+        without pretending it is model-specific memory.
+        """
+        command = "awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t && a) printf \"%.3f %.3f\\n\", t/1024, a/1024}' /proc/meminfo"
+        try:
+            completed = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                 "-o", "ConnectionAttempts=1", self.remote, command],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            total_text, available_text = completed.stdout.strip().split()
+            total = float(total_text)
+            available = float(available_text)
+            return {"status": "available", "source": "orin_remote_proc_meminfo", "data": {
+                "system_memory_used_mib": round(max(0.0, total - available), 3),
+                "system_memory_total_mib": round(total, 3),
+                "system_memory_available_mib": round(max(0.0, available), 3),
+                "system_memory_scope": "host_all_processes",
+            }}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return {"status": "unavailable", "source": "orin_remote_proc_meminfo",
+                    "reason": "remote_meminfo_unavailable"}
 
     def kv_cache(self) -> dict:
         data = self._last_memory.get("data") or {}

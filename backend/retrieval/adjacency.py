@@ -18,7 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .base import CandidateHit, HardFilterContext, RetrievalQuery
+from .base import CandidateHit, HardFilterContext, RetrievalQuery, effective_media_type
+from .temporal import trusted_captured_at
 
 
 def _parse_datetime(value):
@@ -49,7 +50,8 @@ class AdjacencyRetriever:
         # retrieve has no seeds and therefore nothing to expand.
         return []
 
-    def expand(self, seed_asset_ids: list[str], filters: HardFilterContext, limit: int) -> list[CandidateHit]:
+    def expand(self, seed_asset_ids: list[str], filters: HardFilterContext,
+               limit: int, query=None) -> list[CandidateHit]:
         if not seed_asset_ids:
             return []
         seeds = list(dict.fromkeys(seed_asset_ids))[: self._budgets["max_seeds"]]
@@ -110,7 +112,7 @@ class AdjacencyRetriever:
         window = timedelta(minutes=minutes)
         assets = [asset for asset in self.store.list_assets(limit=100_000)
                   if asset.get("id") in set(seeds) or True]
-        seed_times = {asset["id"]: _parse_datetime(asset.get("captured_at"))
+        seed_times = {asset["id"]: _parse_datetime(trusted_captured_at(asset, store=self.store))
                       for asset in self.store.list_assets(limit=100_000) if asset.get("id") in set(seeds)}
         seed_times = {asset_id: t for asset_id, t in seed_times.items() if t is not None}
         if not seed_times:
@@ -119,7 +121,7 @@ class AdjacencyRetriever:
         for asset in assets:
             if asset.get("id") in set(seeds):
                 continue
-            captured = _parse_datetime(asset.get("captured_at"))
+            captured = _parse_datetime(trusted_captured_at(asset, store=self.store))
             if captured is None:
                 continue
             if any(abs((captured - seed_time).total_seconds()) <= window.total_seconds()
@@ -165,12 +167,12 @@ class AdjacencyRetriever:
         if not filters.all_authorized and filters.scope_ids and scope_id not in filters.scope_ids:
             return False
         media_type = asset_or_observation.get("media_type")
-        if filters.media_types and media_type not in filters.media_types:
+        if filters.media_types and effective_media_type(asset_or_observation) not in filters.media_types:
             return False
-        if media_type in filters.negated_media:
+        if effective_media_type(asset_or_observation) in filters.negated_media:
             return False
         if filters.time_bounds:
-            captured = _parse_datetime(asset_or_observation.get("captured_at"))
+            captured = _parse_datetime(trusted_captured_at(asset_or_observation, store=self.store))
             if captured is not None and not (filters.time_bounds[0] <= captured < filters.time_bounds[1]):
                 return False
         return True

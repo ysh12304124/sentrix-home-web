@@ -342,7 +342,7 @@ def _decode_one_target(video, frame_index, fps, width, height):
     # 写死任何一条都会让另外一台失败——46/118 的 ffmpeg 根本没有 cuda hwaccel。
     strategy = select_strategy(detect_codec(video))
     gpu_command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        os.getenv("SENTRIX_FFMPEG_BINARY", "ffmpeg"), "-hide_banner", "-loglevel", "error",
         "-ss", f"{timestamp:.6f}",
         *strategy.input_args,
         "-i", str(video), "-an", "-frames:v", "1",
@@ -359,7 +359,7 @@ def _decode_one_target(video, frame_index, fps, width, height):
     # but decode this target frame on CPU instead of failing the whole video.
     gpu_error = gpu_result.stderr.decode("utf-8", errors="replace")[-800:]
     cpu_command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        os.getenv("SENTRIX_FFMPEG_BINARY", "ffmpeg"), "-hide_banner", "-loglevel", "error",
         "-ss", f"{timestamp:.6f}", "-i", str(video), "-an", "-frames:v", "1",
         "-vf", "format=bgr24", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]

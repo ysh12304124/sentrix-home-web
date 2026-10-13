@@ -344,6 +344,25 @@ def parse_time_expression(value: str | None):
     return None
 
 
+def parse_annual_time_expression(value: str | None):
+    """Return a recurring month/day window for a yearless calendar phrase."""
+    text = re.sub(r"\s+", "", _clean_text(value) or "")
+    if not text:
+        return None
+    if text in {"国庆节", "国庆黄金周", "十一假期"}:
+        return 10, 1, 10, 8
+    month = re.fullmatch(r"(\d{1,2})月", text)
+    if month:
+        number = int(month.group(1))
+        if 1 <= number <= 12:
+            return number, 1, (number % 12) + 1, 1
+    season = {"春天": (3, 1, 6, 1), "春季": (3, 1, 6, 1),
+              "夏天": (6, 1, 9, 1), "夏季": (6, 1, 9, 1),
+              "秋天": (9, 1, 12, 1), "秋季": (9, 1, 12, 1),
+              "冬天": (12, 1, 3, 1), "冬季": (12, 1, 3, 1)}
+    return season.get(text)
+
+
 def _media_type(value: str):
     value = _clean_text(value).lower()
     if any(token in value for token in ("视频", "video", "录像")):
@@ -371,7 +390,8 @@ def build_query_spec(
     all_authorized = scope_id == ""
     scope = raw_scope or "home-default"
     constraints: list[Constraint] = []
-    if parsed.time_expression and parse_time_expression(parsed.time_expression):
+    if parsed.time_expression and (parse_time_expression(parsed.time_expression)
+                                   or parse_annual_time_expression(parsed.time_expression)):
         constraints.append(Constraint("time", parsed.time_expression, HARD, "asset_metadata", source_text=parsed.time_expression))
     for expression in parsed.media_expressions:
         media_type = _media_type(expression)

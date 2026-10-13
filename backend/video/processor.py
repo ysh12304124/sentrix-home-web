@@ -14,7 +14,7 @@ import numpy as np
 
 from ..db import make_id
 from ..geocoding import format_gps_prefix
-from .metadata import probe_video_metadata
+from .metadata import probe_video_metadata, resolve_ffmpeg_binary
 from .svd_keyframe import SVDLowRankKeyframeExtractor
 from .worldmm_adapter import WorldMMAdapter
 from ..platform_profile import profile
@@ -64,7 +64,7 @@ def _browser_preview(video_path, target, codec):
         return None
     target.parent.mkdir(parents=True, exist_ok=True)
     process = subprocess.run([
-        "ffmpeg", "-y", "-v", "error", "-i", str(video_path),
+        resolve_ffmpeg_binary("ffmpeg"), "-y", "-v", "error", "-i", str(video_path),
         "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
         "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(target),
     ], check=False, capture_output=True, text=True, timeout=3600)
@@ -94,10 +94,26 @@ class VideoMemoryAdapter:
             store.update_asset(asset_id, stage, {"video_stage": stage, "retryable": True})
             metadata = probe_video_metadata(asset["path"])
             captured_at = metadata.captured_at or asset.get("captured_at")
+            capture_time_source = metadata.creation_source or (
+                "video_metadata" if metadata.captured_at
+                else "upload_metadata" if asset.get("captured_at") else "unknown"
+            )
             if not captured_at:
                 captured_at = datetime.fromtimestamp(Path(asset["path"]).stat().st_mtime, timezone.utc).isoformat()
                 metadata.creation_source = "file_mtime_fallback"
+                capture_time_source = "file_mtime_fallback"
             location = metadata.captured_location or asset.get("captured_location")
+            location_source = (
+                "video_metadata" if metadata.latitude is not None and metadata.longitude is not None
+                else "upload_metadata" if location else "unknown"
+            )
+            location_provenance = (
+                "gps" if metadata.latitude is not None and metadata.longitude is not None
+                else location_source
+            )
+            asset_metadata = asset.get("metadata_json") or {}
+            source_media_id = str(asset_metadata.get("source_media_id") or "").strip()
+            source_media_title = str(asset_metadata.get("source_media_title") or "").strip()
             reverse_geocode = {}
             if metadata.latitude is not None and metadata.longitude is not None:
                 reverse_geocode = pipeline.geocoder.lookup({
@@ -107,8 +123,10 @@ class VideoMemoryAdapter:
             store.update_asset(asset_id, "video-keyframe-extracting", {
                 "video_stage": "video-keyframe-extracting", "video_metadata": metadata.as_dict(),
                 "captured_at": captured_at, "captured_location": location,
+                "capture_time_source": capture_time_source,
                 "source_device_id": metadata.device or asset.get("source_device_id"),
-                "reverse_geocode": reverse_geocode, "location_source": "video_metadata" if metadata.latitude is not None else "upload_metadata",
+                "reverse_geocode": reverse_geocode, "location_source": location_source,
+                "location_provenance": location_provenance,
             })
 
             data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
@@ -127,13 +145,16 @@ class VideoMemoryAdapter:
             asset_algorithm = ((asset.get("metadata_json") or {}).get("keyframe_algorithm") or "").strip().lower()
             if asset_algorithm:
                 algorithm = asset_algorithm
+            stage = "video-keyframe-extracting"
             if algorithm == "hybrid_webp":
                 return self._process_hybrid_webp(
-                    asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started,
+                    asset, pipeline, metadata, captured_at, location_label, reverse_geocode,
+                    capture_time_source, location_source, location_provenance, started,
                 )
             if algorithm == "svd_lowrank":
                 return self._process_svd_lowrank(
-                    asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started,
+                    asset, pipeline, metadata, captured_at, location_label, reverse_geocode,
+                    capture_time_source, location_source, location_provenance, started,
                 )
             if algorithm != "worldmm":
                 raise ValueError(f"unsupported video keyframe algorithm: {algorithm}")
@@ -165,7 +186,10 @@ class VideoMemoryAdapter:
                     "source_start_sec": scene.start_sec, "source_end_sec": scene.end_sec,
                     "source_metadata": {
                         "worldmm_scene_id": scene.scene_id, "semantic_labels": scene.semantic_labels,
-                        "keyframe_count": len(scene.keyframes), "location_source": "video_metadata",
+                        "keyframe_count": len(scene.keyframes), "location_source": location_source,
+                        "capture_time_source": capture_time_source,
+                        "location_provenance": location_provenance,
+                        "source_media_id": source_media_id, "source_media_title": source_media_title,
                     },
                 })
                 scene_ids.append(event["id"])
@@ -183,14 +207,17 @@ class VideoMemoryAdapter:
                         "parent_asset_id": asset_id, "derived_kind": "video_keyframe",
                         "source_timestamp_sec": frame.timestamp_sec, "source_frame_index": frame.frame_index,
                         "source_scene_index": scene.index, "captured_at": frame_captured_at,
+                        "capture_time_source": capture_time_source,
                         "captured_location": location, "source_device_id": metadata.device or asset.get("source_device_id"),
                         "latitude": metadata.latitude, "longitude": metadata.longitude,
                         "source_captured_location": location,
-                        "content_sha256": _sha256(target), "location_source": "video_metadata",
+                        "content_sha256": _sha256(target), "location_source": location_source,
+                        "location_provenance": location_provenance,
                         "worldmm_scene_id": scene.scene_id, "worldmm_keyframe_code": frame.code,
                         "worldmm_score": frame.score, "worldmm_selection_reason": frame.selection_reason,
                         "worldmm_semantics": {"objects": frame.objects, "actions": frame.actions, "expressions": frame.expressions},
                         "reverse_geocode": reverse_geocode,
+                        "source_media_id": source_media_id, "source_media_title": source_media_title,
                     }
                     store.create_asset(
                         keyframe_id, target.name, "image", str(target), "image/jpeg", target.stat().st_size,
@@ -206,7 +233,8 @@ class VideoMemoryAdapter:
             return store.update_asset(asset_id, "processed", {
                 "video_stage": "processed", "video_metadata": metadata.as_dict(),
                 "latitude": metadata.latitude, "longitude": metadata.longitude,
-                "location_source": "video_metadata" if metadata.latitude is not None else "upload_metadata",
+                "capture_time_source": capture_time_source, "location_source": location_source,
+                "location_provenance": location_provenance,
                 "worldmm_output": str(worldmm_root), "worldmm_scene_count": len(result.scenes),
                 "worldmm_keyframe_count": result.keyframe_count,
                 "worldmm_full_keyframe_count": result.full_keyframe_count,
@@ -221,17 +249,30 @@ class VideoMemoryAdapter:
         except Exception as error:
             data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
             shutil.rmtree(data_root / "derived" / "video" / asset_id / "hybrid-webp" / "vlm-evidence", ignore_errors=True)
+            # Client errors (4xx) are deterministic — retrying won't help.
+            # Mark non-retryable so the batch worker's retry limit can retire them.
+            error_text = f"{type(error).__name__}: {error}"
+            non_retryable_markers = (
+                "400 Bad Request", "401 ", "403 ", "404 ", "422 ",
+                "exceeds the available context size", "exceed_context_size_error",
+            )
+            retryable = not any(marker in error_text for marker in non_retryable_markers)
             return store.update_asset(asset_id, "video-processing-failed", {
-                "video_stage": stage, "error_stage": stage, "error": f"{type(error).__name__}: {error}",
-                "retryable": True, "video_processing_seconds": round(time.perf_counter() - started, 3),
+                "video_stage": stage, "error_stage": stage, "error": error_text,
+                "retryable": retryable, "video_processing_seconds": round(time.perf_counter() - started, 3),
             })
 
-    def _process_svd_lowrank(self, asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started):
+    def _process_svd_lowrank(self, asset, pipeline, metadata, captured_at, location_label,
+                             reverse_geocode, capture_time_source, location_source,
+                             location_provenance, started):
         """Use SVD/eSVD for candidates, then persist semantic WebP representatives."""
         from PIL import Image
 
         store = pipeline.store
         asset_id = asset["id"]
+        asset_metadata = asset.get("metadata_json") or {}
+        source_media_id = str(asset_metadata.get("source_media_id") or "").strip()
+        source_media_title = str(asset_metadata.get("source_media_title") or "").strip()
         data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
         output = data_root / "derived" / "video" / asset_id / "svd-lowrank"
         result = self.svd.run(asset["path"], asset_id, output)
@@ -337,7 +378,9 @@ class VideoMemoryAdapter:
                     ],
                 },
             )
-            event_vlm_seconds += time.perf_counter() - vlm_started
+            vision_seconds = time.perf_counter() - vlm_started
+            event_vlm_seconds += vision_seconds
+            event_analysis["_vision_seconds"] = round(vision_seconds, 4)
             raw_indices = event_analysis.pop("representative_indices", [0])
             selected_indices = []
             for value in raw_indices if isinstance(raw_indices, list) else [raw_indices]:
@@ -352,8 +395,11 @@ class VideoMemoryAdapter:
                 "actions": [event_analysis.get("activity")] if event_analysis.get("activity") else [],
                 "objects": labels,
             }
+            event_title = _event_title(event_item)
+            if source_media_title:
+                event_title = f"{source_media_title} · {event_title}"
             event = store.create_video_scene_event({
-                "scope_id": asset.get("scope_id"), "title": _event_title(event_item),
+                "scope_id": asset.get("scope_id"), "title": event_title,
                 "summary": f"{start_sec:.1f}s~{end_sec:.1f}s；SVD/eSVD 候选 {len(group)} 张，语义去重后 {len(selected_indices)} 张",
                 "time_start": _captured_at(captured_at, start_sec), "time_end": _captured_at(captured_at, end_sec),
                 "place": event_analysis.get("place") or location_label,
@@ -361,6 +407,9 @@ class VideoMemoryAdapter:
                 "source_start_sec": start_sec, "source_end_sec": end_sec,
                 "source_metadata": {
                     "keyframe_algorithm": "svd_lowrank", "semantic_labels": labels[:80],
+                    "source_media_id": source_media_id, "source_media_title": source_media_title,
+                    "capture_time_source": capture_time_source,
+                    "location_source": location_source, "location_provenance": location_provenance,
                     "source_event_ids": list(dict.fromkeys(item["event_id"] for item in group)),
                     "source_frame_count": len(group), "memory_keyframe_count": len(selected_indices),
                     "memory_event_merge": True, "memory_duplicate_frame_removal": True,
@@ -368,6 +417,7 @@ class VideoMemoryAdapter:
                     "vlm_evidence_count": len(evidence), "vlm_evidence_persisted": len(selected_indices),
                     "vlm_selected_evidence_indices": selected_indices,
                     "distinct_states": event_analysis.get("distinct_states") or [],
+                    "state_transitions": event_analysis.get("state_transitions") or [],
                     "event_detail": {
                         key: event_analysis.get(key)
                         for key in ("caption", "activity", "people", "objects", "clothing",
@@ -392,8 +442,11 @@ class VideoMemoryAdapter:
                     "derived_kind": "video_keyframe_webp", "source_timestamp_sec": frame["timestamp_sec"],
                     "source_frame_index": frame["frame_index"], "source_scene_index": scene_index,
                     "captured_at": _captured_at(captured_at, frame["timestamp_sec"]), "captured_location": asset.get("captured_location"),
+                    "capture_time_source": capture_time_source,
+                    "source_media_id": source_media_id, "source_media_title": source_media_title,
                     "source_device_id": metadata.device or asset.get("source_device_id"), "latitude": metadata.latitude, "longitude": metadata.longitude,
-                    "content_sha256": _sha256(target), "location_source": "video_metadata", "keyframe_algorithm": "svd_lowrank",
+                    "content_sha256": _sha256(target), "location_source": location_source,
+                    "location_provenance": location_provenance, "keyframe_algorithm": "svd_lowrank",
                     "memory_event_merge": True, "memory_duplicate_frame_removal": True,
                     "vlm_selected_evidence_index": selected_index,
                     "svd_rank": raw.get("svd_rank"), "energy_ratio": raw.get("energy_ratio"), "svd_fold_group_id": raw.get("fold_group_id"),
@@ -415,6 +468,9 @@ class VideoMemoryAdapter:
         elapsed = round(time.perf_counter() - started, 3)
         return store.update_asset(asset_id, "processed", {
             "video_stage": "processed", "video_metadata": metadata.as_dict(), "keyframe_algorithm": "svd_lowrank",
+            "latitude": metadata.latitude, "longitude": metadata.longitude,
+            "capture_time_source": capture_time_source, "location_source": location_source,
+            "location_provenance": location_provenance,
             "svd_output": str(output), "svd_scene_count": len(result.scenes), "svd_keyframe_count": result.keyframe_count,
             "svd_fold_passes": 2, "svd_second_pass_fold_group_count": second.get("fold_group_count"),
             "svd_second_pass_folded_frame_count": second.get("folded_frame_count"), "yolo_event_generation_status": events.get("status"),
@@ -432,12 +488,17 @@ class VideoMemoryAdapter:
             "error_stage": None, "error": None, "retryable": True,
         })
 
-    def _process_hybrid_webp(self, asset, pipeline, metadata, captured_at, location_label, reverse_geocode, started):
+    def _process_hybrid_webp(self, asset, pipeline, metadata, captured_at, location_label,
+                             reverse_geocode, capture_time_source, location_source,
+                             location_provenance, started):
         """Run the fixed hybrid extractor and import only valid WebP representatives."""
         from .hybrid_keyframe import run as run_hybrid_keyframes
 
         store = pipeline.store
         asset_id = asset["id"]
+        asset_metadata = asset.get("metadata_json") or {}
+        source_media_id = str(asset_metadata.get("source_media_id") or "").strip()
+        source_media_title = str(asset_metadata.get("source_media_title") or "").strip()
         data_root = Path(os.getenv("SENTRIX_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
         output = data_root / "derived" / "video" / asset_id / "hybrid-webp"
         frames, merged, manifest = run_hybrid_keyframes(asset["path"], output, asset_id)
@@ -559,9 +620,12 @@ class VideoMemoryAdapter:
             vision_seconds = time.perf_counter() - vlm_started
             event_vlm_seconds += vision_seconds
             event_analysis["_vision_seconds"] = round(vision_seconds, 4)
+            event_title = _event_title(item)
+            if source_media_title:
+                event_title = f"{source_media_title} · {event_title}"
             event = store.create_video_scene_event({
                 "scope_id": asset.get("scope_id"),
-                "title": _event_title(item),
+                "title": event_title,
                 "summary": f"{start_sec:.1f}s~{end_sec:.1f}s；合并 {item['source_frame_count']} 个片段，保留信息帧 {len(representatives)} 张",
                 "time_start": _captured_at(captured_at, start_sec), "time_end": _captured_at(captured_at, end_sec),
                 "place": location_label, "source_asset_id": asset_id, "source_scene_index": scene_index,
@@ -572,6 +636,7 @@ class VideoMemoryAdapter:
                     "source_frame_count": item["source_frame_count"], "duplicate_frame_count": item["duplicate_frame_count"],
                     "memory_keyframe_count": len(representatives), "semantic_labels": labels[:80],
                     "frame_observations": item.get("frame_observations") or [],
+                    "source_media_id": source_media_id, "source_media_title": source_media_title,
                     "event_detail": {
                         key: event_analysis.get(key)
                         for key in ("caption", "activity", "people", "objects", "clothing",
@@ -583,7 +648,9 @@ class VideoMemoryAdapter:
                     "vlm_selected_evidence_indices": [
                         value.get("vlm_selected_evidence_index", 0) for value in representatives
                     ],
-                    "image_path": str(target), "location_source": "video_metadata",
+                    "image_path": str(target), "location_source": location_source,
+                    "capture_time_source": capture_time_source,
+                    "location_provenance": location_provenance,
                 },
             })
             scene_ids.append(event["id"])
@@ -597,14 +664,17 @@ class VideoMemoryAdapter:
                     "source_frame_index": int(representative.get("source_frame_index", 0) or 0),
                     "source_scene_index": scene_index, "evidence_index": evidence_index,
                     "captured_at": _captured_at(captured_at, float(representative.get("source_timestamp_sec", start_sec) or start_sec)), "captured_location": asset.get("captured_location"),
+                    "capture_time_source": capture_time_source,
                     "source_device_id": metadata.device or asset.get("source_device_id"),
                     "latitude": metadata.latitude, "longitude": metadata.longitude,
-                    "content_sha256": _sha256(target), "location_source": "video_metadata",
+                    "content_sha256": _sha256(target), "location_source": location_source,
+                    "location_provenance": location_provenance,
                     "keyframe_algorithm": manifest["method"], "memory_event_merge": True,
                     "memory_duplicate_frame_removal": True,
                     "source_event_ids": item["source_event_ids"], "worldmm_semantics": {
                         "objects": item["objects"], "actions": item["actions"], "expressions": item["expressions"],
                     }, "reverse_geocode": reverse_geocode,
+                    "source_media_id": source_media_id, "source_media_title": source_media_title,
                 }
                 store.create_asset(keyframe_id, target.name, "image", str(target), "image/webp", target.stat().st_size, provenance, scope_id=asset.get("scope_id"))
                 processed = pipeline.process(
@@ -620,7 +690,8 @@ class VideoMemoryAdapter:
         return store.update_asset(asset_id, "processed", {
             "video_stage": "processed", "video_metadata": metadata.as_dict(),
             "latitude": metadata.latitude, "longitude": metadata.longitude,
-            "location_source": "video_metadata" if metadata.latitude is not None else "upload_metadata",
+            "capture_time_source": capture_time_source, "location_source": location_source,
+            "location_provenance": location_provenance,
             "worldmm_output": str(output), "keyframe_algorithm": manifest["method"],
             "worldmm_scene_count": len(merged), "worldmm_keyframe_count": sum(item.get("memory_keyframe_count", 1) for item in merged),
             "worldmm_full_keyframe_count": transient_vlm_frame_count,

@@ -39,7 +39,13 @@ _lock = threading.Lock()
 def _load():
     global _model
     if _model is None:
-        _model = SentenceTransformer(MODEL, device=DEVICE)
+        # BGE-M3 repositories may publish both .bin and .safetensors copies.
+        # Prefer the already available PyTorch weights so a clean startup does
+        # not download a second multi-GB copy of the same encoder.
+        _model = SentenceTransformer(
+            MODEL, device=DEVICE,
+            model_kwargs={"use_safetensors": False, "local_files_only": True},
+        )
     return _model
 
 

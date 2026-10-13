@@ -1,17 +1,19 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { execFile } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const { URL } = require("node:url");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 11000);
 // The web portal uses the Agent-capable API as its single authority.
 // Default API is the project-local backend that reads ./data/sentrix.db.
-const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || "http://127.0.0.1:9598").replace(/\/$/, "");
+const backendBaseUrl = (process.env.SENTRIX_BACKEND_URL || `http://127.0.0.1:${process.env.SENTRIX_API_PORT || 11001}`).replace(/\/$/, "");
 const photobenchPort = Number(process.env.PHOTOBENCH_PORT || 8771);
 const photobenchDir = path.join(root, "services", "photobench");
-const photobenchPython = process.env.PHOTOBENCH_PYTHON || "python3";
+const photobenchPython = process.env.PHOTOBENCH_PYTHON || (process.platform === "win32"
+  ? path.join(root, ".venv", "Scripts", "python.exe")
+  : "python3");
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -101,9 +103,20 @@ async function ensurePhotobench(req, res) {
     if (probe.ok) return json(res, 200, { status: "running" });
   } catch (_) { /* not running yet */ }
 
-  const logFile = path.join(photobenchDir, "logs", "orchestrator.log");
-  const command = `cd '${photobenchDir}' && mkdir -p logs && set -a && . ./.env.local 2>/dev/null; set +a; nohup '${photobenchPython}' backend/benchmark_orchestrator.py --host 0.0.0.0 --port ${photobenchPort} >> '${logFile}' 2>&1 &`;
-  execFile("bash", ["-c", command], () => {});
+  const logDir = path.join(photobenchDir, "logs");
+  const logFile = path.join(logDir, "orchestrator.log");
+  fs.mkdirSync(logDir, { recursive: true });
+  const logFd = fs.openSync(logFile, "a");
+  const child = spawn(photobenchPython, [
+    "backend/benchmark_orchestrator.py", "--host", "0.0.0.0", "--port", String(photobenchPort),
+  ], {
+    cwd: photobenchDir,
+    detached: true,
+    windowsHide: true,
+    stdio: ["ignore", logFd, logFd],
+  });
+  child.unref();
+  fs.closeSync(logFd);
 
   for (let i = 0; i < 60; i++) {
     await new Promise((resolve) => setTimeout(resolve, 500));
