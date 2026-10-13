@@ -37,6 +37,7 @@ class VisualAnnRetriever:
         self.ann_dir = Path(ann_dir) if ann_dir else _DEFAULT_ANN_DIR
         self.backend = backend
         self._index = None
+        self._index_mtime = None
         self._load_failed = None
         self._status = "uninitialized"
         self.backend_used = "hnswlib"
@@ -46,13 +47,18 @@ class VisualAnnRetriever:
         return self._status
 
     def _load_index(self):
-        if self._index is not None:
-            return self._index
         path = self.ann_dir / self.space
-        if not (self.ann_dir / f"{self.space}.hnsw").is_file():
+        hnsw_path = self.ann_dir / f"{self.space}.hnsw"
+        if not hnsw_path.is_file():
             self._status = "unavailable"
             self._load_failed = "index_missing"
             return None
+        try:
+            mtime = hnsw_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._index is not None and self._index_mtime == mtime:
+            return self._index
         try:
             index = create_index(self.backend, dim=None)
             index.load(str(path))
@@ -64,6 +70,7 @@ class VisualAnnRetriever:
                 return None
             self._status = "ready"
             self._index = index
+            self._index_mtime = mtime
             return index
         except Exception as error:
             self._status = "unavailable"

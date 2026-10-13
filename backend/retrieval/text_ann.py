@@ -34,6 +34,7 @@ class TextAnnRetriever:
         self.backend = backend
         self.spaces = spaces
         self._indices = {}
+        self._index_mtime = {}
         self._load_failed = None
         self._status = "uninitialized"
         self.backend_used = "hnswlib"
@@ -43,12 +44,18 @@ class TextAnnRetriever:
         return self._status
 
     def _load_index(self, space):
-        if space in self._indices:
-            return self._indices[space]
         path = self.ann_dir / space
-        if not (self.ann_dir / f"{space}.hnsw").is_file():
-            self._indices[space] = None
+        hnsw_path = self.ann_dir / f"{space}.hnsw"
+        if not hnsw_path.is_file():
+            self._indices.pop(space, None)
+            self._index_mtime.pop(space, None)
             return None
+        try:
+            mtime = hnsw_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if space in self._indices and self._index_mtime.get(space) == mtime:
+            return self._indices[space]
         try:
             index = create_index(self.backend, dim=None)
             index.load(str(path))
@@ -57,8 +64,10 @@ class TextAnnRetriever:
                 self._status = "incompatible"
                 self._load_failed = index.incompatible_reason
                 self._indices[space] = None
+                self._index_mtime[space] = mtime
                 return None
             self._indices[space] = index
+            self._index_mtime[space] = mtime
             return index
         except Exception as error:
             self._status = "unavailable"
