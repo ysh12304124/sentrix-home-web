@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression coverage for complete live telemetry history responses."""
+"""Regression coverage for full-sample peaks with a bounded plotted history."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class TelemetryHistoryTests(unittest.TestCase):
             run.results_root = root
             run.run_id = "run-full-history"
             run.persist = lambda wait=False: None
+            run._gpu_sampler = type("Sampler", (), {"samples": []})()
             run_dir = root / run.run_id
             run_dir.mkdir(parents=True)
 
@@ -48,11 +49,13 @@ class TelemetryHistoryTests(unittest.TestCase):
             repository.runs[run.run_id] = run
             payload = repository.get_run(run.run_id)
             history = payload["telemetry_live"]["history"]
-            self.assertEqual(len(history), 300)
+            self.assertEqual(payload["telemetry_live"]["samples_count"], 300)
+            self.assertLessEqual(len(history), 240)
+            self.assertGreaterEqual(len(history), 2)
             self.assertEqual(history[0]["t"], 0.0)
             self.assertEqual(history[-1]["t"], 299.0)
             self.assertEqual(history[0]["phase"], "qa_eval")
-            self.assertEqual(payload["telemetry_live"]["samples_count"], 300)
+            self.assertEqual(payload["telemetry_live"]["peak"]["memory_used_mib"], 1299.0)
 
 
 if __name__ == "__main__":

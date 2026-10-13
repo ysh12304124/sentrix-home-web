@@ -131,33 +131,83 @@ def _sum_mib(rows: list[dict], key: str) -> float | None:
     return round(sum(values), 2) if values else None
 
 
+def _process_smaps_field_mib(pid: int, field: str) -> float | None:
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as file:
+            for line in file:
+                if line.startswith(field):
+                    return round(int(line.split()[1]) / 1024, 2)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _process_pss_mib(pid: int) -> float | None:
+    return _process_smaps_field_mib(pid, "Pss:")
+
+
+def _is_model_process(row: dict, *, model_pid: int | None, endpoint_port: str) -> bool:
+    identity = str(row.get("identity") or "")
+    return (
+        (model_pid is not None and row.get("pid") == model_pid)
+        or "llama-server" in identity
+        or f"--port {endpoint_port}" in identity
+        or f"--port {endpoint_port} " in identity
+    )
+
+
 def _augment_local_process_memory(data: dict | None, *, model_pid: int | None, endpoint_port: str) -> dict:
+    """Product occupancy = Sentrix-side PSS sum + llama VmRSS.
+
+    RSS sums double-count shared libraries. PSS sums do not. Llama CUDA UMA is
+    often missing from PSS, so the model term uses VmRSS.
+    """
     data = dict(data or {})
     try:
         rows = _host_process_rows()
     except Exception:
         rows = []
-    model_rows = [
-        row for row in rows
-        if row["pid"] == model_pid or "llama-server" in str(row.get("identity") or "")
-        or str(endpoint_port) in str(row.get("identity") or "")
-    ]
-    system_rows = [row for row in rows if _is_system_related_process(row)]
+    model_rows = [row for row in rows if _is_model_process(row, model_pid=model_pid, endpoint_port=str(endpoint_port))]
+    product_rows = [row for row in rows if _is_system_related_process(row)]
+    sentrix_rows = [row for row in product_rows if row.get("pid") not in {item.get("pid") for item in model_rows}]
+    for row in sentrix_rows + model_rows:
+        pid = int(row["pid"])
+        row["pss_mib"] = _process_pss_mib(pid)
+        row["smaps_rss_mib"] = _process_smaps_field_mib(pid, "Rss:")
     model_rss = _sum_mib(model_rows, "rss_mib")
-    system_rss = _sum_mib(system_rows, "rss_mib")
+    model_pss = _sum_mib(model_rows, "pss_mib")
+    model_smaps_rss = _sum_mib(model_rows, "smaps_rss_mib")
+    sentrix_pss = _sum_mib(sentrix_rows, "pss_mib")
     if model_rss is not None:
         data["model_process_system_memory_used_mib"] = model_rss
-        data["model_process_system_memory_scope"] = "host_process_rss"
+        data["model_process_system_memory_scope"] = "host_process_vmrss"
         data["model_system_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
             for row in model_rows[:20]
         ]
-    if system_rss is not None:
-        data["benchmark_process_memory_used_mib"] = system_rss
-        data["benchmark_process_memory_scope"] = "photobench_related_host_process_rss"
+    sentrix_pss_complete = bool(sentrix_rows) and all(row.get("pss_mib") is not None for row in sentrix_rows)
+    model_pss_complete = bool(model_rows) and all(row.get("pss_mib") is not None for row in model_rows)
+    if sentrix_pss is not None and sentrix_pss_complete:
+        data["sentrix_stack_pss_mib"] = sentrix_pss
+        data["sentrix_stack_pss_scope"] = "sentrix_related_pss_excluding_llama"
+        data["sentrix_processes"] = [
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
+            for row in sentrix_rows[:50]
+        ]
+    # Product total is recorded only when every related PSS is present.
+    # Missing PSS must not be replaced with 0 or with VmRSS.
+    if (sentrix_pss is not None and sentrix_pss_complete and model_pss is not None
+            and model_pss_complete and model_rss is not None and model_smaps_rss is not None):
+        cpu_pages = sentrix_pss + model_pss
+        uma_extra = max(0.0, model_rss - model_smaps_rss)
+        product = round(cpu_pages + uma_extra, 2)
+        data["product_stack_memory_mib"] = product
+        data["benchmark_process_memory_used_mib"] = product
+        data["benchmark_process_memory_scope"] = "all_related_pss_plus_model_uma_extra"
+        data["model_uma_extra_mib"] = round(uma_extra, 2)
         data["benchmark_processes"] = [
-            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "listening_ports")}
-            for row in system_rows[:50]
+            {key: row.get(key) for key in ("pid", "process_name", "rss_mib", "pss_mib", "listening_ports")}
+            for row in (sentrix_rows + model_rows)[:50]
         ]
     return data
 
@@ -213,6 +263,9 @@ def _parse_tegrastats_line(line: str) -> dict:
                 max(0.0, sample["system_memory_total_mib"] - sample[key]), 3
             )
             sample["system_memory_scope"] = "host_all_processes"
+    cpu = re.search(r"cpu@([\d.]+)C", line)
+    if cpu:
+        sample["cpu_temperature_c"] = round(float(cpu.group(1)), 3)
     return sample
 
 
@@ -291,19 +344,41 @@ class LocalJetsonLlamaCppTelemetryProvider:
         self._last_device_probe = 0.0
         self._device_sample: dict = {}
         self._last_pid = None
+        self._system_baseline_mib = None
         self._last_memory = {"status": "unavailable", "reason": "not_sampled"}
 
-    def _pid(self) -> int:
-        raw = self.pid_file.read_text(encoding="ascii").strip()
-        if not raw.isdecimal():
-            raise ValueError("invalid llama-server PID file")
-        pid = int(raw)
+    def _pid_from_proc(self, pid: int) -> int:
         args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         if not args or Path(os.fsdecode(args[0])).name != "llama-server":
             raise ValueError("PID does not belong to llama-server")
         command = [os.fsdecode(arg) for arg in args if arg]
         if "--port" not in command or command[command.index("--port") + 1] != str(self.port):
             raise ValueError("PID is not serving the selected endpoint port")
+        return pid
+
+    def _pid_from_port(self) -> int:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                return self._pid_from_proc(int(entry.name))
+            except (ValueError, FileNotFoundError, PermissionError, OSError):
+                continue
+        raise ValueError(f"no llama-server is listening on port {self.port}")
+
+    def _pid(self) -> int:
+        try:
+            raw = self.pid_file.read_text(encoding="ascii").strip()
+            if raw.isdecimal():
+                return self._pid_from_proc(int(raw))
+        except (OSError, ValueError):
+            pass
+        pid = self._pid_from_port()
+        try:
+            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_file.write_text(f"{pid}\n", encoding="ascii")
+        except OSError:
+            pass
         return pid
 
     @staticmethod
@@ -313,6 +388,32 @@ class LocalJetsonLlamaCppTelemetryProvider:
                 if line.startswith("Pss:"):
                     return round(int(line.split()[1]) / 1024, 2)
         raise ValueError("Pss not found in smaps_rollup")
+
+    @staticmethod
+    def _rss_mib(pid: int) -> float:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines():
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 1024, 2)
+        raise ValueError("VmRSS not found")
+
+    def _llama_args(self, pid: int) -> dict:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        args = [os.fsdecode(item) for item in raw if item]
+        def flag(*names):
+            for name in names:
+                if name in args:
+                    index = args.index(name)
+                    if index + 1 < len(args):
+                        return args[index + 1]
+            return None
+        return {
+            "ctx_size": flag("--ctx-size", "-c"),
+            "parallel": flag("--parallel", "-np"),
+            "n_gpu_layers": flag("--n-gpu-layers", "-ngl"),
+            "cache_ram": flag("--cache-ram"),
+            "model": flag("--model", "-m"),
+            "cmdline": " ".join(args)[:2000],
+        }
 
     def _metrics(self) -> dict:
         data = {}
@@ -362,12 +463,27 @@ class LocalJetsonLlamaCppTelemetryProvider:
                 self._last_probe = 0.0
                 data.pop("process_memory_used_mib", None)
             data["root_pid"] = pid
+            if pid != getattr(self, "_baseline_pid", None):
+                self._baseline_pid = pid
+                self._system_baseline_mib = None
             if time.monotonic() - self._last_probe >= self.pss_interval:
                 self._last_probe = time.monotonic()
                 data["process_memory_used_mib"] = self._pss_mib(pid)
                 data["process_memory_scope"] = "llama_server_pss"
+                try:
+                    data["process_rss_mib"] = self._rss_mib(pid)
+                    data["llama_server_args"] = self._llama_args(pid)
+                except (OSError, ValueError, IndexError):
+                    pass
                 data["pss_sampled_at_monotonic"] = time.monotonic()
                 data.pop("pss_error", None)
+            device = self._device()
+            used = device.get("system_memory_used_mib")
+            if self._system_baseline_mib is None and isinstance(used, (int, float)):
+                self._system_baseline_mib = float(used)
+            if self._system_baseline_mib is not None and isinstance(used, (int, float)):
+                data["system_memory_baseline_mib"] = round(self._system_baseline_mib, 2)
+                data["system_memory_delta_mib"] = round(float(used) - self._system_baseline_mib, 2)
         except (OSError, ValueError, IndexError) as exc:
             data.pop("process_memory_used_mib", None)
             data["pss_error"] = str(exc)
