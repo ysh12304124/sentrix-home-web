@@ -1911,6 +1911,8 @@ class AgentRuntime:
         max_resolution_retries = 2
         completion_retries = 0
         max_completion_retries = 1
+        conservative_retries = 0
+        max_conservative_retries = 1
         answer_quality_retries = 0
         auto_resolution_attempts = 0
         # A failed first visual/OCR candidate must be followed by bounded
@@ -2627,9 +2629,11 @@ class AgentRuntime:
                     messages.append({"role": "assistant", "content": _model_visible_action(action)})
                     if denies_found:
                         messages.append({"role": "user", "content": (
-                            "你的回答说“没有找到”，但 search_memories 实际返回了候选照片（preview 里有 photo_1 等 handle），"
-                            "这与工具结果矛盾。请调用 inspect_photo 复核 preview 里的 photo_1（asset_handle=photo_1），"
-                            "根据观察如实回答；如果观察与用户假设不符，以观察为准。"
+                            "在回答前，值得回看一遍此前的检索过程：检索阶段曾返回过若干候选照片"
+                            "（preview 中留有可用的 handle，如 photo_1）。"
+                            "这些候选是否与问题相关、是否值得进一步查看，可以独立判断一次。"
+                            "若判断值得，调用 inspect_photo（asset_handle 用 preview 里的 handle）"
+                            "取得实际观察后再形成结论；若判断均不相关，以观察为准作答。"
                         )})
                     else:
                         messages.append({"role": "user", "content": (
@@ -2700,6 +2704,25 @@ class AgentRuntime:
                         break
                 if gate_prompted:
                     continue
+                # L0 Recovery（PivotOPD式条件触发）：检索有候选 + 最终回答倾向保守结论
+                # → 给一次有界恢复机会，引导 inspect 候选/换角度重查，而不是直接放行
+                # "无法确认"。措辞借信息不借口吻（hint模板：独立重推，不复述提示）。
+                if (turn.final_answer and search_has_preview and not inspect_called
+                        and conservative_retries < max_conservative_retries
+                        and turn.budget.can_model_step()):
+                    _fa = str(turn.final_answer)
+                    if re.search(r"无法确认|看不出来|看不清|不能确定|不足以确认|无法判断|无法定位|无法回答", _fa):
+                        conservative_retries += 1
+                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
+                        messages.append({"role": "user", "content": (
+                            "在落定最终结论前，有一次独立复核的机会：此前的检索曾返回过若干候选照片"
+                            "（preview 中留有可用的 handle，如 photo_1）。"
+                            "这些候选是否与问题相关，可以先独立判断："
+                            "若值得查看，调用 inspect_photo（asset_handle 用 preview 里的 handle）"
+                            "取得观察，或基于 preview 描述换一个检索角度再试一次；"
+                            "若复核后仍不支持结论，按复核结果作答并说明检查过哪些候选。"
+                        )})
+                        continue
                 # Evidence resolution has a bounded recovery budget.  Once the
                 # model retry and deterministic fallback are exhausted, never
                 # release an unsupported final answer just because a tool was
