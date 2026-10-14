@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,6 +105,12 @@ def select_strategy(codec: str, available: frozenset[str] | None = None) -> Deco
     顺序：实测可用的 nvv4l2dec → 实测可用的 cuda hwaccel → CPU 软解。
     绝不返回"表里有、这台机器上没有"的解码器。
     """
+    # 部署开关：FORCE_CPU_DECODE=1 时跳过一切硬件解码，直接 CPU 软解。
+    # 背景：200 的 API 子进程 ffmpeg 报 CUDA_ERROR_NO_DEVICE（环境继承/驱动
+    # 可见性与交互 shell 不一致），硬件路径在服务进程里不可靠，CPU 软解
+    # 实测单视频 0.13s/5 帧足够。不影响未设该变量的机器（123/135/118）。
+    if os.environ.get("FORCE_CPU_DECODE", "").strip().lower() in {"1", "true", "yes"}:
+        return _CPU
     decoders = nvv4l2_decoders() if available is None else available
     candidate = _NVV4L2.get(str(codec or "").strip().lower())
     if candidate and candidate in decoders:
