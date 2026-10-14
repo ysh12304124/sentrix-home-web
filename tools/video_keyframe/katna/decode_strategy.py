@@ -117,9 +117,11 @@ def select_strategy(codec: str, available: frozenset[str] | None = None) -> Deco
     if _cuda_hwaccel_available():
         return DecodeStrategy(
             name="cuda_hwaccel",
-            input_args=("-hwaccel", "cuda", "-hwaccel_output_format", "cuda"),
-            # 帧留在显存，必须取回系统内存才能交给 numpy / OpenCV。
-            vf_prefix="hwdownload,format=nv12,",
+            # 不带 -hwaccel_output_format cuda：解码帧自动下载回系统内存。
+            # 带 output_format 时帧留在显存，ffmpeg 4.2 的 hwdownload filter
+            # 链报 "Function not implemented"（200 实测 9/10 视频全败）。
+            input_args=("-hwaccel", "cuda",),
+            vf_prefix="",
             concurrency=8,
         )
     return _CPU
