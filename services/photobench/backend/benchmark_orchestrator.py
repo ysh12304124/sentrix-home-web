@@ -3519,7 +3519,7 @@ class BenchmarkRun:
     def _phase_identity_seed(self):
         self._phase_start("identity_seed")
         t0 = time.perf_counter()
-        faces = self.manifest["faces"]
+        faces = self.manifest.get("faces") or []
         manifest_entries = []
         files = []
         file_idx = 0
@@ -3535,11 +3535,13 @@ class BenchmarkRun:
             files.append(("files", ref_path.name, ref_path.read_bytes()))
             file_idx += 1
 
+        # Video-only datasets have no identity reference images. An empty
+        # multipart request is rejected by the API (422); no seed is needed.
         result = upload_files(
             f"{self.sentrix_url}/api/people/seed-batch",
             {"scope_id": self.state["scope_id"], "manifest": json.dumps(manifest_entries, ensure_ascii=False)},
             files, 120,
-        )
+        ) if files else {"results": []}
         t1 = time.perf_counter()
         seeded = result.get("results", [])
         entity_by_name = {
@@ -3561,6 +3563,7 @@ class BenchmarkRun:
         self._phase_done("identity_seed", {
             "upload_seconds": round(t1 - t0, 3),
             "seeded_count": len(seeded),
+            "applicability": "applicable" if files else "not_applicable",
             "details": seeded,
             "family_relationship_import": relationship_import,
         })

@@ -32,6 +32,17 @@ class SuiteControlTests(unittest.TestCase):
     def tearDown(self):
         self.results.cleanup()
 
+    def test_video_only_dataset_skips_empty_identity_upload(self):
+        self.run.manifest = {"faces": [], "family_relationships": []}
+        self.run.state["scope_id"] = "isolated-video-scope"
+        with patch.object(MODULE, "upload_files") as upload:
+            self.run._phase_identity_seed()
+        upload.assert_not_called()
+        phase = self.run.state["phases"]["identity_seed"]
+        self.assertEqual(phase["status"], "done")
+        self.assertEqual(phase["seeded_count"], 0)
+        self.assertEqual(phase["applicability"], "not_applicable")
+
     def test_cancelled_pending_run_never_records_started_at(self):
         self.run.cancel(source="test")
         self.run.execute()
