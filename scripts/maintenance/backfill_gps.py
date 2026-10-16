@@ -98,9 +98,12 @@ def main():
 
         metadata = json.loads(row["metadata_json"] or "{}")
 
-        # Only backfill if GPS is missing
+        # Only backfill if GPS or reverse_geocode is missing.
+        # 注意: 键存在但值为 None (pipeline 反解失败时写入) 也算缺失,
+        # 必须查值而不是查键 —— 200 的照片因此整批被误跳过 (1014)。
         has_gps = bool(metadata.get("exif", {}).get("gps") or metadata.get("gps"))
-        if has_gps and "reverse_geocode" in metadata:
+        has_geo = bool(metadata.get("reverse_geocode"))
+        if has_gps and has_geo:
             continue  # Already complete
 
         exif = extract_exif_gps(path)
