@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "sentrix_baseline_commit": "10a5874318b1eb6bcfb085abf2dc5fa77ad9a5a2",
+  "upstream_repo": "https://github.com/ByteDance-Seed/m3-agent",
+  "annotation_commit": "0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c",
+  "annotation_sha256": "f43031bf0216a2ef2e7909f20ecd534e0098da17b63cdf94325a07f1bea372c1",
+  "dataset_repo": "ByteDance-Seed/M3-Bench",
+  "dataset_revision": "2672152eee36b25ccb38fdbc3b72135347adbb63",
+  "license": "CC-BY-NC-SA-4.0",
+  "selection_rule": "Eight complete household-scene videos: three kitchen, three living room, two study; all associated official QA; no outcome-based filtering. User approved transcoding to approximately 1 GB for 100–150 official QA.",
+  "total_video_bytes": 3375979301,
+  "videos": [
+    {
+      "video_id": "kitchen_05",
+      "path": "videos/robot/kitchen_05.mp4",
+      "bytes": 503164961,
+      "sha256": "ac16a422525e1d983e90c5b35d997a74c9cf82dc13f37c68b7aaf21888b9a47a",
+      "qa_count": 15,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/kitchen_05.mp4"
+    },
+    {
+      "video_id": "kitchen_12",
+      "path": "videos/robot/kitchen_12.mp4",
+      "bytes": 472265296,
+      "sha256": "cc9a2103e651647632a020739e53ddd1944dbc2a7baeb8764253add46fe2d966",
+      "qa_count": 20,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/kitchen_12.mp4"
+    },
+    {
+      "video_id": "kitchen_15",
+      "path": "videos/robot/kitchen_15.mp4",
+      "bytes": 391253238,
+      "sha256": "4d601672b8e5a1ad80c196792e54a42b5b3bb71136c51b29bd20631c2c617e29",
+      "qa_count": 14,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/kitchen_15.mp4"
+    },
+    {
+      "video_id": "living_room_10",
+      "path": "videos/robot/living_room_10.mp4",
+      "bytes": 502353205,
+      "sha256": "f005bf6c591d36493acdac0552a959f750077ae8b97e94c915fd0ecd857b5266",
+      "qa_count": 12,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/living_room_10.mp4"
+    },
+    {
+      "video_id": "living_room_17",
+      "path": "videos/robot/living_room_17.mp4",
+      "bytes": 441338446,
+      "sha256": "ad1716e4324828cae9548172d389bb0f75f88f2f97475678973a2ef0c95c9c55",
+      "qa_count": 15,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/living_room_17.mp4"
+    },
+    {
+      "video_id": "living_room_20",
+      "path": "videos/robot/living_room_20.mp4",
+      "bytes": 367652380,
+      "sha256": "3a28ea876f06ec9913991b58c4f4c623f8411fb0c28021df8d4920dbaddf87b1",
+      "qa_count": 15,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/living_room_20.mp4"
+    },
+    {
+      "video_id": "study_07",
+      "path": "videos/robot/study_07.mp4",
+      "bytes": 363472478,
+      "sha256": "8e60574ef9ea8dfa8ebbd587b3e2ea89824a16b066f0115a3adca89bfc9f3214",
+      "qa_count": 13,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/study_07.mp4"
+    },
+    {
+      "video_id": "study_17",
+      "path": "videos/robot/study_17.mp4",
+      "bytes": 334479297,
+      "sha256": "575c3c9d2a4889fb68017aaf699b599ea0f9b90d07208a62c0b72543f2df774c",
+      "qa_count": 17,
+      "url": "https://huggingface.co/datasets/ByteDance-Seed/M3-Bench/resolve/2672152eee36b25ccb38fdbc3b72135347adbb63/videos/robot/study_17.mp4"
+    }
+  ],
+  "target_encoded_bytes": 1000000000,
+  "evaluation_protocol": "full_video_album_adaptation",
+  "question_language": "original_en"
+}
