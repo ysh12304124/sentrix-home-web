@@ -124,6 +124,31 @@ class SVDLowRankKeyframeExtractor:
     def __init__(self, config: dict[str, Any] | None = None, config_path: str | Path | None = None):
         self.config = _merge(load_svd_config(config_path), config or {})
 
+    def _cuda_enabled(self):
+        return os.getenv("SENTRIX_SVD_DEVICE", "cpu").startswith("cuda")
+
+    def _tensor(self, value):
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("SENTRIX_SVD_DEVICE requires CUDA; refusing CPU fallback")
+        return torch.as_tensor(np.ascontiguousarray(value), device=os.getenv("SENTRIX_SVD_DEVICE", "cuda"))
+
+    def _svd(self, matrix):
+        if not self._cuda_enabled():
+            return np.linalg.svd(matrix, full_matrices=False)
+        import torch
+        # QR-based cuSOLVER SVD preserves the exact decomposition contract.
+        with torch.inference_mode():
+            u, singular, vh = torch.linalg.svd(self._tensor(matrix), full_matrices=False, driver="gesvd")
+            return u.cpu().numpy(), singular.cpu().numpy(), vh.cpu().numpy()
+
+    def _matmul(self, a, b):
+        if not self._cuda_enabled():
+            return a @ b
+        import torch
+        with torch.inference_mode():
+            return (self._tensor(a) @ self._tensor(b)).cpu().numpy()
+
     def preprocess(self, frame: np.ndarray) -> np.ndarray:
         width, height = [int(v) for v in self.config.get("resize", [160, 90])]
         small = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
@@ -199,9 +224,9 @@ class SVDLowRankKeyframeExtractor:
                 )
                 decomposition = "randomized_svd"
             else:
-                u, singular, vt = np.linalg.svd(centered, full_matrices=False)
+                u, singular, vt = self._svd(centered)
             rank, energy = self.estimate_rank(singular, total_energy=total_energy)
-            low_rank = (u[:, :rank] * singular[:rank]) @ vt[:rank, :]
+            low_rank = self._matmul(u[:, :rank] * singular[:rank], vt[:rank, :])
         else:
             singular = np.empty(0, dtype=np.float32)
             rank, energy = 1, 1.0
@@ -232,6 +257,10 @@ class SVDLowRankKeyframeExtractor:
         group_ids: list[str] = []
         assignments: list[dict[str, Any]] = []
         outlier_index = 0
+        gpu_signatures = self._tensor(signatures) if self._cuda_enabled() else None
+        if gpu_signatures is not None:
+            import torch
+            gpu_representatives = torch.empty_like(gpu_signatures)
         for index, ((timestamp, frame_index, _), signature) in enumerate(zip(samples, signatures)):
             if is_outlier[index]:
                 outlier_index += 1
@@ -243,7 +272,8 @@ class SVDLowRankKeyframeExtractor:
                 similarity = None
                 is_new_group = False
                 if group_ids:
-                    similarities = group_representatives[:len(group_ids)] @ signature
+                    similarities = ((gpu_representatives[:len(group_ids)] @ gpu_signatures[index]).cpu().numpy()
+                                    if gpu_signatures is not None else group_representatives[:len(group_ids)] @ signature)
                     if norms[index] <= 1e-8:
                         similarities = np.where(
                             np.linalg.norm(group_representatives[:len(group_ids)], axis=1) <= 1e-8,
@@ -258,6 +288,8 @@ class SVDLowRankKeyframeExtractor:
                     group_id = f"fold_{len(group_ids) + 1:05d}"
                     group_ids.append(group_id)
                     group_representatives[len(group_ids) - 1] = signature
+                    if gpu_signatures is not None:
+                        gpu_representatives[len(group_ids) - 1] = gpu_signatures[index]
                     is_new_group = True
                 status = "representative" if is_new_group else "folded"
             assignments.append({
@@ -316,6 +348,18 @@ class SVDLowRankKeyframeExtractor:
         target = min(rows, columns, max(1, int(max_rank)) + max(0, int(oversample)))
         rng = np.random.default_rng(2026)
         projection = rng.standard_normal((columns, target), dtype=np.float32)
+        if self._cuda_enabled():
+            import torch
+            with torch.inference_mode():
+                gpu = self._tensor(matrix)
+                basis, _ = torch.linalg.qr(gpu @ self._tensor(projection), mode="reduced")
+                for _ in range(max(0, int(power_iterations))):
+                    basis, _ = torch.linalg.qr(gpu @ (gpu.T @ basis), mode="reduced")
+                small_u, singular, vt = torch.linalg.svd(basis.T @ gpu, full_matrices=False, driver="gesvd")
+                u = basis @ small_u
+                if not all(bool(torch.isfinite(t).all()) for t in (u, singular, vt)):
+                    raise RuntimeError("CUDA randomized SVD produced non-finite components")
+                return u.cpu().numpy(), singular.cpu().numpy(), vt.cpu().numpy(), target
         with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
             basis, _ = np.linalg.qr(matrix @ projection, mode="reduced")
             for _ in range(max(0, int(power_iterations))):
@@ -330,7 +374,7 @@ class SVDLowRankKeyframeExtractor:
     def low_rank_decomposition(self, matrix: np.ndarray):
         if matrix.size == 0:
             return np.empty((0, 0)), np.empty(0), np.empty((0, 0)), 1, 1.0
-        u, singular, vt = np.linalg.svd(matrix, full_matrices=False)
+        u, singular, vt = self._svd(matrix)
         rank, energy = self.estimate_rank(singular)
         return u[:, :rank], singular, vt[:rank, :], rank, energy
 
@@ -346,7 +390,7 @@ class SVDLowRankKeyframeExtractor:
     def reconstruction_novelty(self, matrix: np.ndarray, u: np.ndarray, vt: np.ndarray) -> np.ndarray:
         if not len(matrix):
             return np.empty(0)
-        reconstructed = (u @ (u.T @ matrix)) if u.size else np.zeros_like(matrix)
+        reconstructed = self._matmul(u, self._matmul(u.T, matrix)) if u.size else np.zeros_like(matrix)
         return np.mean(np.square(matrix - reconstructed), axis=0)
 
     def subspace_change(self, previous_u: np.ndarray | None, current_u: np.ndarray) -> float:
@@ -358,7 +402,7 @@ class SVDLowRankKeyframeExtractor:
             return 0.0
         # For orthonormal SVD bases, ||AAᵀ-BBᵀ||²_F = 2r-2||AᵀB||²_F.
         # This is numerically safer and avoids constructing a large D×D matrix.
-        overlap = a.T @ b
+        overlap = self._matmul(a.T, b)
         if not np.isfinite(overlap).all():
             return 0.0
         squared_distance = max(0.0, 2.0 * rank - 2.0 * float(np.square(overlap).sum()))
@@ -551,7 +595,7 @@ class SVDLowRankKeyframeExtractor:
         normalized = self._standardize_block(values)
         if not normalized.shape[1] or len(normalized) <= 1:
             return normalized
-        u, singular, _vt = np.linalg.svd(normalized, full_matrices=False)
+        u, singular, _vt = self._svd(normalized)
         energy = np.square(singular)
         ratio = np.cumsum(energy) / max(float(energy.sum()), 1e-12)
         rank = max(1, int(np.searchsorted(ratio, float(self.config.get("energy_threshold", 0.90))) + 1))
@@ -567,10 +611,51 @@ class SVDLowRankKeyframeExtractor:
         return float(np.square(centered).sum())
 
     @staticmethod
+    def _cuda_split_stats(batch):
+        import torch
+        count = batch.shape[1]
+        sums = batch.cumsum(dim=1)
+        squares = batch.square().cumsum(dim=1)
+        totals, total_sq = sums[:, -1], squares[:, -1]
+        unsplit = (total_sq.sum(-1) - totals.square().sum(-1) / count).clamp_min(0)
+        positions = torch.arange(2, count - 1, device=batch.device)
+        left = sums[:, positions - 1]
+        left_sq = squares[:, positions - 1]
+        right = totals[:, None] - left
+        right_sq = total_sq[:, None] - left_sq
+        sse_left = (left_sq.sum(-1) - left.square().sum(-1) / positions).clamp_min(0)
+        sse_right = (right_sq.sum(-1) - right.square().sum(-1) / (count - positions)).clamp_min(0)
+        gains = unsplit[:, None] - sse_left - sse_right
+        best, index = gains.max(dim=1)
+        return best.clamp_min(0), positions[index], unsplit
+
+    def _null_split_gains(self, segment, rng, iterations):
+        if not self._cuda_enabled():
+            return np.asarray([self._best_split_gain(segment[rng.permutation(len(segment))])[0]
+                               for _ in range(iterations)], dtype=np.float64)
+        import torch
+        result = []
+        with torch.inference_mode():
+            gpu = self._tensor(segment)
+            for start in range(0, iterations, 8):
+                permutations = np.stack([rng.permutation(len(segment))
+                                         for _ in range(min(8, iterations - start))])
+                batch = gpu[self._tensor(permutations)]
+                result.extend(self._cuda_split_stats(batch)[0].cpu().tolist())
+        return np.asarray(result, dtype=np.float64)
+
+    @staticmethod
     def _best_split_gain(values: np.ndarray) -> tuple[float, int | None, float]:
         count = len(values)
         if count < 4 or not values.shape[1]:
             return 0.0, None, 0.0
+        if os.getenv("SENTRIX_SVD_DEVICE", "cpu").startswith("cuda"):
+            import torch
+            with torch.inference_mode():
+                batch = torch.as_tensor(np.ascontiguousarray(values), device=os.getenv("SENTRIX_SVD_DEVICE"))[None]
+                gains, positions, unsplit = SVDLowRankKeyframeExtractor._cuda_split_stats(batch)
+                gain = float(gains[0])
+                return gain, int(positions[0]) if gain > 0 else None, float(unsplit[0])
         cumulative = np.cumsum(values, axis=0)
         cumulative_sq = np.cumsum(np.square(values), axis=0)
 
@@ -618,10 +703,7 @@ class SVDLowRankKeyframeExtractor:
             # that are equally likely after destroying temporal order. This
             # makes the number of states data-driven instead of configured.
             rng = np.random.default_rng(2026 + start * 131 + count * 17 + dimensions)
-            null_gains = [
-                self._best_split_gain(segment[rng.permutation(count)])[0]
-                for _ in range(128)
-            ]
+            null_gains = self._null_split_gains(segment, rng, 128)
             if best_gain <= float(np.quantile(null_gains, 0.99)):
                 return
             best_split = start + relative_split
@@ -664,10 +746,7 @@ class SVDLowRankKeyframeExtractor:
             rng = np.random.default_rng(
                 2026 + start * 131 + observations * 17 + dimensions * 7 + sum(ord(char) for char in name)
             )
-            null_gains = np.asarray([
-                self._best_split_gain(segment[rng.permutation(observations)])[0]
-                for _ in range(256)
-            ], dtype=np.float64)
+            null_gains = self._null_split_gains(segment, rng, 256)
             confidence = float((1 + np.count_nonzero(null_gains < gain)) / (len(null_gains) + 1))
             return {
                 "modality": name, "position": start + int(relative_split),
@@ -943,7 +1022,7 @@ class SVDLowRankKeyframeExtractor:
         local = features[indices].astype(np.float64)
         norms = np.linalg.norm(local, axis=1, keepdims=True)
         unit = np.divide(local, norms, out=np.zeros_like(local), where=norms > 1e-8)
-        centrality = np.mean(unit @ unit.T, axis=1)
+        centrality = np.mean(self._matmul(unit, unit.T), axis=1)
         sharpness = np.asarray([
             float(cv2.Laplacian(cv2.cvtColor(samples[int(index)][2], cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
             for index in indices
