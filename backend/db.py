@@ -2445,10 +2445,19 @@ class MemoryStore:
         derived = self.list_derived_assets(video_asset_id)
         for asset in derived:
             self.cleanup_asset_derivatives(asset["id"])
-        self.connection.execute(
-            "DELETE FROM events WHERE source_type = 'video_scene' AND source_asset_id = ?",
+        # A semantic failure may leave a scene with no observation but with
+        # dependent records. Such scenes are absent from the asset cleanup.
+        scene_ids = [row["id"] for row in self._rows(
+            "SELECT id FROM events WHERE source_type = 'video_scene' AND source_asset_id = ?",
             (video_asset_id,),
-        )
+        )]
+        for event_id in scene_ids:
+            for table in ("event_observations", "event_entities", "event_participants",
+                          "event_revisions", "person_event_memory", "person_moments"):
+                self.connection.execute(f"DELETE FROM {table} WHERE event_id = ?", (event_id,))
+            self.connection.execute(
+                "DELETE FROM memory_vectors WHERE source_type = 'event' AND source_id = ?", (event_id,))
+            self.connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.connection.execute(
             "DELETE FROM assets WHERE parent_asset_id = ? AND derived_kind IN ('video_keyframe', 'video_keyframe_webp')",
             (video_asset_id,),

@@ -1588,12 +1588,22 @@ def reprocess_video(asset_id: str, background_tasks: BackgroundTasks):
     value = store.get_asset(asset_id)
     if not value or value.get("media_type") != "video":
         raise HTTPException(status_code=404, detail="video asset not found")
-    store.cleanup_video_derivatives(asset_id)
-    store.update_asset(asset_id, "video-queued", {
-        "video_stage": "video-queued", "error": None, "error_stage": None,
-        "pipeline_attempts": 0, "pipeline_retry_count": 0,
-        "pipeline_failure_terminal": False,
-    })
+    # A failed cleanup must not leave a write transaction open on the shared
+    # request connection and block every subsequent retry/ingestion worker.
+    retry_store = MemoryStore(store.path)
+    try:
+        with db_write_guard("video-reprocess"):
+            retry_store.cleanup_video_derivatives(asset_id)
+            retry_store.update_asset(asset_id, "video-queued", {
+                "video_stage": "video-queued", "error": None, "error_stage": None,
+                "pipeline_attempts": 0, "pipeline_retry_count": 0,
+                "pipeline_failure_terminal": False,
+            })
+    except Exception:
+        retry_store.connection.rollback()
+        raise
+    finally:
+        retry_store.close()
     background_tasks.add_task(process_asset, asset_id)
     return {"accepted": True, "asset_id": asset_id, "status": "video-queued"}
 

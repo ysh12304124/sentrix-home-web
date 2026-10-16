@@ -1547,6 +1547,9 @@ representative_indices 最多3张，选择覆盖 distinct_states 或 state_trans
                 "字段：caption（可见内容）、activity（可见动作）、place（可见环境）、"
                 "people、objects、detail（visible_details 数组）、"
                 "representative_indices（固定为 [0]）。看不清时不要编造。"
+                "这是有限输出预算的恢复调用：caption最多60字，activity/place最多15字，"
+                "people/objects使用简短字符串数组各最多5项，visible_details最多3项。"
+                "不要添加其他字段，整个JSON不超过300汉字，务必闭合所有括号。"
             )
             for source_index in dict.fromkeys((evidence_indices[0], evidence_indices[-1])):
                 recovered = parse_json_response(self.chat(

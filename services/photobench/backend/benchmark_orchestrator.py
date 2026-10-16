@@ -3131,6 +3131,17 @@ class BenchmarkRun:
             for name, fn in phases:
                 if self._cancel.is_set():
                     break
+                if name == "qa_eval" and self.manifest.get("require_complete_memory"):
+                    assets = request_json(
+                        f"{self.sentrix_url}/api/assets?scope_id={quote(self.state['scope_id'])}&limit=10000",
+                        timeout=60,
+                    ).get("assets", [])
+                    originals = [asset for asset in assets if not asset.get("parent_asset_id")]
+                    if (len(originals) != len(album_media_entries(self.manifest))
+                            or any(asset.get("status") != "processed" for asset in assets)):
+                        raise RuntimeError("Dataset requires complete memory; refusing QA with missing or failed media")
+                    if self.mode == "full" and self.state.get("phases", {}).get("graph_memory", {}).get("status") != "done":
+                        raise RuntimeError("Dataset requires a completed graph build before QA")
                 self._current_phase = name
                 self._record_phase(name, "status", "running")
                 with self.lock:

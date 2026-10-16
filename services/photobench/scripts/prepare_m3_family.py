@@ -112,6 +112,7 @@ def prepare(annotations_path, lock_path, encoded_dir, validation_path, output):
                     'faces': [], 'family_relationships': [], 'qa_sets': {}, 'metadata_files': {}}
         manifest['album_id'] = output.name
         manifest['album_name'] = f'M3 家庭视频（{len(rows)} 道官方题改编协议）'
+        manifest['require_complete_memory'] = True
         manifest['evaluation_protocol'] = 'full_video_album_adaptation'
         manifest['sentrix_baseline_commit'] = lock['sentrix_baseline_commit']
         manifest['m3_license'] = lock['license']

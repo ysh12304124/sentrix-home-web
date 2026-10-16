@@ -34,6 +34,7 @@ class M3AdapterTests(unittest.TestCase):
             q, _ = self.fixture(root)
             out = root / 'album'
             m.prepare(root/'robot.json', root/'lock.json', root, root/'validation.json', out)
+            self.assertTrue(m.read(out/'manifest.json')['require_complete_memory'])
             row = json.loads((out/'qa/m3-official-1q.jsonl').read_text())
             self.assertEqual(row['source_annotation'], q)
             self.assertEqual(row['answer'], q['answer'])
