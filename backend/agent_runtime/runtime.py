@@ -2410,64 +2410,6 @@ class AgentRuntime:
                     turn.final_answer = render_emergency_summary(task.as_dict(), reason="输出无法解析")
                 break
             if action.get("action") == "final":
-                # ===== Recovery Gate v2: 三触发→阶梯动作→有界穷尽(K=2)→放行 =====
-                CONSERVATIVE_WORDS = [
-                    "无法确认","看不出来","无法判断","不足以确认","无法回答",
-                    "无法定位","现有记录看不出","无法确定","没有足够的记录",
-                    "无法找到","没有足够信息","信息不足","无法核实",
-                ]
-                final_answer_raw = str(action.get("answer") or "").strip()
-                is_conservative = any(w in final_answer_raw for w in CONSERVATIVE_WORDS)
-                search_has_preview = bool(task.result_preview and task.result_preview.get("preview"))
-                search_results = [s for s in (task.tool_results or []) if s.get("tool") == "search_memories"]
-                inspect_called = any(s.get("tool") == "inspect_photo" for s in (task.tool_results or []))
-                # recovery阶梯计数器(持久化在turn.recovery_trace)
-                rt = turn.recovery_trace.setdefault("conservative_retries", 0)
-                max_recovery = 2  # K=2,论文最优
-                recovery_triggered = False
-
-                if is_conservative and rt < max_recovery and turn.budget.can_model_step():
-                    if rt == 0 and search_has_preview and not inspect_called:
-                        # T1: 保守结论+候选未深挖→inspect最高分候选
-                        preview_handles = [p.get("handle") for p in task.result_preview.get("preview", [])[:3]]
-                        handle_hint = f"（handle如{', '.join(preview_handles)}）" if preview_handles else ""
-                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                        messages.append({"role": "user", "content": (
-                            f"在落定结论前，值得独立复核：检索曾返回候选照片{handle_hint}。"
-                            f"判断是否相关→相关则调用 inspect_photo 取观察→基于观察形成结论→"
-                            f"均不相关则按复核结果作答并说明检查过哪些候选。"
-                        )})
-                        recovery_triggered = True
-                    elif rt == 1:
-                        # T2: 保守结论+已inspect但关键词不匹配→query重写重检
-                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                        messages.append({"role": "user", "content": (
-                            "换一个检索角度：把此前的对话语境纳入检索意图，或去掉部分筛选条件再检索一次，"
-                            "然后基于新的结果形成结论。"
-                        )})
-                        recovery_triggered = True
-                    elif rt >= 2:
-                        # T3: 重检后仍保守→放宽filter重查+inspect新候选
-                        messages.append({"role": "assistant", "content": _model_visible_action(action)})
-                        messages.append({"role": "user", "content": (
-                            "放宽检索条件：逐步去掉时间/地点/人物等筛选器，或切换检索通道（如从语义检索切换到关键词检索），"
-                            "获取更宽的候选集后重新判断。"
-                        )})
-                        recovery_triggered = True
-
-                    if recovery_triggered:
-                        turn.recovery_trace["conservative_retries"] = rt + 1
-                        turn.recovery_trace["last_stage"] = f"recovery_t{rt+1}"
-                        turn.recovery_trace["trigger"] = "conservative_with_candidates" if search_has_preview else "conservative_empty"
-                        continue  # 进入下一轮模型调用
-
-                # ===== 穷尽后放行:追加复核说明(有内容的保守比空洞保守好) =====
-                if is_conservative and rt > 0:
-                    action["answer"] = final_answer_raw + (
-                        f"（已复核{len(task.result_preview.get('preview',[]))}张候选并尝试{rt}种检索角度）"
-                    )
-
-                # Agent2 gate(原有逻辑)
                 last_model_final_answer = str(action.get("answer") or "").strip()
                 selected_image_handles = _normalize_selected_image_handles(
                     action.get("selected_image_handles") or action.get("image_handles"),
