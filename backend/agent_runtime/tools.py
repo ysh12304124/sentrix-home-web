@@ -1512,11 +1512,6 @@ class _SlotRetrievalPacket:
 
 def _search_memories(arguments: dict, *, context: dict | None = None) -> dict:
     query = arguments.get("query") or ""
-    # D4.1: Multi-turn query rewrite —— short query + history → append context tail
-    conv_history = (context or {}).get("conversation_history") or ""
-    if conv_history and len(query.strip()) < 25:
-        tail = conv_history[-400:] if len(conv_history) > 400 else conv_history
-        query = f"{query} {tail}"
     mode = arguments.get("mode") or "best"
     if mode not in {"best", "all", "representative"}:
         mode = "best"
