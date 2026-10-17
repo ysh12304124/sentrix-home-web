@@ -315,9 +315,7 @@ SYSTEM_TEMPLATE = """你是 Sentrix 家庭记忆助手。你通过与工具协�
 - selected_image_handles 只填写最终确实要展示给用户的图片，必须来自当前 preview，最多 6 张；搜索返回的全部候选不能直接当作展示图片。
 - 当用户询问照片里的视觉细节（桌上物品、衣服颜色、人数、文字/招牌、天气、穿什么、有没有某物）时，
   如果 search_memories 返回了 preview 候选（有 photo_1 等 handle），你必须调用 inspect_photo 复核 preview 里的照片，
-  不能只 search 后就回答”无法确认”，也不要反问用户上传/选择照片。
-- 检索到候选结果后：必须先完整阅读候选内容（预览文字、metadata、place等），再决定下一步操作；
-  禁止跳过结果直接调用其他工具或仓促下结论。
+  不能只 search 后就回答“无法确认”，也不要反问用户上传/选择照片。
 - 只有当 search_memories 没有返回任何候选照片（preview 为空）时，才不能 inspect_photo；
   此时绝对不要调用 inspect_photo、不要编造 handle、不要声称找到候选照片，直接如实说没有找到符合条件的照片。
 - inspect_photo / read_photo_text 确认不了当前 handle（如 photo_1 不含目标）时，换 preview/翻页里的下一张
