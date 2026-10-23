@@ -71,8 +71,8 @@ def geocode(latitude, longitude):
                 "longitude": longitude,
                 "confidence": 0.90,
             }
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"  [geocode失败] {type(_e).__name__}: {_e}", flush=True)
     return None
 
 
